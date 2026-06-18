@@ -544,6 +544,9 @@ pub struct BrowseState {
     /// Inline search panel state.
     pub search: SearchState,
 
+    /// Path bar input (when the breadcrumb is in edit mode)
+    pub path_input: Option<TextInputState>,
+
     /// Filter input (when /-mode is active)
     pub filter_input: Option<TextInputState>,
     /// Committed filter text (empty = no filter)
@@ -684,6 +687,7 @@ impl BrowseState {
             multi_select_anchor: None,
             visual_mode: false,
             search: SearchState::new(),
+            path_input: None,
             filter_input: None,
             filter_text: String::new(),
             filter_text_prior: None,
@@ -1547,6 +1551,36 @@ impl BrowseState {
                 self.filter_text = prior;
                 self.apply_view_preserving_cursor();
             }
+        }
+    }
+
+    /// Open the path bar input, seeded with the current directory.
+    pub fn open_path_input(&mut self) {
+        let display = {
+            let path_str = self.current_dir.display().to_string();
+            let home = std::env::var("HOME").unwrap_or_default();
+            if !home.is_empty() && path_str.starts_with(&home) {
+                format!("~{}", &path_str[home.len()..])
+            } else {
+                path_str
+            }
+        };
+        self.path_input = Some(TextInputState::new(display));
+    }
+
+    /// Close the path bar input. If `commit`, navigate to the entered path.
+    pub fn close_path_input(&mut self, commit: bool) {
+        if commit {
+            if let Some(input) = self.path_input.take() {
+                let text = input.text.trim().to_string();
+                if !text.is_empty() {
+                    if let Err(err) = self.navigate_to_str(&text) {
+                        log::warn!("path bar navigation failed: {err}");
+                    }
+                }
+            }
+        } else {
+            self.path_input = None;
         }
     }
 

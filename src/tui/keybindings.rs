@@ -48,6 +48,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    if app.current_screen == AppScreen::Browse && app.browse.path_input.is_some() {
+        handle_browse_path_input_key(app, key);
+        return;
+    }
+
     if app.current_screen == AppScreen::Browse && app.browse.filter_input.is_some() {
         handle_browse_filter_key(app, key, tx);
         return;
@@ -1066,6 +1071,24 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
+            }
+        }
+    }
+}
+
+fn handle_browse_path_input_key(app: &mut AppState, key: KeyEvent) {
+    use super::text_input::handle_text_input_key;
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, _) => {
+            app.browse.close_path_input(true);
+        }
+        (KeyCode::Esc, _) => {
+            app.browse.close_path_input(false);
+        }
+        _ => {
+            if let Some(input) = &mut app.browse.path_input {
+                handle_text_input_key(input, &key);
             }
         }
     }
@@ -12743,6 +12766,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseList => {
                 // Catch-all for scroll routing only; ignore on left click.
+            }
+            TuiButton::BrowseBreadcrumb => {
+                app.browse.open_path_input();
             }
 
             // ── Overlay buttons ──

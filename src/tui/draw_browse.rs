@@ -43,6 +43,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
 
     draw_header(f, chunks[0]);
     draw_breadcrumb(f, chunks[2], &app.browse);
+    app.button_map.record_button(TuiButton::BrowseBreadcrumb, chunks[2]);
 
     // Split main content horizontally: list (2/3) + info (1/3)
     let content_chunks = Layout::default()
@@ -188,6 +189,38 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
 /// (and the active text filter, if any).
 fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
     if area.width < 10 {
+        return;
+    }
+
+    // Editable path input mode
+    if let Some(ref input) = browse.path_input {
+        let prefix = "  path  ";
+        let prefix_w = prefix.chars().count();
+        let input_max = (area.width as usize).saturating_sub(prefix_w).saturating_sub(1);
+        let visible_text = &input.text;
+        let cursor_char_pos = input.text[..input.cursor].chars().count();
+
+        // Scroll the input so the cursor is always visible
+        let scroll_offset = if cursor_char_pos > input_max {
+            cursor_char_pos - input_max
+        } else {
+            0
+        };
+        let visible: String = visible_text.chars().skip(scroll_offset).take(input_max).collect();
+        let cursor_in_visible = cursor_char_pos.saturating_sub(scroll_offset);
+
+        let spans = vec![
+            Span::styled(prefix, Style::default().fg(theme::AMBER)),
+            Span::styled(visible, theme::bright()),
+        ];
+        let line = Paragraph::new(Line::from(spans));
+        f.render_widget(line, area);
+
+        // Position the terminal cursor at the edit position
+        let cursor_x = area.x + prefix_w as u16 + cursor_in_visible as u16;
+        if cursor_x < area.x + area.width {
+            f.set_cursor(cursor_x, area.y);
+        }
         return;
     }
 

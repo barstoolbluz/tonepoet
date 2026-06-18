@@ -178,6 +178,7 @@ pub enum TuiButton {
     BrowseEntry(usize),
     BrowseColumn(ColumnKind),
     BrowseList, // catch-all region for scroll wheel routing
+    BrowseBreadcrumb, // click to edit path
 
     // Browse info pane: clickable metadata field (click → edit tag).
     BrowseInfoMeta(crate::tui::probe::MetadataField),
@@ -327,6 +328,7 @@ impl TuiButton {
             Self::BrowseEntry(_)
             | Self::BrowseColumn(_)
             | Self::BrowseList
+            | Self::BrowseBreadcrumb
             | Self::BrowseInfoMeta(_)
             | Self::BrowseInfoAnalyze
             | Self::BrowseInfoEditTags
