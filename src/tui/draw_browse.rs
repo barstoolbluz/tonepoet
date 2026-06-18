@@ -2,9 +2,9 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -33,23 +33,21 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7), // header banner
-            Constraint::Length(1), // blank
-            Constraint::Length(1), // breadcrumb
-            Constraint::Length(1), // blank
+            Constraint::Length(3), // breadcrumb (bordered)
             Constraint::Min(10),   // main content (list + info)
             Constraint::Length(2), // footer (tabs + context)
         ])
         .split(area);
 
     draw_header(f, chunks[0]);
-    draw_breadcrumb(f, chunks[2], &app.browse);
-    app.button_map.record_button(TuiButton::BrowseBreadcrumb, chunks[2]);
+    draw_breadcrumb(f, chunks[1], &app.browse);
+    app.button_map.record_button(TuiButton::BrowseBreadcrumb, chunks[1]);
 
     // Split main content horizontally: list (2/3) + info (1/3)
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
-        .split(chunks[4]);
+        .split(chunks[2]);
 
     let list_area = content_chunks[0];
     let hover = app.hover_target;
@@ -65,7 +63,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
         f,
-        chunks[5],
+        chunks[3],
         app.current_screen,
         &mut app.button_map,
         status_msg,
@@ -192,45 +190,57 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
         return;
     }
 
+    let border_color = if browse.path_input.is_some() {
+        theme::BLUE
+    } else {
+        theme::BORDER_DIM
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width < 4 {
+        return;
+    }
+
     // Editable path input mode
     if let Some(ref input) = browse.path_input {
-        let prefix = "  path  ";
+        let prefix = " path: ";
         let prefix_w = prefix.chars().count();
-        let input_max = (area.width as usize).saturating_sub(prefix_w).saturating_sub(1);
-        let visible_text = &input.text;
+        let input_max = (inner.width as usize).saturating_sub(prefix_w).saturating_sub(1);
         let cursor_char_pos = input.text[..input.cursor].chars().count();
 
-        // Scroll the input so the cursor is always visible
         let scroll_offset = if cursor_char_pos > input_max {
             cursor_char_pos - input_max
         } else {
             0
         };
-        let visible: String = visible_text.chars().skip(scroll_offset).take(input_max).collect();
+        let visible: String = input.text.chars().skip(scroll_offset).take(input_max).collect();
         let cursor_in_visible = cursor_char_pos.saturating_sub(scroll_offset);
 
         let text_style = if input.select_all {
-            Style::default().fg(theme::BG).bg(theme::AMBER)
+            Style::default().fg(theme::BG).bg(Color::Rgb(180, 190, 210))
         } else {
             theme::bright()
         };
         let spans = vec![
-            Span::styled(prefix, Style::default().fg(theme::AMBER)),
+            Span::styled(prefix, Style::default().fg(theme::BLUE)),
             Span::styled(visible, text_style),
         ];
         let line = Paragraph::new(Line::from(spans));
-        f.render_widget(line, area);
+        f.render_widget(line, inner);
 
-        // Position the terminal cursor at the edit position
-        let cursor_x = area.x + prefix_w as u16 + cursor_in_visible as u16;
-        if cursor_x < area.x + area.width {
-            f.set_cursor(cursor_x, area.y);
+        let cursor_x = inner.x + prefix_w as u16 + cursor_in_visible as u16;
+        if cursor_x < inner.x + inner.width {
+            f.set_cursor(cursor_x, inner.y);
         }
         return;
     }
 
+    // Read-only display mode
     let display = if let Some(ref arc) = browse.archive {
-        // Inside an archive: show "archive.7z:/inner/path"
         let archive_name = arc
             .listing
             .archive_path
@@ -252,29 +262,25 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
         }
     };
 
-    // Filter suffix appears only when a text filter is active.
     let filter_suffix = if !browse.filter_text.is_empty() {
         format!("   filter: {}", browse.filter_text)
     } else {
         String::new()
     };
 
-    // Type-ahead suffix appears while the jump buffer is active.
     let type_ahead_suffix = if browse.type_ahead_active() {
         format!("   jump: {}", browse.type_ahead_buffer)
     } else {
         String::new()
     };
 
-    // Reserve space for prefix + suffixes; truncate the path from the left
-    // so the most contextual portion (current directory) stays visible.
-    let prefix = "  path  ";
+    let prefix = " path: ";
     let prefix_w = prefix.chars().count();
     let suffix_w = filter_suffix.chars().count() + type_ahead_suffix.chars().count();
-    let path_max = (area.width as usize)
+    let path_max = (inner.width as usize)
         .saturating_sub(prefix_w)
         .saturating_sub(suffix_w)
-        .saturating_sub(1); // safety margin
+        .saturating_sub(1);
     let display_truncated = truncate_left(&display, path_max);
 
     let mut spans = vec![
@@ -295,7 +301,7 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
     }
 
     let line = Paragraph::new(Line::from(spans));
-    f.render_widget(line, area);
+    f.render_widget(line, inner);
 }
 
 /// Truncate a string from the LEFT to fit `max` chars, prepending `…` if cut.
