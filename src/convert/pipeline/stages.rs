@@ -5987,6 +5987,7 @@ fn append_request_only_conversion_settings_section(log: &mut String, req: &Pipel
     push_kv_line(log, "Filename template", &req.naming.template);
 }
 
+#[cfg(test)]
 fn build_conversion_log(
     outcome: &AlbumOutcome,
     source: &PreparedSource,

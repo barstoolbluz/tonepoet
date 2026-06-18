@@ -550,6 +550,7 @@ fn read_flac_vorbis_comment_track_context<R: Read + Seek>(reader: &mut R) -> Opt
     None
 }
 
+#[cfg(test)]
 fn parse_flac_vorbis_comment_track_context(bytes: &[u8]) -> Option<(Option<u32>, u32)> {
     if bytes.len() < 4 || &bytes[..4] != b"fLaC" {
         return None;

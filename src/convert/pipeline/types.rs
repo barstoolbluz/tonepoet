@@ -167,6 +167,7 @@ impl AlbumBatchContext {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn with_source_context(mut self, source_context: AlbumBatchSourceContext) -> Self {
         self.source_context = Some(source_context);
         self
@@ -179,6 +180,7 @@ impl AlbumBatchContext {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn with_planner_resolved_album_output_dir(mut self, album_output_dir: PathBuf) -> Self {
         self.album_output_dir = album_output_dir;
         self.album_output_dir_is_planner_resolved = true;
