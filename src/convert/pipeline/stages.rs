@@ -14136,7 +14136,7 @@ fn acquire_publish_lock(album_dir: &Path) -> Result<AlbumPublishLock, PublishErr
     let hidden_lock_path = album_lock_path(album_dir);
     let legacy_lock_path = legacy_album_lock_path(album_dir);
 
-    let hidden = acquire_blocking_file_lock(&hidden_lock_path, false).map_err(PublishError::Io)?;
+    let hidden = acquire_blocking_file_lock(&hidden_lock_path, true).map_err(PublishError::Io)?;
     remove_lock_path_best_effort(&legacy_lock_path);
 
     Ok(AlbumPublishLock { hidden: Some(hidden) })
