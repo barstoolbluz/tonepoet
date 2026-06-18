@@ -673,6 +673,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
+        // Delete: move selected file(s) to trash (with confirmation)
+        (KeyCode::Delete, KeyModifiers::NONE) => {
+            super::command::execute_command(app, super::command::Command::Delete, tx);
+        }
+
         // Enter directory/archive or select file
         (KeyCode::Right, KeyModifiers::NONE) => {
             if let Some(entry) = app.browse.selected_entry() {
