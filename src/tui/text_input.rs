@@ -12,6 +12,9 @@ pub struct TextInputState {
     pub text: String,
     /// Byte offset into `text`; always on a UTF-8 char boundary.
     pub cursor: usize,
+    /// When true, the entire text is selected. The next character input
+    /// replaces all text; navigation keys clear the selection.
+    pub select_all: bool,
 }
 
 impl TextInputState {
@@ -21,6 +24,17 @@ impl TextInputState {
         Self {
             text: initial,
             cursor,
+            select_all: false,
+        }
+    }
+
+    /// Create a new input with all text selected.
+    pub fn new_selected(initial: String) -> Self {
+        let cursor = initial.len();
+        Self {
+            text: initial,
+            cursor,
+            select_all: true,
         }
     }
 
@@ -231,6 +245,32 @@ fn next_boundary_after(text: &str, pos: usize) -> Option<usize> {
 /// Does NOT handle Enter or Esc — those are overlay-specific.
 pub fn handle_text_input_key(input: &mut TextInputState, key: &KeyEvent) -> bool {
     use crossterm::event::KeyModifiers as M;
+
+    // Select-all handling: typing replaces all text, navigation clears selection.
+    if input.select_all {
+        match key.code {
+            KeyCode::Char(c) if !key.modifiers.contains(M::CONTROL) && !key.modifiers.contains(M::ALT) => {
+                input.text.clear();
+                input.cursor = 0;
+                input.select_all = false;
+                input.insert_char(c);
+                return true;
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                input.text.clear();
+                input.cursor = 0;
+                input.select_all = false;
+                return true;
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
+                input.select_all = false;
+                // Fall through to normal handling
+            }
+            _ => {
+                input.select_all = false;
+            }
+        }
+    }
 
     let ctrl = key.modifiers.contains(M::CONTROL);
     let alt = key.modifiers.contains(M::ALT);

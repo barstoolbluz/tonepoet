@@ -209,9 +209,14 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
         let visible: String = visible_text.chars().skip(scroll_offset).take(input_max).collect();
         let cursor_in_visible = cursor_char_pos.saturating_sub(scroll_offset);
 
+        let text_style = if input.select_all {
+            Style::default().fg(theme::BG).bg(theme::AMBER)
+        } else {
+            theme::bright()
+        };
         let spans = vec![
             Span::styled(prefix, Style::default().fg(theme::AMBER)),
-            Span::styled(visible, theme::bright()),
+            Span::styled(visible, text_style),
         ];
         let line = Paragraph::new(Line::from(spans));
         f.render_widget(line, area);

@@ -1565,7 +1565,7 @@ impl BrowseState {
                 path_str
             }
         };
-        self.path_input = Some(TextInputState::new(display));
+        self.path_input = Some(TextInputState::new_selected(display));
     }
 
     /// Close the path bar input. If `commit`, navigate to the entered path.
