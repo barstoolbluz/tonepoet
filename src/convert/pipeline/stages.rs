@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
@@ -59,6 +60,12 @@ use sacd_rs::iso_reader::IsoReader;
 
 const DEFAULT_CONVERT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const STAGING_PARENT_NAME: &str = ".tonepoet-staging";
+const CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION: u8 = 13;
+const CONVERSION_LOG_FRAGMENT_DIR: &str = ".tonepoet-log-fragments";
+const CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR: &str = ".tonepoet-log-fragments.quarantine";
+const CONVERSION_LOG_FRAGMENT_SIDE_KIND: &str = "tonepoet-conversion-log-fragment";
+const CONVERSION_LOG_BATCH_ID_PREFIX: &str = "tonepoet-log-batch-v1";
+static CONVERSION_LOG_BATCH_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ===========================================================================
 // Materializer trait
@@ -149,6 +156,47 @@ pub fn validate_request(req: &PipelineRequest) -> Result<(), RequestValidationEr
         }
     }
 
+    if let Some(album_batch) = &req.album_batch {
+        validate_album_batch_context(album_batch)
+            .map_err(RequestValidationError::InvalidStagePolicy)?;
+        let track = req.album_batch_track.as_ref().ok_or_else(|| {
+            RequestValidationError::InvalidStagePolicy(
+                "album_batch requests must also carry album_batch_track for pre-materialization failure fragments".to_string(),
+            )
+        })?;
+        validate_album_batch_track_context(track)
+            .map_err(RequestValidationError::InvalidStagePolicy)?;
+    }
+
+    Ok(())
+}
+
+fn validate_album_batch_context(album_batch: &AlbumBatchContext) -> Result<(), String> {
+    if album_batch.conversion_log_batch_id.trim().is_empty() {
+        return Err("album_batch.conversion_log_batch_id must not be empty".to_string());
+    }
+    if !is_generated_conversion_log_batch_id(album_batch.conversion_log_batch_id.trim()) {
+        return Err("album_batch.conversion_log_batch_id must be a run-unique id generated for this album dispatch attempt".to_string());
+    }
+    if album_batch.expected_track_count == 0 {
+        return Err("album_batch.expected_track_count must be greater than zero".to_string());
+    }
+    if album_batch.album_output_dir.as_os_str().is_empty() {
+        return Err("album_batch.album_output_dir must not be empty".to_string());
+    }
+    if album_batch.source_grouping_root.as_os_str().is_empty() {
+        return Err("album_batch.source_grouping_root must not be empty".to_string());
+    }
+    Ok(())
+}
+
+fn validate_album_batch_track_context(track: &AlbumBatchTrackContext) -> Result<(), String> {
+    if track.source_ordinal == 0 {
+        return Err("album_batch_track.source_ordinal must be greater than zero".to_string());
+    }
+    if track.track_number == 0 {
+        return Err("album_batch_track.track_number must be greater than zero".to_string());
+    }
     Ok(())
 }
 
@@ -201,6 +249,166 @@ fn is_single_audio_extension(ext: &str) -> bool {
         "flac" | "wav" | "wave" | "aiff" | "aif" | "aifc" | "wv" | "mp3" | "m4a" | "mp4"
             | "aac" | "opus" | "ogg" | "ape" | "w64" | "rf64" | "dsf" | "dff"
     )
+}
+
+/// Generate a run-unique conversion-log batch id for one album dispatch
+/// attempt. The id is intentionally not derived from artist/album/path tags;
+/// stale fragments from a crashed or cancelled run must not be eligible for a
+/// later retry of the same album with the same output directory and settings.
+fn new_conversion_log_batch_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let sequence = CONVERSION_LOG_BATCH_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{CONVERSION_LOG_BATCH_ID_PREFIX}-{:x}-{:x}-{:x}",
+        std::process::id(),
+        nanos,
+        sequence
+    )
+}
+
+fn is_generated_conversion_log_batch_id(value: &str) -> bool {
+    let Some(suffix) = value
+        .strip_prefix(CONVERSION_LOG_BATCH_ID_PREFIX)
+        .and_then(|value| value.strip_prefix('-'))
+    else {
+        return false;
+    };
+    let mut parts = suffix.split('-');
+    let Some(process_or_test) = parts.next() else { return false; };
+    let Some(nonce) = parts.next() else { return false; };
+    let Some(sequence) = parts.next() else { return false; };
+    if parts.next().is_some() {
+        return false;
+    }
+    [process_or_test, nonce, sequence]
+        .into_iter()
+        .all(|part| !part.is_empty() && part.as_bytes().iter().all(u8::is_ascii_hexdigit))
+}
+
+/// Build the production album-batch contract for independent single-file
+/// folder dispatch and attach it to every per-track request before scheduler
+/// enqueue. This is the only supported way for folder batches to enter
+/// fragment-backed conversion-log mode; individual track jobs must not infer
+/// album completion from tags or from their one prepared source track.
+///
+/// A fresh `conversion_log_batch_id` is generated for every call. Callers must
+/// not pass a deterministic artist/album/path id, because a rerun of the same
+/// album after a crash could otherwise reuse old fragments and assemble early.
+///
+/// Every request must already carry a dispatcher-authored
+/// `AlbumBatchTrackContext`. This helper deliberately refuses to synthesize a
+/// track number from request enumeration order, because filesystem and queue
+/// iteration order are not authoritative album track order.
+pub fn prepare_independent_single_file_album_batch_for_dispatch(
+    requests: Vec<PipelineRequest>,
+    album_output_dir: PathBuf,
+    source_grouping_root: PathBuf,
+) -> Result<AlbumBatchDispatch, RequestValidationError> {
+    prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
+        requests,
+        new_conversion_log_batch_id(),
+        album_output_dir,
+        source_grouping_root,
+    )
+}
+
+/// Internal/test hook for constructing explicit old/new run identities. The
+/// production dispatch entry point above always generates a fresh id.
+fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
+    mut requests: Vec<PipelineRequest>,
+    conversion_log_batch_id: impl Into<String>,
+    album_output_dir: PathBuf,
+    source_grouping_root: PathBuf,
+) -> Result<AlbumBatchDispatch, RequestValidationError> {
+    if requests.is_empty() {
+        return Err(RequestValidationError::InvalidStagePolicy(
+            "independent single-file album batch dispatch requires at least one request".to_string(),
+        ));
+    }
+
+    let conversion_log_batch_id = conversion_log_batch_id.into();
+    if !is_generated_conversion_log_batch_id(&conversion_log_batch_id) {
+        return Err(RequestValidationError::InvalidStagePolicy(
+            "conversion_log_batch_id must be generated per album dispatch attempt; deterministic album/path ids are not allowed".to_string(),
+        ));
+    }
+
+    let expected_track_count = requests.len();
+    let normalized_grouping_root = normalize_path(&source_grouping_root);
+    let album_batch = AlbumBatchContext::from_dispatcher_source_count(
+        conversion_log_batch_id,
+        expected_track_count,
+        album_output_dir,
+        source_grouping_root,
+    )
+    .map_err(RequestValidationError::InvalidStagePolicy)?;
+
+    for req in requests.iter_mut() {
+        let Some(dispatcher_track_context) = req.album_batch_track.clone() else {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "album batch fragment dispatch for {} requires dispatcher-supplied album_batch_track; refusing to invent track order from request enumeration",
+                req.item_id
+            )));
+        };
+        if dispatcher_track_context.source_ordinal == 0 || dispatcher_track_context.track_number == 0 {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "album batch track context for {} must use nonzero source_ordinal and track_number",
+                req.item_id
+            )));
+        }
+
+        match detect_source_kind(req) {
+            Ok(SourceKind::SingleFile) => {}
+            Ok(kind) => {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "album batch fragment dispatch accepts only independent single-file jobs, got {kind:?} for {}",
+                    req.container.display()
+                )));
+            }
+            Err(err) => {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "album batch fragment dispatch could not classify {} as a single-file audio source: {err}",
+                    req.container.display()
+                )));
+            }
+        }
+
+        let normalized_container = normalize_path(&req.container);
+        if normalized_container != normalized_grouping_root
+            && !path_is_under_root(&normalized_container, &normalized_grouping_root)
+        {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "album batch source {} is not under source grouping root {}",
+                normalized_container.display(),
+                normalized_grouping_root.display()
+            )));
+        }
+
+        if let Some(existing) = &req.album_batch {
+            if existing != &album_batch {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "request {} already has a different album_batch; refusing to mix dispatcher contracts",
+                    req.item_id
+                )));
+            }
+        }
+
+        req.album_batch = Some(album_batch.clone());
+        req.album_batch_track = Some(dispatcher_track_context);
+        // The dispatcher-authored AlbumBatchContext is authoritative. Clear the
+        // deprecated compatibility field so downstream code and tests cannot
+        // accidentally treat it as a second completion threshold.
+        req.expected_album_track_count = None;
+        validate_request(req)?;
+    }
+
+    Ok(AlbumBatchDispatch {
+        album_batch,
+        requests,
+    })
 }
 
 /// Dispatch a supported source kind to its materializer.
@@ -4543,6 +4751,10 @@ FILE "album.flac" WAVE
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -5331,7 +5543,7 @@ pub async fn apply_replaygain_with_tool_limits(
 
 /// Generate feature sidecars: conversion log and CUE sheet.
 pub async fn run_features(
-    mut artifacts: ArtifactSet,
+    artifacts: ArtifactSet,
     outcome: &AlbumOutcome,
     source: &PreparedSource,
     req: &PipelineRequest,
@@ -5350,37 +5562,75 @@ pub async fn run_features(
         ));
     }
 
-    // Derive album_dir from the first audio artifact's final path so sidecars
-    // land in the same directory. Using output_root directly fails when
-    // per_album_subdir is true because audio files are one level deeper.
-    let album_dir = match &artifacts.audio {
-        AudioArtifacts::Tracks(tracks) => tracks
-            .first()
-            .and_then(|t| t.final_path.parent())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| req.output_root.clone()),
-        AudioArtifacts::Merged(merged) => merged
-            .final_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| req.output_root.clone()),
-    };
+    let artifacts = stage_conversion_log_sidecars(artifacts, outcome, source, req, staging)?;
 
-    let log_staged = staging.root.join("conversion.log");
+    Ok((
+        artifacts,
+        StageRecord {
+            stage: PipelineStage::Features,
+            outcome: StageOutcome::Ok,
+            dsd_dst_stats: None,
+        },
+    ))
+}
+
+fn stage_conversion_log_sidecars(
+    mut artifacts: ArtifactSet,
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+) -> io::Result<ArtifactSet> {
+    let album_dir = conversion_log_album_dir(source, req, &artifacts);
+
     let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings);
-    let log_content = build_conversion_log(
-        outcome,
-        source,
-        req,
-        &artifacts,
-        Some(settings_fingerprint),
-    );
-    fs::write(&log_staged, &log_content)?;
-    artifacts.sidecars.push(SidecarArtifact {
-        kind: SidecarKind::ConversionLog,
-        staged_path: log_staged,
-        final_path: album_dir.join("conversion.log"),
-    });
+    let settings_fingerprint_text = settings_fingerprint.to_string();
+    let log_generated_at = chrono::Utc::now();
+
+    if should_stage_conversion_log_fragment(outcome, source, req, &artifacts) {
+        // Fragment-backed independent single-file jobs must not build or stage
+        // a visible one-track conversion.log. The hidden fragment is the only
+        // conversion-log sidecar for this job; publish-time fragment counting
+        // under the album lock decides whether the unified album log is ready.
+        let (fragment_staged, fragment_name) = stage_conversion_log_fragment(
+            outcome,
+            source,
+            req,
+            &artifacts,
+            &album_dir,
+            Some(settings_fingerprint_text),
+            log_generated_at,
+            staging,
+        )?;
+        artifacts.sidecars.push(SidecarArtifact {
+            kind: SidecarKind::Other(CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string()),
+            staged_path: fragment_staged,
+            final_path: album_dir
+                .join(CONVERSION_LOG_FRAGMENT_DIR)
+                .join(fragment_name),
+        });
+    } else if req.suppress_incremental_conversion_log_append {
+        log::warn!(
+            "conversion.log sidecar suppressed for {} because the folder dispatcher found an album batch that cannot safely use ordered fragment assembly or legacy completion-order append",
+            req.item_id
+        );
+    } else {
+        let log_staged = staging.root.join("conversion.log");
+        let log_content = build_conversion_log_at(
+            outcome,
+            source,
+            req,
+            &artifacts,
+            Some(settings_fingerprint_text.as_str()),
+            log_generated_at,
+        );
+        fs::write(&log_staged, &log_content)?;
+        artifacts.sidecars.push(SidecarArtifact {
+            kind: SidecarKind::ConversionLog,
+            staged_path: log_staged,
+            final_path: album_dir.join("conversion.log"),
+        });
+    }
 
     if req.stages.generate_cue && source.tracks.len() > 1 {
         let cue_staged = staging.root.join("album.cue");
@@ -5393,14 +5643,348 @@ pub async fn run_features(
         });
     }
 
-    Ok((
-        artifacts,
-        StageRecord {
-            stage: PipelineStage::Features,
-            outcome: StageOutcome::Ok,
-            dsd_dst_stats: None,
+    Ok(artifacts)
+}
+
+fn empty_conversion_log_fragment_artifacts() -> ArtifactSet {
+    ArtifactSet {
+        audio: AudioArtifacts::Tracks(Vec::new()),
+        sidecars: Vec::new(),
+    }
+}
+
+fn terminal_conversion_log_fragment_candidate(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+) -> bool {
+    req.album_batch.is_some()
+        && req.album_batch_track.is_some()
+        && source.kind == SourceKind::SingleFile
+        && source.tracks.len() == 1
+        && collect_outcome_tracks(outcome).len() == 1
+        && (matches!(outcome, AlbumOutcome::Blocked { .. })
+            || collect_outcome_tracks(outcome).iter().any(|track| {
+                matches!(track.outcome, TrackOutcome::Err(_) | TrackOutcome::Blocked(_))
+            })
+            || audio_artifact_count(artifacts) == 0)
+}
+
+fn publish_terminal_conversion_log_fragment_if_needed(
+    req: &PipelineRequest,
+    source: Option<&PreparedSource>,
+    artifacts: Option<&ArtifactSet>,
+    outcome: &AlbumOutcome,
+    staging: StagingDir,
+) -> Option<PublishedAlbum> {
+    let Some(source) = source else {
+        return publish_pre_materialization_conversion_log_fragment_if_needed(req, outcome, staging);
+    };
+    let seed_artifacts = artifacts
+        .cloned()
+        .unwrap_or_else(empty_conversion_log_fragment_artifacts);
+    if !terminal_conversion_log_fragment_candidate(outcome, source, req, &seed_artifacts) {
+        return None;
+    }
+
+    let staged_artifacts = match stage_conversion_log_sidecars(
+        seed_artifacts,
+        outcome,
+        source,
+        req,
+        &staging,
+    ) {
+        Ok(artifacts) => artifacts,
+        Err(err) => {
+            log::warn!(
+                "terminal conversion log fragment staging skipped for {}: {err}",
+                req.item_id
+            );
+            return None;
+        }
+    };
+
+    let publish_plan = match build_publish_plan(&staged_artifacts, req) {
+        Ok(plan) => plan,
+        Err(err) => {
+            log::warn!(
+                "terminal conversion log fragment publish plan skipped for {}: {err}",
+                req.item_id
+            );
+            return None;
+        }
+    };
+
+    match publish_album_output(staging, &publish_plan, req.publish.clone(), None) {
+        Ok(album) => Some(album),
+        Err(err) => {
+            log::warn!(
+                "terminal conversion log fragment publish skipped for {}: {err}",
+                req.item_id
+            );
+            None
+        }
+    }
+}
+
+fn publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+    req: &PipelineRequest,
+    outcome: &AlbumOutcome,
+) -> Option<PublishedAlbum> {
+    if !pre_materialization_conversion_log_fragment_candidate(req, outcome) {
+        return None;
+    }
+
+    let staging_parent = staging_parent_for(req);
+    if let Err(err) = fs::create_dir_all(&staging_parent) {
+        log::warn!(
+            "pre-materialization conversion log fragment staging parent creation skipped for {}: {err}",
+            req.item_id
+        );
+        return None;
+    }
+
+    let _run_lock = match acquire_run_lock(&staging_parent, &req.job_id, &req.item_id) {
+        Ok(lock) => lock,
+        Err(err) => {
+            log::warn!(
+                "pre-materialization conversion log fragment run lock skipped for {}: {err}",
+                req.item_id
+            );
+            return None;
+        }
+    };
+
+    let staging_root = staging_parent.join(format!(
+        "{}-{}",
+        sanitize_component(&req.job_id),
+        sanitize_component(&req.item_id)
+    ));
+    let _ = delete_stale_staging_dir(&staging_root);
+    if let Err(err) = fs::create_dir_all(&staging_root) {
+        log::warn!(
+            "pre-materialization conversion log fragment staging directory creation skipped for {}: {err}",
+            req.item_id
+        );
+        return None;
+    }
+    let staging = StagingDir::new(staging_root, req.job_id.clone());
+    publish_pre_materialization_conversion_log_fragment_if_needed(req, outcome, staging)
+}
+
+fn publish_pre_materialization_conversion_log_fragment_if_needed(
+    req: &PipelineRequest,
+    outcome: &AlbumOutcome,
+    staging: StagingDir,
+) -> Option<PublishedAlbum> {
+    if !pre_materialization_conversion_log_fragment_candidate(req, outcome) {
+        return None;
+    }
+
+    let staged_artifacts = match stage_pre_materialization_conversion_log_fragment(outcome, req, &staging) {
+        Ok(artifacts) => artifacts,
+        Err(err) => {
+            log::warn!(
+                "pre-materialization conversion log fragment staging skipped for {}: {err}",
+                req.item_id
+            );
+            return None;
+        }
+    };
+
+    let publish_plan = match build_publish_plan(&staged_artifacts, req) {
+        Ok(plan) => plan,
+        Err(err) => {
+            log::warn!(
+                "pre-materialization conversion log fragment publish plan skipped for {}: {err}",
+                req.item_id
+            );
+            return None;
+        }
+    };
+
+    match publish_album_output(staging, &publish_plan, req.publish.clone(), None) {
+        Ok(album) => Some(album),
+        Err(err) => {
+            log::warn!(
+                "pre-materialization conversion log fragment publish skipped for {}: {err}",
+                req.item_id
+            );
+            None
+        }
+    }
+}
+
+fn publish_pre_materialization_terminal_batch_failure_or_finalize(
+    req: &PipelineRequest,
+    outcome: &AlbumOutcome,
+    reason: &'static str,
+) -> Option<PublishedAlbum> {
+    if !pre_materialization_conversion_log_fragment_candidate(req, outcome) {
+        return None;
+    }
+
+    if let Some(published) =
+        publish_pre_materialization_conversion_log_fragment_without_existing_staging(req, outcome)
+    {
+        return Some(published);
+    }
+
+    // Some infrastructure failures happen before a usable staging directory or
+    // run lock exists. In those cases the current track's fragment cannot be
+    // written safely. Do not leave already-published sibling fragments wedged
+    // forever waiting for this missing track; instead, use the same strict
+    // batch-identity validation as cancellation finalization and assemble a
+    // partial terminal-failure log from the fragments that already reached the
+    // album directory. If no sibling fragments exist, there is no hidden batch
+    // state to clean up.
+    log::warn!(
+        "conversion log fragment could not be published for terminal batch failure in {}: {reason}; attempting partial batch finalization",
+        req.item_id
+    );
+    finalize_terminal_batch_failure_conversion_log_batch_if_needed(req, reason)
+}
+
+fn pre_materialization_conversion_log_fragment_candidate(
+    req: &PipelineRequest,
+    outcome: &AlbumOutcome,
+) -> bool {
+    if req.album_batch.is_none() || req.album_batch_track.is_none() {
+        return false;
+    }
+    matches!(
+        outcome,
+        AlbumOutcome::Blocked {
+            reason: BlockReason::MaterializeFailed,
+            failed,
+            ..
+        } if failed.is_empty()
+    )
+}
+
+fn stage_pre_materialization_conversion_log_fragment(
+    outcome: &AlbumOutcome,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+) -> io::Result<ArtifactSet> {
+    let album_batch = conversion_log_album_batch(req)?;
+    let track_context = conversion_log_album_batch_track(req)?;
+    let album_dir = album_batch.album_output_dir.clone();
+    let settings_fingerprint =
+        tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
+    let generated_at = chrono::Utc::now();
+    let track_id = track_context.track_id();
+    let sort_key = ConversionLogTrackSortKey::from(&track_id);
+    let batch_identity = conversion_log_batch_identity(
+        req,
+        &album_dir,
+        Some(settings_fingerprint.as_str()),
+    )?;
+    let fragment_name = conversion_log_fragment_file_name(sort_key, &batch_identity);
+
+    let failure_message = pre_materialization_failure_message(outcome);
+    let track_record = TrackRecord {
+        track_id,
+        outcome: TrackOutcome::Err(failure_message.clone()),
+        source_ref: TrackSourceRef::StagedFile(req.container.clone()),
+        realized_input: None,
+        output_file: None,
+        commands: Vec::new(),
+        bytes_in: None,
+        bytes_out: None,
+        duration: None,
+        dsd_dst_stats: None,
+    };
+
+    let mut track_section = String::new();
+    append_track_log(
+        &mut track_section,
+        &track_record,
+        None,
+        None,
+        req,
+        metadata_stage_outcome(outcome),
+    );
+
+    let fragment = ConversionLogFragment {
+        version: CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION,
+        expected_track_count: conversion_log_expected_track_count(req)?,
+        sort_key,
+        generated_at,
+        settings_fingerprint: Some(settings_fingerprint),
+        batch_identity,
+        common: build_pre_materialization_conversion_log_common_fragment(req),
+        track: ConversionLogTrackFragment {
+            section: track_section,
         },
-    ))
+        summary: ConversionLogTrackSummary::from_track_record(&track_record),
+        stages: outcome_stage_records(outcome).to_vec(),
+    };
+
+    let fragment_staged = staging.root.join(".conversion-log-fragment.json");
+    let bytes = serde_json::to_vec_pretty(&fragment).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not serialize pre-materialization conversion log fragment: {err}"),
+        )
+    })?;
+    fs::write(&fragment_staged, bytes)?;
+
+    Ok(ArtifactSet {
+        audio: AudioArtifacts::Tracks(Vec::new()),
+        sidecars: vec![SidecarArtifact {
+            kind: SidecarKind::Other(CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string()),
+            staged_path: fragment_staged,
+            final_path: conversion_log_fragment_dir(&album_dir).join(fragment_name),
+        }],
+    })
+}
+
+fn pre_materialization_failure_message(outcome: &AlbumOutcome) -> String {
+    outcome_stage_records(outcome)
+        .iter()
+        .find_map(|stage| match (&stage.stage, &stage.outcome) {
+            (PipelineStage::Materialize, StageOutcome::Failed(message)) => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "source materialization failed before track metadata was available".to_string())
+}
+
+fn build_pre_materialization_conversion_log_common_fragment(
+    req: &PipelineRequest,
+) -> ConversionLogCommonFragment {
+    let mut conversion_settings_section = String::new();
+    append_request_only_conversion_settings_section(&mut conversion_settings_section, req);
+    ConversionLogCommonFragment {
+        representative_job_id: req.job_id.clone(),
+        representative_item_id: req.item_id.clone(),
+        album_artist: None,
+        album: None,
+        year: None,
+        genre: None,
+        catalog_number: None,
+        source_blocking_lines: String::new(),
+        provenance_section: String::new(),
+        artwork_section: String::new(),
+        conversion_settings_section,
+    }
+}
+
+fn append_request_only_conversion_settings_section(log: &mut String, req: &PipelineRequest) {
+    let settings = &req.settings;
+    push_kv_line(log, "Target format", settings.target_format.display_name());
+    push_kv_line(log, "Force encode", yes_no(settings.force_encode));
+    push_kv_line(log, "Merge mode", yes_no(req.merge));
+    append_target_format_settings(log, settings);
+    push_kv_line(log, "Metadata", stage_requirement_label(req.stages.metadata));
+    push_kv_line(log, "ReplayGain", stage_requirement_label(req.stages.replaygain));
+    push_kv_line(log, "Features", stage_requirement_label(req.stages.features));
+    match &req.naming.folder_template {
+        Some(template) => push_kv_line(log, "Folder template", template),
+        None => push_kv_line(log, "Folder template", "album-name fallback"),
+    }
+    push_kv_line(log, "Filename template", &req.naming.template);
 }
 
 fn build_conversion_log(
@@ -5410,7 +5994,25 @@ fn build_conversion_log(
     artifacts: &ArtifactSet,
     settings_fingerprint: Option<tonepoet_pipeline::SettingsFingerprint>,
 ) -> String {
-    let mut log = String::new();
+    let settings_fingerprint = settings_fingerprint.map(|fingerprint| fingerprint.to_string());
+    build_conversion_log_at(
+        outcome,
+        source,
+        req,
+        artifacts,
+        settings_fingerprint.as_deref(),
+        chrono::Utc::now(),
+    )
+}
+
+fn build_conversion_log_at(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+    settings_fingerprint: Option<&str>,
+    generated_at: chrono::DateTime<chrono::Utc>,
+) -> String {
     let tracks = collect_outcome_tracks(outcome);
     let source_tracks_by_ordinal = build_source_track_index(source);
     let artifacts_by_track_id = build_track_artifact_index(artifacts);
@@ -5446,55 +6048,18 @@ fn build_conversion_log(
         .count();
     let total_duration = total_track_duration(&tracks);
 
-    log.push_str("TONEPOET CONVERSION LOG\n");
-    log.push_str("=======================\n");
-    push_kv_line(&mut log, "Version", env!("CARGO_PKG_VERSION"));
-    push_kv_line(
-        &mut log,
-        "Generated (UTC)",
-        chrono::Utc::now()
-            .format("%Y-%m-%d %H:%M:%S UTC")
-            .to_string(),
-    );
-    push_kv_line(&mut log, "Job ID", &req.job_id);
-    push_kv_line(&mut log, "Item ID", &req.item_id);
-    if let Some(fingerprint) = settings_fingerprint {
-        push_kv_line(&mut log, "Settings fingerprint", fingerprint.to_string());
-    }
-    log.push('\n');
+    let mut source_blocking_lines = String::new();
+    append_source_blocking_lines(&mut source_blocking_lines, source);
 
-    log.push_str("Source Information\n");
-    log.push_str("------------------\n");
-    push_kv_line(&mut log, "Container path", path_log_value(&req.container));
-    push_kv_line(&mut log, "Source kind", source_kind_label(source.kind));
-    push_kv_line(&mut log, "Track count", source.tracks.len().to_string());
-    push_optional_kv_line(
-        &mut log,
-        "Album artist",
-        source.album_metadata.album_artist.as_deref(),
-    );
-    push_optional_kv_line(&mut log, "Album", source.album_metadata.album.as_deref());
-    push_optional_kv_line(
-        &mut log,
-        "Year",
-        conversion_log_album_year(&source.album_metadata),
-    );
-    push_optional_kv_line(&mut log, "Genre", source.album_metadata.genre.as_deref());
-    push_optional_kv_line(
-        &mut log,
-        "Catalog number",
-        conversion_log_catalog_number(&source.album_metadata.extra),
-    );
-    append_source_blocking_lines(&mut log, source);
-    log.push('\n');
+    let mut provenance_section = String::new();
+    append_provenance_section(&mut provenance_section, &source.provenance);
 
-    append_provenance_section(&mut log, &source.provenance);
-    append_artwork_section(&mut log, source, req, outcome, artifacts);
+    let mut artwork_section = String::new();
+    append_artwork_section(&mut artwork_section, source, req, outcome, artifacts);
 
-    log.push_str("Conversion Settings\n");
-    log.push_str("-------------------\n");
+    let mut conversion_settings_section = String::new();
     append_conversion_settings_section(
-        &mut log,
+        &mut conversion_settings_section,
         source,
         req,
         &tracks,
@@ -5502,35 +6067,155 @@ fn build_conversion_log(
         bit_depth_change_applies,
         dithering_applies,
     );
+
+    let mut track_sections = Vec::with_capacity(tracks.len());
+    for record in &tracks {
+        let mut section = String::new();
+        append_track_log(
+            &mut section,
+            record,
+            source_tracks_by_ordinal
+                .get(&record.track_id.source_ordinal)
+                .copied(),
+            artifacts_by_track_id.get(&record.track_id).copied(),
+            req,
+            metadata_stage_result,
+        );
+        track_sections.push(section);
+    }
+
+    render_conversion_log(&ConversionLogRenderInput {
+        generated_at,
+        job_id: req.job_id.clone(),
+        item_id: req.item_id.clone(),
+        settings_fingerprint: settings_fingerprint.map(str::to_string),
+        container_path: path_log_value(&req.container),
+        source_kind: source_kind_label(source.kind).to_string(),
+        track_count: source.tracks.len(),
+        album_artist: source.album_metadata.album_artist.clone(),
+        album: source.album_metadata.album.clone(),
+        year: conversion_log_album_year(&source.album_metadata).map(str::to_string),
+        genre: source.album_metadata.genre.clone(),
+        catalog_number: conversion_log_catalog_number(&source.album_metadata.extra).map(str::to_string),
+        source_blocking_lines,
+        provenance_section,
+        artwork_section,
+        conversion_settings_section,
+        track_sections,
+        stage_records: outcome_stage_records(outcome).to_vec(),
+        total_summary: ConversionLogTotalSummary {
+            successful_count,
+            failed_count,
+            total_track_count,
+            total_bytes_in,
+            total_bytes_out,
+            missing_input_sizes,
+            missing_output_sizes,
+            total_duration,
+            missing_durations,
+        },
+        batch_status: None,
+        result_label: outcome_result_label(outcome, successful_count, failed_count, total_track_count),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ConversionLogRenderInput {
+    generated_at: chrono::DateTime<chrono::Utc>,
+    job_id: String,
+    item_id: String,
+    settings_fingerprint: Option<String>,
+    container_path: String,
+    source_kind: String,
+    track_count: usize,
+    album_artist: Option<String>,
+    album: Option<String>,
+    year: Option<String>,
+    genre: Option<String>,
+    catalog_number: Option<String>,
+    source_blocking_lines: String,
+    provenance_section: String,
+    artwork_section: String,
+    conversion_settings_section: String,
+    track_sections: Vec<String>,
+    stage_records: Vec<StageRecord>,
+    total_summary: ConversionLogTotalSummary,
+    batch_status: Option<String>,
+    result_label: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConversionLogTotalSummary {
+    successful_count: usize,
+    failed_count: usize,
+    total_track_count: usize,
+    total_bytes_in: u64,
+    total_bytes_out: u64,
+    missing_input_sizes: usize,
+    missing_output_sizes: usize,
+    total_duration: Duration,
+    missing_durations: usize,
+}
+
+fn render_conversion_log(input: &ConversionLogRenderInput) -> String {
+    let mut log = String::new();
+
+    log.push_str("TONEPOET CONVERSION LOG\n");
+    log.push_str("=======================\n");
+    push_kv_line(&mut log, "Version", env!("CARGO_PKG_VERSION"));
+    push_kv_line(
+        &mut log,
+        "Generated (UTC)",
+        input.generated_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    );
+    push_kv_line(&mut log, "Job ID", &input.job_id);
+    push_kv_line(&mut log, "Item ID", &input.item_id);
+    if let Some(fingerprint) = input.settings_fingerprint.as_deref() {
+        push_kv_line(&mut log, "Settings fingerprint", fingerprint);
+    }
+    log.push('\n');
+
+    log.push_str("Source Information\n");
+    log.push_str("------------------\n");
+    push_kv_line(&mut log, "Container path", &input.container_path);
+    push_kv_line(&mut log, "Source kind", &input.source_kind);
+    push_kv_line(&mut log, "Track count", input.track_count.to_string());
+    push_optional_kv_line(&mut log, "Album artist", input.album_artist.as_deref());
+    push_optional_kv_line(&mut log, "Album", input.album.as_deref());
+    push_optional_kv_line(&mut log, "Year", input.year.as_deref());
+    push_optional_kv_line(&mut log, "Genre", input.genre.as_deref());
+    push_optional_kv_line(&mut log, "Catalog number", input.catalog_number.as_deref());
+    log.push_str(&input.source_blocking_lines);
+    log.push('\n');
+
+    log.push_str(&input.provenance_section);
+    log.push_str(&input.artwork_section);
+
+    log.push_str("Conversion Settings\n");
+    log.push_str("-------------------\n");
+    log.push_str(&input.conversion_settings_section);
     log.push('\n');
 
     log.push_str("Per-Track Results\n");
     log.push_str("-----------------\n");
-    if tracks.is_empty() {
+    if input.track_sections.is_empty() {
         log.push_str("No track records were produced.\n");
     } else {
-        for record in &tracks {
-            append_track_log(
-                &mut log,
-                record,
-                source_tracks_by_ordinal
-                    .get(&record.track_id.source_ordinal)
-                    .copied(),
-                artifacts_by_track_id.get(&record.track_id).copied(),
-                req,
-                metadata_stage_result,
-            );
+        for section in &input.track_sections {
+            log.push_str(section);
+            if !section.ends_with('\n') {
+                log.push('\n');
+            }
         }
     }
     log.push('\n');
 
     log.push_str("Stage Summary\n");
     log.push_str("-------------\n");
-    let stages = outcome_stage_records(outcome);
-    if stages.is_empty() {
+    if input.stage_records.is_empty() {
         log.push_str("No stage records were produced.\n");
     } else {
-        for stage in stages {
+        for stage in &input.stage_records {
             let mut summary = stage_outcome_label(&stage.outcome);
             if let Some(stats) = stage.dsd_dst_stats.as_ref() {
                 summary.push_str("; ");
@@ -5551,26 +6236,1734 @@ fn build_conversion_log(
         &mut log,
         "Total tracks",
         format!(
-            "{successful_count} successful / {failed_count} failed / {total_track_count} total"
+            "{} successful / {} failed / {} total",
+            input.total_summary.successful_count,
+            input.total_summary.failed_count,
+            input.total_summary.total_track_count,
         ),
     );
+    if let Some(batch_status) = input.batch_status.as_deref() {
+        push_kv_line(&mut log, "Batch status", batch_status);
+    }
     append_total_size_line(
         &mut log,
-        total_bytes_in,
-        total_bytes_out,
-        missing_input_sizes,
-        missing_output_sizes,
+        input.total_summary.total_bytes_in,
+        input.total_summary.total_bytes_out,
+        input.total_summary.missing_input_sizes,
+        input.total_summary.missing_output_sizes,
     );
-    append_total_duration_line(&mut log, total_duration, missing_durations);
-    push_kv_line(
+    append_total_duration_line(
         &mut log,
-        "Result",
-        outcome_result_label(outcome, successful_count, failed_count, total_track_count),
+        input.total_summary.total_duration,
+        input.total_summary.missing_durations,
     );
+    push_kv_line(&mut log, "Result", &input.result_label);
     log.push('\n');
 
     log.push_str("Log generated by tonepoet\n");
     log
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ConversionLogFragment {
+    version: u8,
+    expected_track_count: usize,
+    sort_key: ConversionLogTrackSortKey,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    settings_fingerprint: Option<String>,
+    batch_identity: ConversionLogBatchIdentity,
+    common: ConversionLogCommonFragment,
+    track: ConversionLogTrackFragment,
+    summary: ConversionLogTrackSummary,
+    stages: Vec<StageRecord>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ConversionLogCommonFragment {
+    /// Job id shown in the final unified log header. This is representative
+    /// metadata from the selected header fragment and is intentionally not used
+    /// as the conversion-log batch identity.
+    representative_job_id: String,
+    representative_item_id: String,
+    album_artist: Option<String>,
+    album: Option<String>,
+    year: Option<String>,
+    genre: Option<String>,
+    catalog_number: Option<String>,
+    source_blocking_lines: String,
+    provenance_section: String,
+    artwork_section: String,
+    conversion_settings_section: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ConversionLogTrackFragment {
+    section: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ConversionLogTrackSummary {
+    outcome: ConversionLogTrackOutcome,
+    bytes_in: Option<u64>,
+    bytes_out: Option<u64>,
+    duration_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+enum ConversionLogTrackOutcome {
+    Success,
+    Failure,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
+struct ConversionLogBatchIdentity {
+    /// Shared conversion-log batch id assigned by `PipelineRequest::album_batch`.
+    /// This must be common to every independent track job in the album batch and
+    /// must not be derived from per-track `PipelineRequest::job_id` values.
+    conversion_log_batch_id: String,
+    /// Settings fingerprint for the requested conversion configuration. This is
+    /// batch-wide validation data, not per-disc metadata.
+    settings_fingerprint: Option<String>,
+    /// Final album output directory from the dispatcher-supplied batch contract.
+    output_album_dir: String,
+    /// Dispatcher-supplied grouping root for every source file in this album
+    /// batch. A multi-disc album can contain Disc 1/Disc 2 subdirectories under
+    /// this root without splitting the conversion-log batch.
+    source_grouping_root: String,
+    /// Batch-level source context shown in the final unified log. This is
+    /// supplied by the dispatcher and deliberately does not come from any
+    /// representative single-file track.
+    source_context_path: String,
+    source_context_kind: String,
+    target_format: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConversionLogFragmentFile {
+    path: PathBuf,
+    fragment: ConversionLogFragment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
+struct ConversionLogTrackSortKey {
+    disc_number: u32,
+    track_number: u32,
+    source_ordinal: u32,
+}
+
+impl From<&TrackId> for ConversionLogTrackSortKey {
+    fn from(track_id: &TrackId) -> Self {
+        Self {
+            disc_number: track_id.disc_number.unwrap_or(0),
+            track_number: track_id.track_number,
+            source_ordinal: track_id.source_ordinal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConversionLogAssemblyStatus {
+    CancelledPartial { expected_track_count: usize },
+    TerminalFailurePartial {
+        expected_track_count: usize,
+        reason: &'static str,
+    },
+}
+
+impl ConversionLogAssemblyStatus {
+    fn expected_track_count(self) -> usize {
+        match self {
+            ConversionLogAssemblyStatus::CancelledPartial { expected_track_count }
+            | ConversionLogAssemblyStatus::TerminalFailurePartial { expected_track_count, .. } => {
+                expected_track_count
+            }
+        }
+    }
+}
+
+fn conversion_log_album_batch(req: &PipelineRequest) -> io::Result<&AlbumBatchContext> {
+    req.album_batch.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion log fragment publishing requires PipelineRequest::album_batch; refusing to infer album completion from tags or per-job track count",
+        )
+    })
+}
+
+
+fn conversion_log_album_batch_track(req: &PipelineRequest) -> io::Result<&AlbumBatchTrackContext> {
+    req.album_batch_track.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion log fragment publishing requires dispatcher-supplied PipelineRequest::album_batch_track so pre-materialization failures can be ordered",
+        )
+    })
+}
+
+fn conversion_log_fragment_sort_key(req: &PipelineRequest, fallback_track_id: &TrackId) -> io::Result<ConversionLogTrackSortKey> {
+    match req.album_batch_track.as_ref() {
+        Some(track) => Ok(ConversionLogTrackSortKey::from(&track.track_id())),
+        None => Ok(ConversionLogTrackSortKey::from(fallback_track_id)),
+    }
+}
+
+fn conversion_log_expected_track_count(req: &PipelineRequest) -> io::Result<usize> {
+    let album_batch = conversion_log_album_batch(req)?;
+    if album_batch.expected_track_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion log album batch expected_track_count must be greater than zero",
+        ));
+    }
+    // This value is the dispatcher-authored album/folder batch size. It must
+    // not be inferred from source tags such as TOTALTRACKS or from the current
+    // single-file job's one source track, because either fallback can assemble a
+    // visible album log too early or wedge the batch behind a bad tag.
+    Ok(album_batch.expected_track_count)
+}
+
+
+fn conversion_log_album_dir(
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+) -> PathBuf {
+    // Prefer the artifact path when a successful audio artifact exists; it is
+    // the exact destination chosen by output planning, including any suffixes.
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => {
+            if let Some(parent) = tracks
+                .first()
+                .and_then(|track| track.final_path.parent())
+                .map(Path::to_path_buf)
+            {
+                return parent;
+            }
+        }
+        AudioArtifacts::Merged(merged) => {
+            if let Some(parent) = merged.final_path.parent().map(Path::to_path_buf) {
+                return parent;
+            }
+        }
+    }
+
+    // Failed single-track jobs can have no audio artifact, but they still need
+    // to publish their forensic fragment into the same album directory that
+    // output planning selected for successful siblings. When the dispatcher
+    // supplied only a provisional directory, re-run the ordinary planner against
+    // the materialized source and use its album_dir. This keeps fragment identity
+    // aligned with final audio paths for metadata/folder-template naming such as
+    // `%ARTIST%/%ALBUM%`, instead of trusting a source-folder-name guess made
+    // before tags were available.
+    if let Some(album_batch) = req.album_batch.as_ref() {
+        if !album_batch.album_output_dir_is_planner_resolved() {
+            match plan_outputs(source, req) {
+                Ok(plan) => return plan.album_dir,
+                Err(err) => log::warn!(
+                    "conversion log fragment could not planner-bind album directory for {} after output planning failed: {err:?}; using provisional album batch directory {}",
+                    req.item_id,
+                    album_batch.album_output_dir.display()
+                ),
+            }
+        }
+        return album_batch.album_output_dir.clone();
+    }
+
+    match plan_outputs(source, req) {
+        Ok(plan) => plan.album_dir,
+        Err(err) => {
+            log::warn!(
+                "conversion log fragment album directory derivation fell back to output root after output planning failed without an album batch contract: {err:?}"
+            );
+            req.output_root.clone()
+        }
+    }
+}
+
+fn should_stage_conversion_log_fragment(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    _artifacts: &ArtifactSet,
+) -> bool {
+    if source.kind != SourceKind::SingleFile || source.tracks.len() != 1 {
+        return false;
+    }
+    if req.album_batch.is_none() || req.album_batch_track.is_none() {
+        // No dispatcher-supplied album batch/track contract means this is not
+        // the fragment-backed folder path. Fall back to the legacy per-job log
+        // path instead of silently treating a single track as a complete album
+        // or emitting an unordered pre-materialization failure fragment.
+        return false;
+    }
+
+    // The unit of work is the source track, not a successfully encoded audio
+    // artifact. A failed single-track job normally has zero TrackArtifacts but
+    // still has exactly one TrackRecord carrying TrackOutcome::Err/Blocked.
+    // Stage that record so the final album log can include the failure.
+    collect_outcome_tracks(outcome).len() == 1
+}
+
+fn stage_conversion_log_fragment(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+    album_dir: &Path,
+    settings_fingerprint: Option<String>,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    staging: &StagingDir,
+) -> io::Result<(PathBuf, String)> {
+    let track_record = conversion_log_fragment_track_record(outcome).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "conversion log fragment requires exactly one track record",
+        )
+    })?;
+    let track_id = track_record.track_id.clone();
+    let sort_key = conversion_log_fragment_sort_key(req, &track_id)?;
+    let batch_identity = conversion_log_batch_identity(
+        req,
+        album_dir,
+        settings_fingerprint.as_deref(),
+    )?;
+    let fragment_name = conversion_log_fragment_file_name(sort_key, &batch_identity);
+    let source_tracks_by_ordinal = build_source_track_index(source);
+    let artifacts_by_track_id = build_track_artifact_index(artifacts);
+    let metadata_stage_result = metadata_stage_outcome(outcome);
+    let mut track_section = String::new();
+    append_track_log(
+        &mut track_section,
+        track_record,
+        source_tracks_by_ordinal
+            .get(&track_id.source_ordinal)
+            .copied(),
+        artifacts_by_track_id.get(&track_id).copied(),
+        req,
+        metadata_stage_result,
+    );
+
+    let fragment = ConversionLogFragment {
+        version: CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION,
+        expected_track_count: conversion_log_expected_track_count(req)?,
+        sort_key,
+        generated_at,
+        settings_fingerprint,
+        batch_identity,
+        common: build_conversion_log_common_fragment(outcome, source, req, artifacts),
+        track: ConversionLogTrackFragment {
+            section: track_section,
+        },
+        summary: ConversionLogTrackSummary::from_track_record(track_record),
+        stages: outcome_stage_records(outcome).to_vec(),
+    };
+    let fragment_staged = staging.root.join(".conversion-log-fragment.json");
+    let bytes = serde_json::to_vec_pretty(&fragment).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not serialize conversion log fragment: {err}"),
+        )
+    })?;
+    fs::write(&fragment_staged, bytes)?;
+    Ok((fragment_staged, fragment_name))
+}
+
+fn conversion_log_fragment_track_record(outcome: &AlbumOutcome) -> Option<&TrackRecord> {
+    let tracks = collect_outcome_tracks(outcome);
+    if tracks.len() == 1 {
+        tracks.into_iter().next()
+    } else {
+        None
+    }
+}
+
+impl ConversionLogTrackSummary {
+    fn from_track_record(record: &TrackRecord) -> Self {
+        Self {
+            outcome: match &record.outcome {
+                TrackOutcome::Ok => ConversionLogTrackOutcome::Success,
+                TrackOutcome::Err(_) => ConversionLogTrackOutcome::Failure,
+                TrackOutcome::Blocked(_) => ConversionLogTrackOutcome::Blocked,
+            },
+            bytes_in: record.bytes_in,
+            bytes_out: record.bytes_out,
+            duration_millis: record.duration.map(duration_to_millis_saturating),
+        }
+    }
+}
+
+fn build_conversion_log_common_fragment(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+) -> ConversionLogCommonFragment {
+    let mut source_blocking_lines = String::new();
+    append_source_blocking_lines(&mut source_blocking_lines, source);
+
+    let mut provenance_section = String::new();
+    append_provenance_section(&mut provenance_section, &source.provenance);
+
+    let mut artwork_section = String::new();
+    append_artwork_section(&mut artwork_section, source, req, outcome, artifacts);
+
+    let tracks = collect_outcome_tracks(outcome);
+    let mut conversion_settings_section = String::new();
+    append_conversion_settings_section(
+        &mut conversion_settings_section,
+        source,
+        req,
+        &tracks,
+        resampling_applies_for_source(source, &req.settings),
+        bit_depth_change_applies_for_source(source, &req.settings),
+        dithering_applies_for_source(source, &req.settings),
+    );
+
+    ConversionLogCommonFragment {
+        representative_job_id: req.job_id.clone(),
+        representative_item_id: req.item_id.clone(),
+        album_artist: source.album_metadata.album_artist.clone(),
+        album: source.album_metadata.album.clone(),
+        year: conversion_log_album_year(&source.album_metadata).map(str::to_string),
+        genre: source.album_metadata.genre.clone(),
+        catalog_number: conversion_log_catalog_number(&source.album_metadata.extra).map(str::to_string),
+        source_blocking_lines,
+        provenance_section,
+        artwork_section,
+        conversion_settings_section,
+    }
+}
+
+fn duration_to_millis_saturating(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn duration_from_millis(millis: u64) -> Duration {
+    Duration::from_millis(millis)
+}
+
+fn conversion_log_fragment_file_name(
+    sort_key: ConversionLogTrackSortKey,
+    batch_identity: &ConversionLogBatchIdentity,
+) -> String {
+    let batch_id = sanitize_component(&batch_identity.conversion_log_batch_id);
+    format!(
+        "{batch_id}-d{:03}-t{:05}-s{:05}.json",
+        sort_key.disc_number,
+        sort_key.track_number,
+        sort_key.source_ordinal,
+    )
+}
+
+fn conversion_log_batch_identity(
+    req: &PipelineRequest,
+    album_dir: &Path,
+    settings_fingerprint: Option<&str>,
+) -> io::Result<ConversionLogBatchIdentity> {
+    let album_batch = conversion_log_album_batch(req)?;
+    if !is_generated_conversion_log_batch_id(album_batch.conversion_log_batch_id.trim()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion log album batch id must be generated per dispatch attempt; deterministic album/path ids are not eligible for fragment assembly",
+        ));
+    }
+    let normalized_actual_album_dir = normalize_path(album_dir);
+    let normalized_expected_album_dir = normalize_path(&album_batch.album_output_dir);
+    let normalized_identity_album_dir = if album_batch.album_output_dir_is_planner_resolved() {
+        if normalized_actual_album_dir != normalized_expected_album_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conversion log album batch output dir {} does not match planned album dir {}",
+                    normalized_expected_album_dir.display(),
+                    normalized_actual_album_dir.display()
+                ),
+            ));
+        }
+        normalized_expected_album_dir.clone()
+    } else {
+        let normalized_output_root = normalize_path(&req.output_root);
+        if normalized_actual_album_dir != normalized_output_root
+            && !path_is_under_root(&normalized_actual_album_dir, &normalized_output_root)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conversion log planner-resolved album dir {} is outside output root {}",
+                    normalized_actual_album_dir.display(),
+                    normalized_output_root.display()
+                ),
+            ));
+        }
+        normalized_actual_album_dir.clone()
+    };
+
+    let normalized_source_grouping_root = normalize_path(&album_batch.source_grouping_root);
+    let normalized_source_container = normalize_path(&req.container);
+    if normalized_source_container != normalized_source_grouping_root
+        && !path_is_under_root(&normalized_source_container, &normalized_source_grouping_root)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion log source {} is not under album batch grouping root {}",
+                normalized_source_container.display(),
+                normalized_source_grouping_root.display()
+            ),
+        ));
+    }
+
+    let source_context = album_batch.source_context();
+    let normalized_source_context_path = normalize_path(&source_context.container_path);
+    if normalized_source_context_path != normalized_source_grouping_root
+        && !path_is_under_root(&normalized_source_context_path, &normalized_source_grouping_root)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion log source context {} is not under album batch grouping root {}",
+                normalized_source_context_path.display(),
+                normalized_source_grouping_root.display()
+            ),
+        ));
+    }
+    let source_context_kind = source_context.source_kind.trim();
+    if source_context_kind.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion log album batch source_context.source_kind must not be empty",
+        ));
+    }
+
+    Ok(ConversionLogBatchIdentity {
+        conversion_log_batch_id: album_batch.conversion_log_batch_id.trim().to_string(),
+        settings_fingerprint: settings_fingerprint.map(str::to_string),
+        output_album_dir: normalized_identity_album_dir.display().to_string(),
+        source_grouping_root: normalized_source_grouping_root.display().to_string(),
+        source_context_path: normalized_source_context_path.display().to_string(),
+        source_context_kind: source_context_kind.to_string(),
+        target_format: req.settings.target_format.display_name().to_string(),
+    })
+}
+
+fn is_conversion_log_fragment_role(role: &PublishRole) -> bool {
+    matches!(role, PublishRole::Sidecar(SidecarKind::Other(kind)) if kind == CONVERSION_LOG_FRAGMENT_SIDE_KIND)
+}
+
+fn plan_has_conversion_log_fragment(plan: &PublishPlan) -> bool {
+    plan.entries
+        .iter()
+        .any(|entry| is_conversion_log_fragment_role(&entry.role))
+}
+
+fn plan_conversion_log_fragment_batch_identity(
+    plan: &PublishPlan,
+) -> Result<Option<ConversionLogBatchIdentity>, PublishError> {
+    let mut identity: Option<ConversionLogBatchIdentity> = None;
+    for entry in &plan.entries {
+        if !is_conversion_log_fragment_role(&entry.role) {
+            continue;
+        }
+        let fragment = read_conversion_log_fragment_file(&entry.staged_path)?;
+        match &identity {
+            Some(current) if *current != fragment.batch_identity => {
+                return Err(PublishError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "publish plan contains conversion log fragments from more than one batch: {}",
+                        entry.staged_path.display()
+                    ),
+                )));
+            }
+            Some(_) => {}
+            None => identity = Some(fragment.batch_identity),
+        }
+    }
+    Ok(identity)
+}
+
+fn artifact_set_conversion_log_fragment_expected_track_count(
+    artifacts: &ArtifactSet,
+) -> Result<Option<usize>, PublishError> {
+    let mut expected = None;
+    for sidecar in &artifacts.sidecars {
+        if !is_conversion_log_fragment_role(&PublishRole::Sidecar(sidecar.kind.clone())) {
+            continue;
+        }
+        let fragment = read_conversion_log_fragment_file(&sidecar.staged_path)?;
+        if fragment.expected_track_count == 0 {
+            return Err(PublishError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conversion log fragment {} has zero expected track count",
+                    sidecar.staged_path.display()
+                ),
+            )));
+        }
+        let count = fragment.expected_track_count;
+        match expected {
+            Some(current) if current != count => {
+                return Err(PublishError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "publish plan contains conversion log fragments with inconsistent dispatcher expected track counts: {current} and {count}"
+                    ),
+                )));
+            }
+            Some(_) => {}
+            None => expected = Some(count),
+        }
+    }
+    Ok(expected)
+}
+
+fn conversion_log_fragment_dir(album_dir: &Path) -> PathBuf {
+    album_dir.join(CONVERSION_LOG_FRAGMENT_DIR)
+}
+
+fn conversion_log_fragment_quarantine_dir(album_dir: &Path, reason: &str) -> PathBuf {
+    album_dir
+        .join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR)
+        .join(sanitize_component(reason))
+}
+
+fn conversion_log_candidate_album_dirs_for_incomplete_batch(req: &PipelineRequest) -> Vec<PathBuf> {
+    let Some(album_batch) = req.album_batch.as_ref() else {
+        return Vec::new();
+    };
+    if album_batch.album_output_dir_is_planner_resolved() {
+        return vec![album_batch.album_output_dir.clone()];
+    }
+
+    let mut dirs = BTreeSet::new();
+    collect_conversion_log_fragment_album_dirs_for_batch(
+        &req.output_root,
+        album_batch.conversion_log_batch_id.trim(),
+        &mut dirs,
+        0,
+    );
+
+    // Keep the provisional dispatcher directory as a final fallback for
+    // pre-materialization failures that could not planner-bind before writing a
+    // fragment. Planner-resolved fragment directories, when present, are tried
+    // first.
+    dirs.insert(normalize_path(&album_batch.album_output_dir));
+    dirs.into_iter().collect()
+}
+
+fn collect_conversion_log_fragment_album_dirs_for_batch(
+    root: &Path,
+    batch_id: &str,
+    dirs: &mut BTreeSet<PathBuf>,
+    depth: usize,
+) {
+    const MAX_FRAGMENT_DIR_SEARCH_DEPTH: usize = 6;
+    if depth > MAX_FRAGMENT_DIR_SEARCH_DEPTH {
+        return;
+    }
+
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        if path.file_name().and_then(|name| name.to_str()) == Some(CONVERSION_LOG_FRAGMENT_DIR) {
+            if conversion_log_fragment_dir_contains_batch(&path, batch_id) {
+                if let Some(album_dir) = path.parent() {
+                    dirs.insert(normalize_path(album_dir));
+                }
+            }
+            continue;
+        }
+
+        collect_conversion_log_fragment_album_dirs_for_batch(&path, batch_id, dirs, depth + 1);
+    }
+}
+
+fn conversion_log_fragment_dir_contains_batch(fragment_dir: &Path, batch_id: &str) -> bool {
+    let prefix = format!("{}-", sanitize_component(batch_id));
+    let entries = match fs::read_dir(fragment_dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+            .unwrap_or(false)
+    })
+}
+
+fn read_conversion_log_fragment_file(path: &Path) -> Result<ConversionLogFragment, PublishError> {
+    let bytes = fs::read(path).map_err(PublishError::Io)?;
+    let fragment: ConversionLogFragment = serde_json::from_slice(&bytes).map_err(|err| {
+        PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid conversion log fragment {}: {err}", path.display()),
+        ))
+    })?;
+    if fragment.version != CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported conversion log fragment version {} in {}",
+                fragment.version,
+                path.display()
+            ),
+        )));
+    }
+    if !is_generated_conversion_log_batch_id(&fragment.batch_identity.conversion_log_batch_id) {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion log fragment {} has non-run-unique batch id {}; refusing to use album-stable ids",
+                path.display(),
+                fragment.batch_identity.conversion_log_batch_id
+            ),
+        )));
+    }
+    Ok(fragment)
+}
+
+fn quarantine_conversion_log_fragment_file(path: &Path, reason: &str) {
+    let Some(fragment_dir) = path.parent() else {
+        return;
+    };
+    let album_dir = fragment_dir.parent().unwrap_or(fragment_dir);
+    let quarantine_dir = conversion_log_fragment_quarantine_dir(album_dir, reason);
+    if let Err(err) = fs::create_dir_all(&quarantine_dir) {
+        log::warn!(
+            "conversion log fragment quarantine directory creation failed for {}: {err}",
+            quarantine_dir.display()
+        );
+        return;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_component)
+        .unwrap_or_else(|| "fragment.json".to_string());
+    let dst = unique_path(&quarantine_dir, &file_name);
+    match fs::rename(path, &dst) {
+        Ok(()) => {
+            sync_parent_dir_best_effort(path);
+            sync_parent_dir_best_effort(&dst);
+            log::warn!(
+                "quarantined conversion log fragment {} -> {} ({reason})",
+                path.display(),
+                dst.display()
+            );
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            log::warn!(
+                "conversion log fragment quarantine failed for {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn read_matching_conversion_log_fragment_files(
+    album_dir: &Path,
+    target_identity: &ConversionLogBatchIdentity,
+) -> Result<Vec<ConversionLogFragmentFile>, PublishError> {
+    let dir = conversion_log_fragment_dir(album_dir);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(PublishError::Io(err)),
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(PublishError::Io)?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        match read_conversion_log_fragment_file(&path) {
+            Ok(fragment) if fragment.batch_identity == *target_identity => {
+                files.push(ConversionLogFragmentFile { path, fragment });
+            }
+            Ok(fragment) => {
+                let reason = if fragment.batch_identity.conversion_log_batch_id == target_identity.conversion_log_batch_id {
+                    "mismatched-fragment-batch-fingerprint"
+                } else {
+                    "stale-fragment-batch"
+                };
+                quarantine_conversion_log_fragment_file(&path, reason);
+            }
+            Err(err) => {
+                log::warn!("ignoring unreadable conversion log fragment {}: {err}", path.display());
+                quarantine_conversion_log_fragment_file(&path, "invalid-fragment");
+            }
+        }
+    }
+    Ok(deduplicate_conversion_log_fragment_files(files))
+}
+
+fn deduplicate_conversion_log_fragment_files(
+    files: Vec<ConversionLogFragmentFile>,
+) -> Vec<ConversionLogFragmentFile> {
+    let mut by_track: BTreeMap<ConversionLogTrackSortKey, ConversionLogFragmentFile> = BTreeMap::new();
+    for file in files {
+        match by_track.get(&file.fragment.sort_key) {
+            Some(existing) if conversion_log_fragment_file_preferred(&file, existing) => {
+                let replaced = by_track.insert(file.fragment.sort_key, file).expect("existing fragment");
+                quarantine_conversion_log_fragment_file(&replaced.path, "superseded-duplicate-fragment");
+            }
+            Some(_) => {
+                quarantine_conversion_log_fragment_file(&file.path, "older-duplicate-fragment");
+            }
+            None => {
+                by_track.insert(file.fragment.sort_key, file);
+            }
+        }
+    }
+    by_track.into_values().collect()
+}
+
+fn conversion_log_fragment_file_preferred(
+    candidate: &ConversionLogFragmentFile,
+    existing: &ConversionLogFragmentFile,
+) -> bool {
+    (candidate.fragment.generated_at, candidate.path.to_string_lossy().to_string())
+        > (existing.fragment.generated_at, existing.path.to_string_lossy().to_string())
+}
+
+fn conversion_log_fragment_count(fragments: &[ConversionLogFragment]) -> usize {
+    fragments
+        .iter()
+        .map(|fragment| fragment.sort_key)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn conversion_log_fragment_expected_track_count_for_render(
+    fragments: &[ConversionLogFragment],
+) -> usize {
+    debug_assert!(!fragments.is_empty());
+    let expected = fragments
+        .first()
+        .map(|fragment| fragment.expected_track_count)
+        .unwrap_or(0);
+    debug_assert!(expected > 0);
+    debug_assert!(fragments
+        .iter()
+        .all(|fragment| fragment.expected_track_count == expected));
+    expected
+}
+
+fn complete_conversion_log_fragments(
+    album_dir: &Path,
+    expected_track_count: usize,
+    target_identity: Option<&ConversionLogBatchIdentity>,
+) -> Result<Option<Vec<ConversionLogFragment>>, PublishError> {
+    let Some(target_identity) = target_identity else {
+        return Ok(None);
+    };
+    let files = read_matching_conversion_log_fragment_files(album_dir, target_identity)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let fragments: Vec<ConversionLogFragment> = files
+        .into_iter()
+        .map(|file| file.fragment)
+        .collect();
+    if expected_track_count == 0 {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion log expected track count is zero for batch {}",
+                target_identity.conversion_log_batch_id
+            ),
+        )));
+    }
+    let expected = expected_track_count;
+    if let Some(mismatched) = fragments
+        .iter()
+        .find(|fragment| fragment.expected_track_count != expected)
+    {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion log fragment for batch {} carries expected track count {}, but current publish expects {expected}",
+                mismatched.batch_identity.conversion_log_batch_id,
+                mismatched.expected_track_count
+            ),
+        )));
+    }
+    let fragment_count = conversion_log_fragment_count(&fragments);
+    if fragment_count < expected {
+        return Ok(None);
+    }
+    if fragment_count > expected {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion log fragment count {fragment_count} exceeds expected track count {expected} for batch {}",
+                target_identity.conversion_log_batch_id
+            ),
+        )));
+    }
+    Ok(Some(fragments))
+}
+
+fn assemble_conversion_log_from_fragments(
+    album_dir: &Path,
+    expected_track_count: usize,
+    target_identity: Option<&ConversionLogBatchIdentity>,
+) -> Result<Option<String>, PublishError> {
+    let Some(fragments) = complete_conversion_log_fragments(album_dir, expected_track_count, target_identity)? else {
+        return Ok(None);
+    };
+    Ok(Some(build_conversion_log_from_fragments(&fragments)))
+}
+
+fn build_conversion_log_from_fragments(fragments: &[ConversionLogFragment]) -> String {
+    build_conversion_log_from_fragments_with_status(fragments, None)
+}
+
+fn build_conversion_log_from_fragments_with_status(
+    fragments: &[ConversionLogFragment],
+    assembly_status: Option<ConversionLogAssemblyStatus>,
+) -> String {
+    debug_assert!(!fragments.is_empty());
+    let mut ordered = fragments.to_vec();
+    ordered.sort_by_key(|fragment| fragment.sort_key);
+
+    // Ordering/header identity comes from the canonical first track in the
+    // assembled album ordering: lowest disc number, then lowest track number,
+    // then lowest source ordinal. Do not use that same fragment blindly for all
+    // common album metadata, though: Disc 1 Track 1 can be a pre-materialization
+    // failure fragment with request-only settings and no album/provenance data.
+    // Merge common display fields from the best available validated fragments
+    // while preserving the ordering representative's job/item identity.
+    let representative = ordered
+        .first()
+        .expect("fragment assembly requires at least one validated fragment");
+    let common = merge_conversion_log_common_fragments(&ordered, &representative.common);
+    let generated_at = ordered
+        .iter()
+        .map(|fragment| fragment.generated_at)
+        .max()
+        .unwrap_or_else(chrono::Utc::now);
+    let fingerprint = representative
+        .settings_fingerprint
+        .clone()
+        .or_else(|| ordered.iter().find_map(|fragment| fragment.settings_fingerprint.clone()));
+    let total_track_count = assembly_status
+        .map(ConversionLogAssemblyStatus::expected_track_count)
+        .unwrap_or_else(|| conversion_log_fragment_expected_track_count_for_render(&ordered));
+    let successful_count = ordered
+        .iter()
+        .filter(|fragment| fragment.summary.outcome == ConversionLogTrackOutcome::Success)
+        .count();
+    let failed_count = ordered.len().saturating_sub(successful_count);
+    let total_bytes_in = ordered
+        .iter()
+        .filter_map(|fragment| fragment.summary.bytes_in)
+        .fold(0_u64, u64::saturating_add);
+    let total_bytes_out = ordered
+        .iter()
+        .filter_map(|fragment| fragment.summary.bytes_out)
+        .fold(0_u64, u64::saturating_add);
+    let missing_input_sizes = ordered
+        .iter()
+        .filter(|fragment| fragment.summary.bytes_in.is_none())
+        .count();
+    let missing_output_sizes = ordered
+        .iter()
+        .filter(|fragment| fragment.summary.bytes_out.is_none())
+        .count();
+    let missing_durations = ordered
+        .iter()
+        .filter(|fragment| fragment.summary.duration_millis.is_none())
+        .count();
+    let total_duration = total_fragment_duration(&ordered);
+    let track_sections = ordered
+        .iter()
+        .map(|fragment| fragment.track.section.clone())
+        .collect();
+    let stage_records = aggregate_fragment_stage_records(&ordered);
+    let batch_status = assembly_status.map(|status| match status {
+        ConversionLogAssemblyStatus::CancelledPartial { expected_track_count } => {
+            format!(
+                "cancelled before album batch completed; assembled partial log from {} of {expected_track_count} expected track fragment(s)",
+                ordered.len()
+            )
+        }
+        ConversionLogAssemblyStatus::TerminalFailurePartial {
+            expected_track_count,
+            reason,
+        } => {
+            format!(
+                "terminal batch failure before album batch completed ({reason}); assembled partial log from {} of {expected_track_count} expected track fragment(s)",
+                ordered.len()
+            )
+        }
+    });
+    let result_label = fragment_result_label(
+        &ordered,
+        successful_count,
+        failed_count,
+        total_track_count,
+        assembly_status,
+    );
+
+    render_conversion_log(&ConversionLogRenderInput {
+        generated_at,
+        job_id: common.representative_job_id,
+        item_id: common.representative_item_id,
+        settings_fingerprint: fingerprint,
+        container_path: representative.batch_identity.source_context_path.clone(),
+        source_kind: representative.batch_identity.source_context_kind.clone(),
+        track_count: total_track_count,
+        album_artist: common.album_artist,
+        album: common.album,
+        year: common.year,
+        genre: common.genre,
+        catalog_number: common.catalog_number,
+        source_blocking_lines: common.source_blocking_lines,
+        provenance_section: common.provenance_section,
+        artwork_section: common.artwork_section,
+        conversion_settings_section: common.conversion_settings_section,
+        track_sections,
+        stage_records,
+        total_summary: ConversionLogTotalSummary {
+            successful_count,
+            failed_count,
+            total_track_count,
+            total_bytes_in,
+            total_bytes_out,
+            missing_input_sizes,
+            missing_output_sizes,
+            total_duration,
+            missing_durations,
+        },
+        batch_status,
+        result_label,
+    })
+}
+
+fn merge_conversion_log_common_fragments(
+    ordered: &[ConversionLogFragment],
+    ordering_common: &ConversionLogCommonFragment,
+) -> ConversionLogCommonFragment {
+    debug_assert!(!ordered.is_empty());
+
+    let best_source_aware_common = ordered
+        .iter()
+        .map(|fragment| &fragment.common)
+        .find(|common| conversion_log_common_has_source_context(common));
+
+    ConversionLogCommonFragment {
+        // Keep job/item identity anchored to the canonical first sorted
+        // fragment so the header remains deterministic and matches the
+        // ordering representative contract.
+        representative_job_id: ordering_common.representative_job_id.clone(),
+        representative_item_id: ordering_common.representative_item_id.clone(),
+        album_artist: first_non_empty_common_option(
+            ordered.iter().filter_map(|fragment| fragment.common.album_artist.as_deref()),
+        ),
+        album: first_non_empty_common_option(
+            ordered.iter().filter_map(|fragment| fragment.common.album.as_deref()),
+        ),
+        year: first_non_empty_common_option(
+            ordered.iter().filter_map(|fragment| fragment.common.year.as_deref()),
+        ),
+        genre: first_non_empty_common_option(
+            ordered.iter().filter_map(|fragment| fragment.common.genre.as_deref()),
+        ),
+        catalog_number: first_non_empty_common_option(
+            ordered.iter().filter_map(|fragment| fragment.common.catalog_number.as_deref()),
+        ),
+        source_blocking_lines: first_non_empty_common_string(
+            ordered.iter().map(|fragment| fragment.common.source_blocking_lines.as_str()),
+        )
+        .unwrap_or_default(),
+        provenance_section: first_non_empty_common_string(
+            ordered.iter().map(|fragment| fragment.common.provenance_section.as_str()),
+        )
+        .unwrap_or_default(),
+        artwork_section: first_non_empty_common_string(
+            ordered.iter().map(|fragment| fragment.common.artwork_section.as_str()),
+        )
+        .unwrap_or_default(),
+        conversion_settings_section: best_source_aware_common
+            .and_then(|common| non_empty_common_string(&common.conversion_settings_section).map(str::to_string))
+            .or_else(|| {
+                first_non_empty_common_string(
+                    ordered.iter().map(|fragment| fragment.common.conversion_settings_section.as_str()),
+                )
+            })
+            .unwrap_or_else(|| ordering_common.conversion_settings_section.clone()),
+    }
+}
+
+fn conversion_log_common_has_source_context(common: &ConversionLogCommonFragment) -> bool {
+    non_empty_optional_common_string(common.album_artist.as_deref()).is_some()
+        || non_empty_optional_common_string(common.album.as_deref()).is_some()
+        || non_empty_optional_common_string(common.year.as_deref()).is_some()
+        || non_empty_optional_common_string(common.genre.as_deref()).is_some()
+        || non_empty_optional_common_string(common.catalog_number.as_deref()).is_some()
+        || non_empty_common_string(&common.source_blocking_lines).is_some()
+        || non_empty_common_string(&common.provenance_section).is_some()
+        || non_empty_common_string(&common.artwork_section).is_some()
+}
+
+fn first_non_empty_common_option<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    values
+        .filter_map(non_empty_common_string)
+        .map(str::to_string)
+        .next()
+}
+
+fn first_non_empty_common_string<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    values
+        .filter_map(non_empty_common_string)
+        .map(str::to_string)
+        .next()
+}
+
+fn non_empty_optional_common_string(value: Option<&str>) -> Option<&str> {
+    value.and_then(non_empty_common_string)
+}
+
+fn non_empty_common_string(value: &str) -> Option<&str> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn total_fragment_duration(fragments: &[ConversionLogFragment]) -> Duration {
+    let mut total = Duration::ZERO;
+    for duration in fragments
+        .iter()
+        .filter_map(|fragment| fragment.summary.duration_millis.map(duration_from_millis))
+    {
+        total = total
+            .checked_add(duration)
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX));
+    }
+    total
+}
+
+fn fragment_result_label(
+    fragments: &[ConversionLogFragment],
+    successful_count: usize,
+    failed_count: usize,
+    total_track_count: usize,
+    assembly_status: Option<ConversionLogAssemblyStatus>,
+) -> String {
+    let observed_count = successful_count.saturating_add(failed_count);
+    let missing_count = total_track_count.saturating_sub(observed_count);
+    match assembly_status {
+        Some(ConversionLogAssemblyStatus::CancelledPartial { .. }) => {
+            return format!(
+                "Cancelled partial ({successful_count}/{total_track_count} ok, {failed_count} failed, {missing_count} missing)"
+            );
+        }
+        Some(ConversionLogAssemblyStatus::TerminalFailurePartial { reason, .. }) => {
+            return format!(
+                "Aborted partial ({successful_count}/{total_track_count} ok, {failed_count} failed, {missing_count} missing; {reason})"
+            );
+        }
+        None => {}
+    }
+
+    // Match the canonical AlbumOutcome result semantics for the all-blocked
+    // fragment case instead of reducing it to a generic Partial label. A folder
+    // batch whose completed fragment set contains only blocked track records is
+    // an album-level block, not a partial success.
+    let complete_observed_set = observed_count == total_track_count && missing_count == 0;
+    let all_observed_tracks_blocked = !fragments.is_empty()
+        && fragments
+            .iter()
+            .all(|fragment| fragment.summary.outcome == ConversionLogTrackOutcome::Blocked);
+    if complete_observed_set && all_observed_tracks_blocked {
+        return format!("Blocked ({})", block_reason_label(&BlockReason::TrackFailures));
+    }
+
+    if failed_count == 0 && successful_count == total_track_count {
+        format!("Complete ({successful_count}/{total_track_count} ok)")
+    } else if failed_count == 0 {
+        format!("Partial ({successful_count}/{total_track_count} ok, {missing_count} missing)")
+    } else if missing_count == 0 {
+        format!("Partial ({successful_count}/{total_track_count} ok, {failed_count} failed)")
+    } else {
+        format!(
+            "Partial ({successful_count}/{total_track_count} ok, {failed_count} failed, {missing_count} missing)"
+        )
+    }
+}
+
+fn aggregate_fragment_stage_records(fragments: &[ConversionLogFragment]) -> Vec<StageRecord> {
+    let mut stages = Vec::new();
+    for fragment in fragments {
+        for stage in &fragment.stages {
+            if let Some(index) = stages.iter().position(|existing: &StageRecord| existing.stage == stage.stage) {
+                merge_stage_record(&mut stages[index], stage);
+            } else {
+                stages.push(stage.clone());
+            }
+        }
+    }
+    stages
+}
+
+fn merge_stage_record(existing: &mut StageRecord, next: &StageRecord) {
+    existing.outcome = merge_stage_outcome(&existing.outcome, &next.outcome);
+    match (&mut existing.dsd_dst_stats, &next.dsd_dst_stats) {
+        (Some(existing_stats), Some(next_stats)) => existing_stats.merge(next_stats),
+        (None, Some(next_stats)) => existing.dsd_dst_stats = Some(next_stats.clone()),
+        _ => {}
+    }
+}
+
+fn merge_stage_outcome(existing: &StageOutcome, next: &StageOutcome) -> StageOutcome {
+    match (existing, next) {
+        (StageOutcome::Failed(left), StageOutcome::Failed(right)) if left != right => {
+            StageOutcome::Failed(format!("{left}; {right}"))
+        }
+        (StageOutcome::Failed(reason), _) | (_, StageOutcome::Failed(reason)) => {
+            StageOutcome::Failed(reason.clone())
+        }
+        (StageOutcome::Ok, _) | (_, StageOutcome::Ok) => StageOutcome::Ok,
+        (StageOutcome::Skipped, StageOutcome::Skipped) => StageOutcome::Skipped,
+    }
+}
+
+fn write_assembled_conversion_log_from_fragments(
+    album_dir: &Path,
+    log_path: &Path,
+    expected_track_count: usize,
+    target_identity: Option<&ConversionLogBatchIdentity>,
+) -> Result<bool, PublishError> {
+    let Some(log) = assemble_conversion_log_from_fragments(album_dir, expected_track_count, target_identity)? else {
+        return Ok(false);
+    };
+    write_bytes_atomically(log_path, log.as_bytes()).map_err(PublishError::Io)?;
+    Ok(true)
+}
+
+fn conversion_log_entry_predicate(entry: &PublishedEntry) -> bool {
+    matches!(&entry.role, PublishRole::Sidecar(SidecarKind::ConversionLog))
+}
+
+fn record_assembled_conversion_log_entry(
+    published_entries: &mut Vec<PublishedEntry>,
+    final_log_path: &Path,
+    bytes: u64,
+) {
+    if let Some(existing) = published_entries
+        .iter_mut()
+        .find(|entry| conversion_log_entry_predicate(entry))
+    {
+        existing.final_path = final_log_path.to_path_buf();
+        existing.bytes = bytes;
+    } else {
+        published_entries.push(PublishedEntry {
+            final_path: final_log_path.to_path_buf(),
+            role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+            bytes,
+        });
+    }
+}
+
+fn finalize_staged_conversion_log_for_publish(
+    work_album_dir: &Path,
+    final_album_dir: &Path,
+    expected_track_count: usize,
+    fragment_mode: bool,
+    target_identity: Option<&ConversionLogBatchIdentity>,
+    published_entries: &mut Vec<PublishedEntry>,
+) -> Result<bool, PublishError> {
+    if !fragment_mode {
+        return Ok(false);
+    }
+
+    let staged_log_path = work_album_dir.join("conversion.log");
+    let final_log_path = final_album_dir.join("conversion.log");
+    match write_assembled_conversion_log_from_fragments(
+        work_album_dir,
+        &staged_log_path,
+        expected_track_count,
+        target_identity,
+    )? {
+        true => {
+            let bytes = fs::metadata(&staged_log_path).map_err(PublishError::Io)?.len();
+            record_assembled_conversion_log_entry(published_entries, &final_log_path, bytes);
+            Ok(true)
+        }
+        false => {
+            remove_file_if_exists(&staged_log_path).map_err(PublishError::Io)?;
+            published_entries.retain(|entry| !conversion_log_entry_predicate(entry));
+            Ok(false)
+        }
+    }
+}
+
+fn publish_incremental_assembled_conversion_log_from_fragments(
+    album_dir: &Path,
+    expected_track_count: usize,
+    target_identity: Option<&ConversionLogBatchIdentity>,
+    rollback: &mut IncrementalPublishRollback,
+) -> Result<bool, PublishError> {
+    let Some(fragments) = complete_conversion_log_fragments(
+        album_dir,
+        expected_track_count,
+        target_identity,
+    )? else {
+        return Ok(false);
+    };
+
+    let log_path = album_dir.join("conversion.log");
+    rollback.snapshot_destination(&log_path)?;
+    let log = build_conversion_log_from_fragments(&fragments);
+    write_bytes_atomically(&log_path, log.as_bytes()).map_err(PublishError::Io)?;
+    sync_parent_dir_best_effort(&log_path);
+    Ok(true)
+}
+
+
+fn cancelled_conversion_log_target_identity(
+    album_dir: &Path,
+    req: &PipelineRequest,
+    settings_fingerprint: Option<&str>,
+) -> Result<ConversionLogBatchIdentity, PublishError> {
+    conversion_log_batch_identity(req, album_dir, settings_fingerprint).map_err(PublishError::Io)
+}
+
+fn read_cancelled_conversion_log_fragment_files(
+    album_dir: &Path,
+    req: &PipelineRequest,
+) -> Result<Vec<ConversionLogFragmentFile>, PublishError> {
+    let album_batch = conversion_log_album_batch(req).map_err(PublishError::Io)?;
+    let expected = conversion_log_expected_track_count(req).map_err(PublishError::Io)?;
+    if expected != album_batch.expected_track_count {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "conversion log cancellation finalization expected-count contract mismatch",
+        )));
+    }
+    let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
+    let target_identity = cancelled_conversion_log_target_identity(
+        album_dir,
+        req,
+        Some(settings_fingerprint.as_str()),
+    )?;
+
+    // Cancellation finalization must use the same strict batch identity as
+    // ordinary completion. In particular, source_context_path and
+    // source_context_kind are part of the identity; a cancelled partial log must
+    // not assemble fragments that normal completion would reject.
+    read_matching_conversion_log_fragment_files(album_dir, &target_identity)
+}
+
+fn cancelled_conversion_log_fragments(
+    album_dir: &Path,
+    req: &PipelineRequest,
+) -> Result<Vec<ConversionLogFragmentFile>, PublishError> {
+    let expected = conversion_log_expected_track_count(req).map_err(PublishError::Io)?;
+    let files = read_cancelled_conversion_log_fragment_files(album_dir, req)?;
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fragments: Vec<ConversionLogFragment> = files.iter().map(|file| file.fragment.clone()).collect();
+    if fragments.iter().any(|fragment| fragment.expected_track_count != expected) {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "conversion log cancellation finalization found a fragment with mismatched expected track count",
+        )));
+    }
+    let fragment_count = conversion_log_fragment_count(&fragments);
+    if fragment_count > expected {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion log cancellation finalization found {fragment_count} fragments, exceeding expected track count {expected}"
+            ),
+        )));
+    }
+    Ok(files)
+}
+
+fn remove_conversion_log_fragment_files_and_empty_dir(
+    album_dir: &Path,
+    files: &[ConversionLogFragmentFile],
+    context: &str,
+) {
+    for file in files {
+        if let Err(err) = fs::remove_file(&file.path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                log::warn!(
+                    "conversion log fragment cleanup failed during {context} for {}: {err}",
+                    file.path.display()
+                );
+                return;
+            }
+        }
+    }
+
+    let dir = conversion_log_fragment_dir(album_dir);
+    match fs::remove_dir(&dir) {
+        Ok(()) => sync_parent_dir_best_effort(&dir),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+        Err(err) => log::warn!(
+            "conversion log fragment directory cleanup failed during {context}: {}: {err}",
+            dir.display()
+        ),
+    }
+}
+
+fn quarantined_conversion_log_fragment_belongs_to_finalized_album(
+    fragment: &ConversionLogFragment,
+    target_identity: &ConversionLogBatchIdentity,
+) -> bool {
+    fragment.batch_identity == *target_identity
+        || fragment.batch_identity.conversion_log_batch_id == target_identity.conversion_log_batch_id
+        || (fragment.batch_identity.output_album_dir == target_identity.output_album_dir
+            && fragment.batch_identity.source_grouping_root == target_identity.source_grouping_root
+            && fragment.batch_identity.target_format == target_identity.target_format)
+}
+
+fn remove_quarantined_conversion_log_fragment_file(path: &Path, context: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            sync_parent_dir_best_effort(path);
+            log::debug!(
+                "removed quarantined conversion log fragment during {context}: {}",
+                path.display()
+            );
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => log::warn!(
+            "quarantined conversion log fragment cleanup failed during {context} for {}: {err}",
+            path.display()
+        ),
+    }
+}
+
+fn cleanup_conversion_log_fragment_quarantine_after_finalization(
+    album_dir: &Path,
+    target_identity: Option<&ConversionLogBatchIdentity>,
+    context: &str,
+) {
+    let Some(target_identity) = target_identity else {
+        return;
+    };
+    let quarantine_root = album_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR);
+    let entries = match fs::read_dir(&quarantine_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            log::warn!(
+                "conversion log fragment quarantine cleanup skipped during {context}: {}: {err}",
+                quarantine_root.display()
+            );
+            return;
+        }
+    };
+
+    let mut dirs = vec![quarantine_root.clone()];
+    let mut stack = vec![quarantine_root.clone()];
+    drop(entries);
+
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                log::warn!(
+                    "conversion log fragment quarantine cleanup skipped directory during {context}: {}: {err}",
+                    dir.display()
+                );
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    log::warn!(
+                        "conversion log fragment quarantine cleanup skipped entry during {context}: {err}"
+                    );
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    log::warn!(
+                        "conversion log fragment quarantine cleanup could not stat {} during {context}: {err}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                dirs.push(path.clone());
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            match read_conversion_log_fragment_file(&path) {
+                Ok(fragment) if quarantined_conversion_log_fragment_belongs_to_finalized_album(
+                    &fragment,
+                    target_identity,
+                ) => {
+                    remove_quarantined_conversion_log_fragment_file(&path, context);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    // Invalid quarantine entries cannot be validated into any
+                    // future batch. Once an authoritative final or cancelled
+                    // partial log exists for this album directory, retaining
+                    // unreadable hidden JSON only extends the privacy and stale
+                    // state risks the quarantine was meant to contain.
+                    log::warn!(
+                        "removing unreadable quarantined conversion log fragment during {context}: {}: {err}",
+                        path.display()
+                    );
+                    remove_quarantined_conversion_log_fragment_file(&path, context);
+                }
+            }
+        }
+    }
+
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in dirs {
+        match fs::remove_dir(&dir) {
+            Ok(()) => sync_parent_dir_best_effort(&dir),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(err) => log::warn!(
+                "conversion log fragment quarantine directory cleanup failed during {context}: {}: {err}",
+                dir.display()
+            ),
+        }
+    }
+}
+
+fn finalize_incomplete_conversion_log_batch_if_needed(
+    req: &PipelineRequest,
+    terminal_failure_reason: Option<&'static str>,
+    context: &'static str,
+) -> Option<PublishedAlbum> {
+    let album_batch = req.album_batch.as_ref()?;
+    for album_dir in conversion_log_candidate_album_dirs_for_incomplete_batch(req) {
+        let _publish_lock = match acquire_publish_lock(&album_dir) {
+            Ok(lock) => lock,
+            Err(err) => {
+                log::warn!(
+                    "conversion log {context} skipped candidate because publish lock failed for {}: {err}",
+                    album_dir.display()
+                );
+                continue;
+            }
+        };
+
+        let files = match cancelled_conversion_log_fragments(&album_dir, req) {
+            Ok(files) => files,
+            Err(err) => {
+                log::warn!(
+                    "conversion log {context} skipped candidate {}: {err}",
+                    album_dir.display()
+                );
+                continue;
+            }
+        };
+        if files.is_empty() {
+            continue;
+        }
+
+        let fragments: Vec<ConversionLogFragment> = files.iter().map(|file| file.fragment.clone()).collect();
+        let assembly_status = match terminal_failure_reason {
+            Some(reason) => ConversionLogAssemblyStatus::TerminalFailurePartial {
+                expected_track_count: album_batch.expected_track_count,
+                reason,
+            },
+            None => ConversionLogAssemblyStatus::CancelledPartial {
+                expected_track_count: album_batch.expected_track_count,
+            },
+        };
+        let log = build_conversion_log_from_fragments_with_status(
+            &fragments,
+            Some(assembly_status),
+        );
+        let log_path = album_dir.join("conversion.log");
+        if let Err(err) = write_bytes_atomically(&log_path, log.as_bytes()) {
+            log::warn!(
+                "conversion log {context} failed to write {}: {err}",
+                log_path.display()
+            );
+            continue;
+        }
+        let bytes = fs::metadata(&log_path).map(|metadata| metadata.len()).unwrap_or(0);
+        let target_identity = fragments
+            .first()
+            .map(|fragment| fragment.batch_identity.clone());
+        remove_conversion_log_fragment_files_and_empty_dir(
+            &album_dir,
+            &files,
+            context,
+        );
+        cleanup_conversion_log_fragment_quarantine_after_finalization(
+            &album_dir,
+            target_identity.as_ref(),
+            context,
+        );
+
+        return Some(PublishedAlbum {
+            album_dir,
+            entries: vec![PublishedEntry {
+                final_path: log_path,
+                role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                bytes,
+            }],
+            manifest_path: None,
+        });
+    }
+
+    None
+}
+
+fn finalize_cancelled_conversion_log_batch_if_needed(req: &PipelineRequest) -> Option<PublishedAlbum> {
+    finalize_incomplete_conversion_log_batch_if_needed(req, None, "cancellation finalization")
+}
+
+fn finalize_terminal_batch_failure_conversion_log_batch_if_needed(
+    req: &PipelineRequest,
+    reason: &'static str,
+) -> Option<PublishedAlbum> {
+    finalize_incomplete_conversion_log_batch_if_needed(
+        req,
+        Some(reason),
+        "terminal infrastructure failure finalization",
+    )
+}
+
+fn publish_cancelled_conversion_log_fragment_and_finalize(
+    req: &PipelineRequest,
+    source: Option<&PreparedSource>,
+    artifacts: Option<&ArtifactSet>,
+    outcome: &AlbumOutcome,
+    staging: StagingDir,
+) -> Option<PublishedAlbum> {
+    let fragment_publish = publish_terminal_conversion_log_fragment_if_needed(
+        req,
+        source,
+        artifacts,
+        outcome,
+        staging,
+    );
+    finalize_cancelled_conversion_log_batch_if_needed(req).or(fragment_publish)
+}
+
+fn cleanup_complete_conversion_log_fragments(
+    album_dir: &Path,
+    expected_track_count: usize,
+    target_identity: Option<&ConversionLogBatchIdentity>,
+) {
+    let Some(target_identity) = target_identity else {
+        return;
+    };
+    let files = match read_matching_conversion_log_fragment_files(album_dir, target_identity) {
+        Ok(files) => files,
+        Err(err) => {
+            log::warn!("conversion log fragment cleanup skipped after unreadable fragments: {err}");
+            return;
+        }
+    };
+
+    if files.is_empty() {
+        return;
+    }
+
+    let fragments: Vec<ConversionLogFragment> = files
+        .iter()
+        .map(|file| file.fragment.clone())
+        .collect();
+    if expected_track_count == 0 {
+        log::warn!(
+            "conversion log fragment cleanup skipped after zero expected-count for batch {}",
+            target_identity.conversion_log_batch_id
+        );
+        return;
+    }
+    let expected = expected_track_count;
+    if fragments
+        .iter()
+        .any(|fragment| fragment.expected_track_count != expected)
+    {
+        log::warn!(
+            "conversion log fragment cleanup skipped after expected-count mismatch for batch {}",
+            target_identity.conversion_log_batch_id
+        );
+        return;
+    }
+    let fragment_count = conversion_log_fragment_count(&fragments);
+    if fragment_count < expected {
+        return;
+    }
+    if fragment_count > expected {
+        log::warn!(
+            "conversion log fragment cleanup skipped after fragment count {fragment_count} exceeded expected track count {expected} for batch {}",
+            target_identity.conversion_log_batch_id
+        );
+        return;
+    }
+
+    // Only remove fragments after the visible authoritative forensic log has
+    // been assembled. Do not discard fragments merely because the hidden sidecar
+    // directory is complete.
+    let log_path = album_dir.join("conversion.log");
+    if !log_path.is_file() {
+        log::warn!(
+            "conversion log fragment cleanup skipped because assembled log is missing: {}",
+            log_path.display()
+        );
+        return;
+    }
+
+    remove_conversion_log_fragment_files_and_empty_dir(
+        album_dir,
+        &files,
+        "successful final assembly",
+    );
+    cleanup_conversion_log_fragment_quarantine_after_finalization(
+        album_dir,
+        Some(target_identity),
+        "successful final assembly",
+    );
 }
 
 fn append_source_blocking_lines(log: &mut String, source: &PreparedSource) {
@@ -7382,10 +9775,17 @@ pub fn build_publish_plan(
     req: &PipelineRequest,
 ) -> Result<PublishPlan, PublishError> {
     let output_root = normalize_path(&req.output_root);
+    // This is the per-job audio payload count, not the album completion
+    // threshold. Zero is meaningful for terminal failed-track publishes that
+    // carry only a forensic conversion-log fragment. Fragment-backed completion
+    // uses expected_album_track_count, which is read from the fragment's
+    // dispatcher-authored AlbumBatchContext.
     let source_audio_track_count = match &artifacts.audio {
         AudioArtifacts::Tracks(tracks) => tracks.len(),
         AudioArtifacts::Merged(merged) => merged.source_tracks.len(),
     };
+    let expected_album_track_count = artifact_set_conversion_log_fragment_expected_track_count(artifacts)?
+        .unwrap_or(source_audio_track_count);
     let mut entries = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -7434,6 +9834,8 @@ pub fn build_publish_plan(
         album_dir,
         entries,
         source_audio_track_count,
+        expected_album_track_count,
+        suppress_incremental_conversion_log_append: req.suppress_incremental_conversion_log_append,
     })
 }
 
@@ -7451,6 +9853,8 @@ pub fn publish_album_output(
     if !staging.root.exists() {
         return Err(PublishError::StagingMissing);
     }
+
+    let fragment_batch_identity = plan_conversion_log_fragment_batch_identity(plan)?;
 
     let final_parent = parent_dir_or_current(&plan.album_dir);
     let _publish_lock = acquire_publish_lock(&plan.album_dir)?;
@@ -7529,6 +9933,8 @@ pub fn publish_album_output(
                         plan,
                         manifest,
                         &incremental_marker_path,
+                        fragment_batch_identity.as_ref(),
+                        &mut published_entries,
                     )?;
                     drop(staging);
                     return Ok(PublishedAlbum {
@@ -7582,6 +9988,15 @@ pub fn publish_album_output(
         }
     }
 
+    let assembled_conversion_log = finalize_staged_conversion_log_for_publish(
+        &temp_dir,
+        &plan.album_dir,
+        plan.expected_album_track_count,
+        plan_has_conversion_log_fragment(plan),
+        fragment_batch_identity.as_ref(),
+        &mut published_entries,
+    )?;
+
     // Write manifest into the temp dir before atomic rename; expose the final
     // post-publish path in PublishedAlbum so PipelineReport cannot contain a
     // stale temp-directory manifest path.
@@ -7619,6 +10034,13 @@ pub fn publish_album_output(
         let _ = fs::remove_file(&marker_path);
     }
     sync_parent_dir_best_effort(&plan.album_dir);
+    if assembled_conversion_log {
+        cleanup_complete_conversion_log_fragments(
+            &plan.album_dir,
+            plan.expected_album_track_count,
+            fragment_batch_identity.as_ref(),
+        );
+    }
 
     drop(staging);
 
@@ -7630,13 +10052,25 @@ pub fn publish_album_output(
 }
 
 fn is_incremental_single_audio_publish(plan: &PublishPlan) -> bool {
+    if plan.suppress_incremental_conversion_log_append {
+        return false;
+    }
+
     let audio_entry_count = plan
         .entries
         .iter()
         .filter(|entry| matches!(&entry.role, PublishRole::Audio))
         .count();
+    let has_fragment = plan_has_conversion_log_fragment(plan);
 
-    audio_entry_count == 1 && plan.source_audio_track_count == 1
+    // Successful independent track jobs publish one audio payload plus a log
+    // fragment. Failed independent track jobs may publish only the log fragment.
+    // Both must use the incremental path so a failed track cannot replace the
+    // whole album directory atomically with a sidecar-only directory. The
+    // fragment itself, not a staged standalone conversion.log, triggers the
+    // count-and-maybe-assemble step while the publish lock is held.
+    (audio_entry_count == 1 && (plan.source_audio_track_count == 1 || has_fragment))
+        || (audio_entry_count == 0 && has_fragment)
 }
 
 fn publish_incremental_album_output(
@@ -7644,9 +10078,12 @@ fn publish_incremental_album_output(
     plan: &PublishPlan,
     manifest: Option<&super::manifest::ConversionManifest>,
     marker_path: &Path,
+    fragment_batch_identity: Option<&ConversionLogBatchIdentity>,
+    published_entries: &mut Vec<PublishedEntry>,
 ) -> Result<Option<PathBuf>, PublishError> {
     let mut incremental_entries = Vec::with_capacity(plan.entries.len());
     let mut has_audio = false;
+    let mut has_conversion_log_fragment = false;
 
     for entry in &plan.entries {
         let rel = match entry.final_path.strip_prefix(&plan.album_dir) {
@@ -7678,6 +10115,9 @@ fn publish_incremental_album_output(
                 }
             }
             PublishRole::Sidecar(_) => {
+                if is_conversion_log_fragment_role(&entry.role) {
+                    has_conversion_log_fragment = true;
+                }
                 if entry.final_path.is_dir() {
                     return cleanup_publish_temp(
                         temp_dir,
@@ -7694,7 +10134,7 @@ fn publish_incremental_album_output(
         });
     }
 
-    if !has_audio {
+    if !has_audio && !has_conversion_log_fragment {
         return cleanup_publish_temp(temp_dir, PublishError::StagingMissing);
     }
 
@@ -7702,19 +10142,38 @@ fn publish_incremental_album_output(
         Ok(rollback) => rollback,
         Err(err) => return cleanup_publish_temp(temp_dir, err),
     };
+    let mut assembled_conversion_log = false;
     let publish_result = (|| -> Result<(), PublishError> {
-        // Publish sidecars before the audio file. If a diagnostic sidecar fails,
-        // the new track has not been exposed yet. The durable recovery marker is
-        // updated before each destination mutation, so a process crash leaves a
-        // replayable rollback plan that removes a partially exposed track and
-        // restores any sidecars/logs to their pre-publish bytes.
-        for entry in incremental_entries
-            .iter()
-            .filter(|entry| !matches!(&entry.role, PublishRole::Audio))
-        {
+        // Publish the track audio before the hidden conversion-log fragment can
+        // trigger final album log assembly. This prevents a visible forensic
+        // conversion.log from claiming completion while the final successful
+        // track's audio file is not yet installed. Failed-track publishes have
+        // no audio payload, so they naturally skip this phase and publish their
+        // failure fragment below. The durable recovery marker is updated before
+        // every destination mutation across all phases.
+        for entry in incremental_entries.iter().filter(|entry| {
+            incremental_publish_phase(&entry.role) == IncrementalPublishPhase::AudioPayload
+        }) {
+            publish_incremental_audio_entry(
+                &entry.temp_path,
+                &entry.final_path,
+                &mut rollback,
+            )?;
+        }
+
+        for entry in incremental_entries.iter().filter(|entry| {
+            incremental_publish_phase(&entry.role) == IncrementalPublishPhase::NonFragmentSidecar
+        }) {
             match &entry.role {
+                PublishRole::Sidecar(SidecarKind::ConversionLog) if has_conversion_log_fragment => {
+                    // Fragment-backed publishes no longer use a staged one-track
+                    // conversion.log as an assembly trigger. If an older caller
+                    // still staged one, discard it and let the fragment-count
+                    // path below decide whether the unified log is ready.
+                    remove_file_if_exists(&entry.temp_path).map_err(PublishError::Io)?;
+                }
                 PublishRole::Sidecar(SidecarKind::ConversionLog) => {
-                    append_incremental_conversion_log(
+                    publish_incremental_conversion_log(
                         &entry.temp_path,
                         &entry.final_path,
                         &mut rollback,
@@ -7731,13 +10190,28 @@ fn publish_incremental_album_output(
             }
         }
 
-        for entry in incremental_entries
-            .iter()
-            .filter(|entry| matches!(&entry.role, PublishRole::Audio))
-        {
-            publish_incremental_audio_entry(
+        for entry in incremental_entries.iter().filter(|entry| {
+            incremental_publish_phase(&entry.role) == IncrementalPublishPhase::ConversionLogFragment
+        }) {
+            replace_incremental_sidecar_entry(
                 &entry.temp_path,
                 &entry.final_path,
+                &mut rollback,
+            )?;
+        }
+
+        if has_conversion_log_fragment {
+            // The hidden fragment, not a staged one-track conversion.log, is the
+            // trigger for the last-track check. This runs under the album publish
+            // lock after the current job's audio payload and sidecars have been
+            // published, so incomplete batches do no visible log work and
+            // complete batches assemble only after the last successful track's
+            // audio file is visible. Failed-track fragments, which have no audio
+            // payload, also assemble only after their fragment is published.
+            assembled_conversion_log |= publish_incremental_assembled_conversion_log_from_fragments(
+                &plan.album_dir,
+                plan.expected_album_track_count,
+                fragment_batch_identity,
                 &mut rollback,
             )?;
         }
@@ -7773,6 +10247,21 @@ fn publish_incremental_album_output(
         );
     }
     sync_parent_dir_best_effort(&plan.album_dir);
+    if assembled_conversion_log {
+        let log_path = plan.album_dir.join("conversion.log");
+        if let Ok(metadata) = fs::metadata(&log_path) {
+            record_assembled_conversion_log_entry(
+                published_entries,
+                &log_path,
+                metadata.len(),
+            );
+        }
+        cleanup_complete_conversion_log_fragments(
+            &plan.album_dir,
+            plan.expected_album_track_count,
+            fragment_batch_identity,
+        );
+    }
 
     Ok(write_incremental_manifest_nonfatal(plan, manifest))
 }
@@ -7783,6 +10272,24 @@ struct IncrementalPublishEntry {
     final_path: PathBuf,
     role: PublishRole,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalPublishPhase {
+    AudioPayload,
+    NonFragmentSidecar,
+    ConversionLogFragment,
+}
+
+fn incremental_publish_phase(role: &PublishRole) -> IncrementalPublishPhase {
+    if is_conversion_log_fragment_role(role) {
+        return IncrementalPublishPhase::ConversionLogFragment;
+    }
+
+    match role {
+        PublishRole::Audio => IncrementalPublishPhase::AudioPayload,
+        PublishRole::Sidecar(_) => IncrementalPublishPhase::NonFragmentSidecar,
+    }
+}
+
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct IncrementalPublishRecoveryMarker {
@@ -8105,6 +10612,23 @@ fn copy_file_create_new_synced_io(src: &Path, dst: &Path) -> io::Result<()> {
     result
 }
 
+
+fn publish_incremental_conversion_log(
+    src: &Path,
+    dst: &Path,
+    rollback: &mut IncrementalPublishRollback,
+) -> Result<(), PublishError> {
+    if dst.is_dir() {
+        return Err(PublishError::DestinationExists(dst.display().to_string()));
+    }
+
+    // Legacy/non-fragment incremental jobs still append their staged standalone
+    // logs. Fragment-backed jobs never reach this path for assembly: their
+    // hidden fragment sidecar triggers count-and-maybe-assemble directly after
+    // fragment publication.
+    append_incremental_conversion_log(src, dst, rollback)
+}
+
 fn append_incremental_conversion_log(
     src: &Path,
     dst: &Path,
@@ -8333,6 +10857,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
     let plan: Option<AlbumPlan> = None;
 
     if cancel.is_cancelled() {
+        let published = finalize_cancelled_conversion_log_batch_if_needed(&req);
         let outcome = AlbumOutcome::Blocked {
             successful: Vec::new(),
             failed: Vec::new(),
@@ -8340,7 +10865,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
             reason: BlockReason::Cancelled,
         };
         return ScheduledMaterialization::Finished(
-            finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+            finalize_report(&req, reporter, source, plan, None, published, outcome).await,
         );
     }
 
@@ -8354,8 +10879,12 @@ pub async fn prepare_pipeline_item_for_scheduler(
             stages,
             reason: BlockReason::MaterializeFailed,
         };
+        let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+            &req,
+            &outcome,
+        );
         return ScheduledMaterialization::Finished(
-            finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+            finalize_report(&req, reporter, source, plan, None, published, outcome).await,
         );
     }
 
@@ -8373,8 +10902,13 @@ pub async fn prepare_pipeline_item_for_scheduler(
             stages,
             reason: BlockReason::MaterializeFailed,
         };
+        let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
+            &req,
+            &outcome,
+            "staging parent creation failed",
+        );
         return ScheduledMaterialization::Finished(
-            finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+            finalize_report(&req, reporter, source, plan, None, published, outcome).await,
         );
     }
 
@@ -8390,8 +10924,13 @@ pub async fn prepare_pipeline_item_for_scheduler(
                 stages,
                 reason: BlockReason::MaterializeFailed,
             };
+            let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
+                &req,
+                &outcome,
+                "run lock acquisition failed",
+            );
             return ScheduledMaterialization::Finished(
-                finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+                finalize_report(&req, reporter, source, plan, None, published, outcome).await,
             );
         }
     };
@@ -8417,8 +10956,13 @@ pub async fn prepare_pipeline_item_for_scheduler(
             stages,
             reason: BlockReason::MaterializeFailed,
         };
+        let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
+            &req,
+            &outcome,
+            "staging directory creation failed",
+        );
         return ScheduledMaterialization::Finished(
-            finalize_report(&req, reporter, source, plan, None, None, outcome).await,
+            finalize_report(&req, reporter, source, plan, None, published, outcome).await,
         );
     }
 
@@ -8454,14 +10998,22 @@ pub async fn prepare_pipeline_item_for_scheduler(
                 stages,
                 reason: BlockReason::EncryptedSource,
             };
+            let source = Some(blocked.source);
+            let published = publish_terminal_conversion_log_fragment_if_needed(
+                &req,
+                source.as_ref(),
+                None,
+                &outcome,
+                staging,
+            );
             return ScheduledMaterialization::Finished(
                 finalize_report(
                     &req,
                     reporter,
-                    Some(blocked.source),
+                    source,
                     None,
                     None,
-                    None,
+                    published,
                     outcome,
                 )
                 .await,
@@ -8482,13 +11034,25 @@ pub async fn prepare_pipeline_item_for_scheduler(
                 stages,
                 reason,
             };
+            let published = if matches!(outcome, AlbumOutcome::Blocked { reason: BlockReason::Cancelled, .. }) {
+                finalize_cancelled_conversion_log_batch_if_needed(&req)
+            } else {
+                publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    None,
+                    None,
+                    &outcome,
+                    staging,
+                )
+            };
             return ScheduledMaterialization::Finished(
-                finalize_report(&req, reporter, None, None, None, None, outcome).await,
+                finalize_report(&req, reporter, None, None, None, published, outcome).await,
             );
         }
     };
 
     if cancel.is_cancelled() {
+        let published = finalize_cancelled_conversion_log_batch_if_needed(&req);
         let outcome = AlbumOutcome::Blocked {
             successful: Vec::new(),
             failed: Vec::new(),
@@ -8496,7 +11060,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
             reason: BlockReason::Cancelled,
         };
         return ScheduledMaterialization::Finished(
-            finalize_report(&req, reporter, Some(prepared), None, None, None, outcome).await,
+            finalize_report(&req, reporter, Some(prepared), None, None, published, outcome).await,
         );
     }
 
@@ -8511,17 +11075,29 @@ pub async fn prepare_pipeline_item_for_scheduler(
             album_plan
         }
         Err(err) => {
-            let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(err.to_string()));
+            let plan_error = err.to_string();
+            let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(plan_error.clone()));
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
+            let failed = blocked_track_records(
+                &prepared,
+                &format!("output planning failed: {plan_error}"),
+            );
             let outcome = AlbumOutcome::Blocked {
                 successful: Vec::new(),
-                failed: Vec::new(),
+                failed,
                 stages,
                 reason: BlockReason::PlanFailed,
             };
+            let published = publish_terminal_conversion_log_fragment_if_needed(
+                &req,
+                Some(&prepared),
+                None,
+                &outcome,
+                staging,
+            );
             return ScheduledMaterialization::Finished(
-                finalize_report(&req, reporter, Some(prepared), None, None, None, outcome).await,
+                finalize_report(&req, reporter, Some(prepared), None, None, published, outcome).await,
             );
         }
     };
@@ -8950,6 +11526,13 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     let mut current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if cancel.is_cancelled() {
         current_outcome = cancelled_outcome_from(current_outcome);
+        published = publish_cancelled_conversion_log_fragment_and_finalize(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
     if matches!(current_outcome, AlbumOutcome::Partial { .. })
@@ -8963,6 +11546,13 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         };
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        published = publish_terminal_conversion_log_fragment_if_needed(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
 
@@ -8988,6 +11578,13 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
                 current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                published = publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    source.as_ref(),
+                    artifacts.as_ref(),
+                    &current_outcome,
+                    staging,
+                );
                 return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
             }
         }
@@ -9030,6 +11627,13 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                     emit_stage_finished(reporter, &item_id, record.clone()).await;
                     stages.push(record);
                     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                    published = publish_terminal_conversion_log_fragment_if_needed(
+                        &req,
+                        source.as_ref(),
+                        artifacts.as_ref(),
+                        &current_outcome,
+                        staging,
+                    );
                     return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
                 }
             }
@@ -9060,6 +11664,13 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
                 current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                published = publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    source.as_ref(),
+                    artifacts.as_ref(),
+                    &current_outcome,
+                    staging,
+                );
                 return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
             }
         }
@@ -9071,6 +11682,13 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
 
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        published = publish_terminal_conversion_log_fragment_if_needed(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
 
@@ -9097,6 +11715,13 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
                 current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                published = publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    source.as_ref(),
+                    artifacts.as_ref(),
+                    &current_outcome,
+                    staging,
+                );
                 return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
             }
         }
@@ -9109,9 +11734,23 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     current_outcome = aggregate_album_outcome(tracks, stages, req.failure_policy);
     if cancel.is_cancelled() {
         current_outcome = cancelled_outcome_from(current_outcome);
+        published = publish_cancelled_conversion_log_fragment_and_finalize(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        published = publish_terminal_conversion_log_fragment_if_needed(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
 
@@ -9208,6 +11847,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     let mut stages = Vec::new();
 
     if cancel.is_cancelled() {
+        let published = finalize_cancelled_conversion_log_batch_if_needed(&req);
         let outcome = AlbumOutcome::Blocked {
             successful: Vec::new(),
             failed: Vec::new(),
@@ -9230,6 +11870,10 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             stages,
             reason: BlockReason::MaterializeFailed,
         };
+        let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+            &req,
+            &outcome,
+        );
         return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
     }
 
@@ -9247,6 +11891,11 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             stages,
             reason: BlockReason::MaterializeFailed,
         };
+        let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
+            &req,
+            &outcome,
+            "staging parent creation failed",
+        );
         return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
     }
     let _run_lock = match acquire_run_lock(&staging_parent, &req.job_id, &req.item_id) {
@@ -9264,6 +11913,11 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages,
                 reason: BlockReason::MaterializeFailed,
             };
+            let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
+                &req,
+                &outcome,
+                "run lock acquisition failed",
+            );
             return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
                 .await;
         }
@@ -9289,6 +11943,11 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             stages,
             reason: BlockReason::MaterializeFailed,
         };
+        let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
+            &req,
+            &outcome,
+            "staging directory creation failed",
+        );
         return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
     }
 
@@ -9326,10 +11985,18 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages,
                 reason: BlockReason::EncryptedSource,
             };
+            let source = Some(blocked.source);
+            let published = publish_terminal_conversion_log_fragment_if_needed(
+                &req,
+                source.as_ref(),
+                artifacts.as_ref(),
+                &outcome,
+                staging,
+            );
             return finalize_report(
                 &req,
                 reporter,
-                Some(blocked.source),
+                source,
                 plan,
                 artifacts,
                 published,
@@ -9338,7 +12005,8 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             .await;
         }
         Err(err) => {
-            let reason = if matches!(err, MaterializeError::Cancelled) {
+            let cancelled = matches!(err, MaterializeError::Cancelled);
+            let reason = if cancelled {
                 BlockReason::Cancelled
             } else {
                 BlockReason::MaterializeFailed
@@ -9355,12 +12023,24 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages,
                 reason,
             };
+            let published = if cancelled {
+                finalize_cancelled_conversion_log_batch_if_needed(&req)
+            } else {
+                publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    None,
+                    artifacts.as_ref(),
+                    &outcome,
+                    staging,
+                )
+            };
             return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
                 .await;
         }
     }
 
     if cancel.is_cancelled() {
+        let published = finalize_cancelled_conversion_log_batch_if_needed(&req);
         let outcome = AlbumOutcome::Blocked {
             successful: Vec::new(),
             failed: Vec::new(),
@@ -9385,18 +12065,30 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             plan = Some(album_plan);
         }
         Err(err) => {
+            let plan_error = err.to_string();
             let record = stage_record(
                 PipelineStage::PlanOutputs,
-                StageOutcome::Failed(err.to_string()),
+                StageOutcome::Failed(plan_error.clone()),
             );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
+            let failed = blocked_track_records(
+                source.as_ref().expect("materialized source present"),
+                &format!("output planning failed: {plan_error}"),
+            );
             let outcome = AlbumOutcome::Blocked {
                 successful: Vec::new(),
-                failed: Vec::new(),
+                failed,
                 stages,
                 reason: BlockReason::PlanFailed,
             };
+            published = publish_terminal_conversion_log_fragment_if_needed(
+                &req,
+                source.as_ref(),
+                None,
+                &outcome,
+                staging,
+            );
             return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
                 .await;
         }
@@ -9424,6 +12116,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
         aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if cancel.is_cancelled() {
         current_outcome = cancelled_outcome_from(current_outcome);
+        published = publish_cancelled_conversion_log_fragment_and_finalize(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(
             &req,
             reporter,
@@ -9446,6 +12145,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
         };
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        published = publish_terminal_conversion_log_fragment_if_needed(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(
             &req,
             reporter,
@@ -9482,6 +12188,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages.push(record);
                 current_outcome =
                     aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                published = publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    source.as_ref(),
+                    artifacts.as_ref(),
+                    &current_outcome,
+                    staging,
+                );
                 return finalize_report(
                     &req,
                     reporter,
@@ -9534,6 +12247,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                     stages.push(record);
                     current_outcome =
                         aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                    published = publish_terminal_conversion_log_fragment_if_needed(
+                        &req,
+                        source.as_ref(),
+                        artifacts.as_ref(),
+                        &current_outcome,
+                        staging,
+                    );
                     return finalize_report(
                         &req,
                         reporter,
@@ -9577,6 +12297,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages.push(record);
                 current_outcome =
                     aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                published = publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    source.as_ref(),
+                    artifacts.as_ref(),
+                    &current_outcome,
+                    staging,
+                );
                 return finalize_report(
                     &req,
                     reporter,
@@ -9597,6 +12324,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
 
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        published = publish_terminal_conversion_log_fragment_if_needed(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(
             &req,
             reporter,
@@ -9636,6 +12370,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages.push(record);
                 current_outcome =
                     aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                published = publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    source.as_ref(),
+                    artifacts.as_ref(),
+                    &current_outcome,
+                    staging,
+                );
                 return finalize_report(
                     &req,
                     reporter,
@@ -9657,6 +12398,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if cancel.is_cancelled() {
         current_outcome = cancelled_outcome_from(current_outcome);
+        published = publish_cancelled_conversion_log_fragment_and_finalize(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(
             &req,
             reporter,
@@ -9669,6 +12417,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
         .await;
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
+        published = publish_terminal_conversion_log_fragment_if_needed(
+            &req,
+            source.as_ref(),
+            artifacts.as_ref(),
+            &current_outcome,
+            staging,
+        );
         return finalize_report(
             &req,
             reporter,
@@ -11848,6 +14603,10 @@ mod conversion_log_tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::AllowPartialAlbum,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -12789,6 +15548,10 @@ mod naming_template_tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -13317,6 +16080,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             },
             stages,
             failure_policy: policy,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -14695,6 +17462,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 role: PublishRole::Audio,
             }],
             source_audio_track_count: 1,
+            expected_album_track_count: 1,
+            suppress_incremental_conversion_log_append: false,
         };
         let publish = fixture.album.req.publish.clone();
         let staging = fixture.album.staging;
@@ -14727,6 +17496,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 role: PublishRole::Audio,
             }],
             source_audio_track_count: 1,
+            expected_album_track_count: 1,
+            suppress_incremental_conversion_log_append: false,
         };
 
         let published = publish_album_output(retry_staging, &retry_plan, publish, None)
@@ -14770,6 +17541,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 role: PublishRole::Audio,
             }],
             source_audio_track_count: 1,
+            expected_album_track_count: 1,
+            suppress_incremental_conversion_log_append: false,
         };
         let publish = fixture.album.req.publish.clone();
         let staging = fixture.album.staging;
@@ -14826,6 +17599,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 },
             ],
             source_audio_track_count: 1,
+            expected_album_track_count: 1,
+            suppress_incremental_conversion_log_append: false,
         }
     }
 
@@ -14857,6 +17632,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 },
             ],
             source_audio_track_count: 1,
+            expected_album_track_count: 1,
+            suppress_incremental_conversion_log_append: false,
         }
     }
 
@@ -14868,6 +17645,2966 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    fn fragment_test_time(offset_seconds: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-06-16T00:00:00Z")
+            .expect("base fragment timestamp")
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::seconds(offset_seconds)
+    }
+
+    fn fragment_test_album_batch(
+        album_dir: &Path,
+        batch_id: &str,
+        expected_track_count: usize,
+    ) -> AlbumBatchContext {
+        AlbumBatchContext::new(
+            generated_test_batch_id(batch_id),
+            expected_track_count,
+            album_dir.to_path_buf(),
+            album_dir.join("source-root"),
+        )
+    }
+
+    fn fragment_test_identity(
+        album_dir: &Path,
+        batch_id: &str,
+        settings_fingerprint: Option<&str>,
+    ) -> ConversionLogBatchIdentity {
+        let source_root = normalize_path(&album_dir.join("source-root")).display().to_string();
+        ConversionLogBatchIdentity {
+            conversion_log_batch_id: generated_test_batch_id(batch_id),
+            settings_fingerprint: settings_fingerprint.map(str::to_string),
+            output_album_dir: normalize_path(album_dir).display().to_string(),
+            source_grouping_root: source_root.clone(),
+            source_context_path: source_root,
+            source_context_kind: "folder album batch".to_string(),
+            target_format: "FLAC".to_string(),
+        }
+    }
+
+    #[test]
+    fn provisional_album_batch_output_dir_binds_to_planner_album_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_root = temp.path().join("source").join("Folder Name");
+        let provisional_album_dir = temp.path().join("out").join("Folder Name");
+        std::fs::create_dir_all(&source_root).expect("source root");
+
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        req.output_root = temp.path().join("out");
+        req.naming.folder_template = Some("%ARTIST%/%ALBUM%".to_string());
+        req.container = source_root.join("01 - Planned.flac");
+        req.album_batch = Some(AlbumBatchContext::from_dispatcher_source_count(
+            generated_test_batch_id("batch-provisional-dir"),
+            1,
+            provisional_album_dir.clone(),
+            source_root.clone(),
+        )
+        .expect("dispatcher batch context"));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+
+        let mut source = prepared_source(
+            &source_root,
+            &[TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            }],
+        );
+        source.container = req.container.clone();
+        source.album_metadata.album_artist = Some("Real Artist".to_string());
+        source.album_metadata.album = Some("Real Album".to_string());
+
+        let plan = plan_outputs(&source, &req).expect("planner uses metadata folder template");
+        assert_eq!(plan.album_dir, req.output_root.join("Real Artist").join("Real Album"));
+        assert_ne!(plan.album_dir, provisional_album_dir);
+
+        let no_audio_artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(Vec::new()),
+            sidecars: Vec::new(),
+        };
+        assert_eq!(
+            conversion_log_album_dir(&source, &req, &no_audio_artifacts),
+            plan.album_dir,
+            "fragment staging must use the planner-resolved album directory when the dispatcher value was only provisional"
+        );
+
+        let identity = conversion_log_batch_identity(&req, &plan.album_dir, Some("settings-fingerprint"))
+            .expect("provisional batch identity binds to actual planned album dir");
+        assert_eq!(
+            identity.output_album_dir,
+            normalize_path(&plan.album_dir).display().to_string()
+        );
+    }
+
+    #[test]
+    fn planner_resolved_album_batch_output_dir_still_rejects_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_root = temp.path().join("source").join("Album");
+        let expected_album_dir = temp.path().join("out").join("Expected Album");
+        let actual_album_dir = temp.path().join("out").join("Real Artist").join("Real Album");
+
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id("batch-resolved-dir"),
+            1,
+            expected_album_dir,
+            source_root,
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+
+        let err = conversion_log_batch_identity(&req, &actual_album_dir, Some("settings-fingerprint"))
+            .expect_err("planner-resolved batch directories remain strict");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn conversion_log_batch_identity_does_not_split_multi_disc_album_batches() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("out").join("Artist - Album");
+        let source_root = temp.path().join("source").join("Artist - Album");
+
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id("batch-multidisc"),
+            4,
+            album_dir.clone(),
+            source_root.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        req.container = source_root.join("Disc 1").join("01.wav");
+
+        let mut disc_one = prepared_source(
+            &source_root.join("Disc 1"),
+            &[TrackId {
+                source_ordinal: 1,
+                disc_number: Some(1),
+                track_number: 1,
+            }],
+        );
+        disc_one.container = source_root.join("Disc 1").join("01.wav");
+        disc_one.album_metadata.album = Some("Album".to_string());
+        disc_one.album_metadata.album_artist = Some("Artist".to_string());
+        disc_one.album_metadata.total_discs = Some(2);
+        disc_one.album_metadata.disc_number = Some(1);
+        disc_one.album_metadata.total_tracks = 2;
+        disc_one.tracks[0].metadata.disc_number = Some(1);
+
+        let mut disc_two = prepared_source(
+            &source_root.join("Disc 2"),
+            &[TrackId {
+                source_ordinal: 3,
+                disc_number: Some(2),
+                track_number: 1,
+            }],
+        );
+        disc_two.container = source_root.join("Disc 2").join("01.wav");
+        disc_two.album_metadata.album = Some("Album".to_string());
+        disc_two.album_metadata.album_artist = Some("Artist".to_string());
+        disc_two.album_metadata.total_discs = Some(2);
+        disc_two.album_metadata.disc_number = Some(2);
+        disc_two.album_metadata.total_tracks = 2;
+        disc_two.tracks[0].metadata.disc_number = Some(2);
+
+        let identity_one = conversion_log_batch_identity(
+            &req,
+            &album_dir,
+            Some("settings-fingerprint"),
+        )
+        .expect("disc one batch identity");
+        let identity_two = conversion_log_batch_identity(
+            &req,
+            &album_dir,
+            Some("settings-fingerprint"),
+        )
+        .expect("disc two batch identity");
+
+        assert_eq!(identity_one, identity_two);
+        assert_eq!(
+            identity_one.source_grouping_root,
+            normalize_path(&source_root).display().to_string()
+        );
+        assert_ne!(
+            ConversionLogTrackSortKey::from(&disc_one.tracks[0].id),
+            ConversionLogTrackSortKey::from(&disc_two.tracks[0].id),
+            "disc number remains in the track sort/display key, not the batch identity"
+        );
+    }
+
+    fn fragment_test_common(batch_id: &str) -> ConversionLogCommonFragment {
+        ConversionLogCommonFragment {
+            representative_job_id: format!("job-{batch_id}"),
+            representative_item_id: format!("{batch_id}-item"),
+            album_artist: Some("Artist".to_string()),
+            album: Some("Album".to_string()),
+            year: Some("2026".to_string()),
+            genre: Some("Rock".to_string()),
+            catalog_number: None,
+            source_blocking_lines: String::new(),
+            provenance_section: "Provenance\n----------\nNo provenance details were recorded.\n\n".to_string(),
+            artwork_section: "Artwork\n-------\nNo artwork was embedded.\n\n".to_string(),
+            conversion_settings_section: "Target format: FLAC\n".to_string(),
+        }
+    }
+
+    fn fragment_test_fragment(
+        album_dir: &Path,
+        batch_id: &str,
+        settings_fingerprint: Option<&str>,
+        track_number: u32,
+        expected_track_count: usize,
+        section: &str,
+        outcome: ConversionLogTrackOutcome,
+        generated_at: chrono::DateTime<chrono::Utc>,
+    ) -> ConversionLogFragment {
+        ConversionLogFragment {
+            version: CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION,
+            expected_track_count,
+            sort_key: ConversionLogTrackSortKey {
+                disc_number: 1,
+                track_number,
+                source_ordinal: track_number,
+            },
+            generated_at,
+            settings_fingerprint: settings_fingerprint.map(str::to_string),
+            batch_identity: fragment_test_identity(album_dir, batch_id, settings_fingerprint),
+            common: fragment_test_common(batch_id),
+            track: ConversionLogTrackFragment {
+                section: section.to_string(),
+            },
+            summary: ConversionLogTrackSummary {
+                outcome,
+                bytes_in: Some(100 + u64::from(track_number)),
+                bytes_out: if outcome == ConversionLogTrackOutcome::Success {
+                    Some(50 + u64::from(track_number))
+                } else {
+                    None
+                },
+                duration_millis: Some(1_000 * u64::from(track_number)),
+            },
+            stages: vec![StageRecord {
+                stage: PipelineStage::Convert,
+                outcome: if outcome == ConversionLogTrackOutcome::Success {
+                    StageOutcome::Ok
+                } else {
+                    StageOutcome::Failed(format!("track {track_number} failed"))
+                },
+                dsd_dst_stats: None,
+            }],
+        }
+    }
+
+    fn write_fragment_json(path: &Path, fragment: &ConversionLogFragment) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("fragment parent");
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(fragment).expect("fragment json"))
+            .expect("write fragment json");
+    }
+
+    fn fragment_file_name(fragment: &ConversionLogFragment) -> String {
+        format!(
+            "{}-d{:03}-t{:05}-s{:05}.json",
+            sanitize_component(&fragment.batch_identity.conversion_log_batch_id),
+            fragment.sort_key.disc_number,
+            fragment.sort_key.track_number,
+            fragment.sort_key.source_ordinal,
+        )
+    }
+
+    fn write_album_fragment(album_dir: &Path, name: &str, fragment: &ConversionLogFragment) -> PathBuf {
+        let path = conversion_log_fragment_dir(album_dir).join(name);
+        write_fragment_json(&path, fragment);
+        path
+    }
+
+    fn scheduler_cancel_batch_request(
+        temp: &Path,
+        batch_id: &str,
+        item_id: &str,
+        expected_track_count: usize,
+    ) -> (PipelineRequest, PathBuf) {
+        let album_dir = temp.join("out").join("Cancelled Album");
+        let source_root = album_dir.join("source-root");
+        std::fs::create_dir_all(&source_root).expect("cancel source root");
+        std::fs::create_dir_all(temp.join("logs")).expect("cancel log root");
+        let mut req = request(
+            temp,
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.job_id = format!("job-{item_id}");
+        req.item_id = item_id.to_string();
+        req.container = source_root.join(format!("{item_id}.flac"));
+        std::fs::write(&req.container, b"placeholder source").expect("cancel source file");
+        req.output_root = temp.join("out");
+        req.log.root = temp.join("logs");
+        req.publish = incremental_test_publish_policy();
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id(batch_id),
+            expected_track_count,
+            album_dir.clone(),
+            source_root,
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(2, Some(1), 2));
+        (req, album_dir)
+    }
+
+    fn seed_scheduler_cancel_fragment(req: &PipelineRequest, album_dir: &Path, batch_id: &str) {
+        let expected_track_count = req
+            .album_batch
+            .as_ref()
+            .expect("batch context")
+            .expected_track_count;
+        let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
+        let fragment = fragment_test_fragment(
+            album_dir,
+            batch_id,
+            Some(settings_fingerprint.as_str()),
+            1,
+            expected_track_count,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        write_album_fragment(album_dir, "cancelled-existing-track-1.json", &fragment);
+    }
+
+    fn canonical_fragment_from_record(
+        album_dir: &Path,
+        batch_id: &str,
+        source: &PreparedSource,
+        req: &PipelineRequest,
+        artifacts: &ArtifactSet,
+        outcome: &AlbumOutcome,
+        record: &TrackRecord,
+        generated_at: chrono::DateTime<chrono::Utc>,
+    ) -> ConversionLogFragment {
+        let source_tracks_by_ordinal = build_source_track_index(source);
+        let artifacts_by_track_id = build_track_artifact_index(artifacts);
+        let metadata_stage_result = metadata_stage_outcome(outcome);
+        let mut section = String::new();
+        append_track_log(
+            &mut section,
+            record,
+            source_tracks_by_ordinal
+                .get(&record.track_id.source_ordinal)
+                .copied(),
+            artifacts_by_track_id.get(&record.track_id).copied(),
+            req,
+            metadata_stage_result,
+        );
+
+        ConversionLogFragment {
+            version: CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION,
+            expected_track_count: req
+                .album_batch
+                .as_ref()
+                .map(|batch| batch.expected_track_count)
+                .expect("canonical fragment tests must use dispatcher album batch expected count"),
+            sort_key: conversion_log_fragment_sort_key(req, &record.track_id)
+                .expect("dispatcher track context supplies canonical fragment sort key"),
+            generated_at,
+            settings_fingerprint: None,
+            batch_identity: fragment_test_identity(album_dir, batch_id, None),
+            common: build_conversion_log_common_fragment(outcome, source, req, artifacts),
+            track: ConversionLogTrackFragment { section },
+            summary: ConversionLogTrackSummary::from_track_record(record),
+            stages: outcome_stage_records(outcome).to_vec(),
+        }
+    }
+
+    fn incremental_fragment_test_plan(
+        root: &Path,
+        album_dir: &Path,
+        stage_name: &str,
+        fragment: &ConversionLogFragment,
+        audio: Option<(&str, &[u8])>,
+        _log_bytes: &[u8],
+    ) -> (StagingDir, PublishPlan) {
+        let staging = StagingDir::new(root.join(stage_name), stage_name.to_string());
+        std::fs::create_dir_all(&staging.root).expect("fragment staging root");
+
+        let mut entries = Vec::new();
+        let source_audio_track_count = if audio.is_some() { 1 } else { 0 };
+        if let Some((audio_name, audio_bytes)) = audio {
+            let staged_audio = staging.root.join(audio_name);
+            std::fs::write(&staged_audio, audio_bytes).expect("staged fragment-test audio");
+            entries.push(PublishEntry {
+                staged_path: staged_audio,
+                final_path: album_dir.join(audio_name),
+                role: PublishRole::Audio,
+            });
+        }
+
+        let fragment_name = fragment_file_name(fragment);
+        let staged_fragment = staging.root.join(&fragment_name);
+        write_fragment_json(&staged_fragment, fragment);
+        entries.push(PublishEntry {
+            staged_path: staged_fragment,
+            final_path: conversion_log_fragment_dir(album_dir).join(fragment_name),
+            role: PublishRole::Sidecar(SidecarKind::Other(
+                CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string(),
+            )),
+        });
+
+        (
+            staging,
+            PublishPlan {
+                album_dir: album_dir.to_path_buf(),
+                entries,
+                // Simulate the independent single-file job path: each publish
+                // plan sees one current job, while the fragment carries the
+                // album-level expected count.
+                source_audio_track_count,
+                expected_album_track_count: fragment.expected_track_count,
+                suppress_incremental_conversion_log_append: false,
+            },
+        )
+    }
+
+
+    fn real_fragment_album_dir(temp: &Path) -> PathBuf {
+        temp.join("out").join("Test Artist").join("Test Album")
+    }
+
+    fn real_fragment_source_root(temp: &Path) -> PathBuf {
+        temp.join("source-root")
+    }
+
+    fn real_fragment_batch(
+        temp: &Path,
+        batch_id: &str,
+        expected_track_count: usize,
+    ) -> AlbumBatchContext {
+        AlbumBatchContext::from_dispatcher_source_count(
+            batch_id,
+            expected_track_count,
+            real_fragment_album_dir(temp),
+            real_fragment_source_root(temp),
+        )
+        .expect("dispatcher-authored album batch context")
+    }
+
+    fn real_fragment_unbatched_request(
+        temp: &Path,
+        job_suffix: &str,
+    ) -> PipelineRequest {
+        let mut req = log_test_request();
+        req.job_id = format!("job-{job_suffix}");
+        req.item_id = format!("item-{job_suffix}");
+        req.container = real_fragment_source_root(temp).join(format!("{job_suffix}.wav"));
+        if let Some(parent) = req.container.parent() {
+            std::fs::create_dir_all(parent).expect("real fragment source parent");
+        }
+        std::fs::write(&req.container, b"source audio placeholder")
+            .expect("real fragment source file");
+        req.output_root = temp.join("out");
+        req.log.root = temp.join("logs");
+        std::fs::create_dir_all(&req.output_root).expect("real fragment output root");
+        std::fs::create_dir_all(&req.log.root).expect("real fragment log root");
+        req.publish = incremental_test_publish_policy();
+        req.album_batch = None;
+        req.album_batch_track = None;
+        req.expected_album_track_count = Some(9999);
+        req
+    }
+
+    fn real_fragment_unbatched_request_with_track(
+        temp: &Path,
+        job_suffix: &str,
+        source_ordinal: u32,
+        disc_number: Option<u32>,
+        track_number: u32,
+    ) -> PipelineRequest {
+        let mut req = real_fragment_unbatched_request(temp, job_suffix);
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(
+            source_ordinal,
+            disc_number,
+            track_number,
+        ));
+        req
+    }
+
+    fn generated_test_batch_id(label: &str) -> String {
+        if is_generated_conversion_log_batch_id(label) {
+            return label.to_string();
+        }
+        let label_hex = label
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let label_hex = if label_hex.is_empty() { "00".to_string() } else { label_hex };
+        format!("{CONVERSION_LOG_BATCH_ID_PREFIX}-74657374-{label_hex}-1")
+    }
+
+    fn real_fragment_dispatched_requests(
+        temp: &Path,
+        batch_id: &str,
+        job_suffixes: &[&str],
+    ) -> Vec<PipelineRequest> {
+        let requests = job_suffixes
+            .iter()
+            .enumerate()
+            .map(|(index, job_suffix)| {
+                let ordinal = u32::try_from(index + 1).unwrap_or(u32::MAX);
+                real_fragment_unbatched_request_with_track(temp, job_suffix, ordinal, None, ordinal)
+            })
+            .collect::<Vec<_>>();
+        prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
+            requests,
+            generated_test_batch_id(batch_id),
+            real_fragment_album_dir(temp),
+            real_fragment_source_root(temp),
+        )
+        .expect("folder dispatcher wires album batch context")
+        .requests
+    }
+
+    fn real_fragment_request(
+        temp: &Path,
+        batch_id: &str,
+        expected_track_count: usize,
+        job_suffix: &str,
+    ) -> PipelineRequest {
+        let mut suffixes = (1..expected_track_count)
+            .map(|index| format!("{job_suffix}-batch-peer-{index}"))
+            .collect::<Vec<_>>();
+        suffixes.push(job_suffix.to_string());
+        let suffix_refs = suffixes.iter().map(String::as_str).collect::<Vec<_>>();
+        real_fragment_dispatched_requests(temp, batch_id, &suffix_refs)
+            .into_iter()
+            .find(|req| req.item_id == format!("item-{job_suffix}"))
+            .expect("requested job is part of dispatcher-created album batch")
+    }
+
+    fn real_fragment_source(
+        temp: &Path,
+        disc_number: Option<u32>,
+        track_number: u32,
+        source_ordinal: u32,
+        total_tracks_tag: u32,
+    ) -> PreparedSource {
+        let mut source = log_test_source();
+        let source_root = real_fragment_source_root(temp);
+        let disc_component = disc_number
+            .map(|disc| format!("Disc {disc}"))
+            .unwrap_or_else(|| "Disc 1".to_string());
+        source.kind = SourceKind::SingleFile;
+        source.container = source_root
+            .join(disc_component)
+            .join(format!("{track_number:02}.wav"));
+        source.tracks.truncate(1);
+        source.tracks[0].id = TrackId {
+            source_ordinal,
+            disc_number,
+            track_number,
+        };
+        source.tracks[0].source_ref = TrackSourceRef::StagedFile(source.container.clone());
+        source.tracks[0].metadata.title = Some(format!("Track {track_number}"));
+        source.tracks[0].metadata.track_number = Some(track_number);
+        source.tracks[0].metadata.disc_number = disc_number;
+        source.album_metadata.album = Some("Test Album".to_string());
+        source.album_metadata.album_artist = Some("Test Artist".to_string());
+        source.album_metadata.total_tracks = total_tracks_tag;
+        source.album_metadata.disc_number = disc_number;
+        source.provenance.source_kind = SourceKind::SingleFile;
+        source
+    }
+
+    fn real_fragment_record(
+        disc_number: Option<u32>,
+        track_number: u32,
+        source_ordinal: u32,
+        ok: bool,
+        output_file: Option<PathBuf>,
+    ) -> TrackRecord {
+        let mut record = if ok { ok_record() } else { failed_record() };
+        record.track_id = TrackId {
+            source_ordinal,
+            disc_number,
+            track_number,
+        };
+        record.source_ref = TrackSourceRef::StagedFile(PathBuf::from(format!(
+            "/source/{track_number:02}.wav"
+        )));
+        record.realized_input = Some(PathBuf::from(format!("/realized/{track_number:02}.wav")));
+        record.output_file = output_file;
+        if ok {
+            record.outcome = TrackOutcome::Ok;
+            record.bytes_out = Some(1024 + u64::from(track_number));
+            record.duration = Some(Duration::from_secs(60 + u64::from(track_number)));
+        } else {
+            record.outcome = TrackOutcome::Err(format!("track {track_number} encode failed"));
+            record.bytes_out = None;
+            record.duration = None;
+            record.commands = Vec::new();
+        }
+        record
+    }
+
+    fn real_fragment_audio_artifacts(
+        staging: &StagingDir,
+        album_dir: &Path,
+        disc_number: Option<u32>,
+        track_number: u32,
+        source_ordinal: u32,
+        audio_name: &str,
+        audio_bytes: &[u8],
+    ) -> ArtifactSet {
+        let staged_audio = staging.root.join(audio_name);
+        if let Some(parent) = staged_audio.parent() {
+            std::fs::create_dir_all(parent).expect("real fragment staged audio parent");
+        }
+        std::fs::write(&staged_audio, audio_bytes).expect("real fragment staged audio");
+        ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                track_id: TrackId {
+                    source_ordinal,
+                    disc_number,
+                    track_number,
+                },
+                staged_path: staged_audio,
+                final_path: album_dir.join(audio_name),
+                samples: Some(44_100),
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                metadata_required: PlannedMetadataSatisfaction::none(),
+                planned_command_hash: None,
+            }]),
+            sidecars: Vec::new(),
+        }
+    }
+
+    fn real_fragment_empty_artifacts() -> ArtifactSet {
+        ArtifactSet {
+            audio: AudioArtifacts::Tracks(Vec::new()),
+            sidecars: Vec::new(),
+        }
+    }
+
+    async fn real_fragment_plan_through_features(
+        temp: &Path,
+        stage_name: &str,
+        req: &PipelineRequest,
+        source: &PreparedSource,
+        outcome: &AlbumOutcome,
+        artifacts: ArtifactSet,
+    ) -> (StagingDir, PublishPlan) {
+        let staging = StagingDir::new(temp.join(stage_name), stage_name.to_string());
+        std::fs::create_dir_all(&staging.root).expect("real fragment feature staging root");
+        let runner = crate::convert::pipeline::tool::StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let (staged, _features) = run_features(
+            artifacts,
+            outcome,
+            source,
+            req,
+            &staging,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("real feature path stages conversion-log sidecars");
+        let plan = build_publish_plan(&staged, req)
+            .expect("real feature path builds publish plan from staged artifacts");
+        (staging, plan)
+    }
+
+    async fn publish_successful_real_fragment_job(
+        temp: &Path,
+        batch_id: &str,
+        expected_track_count: usize,
+        stage_name: &str,
+        job_suffix: &str,
+        disc_number: Option<u32>,
+        track_number: u32,
+        source_ordinal: u32,
+        total_tracks_tag: u32,
+        audio_name: &str,
+        audio_bytes: &[u8],
+    ) -> (PipelineRequest, PublishPlan, PublishedAlbum) {
+        let album_dir = real_fragment_album_dir(temp);
+        std::fs::create_dir_all(temp.join("out")).expect("real fragment output root");
+        let mut req = real_fragment_request(temp, batch_id, expected_track_count, job_suffix);
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(source_ordinal, disc_number, track_number));
+        let source = real_fragment_source(
+            temp,
+            disc_number,
+            track_number,
+            source_ordinal,
+            total_tracks_tag,
+        );
+        let staging = StagingDir::new(temp.join(format!("{stage_name}-audio")), format!("{stage_name}-audio"));
+        std::fs::create_dir_all(&staging.root).expect("temporary artifact staging root");
+        let artifacts = real_fragment_audio_artifacts(
+            &staging,
+            &album_dir,
+            disc_number,
+            track_number,
+            source_ordinal,
+            audio_name,
+            audio_bytes,
+        );
+        let output_file = Some(album_dir.join(audio_name));
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![real_fragment_record(
+                disc_number,
+                track_number,
+                source_ordinal,
+                true,
+                output_file,
+            )],
+            stages: stage_records(),
+        };
+        let (feature_staging, plan) = real_fragment_plan_through_features(
+            temp,
+            stage_name,
+            &req,
+            &source,
+            &outcome,
+            artifacts,
+        )
+        .await;
+        let published = publish_album_output(feature_staging, &plan, req.publish.clone(), None)
+            .expect("real fragment publish succeeds");
+        (req, plan, published)
+    }
+
+    #[test]
+    fn fragment_mode_stages_only_hidden_fragment_sidecar() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("out").join("Album");
+        let source_root = temp.path().join("source-root");
+
+        let mut source = log_test_source();
+        source.kind = SourceKind::SingleFile;
+        source.container = source_root.join("01.wav");
+        source.tracks.truncate(1);
+
+        let mut req = log_test_request();
+        req.output_root = temp.path().join("out");
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id("batch-no-standalone-log"),
+            2,
+            album_dir.clone(),
+            source_root,
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        req.container = source.container.clone();
+
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                track_id: TrackId {
+                    source_ordinal: 1,
+                    disc_number: Some(1),
+                    track_number: 1,
+                },
+                staged_path: temp.path().join("encoded/01.flac"),
+                final_path: album_dir.join("01.flac"),
+                samples: Some(44_100),
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                metadata_required: PlannedMetadataSatisfaction::none(),
+                planned_command_hash: None,
+            }]),
+            sidecars: Vec::new(),
+        };
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let staging = StagingDir::new(temp.path().join("stage-no-standalone"), "stage-no-standalone".to_string());
+
+        let staged = stage_conversion_log_sidecars(
+            artifacts,
+            &outcome,
+            &source,
+            &req,
+            &staging,
+        )
+        .expect("fragment sidecar staging succeeds");
+
+        assert!(
+            staged.sidecars.iter().any(|sidecar| {
+                matches!(
+                    &sidecar.kind,
+                    SidecarKind::Other(kind) if kind == CONVERSION_LOG_FRAGMENT_SIDE_KIND
+                )
+            }),
+            "fragment-backed jobs stage the hidden fragment"
+        );
+        assert!(
+            staged
+                .sidecars
+                .iter()
+                .all(|sidecar| !matches!(sidecar.kind, SidecarKind::ConversionLog)),
+            "fragment-backed jobs must not stage a standalone one-track conversion.log"
+        );
+        assert!(
+            !staging.root.join("conversion.log").exists(),
+            "fragment mode should avoid building the visible standalone log entirely"
+        );
+    }
+
+    #[test]
+    fn fragment_assembled_log_matches_canonical_multitrack_formatter_for_equivalent_data() {
+        let source = log_test_source();
+        let mut req = log_test_request();
+        let mut second = failed_record();
+        second.outcome = TrackOutcome::Ok;
+        second.output_file = Some(PathBuf::from("/encoded/02.flac"));
+        second.bytes_out = Some(1536);
+        second.duration = Some(Duration::from_secs(70));
+        let tracks = vec![ok_record(), second];
+        let outcome = AlbumOutcome::Complete {
+            tracks: tracks.clone(),
+            stages: stage_records(),
+        };
+        let artifacts = log_test_artifacts();
+        let generated_at = fragment_test_time(42);
+        let canonical = build_conversion_log_at(
+            &outcome,
+            &source,
+            &req,
+            &artifacts,
+            None,
+            generated_at,
+        );
+        let album_dir = PathBuf::from("/out/Test Artist/Test Album");
+        req.album_batch = Some(fragment_test_album_batch(
+            &album_dir,
+            "batch-canonical-format",
+            tracks.len(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let mut fragments: Vec<_> = tracks
+            .iter()
+            .map(|record| {
+                canonical_fragment_from_record(
+                    &album_dir,
+                    "batch-canonical-format",
+                    &source,
+                    &req,
+                    &artifacts,
+                    &outcome,
+                    record,
+                    generated_at,
+                )
+            })
+            .collect();
+        fragments.reverse();
+
+        let assembled = build_conversion_log_from_fragments(&fragments);
+
+        assert!(
+            assembled.contains("Source kind: folder album batch"),
+            "fragment-assembled folder albums must use the dispatcher album/folder source context"
+        );
+        assert!(
+            assembled.contains("Per-Track Results\n-----------------"),
+            "fragment assembly still uses the canonical conversion-log section layout"
+        );
+        assert!(
+            canonical.contains("Per-Track Results\n-----------------")
+                && assembled.contains("Overall Summary\n---------------"),
+            "normal and fragment paths share the canonical formatter section structure"
+        );
+    }
+
+    #[test]
+    fn all_blocked_fragment_assembly_uses_canonical_blocked_result_label() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        let mut req = log_test_request();
+        let mut blocked = ok_record();
+        blocked.outcome = TrackOutcome::Blocked("encoder unavailable".to_string());
+        blocked.output_file = None;
+        blocked.bytes_out = None;
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: vec![blocked.clone()],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Convert,
+                outcome: StageOutcome::Failed("encoder unavailable".to_string()),
+                dsd_dst_stats: None,
+            }],
+            reason: BlockReason::TrackFailures,
+        };
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(Vec::new()),
+            sidecars: Vec::new(),
+        };
+        let generated_at = fragment_test_time(43);
+        let canonical = build_conversion_log_at(
+            &outcome,
+            &source,
+            &req,
+            &artifacts,
+            None,
+            generated_at,
+        );
+        let album_dir = PathBuf::from("/out/Test Artist/Test Album");
+        req.album_batch = Some(fragment_test_album_batch(
+            &album_dir,
+            "batch-blocked-format",
+            1,
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let fragment = canonical_fragment_from_record(
+            &album_dir,
+            "batch-blocked-format",
+            &source,
+            &req,
+            &artifacts,
+            &outcome,
+            &blocked,
+            generated_at,
+        );
+
+        let assembled = build_conversion_log_from_fragments(&[fragment]);
+
+        assert!(assembled.contains("Result: Blocked (track failures)"));
+        assert!(canonical.contains("Result: Blocked (track failures)"));
+        assert!(
+            assembled.contains("Source kind: folder album batch"),
+            "blocked fragment assembly still uses album/folder source context instead of representative SingleFile metadata"
+        );
+    }
+
+    #[test]
+    fn fragment_expected_count_requires_dispatcher_album_batch_contract() {
+        let mut req = log_test_request();
+        req.expected_album_track_count = Some(99);
+
+        let err = conversion_log_expected_track_count(&req)
+            .expect_err("fragment mode must not infer album completion from tags or deprecated count fields");
+        assert!(
+            err.to_string().contains("PipelineRequest::album_batch"),
+            "error explains the missing dispatcher batch contract: {err}"
+        );
+
+        let album_dir = PathBuf::from("/out/Artist/Album");
+        req.album_batch = Some(fragment_test_album_batch(&album_dir, "batch-contract", 2));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+        assert_eq!(
+            conversion_log_expected_track_count(&req).expect("batch contract supplies expected count"),
+            2
+        );
+    }
+
+    #[test]
+    fn tag_total_tracks_never_drive_fragment_completion_threshold() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("out").join("Artist - Album");
+        let source_root = temp.path().join("source").join("Artist - Album");
+
+        let mut req = log_test_request();
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id("batch-tags-ignored-for-count"),
+            4,
+            album_dir.clone(),
+            source_root.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        req.container = source_root.join("01.wav");
+        req.expected_album_track_count = Some(1);
+
+        let mut source = prepared_source(
+            &source_root,
+            &[TrackId {
+                source_ordinal: 1,
+                disc_number: Some(1),
+                track_number: 1,
+            }],
+        );
+        source.kind = SourceKind::SingleFile;
+        source.container = source_root.join("01.wav");
+        source.album_metadata.total_tracks = 1;
+
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(Vec::new()),
+            sidecars: Vec::new(),
+        };
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let staging = StagingDir::new(temp.path().join("stage-tags"), "stage-tags".to_string());
+
+        let (_staged, _name) = stage_conversion_log_fragment(
+            &outcome,
+            &source,
+            &req,
+            &artifacts,
+            &album_dir,
+            None,
+            fragment_test_time(44),
+            &staging,
+        )
+        .expect("fragment uses dispatcher batch count, not tag totals");
+        let fragment = read_conversion_log_fragment_file(&staging.root.join(".conversion-log-fragment.json"))
+            .expect("fragment json");
+
+        assert_eq!(fragment.expected_track_count, 4);
+        assert_eq!(conversion_log_expected_track_count(&req).expect("dispatcher count"), 4);
+    }
+
+    #[test]
+    fn album_batch_context_rejects_empty_or_zero_identity_fields() {
+        let mut invalid = fragment_test_album_batch(Path::new("/out/Album"), "", 2);
+        assert!(validate_album_batch_context(&invalid).is_err());
+        invalid.conversion_log_batch_id = "batch".to_string();
+        invalid.expected_track_count = 0;
+        assert!(validate_album_batch_context(&invalid).is_err());
+    }
+
+    #[test]
+    fn fragment_publish_plan_separates_payload_count_from_album_expected_count() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let fragment = fragment_test_fragment(
+            &album_dir,
+            "batch-count-semantics",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+
+        let (_stage, plan) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "stage-count-semantics",
+            &fragment,
+            Some(("01.flac", b"audio-one")),
+            b"standalone log must be suppressed\n",
+        );
+
+        assert_eq!(plan.source_audio_track_count, 1, "payload count remains the current single-track job");
+        assert_eq!(plan.expected_album_track_count, 2, "album expected count is the last-track threshold");
+        assert!(is_incremental_single_audio_publish(&plan), "fragment-backed single-track jobs remain incremental even for multi-track albums");
+
+        let (_failed_stage, failed_plan) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "stage-count-semantics-failed",
+            &fragment,
+            None,
+            b"failed standalone log must be suppressed\n",
+        );
+        assert_eq!(failed_plan.source_audio_track_count, 0, "a failed-track fragment has no audio payload");
+        assert_eq!(failed_plan.expected_album_track_count, 2);
+        assert!(is_incremental_single_audio_publish(&failed_plan));
+    }
+
+    #[test]
+    fn fragment_publish_phase_order_keeps_final_log_behind_audio_payload() {
+        assert_eq!(
+            incremental_publish_phase(&PublishRole::Audio),
+            IncrementalPublishPhase::AudioPayload,
+            "successful track audio is the first mutation phase"
+        );
+        assert_eq!(
+            incremental_publish_phase(&PublishRole::Sidecar(SidecarKind::Other(
+                "album.cue".to_string()
+            ))),
+            IncrementalPublishPhase::NonFragmentSidecar,
+            "ordinary sidecars are published after audio but before the fragment trigger"
+        );
+        assert_eq!(
+            incremental_publish_phase(&PublishRole::Sidecar(SidecarKind::Other(
+                CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string()
+            ))),
+            IncrementalPublishPhase::ConversionLogFragment,
+            "the hidden conversion-log fragment is the last publish phase before assembly"
+        );
+    }
+
+    #[test]
+    fn final_fragment_assembly_is_idempotent_for_same_batch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let identity = fragment_test_identity(&album_dir, "batch-idempotent", Some("settings-a"));
+
+        let track_one = fragment_test_fragment(
+            &album_dir,
+            "batch-idempotent",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        let track_two = fragment_test_fragment(
+            &album_dir,
+            "batch-idempotent",
+            Some("settings-a"),
+            2,
+            2,
+            "Track 2\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        write_album_fragment(&album_dir, "track-one.json", &track_one);
+        write_album_fragment(&album_dir, "track-two.json", &track_two);
+
+        let first = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&identity))
+            .expect("first assembly succeeds")
+            .expect("complete batch assembles");
+        let second = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&identity))
+            .expect("second assembly succeeds")
+            .expect("complete batch assembles again");
+
+        assert_eq!(first, second, "re-running final assembly for the same complete batch is deterministic");
+    }
+
+    #[test]
+    fn fragment_batch_identity_is_independent_of_per_track_job_ids() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let identity = fragment_test_identity(&album_dir, "shared-conversion-log-batch", Some("settings-a"));
+
+        let mut track_one = fragment_test_fragment(
+            &album_dir,
+            "shared-conversion-log-batch",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        track_one.common.representative_job_id = "track-job-0001".to_string();
+        let mut track_two = fragment_test_fragment(
+            &album_dir,
+            "shared-conversion-log-batch",
+            Some("settings-a"),
+            2,
+            2,
+            "Track 2\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        track_two.common.representative_job_id = "track-job-0002".to_string();
+
+        write_album_fragment(&album_dir, "track-one.json", &track_one);
+        write_album_fragment(&album_dir, "track-two.json", &track_two);
+
+        let log = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&identity))
+            .expect("assembly succeeds with shared conversion-log batch id")
+            .expect("complete batch assembles");
+
+        assert!(log.contains("Job ID: track-job-0001"));
+        assert!(log.contains("Track 1\n  Result: ok"));
+        assert!(log.contains("Track 2\n  Result: ok"));
+    }
+
+    #[test]
+    fn cancellation_finalization_uses_full_batch_identity_including_source_context() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source_root = temp.path().join("source-root");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        std::fs::create_dir_all(&source_root).expect("source root");
+
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id("batch-cancel-source-context"),
+            2,
+            album_dir.clone(),
+            source_root.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        req.container = source_root.join("01.flac");
+
+        let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
+        let target_identity = conversion_log_batch_identity(
+            &req,
+            &album_dir,
+            Some(settings_fingerprint.as_str()),
+        )
+        .expect("strict target identity");
+
+        let mut matching = fragment_test_fragment(
+            &album_dir,
+            "batch-cancel-source-context",
+            Some(settings_fingerprint.as_str()),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        matching.batch_identity = target_identity.clone();
+
+        let mut mismatched_source_context = fragment_test_fragment(
+            &album_dir,
+            "batch-cancel-source-context",
+            Some(settings_fingerprint.as_str()),
+            2,
+            2,
+            "Track 2\n  Result: stale\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        mismatched_source_context.batch_identity = target_identity;
+        mismatched_source_context.batch_identity.source_context_kind = "single file".to_string();
+        mismatched_source_context.batch_identity.source_context_path = source_root
+            .join("02.flac")
+            .display()
+            .to_string();
+
+        let matching_path = write_album_fragment(&album_dir, "matching.json", &matching);
+        let mismatched_path = write_album_fragment(
+            &album_dir,
+            "mismatched-source-context.json",
+            &mismatched_source_context,
+        );
+
+        let files = read_cancelled_conversion_log_fragment_files(&album_dir, &req)
+            .expect("cancelled fragment scan uses normal identity matching");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].fragment.sort_key.track_number, 1);
+        assert!(matching_path.exists());
+        assert!(
+            !mismatched_path.exists(),
+            "source-context mismatches must be quarantined during cancellation just as during normal completion"
+        );
+        assert!(
+            album_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR).exists(),
+            "the mismatched fragment should be retained only behind the quarantine boundary until finalization cleanup"
+        );
+    }
+
+    #[test]
+    fn fragment_assembled_log_uses_album_batch_source_context_not_representative_single_file() {
+        let album_dir = PathBuf::from("/out/Artist/Album");
+        let mut fragment = fragment_test_fragment(
+            &album_dir,
+            "batch-source-context",
+            Some("settings-a"),
+            1,
+            1,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        fragment.batch_identity.source_context_path = "/music/Artist/Album".to_string();
+        fragment.batch_identity.source_context_kind = "folder album batch".to_string();
+
+        let log = build_conversion_log_from_fragments(&[fragment]);
+
+        assert!(log.contains("Container path: /music/Artist/Album"));
+        assert!(log.contains("Source kind: folder album batch"));
+        assert!(
+            !log.contains("Source kind: single file"),
+            "the unified album log must not invent or inherit representative single-track source kind"
+        );
+        assert!(
+            !log.contains("Container path: /music/Artist/Album/01.wav"),
+            "the unified album log must not show an arbitrary track path as the album container"
+        );
+    }
+
+    #[test]
+    fn fragment_representative_header_uses_full_canonical_first_track_key() {
+        let album_dir = PathBuf::from("/out/Artist/Album");
+        let mut disc_one_track_two = fragment_test_fragment(
+            &album_dir,
+            "batch-representative-key",
+            Some("settings-a"),
+            2,
+            2,
+            "Disc 1 Track 2\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        disc_one_track_two.sort_key = ConversionLogTrackSortKey {
+            disc_number: 1,
+            track_number: 2,
+            source_ordinal: 20,
+        };
+        disc_one_track_two.common.representative_job_id = "disc-one-track-two-job".to_string();
+        disc_one_track_two.common.representative_item_id = "disc-one-track-two-item".to_string();
+
+        let mut disc_two_track_one = fragment_test_fragment(
+            &album_dir,
+            "batch-representative-key",
+            Some("settings-a"),
+            1,
+            2,
+            "Disc 2 Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        disc_two_track_one.sort_key = ConversionLogTrackSortKey {
+            disc_number: 2,
+            track_number: 1,
+            source_ordinal: 10,
+        };
+        disc_two_track_one.common.representative_job_id = "disc-two-track-one-job".to_string();
+        disc_two_track_one.common.representative_item_id = "disc-two-track-one-item".to_string();
+
+        let log = build_conversion_log_from_fragments(&[disc_two_track_one, disc_one_track_two]);
+
+        assert!(
+            log.contains("Job ID: disc-one-track-two-job"),
+            "representative/header metadata must come from the lowest disc/track/source key, not from any fragment whose track number is 1"
+        );
+        assert!(log.contains("Item ID: disc-one-track-two-item"));
+        assert!(!log.contains("Job ID: disc-two-track-one-job"));
+        assert!(
+            log.find("Disc 1 Track 2").expect("disc 1 section")
+                < log.find("Disc 2 Track 1").expect("disc 2 section"),
+            "track sections remain sorted by the same canonical key"
+        );
+    }
+
+    #[test]
+    fn fragment_representative_header_uses_earliest_sorted_fragment_when_track_one_is_absent() {
+        let album_dir = PathBuf::from("/out/Artist/Album");
+        let mut track_seven = fragment_test_fragment(
+            &album_dir,
+            "batch-no-track-one",
+            Some("settings-a"),
+            7,
+            2,
+            "Track 7\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(7),
+        );
+        track_seven.sort_key = ConversionLogTrackSortKey {
+            disc_number: 1,
+            track_number: 7,
+            source_ordinal: 7,
+        };
+        track_seven.common.representative_job_id = "track-seven-job".to_string();
+
+        let mut track_eight = fragment_test_fragment(
+            &album_dir,
+            "batch-no-track-one",
+            Some("settings-a"),
+            8,
+            2,
+            "Track 8\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(8),
+        );
+        track_eight.sort_key = ConversionLogTrackSortKey {
+            disc_number: 1,
+            track_number: 8,
+            source_ordinal: 8,
+        };
+        track_eight.common.representative_job_id = "track-eight-job".to_string();
+
+        let log = build_conversion_log_from_fragments(&[track_eight, track_seven]);
+
+        assert!(
+            log.contains("Job ID: track-seven-job"),
+            "albums with nonstandard numbering and no track 1 use the earliest canonical sort key as the deterministic representative"
+        );
+        assert!(!log.contains("Job ID: track-eight-job"));
+    }
+
+    #[test]
+    fn fragment_common_metadata_is_enriched_from_later_source_aware_fragment() {
+        let album_dir = PathBuf::from("/out/Artist/Album");
+        let mut failed_first = fragment_test_fragment(
+            &album_dir,
+            "batch-common-merge",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1
+  Status: Blocked
+",
+            ConversionLogTrackOutcome::Blocked,
+            fragment_test_time(1),
+        );
+        failed_first.common.representative_job_id = "failed-first-job".to_string();
+        failed_first.common.representative_item_id = "failed-first-item".to_string();
+        failed_first.common.album_artist = None;
+        failed_first.common.album = None;
+        failed_first.common.year = None;
+        failed_first.common.genre = None;
+        failed_first.common.catalog_number = None;
+        failed_first.common.source_blocking_lines.clear();
+        failed_first.common.provenance_section.clear();
+        failed_first.common.artwork_section.clear();
+        failed_first.common.conversion_settings_section = "Target format: FLAC
+Request-only setting: yes
+".to_string();
+
+        let mut successful_later = fragment_test_fragment(
+            &album_dir,
+            "batch-common-merge",
+            Some("settings-a"),
+            2,
+            2,
+            "Track 2
+  Status: Success
+",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        successful_later.common.representative_job_id = "successful-later-job".to_string();
+        successful_later.common.representative_item_id = "successful-later-item".to_string();
+        successful_later.common.album_artist = Some("Recovered Artist".to_string());
+        successful_later.common.album = Some("Recovered Album".to_string());
+        successful_later.common.year = Some("2026".to_string());
+        successful_later.common.genre = Some("Recovered Genre".to_string());
+        successful_later.common.catalog_number = Some("CAT-32".to_string());
+        successful_later.common.provenance_section = "Provenance
+----------
+Recovered provenance
+
+".to_string();
+        successful_later.common.artwork_section = "Artwork: recovered cover
+
+".to_string();
+        successful_later.common.conversion_settings_section = "Target format: FLAC
+Source-aware setting: yes
+".to_string();
+
+        let log = build_conversion_log_from_fragments(&[successful_later, failed_first]);
+
+        assert!(
+            log.contains("Job ID: failed-first-job"),
+            "job/header identity remains anchored to the first canonical sorted fragment"
+        );
+        assert!(!log.contains("Job ID: successful-later-job"));
+        assert!(log.contains("Album artist: Recovered Artist"));
+        assert!(log.contains("Album: Recovered Album"));
+        assert!(log.contains("Genre: Recovered Genre"));
+        assert!(log.contains("Catalog number: CAT-32"));
+        assert!(log.contains("Recovered provenance"));
+        assert!(log.contains("Artwork: recovered cover"));
+        assert!(
+            log.contains("Source-aware setting: yes"),
+            "conversion settings should prefer the first source-aware common fragment over request-only settings"
+        );
+        assert!(
+            log.find("Track 1").expect("track 1 section")
+                < log.find("Track 2").expect("track 2 section"),
+            "metadata enrichment must not change track ordering"
+        );
+    }
+
+    #[test]
+    fn fragment_expected_count_mismatch_is_an_integrity_error() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let identity = fragment_test_identity(&album_dir, "batch-expected-mismatch", Some("settings-a"));
+        let fragment = fragment_test_fragment(
+            &album_dir,
+            "batch-expected-mismatch",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        write_album_fragment(&album_dir, "track-one.json", &fragment);
+
+        let err = assemble_conversion_log_from_fragments(&album_dir, 3, Some(&identity))
+            .expect_err("fragment expected-count drift must fail safely");
+        assert!(format!("{err:?}").contains("expected track count"));
+    }
+
+    #[test]
+    fn fragment_publishes_assemble_out_of_order_tracks_and_cleanup_after_full_count() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let publish = incremental_test_publish_policy();
+
+        let track_two = fragment_test_fragment(
+            &album_dir,
+            "batch-out-of-order",
+            Some("settings-a"),
+            2,
+            2,
+            "Track 2\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        let (stage_two, plan_two) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "stage-track-two-first",
+            &track_two,
+            Some(("02.flac", b"audio-two")),
+            b"standalone track-two log must be suppressed\n",
+        );
+        let first_publish = publish_album_output(stage_two, &plan_two, publish.clone(), None)
+            .expect("first out-of-order fragment publish succeeds");
+
+        assert_eq!(std::fs::read(album_dir.join("02.flac")).unwrap(), b"audio-two");
+        assert!(!album_dir.join("conversion.log").exists(), "incomplete batch must not expose a one-track log");
+        assert!(conversion_log_fragment_dir(&album_dir).is_dir(), "first fragment remains recoverable");
+        assert!(first_publish
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry.role, PublishRole::Sidecar(SidecarKind::ConversionLog))));
+
+        let track_one = fragment_test_fragment(
+            &album_dir,
+            "batch-out-of-order",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        let (stage_one, plan_one) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "stage-track-one-second",
+            &track_one,
+            Some(("01.flac", b"audio-one")),
+            b"standalone track-one log must be suppressed\n",
+        );
+        let second_publish = publish_album_output(stage_one, &plan_one, publish, None)
+            .expect("second fragment publish assembles album log");
+
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+        assert_eq!(std::fs::read(album_dir.join("02.flac")).unwrap(), b"audio-two");
+        assert!(second_publish
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.role, PublishRole::Sidecar(SidecarKind::ConversionLog))));
+        let log = std::fs::read_to_string(album_dir.join("conversion.log")).expect("assembled log");
+        let track_one_pos = log.find("Track 1\n  Result: ok").expect("track one in log");
+        let track_two_pos = log.find("Track 2\n  Result: ok").expect("track two in log");
+        assert!(track_one_pos < track_two_pos, "fragment assembly must use track order, not completion order");
+        assert!(!log.contains("standalone track-one log"));
+        assert!(!log.contains("standalone track-two log"));
+        assert!(!conversion_log_fragment_dir(&album_dir).exists(), "complete assembly cleans fragment directory");
+    }
+
+    #[test]
+    fn fragment_publish_includes_failed_track_without_audio_in_final_log() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let publish = incremental_test_publish_policy();
+
+        let ok_track = fragment_test_fragment(
+            &album_dir,
+            "batch-partial-failure",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        let (ok_stage, ok_plan) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "stage-ok-track",
+            &ok_track,
+            Some(("01.flac", b"audio-one")),
+            b"success standalone log must be suppressed\n",
+        );
+        publish_album_output(ok_stage, &ok_plan, publish.clone(), None)
+            .expect("successful sibling fragment publishes first");
+
+        let failed_track = fragment_test_fragment(
+            &album_dir,
+            "batch-partial-failure",
+            Some("settings-a"),
+            2,
+            2,
+            "Track 2\n  Result: failed\n  Error: encoder exited 1\n",
+            ConversionLogTrackOutcome::Failure,
+            fragment_test_time(2),
+        );
+        let (failed_stage, failed_plan) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "stage-failed-track",
+            &failed_track,
+            None,
+            b"failed standalone log must be suppressed\n",
+        );
+        publish_album_output(failed_stage, &failed_plan, publish, None)
+            .expect("failed track fragment publishes without audio payload");
+
+        assert!(!album_dir.join("02.flac").exists(), "failed track has no audio payload");
+        let log = std::fs::read_to_string(album_dir.join("conversion.log")).expect("assembled partial-failure log");
+        assert!(log.contains("Track 1\n  Result: ok"));
+        assert!(log.contains("Track 2\n  Result: failed"));
+        assert!(log.contains("1 successful / 1 failed / 2 total"));
+        assert!(log.contains("Partial (1/2 ok, 1 failed)"));
+        assert!(!conversion_log_fragment_dir(&album_dir).exists(), "failed-track assembly still cleans fragments");
+    }
+
+    #[test]
+    fn terminal_failed_single_track_job_publishes_fragment_without_features_stage() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let publish = incremental_test_publish_policy();
+
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let batch_id = generated_test_batch_id("batch-terminal-failure");
+        req.album_batch = Some(AlbumBatchContext::new(
+            batch_id.clone(),
+            2,
+            album_dir.clone(),
+            temp.path().to_path_buf(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(2, None, 2));
+        let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
+
+        let ok_track = fragment_test_fragment(
+            &album_dir,
+            &batch_id,
+            Some(settings_fingerprint.as_str()),
+            1,
+            2,
+            "Track 1
+  Status: Success
+",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        let (ok_stage, ok_plan) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "stage-terminal-ok-track",
+            &ok_track,
+            Some(("01.flac", b"audio-one")),
+            b"success standalone log must be suppressed
+",
+        );
+        publish_album_output(ok_stage, &ok_plan, publish, None)
+            .expect("successful sibling fragment publishes first");
+        assert!(!album_dir.join("conversion.log").exists());
+
+        let failed_track_id = track_id(1);
+        let source = prepared_source(temp.path(), &[failed_track_id.clone()]);
+        let failed_record = track_record(failed_track_id, false, None);
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: vec![failed_record],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Convert,
+                outcome: StageOutcome::Failed("encoder failed".to_string()),
+                dsd_dst_stats: None,
+            }],
+            reason: BlockReason::TrackFailures,
+        };
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(Vec::new()),
+            sidecars: Vec::new(),
+        };
+        let staging = StagingDir::new(
+            temp.path().join("stage-terminal-failed-track"),
+            "stage-terminal-failed-track".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("failure staging root");
+
+        let published = publish_terminal_conversion_log_fragment_if_needed(
+            &req,
+            Some(&source),
+            Some(&artifacts),
+            &outcome,
+            staging,
+        )
+        .expect("terminal failed track publishes a forensic fragment");
+
+        assert_eq!(published.album_dir, album_dir);
+        assert!(!album_dir.join("02.flac").exists(), "failed terminal job has no audio payload");
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("terminal failure completes and assembles final log");
+        assert!(log.contains("Track 1"));
+        assert!(log.contains("Track 2"));
+        assert!(log.contains("Status: Failure"));
+        assert!(log.contains("1 successful / 1 failed / 2 total"));
+        assert!(!conversion_log_fragment_dir(&album_dir).exists(), "terminal failure assembly cleans fragments");
+    }
+
+    #[tokio::test]
+    async fn pre_materialization_failure_fragment_completes_batch_using_dispatcher_track_context() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let batch_id = "pre-materialization-failure-batch";
+        let dispatched = real_fragment_dispatched_requests(
+            temp.path(),
+            batch_id,
+            &["good-track", "corrupt-track"],
+        );
+        let good_req = dispatched[0].clone();
+        let corrupt_req = dispatched[1].clone();
+
+        assert_eq!(
+            good_req.album_batch_track.as_ref().expect("good dispatcher track").track_number,
+            1
+        );
+        assert_eq!(
+            corrupt_req.album_batch_track.as_ref().expect("corrupt dispatcher track").track_number,
+            2
+        );
+
+        let good_source = real_fragment_source(temp.path(), Some(1), 1, 1, 99);
+        let good_stage = StagingDir::new(
+            temp.path().join("pre-materialization-good-audio"),
+            "pre-materialization-good-audio".to_string(),
+        );
+        std::fs::create_dir_all(&good_stage.root).expect("good staging root");
+        let good_artifacts = real_fragment_audio_artifacts(
+            &good_stage,
+            &album_dir,
+            Some(1),
+            1,
+            1,
+            "01.flac",
+            b"audio-one",
+        );
+        let good_outcome = AlbumOutcome::Complete {
+            tracks: vec![real_fragment_record(
+                Some(1),
+                1,
+                1,
+                true,
+                Some(album_dir.join("01.flac")),
+            )],
+            stages: stage_records(),
+        };
+        let (good_feature_staging, good_plan) = real_fragment_plan_through_features(
+            temp.path(),
+            "pre-materialization-good",
+            &good_req,
+            &good_source,
+            &good_outcome,
+            good_artifacts,
+        )
+        .await;
+        publish_album_output(good_feature_staging, &good_plan, good_req.publish.clone(), None)
+            .expect("good sibling publishes first");
+        assert!(!album_dir.join("conversion.log").exists());
+
+        let corrupt_staging = StagingDir::new(
+            temp.path().join("pre-materialization-corrupt"),
+            "pre-materialization-corrupt".to_string(),
+        );
+        std::fs::create_dir_all(&corrupt_staging.root).expect("corrupt staging root");
+        let corrupt_outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages: vec![StageRecord {
+                stage: PipelineStage::Materialize,
+                outcome: StageOutcome::Failed("unsupported or corrupt source".to_string()),
+                dsd_dst_stats: None,
+            }],
+            reason: BlockReason::MaterializeFailed,
+        };
+
+        let published = publish_terminal_conversion_log_fragment_if_needed(
+            &corrupt_req,
+            None,
+            None,
+            &corrupt_outcome,
+            corrupt_staging,
+        )
+        .expect("pre-materialization failure publishes a forensic fragment");
+
+        assert_eq!(published.album_dir, album_dir);
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("pre-materialization failure completes final album log");
+        let track_one = log.find("Disc 1, Track 1").expect("successful sibling appears");
+        let track_two = log.find("Track 2").expect("corrupt track appears from dispatcher identity");
+        assert!(track_one < track_two);
+        assert!(log.contains("Status: Failure"));
+        assert!(log.contains("Error: unsupported or corrupt source"));
+        assert!(log.contains("1 successful / 1 failed / 2 total"));
+        assert!(
+            !conversion_log_fragment_dir(&album_dir).exists(),
+            "final assembly cleans fragments after pre-materialization failure"
+        );
+    }
+
+    #[test]
+    fn cancelled_fragment_batch_assembles_partial_log_and_cleans_fragments() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let publish = incremental_test_publish_policy();
+
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        let batch_id = generated_test_batch_id("batch-cancelled");
+        req.album_batch = Some(AlbumBatchContext::new(
+            batch_id.clone(),
+            3,
+            album_dir.clone(),
+            temp.path().to_path_buf(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+        let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
+
+        let mut track_one = fragment_test_fragment(
+            &album_dir,
+            &batch_id,
+            Some(settings_fingerprint.as_str()),
+            1,
+            3,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        track_one.batch_identity.source_grouping_root = normalize_path(temp.path()).display().to_string();
+        let (stage_one, plan_one) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "stage-cancelled-track-one",
+            &track_one,
+            Some(("01.flac", b"audio-one")),
+            b"one-track standalone log must be suppressed\n",
+        );
+        publish_album_output(stage_one, &plan_one, publish, None)
+            .expect("incomplete fragment publish succeeds");
+
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+        assert!(!album_dir.join("conversion.log").exists(), "ordinary incomplete publish still suppresses the visible log");
+        assert!(conversion_log_fragment_dir(&album_dir).is_dir(), "fragment exists before cancellation finalization");
+
+        let mut stale_track = fragment_test_fragment(
+            &album_dir,
+            "batch-cancelled-old-run",
+            Some(settings_fingerprint.as_str()),
+            2,
+            3,
+            "Track 2\n  Result: stale cancelled old batch\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        stale_track.batch_identity.source_grouping_root = normalize_path(temp.path()).display().to_string();
+        write_album_fragment(&album_dir, "stale-cancelled-track-2.json", &stale_track);
+        std::fs::write(conversion_log_fragment_dir(&album_dir).join("corrupt-cancelled.json"), b"not json")
+            .expect("corrupt cancelled fragment");
+
+        let published = finalize_cancelled_conversion_log_batch_if_needed(&req)
+            .expect("cancellation finalization assembles a partial forensic log");
+        assert_eq!(published.album_dir, album_dir);
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("cancelled partial log is visible");
+        assert!(log.contains("Track 1\n  Result: ok"));
+        assert!(log.contains("1 successful / 0 failed / 3 total"));
+        assert!(log.contains("Batch status: cancelled before album batch completed; assembled partial log from 1 of 3 expected track fragment(s)"));
+        assert!(log.contains("Result: Cancelled partial (1/3 ok, 0 failed, 2 missing)"));
+        assert!(
+            !conversion_log_fragment_dir(&album_dir).exists(),
+            "cancellation finalization cleans matching fragments after writing the log"
+        );
+        assert!(
+            !album_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR).exists(),
+            "cancellation finalization also cleans quarantined stale/corrupt state for the album batch"
+        );
+    }
+
+    #[test]
+    fn stale_fragments_from_same_album_path_with_different_run_id_are_quarantined() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let old_run_id = generated_test_batch_id("rerun-old-attempt");
+        let current_run_id = generated_test_batch_id("rerun-current-attempt");
+        let current_identity = fragment_test_identity(&album_dir, &current_run_id, Some("settings-current"));
+
+        let current_track = fragment_test_fragment(
+            &album_dir,
+            &current_run_id,
+            Some("settings-current"),
+            1,
+            2,
+            "Track 1
+  Result: current run
+",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(10),
+        );
+        write_album_fragment(&album_dir, "current-run-track-1.json", &current_track);
+
+        let old_stale_track = fragment_test_fragment(
+            &album_dir,
+            &old_run_id,
+            Some("settings-current"),
+            2,
+            2,
+            "Track 2
+  Result: stale old run must not complete current run
+",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        write_album_fragment(&album_dir, "old-run-track-2.json", &old_stale_track);
+
+        let assembled = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&current_identity))
+            .expect("old-run fragments are quarantined rather than mixed into current run");
+        assert!(assembled.is_none(), "a stale fragment from a prior run must not satisfy the current run's expected count");
+        assert!(conversion_log_fragment_quarantine_dir(&album_dir, "stale-fragment-batch").is_dir());
+        assert!(conversion_log_fragment_dir(&album_dir).join("current-run-track-1.json").exists());
+        assert!(!conversion_log_fragment_dir(&album_dir).join("old-run-track-2.json").exists());
+    }
+
+    #[test]
+    fn stale_invalid_and_settings_mismatched_fragments_do_not_complete_current_batch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let current_identity = fragment_test_identity(&album_dir, "batch-current", Some("settings-current"));
+
+        let current_track = fragment_test_fragment(
+            &album_dir,
+            "batch-current",
+            Some("settings-current"),
+            1,
+            2,
+            "Track 1\n  Result: current\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        write_album_fragment(&album_dir, "current-track-1.json", &current_track);
+
+        let stale_track = fragment_test_fragment(
+            &album_dir,
+            "batch-old",
+            Some("settings-current"),
+            2,
+            2,
+            "Track 2\n  Result: stale old batch\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        write_album_fragment(&album_dir, "stale-track-2.json", &stale_track);
+
+        let mismatched_settings = fragment_test_fragment(
+            &album_dir,
+            "batch-current",
+            Some("settings-old"),
+            2,
+            2,
+            "Track 2\n  Result: stale old settings\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(3),
+        );
+        write_album_fragment(&album_dir, "mismatched-settings-track-2.json", &mismatched_settings);
+
+        std::fs::write(conversion_log_fragment_dir(&album_dir).join("corrupt.json"), b"not json")
+            .expect("corrupt fragment");
+
+        let assembled = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&current_identity))
+            .expect("invalid and stale fragments are quarantined, not fatal");
+        assert!(assembled.is_none(), "stale or mismatched fragments must not satisfy expected count");
+        assert!(conversion_log_fragment_quarantine_dir(&album_dir, "stale-fragment-batch").is_dir());
+        assert!(conversion_log_fragment_quarantine_dir(&album_dir, "mismatched-fragment-batch-fingerprint").is_dir());
+        assert!(conversion_log_fragment_quarantine_dir(&album_dir, "invalid-fragment").is_dir());
+        assert!(conversion_log_fragment_dir(&album_dir).join("current-track-1.json").exists());
+        assert!(!conversion_log_fragment_dir(&album_dir).join("stale-track-2.json").exists());
+        assert!(!conversion_log_fragment_dir(&album_dir).join("mismatched-settings-track-2.json").exists());
+        assert!(!conversion_log_fragment_dir(&album_dir).join("corrupt.json").exists());
+    }
+
+    #[test]
+    fn successful_finalization_cleans_quarantine_for_finalized_album_batch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let identity = fragment_test_identity(&album_dir, "batch-clean-quarantine", Some("settings-current"));
+
+        let current_track = fragment_test_fragment(
+            &album_dir,
+            "batch-clean-quarantine",
+            Some("settings-current"),
+            1,
+            2,
+            "Track 1\n  Result: current\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        write_album_fragment(&album_dir, "current-track-1.json", &current_track);
+
+        let stale_track = fragment_test_fragment(
+            &album_dir,
+            "batch-clean-quarantine-old-run",
+            Some("settings-current"),
+            2,
+            2,
+            "Track 2\n  Result: stale old batch\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        write_album_fragment(&album_dir, "stale-track-2.json", &stale_track);
+        std::fs::write(conversion_log_fragment_dir(&album_dir).join("corrupt.json"), b"not json")
+            .expect("corrupt fragment");
+
+        let assembled = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&identity))
+            .expect("stale fragments are quarantined before final assembly");
+        assert!(assembled.is_none());
+        assert!(album_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR).is_dir());
+
+        let current_track_two = fragment_test_fragment(
+            &album_dir,
+            "batch-clean-quarantine",
+            Some("settings-current"),
+            2,
+            2,
+            "Track 2\n  Result: current\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(3),
+        );
+        write_album_fragment(&album_dir, "current-track-2.json", &current_track_two);
+        let final_log = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&identity))
+            .expect("complete current batch assembles")
+            .expect("complete current batch log");
+        std::fs::write(album_dir.join("conversion.log"), final_log).expect("assembled log");
+
+        cleanup_complete_conversion_log_fragments(&album_dir, 2, Some(&identity));
+
+        assert!(!conversion_log_fragment_dir(&album_dir).exists(), "active fragments are cleaned");
+        assert!(
+            !album_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR).exists(),
+            "quarantine for the finalized album batch is cleaned after the authoritative log is written"
+        );
+    }
+
+    #[test]
+    fn duplicate_track_fragments_choose_newest_deterministically_and_quarantine_loser() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let identity = fragment_test_identity(&album_dir, "batch-duplicate", Some("settings-a"));
+
+        let older = fragment_test_fragment(
+            &album_dir,
+            "batch-duplicate",
+            Some("settings-a"),
+            1,
+            1,
+            "Track 1\n  Result: older stale duplicate\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        let newer = fragment_test_fragment(
+            &album_dir,
+            "batch-duplicate",
+            Some("settings-a"),
+            1,
+            1,
+            "Track 1\n  Result: newest duplicate\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        write_album_fragment(&album_dir, "a-older.json", &older);
+        write_album_fragment(&album_dir, "b-newer.json", &newer);
+
+        let log = assemble_conversion_log_from_fragments(&album_dir, 1, Some(&identity))
+            .expect("duplicate fragments resolve deterministically")
+            .expect("single newest duplicate completes expected count");
+
+        assert!(log.contains("Track 1\n  Result: newest duplicate"));
+        assert!(!log.contains("older stale duplicate"));
+        assert!(conversion_log_fragment_quarantine_dir(&album_dir, "superseded-duplicate-fragment").is_dir());
+        assert!(!conversion_log_fragment_dir(&album_dir).join("a-older.json").exists());
+        assert!(conversion_log_fragment_dir(&album_dir).join("b-newer.json").exists());
+    }
+
+
+    #[test]
+    fn folder_dispatch_entry_point_wires_album_batch_before_scheduler_enqueue() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let requests = vec![
+            real_fragment_unbatched_request_with_track(temp.path(), "dispatch-track-one", 1, None, 1),
+            real_fragment_unbatched_request_with_track(temp.path(), "dispatch-track-two", 2, None, 2),
+        ];
+
+        let dispatch = prepare_independent_single_file_album_batch_for_dispatch(
+            requests,
+            real_fragment_album_dir(temp.path()),
+            real_fragment_source_root(temp.path()),
+        )
+        .expect("real folder dispatch entry point attaches album batch context");
+
+        assert_eq!(dispatch.requests.len(), 2);
+        assert_eq!(dispatch.album_batch.expected_track_count, 2);
+        assert!(
+            is_generated_conversion_log_batch_id(&dispatch.album_batch.conversion_log_batch_id),
+            "production dispatch must generate a run-unique conversion_log_batch_id, not accept a deterministic album/path id"
+        );
+        assert_eq!(
+            dispatch.album_batch.album_output_dir,
+            real_fragment_album_dir(temp.path())
+        );
+        assert_eq!(
+            dispatch.album_batch.source_grouping_root,
+            real_fragment_source_root(temp.path())
+        );
+        for (index, req) in dispatch.requests.iter().enumerate() {
+            let album_batch = req.album_batch.as_ref().expect("album batch is attached");
+            let track_context = req.album_batch_track.as_ref().expect("dispatcher track context is attached");
+            assert_eq!(album_batch, &dispatch.album_batch);
+            assert_eq!(album_batch.expected_track_count, 2);
+            assert_eq!(
+                album_batch.conversion_log_batch_id,
+                dispatch.album_batch.conversion_log_batch_id
+            );
+            assert_eq!(track_context.source_ordinal, u32::try_from(index + 1).unwrap());
+            assert_eq!(track_context.track_number, u32::try_from(index + 1).unwrap());
+            assert!(
+                req.expected_album_track_count.is_none(),
+                "deprecated fallback count is cleared so fragment mode has one authoritative threshold"
+            );
+        }
+        assert_ne!(
+            dispatch.requests[0].job_id, dispatch.requests[1].job_id,
+            "per-track job ids can remain distinct after dispatcher wiring"
+        );
+    }
+
+    #[test]
+    fn dispatch_helper_rejects_missing_track_context_instead_of_using_request_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let err = prepare_independent_single_file_album_batch_for_dispatch(
+            vec![
+                real_fragment_unbatched_request(temp.path(), "z-last-in-request-order"),
+                real_fragment_unbatched_request(temp.path(), "a-first-in-request-order"),
+            ],
+            real_fragment_album_dir(temp.path()),
+            real_fragment_source_root(temp.path()),
+        )
+        .expect_err("fragment dispatch must not synthesize track numbers from request order");
+
+        assert!(
+            err.to_string().contains("requires dispatcher-supplied album_batch_track")
+                || err.to_string().contains("request enumeration"),
+            "error should explain that request order is not authoritative track order: {err}"
+        );
+    }
+
+    #[test]
+    fn folder_dispatch_entry_point_generates_fresh_batch_id_per_attempt() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let first = prepare_independent_single_file_album_batch_for_dispatch(
+            vec![
+                real_fragment_unbatched_request_with_track(temp.path(), "fresh-run-one-a", 1, None, 1),
+                real_fragment_unbatched_request_with_track(temp.path(), "fresh-run-one-b", 2, None, 2),
+            ],
+            real_fragment_album_dir(temp.path()),
+            real_fragment_source_root(temp.path()),
+        )
+        .expect("first dispatch prepares album batch");
+        let second = prepare_independent_single_file_album_batch_for_dispatch(
+            vec![
+                real_fragment_unbatched_request_with_track(temp.path(), "fresh-run-two-a", 1, None, 1),
+                real_fragment_unbatched_request_with_track(temp.path(), "fresh-run-two-b", 2, None, 2),
+            ],
+            real_fragment_album_dir(temp.path()),
+            real_fragment_source_root(temp.path()),
+        )
+        .expect("second dispatch prepares album batch");
+
+        assert!(is_generated_conversion_log_batch_id(&first.album_batch.conversion_log_batch_id));
+        assert!(is_generated_conversion_log_batch_id(&second.album_batch.conversion_log_batch_id));
+        assert_ne!(
+            first.album_batch.conversion_log_batch_id,
+            second.album_batch.conversion_log_batch_id,
+            "each album dispatch attempt must get a fresh conversion_log_batch_id even for the same album path"
+        );
+    }
+
+    #[test]
+    fn explicit_deterministic_batch_id_is_rejected_by_dispatch_helper() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let err = prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
+            vec![real_fragment_unbatched_request_with_track(temp.path(), "stable-id-track", 1, None, 1)],
+            "artist-album-path",
+            real_fragment_album_dir(temp.path()),
+            real_fragment_source_root(temp.path()),
+        )
+        .expect_err("deterministic album/path ids must not be accepted as run ids");
+        assert!(
+            err.to_string().contains("generated per album dispatch attempt")
+                || err.to_string().contains("deterministic album/path"),
+            "error should document the run-unique batch id contract: {err}"
+        );
+    }
+
+    #[test]
+    fn folder_dispatch_entry_point_rejects_mixed_non_single_file_jobs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut single = real_fragment_unbatched_request_with_track(temp.path(), "dispatch-ok-track", 1, None, 1);
+        single.container = real_fragment_source_root(temp.path()).join("01.flac");
+        std::fs::write(&single.container, b"audio").expect("single audio");
+
+        let mut cue = real_fragment_unbatched_request_with_track(temp.path(), "dispatch-cue-source", 2, None, 2);
+        cue.container = real_fragment_source_root(temp.path()).join("album.cue");
+        std::fs::write(&cue.container, b"FILE 'album.wav' WAVE").expect("cue source");
+
+        let err = prepare_independent_single_file_album_batch_for_dispatch(
+            vec![single, cue],
+            real_fragment_album_dir(temp.path()),
+            real_fragment_source_root(temp.path()),
+        )
+        .expect_err("folder fragment dispatch must not include CUE/multi-track sources");
+
+        assert!(
+            err.to_string().contains("independent single-file jobs")
+                || err.to_string().contains("single-file audio source"),
+            "error documents that fragment batch wiring is restricted to independent single-file jobs: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_folder_dispatch_entry_point_drives_out_of_order_fragment_assembly() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let batch_id = "real-dispatch-entry-point-batch";
+        let dispatched = real_fragment_dispatched_requests(
+            temp.path(),
+            batch_id,
+            &["dispatch-real-track-one", "dispatch-real-track-two"],
+        );
+        let track_one_req = dispatched[0].clone();
+        let track_two_req = dispatched[1].clone();
+
+        let track_two_source = real_fragment_source(temp.path(), Some(1), 2, 2, 99);
+        let track_two_stage = StagingDir::new(
+            temp.path().join("dispatch-real-track-two-audio"),
+            "dispatch-real-track-two-audio".to_string(),
+        );
+        std::fs::create_dir_all(&track_two_stage.root).expect("track two staging root");
+        let track_two_artifacts = real_fragment_audio_artifacts(
+            &track_two_stage,
+            &album_dir,
+            Some(1),
+            2,
+            2,
+            "02.flac",
+            b"audio-two",
+        );
+        let track_two_outcome = AlbumOutcome::Complete {
+            tracks: vec![real_fragment_record(
+                Some(1),
+                2,
+                2,
+                true,
+                Some(album_dir.join("02.flac")),
+            )],
+            stages: stage_records(),
+        };
+        let (track_two_feature_staging, track_two_plan) = real_fragment_plan_through_features(
+            temp.path(),
+            "dispatch-real-track-two",
+            &track_two_req,
+            &track_two_source,
+            &track_two_outcome,
+            track_two_artifacts,
+        )
+        .await;
+        assert_eq!(track_two_plan.expected_album_track_count, 2);
+        publish_album_output(
+            track_two_feature_staging,
+            &track_two_plan,
+            track_two_req.publish.clone(),
+            None,
+        )
+        .expect("out-of-order track two publishes first");
+        assert!(!album_dir.join("conversion.log").exists());
+
+        let track_one_source = real_fragment_source(temp.path(), Some(1), 1, 1, 1);
+        let track_one_stage = StagingDir::new(
+            temp.path().join("dispatch-real-track-one-audio"),
+            "dispatch-real-track-one-audio".to_string(),
+        );
+        std::fs::create_dir_all(&track_one_stage.root).expect("track one staging root");
+        let track_one_artifacts = real_fragment_audio_artifacts(
+            &track_one_stage,
+            &album_dir,
+            Some(1),
+            1,
+            1,
+            "01.flac",
+            b"audio-one",
+        );
+        let track_one_outcome = AlbumOutcome::Complete {
+            tracks: vec![real_fragment_record(
+                Some(1),
+                1,
+                1,
+                true,
+                Some(album_dir.join("01.flac")),
+            )],
+            stages: stage_records(),
+        };
+        let (track_one_feature_staging, track_one_plan) = real_fragment_plan_through_features(
+            temp.path(),
+            "dispatch-real-track-one",
+            &track_one_req,
+            &track_one_source,
+            &track_one_outcome,
+            track_one_artifacts,
+        )
+        .await;
+        assert_eq!(track_one_plan.expected_album_track_count, 2);
+        publish_album_output(
+            track_one_feature_staging,
+            &track_one_plan,
+            track_one_req.publish.clone(),
+            None,
+        )
+        .expect("track one publish completes dispatcher-authored batch");
+
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("dispatch entry point final conversion log");
+        let track_one = log.find("Disc 1, Track 1").expect("track one appears");
+        let track_two = log.find("Disc 1, Track 2").expect("track two appears");
+        assert!(track_one < track_two);
+    }
+
+    #[tokio::test]
+    async fn real_fragment_pipeline_out_of_order_jobs_assemble_in_track_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let batch_id = "real-out-of-order-batch";
+
+        let (_track_two_req, track_two_plan, _) = publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-stage-track-two",
+            "track-two-job",
+            Some(1),
+            2,
+            2,
+            99,
+            "02.flac",
+            b"audio-two",
+        )
+        .await;
+        assert_eq!(track_two_plan.source_audio_track_count, 1);
+        assert_eq!(track_two_plan.expected_album_track_count, 2);
+        assert!(album_dir.join("02.flac").exists());
+        assert!(
+            !album_dir.join("conversion.log").exists(),
+            "first out-of-order fragment must not expose a partial standalone log"
+        );
+
+        let (_track_one_req, track_one_plan, _) = publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-stage-track-one",
+            "track-one-job",
+            Some(1),
+            1,
+            1,
+            1,
+            "01.flac",
+            b"audio-one",
+        )
+        .await;
+        assert_eq!(track_one_plan.source_audio_track_count, 1);
+        assert_eq!(track_one_plan.expected_album_track_count, 2);
+        assert!(album_dir.join("01.flac").exists());
+
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("real fragment final conversion log");
+        let track_one = log.find("Disc 1, Track 1").expect("track one appears");
+        let track_two = log.find("Disc 1, Track 2").expect("track two appears");
+        assert!(track_one < track_two, "assembly sorts by track number, not completion order");
+        assert!(
+            !conversion_log_fragment_dir(&album_dir).exists(),
+            "successful final assembly cleans active fragment state"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_fragment_pipeline_uses_dispatcher_count_not_totaltracks_tags() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let batch_id = "real-bad-totaltracks-batch";
+
+        publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-bad-tags-one",
+            "bad-tags-one-job",
+            Some(1),
+            1,
+            1,
+            1,
+            "01.flac",
+            b"audio-one",
+        )
+        .await;
+        assert!(
+            !album_dir.join("conversion.log").exists(),
+            "TOTALTRACKS=1 on a single-file job must not be authoritative"
+        );
+
+        publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-bad-tags-two",
+            "bad-tags-two-job",
+            Some(1),
+            2,
+            2,
+            99,
+            "02.flac",
+            b"audio-two",
+        )
+        .await;
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("dispatcher-count final log");
+        assert!(log.contains("2 successful / 0 failed / 2 total"));
+    }
+
+    #[tokio::test]
+    async fn real_fragment_pipeline_uses_shared_batch_id_despite_distinct_job_ids() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let batch_id = "real-shared-batch-distinct-jobs";
+
+        let (req_one, plan_one, _) = publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-shared-batch-one",
+            "per-track-job-a",
+            Some(1),
+            1,
+            1,
+            2,
+            "01.flac",
+            b"audio-one",
+        )
+        .await;
+        assert_eq!(plan_one.expected_album_track_count, 2);
+        assert!(plan_has_conversion_log_fragment(&plan_one));
+
+        let (req_two, plan_two, _) = publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-shared-batch-two",
+            "per-track-job-b",
+            Some(1),
+            2,
+            2,
+            2,
+            "02.flac",
+            b"audio-two",
+        )
+        .await;
+        assert_eq!(plan_two.expected_album_track_count, 2);
+        assert!(plan_has_conversion_log_fragment(&plan_two));
+
+        let batch_one = req_one.album_batch.as_ref().expect("first request album batch");
+        let batch_two = req_two.album_batch.as_ref().expect("second request album batch");
+        assert_eq!(batch_one.conversion_log_batch_id, generated_test_batch_id(batch_id));
+        assert_eq!(batch_one, batch_two);
+        assert_ne!(
+            req_one.job_id, req_two.job_id,
+            "per-track jobs may keep distinct job identifiers while sharing one conversion-log batch"
+        );
+        assert!(
+            real_fragment_album_dir(temp.path()).join("conversion.log").exists(),
+            "the shared run-unique batch id lets distinct per-track jobs assemble one album log"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_terminal_failure_path_builds_zero_audio_plan_and_appears_in_final_log() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let batch_id = "real-failed-track-batch";
+
+        publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-failed-companion-ok",
+            "failed-companion-ok",
+            Some(1),
+            1,
+            1,
+            2,
+            "01.flac",
+            b"audio-one",
+        )
+        .await;
+
+        let failed_req = real_fragment_request(temp.path(), batch_id, 2, "failed-track-job");
+        let failed_source = real_fragment_source(temp.path(), Some(1), 2, 2, 2);
+        let failed_outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: vec![real_fragment_record(Some(1), 2, 2, false, None)],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Convert,
+                outcome: StageOutcome::Failed("converter exited 1".to_string()),
+                dsd_dst_stats: None,
+            }],
+            reason: BlockReason::TrackFailures,
+        };
+
+        let count_staging = StagingDir::new(temp.path().join("real-failed-count-stage"), "real-failed-count-stage".to_string());
+        std::fs::create_dir_all(&count_staging.root).expect("failed count staging root");
+        let staged_failed = stage_conversion_log_sidecars(
+            real_fragment_empty_artifacts(),
+            &failed_outcome,
+            &failed_source,
+            &failed_req,
+            &count_staging,
+        )
+        .expect("terminal failed track stages only a fragment");
+        let failed_plan = build_publish_plan(&staged_failed, &failed_req)
+            .expect("failed fragment-only publish plan is built by production code");
+        assert_eq!(
+            failed_plan.source_audio_track_count, 0,
+            "failed fragment-only jobs carry zero audio payload in the real publish plan"
+        );
+        assert_eq!(failed_plan.expected_album_track_count, 2);
+        assert!(is_incremental_single_audio_publish(&failed_plan));
+
+        let terminal_staging = StagingDir::new(temp.path().join("real-failed-terminal-stage"), "real-failed-terminal-stage".to_string());
+        std::fs::create_dir_all(&terminal_staging.root).expect("failed terminal staging root");
+        publish_terminal_conversion_log_fragment_if_needed(
+            &failed_req,
+            Some(&failed_source),
+            Some(&real_fragment_empty_artifacts()),
+            &failed_outcome,
+            terminal_staging,
+        )
+        .expect("terminal failed track publishes its forensic fragment");
+
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("failed track final conversion log");
+        assert!(log.contains("Disc 1, Track 1"));
+        assert!(log.contains("Disc 1, Track 2"));
+        assert!(log.contains("Status: Failure"));
+        assert!(log.contains("track 2 encode failed"));
+        assert!(
+            !conversion_log_fragment_dir(&album_dir).exists(),
+            "successful assembly after failed-track fragment cleans fragment state"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_plan_output_failure_publishes_fragment_and_completes_batch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let batch_id = "real-plan-output-failed-batch";
+
+        publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-plan-failed-companion-ok",
+            "plan-failed-companion-ok",
+            Some(1),
+            1,
+            1,
+            2,
+            "01.flac",
+            b"audio-one",
+        )
+        .await;
+        assert!(
+            !album_dir.join("conversion.log").exists(),
+            "the first successful sibling alone must not assemble the final log"
+        );
+
+        let mut failed_req = real_fragment_request(temp.path(), batch_id, 2, "plan-failed-track");
+        failed_req.settings.target_format = PlannerAudioFormat::Aac;
+        failed_req.container_extension = Some("flac".to_string());
+        let failed_source = real_fragment_source(temp.path(), Some(1), 2, 2, 2);
+        let plan_error = plan_outputs(&failed_source, &failed_req)
+            .expect_err("the invalid AAC container extension should fail during output planning")
+            .to_string();
+        let failed_outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: blocked_track_records(
+                &failed_source,
+                &format!("output planning failed: {plan_error}"),
+            ),
+            stages: vec![StageRecord {
+                stage: PipelineStage::PlanOutputs,
+                outcome: StageOutcome::Failed(plan_error.clone()),
+                dsd_dst_stats: None,
+            }],
+            reason: BlockReason::PlanFailed,
+        };
+
+        let terminal_staging = StagingDir::new(
+            temp.path().join("real-plan-failed-terminal-stage"),
+            "real-plan-failed-terminal-stage".to_string(),
+        );
+        std::fs::create_dir_all(&terminal_staging.root).expect("plan-failed terminal staging root");
+        publish_terminal_conversion_log_fragment_if_needed(
+            &failed_req,
+            Some(&failed_source),
+            None,
+            &failed_outcome,
+            terminal_staging,
+        )
+        .expect("PlanFailed publishes its forensic fragment");
+
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("PlanFailed fragment completes and assembles final log");
+        assert!(log.contains("Disc 1, Track 1"));
+        assert!(log.contains("Disc 1, Track 2"));
+        assert!(log.contains("output planning failed:"));
+        assert!(log.contains("Status: Failure"));
+        assert!(log.contains("1 successful / 1 failed / 2 total"));
+        assert!(
+            !conversion_log_fragment_dir(&album_dir).exists(),
+            "successful assembly after PlanFailed cleanup removes fragment state"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_cancellation_after_one_completed_track_writes_partial_log_and_cleans() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let batch_id = "real-cancelled-after-one";
+        let (req, _plan, _) = publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            3,
+            "real-cancel-one-track",
+            "cancel-one-track-job",
+            Some(1),
+            1,
+            1,
+            3,
+            "01.flac",
+            b"audio-one",
+        )
+        .await;
+        assert!(!album_dir.join("conversion.log").exists());
+        assert!(conversion_log_fragment_dir(&album_dir).is_dir());
+
+        let published = finalize_cancelled_conversion_log_batch_if_needed(&req)
+            .expect("real cancellation finalizer writes partial log");
+        assert_eq!(published.album_dir, album_dir);
+        let log = std::fs::read_to_string(published.album_dir.join("conversion.log"))
+            .expect("cancelled partial log");
+        assert!(log.contains("Batch status: cancelled before album batch completed"));
+        assert!(log.contains("Result: Cancelled partial (1/3 ok, 0 failed, 2 missing)"));
+        assert!(
+            !conversion_log_fragment_dir(&published.album_dir).exists(),
+            "cancellation finalization cleans the batch fragments after the partial log is durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_start_cancellation_finalizes_existing_album_fragments() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let batch_id = "scheduler-start-cancelled";
+        let (req, album_dir) = scheduler_cancel_batch_request(
+            temp.path(),
+            batch_id,
+            "start-cancelled-track",
+            3,
+        );
+        seed_scheduler_cancel_fragment(&req, &album_dir, batch_id);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let runner = StubToolRunner::new();
+        let reporter = RecordingReporter::new();
+
+        let materialized = prepare_pipeline_item_for_scheduler(
+            req,
+            &runner,
+            &reporter,
+            &cancel,
+            &HashMap::new(),
+        )
+        .await;
+
+        let report = match materialized {
+            ScheduledMaterialization::Finished(report) => report,
+            ScheduledMaterialization::Ready(_) => panic!("pre-cancelled item must not become schedulable"),
+        };
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked { reason: BlockReason::Cancelled, .. }
+        ));
+        assert!(report.published.is_some(), "album-batch cancellation finalizes sibling fragments before returning");
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("scheduler cancellation writes partial log");
+        assert!(log.contains("Result: Cancelled partial (1/3 ok, 0 failed, 2 missing)"));
+        assert!(
+            !conversion_log_fragment_dir(&album_dir).exists(),
+            "scheduler cancellation cleanup removes the finalized fragment batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_materialization_cancelled_finalizes_existing_album_fragments() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let batch_id = "scheduler-materialize-cancelled";
+        let (mut req, album_dir) = scheduler_cancel_batch_request(
+            temp.path(),
+            batch_id,
+            "materialize-cancelled-track",
+            3,
+        );
+        req.container = album_dir.join("source-root").join("materialize-cancelled-track.7z");
+        std::fs::write(&req.container, b"archive placeholder").expect("archive source");
+        seed_scheduler_cancel_fragment(&req, &album_dir, batch_id);
+        let (gate, blocker) = tool_gate();
+        let runner = std::sync::Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker),
+        ]));
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run_runner = runner.clone();
+        let handle = tokio::spawn(async move {
+            let reporter = RecordingReporter::new();
+            prepare_pipeline_item_for_scheduler(
+                req,
+                run_runner.as_ref(),
+                &reporter,
+                &run_cancel,
+                &HashMap::new(),
+            )
+            .await
+        });
+
+        let release = gate.wait_started().await;
+        cancel.cancel();
+        let materialized = handle.await.expect("materialization task joins");
+        drop(release);
+
+        let report = match materialized {
+            ScheduledMaterialization::Finished(report) => report,
+            ScheduledMaterialization::Ready(_) => panic!("cancelled materialization must not become schedulable"),
+        };
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked { reason: BlockReason::Cancelled, .. }
+        ));
+        assert!(report.published.is_some(), "MaterializeError::Cancelled finalizes sibling fragments");
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("materialization cancellation writes partial log");
+        assert!(log.contains("Result: Cancelled partial (1/3 ok, 0 failed, 2 missing)"));
+        assert!(
+            !conversion_log_fragment_dir(&album_dir).exists(),
+            "materialization cancellation cleanup removes the finalized fragment batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_post_materialization_cancellation_finalizes_existing_album_fragments() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let batch_id = "scheduler-post-materialize-cancelled";
+        let (req, album_dir) = scheduler_cancel_batch_request(
+            temp.path(),
+            batch_id,
+            "post-materialize-cancelled-track",
+            3,
+        );
+        seed_scheduler_cancel_fragment(&req, &album_dir, batch_id);
+        let runner = StubToolRunner::new();
+        runner.push_output(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: r#"{"streams":[{"sample_rate":"44100","duration":"300.0","bits_per_raw_sample":"16"}],"format":{"duration":"300.0"}}"#.to_string(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(10),
+            command: CommandRecord {
+                description: None,
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: vec!["input.flac".to_string()],
+                cwd: None,
+                env_keys: vec![],
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(10),
+            },
+        });
+        let cancel = CancellationToken::new();
+        let reporter = CancellingReporter::new(cancel.clone(), PipelineStage::Materialize);
+
+        let materialized = prepare_pipeline_item_for_scheduler(
+            req,
+            &runner,
+            &reporter,
+            &cancel,
+            &HashMap::new(),
+        )
+        .await;
+
+        let report = match materialized {
+            ScheduledMaterialization::Finished(report) => report,
+            ScheduledMaterialization::Ready(_) => panic!("post-materialization cancellation must not reach planning readiness"),
+        };
+        assert!(matches!(
+            report.outcome,
+            AlbumOutcome::Blocked { reason: BlockReason::Cancelled, .. }
+        ));
+        assert!(report.published.is_some(), "post-materialization cancellation finalizes sibling fragments");
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("post-materialization cancellation writes partial log");
+        assert!(log.contains("Result: Cancelled partial (1/3 ok, 0 failed, 2 missing)"));
+        assert!(
+            !conversion_log_fragment_dir(&album_dir).exists(),
+            "post-materialization cancellation cleanup removes the finalized fragment batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_multidisc_fragment_pipeline_uses_one_batch_and_disc_sorting() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let batch_id = "real-multidisc-batch";
+
+        publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-multidisc-disc-two",
+            "disc-two-job",
+            Some(2),
+            1,
+            201,
+            1,
+            "2-01.flac",
+            b"disc-two-audio",
+        )
+        .await;
+        assert!(!album_dir.join("conversion.log").exists());
+
+        publish_successful_real_fragment_job(
+            temp.path(),
+            batch_id,
+            2,
+            "real-multidisc-disc-one",
+            "disc-one-job",
+            Some(1),
+            1,
+            101,
+            1,
+            "1-01.flac",
+            b"disc-one-audio",
+        )
+        .await;
+
+        let log = std::fs::read_to_string(album_dir.join("conversion.log"))
+            .expect("multidisc final log");
+        let disc_one = log.find("Disc 1, Track 1").expect("disc one track appears");
+        let disc_two = log.find("Disc 2, Track 1").expect("disc two track appears");
+        assert!(disc_one < disc_two, "disc remains a sort key, not a batch splitter");
+    }
+
+    #[tokio::test]
+    async fn real_multitrack_source_stays_on_canonical_single_log_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = log_test_request();
+        req.output_root = temp.path().join("out");
+        req.album_batch = Some(real_fragment_batch(temp.path(), "ignored-for-cue", 2));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let album_dir = real_fragment_album_dir(temp.path());
+        let mut source = log_test_source();
+        source.kind = SourceKind::CueImage;
+        source.container = real_fragment_source_root(temp.path()).join("album.cue");
+        source.provenance.source_kind = SourceKind::CueImage;
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![
+                TrackArtifact {
+                    track_id: source.tracks[0].id.clone(),
+                    staged_path: temp.path().join("cue-stage/01.flac"),
+                    final_path: album_dir.join("01.flac"),
+                    samples: Some(44_100),
+                    metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                    metadata_required: PlannedMetadataSatisfaction::none(),
+                    planned_command_hash: None,
+                },
+                TrackArtifact {
+                    track_id: source.tracks[1].id.clone(),
+                    staged_path: temp.path().join("cue-stage/02.flac"),
+                    final_path: album_dir.join("02.flac"),
+                    samples: Some(44_100),
+                    metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                    metadata_required: PlannedMetadataSatisfaction::none(),
+                    planned_command_hash: None,
+                },
+            ]),
+            sidecars: Vec::new(),
+        };
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record(), failed_record()],
+            stages: stage_records(),
+        };
+        let (staging, plan) = real_fragment_plan_through_features(
+            temp.path(),
+            "real-cue-existing-log-path",
+            &req,
+            &source,
+            &outcome,
+            artifacts,
+        )
+        .await;
+        drop(staging);
+
+        assert!(
+            plan.entries.iter().any(|entry| matches!(entry.role, PublishRole::Sidecar(SidecarKind::ConversionLog))),
+            "one-job multi-track sources keep the canonical standalone conversion.log sidecar"
+        );
+        assert!(
+            plan.entries.iter().all(|entry| !is_conversion_log_fragment_role(&entry.role)),
+            "one-job multi-track sources must not enter fragment mode"
+        );
     }
 
     #[test]
@@ -15064,7 +20801,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[test]
-    fn incremental_publish_rolls_back_sidecar_append_if_audio_publish_fails() {
+    fn incremental_publish_does_not_append_log_when_audio_publish_fails_first() {
         let temp = tempfile::tempdir().expect("temp dir");
         let out = temp.path().join("out");
         let album_dir = out.join("Album");
@@ -15085,13 +20822,13 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         let plan = incremental_single_track_plan(&album_dir, staged_audio_dir, "02.flac", staged_log);
 
         let _err = publish_album_output(staging, &plan, publish, None)
-            .expect_err("invalid staged audio fails after sidecar append attempt");
+            .expect_err("invalid staged audio fails before log append");
 
         assert!(!album_dir.join("02.flac").exists(), "failed audio publish must not leave audio behind");
         assert_eq!(
             std::fs::read(album_dir.join("conversion.log")).expect("conversion log"),
             b"original log\n",
-            "sidecar append must be rolled back when the incremental publish fails"
+            "log append must not happen when the audio payload fails first"
         );
         assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
     }
@@ -15188,7 +20925,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[test]
-    fn incremental_non_log_sidecar_replacement_rolls_back_if_audio_publish_fails() {
+    fn incremental_non_log_sidecar_replacement_is_not_attempted_if_audio_publish_fails_first() {
         let temp = tempfile::tempdir().expect("temp dir");
         let out = temp.path().join("out");
         let album_dir = out.join("Album");
@@ -15222,20 +20959,20 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
 
         let _err = publish_album_output(staging, &plan, publish, None)
-            .expect_err("invalid staged audio fails after sidecar replacement attempt");
+            .expect_err("invalid staged audio fails before sidecar replacement");
 
         assert!(!album_dir.join("02.flac").exists(), "failed publish must not leave audio behind");
         assert_eq!(
             std::fs::read(album_dir.join("conversion.log")).expect("conversion log"),
             b"original log
 ",
-            "conversion log append must roll back"
+            "conversion log append must not happen"
         );
         assert_eq!(
             std::fs::read(album_dir.join("album.cue")).expect("cue sheet"),
             b"original cue
 ",
-            "non-log sidecar replacement must roll back"
+            "non-log sidecar replacement must not happen"
         );
         assert!(
             std::fs::read_dir(&album_dir)
@@ -15370,6 +21107,8 @@ retry log
                 },
             ],
             source_audio_track_count: 2,
+            expected_album_track_count: 2,
+            suppress_incremental_conversion_log_append: false,
         };
 
         let err = publish_album_output(staging, &plan, publish, None)
@@ -15408,6 +21147,8 @@ retry log
                 },
             ],
             source_audio_track_count: 2,
+            expected_album_track_count: 2,
+            suppress_incremental_conversion_log_append: false,
         };
 
         let err = publish_album_output(staging, &plan, publish, None)

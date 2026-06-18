@@ -983,6 +983,10 @@ fn build_pipeline_request_template(
         },
         container_extension: None,
         container_ffmpeg_flags: Vec::new(),
+        album_batch: None,
+        album_batch_track: None,
+        expected_album_track_count: None,
+        suppress_incremental_conversion_log_append: false,
     })
 }
 

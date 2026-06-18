@@ -4548,6 +4548,10 @@ fn execute_commit_with_source_options_transform(
                         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
                         container_extension: options.container_extension.clone(),
                         container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
+                        album_batch: None,
+                        album_batch_track: None,
+                        expected_album_track_count: None,
+                        suppress_incremental_conversion_log_append: false,
                     });
                 }
             }

@@ -45,6 +45,197 @@ impl std::fmt::Display for SecretString {
     }
 }
 
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumBatchSourceContext {
+    /// Human-readable source kind to print in the unified album conversion log.
+    /// Independent single-file folder batches should use the default
+    /// "folder album batch" value so the assembled log does not describe the
+    /// album as a representative `SingleFile` track job.
+    pub source_kind: String,
+    /// Batch-level source context shown as the conversion log container path.
+    /// For folder/album dispatch this is normally the source grouping root, not
+    /// an arbitrary representative track file.
+    pub container_path: PathBuf,
+}
+
+impl AlbumBatchSourceContext {
+    #[must_use]
+    pub fn folder_album_batch(container_path: PathBuf) -> Self {
+        Self {
+            source_kind: "folder album batch".to_string(),
+            container_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumBatchContext {
+    /// Explicit shared conversion-log batch id assigned once by the folder/album
+    /// dispatcher before it enqueues independent single-file track jobs. This id
+    /// must be fresh for each album conversion attempt, not deterministically
+    /// derived from artist/album/path metadata. Reusing it across attempts would
+    /// make stale fragments from a crashed or cancelled run eligible for a later
+    /// assembly. This is intentionally separate from `PipelineRequest::job_id`,
+    /// which may remain job-scoped for worker staging, run locks, reporting, and
+    /// retry identity. Every track job in the same album batch must carry the
+    /// same value here, even when each track job has its own distinct `job_id`.
+    #[serde(alias = "album_batch_id")]
+    pub(crate) conversion_log_batch_id: String,
+    /// Total source tracks expected for this album/folder batch. This must be
+    /// computed by the folder/album dispatcher from the source group it is about
+    /// to enqueue, not from per-file tags such as TOTALTRACKS/TOTALDISCS and not
+    /// from an individual single-file job's one prepared source track. This is
+    /// the only authoritative count used for conversion-log last-track
+    /// detection.
+    pub(crate) expected_track_count: usize,
+    /// Album output directory associated with this batch. For production
+    /// independent-file dispatch this starts as a provisional source-path
+    /// estimate, because the real directory is chosen later by `plan_outputs()`
+    /// from materialized metadata and naming templates. Fragment identity must
+    /// therefore bind to the planner-resolved directory once a track has been
+    /// planned. Tests and already-planned callers may mark this value as
+    /// planner-resolved.
+    pub(crate) album_output_dir: PathBuf,
+    /// True only when `album_output_dir` came from the same output-planning
+    /// logic that chooses final audio paths. False means the value is a
+    /// dispatcher fallback used only until the first planned/published track
+    /// supplies the actual album directory.
+    #[serde(default)]
+    pub(crate) album_output_dir_is_planner_resolved: bool,
+    /// Stable root used to group the source files that belong to this album
+    /// batch. This prevents fragments from unrelated folders/runs from sharing
+    /// a batch id by accident.
+    pub(crate) source_grouping_root: PathBuf,
+    /// Explicit batch-level source context for the final unified log. This keeps
+    /// the album log from inheriting `SingleFile` source semantics and a single
+    /// track's path from the representative fragment. Older serialized requests
+    /// that omit this field default to `folder album batch` at
+    /// `source_grouping_root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_context: Option<AlbumBatchSourceContext>,
+}
+
+impl AlbumBatchContext {
+    /// Crate-internal constructor for tests and migration code. Production
+    /// independent single-file folder conversions must not construct this
+    /// contract directly; they must call
+    /// `prepare_independent_single_file_album_batch_for_dispatch(...)`, which
+    /// generates a fresh per-attempt `conversion_log_batch_id`, validates the
+    /// source group, and attaches per-track ordering context.
+    #[must_use]
+    pub(crate) fn new(
+        conversion_log_batch_id: impl Into<String>,
+        expected_track_count: usize,
+        album_output_dir: PathBuf,
+        source_grouping_root: PathBuf,
+    ) -> Self {
+        Self {
+            conversion_log_batch_id: conversion_log_batch_id.into(),
+            expected_track_count,
+            album_output_dir,
+            album_output_dir_is_planner_resolved: true,
+            source_context: Some(AlbumBatchSourceContext::folder_album_batch(
+                source_grouping_root.clone(),
+            )),
+            source_grouping_root,
+        }
+    }
+
+    /// Crate-internal constructor used by the dispatch helper after it has
+    /// generated a fresh per-attempt batch id and validated the source group.
+    /// Production callers should not call this directly: use
+    /// `prepare_independent_single_file_album_batch_for_dispatch(...)` so
+    /// fragment mode cannot be entered with an album-stable or caller-supplied
+    /// deterministic id.
+    pub(crate) fn from_dispatcher_source_count(
+        conversion_log_batch_id: impl Into<String>,
+        dispatcher_source_count: usize,
+        album_output_dir: PathBuf,
+        source_grouping_root: PathBuf,
+    ) -> Result<Self, String> {
+        if dispatcher_source_count == 0 {
+            return Err("album batch dispatcher source count must be greater than zero".to_string());
+        }
+        Ok(Self::new(
+            conversion_log_batch_id,
+            dispatcher_source_count,
+            album_output_dir,
+            source_grouping_root,
+        )
+        .with_provisional_album_output_dir())
+    }
+
+    #[must_use]
+    pub(crate) fn with_source_context(mut self, source_context: AlbumBatchSourceContext) -> Self {
+        self.source_context = Some(source_context);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_provisional_album_output_dir(mut self) -> Self {
+        self.album_output_dir_is_planner_resolved = false;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_planner_resolved_album_output_dir(mut self, album_output_dir: PathBuf) -> Self {
+        self.album_output_dir = album_output_dir;
+        self.album_output_dir_is_planner_resolved = true;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn album_output_dir_is_planner_resolved(&self) -> bool {
+        self.album_output_dir_is_planner_resolved
+    }
+
+    #[must_use]
+    pub fn source_context(&self) -> AlbumBatchSourceContext {
+        self.source_context.clone().unwrap_or_else(|| {
+            AlbumBatchSourceContext::folder_album_batch(self.source_grouping_root.clone())
+        })
+    }
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumBatchTrackContext {
+    /// Dispatcher-owned source ordinal for this file within the album batch.
+    /// This is available before source materialization and is used only as a
+    /// deterministic tie-breaker in the unified conversion-log ordering.
+    pub source_ordinal: u32,
+    /// Dispatcher-owned disc number when the folder grouping or filename parser
+    /// can determine it before materialization. `None` means single-disc or
+    /// unknown; it must not split the album batch identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_number: Option<u32>,
+    /// Dispatcher-owned track number for this file within its disc or album.
+    /// This lets corrupt/unsupported files that fail before `PreparedSource`
+    /// still contribute a forensic failure fragment in the correct position.
+    pub track_number: u32,
+}
+
+impl AlbumBatchTrackContext {
+    #[must_use]
+    pub const fn new(source_ordinal: u32, disc_number: Option<u32>, track_number: u32) -> Self {
+        Self {
+            source_ordinal,
+            disc_number,
+            track_number,
+        }
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> TrackId {
+        TrackId {
+            source_ordinal: self.source_ordinal,
+            disc_number: self.disc_number,
+            track_number: self.track_number,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineRequest {
     pub job_id: String,
@@ -61,6 +252,41 @@ pub struct PipelineRequest {
     pub log: LogPolicy,
     pub stages: StagePolicy,
     pub failure_policy: FailurePolicy,
+    /// Album/folder batch contract for independent single-file jobs. Production
+    /// callers must obtain this through
+    /// `prepare_independent_single_file_album_batch_for_dispatch(...)`; direct
+    /// construction is intentionally crate-private so external callers cannot
+    /// supply a generated-looking deterministic id. Its
+    /// `conversion_log_batch_id` is the fragment identity; `job_id` remains per
+    /// job. Fragment-backed conversion-log assembly requires this field; when
+    /// it is absent, single-file jobs use the legacy per-job conversion log path
+    /// instead of guessing from tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_batch: Option<AlbumBatchContext>,
+    /// Per-request track identity supplied by the same folder/album dispatcher
+    /// that creates `album_batch`. This must be available before source
+    /// materialization so a corrupt, missing, or unsupported file can still
+    /// publish a minimal failed-track conversion-log fragment. Successful
+    /// materialized tracks may carry richer tag-derived metadata, but fragment
+    /// ordering and pre-materialization failure fragments use this dispatcher
+    /// key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_batch_track: Option<AlbumBatchTrackContext>,
+    /// Set by the production folder dispatcher only when it has identified an
+    /// independent single-file album group but cannot safely use either ordered
+    /// fragment assembly or legacy append semantics, for example because the
+    /// queued tracks have incompatible conversion settings. Missing or ambiguous
+    /// track-number metadata alone is not fatal: those jobs intentionally fall
+    /// back to the legacy completion-order incremental conversion.log append
+    /// path rather than pretending to have authoritative track order.
+    #[serde(default)]
+    pub suppress_incremental_conversion_log_append: bool,
+    /// Deprecated compatibility field accepted only so older serialized
+    /// requests can still be read. The conversion-log fragment path ignores
+    /// this field completely; only `album_batch.expected_track_count`, supplied
+    /// by the folder/album dispatcher, may define the completion threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_album_track_count: Option<usize>,
     /// Container extension override. `None` = codec default extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_extension: Option<String>,
@@ -73,6 +299,28 @@ impl PipelineRequest {
     pub fn target_format(&self) -> tonepoet_pipeline::AudioFormat {
         self.settings.target_format.clone()
     }
+
+    #[must_use]
+    pub fn with_album_batch(mut self, album_batch: AlbumBatchContext) -> Self {
+        self.album_batch = Some(album_batch);
+        self
+    }
+
+    #[must_use]
+    pub fn with_album_batch_track(mut self, album_batch_track: AlbumBatchTrackContext) -> Self {
+        self.album_batch_track = Some(album_batch_track);
+        self
+    }
+}
+
+
+/// Dispatcher output for an independent single-file album/folder batch. The
+/// folder dispatcher constructs this once, before enqueueing per-track jobs, so
+/// every job receives the same album-level conversion-log contract.
+#[derive(Debug, Clone)]
+pub struct AlbumBatchDispatch {
+    pub album_batch: AlbumBatchContext,
+    pub requests: Vec<PipelineRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +618,10 @@ pub struct RedactedPipelineRequest {
     pub log: LogPolicy,
     pub stages: StagePolicy,
     pub failure_policy: FailurePolicy,
+    pub album_batch: Option<AlbumBatchContext>,
+    pub album_batch_track: Option<AlbumBatchTrackContext>,
+    pub suppress_incremental_conversion_log_append: bool,
+    pub expected_album_track_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +684,10 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
             log: req.log.clone(),
             stages: req.stages.clone(),
             failure_policy: req.failure_policy,
+            album_batch: req.album_batch.clone(),
+            album_batch_track: req.album_batch_track.clone(),
+            suppress_incremental_conversion_log_append: req.suppress_incremental_conversion_log_append,
+            expected_album_track_count: req.expected_album_track_count,
         }
     }
 }
@@ -1341,7 +1597,7 @@ pub struct ArtifactSet {
     pub sidecars: Vec<SidecarArtifact>,
 }
 
-fn default_publish_source_audio_track_count() -> usize {
+fn default_publish_track_count() -> usize {
     0
 }
 
@@ -1349,12 +1605,28 @@ fn default_publish_source_audio_track_count() -> usize {
 pub struct PublishPlan {
     pub album_dir: PathBuf,
     pub entries: Vec<PublishEntry>,
-    /// Number of source tracks represented by this publish plan's audio
-    /// payload. This is intentionally distinct from the number of final audio
-    /// files: a merged multi-track album can have one final audio file while
-    /// still requiring album-level collision protection under FailIfExists.
-    #[serde(default = "default_publish_source_audio_track_count")]
+    /// Number of source tracks represented by this publish plan's audio payload
+    /// for this one job. This stays at 1 for successful independent single-file
+    /// track jobs even when those jobs participate in a larger album/folder
+    /// batch. It is allowed to be 0 for terminal failure publishes that carry a
+    /// forensic conversion-log fragment but no audio artifact.
+    ///
+    /// Do not use this field for conversion-log fragment completion. Use
+    /// `expected_album_track_count` for the album-level last-track threshold.
+    #[serde(default = "default_publish_track_count")]
     pub source_audio_track_count: usize,
+    /// Total source tracks expected in the album/folder conversion batch. For
+    /// ordinary one-job publishes this usually equals `source_audio_track_count`;
+    /// for fragment-backed independent single-file jobs it is carried by the
+    /// fragment sidecar and may be greater than the current job's payload count.
+    #[serde(default = "default_publish_track_count")]
+    pub expected_album_track_count: usize,
+    /// True when the production dispatcher identified an independent multi-file
+    /// album group but could not prove canonical track identity. Such plans must
+    /// not use the legacy incremental conversion.log append path, because that
+    /// path writes in worker-completion order.
+    #[serde(default)]
+    pub suppress_incremental_conversion_log_append: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

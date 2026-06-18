@@ -11,7 +11,9 @@ use super::{
 };
 use log::info;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -19,11 +21,12 @@ use tonepoet_pipeline::PipelineSettings;
 
 use crate::convert::pipeline::{
     boxed_work, build_pipeline_request, build_pipeline_request_from_settings, detect_source_kind,
+    prepare_independent_single_file_album_batch_for_dispatch,
     encode_realized_track_for_scheduler_with_tool_limits, encode_track_for_scheduler_with_tool_limits,
     finish_pipeline_album_for_scheduler_with_tool_limits, map_album_outcome,
     prepare_pipeline_item_for_scheduler, realize_track_for_scheduler_with_tool_limits,
     run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_worker_failure_output,
-    AlbumCompletionTracker,
+    AlbumBatchTrackContext, AlbumCompletionTracker,
     AlbumReadiness, BroadcastReporter, PipelineRequest, PoolLimits,
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
@@ -130,6 +133,822 @@ fn terminal_progress_for_status(
         }
         ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => 0.0,
     }
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct IndependentSingleFileBatchKey {
+    source_grouping_root_key: String,
+    provisional_album_output_dir_key: String,
+    target_format_key: String,
+    naming_key: String,
+}
+
+#[derive(Debug)]
+struct IndependentSingleFileBatchCandidate {
+    item_index: usize,
+    request: PipelineRequest,
+}
+
+/// Attach the conversion-log album-batch contract at the real queue dispatch
+/// boundary, before `build_initial_work()` submits independent single-file jobs
+/// to the shared scheduler. This is the production call site that turns a
+/// folder of per-file `ConversionItem`s into one fragment-backed album batch;
+/// tests that call the lower-level helper directly do not exercise this path.
+fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [ConversionItem]) {
+    let mut groups: BTreeMap<IndependentSingleFileBatchKey, Vec<IndependentSingleFileBatchCandidate>> =
+        BTreeMap::new();
+
+    for (item_index, item) in items.iter().enumerate() {
+        let request = match build_pipeline_request(item) {
+            Ok(request) => request,
+            Err(err) => {
+                log::warn!(
+                    "skipping album-batch preparation for {} because request construction failed: {err}",
+                    item.id
+                );
+                continue;
+            }
+        };
+
+        if request.album_batch.is_some() {
+            continue;
+        }
+
+        if !matches!(detect_source_kind(&request), Ok(SourceKind::SingleFile)) {
+            continue;
+        }
+
+        let source_grouping_root = source_grouping_root_for_dispatch_request(&request);
+        let album_output_dir = provisional_album_output_dir_for_dispatch_request(&request, &source_grouping_root);
+        let key = IndependentSingleFileBatchKey {
+            source_grouping_root_key: normalized_path_key(&source_grouping_root),
+            provisional_album_output_dir_key: normalized_path_key(&album_output_dir),
+            target_format_key: format!(
+                "{:?}|{:?}|{:?}",
+                request.settings.target_format,
+                request.container_extension,
+                request.container_ffmpeg_flags
+            ),
+            naming_key: format!(
+                "{}|{:?}|{}",
+                request.naming.template,
+                request.naming.folder_template,
+                request.naming.per_album_subdir
+            ),
+        };
+        groups.entry(key).or_default().push(IndependentSingleFileBatchCandidate {
+            item_index,
+            request,
+        });
+    }
+
+    for (_key, group) in groups {
+        if group.len() <= 1 {
+            continue;
+        }
+
+        let source_grouping_root = source_grouping_root_for_dispatch_request(&group[0].request);
+        let album_output_dir = provisional_album_output_dir_for_dispatch_request(&group[0].request, &source_grouping_root);
+
+        if let Some(mismatched) = group.iter().find(|candidate| {
+            conversion_settings_fingerprint_key(&candidate.request.settings)
+                != conversion_settings_fingerprint_key(&group[0].request.settings)
+        }) {
+            log::error!(
+                "independent single-file album batch at {} cannot enable ordered fragment logging because {} has conversion settings that differ from the rest of the batch; suppressing legacy conversion.log append for this batch instead of mixing incompatible fragments",
+                source_grouping_root.display(),
+                mismatched.request.container.display()
+            );
+            mark_queued_album_batch_as_ordering_unavailable(items, &group);
+            continue;
+        }
+
+        let mut prepared = Vec::with_capacity(group.len());
+        let mut missing_track_identity = None;
+        let mut ambiguous_track_identity = None;
+        for candidate in group.iter() {
+            let metadata_track_context = track_context_from_dispatch_metadata(&candidate.request.container);
+            let disc_number = candidate
+                .request
+                .album_batch_track
+                .as_ref()
+                .and_then(|track| track.disc_number)
+                .or_else(|| metadata_track_context.and_then(|context| context.0))
+                .or_else(|| disc_number_from_dispatch_path(&candidate.request.container));
+            let track_number = candidate
+                .request
+                .album_batch_track
+                .as_ref()
+                .map(|track| track.track_number)
+                .or_else(|| metadata_track_context.map(|context| context.1))
+                .or_else(|| strict_track_number_from_dispatch_path(&candidate.request.container));
+            let Some(track_number) = track_number.filter(|value| *value > 0) else {
+                if filename_contains_non_prefix_digits(&candidate.request.container) {
+                    ambiguous_track_identity = Some(candidate.request.container.clone());
+                } else {
+                    missing_track_identity = Some(candidate.request.container.clone());
+                }
+                break;
+            };
+            prepared.push((
+                disc_number.unwrap_or(0),
+                track_number,
+                normalized_path_key(&candidate.request.container),
+                candidate.item_index,
+                candidate.request.clone(),
+            ));
+        }
+
+        if let Some(path) = missing_track_identity.or(ambiguous_track_identity) {
+            log::warn!(
+                "independent single-file album batch at {} cannot prove track-number ordering because {} has no TRACKNUMBER metadata and no strict filename track prefix; leaving legacy completion-order conversion.log append enabled for this batch",
+                source_grouping_root.display(),
+                path.display()
+            );
+            continue;
+        }
+
+        let mut seen_track_identities: BTreeMap<(u32, u32), PathBuf> = BTreeMap::new();
+        let mut duplicate_track_identity = None;
+        for (disc_number, track_number, _path_key, _item_index, request) in prepared.iter() {
+            let key = (*disc_number, *track_number);
+            if let Some(first_path) = seen_track_identities.insert(key, request.container.clone()) {
+                duplicate_track_identity = Some((key, first_path, request.container.clone()));
+                break;
+            }
+        }
+        if let Some(((disc_number, track_number), first_path, duplicate_path)) = duplicate_track_identity {
+            let disc_label = if disc_number == 0 {
+                "unknown".to_string()
+            } else {
+                disc_number.to_string()
+            };
+            log::warn!(
+                "independent single-file album batch at {} has duplicate track identity disc={} track={} for {} and {}; leaving legacy completion-order conversion.log append enabled for this batch",
+                source_grouping_root.display(),
+                disc_label,
+                track_number,
+                first_path.display(),
+                duplicate_path.display()
+            );
+            continue;
+        }
+
+        prepared.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+
+        let mut requests = Vec::with_capacity(prepared.len());
+        let mut item_indices = Vec::with_capacity(prepared.len());
+
+        for (ordinal_index, (disc_number_for_sort, track_number, _path_key, item_index, mut request)) in prepared.into_iter().enumerate() {
+            if request.album_batch_track.is_none() {
+                let source_ordinal = u32::try_from(ordinal_index + 1).unwrap_or(u32::MAX);
+                let disc_number = if disc_number_for_sort == 0 {
+                    None
+                } else {
+                    Some(disc_number_for_sort)
+                };
+                request.album_batch_track = Some(AlbumBatchTrackContext::new(
+                    source_ordinal,
+                    disc_number,
+                    track_number,
+                ));
+            }
+            request.suppress_incremental_conversion_log_append = false;
+            item_indices.push(item_index);
+            requests.push(request);
+        }
+
+        match prepare_independent_single_file_album_batch_for_dispatch(
+            requests,
+            album_output_dir.clone(),
+            source_grouping_root.clone(),
+        ) {
+            Ok(dispatch) => {
+                for (item_index, request) in item_indices.into_iter().zip(dispatch.requests.into_iter()) {
+                    if let Some(item) = items.get_mut(item_index) {
+                        item.pipeline_request = Some(request);
+                    }
+                }
+            }
+            Err(err) => {
+                log::error!(
+                    "independent single-file album batch at {} could not enable ordered fragment logging because dispatch preparation failed: {err}; suppressing legacy conversion.log append for this batch",
+                    source_grouping_root.display()
+                );
+                for item_index in item_indices {
+                    if let Some(item) = items.get_mut(item_index) {
+                        let mut request = match item.pipeline_request.clone() {
+                            Some(request) => request,
+                            None => match build_pipeline_request(item) {
+                                Ok(request) => request,
+                                Err(err) => {
+                                    log::warn!(
+                                        "could not attach ordered-log suppression to {} after dispatch preparation failed: {err}",
+                                        item.id
+                                    );
+                                    continue;
+                                }
+                            },
+                        };
+                        request.album_batch = None;
+                        request.album_batch_track = None;
+                        request.expected_album_track_count = None;
+                        request.suppress_incremental_conversion_log_append = true;
+                        item.pipeline_request = Some(request);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn conversion_settings_fingerprint_key(settings: &PipelineSettings) -> String {
+    tonepoet_pipeline::fingerprint::settings_fingerprint(settings).to_string()
+}
+
+fn source_grouping_root_for_dispatch_request(req: &PipelineRequest) -> PathBuf {
+    let parent = req
+        .container
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| req.container.clone());
+
+    if is_disc_directory(&parent) {
+        parent.parent().map(Path::to_path_buf).unwrap_or(parent)
+    } else {
+        parent
+    }
+}
+
+fn provisional_album_output_dir_for_dispatch_request(req: &PipelineRequest, source_grouping_root: &Path) -> PathBuf {
+    if !req.naming.per_album_subdir {
+        return req.output_root.clone();
+    }
+
+    // This is only a dispatch-time grouping/fallback directory. It must not be
+    // treated as the authoritative album output directory when folder templates
+    // or tag metadata can change the planner's final album path. The
+    // AlbumBatchContext created from it is marked provisional; fragment staging
+    // and identity bind to the directory returned by plan_outputs() once a
+    // track has been materialized/planned.
+    let component = source_grouping_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(sanitize_album_batch_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Album".to_string());
+    req.output_root.join(component)
+}
+
+fn is_disc_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| {
+            let lower = name.trim().to_ascii_lowercase();
+            matches!(lower.as_str(), "disc" | "disk" | "cd")
+                || disc_number_from_directory_name(name).is_some()
+        })
+        .unwrap_or(false)
+}
+
+fn disc_number_from_dispatch_path(path: &Path) -> Option<u32> {
+    let parent = path.parent()?;
+    let name = parent.file_name()?.to_str()?;
+    disc_number_from_directory_name(name)
+}
+
+fn disc_number_from_directory_name(name: &str) -> Option<u32> {
+    let lower = name.trim().to_ascii_lowercase();
+    for prefix in ["disc", "disk", "cd"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            let rest = rest
+                .strip_prefix('-')
+                .or_else(|| rest.strip_prefix('_'))
+                .or_else(|| rest.strip_prefix('.'))
+                .unwrap_or(rest)
+                .trim_start();
+            let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                if let Ok(number) = digits.parse::<u32>() {
+                    if number > 0 {
+                        return Some(number);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn mark_queued_album_batch_as_ordering_unavailable(
+    items: &mut [ConversionItem],
+    group: &[IndependentSingleFileBatchCandidate],
+) {
+    for candidate in group {
+        if let Some(item) = items.get_mut(candidate.item_index) {
+            let mut request = candidate.request.clone();
+            request.album_batch = None;
+            request.album_batch_track = None;
+            request.expected_album_track_count = None;
+            request.suppress_incremental_conversion_log_append = true;
+            item.pipeline_request = Some(request);
+        }
+    }
+}
+
+fn strict_track_number_from_dispatch_path(path: &Path) -> Option<u32> {
+    let stem = path.file_stem()?.to_str()?.trim();
+    let mut digits = String::new();
+    let mut chars = stem.char_indices().peekable();
+    while let Some((_idx, ch)) = chars.peek().copied() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() || digits.len() > 3 {
+        return None;
+    }
+    let rest = &stem[digits.len()..];
+    if !has_strict_track_prefix_separator(rest) {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn has_strict_track_prefix_separator(rest: &str) -> bool {
+    if rest.is_empty() {
+        return true;
+    }
+    let trimmed = rest.trim_start();
+    matches!(trimmed.chars().next(), Some('-' | '_' | '.'))
+}
+
+fn track_context_from_dispatch_metadata(path: &Path) -> Option<(Option<u32>, u32)> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+
+    match extension.as_deref() {
+        Some("flac") => flac_vorbis_comment_track_context(path)
+            .or_else(|| id3v2_track_context(path))
+            .or_else(|| apev2_track_context(path)),
+        Some("mp3") | Some("aif") | Some("aiff") => id3v2_track_context(path)
+            .or_else(|| id3v1_track_context(path))
+            .or_else(|| apev2_track_context(path)),
+        Some("ape") | Some("wv") | Some("mpc") | Some("mp+") => apev2_track_context(path)
+            .or_else(|| id3v2_track_context(path))
+            .or_else(|| id3v1_track_context(path)),
+        _ => id3v2_track_context(path)
+            .or_else(|| id3v1_track_context(path))
+            .or_else(|| apev2_track_context(path)),
+    }
+}
+
+fn flac_vorbis_comment_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
+    let mut file = fs::File::open(path).ok()?;
+    read_flac_vorbis_comment_track_context(&mut file)
+}
+
+fn read_flac_vorbis_comment_track_context<R: Read + Seek>(reader: &mut R) -> Option<(Option<u32>, u32)> {
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).ok()?;
+    if &magic != b"fLaC" {
+        return None;
+    }
+
+    loop {
+        let mut header = [0u8; 4];
+        reader.read_exact(&mut header).ok()?;
+        let is_last = header[0] & 0x80 != 0;
+        let block_type = header[0] & 0x7f;
+        let length = ((usize::from(header[1])) << 16)
+            | ((usize::from(header[2])) << 8)
+            | usize::from(header[3]);
+
+        if block_type == 4 {
+            let mut block = vec![0u8; length];
+            reader.read_exact(&mut block).ok()?;
+            return parse_vorbis_comment_track_context(&block);
+        }
+
+        reader.seek(SeekFrom::Current(i64::try_from(length).ok()?)).ok()?;
+        if is_last {
+            break;
+        }
+    }
+    None
+}
+
+fn parse_flac_vorbis_comment_track_context(bytes: &[u8]) -> Option<(Option<u32>, u32)> {
+    if bytes.len() < 4 || &bytes[..4] != b"fLaC" {
+        return None;
+    }
+
+    let mut offset = 4usize;
+    while offset.checked_add(4)? <= bytes.len() {
+        let header = bytes[offset];
+        let is_last = header & 0x80 != 0;
+        let block_type = header & 0x7f;
+        let length = ((usize::from(bytes[offset + 1])) << 16)
+            | ((usize::from(bytes[offset + 2])) << 8)
+            | usize::from(bytes[offset + 3]);
+        offset = offset.checked_add(4)?;
+        let end = offset.checked_add(length)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if block_type == 4 {
+            return parse_vorbis_comment_track_context(&bytes[offset..end]);
+        }
+        offset = end;
+        if is_last {
+            break;
+        }
+    }
+    None
+}
+
+fn parse_vorbis_comment_track_context(block: &[u8]) -> Option<(Option<u32>, u32)> {
+    let mut offset = 0usize;
+    let vendor_len = read_le_u32(block, &mut offset)? as usize;
+    offset = offset.checked_add(vendor_len)?;
+    if offset > block.len() {
+        return None;
+    }
+    let comment_count = read_le_u32(block, &mut offset)? as usize;
+    let mut track_number = None;
+    let mut disc_number = None;
+    for _ in 0..comment_count {
+        let len = read_le_u32(block, &mut offset)? as usize;
+        let end = offset.checked_add(len)?;
+        if end > block.len() {
+            return None;
+        }
+        let comment = std::str::from_utf8(&block[offset..end]).ok()?;
+        offset = end;
+        let Some((key, value)) = comment.split_once('=') else {
+            continue;
+        };
+        match key.trim().to_ascii_uppercase().as_str() {
+            "TRACKNUMBER" | "TRACK" => {
+                track_number = parse_metadata_ordinal(value).or(track_number);
+            }
+            "DISCNUMBER" | "DISC" => {
+                disc_number = parse_metadata_ordinal(value).or(disc_number);
+            }
+            _ => {}
+        }
+    }
+    track_number.map(|track| (disc_number, track))
+}
+
+fn id3v2_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 10];
+    file.read_exact(&mut header).ok()?;
+    if &header[..3] != b"ID3" {
+        return None;
+    }
+    let major = header[3];
+    if !(2..=4).contains(&major) {
+        return None;
+    }
+    let tag_size = read_synchsafe_u32(&header[6..10])? as usize;
+    if tag_size == 0 || tag_size > 16 * 1024 * 1024 {
+        return None;
+    }
+    let mut body = vec![0u8; tag_size];
+    file.read_exact(&mut body).ok()?;
+    parse_id3v2_track_context(major, header[5], &body)
+}
+
+fn parse_id3v2_track_context(major: u8, flags: u8, body: &[u8]) -> Option<(Option<u32>, u32)> {
+    let deunsynchronized;
+    let body = if id3v2_tag_uses_unsynchronization(flags) {
+        deunsynchronized = id3v2_deunsynchronize(body);
+        deunsynchronized.as_slice()
+    } else {
+        body
+    };
+    let mut offset = id3v2_frame_start_offset(major, flags, body).unwrap_or(0);
+    let mut track_number = None;
+    let mut disc_number = None;
+
+    while offset < body.len() {
+        if major == 2 {
+            let frame_header_end = offset.checked_add(6)?;
+            if frame_header_end > body.len() {
+                break;
+            }
+            let id = &body[offset..offset + 3];
+            if id.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let size = ((usize::from(body[offset + 3])) << 16)
+                | ((usize::from(body[offset + 4])) << 8)
+                | usize::from(body[offset + 5]);
+            offset = frame_header_end;
+            let end = offset.checked_add(size)?;
+            if end > body.len() {
+                break;
+            }
+            match id {
+                b"TRK" => track_number = parse_id3_text_ordinal(&body[offset..end]).or(track_number),
+                b"TPA" => disc_number = parse_id3_text_ordinal(&body[offset..end]).or(disc_number),
+                _ => {}
+            }
+            offset = end;
+        } else {
+            let frame_header_end = offset.checked_add(10)?;
+            if frame_header_end > body.len() {
+                break;
+            }
+            let id = &body[offset..offset + 4];
+            if id.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let size = if major == 4 {
+                read_synchsafe_u32(&body[offset + 4..offset + 8])? as usize
+            } else {
+                u32::from_be_bytes(body[offset + 4..offset + 8].try_into().ok()?) as usize
+            };
+            offset = frame_header_end;
+            let end = offset.checked_add(size)?;
+            if end > body.len() {
+                break;
+            }
+            match id {
+                b"TRCK" => track_number = parse_id3_text_ordinal(&body[offset..end]).or(track_number),
+                b"TPOS" => disc_number = parse_id3_text_ordinal(&body[offset..end]).or(disc_number),
+                _ => {}
+            }
+            offset = end;
+        }
+    }
+
+    track_number.map(|track| (disc_number, track))
+}
+
+fn id3v2_tag_uses_unsynchronization(flags: u8) -> bool {
+    flags & 0x80 != 0
+}
+
+fn id3v2_deunsynchronize(data: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(data.len());
+    let mut index = 0;
+    while index < data.len() {
+        let byte = data[index];
+        output.push(byte);
+        if byte == 0xff && data.get(index + 1) == Some(&0x00) {
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    output
+}
+
+fn id3v2_frame_start_offset(major: u8, flags: u8, body: &[u8]) -> Option<usize> {
+    if flags & 0x40 == 0 {
+        return Some(0);
+    }
+    if major == 4 {
+        let size = read_synchsafe_u32(body.get(0..4)?)? as usize;
+        return size.checked_add(4).filter(|offset| *offset <= body.len());
+    }
+    if major == 3 {
+        let size = u32::from_be_bytes(body.get(0..4)?.try_into().ok()?) as usize;
+        return size.checked_add(4).filter(|offset| *offset <= body.len());
+    }
+    Some(0)
+}
+
+fn parse_id3_text_ordinal(frame: &[u8]) -> Option<u32> {
+    let value = decode_id3_text_frame(frame)?;
+    parse_metadata_ordinal(value.trim_matches(char::from(0)))
+}
+
+fn decode_id3_text_frame(frame: &[u8]) -> Option<String> {
+    let (&encoding, payload) = frame.split_first()?;
+    match encoding {
+        0 => Some(payload.iter().map(|byte| char::from(*byte)).collect()),
+        3 => String::from_utf8(payload.to_vec()).ok(),
+        1 | 2 => decode_utf16_id3_text(encoding, payload),
+        _ => None,
+    }
+}
+
+fn decode_utf16_id3_text(encoding: u8, payload: &[u8]) -> Option<String> {
+    let (little_endian, bytes) = if encoding == 1 && payload.len() >= 2 {
+        match &payload[..2] {
+            [0xff, 0xfe] => (true, &payload[2..]),
+            [0xfe, 0xff] => (false, &payload[2..]),
+            _ => (false, payload),
+        }
+    } else {
+        (false, payload)
+    };
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let unit = if little_endian {
+            u16::from_le_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        };
+        units.push(unit);
+    }
+    String::from_utf16(&units).ok()
+}
+
+fn id3v1_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len < 128 {
+        return None;
+    }
+    file.seek(SeekFrom::End(-128)).ok()?;
+    let mut tag = [0u8; 128];
+    file.read_exact(&mut tag).ok()?;
+    parse_id3v1_track_context(&tag)
+}
+
+fn parse_id3v1_track_context(tag: &[u8]) -> Option<(Option<u32>, u32)> {
+    if tag.len() != 128 || &tag[..3] != b"TAG" {
+        return None;
+    }
+    // ID3v1.1 stores the track number in the comment terminator slot:
+    // bytes 97..127 are the comment field, byte 125 must be zero, and
+    // byte 126 stores a nonzero track ordinal. ID3v1 has no disc field.
+    let track = *tag.get(126)?;
+    if *tag.get(125)? != 0 || track == 0 {
+        return None;
+    }
+    Some((None, u32::from(track)))
+}
+
+fn apev2_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let footer_offset = apev2_footer_offset(&mut file, len)?;
+    file.seek(SeekFrom::Start(footer_offset)).ok()?;
+    let mut footer = [0u8; 32];
+    file.read_exact(&mut footer).ok()?;
+    let tag_size = u32::from_le_bytes(footer[12..16].try_into().ok()?) as u64;
+    let item_count = u32::from_le_bytes(footer[16..20].try_into().ok()?) as usize;
+    if tag_size < 32 || tag_size > len || tag_size > 16 * 1024 * 1024 {
+        return None;
+    }
+    let tag_start = footer_offset.checked_add(32)?.checked_sub(tag_size)?;
+    let item_end = footer_offset;
+    if item_end < tag_start {
+        return None;
+    }
+    let mut item_start = tag_start;
+    if item_end.checked_sub(item_start)? >= 32 {
+        file.seek(SeekFrom::Start(item_start)).ok()?;
+        let mut maybe_header = [0u8; 8];
+        file.read_exact(&mut maybe_header).ok()?;
+        if &maybe_header == b"APETAGEX" {
+            item_start = item_start.checked_add(32)?;
+        }
+    }
+    let item_bytes_len = usize::try_from(item_end.checked_sub(item_start)?).ok()?;
+    let mut items = vec![0u8; item_bytes_len];
+    file.seek(SeekFrom::Start(item_start)).ok()?;
+    file.read_exact(&mut items).ok()?;
+    parse_apev2_track_context(&items, item_count)
+}
+
+fn apev2_footer_offset(file: &mut fs::File, len: u64) -> Option<u64> {
+    if len < 32 {
+        return None;
+    }
+    if file_has_signature_at(file, len - 32, b"APETAGEX") {
+        return Some(len - 32);
+    }
+    if len >= 160 && file_has_signature_at(file, len - 160, b"APETAGEX") && file_has_signature_at(file, len - 128, b"TAG") {
+        return Some(len - 160);
+    }
+    None
+}
+
+fn file_has_signature_at(file: &mut fs::File, offset: u64, signature: &[u8]) -> bool {
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; signature.len()];
+    file.read_exact(&mut buf).is_ok() && buf == signature
+}
+
+fn parse_apev2_track_context(items: &[u8], item_count: usize) -> Option<(Option<u32>, u32)> {
+    let mut offset = 0usize;
+    let mut track_number = None;
+    let mut disc_number = None;
+    for _ in 0..item_count {
+        let header_end = offset.checked_add(8)?;
+        if header_end > items.len() {
+            return None;
+        }
+        let value_size = u32::from_le_bytes(items[offset..offset + 4].try_into().ok()?) as usize;
+        offset = header_end;
+        let key_start = offset;
+        while offset < items.len() && items[offset] != 0 {
+            offset += 1;
+        }
+        if offset >= items.len() {
+            return None;
+        }
+        let key = std::str::from_utf8(&items[key_start..offset]).ok()?;
+        offset += 1;
+        let value_end = offset.checked_add(value_size)?;
+        if value_end > items.len() {
+            return None;
+        }
+        let value = std::str::from_utf8(&items[offset..value_end]).ok()?;
+        match key.trim().to_ascii_uppercase().as_str() {
+            "TRACK" | "TRACKNUMBER" => track_number = parse_metadata_ordinal(value).or(track_number),
+            "DISC" | "DISCNUMBER" => disc_number = parse_metadata_ordinal(value).or(disc_number),
+            _ => {}
+        }
+        offset = value_end;
+    }
+    track_number.map(|track| (disc_number, track))
+}
+
+fn read_synchsafe_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() != 4 || bytes.iter().any(|byte| byte & 0x80 != 0) {
+        return None;
+    }
+    Some(
+        (u32::from(bytes[0]) << 21)
+            | (u32::from(bytes[1]) << 14)
+            | (u32::from(bytes[2]) << 7)
+            | u32::from(bytes[3]),
+    )
+}
+
+fn read_le_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let slice: [u8; 4] = bytes.get(*offset..end)?.try_into().ok()?;
+    *offset = end;
+    Some(u32::from_le_bytes(slice))
+}
+
+fn parse_metadata_ordinal(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    let digits: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn filename_contains_non_prefix_digits(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| {
+            let trimmed = stem.trim();
+            strict_track_number_from_dispatch_path(path).is_none()
+                && trimmed.chars().any(|ch| ch.is_ascii_digit())
+        })
+        .unwrap_or(false)
+}
+
+fn sanitize_album_batch_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    let trimmed = sanitized.trim().trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "Album".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn normalized_path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
 }
 
 fn effective_worker_count_for_tool_limits(
@@ -248,6 +1067,8 @@ impl ConversionProcessor {
                 };
             }
         }
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut queued_items);
 
         self.scheduler_metrics.reset();
         let effective_worker_count = effective_worker_count_for_tool_limits(
@@ -1598,9 +2419,846 @@ mod tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
+    }
+
+    fn conversion_item_with_pipeline_request(id: &str, request: PipelineRequest) -> ConversionItem {
+        let mut item = ConversionItem::default();
+        item.id = id.to_string();
+        item.input_path = request.container.clone();
+        item.pipeline_request = Some(request);
+        item
+    }
+
+    fn processor_dispatch_request_for_path(
+        root: &std::path::Path,
+        item_id: &str,
+        job_id: &str,
+        container: std::path::PathBuf,
+    ) -> PipelineRequest {
+        let mut req = pipeline_request_for_processor_limit_test(root);
+        req.item_id = item_id.to_string();
+        req.job_id = job_id.to_string();
+        req.container = container;
+        req.output_root = root.join("out");
+        req.log.root = root.join("logs");
+        req.album_batch = None;
+        req.album_batch_track = None;
+        req.suppress_incremental_conversion_log_append = false;
+        req.expected_album_track_count = None;
+        req
+    }
+
+    #[test]
+    fn queued_folder_dispatch_attaches_fragment_batch_before_scheduler_enqueue() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_01 = album_root.join("01 - Speak To Me.flac");
+        let track_02 = album_root.join("02 - Breathe.flac");
+        std::fs::write(&track_01, b"not real audio; dispatch test only").expect("track 1 file");
+        std::fs::write(&track_02, b"not real audio; dispatch test only").expect("track 2 file");
+
+        // Intentionally pass request/order as 02, then 01. Production dispatch
+        // must not preserve filesystem/request enumeration order; it should
+        // parse canonical track identity, sort, and then attach a shared
+        // fragment-batch contract before build_initial_work() submits jobs.
+        let req_02 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-02",
+            "job-02",
+            track_02.clone(),
+        );
+        let req_01 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-01",
+            "job-01",
+            track_01.clone(),
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-02", req_02),
+            conversion_item_with_pipeline_request("item-01", req_01),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let prepared_02 = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("item 02 has prepared request");
+        let prepared_01 = items[1]
+            .pipeline_request
+            .as_ref()
+            .expect("item 01 has prepared request");
+        let batch_02 = prepared_02
+            .album_batch
+            .as_ref()
+            .expect("track 02 enters fragment-backed batch");
+        let batch_01 = prepared_01
+            .album_batch
+            .as_ref()
+            .expect("track 01 enters fragment-backed batch");
+        assert_eq!(batch_01.conversion_log_batch_id, batch_02.conversion_log_batch_id);
+        assert_eq!(batch_01.expected_track_count, 2);
+        assert_eq!(batch_02.expected_track_count, 2);
+
+        let order_01 = prepared_01
+            .album_batch_track
+            .as_ref()
+            .expect("track 01 receives dispatcher ordering");
+        let order_02 = prepared_02
+            .album_batch_track
+            .as_ref()
+            .expect("track 02 receives dispatcher ordering");
+        assert_eq!(order_01.track_number, 1);
+        assert_eq!(order_02.track_number, 2);
+        assert!(order_01.source_ordinal < order_02.source_ordinal);
+    }
+
+
+    #[test]
+    fn queued_folder_dispatch_suppresses_ordered_logging_when_conversion_settings_differ() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_01 = album_root.join("01 - First.flac");
+        let track_02 = album_root.join("02 - Second.flac");
+        std::fs::write(&track_01, b"not real audio; dispatch test only").expect("track 1 file");
+        std::fs::write(&track_02, b"not real audio; dispatch test only").expect("track 2 file");
+
+        let req_01 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-01",
+            "job-01",
+            track_01,
+        );
+        let mut req_02 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-02",
+            "job-02",
+            track_02,
+        );
+        req_02.settings.force_encode = !req_02.settings.force_encode;
+        assert_ne!(
+            conversion_settings_fingerprint_key(&req_01.settings),
+            conversion_settings_fingerprint_key(&req_02.settings),
+            "test setup must exercise a real settings-fingerprint mismatch"
+        );
+
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-01", req_01),
+            conversion_item_with_pipeline_request("item-02", req_02),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        for item in &items {
+            let request = item
+                .pipeline_request
+                .as_ref()
+                .expect("heterogeneous item keeps explicit request");
+            assert!(request.album_batch.is_none());
+            assert!(request.album_batch_track.is_none());
+            assert!(
+                request.suppress_incremental_conversion_log_append,
+                "heterogeneous settings must not share a fragment batch or fall back to completion-order conversion.log append"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_track_number_parser_accepts_only_strict_track_prefixes() {
+        assert_eq!(strict_track_number_from_dispatch_path(std::path::Path::new("01 - Speak To Me.flac")), Some(1));
+        assert_eq!(strict_track_number_from_dispatch_path(std::path::Path::new("1. Breathe.flac")), Some(1));
+        assert_eq!(strict_track_number_from_dispatch_path(std::path::Path::new("02_Time.flac")), Some(2));
+
+        assert_eq!(strict_track_number_from_dispatch_path(std::path::Path::new("Speak To Me.flac")), None);
+        assert_eq!(strict_track_number_from_dispatch_path(std::path::Path::new("Symphony No. 5.flac")), None);
+        assert_eq!(strict_track_number_from_dispatch_path(std::path::Path::new("Take 2.flac")), None);
+        assert_eq!(strict_track_number_from_dispatch_path(std::path::Path::new("2024 Remaster.flac")), None);
+    }
+
+    fn fake_flac_with_vorbis_comments(comments: &[(&str, &str)]) -> Vec<u8> {
+        let mut block = Vec::new();
+        let vendor = b"tonepoet-test";
+        block.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        block.extend_from_slice(vendor);
+        block.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for (key, value) in comments {
+            let comment = format!("{key}={value}");
+            block.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+            block.extend_from_slice(comment.as_bytes());
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"fLaC");
+        bytes.push(0x84);
+        bytes.push(((block.len() >> 16) & 0xff) as u8);
+        bytes.push(((block.len() >> 8) & 0xff) as u8);
+        bytes.push((block.len() & 0xff) as u8);
+        bytes.extend_from_slice(&block);
+        bytes
+    }
+
+    fn synchsafe_bytes(size: usize) -> [u8; 4] {
+        [
+            ((size >> 21) & 0x7f) as u8,
+            ((size >> 14) & 0x7f) as u8,
+            ((size >> 7) & 0x7f) as u8,
+            (size & 0x7f) as u8,
+        ]
+    }
+
+    fn fake_id3v23_with_text_frames(frames: &[(&str, &str)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, value) in frames {
+            let mut payload = Vec::new();
+            payload.push(3); // UTF-8 text frame
+            payload.extend_from_slice(value.as_bytes());
+            body.extend_from_slice(id.as_bytes());
+            body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(&payload);
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ID3");
+        bytes.extend_from_slice(&[3, 0, 0]);
+        bytes.extend_from_slice(&synchsafe_bytes(body.len()));
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(b"fake audio payload");
+        bytes
+    }
+
+    fn id3v2_unsynchronize_for_test(data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(data.len());
+        for byte in data {
+            output.push(*byte);
+            if *byte == 0xff {
+                output.push(0x00);
+            }
+        }
+        output
+    }
+
+    fn fake_unsynchronized_id3v23_with_utf16_track(track: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(1); // UTF-16 with BOM
+        payload.extend_from_slice(&[0xff, 0xfe]);
+        for unit in track.encode_utf16() {
+            payload.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"TRCK");
+        body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&payload);
+        let body = id3v2_unsynchronize_for_test(&body);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ID3");
+        bytes.extend_from_slice(&[3, 0, 0x80]);
+        bytes.extend_from_slice(&synchsafe_bytes(body.len()));
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(b"fake audio payload");
+        bytes
+    }
+
+    fn fake_id3v1_with_track(track: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"fake audio payload");
+        let mut tag = [0u8; 128];
+        tag[..3].copy_from_slice(b"TAG");
+        tag[3..8].copy_from_slice(b"Title");
+        tag[33..39].copy_from_slice(b"Artist");
+        tag[63..68].copy_from_slice(b"Album");
+        tag[93..97].copy_from_slice(b"2026");
+        tag[125] = 0;
+        tag[126] = track;
+        tag[127] = 255;
+        bytes.extend_from_slice(&tag);
+        bytes
+    }
+
+    fn fake_apev2_with_items(items: &[(&str, &str)]) -> Vec<u8> {
+        let mut item_bytes = Vec::new();
+        for (key, value) in items {
+            item_bytes.extend_from_slice(&(value.as_bytes().len() as u32).to_le_bytes());
+            item_bytes.extend_from_slice(&0u32.to_le_bytes());
+            item_bytes.extend_from_slice(key.as_bytes());
+            item_bytes.push(0);
+            item_bytes.extend_from_slice(value.as_bytes());
+        }
+        let tag_size = item_bytes.len() + 32;
+        let mut footer = Vec::new();
+        footer.extend_from_slice(b"APETAGEX");
+        footer.extend_from_slice(&2000u32.to_le_bytes());
+        footer.extend_from_slice(&(tag_size as u32).to_le_bytes());
+        footer.extend_from_slice(&(items.len() as u32).to_le_bytes());
+        footer.extend_from_slice(&0u32.to_le_bytes());
+        footer.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"fake audio payload");
+        bytes.extend_from_slice(&item_bytes);
+        bytes.extend_from_slice(&footer);
+        bytes
+    }
+
+    #[test]
+    fn dispatch_reads_flac_tracknumber_metadata_for_unnumbered_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("Speak To Me.flac");
+        let track_b = album_root.join("Breathe.flac");
+        std::fs::write(&track_a, fake_flac_with_vorbis_comments(&[("TRACKNUMBER", "1/2")]))
+            .expect("track a flac");
+        std::fs::write(&track_b, fake_flac_with_vorbis_comments(&[("TRACKNUMBER", "2/2")]))
+            .expect("track b flac");
+
+        let req_a = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-a",
+            "job-a",
+            track_a,
+        );
+        let req_b = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-b",
+            "job-b",
+            track_b,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-b", req_b),
+            conversion_item_with_pipeline_request("item-a", req_a),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let prepared_b = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("track b prepared request");
+        let prepared_a = items[1]
+            .pipeline_request
+            .as_ref()
+            .expect("track a prepared request");
+        assert_eq!(
+            prepared_a.album_batch.as_ref().map(|batch| batch.conversion_log_batch_id.clone()),
+            prepared_b.album_batch.as_ref().map(|batch| batch.conversion_log_batch_id.clone())
+        );
+        assert_eq!(
+            prepared_a.album_batch_track.as_ref().map(|track| track.track_number),
+            Some(1)
+        );
+        assert_eq!(
+            prepared_b.album_batch_track.as_ref().map(|track| track.track_number),
+            Some(2)
+        );
+        assert!(!prepared_a.suppress_incremental_conversion_log_append);
+        assert!(!prepared_b.suppress_incremental_conversion_log_append);
+    }
+
+    #[test]
+    fn flac_metadata_track_context_parses_track_and_disc_ordinals() {
+        let bytes = fake_flac_with_vorbis_comments(&[
+            ("DISCNUMBER", "2/3"),
+            ("TRACKNUMBER", "07/12"),
+        ]);
+        assert_eq!(parse_flac_vorbis_comment_track_context(&bytes), Some((Some(2), 7)));
+    }
+
+    #[test]
+    fn flac_metadata_reader_streams_metadata_blocks_without_audio_payload() {
+        let vorbis_file = fake_flac_with_vorbis_comments(&[
+            ("DISCNUMBER", "2/3"),
+            ("TRACKNUMBER", "07/12"),
+        ]);
+        let vorbis_block = &vorbis_file[8..];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"fLaC");
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 34]);
+        bytes.extend_from_slice(&[0u8; 34]);
+        bytes.push(0x84);
+        bytes.push(((vorbis_block.len() >> 16) & 0xff) as u8);
+        bytes.push(((vorbis_block.len() >> 8) & 0xff) as u8);
+        bytes.push((vorbis_block.len() & 0xff) as u8);
+        bytes.extend_from_slice(vorbis_block);
+        bytes.extend_from_slice(&[0xff; 1024]);
+
+        let mut cursor = std::io::Cursor::new(bytes);
+        assert_eq!(
+            read_flac_vorbis_comment_track_context(&mut cursor),
+            Some((Some(2), 7))
+        );
+    }
+
+    #[test]
+    fn id3v2_metadata_track_context_parses_track_and_disc_ordinals() {
+        let bytes = fake_id3v23_with_text_frames(&[
+            ("TPOS", "2/3"),
+            ("TRCK", "07/12"),
+        ]);
+        assert_eq!(parse_id3v2_track_context(3, 0, &bytes[10..bytes.len() - b"fake audio payload".len()]), Some((Some(2), 7)));
+    }
+
+    #[test]
+    fn id3v2_metadata_track_context_deunsynchronizes_tag_body() {
+        let bytes = fake_unsynchronized_id3v23_with_utf16_track("07/12");
+        assert_eq!(
+            parse_id3v2_track_context(3, 0x80, &bytes[10..bytes.len() - b"fake audio payload".len()]),
+            Some((None, 7))
+        );
+    }
+
+    #[test]
+    fn id3v1_metadata_track_context_parses_track_ordinal() {
+        let bytes = fake_id3v1_with_track(7);
+        let tag = &bytes[bytes.len() - 128..];
+        assert_eq!(parse_id3v1_track_context(tag), Some((None, 7)));
+    }
+
+    #[test]
+    fn apev2_metadata_track_context_parses_track_and_disc_ordinals() {
+        let mut item_bytes = Vec::new();
+        for (key, value) in [("Disc", "2/3"), ("Track", "07/12")] {
+            item_bytes.extend_from_slice(&(value.as_bytes().len() as u32).to_le_bytes());
+            item_bytes.extend_from_slice(&0u32.to_le_bytes());
+            item_bytes.extend_from_slice(key.as_bytes());
+            item_bytes.push(0);
+            item_bytes.extend_from_slice(value.as_bytes());
+        }
+        assert_eq!(parse_apev2_track_context(&item_bytes, 2), Some((Some(2), 7)));
+    }
+
+    #[test]
+    fn dispatch_reads_id3v1_tracknumber_metadata_for_unnumbered_mp3_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("Speak To Me.mp3");
+        let track_b = album_root.join("Breathe.mp3");
+        std::fs::write(&track_a, fake_id3v1_with_track(1))
+            .expect("track a id3v1");
+        std::fs::write(&track_b, fake_id3v1_with_track(2))
+            .expect("track b id3v1");
+
+        let req_a = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-a",
+            "job-a",
+            track_a,
+        );
+        let req_b = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-b",
+            "job-b",
+            track_b,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-b", req_b),
+            conversion_item_with_pipeline_request("item-a", req_a),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let prepared_b = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("track b prepared request");
+        let prepared_a = items[1]
+            .pipeline_request
+            .as_ref()
+            .expect("track a prepared request");
+        assert_eq!(
+            prepared_a.album_batch_track.as_ref().map(|track| track.track_number),
+            Some(1)
+        );
+        assert_eq!(
+            prepared_b.album_batch_track.as_ref().map(|track| track.track_number),
+            Some(2)
+        );
+        assert_eq!(
+            prepared_a.album_batch.as_ref().map(|batch| batch.conversion_log_batch_id.clone()),
+            prepared_b.album_batch.as_ref().map(|batch| batch.conversion_log_batch_id.clone())
+        );
+    }
+
+    #[test]
+    fn dispatch_reads_id3v2_tracknumber_metadata_for_unnumbered_mp3_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("Speak To Me.mp3");
+        let track_b = album_root.join("Breathe.mp3");
+        std::fs::write(&track_a, fake_id3v23_with_text_frames(&[("TRCK", "1/2")]))
+            .expect("track a id3");
+        std::fs::write(&track_b, fake_id3v23_with_text_frames(&[("TRCK", "2/2")]))
+            .expect("track b id3");
+
+        let req_a = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-a",
+            "job-a",
+            track_a,
+        );
+        let req_b = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-b",
+            "job-b",
+            track_b,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-b", req_b),
+            conversion_item_with_pipeline_request("item-a", req_a),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let prepared_b = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("track b prepared request");
+        let prepared_a = items[1]
+            .pipeline_request
+            .as_ref()
+            .expect("track a prepared request");
+        assert_eq!(
+            prepared_a.album_batch_track.as_ref().map(|track| track.track_number),
+            Some(1)
+        );
+        assert_eq!(
+            prepared_b.album_batch_track.as_ref().map(|track| track.track_number),
+            Some(2)
+        );
+        assert_eq!(
+            prepared_a.album_batch.as_ref().map(|batch| batch.conversion_log_batch_id.clone()),
+            prepared_b.album_batch.as_ref().map(|batch| batch.conversion_log_batch_id.clone())
+        );
+    }
+
+    #[test]
+    fn dispatch_reads_apev2_tracknumber_metadata_for_unnumbered_wavpack_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("Speak To Me.wv");
+        let track_b = album_root.join("Breathe.wv");
+        std::fs::write(&track_a, fake_apev2_with_items(&[("Track", "1/2")]))
+            .expect("track a apev2");
+        std::fs::write(&track_b, fake_apev2_with_items(&[("Track", "2/2")]))
+            .expect("track b apev2");
+
+        let req_a = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-a",
+            "job-a",
+            track_a,
+        );
+        let req_b = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-b",
+            "job-b",
+            track_b,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-b", req_b),
+            conversion_item_with_pipeline_request("item-a", req_a),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let prepared_b = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("track b prepared request");
+        let prepared_a = items[1]
+            .pipeline_request
+            .as_ref()
+            .expect("track a prepared request");
+        assert_eq!(
+            prepared_a.album_batch_track.as_ref().map(|track| track.track_number),
+            Some(1)
+        );
+        assert_eq!(
+            prepared_b.album_batch_track.as_ref().map(|track| track.track_number),
+            Some(2)
+        );
+        assert_eq!(
+            prepared_a.album_batch.as_ref().map(|batch| batch.conversion_log_batch_id.clone()),
+            prepared_b.album_batch.as_ref().map(|batch| batch.conversion_log_batch_id.clone())
+        );
+    }
+
+    #[test]
+    fn dispatch_disc_directory_parser_accepts_common_disc_folder_names() {
+        for name in ["Disc1", "Disc 1", "Disc-1", "Disc_1", "Disk1", "Disk 1", "CD1", "CD 1"] {
+            let path = std::path::Path::new(name);
+            assert!(is_disc_directory(path), "{name} should be recognized as a disc directory");
+            assert_eq!(disc_number_from_directory_name(name), Some(1));
+        }
+
+        assert!(is_disc_directory(std::path::Path::new("disc")));
+        assert!(is_disc_directory(std::path::Path::new("disk")));
+        assert!(is_disc_directory(std::path::Path::new("cd")));
+        assert!(!is_disc_directory(std::path::Path::new("Compact Discs")));
+        assert_eq!(disc_number_from_directory_name("Discography"), None);
+        assert_eq!(disc_number_from_directory_name("CDs"), None);
+    }
+
+    #[test]
+    fn queued_folder_dispatch_folds_cd_numbered_disc_dirs_into_one_album_batch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        let cd1 = album_root.join("CD1");
+        let cd2 = album_root.join("CD 2");
+        std::fs::create_dir_all(&cd1).expect("cd1 dir");
+        std::fs::create_dir_all(&cd2).expect("cd2 dir");
+        let track_01 = cd1.join("01 - First.flac");
+        let track_02 = cd2.join("01 - Second.flac");
+        std::fs::write(&track_01, b"not real audio; dispatch test only").expect("track 1 file");
+        std::fs::write(&track_02, b"not real audio; dispatch test only").expect("track 2 file");
+
+        let req_01 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-disc-1",
+            "job-disc-1",
+            track_01,
+        );
+        let req_02 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-disc-2",
+            "job-disc-2",
+            track_02,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-disc-1", req_01),
+            conversion_item_with_pipeline_request("item-disc-2", req_02),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let prepared_01 = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("disc 1 item has prepared request");
+        let prepared_02 = items[1]
+            .pipeline_request
+            .as_ref()
+            .expect("disc 2 item has prepared request");
+        let batch_01 = prepared_01.album_batch.as_ref().expect("disc 1 enters batch");
+        let batch_02 = prepared_02.album_batch.as_ref().expect("disc 2 enters same batch");
+        assert_eq!(batch_01.conversion_log_batch_id, batch_02.conversion_log_batch_id);
+        assert_eq!(batch_01.expected_track_count, 2);
+        assert_eq!(batch_02.expected_track_count, 2);
+        assert_eq!(batch_01.source_grouping_root, album_root);
+        assert_eq!(batch_02.source_grouping_root, album_root);
+
+        let order_01 = prepared_01.album_batch_track.as_ref().expect("disc 1 order");
+        let order_02 = prepared_02.album_batch_track.as_ref().expect("disc 2 order");
+        assert_eq!(order_01.disc_number, Some(1));
+        assert_eq!(order_02.disc_number, Some(2));
+        assert_eq!(order_01.track_number, 1);
+        assert_eq!(order_02.track_number, 1);
+        assert!(order_01.source_ordinal < order_02.source_ordinal);
+    }
+
+    #[test]
+    fn build_initial_work_preserves_prepared_album_batch_request_at_scheduler_boundary() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_01 = album_root.join("01 - First.flac");
+        let track_02 = album_root.join("02 - Second.flac");
+        std::fs::write(&track_01, b"not real audio; dispatch test only").expect("track 1 file");
+        std::fs::write(&track_02, b"not real audio; dispatch test only").expect("track 2 file");
+
+        let req_01 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-01",
+            "prepared-job-01",
+            track_01,
+        );
+        let req_02 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-02",
+            "prepared-job-02",
+            track_02,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-01", req_01),
+            conversion_item_with_pipeline_request("item-02", req_02),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let item = items[0].clone();
+        let boundary_request = build_pipeline_request(&item)
+            .expect("build_initial_work boundary must reuse the prepared request");
+        assert!(boundary_request.album_batch.is_some());
+        assert!(boundary_request.album_batch_track.is_some());
+        assert_eq!(boundary_request.job_id, "prepared-job-01");
+        assert_eq!(boundary_request.item_id, "item-01");
+
+        let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
+            Some(1),
+            CancellationToken::new(),
+            PoolLimits::default(),
+        );
+        let mut terminal = BTreeMap::new();
+        let mut job_to_item = BTreeMap::new();
+        let tool_paths = HashMap::new();
+        let (progress_tx, _progress_rx) = broadcast::channel(4);
+        let work = build_initial_work(
+            item,
+            &pool,
+            &mut terminal,
+            &mut job_to_item,
+            &tool_paths,
+            &progress_tx,
+            None,
+            2,
+            Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
+        )
+        .expect("prepared single-file item produces scheduler work");
+
+        assert_eq!(work.kind, WorkKind::SingleFile);
+        assert_eq!(work.job_id, "prepared-job-01");
+        assert_eq!(job_to_item.get("prepared-job-01").map(String::as_str), Some("item-01"));
+        assert!(terminal.is_empty());
+    }
+
+    #[test]
+    fn queued_folder_dispatch_keeps_legacy_append_for_duplicate_track_identities() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("01 - First.flac");
+        let track_b = album_root.join("01 - Duplicate.flac");
+        std::fs::write(&track_a, b"not real audio; dispatch test only").expect("track a file");
+        std::fs::write(&track_b, b"not real audio; dispatch test only").expect("track b file");
+
+        let req_a = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-a",
+            "job-a",
+            track_a,
+        );
+        let req_b = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-b",
+            "job-b",
+            track_b,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-a", req_a),
+            conversion_item_with_pipeline_request("item-b", req_b),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        for item in &items {
+            let request = item
+                .pipeline_request
+                .as_ref()
+                .expect("duplicate item keeps explicit request");
+            assert!(request.album_batch.is_none());
+            assert!(request.album_batch_track.is_none());
+            assert!(
+                !request.suppress_incremental_conversion_log_append,
+                "duplicate track identities are ambiguous, so fall back to completion-order append"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_folder_dispatch_keeps_legacy_append_when_track_identity_is_absent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("Speak To Me.flac");
+        let track_b = album_root.join("Breathe.flac");
+        std::fs::write(&track_a, b"not real audio; dispatch test only").expect("track a file");
+        std::fs::write(&track_b, b"not real audio; dispatch test only").expect("track b file");
+
+        let req_a = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-a",
+            "job-a",
+            track_a,
+        );
+        let req_b = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-b",
+            "job-b",
+            track_b,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-a", req_a),
+            conversion_item_with_pipeline_request("item-b", req_b),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        for item in &items {
+            let request = item
+                .pipeline_request
+                .as_ref()
+                .expect("unproven item keeps explicit request");
+            assert!(request.album_batch.is_none());
+            assert!(request.album_batch_track.is_none());
+            assert!(
+                !request.suppress_incremental_conversion_log_append,
+                "when no track-number information exists, fall back to completion-order conversion.log append"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_folder_dispatch_does_not_treat_embedded_digits_as_track_numbers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Composer").join("Symphony");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("Symphony No. 5.flac");
+        let track_b = album_root.join("2024 Remaster.flac");
+        std::fs::write(&track_a, b"not real audio; dispatch test only").expect("track a file");
+        std::fs::write(&track_b, b"not real audio; dispatch test only").expect("track b file");
+
+        let req_a = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-a",
+            "job-a",
+            track_a,
+        );
+        let req_b = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-b",
+            "job-b",
+            track_b,
+        );
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-a", req_a),
+            conversion_item_with_pipeline_request("item-b", req_b),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        assert!(items.iter().all(|item| item
+            .pipeline_request
+            .as_ref()
+            .map(|request| {
+                request.album_batch.is_none()
+                    && request.album_batch_track.is_none()
+                    && !request.suppress_incremental_conversion_log_append
+            })
+            .unwrap_or(false)));
     }
 
     fn prepared_track_for_processor_limit_test(root: &std::path::Path) -> PreparedTrack {
