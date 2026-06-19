@@ -67,7 +67,7 @@ It performs no writes and no path traversal. File names are restricted to single
 
 ### ISO implementation
 
-`IsoDvdaVolume` is feature-gated behind `iso-isomage`. It uses `isomage` to parse ISO/UDF and streams individual nodes into in-memory cursors. This is deliberate: current `isomage` public API exposes tree lookup and `cat_node`, not a stable random-access file object for files inside the ISO. The adapter is not considered validated until `tests/dvda_phase1_iso_validation.rs` passes against the seven original Phase 0 UDF 1.02 ISO images. Until then, extracted-directory parsing is the validated Phase 1 backend and ISO support is an explicitly marked adapter under validation.
+`IsoDvdaVolume` is feature-gated behind `iso-isomage`. It uses `isomage` to parse ISO/UDF and streams individual nodes into in-memory cursors. This is deliberate: current `isomage` public API exposes tree lookup and `cat_node`, not a stable random-access file object for files inside the ISO. The adapter is not considered validated until `tests/dvda_demuxer_iso_validation.rs` passes against the seven original Phase 0 UDF 1.02 ISO images. Until then, extracted-directory parsing is the validated Phase 1 backend and ISO support is an explicitly marked adapter under validation.
 
 If `isomage` proves inadequate on target DVD-Audio UDF images, the fallback should be an explicit temporary extraction adapter with the same `DvdaVolume` trait. Do not leak that fallback into the parser.
 
@@ -224,7 +224,7 @@ Phase 1 may detect `DVDAUDIO.MKB` and mark likely CPPM presence. It must not att
 Phase 1 is complete when:
 
 1. `DirectoryDvdaVolume` parses all seven extracted fixture directories.
-2. `IsoDvdaVolume` passes `tests/dvda_phase1_iso_validation.rs` against the seven original Phase 0 UDF 1.02 ISO images, or ISO support remains explicitly marked as under validation.
+2. `IsoDvdaVolume` passes `tests/dvda_demuxer_iso_validation.rs` against the seven original Phase 0 UDF 1.02 ISO images, or ISO support remains explicitly marked as under validation.
 3. AMG, ATSI, and SAMG parsers use explicit bounds checks and return structured `thiserror` errors.
 4. AOTT parsing is covered by exact synthetic binary tests and real-fixture AOTT reference/invariant assertions.
 5. ATSI title/track/sector assignment matches the Phase 0 corpus probe and foo_input_dvda logic.

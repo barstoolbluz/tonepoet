@@ -208,7 +208,7 @@ tonepoet existing SACD sidecar (pattern to follow):
 tonepoet DVD-Audio:
   src/disc/dvda_utils.rs        — map_dvda_source, probe_group_aob_format
   src/disc/dvda_mapper.rs       — map_dvda_disc
-  crates/dvda-phase1/src/tui/dvda/model.rs — DvdaDisc, AudioTitle, AudioChapter
+  crates/dvda-demuxer/src/tui/dvda/model.rs — DvdaDisc, AudioTitle, AudioChapter
 ```
 
 ---

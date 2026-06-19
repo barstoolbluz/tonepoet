@@ -322,7 +322,7 @@ src/disc/dvda_utils.rs (560 lines)
   ~110  probe_group_aob_format_with_path() — cross-ATS probe fallback (Bug 2)
   ~166  disc_lba computation — same wrong formula
 
-crates/dvda-phase1/src/tui/dvda/model.rs (614 lines)
+crates/dvda-demuxer/src/tui/dvda/model.rs (614 lines)
   ~373  SamgInfo, SamgTrack — abs_first_sector field
   ~420  DvdaGroup — title_refs + samg_tracks
   ~445  SamgTrackRef

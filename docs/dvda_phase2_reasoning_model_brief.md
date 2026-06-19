@@ -4,12 +4,12 @@
 
 Design the Phase 2 implementation: wiring the DVD-Audio parser into
 tonepoet's conversion pipeline as a materializer. Phase 1 delivered a
-standalone IFO parser crate (`crates/dvda-phase1/`) that successfully
+standalone IFO parser crate (`crates/dvda-demuxer/`) that successfully
 parses all 7 test ISOs. Phase 2 integrates it.
 
 Specifically:
 
-1. **Integration strategy**: Should we add `dvda-phase1` as a workspace
+1. **Integration strategy**: Should we add `dvda-demuxer` as a workspace
    dependency, or copy `src/tui/dvda/` into the main crate? The SACD parser
    lives at `src/tui/sacd/` (in the main crate). The Phase 1 crate mirrors
    that layout (`src/tui/dvda/`).
@@ -384,11 +384,11 @@ Phase 2 tests should:
 
 ## Phase 1 code bundle
 
-The full Phase 1 crate is at `crates/dvda-phase1/` in the tonepoet repo.
+The full Phase 1 crate is at `crates/dvda-demuxer/` in the tonepoet repo.
 Key files for the reasoning model:
 
 ```
-crates/dvda-phase1/src/tui/dvda/
+crates/dvda-demuxer/src/tui/dvda/
   mod.rs          — public API: parse_dvda_volume, DirectoryDvdaVolume, types
   model.rs        — DvdaDisc, TitleSet, AudioTitle, AudioChapter, SectorRange, etc.
   parser.rs       — parse_dvda_volume() orchestrator

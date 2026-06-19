@@ -8,7 +8,7 @@ Expected local validation command from the Tonepoet workspace after the fixture 
 
 ```sh
 DVDA_PHASE1_ISO_ROOT=/path/to/dvda-isos \
-  cargo test -p tonepoet --features iso-isomage --test dvda_phase1_iso_validation
+  cargo test -p tonepoet --features iso-isomage --test dvda_demuxer_iso_validation
 ```
 
 The test expects one ISO per fixture, named:

@@ -215,7 +215,7 @@ docs/stereo-downmix-feedback-from-reasoning-model.md — full reasoning model gu
 - Brothers in Arms group 3: should produce a 2-channel WAV (not 6-channel)
 - Brothers in Arms group 1: should produce a 6-channel WAV (unchanged)
 - All other discs: should produce unchanged output (no stereo detection triggers)
-- `cargo test -p dvda-phase1` and `cargo test --bin tonepoet` pass
+- `cargo test -p dvda-demuxer` and `cargo test --bin tonepoet` pass
 
 ---
 

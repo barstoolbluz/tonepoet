@@ -4,7 +4,7 @@ This bundle implements Phase 2 as a source overlay for tonepoet.
 
 ## Decisions encoded in the patch
 
-1. The Phase 1 parser lives in the workspace crate `crates/dvda-phase1/`. The main crate keeps `src/tui/dvda/mod.rs` only as a compatibility re-export (`pub use dvda_phase1::*;`) so existing call sites do not need churn while parser code has one home.
+1. The Phase 1 parser lives in the workspace crate `crates/dvda-demuxer/`. The main crate keeps `src/tui/dvda/mod.rs` only as a compatibility re-export (`pub use dvda_demuxer::*;`) so existing call sites do not need churn while parser code has one home.
 2. `TrackSourceRef::DvdaTrack` carries an explicit `DvdaVolumeSourceRef`, group identity, optional ATS title identity, optional SAMG ordinal, typed decode-boundary fields (`first_pts`, `len_in_pts`, `track_type`, `index_start`, `downmix_matrix`, and ATS title context), resolved structural audio format when known, sector ranges, AOB inventory when the range is ATS-relative, and an explicit `DvdaSectorAddressSpace`. `DvdaVolumeSourceRef` distinguishes user directories, ISO images, and staged AUDIO_TS roots so Phase 3 readers do not infer the backing volume from a plain path. SAMG-only groups use `SamgAbsolute` ranges instead of pretending an ATS mapping exists.
 3. Format selection does not trust `track_type` for real discs. Phase 2 records an `audio_format_index` only when one ATS audio format is present. Multi-format ATS tracks keep it as `None`; sample rate, bit depth, expected sample count, and channel-layout extras also remain unknown until Phase 3 packet inspection can identify the stream format.
 4. Detection runs after SACD and before CUE/archive fallback. It uses layered evidence: directory `AUDIO_TS/AUDIO_TS.IFO` lookup, UDF lookup inside ISO, ISO9660 bridge lookup inside ISO, and AMG identifier validation at byte offset 0 of the IFO file. Raw ISO scanning is restricted to explicit DVD-Audio requests after filesystem-backed checks fail; normal auto-detection does not route on a stray byte string, and explicit raw evidence does not route unless a backend can also open the volume.
@@ -58,9 +58,9 @@ decode, encode, or publish stages run for that source.
 
 ### Single parser source of truth
 
-`crates/dvda-phase1/` is the only DVD-Audio parser implementation. `src/tui/dvda/mod.rs` is intentionally a re-export shim. The crate root `crates/dvda-phase1/src/lib.rs` preserves the parser internals' historical `crate::tui::dvda` module path and re-exports the public parser API at the crate root.
+`crates/dvda-demuxer/` is the only DVD-Audio parser implementation. `src/tui/dvda/mod.rs` is intentionally a re-export shim. The crate root `crates/dvda-demuxer/src/lib.rs` preserves the parser internals' historical `crate::tui::dvda` module path and re-exports the public parser API at the crate root.
 
-The target repository must add `crates/dvda-phase1` to `[workspace].members` and add `dvda-phase1 = { path = "crates/dvda-phase1" }` to the main package dependencies. See `patches/cargo_dvda_phase1_workspace.patch`.
+The target repository must add `crates/dvda-demuxer` to `[workspace].members` and add `dvda-demuxer = { path = "crates/dvda-demuxer" }` to the main package dependencies. See `patches/cargo_dvda_demuxer_workspace.patch`.
 
 
 ## ISO9660 detection/materialization alignment

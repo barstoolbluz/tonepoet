@@ -1,5 +1,5 @@
 [package]
-name = "dvda-phase1"
+name = "dvda-demuxer"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
@@ -8,7 +8,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [lib]
-name = "dvda_phase1"
+name = "dvda_demuxer"
 path = "src/lib.rs"
 
 [features]

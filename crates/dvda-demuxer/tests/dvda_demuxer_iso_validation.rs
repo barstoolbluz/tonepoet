@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use dvda_phase1::tui::dvda::{parse_dvda_volume, DvdaDisc, IsoDvdaVolume};
+use dvda_demuxer::tui::dvda::{parse_dvda_volume, DvdaDisc, IsoDvdaVolume};
 
 #[derive(Clone, Debug)]
 struct IsoExpectation {

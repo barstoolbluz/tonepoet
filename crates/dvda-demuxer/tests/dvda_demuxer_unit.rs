@@ -4,11 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dvda_phase1::tui::dvda::ifo::amg::{parse_amg, parse_aott_srpt};
-use dvda_phase1::tui::dvda::ifo::atsi::parse_atsi;
-use dvda_phase1::tui::dvda::ifo::samg::parse_samg;
-use dvda_phase1::tui::dvda::sector::{build_aob_inventory, AobSectorReader};
-use dvda_phase1::tui::dvda::{
+use dvda_demuxer::tui::dvda::ifo::amg::{parse_amg, parse_aott_srpt};
+use dvda_demuxer::tui::dvda::ifo::atsi::parse_atsi;
+use dvda_demuxer::tui::dvda::ifo::samg::parse_samg;
+use dvda_demuxer::tui::dvda::sector::{build_aob_inventory, AobSectorReader};
+use dvda_demuxer::tui::dvda::{
     bit_depth_from_code, channel_assignment, parse_channel_format, parse_dvda_volume,
     sample_rate_from_code, DirectoryDvdaVolume, DvdaError, DvdaVolume, SamgZone, DVD_BLOCK_SIZE,
 };
@@ -620,12 +620,12 @@ trait TitleSetKindForTest {
     fn to_string_for_test(&self) -> &'static str;
 }
 
-impl TitleSetKindForTest for dvda_phase1::tui::dvda::TitleSetKind {
+impl TitleSetKindForTest for dvda_demuxer::tui::dvda::TitleSetKind {
     fn to_string_for_test(&self) -> &'static str {
         match self {
-            dvda_phase1::tui::dvda::TitleSetKind::Audio => "audio",
-            dvda_phase1::tui::dvda::TitleSetKind::Video => "video",
-            dvda_phase1::tui::dvda::TitleSetKind::Unknown => "unknown",
+            dvda_demuxer::tui::dvda::TitleSetKind::Audio => "audio",
+            dvda_demuxer::tui::dvda::TitleSetKind::Video => "video",
+            dvda_demuxer::tui::dvda::TitleSetKind::Unknown => "unknown",
         }
     }
 }

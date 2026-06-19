@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use dvda_phase1::tui::dvda::{parse_dvda_volume, DirectoryDvdaVolume};
+use dvda_demuxer::tui::dvda::{parse_dvda_volume, DirectoryDvdaVolume};
 
 #[derive(Clone, Debug)]
 struct FixtureExpectation {
@@ -132,7 +132,7 @@ fn parses_phase0_fixture_directories() {
 
         for ts in &disc.title_sets {
             // Skip video title sets — they don't have audio format entries
-            if ts.kind != dvda_phase1::tui::dvda::model::TitleSetKind::Audio {
+            if ts.kind != dvda_demuxer::tui::dvda::model::TitleSetKind::Audio {
                 continue;
             }
             assert_eq!(
@@ -178,7 +178,7 @@ fn parses_phase0_fixture_directories() {
     }
 }
 
-fn assert_samg_repeated_copies_are_valid(fixture_name: &str, disc: &dvda_phase1::tui::dvda::DvdaDisc) {
+fn assert_samg_repeated_copies_are_valid(fixture_name: &str, disc: &dvda_demuxer::tui::dvda::DvdaDisc) {
     let samg = disc
         .samg
         .as_ref()
@@ -196,7 +196,7 @@ fn assert_samg_repeated_copies_are_valid(fixture_name: &str, disc: &dvda_phase1:
     );
 }
 
-fn assert_aott_entries_resolve(fixture_name: &str, disc: &dvda_phase1::tui::dvda::DvdaDisc) {
+fn assert_aott_entries_resolve(fixture_name: &str, disc: &dvda_demuxer::tui::dvda::DvdaDisc) {
     let mut refs = BTreeSet::new();
     for entry in &disc.amg.audio_title_table {
         if !entry.playback_type.is_audio {
@@ -228,7 +228,7 @@ fn assert_aott_entries_resolve(fixture_name: &str, disc: &dvda_phase1::tui::dvda
     }
 }
 
-fn assert_mgletsgetiton_multi_format_ats(disc: &dvda_phase1::tui::dvda::DvdaDisc) {
+fn assert_mgletsgetiton_multi_format_ats(disc: &dvda_demuxer::tui::dvda::DvdaDisc) {
     let ats1 = disc
         .title_sets
         .iter()

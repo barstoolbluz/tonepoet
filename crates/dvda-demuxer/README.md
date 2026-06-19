@@ -32,7 +32,7 @@ isomage = { version = "2.1", optional = true }
 iso-isomage = ["dep:isomage"]
 ```
 
-5. Copy `tests/dvda_phase1_unit.rs`, `tests/dvda_phase1_fixtures.rs`, and, if ISO support is enabled, `tests/dvda_phase1_iso_validation.rs` into the workspace tests area.
+5. Copy `tests/dvda_demuxer_unit.rs`, `tests/dvda_demuxer_fixtures.rs`, and, if ISO support is enabled, `tests/dvda_demuxer_iso_validation.rs` into the workspace tests area.
 6. Run the directory fixture tests against `tests/fixtures/dvda`.
 7. Run `docs/ISO_UDF_VALIDATION.md` once the original Phase 0 ISO images are available.
 8. Keep the parser independent of materializer and pipeline modules until Phase 2.
@@ -47,4 +47,4 @@ Phase 1 now exposes the active audio-format table index directly. `AudioChapter.
 
 ## ISO/UDF status
 
-`IsoDvdaVolume` is compiled only with `--features iso-isomage`. It uses `isomage` tree lookup and `cat_node` streaming, but the adapter should not be called validated until `tests/dvda_phase1_iso_validation.rs` has passed against the seven original Phase 0 ISO images. See `docs/ISO_UDF_VALIDATION.md`.
+`IsoDvdaVolume` is compiled only with `--features iso-isomage`. It uses `isomage` tree lookup and `cat_node` streaming, but the adapter should not be called validated until `tests/dvda_demuxer_iso_validation.rs` has passed against the seven original Phase 0 ISO images. See `docs/ISO_UDF_VALIDATION.md`.

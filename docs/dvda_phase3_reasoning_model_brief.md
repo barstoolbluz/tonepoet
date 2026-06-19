@@ -321,7 +321,7 @@ in the Phase 1 crate.
 
 ## Existing infrastructure to reuse
 
-### Phase 1 crate (`crates/dvda-phase1/`)
+### Phase 1 crate (`crates/dvda-demuxer/`)
 
 - `AobSectorReader` — reads logical sectors from concatenated AOBs
 - `DvdaVolume` trait — opens files from directory or ISO

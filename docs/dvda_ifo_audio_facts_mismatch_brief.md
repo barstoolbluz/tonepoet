@@ -139,7 +139,7 @@ src/convert/pipeline/materializer_dvda.rs
   1747  audio_facts_for_title_chapter() function
   1742  single-present-format branch (the problem for Document)
 
-crates/dvda-phase1/src/tui/dvda/model.rs
+crates/dvda-demuxer/src/tui/dvda/model.rs
   525   track_type_low_bits_candidate() — the 3-bit mask
   330   AudioChapter struct — track_type field
 

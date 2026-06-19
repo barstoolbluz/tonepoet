@@ -16,5 +16,5 @@ src/tui/dvda/
     samg.rs
 
 tests/
-  dvda_phase1_unit.rs       # synthetic unit coverage; no corpus required
-  dvda_phase1_fixtures.rs   # seven-disc fixture integration/AOTT assertions
+  dvda_demuxer_unit.rs       # synthetic unit coverage; no corpus required
+  dvda_demuxer_fixtures.rs   # seven-disc fixture integration/AOTT assertions

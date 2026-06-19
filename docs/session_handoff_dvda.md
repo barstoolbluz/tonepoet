@@ -13,7 +13,7 @@ Phase 4 (TUI disc browser).
    reference implementation analysis, reasoning model review
 2. **Phase 0** — Corpus characterization: 7 DVD-Audio ISOs probed, IFO
    fixtures extracted, diagnostic Python parser, expected properties doc
-3. **Phase 1** — Standalone IFO parser crate (`crates/dvda-phase1/`):
+3. **Phase 1** — Standalone IFO parser crate (`crates/dvda-demuxer/`):
    AMG, ATSI, SAMG parsers, DvdaVolume trait, sector reader
 4. **Phase 2** — Pipeline integration: SourceKind::DvdAudio,
    TrackSourceRef::DvdaTrack, DvdaMaterializer, detection/dispatch wiring
@@ -34,8 +34,8 @@ pipeline bug fixes cherry-picked.
 
 ### DVD-Audio parser lives in a separate crate
 
-`crates/dvda-phase1/` is a workspace member. The main crate re-exports
-it via `src/tui/dvda/mod.rs` (`pub use dvda_phase1::*;`). Parser code
+`crates/dvda-demuxer/` is a workspace member. The main crate re-exports
+it via `src/tui/dvda/mod.rs` (`pub use dvda_demuxer::*;`). Parser code
 has one home; changes go in the crate, not the shim.
 
 ### Sector-range splitting, not PTS seeking
@@ -101,7 +101,7 @@ not the imprecise PTS estimate.
 - `SourceOptions.dvda_assume_decrypted: bool` — CPPM override (not wired to CLI yet)
 - `SourceAudioDescriptor` — typed source audio facts with `ChannelGroupDescriptor`
 
-### DVD-Audio parser (`crates/dvda-phase1/src/tui/dvda/`)
+### DVD-Audio parser (`crates/dvda-demuxer/src/tui/dvda/`)
 
 - `parse_dvda_volume(&volume) -> Result<DvdaDisc>` — main entry point
 - `DvdaDisc` — top-level: `amg`, `title_sets`, `samg`, `groups`, `copy_protection`
@@ -188,7 +188,7 @@ IFO fixtures: `tests/fixtures/dvda/` (7 directories with IFO + MKB files)
 AOB sector fixtures: `tests/fixtures/dvda_aob_samples/` (16 sectors per disc)
 LPCM reference vectors: `tests/fixtures/dvda_lpcm_foo_reference_vectors.cpp`
 Diagnostic parser: `scripts/dvda_corpus_probe.py` (Python, parses IFO fixtures)
-Phase 1 crate tests: `cargo test -p dvda-phase1` (23 tests, all passing)
+Phase 1 crate tests: `cargo test -p dvda-demuxer` (23 tests, all passing)
 
 ---
 
@@ -213,7 +213,7 @@ Zip file at repo root: `foo_input_dvda-0.8.2.zip`. Extract with
 - `docs/dvda_materializer_brief.md` — original research brief
 - `docs/dvd-a-materializer-guidance.md` — reasoning model's Phase 1-5 guidance
 - `docs/dvda_corpus_expected.md` — per-disc expected properties
-- `docs/dvda_phase1_reasoning_model_brief.md` — Phase 1 parser brief
+- `docs/dvda_demuxer_reasoning_model_brief.md` — Phase 1 parser brief
 - `docs/dvda_phase2_reasoning_model_brief.md` — Phase 2 pipeline brief
 - `docs/dvda_phase2_implementation_notes.md` — Phase 2 design decisions
 - `docs/dvda_phase3_reasoning_model_brief.md` — Phase 3 demux/extract brief

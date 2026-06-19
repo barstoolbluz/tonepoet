@@ -18,7 +18,7 @@ its consumers.
 
 ### DVD-Audio parser → `DvdaDisc`
 
-The `dvda-phase1` crate produces a deeply hierarchical model:
+The `dvda-demuxer` crate produces a deeply hierarchical model:
 
 ```
 DvdaDisc
@@ -159,7 +159,7 @@ But edge cases exist:
 ### Option A: In the main crate (`src/disc/`)
 
 New module `src/disc/mod.rs` with the model types. Accessible from both
-TUI and CLI code. Can import from `dvda-phase1` and `sacd` modules.
+TUI and CLI code. Can import from `dvda-demuxer` and `sacd` modules.
 
 ### Option B: In a new shared crate (`crates/tonepoet-disc/`)
 
@@ -247,7 +247,7 @@ loop. Moving it into the mapper would centralize it.
 5. **Label synthesis**: who builds the human-readable presentation label
    ("MLP 96kHz/24-bit 5.0")? The mapper, or the consumer?
 
-6. **Crate dependencies**: should the model crate depend on `dvda-phase1`
+6. **Crate dependencies**: should the model crate depend on `dvda-demuxer`
    and the SACD parser, or should mappers live outside the model crate?
 
 7. **`disc-info` CLI command**: should this replace `dvda-info`, or

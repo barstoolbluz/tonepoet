@@ -178,7 +178,7 @@ tonepoet:
   src/disc/dvda_utils.rs        — AobProbeResult with channel_label, cross_ats detection
   src/disc/dvda_mapper.rs       — probe.channel_label consumption
   src/convert/pipeline/dvda_mlp.rs — MlpMajorSyncInfo.num_substreams
-  crates/dvda-phase1/src/tui/dvda/model.rs — DownmixMatrix, DownmixCoefficient
+  crates/dvda-demuxer/src/tui/dvda/model.rs — DownmixMatrix, DownmixCoefficient
 ```
 
 ---

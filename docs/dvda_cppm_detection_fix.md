@@ -10,7 +10,7 @@ This is because the CPPM detection in the Phase 1 parser equates MKB presence
 with CPPM protection:
 
 ```rust
-// crates/dvda-phase1/src/tui/dvda/parser.rs:58-62
+// crates/dvda-demuxer/src/tui/dvda/parser.rs:58-62
 let mkb_present = volume.exists_audio_ts_file("DVDAUDIO.MKB");
 let copy_protection = CopyProtectionInfo {
     mkb_present,
@@ -74,7 +74,7 @@ for edge cases where the probe might be wrong.
 
 ## Where to change
 
-**Phase 1 parser** (`crates/dvda-phase1/src/tui/dvda/parser.rs:58-62`):
+**Phase 1 parser** (`crates/dvda-demuxer/src/tui/dvda/parser.rs:58-62`):
 - After checking `mkb_present`, probe the first sector of the first AOB
 - Set `cppm_detected` based on AOB readability, not MKB presence alone
 - This requires the volume to be able to read AOB files (it already can via

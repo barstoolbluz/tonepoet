@@ -92,14 +92,14 @@ offset 0x40: atstt_vobs         (title VOBs — THIS IS NEEDED)
 
 ### Step 1: Parse `atstt_vobs` in the ATSI parser
 
-**File:** `crates/dvda-phase1/src/tui/dvda/ifo/atsi.rs`
+**File:** `crates/dvda-demuxer/src/tui/dvda/ifo/atsi.rs`
 
 Add reading of offset `0x40` from the ATSI MAT header:
 ```rust
 atstt_vobs: be_u32(bytes, 0x40, "atstt_vobs")?,
 ```
 
-**File:** `crates/dvda-phase1/src/tui/dvda/model.rs`
+**File:** `crates/dvda-demuxer/src/tui/dvda/model.rs`
 
 Add field to `AtsiHeader` (line ~157):
 ```rust
@@ -169,8 +169,8 @@ the current behavior (ATS 1 fallback or Unknown).
 
 | File | Change | Lines |
 |------|--------|-------|
-| `crates/dvda-phase1/src/tui/dvda/ifo/atsi.rs` | Parse `atstt_vobs` at offset 0x40 | ~2 |
-| `crates/dvda-phase1/src/tui/dvda/model.rs` | Add `atstt_vobs` to `AtsiHeader` | ~1 |
+| `crates/dvda-demuxer/src/tui/dvda/ifo/atsi.rs` | Parse `atstt_vobs` at offset 0x40 | ~2 |
+| `crates/dvda-demuxer/src/tui/dvda/model.rs` | Add `atstt_vobs` to `AtsiHeader` | ~1 |
 | `src/disc/dvda_utils.rs` | Cross-ATS raw ISO sector read in probe fallback | ~25 |
 | **Total** | | **~28** |
 
@@ -193,16 +193,16 @@ the current behavior (ATS 1 fallback or Unknown).
 After implementing, verify:
 1. `disc-info` on Brothers in Arms shows group 3 as "MLP 96kHz/24-bit Stereo"
 2. All existing discs with AOBs still probe correctly
-3. `cargo test -p dvda-phase1` passes (ATSI parser changes)
+3. `cargo test -p dvda-demuxer` passes (ATSI parser changes)
 4. `cargo test --bin tonepoet` passes (probe changes)
 
 ---
 
 ## What the reasoning model should produce
 
-1. Modified `crates/dvda-phase1/src/tui/dvda/ifo/atsi.rs` with
+1. Modified `crates/dvda-demuxer/src/tui/dvda/ifo/atsi.rs` with
    `atstt_vobs` parsing
-2. Modified `crates/dvda-phase1/src/tui/dvda/model.rs` with the new
+2. Modified `crates/dvda-demuxer/src/tui/dvda/model.rs` with the new
    field on `AtsiHeader`
 3. Modified `src/disc/dvda_utils.rs` with the cross-ATS probe fallback
    using disc-absolute sector reads

@@ -4,7 +4,7 @@ This revision addresses the test-coverage feedback against the original Phase 1 
 
 ## Added self-contained tests
 
-`tests/dvda_phase1_unit.rs` now includes deterministic synthetic binary fixtures for:
+`tests/dvda_demuxer_unit.rs` now includes deterministic synthetic binary fixtures for:
 
 * AMG header parsing,
 * direct AOTT_SRPT parsing,
@@ -22,7 +22,7 @@ These tests do not require `tests/fixtures/dvda` and therefore still exercise th
 
 ## Strengthened fixture assertions
 
-`tests/dvda_phase1_fixtures.rs` still skips when the real seven-disc corpus is absent, but when the fixtures exist it now asserts AOTT-specific behavior:
+`tests/dvda_demuxer_fixtures.rs` still skips when the real seven-disc corpus is absent, but when the fixtures exist it now asserts AOTT-specific behavior:
 
 * minimum AOTT entry count per fixture family,
 * playback type is marked audio,
@@ -51,7 +51,7 @@ This revision adds decoded audio-format index exposure instead of leaving later 
 
 ## ISO/UDF validation status
 
-The ISO backend is now treated as feature-gated and under validation, not as proven by scaffold code alone. `docs/ISO_UDF_VALIDATION.md` and `tests/dvda_phase1_iso_validation.rs` define the real-corpus validation path for the seven UDF 1.02 ISO images. Until that test passes on the real ISO corpus, the extracted-directory backend is the validated Phase 1 backend.
+The ISO backend is now treated as feature-gated and under validation, not as proven by scaffold code alone. `docs/ISO_UDF_VALIDATION.md` and `tests/dvda_demuxer_iso_validation.rs` define the real-corpus validation path for the seven UDF 1.02 ISO images. Until that test passes on the real ISO corpus, the extracted-directory backend is the validated Phase 1 backend.
 
 ## 2026-06-07 forensic/modeling correction
 

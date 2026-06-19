@@ -450,7 +450,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dvda-phase1"
+name = "dvda-demuxer"
 version = "0.1.0"
 dependencies = [
  "thiserror 1.0.69",
@@ -2408,7 +2408,7 @@ dependencies = [
  "crc32fast",
  "crossterm",
  "dirs",
- "dvda-phase1",
+ "dvda-demuxer",
  "dvdvideo",
  "encoding_rs",
  "env_logger 0.10.2",
