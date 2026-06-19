@@ -209,6 +209,9 @@ fn realize_lpcm_with_dvdvideo_demuxer(
     let mut read_buffer = vec![0u8; DVDV_READ_CHUNK_BYTES];
     let mut pending = Vec::new();
     let mut data_bytes_written = 0u64;
+    let mut sample_rate_mismatch_logged = false;
+    let mut bit_depth_mismatch_logged = false;
+    let mut channel_count_mismatch_logged = false;
     let target_substream = checked_dvdv_private_substream_id(DvdVideoAudioCoding::Lpcm, audio_stream_index)?;
 
     for_each_sector_in_authored_spans(
@@ -246,17 +249,27 @@ fn realize_lpcm_with_dvdvideo_demuxer(
 
                 if let Some(pcm) = packet.sub_header.pcm.as_ref() {
                     if let Some(rate) = pcm.group1_sample_rate.or(pcm.group2_sample_rate) {
-                        if rate != sample_rate {
-                            return Err(ConvertError::TrackValidation(format!(
-                                "DVD-Video LPCM stream sample-rate mismatch: IFO says {sample_rate}, packet says {rate}"
-                            )));
+                        if rate != sample_rate && !sample_rate_mismatch_logged {
+                            log::warn!(
+                                "DVD-Video LPCM stream sample-rate mismatch after discovery: prepared track says {sample_rate}, packet says {rate}; keeping prepared-track format"
+                            );
+                            sample_rate_mismatch_logged = true;
                         }
                     }
                     if let Some(bits) = pcm.group1_bits.or(pcm.group2_bits) {
-                        if bits != bit_depth {
-                            return Err(ConvertError::TrackValidation(format!(
-                                "DVD-Video LPCM stream bit-depth mismatch: IFO says {bit_depth}, packet says {bits}"
-                            )));
+                        if bits != bit_depth && !bit_depth_mismatch_logged {
+                            log::warn!(
+                                "DVD-Video LPCM stream bit-depth mismatch after discovery: prepared track says {bit_depth}, packet says {bits}; keeping prepared-track format"
+                            );
+                            bit_depth_mismatch_logged = true;
+                        }
+                    }
+                    if let Some(packet_channels) = pcm.channel_count {
+                        if packet_channels != channels && !channel_count_mismatch_logged {
+                            log::warn!(
+                                "DVD-Video LPCM stream channel-count mismatch after discovery: prepared track says {channels}, packet says {packet_channels}; keeping prepared-track format"
+                            );
+                            channel_count_mismatch_logged = true;
                         }
                     }
                 }

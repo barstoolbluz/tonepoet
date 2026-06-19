@@ -39,6 +39,14 @@ impl DvdaSubstreamKind {
     }
 }
 
+const DVD_VIDEO_LPCM_SUBSTREAM_FIRST: u8 = 0xA0;
+const DVD_VIDEO_LPCM_SUBSTREAM_LAST: u8 = 0xA7;
+
+#[must_use]
+const fn is_dvd_video_lpcm_substream_id(stream_id: u8) -> bool {
+    stream_id >= DVD_VIDEO_LPCM_SUBSTREAM_FIRST && stream_id <= DVD_VIDEO_LPCM_SUBSTREAM_LAST
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DvdaSubHeaderMode {
     /// DVD-Audio AOB Private Stream 1 layout: byte 3 is extra_header_length.
@@ -65,6 +73,7 @@ pub struct DvdaPcmSubHeader {
     pub group2_bits: Option<u32>,
     pub group1_sample_rate: Option<u32>,
     pub group2_sample_rate: Option<u32>,
+    pub channel_count: Option<u8>,
     pub channel_assignment: u8,
     pub cci: u8,
 }
@@ -82,7 +91,11 @@ pub struct DvdaSubHeader {
 impl DvdaSubHeader {
     #[must_use]
     pub const fn kind(self) -> DvdaSubstreamKind {
-        DvdaSubstreamKind::from_stream_id(self.stream_id)
+        if self.pcm.is_some() {
+            DvdaSubstreamKind::Pcm
+        } else {
+            DvdaSubstreamKind::from_stream_id(self.stream_id)
+        }
     }
 }
 
@@ -454,6 +467,7 @@ fn pcm_format_without_pointer(
     Option<u32>,
     Option<u32>,
     Option<u32>,
+    Option<u8>,
     u8,
 ) {
     (
@@ -465,6 +479,7 @@ fn pcm_format_without_pointer(
         pcm.group2_bits,
         pcm.group1_sample_rate,
         pcm.group2_sample_rate,
+        pcm.channel_count,
         pcm.channel_assignment,
     )
 }
@@ -543,18 +558,17 @@ fn parse_dvd_video_sub_header(
 
     let stream_id = bytes[0];
     let cyclic = bytes[1];
-    let (cci, pcm) = match DvdaSubstreamKind::from_stream_id(stream_id) {
-        DvdaSubstreamKind::Pcm => {
-            if let Some(pcm) = parse_dvd_video_pcm_sub_header(bytes) {
-                (Some(pcm.cci), Some(pcm))
-            } else {
-                (None, None)
-            }
+    let (cci, pcm) = if is_dvd_video_lpcm_substream_id(stream_id) {
+        if let Some(pcm) = parse_dvd_video_pcm_sub_header(bytes) {
+            (Some(pcm.cci), Some(pcm))
+        } else {
+            (None, None)
         }
-        // DVD-Video mode is only selected for VOB LPCM evidence. Unknown and
-        // MLP sub-stream IDs remain parseable for diagnostics/filtering, but we
-        // do not reinterpret bytes[3] as a DVD-Audio extra-header length here.
-        DvdaSubstreamKind::Mlp | DvdaSubstreamKind::Unknown(_) => (None, None),
+    } else {
+        // DVD-Video mode is only selected for VOB LPCM evidence. Unknown
+        // sub-stream IDs remain parseable for diagnostics/filtering, but we do
+        // not reinterpret bytes[3] as a DVD-Audio extra-header length here.
+        (None, None)
     };
 
     Ok(DvdaSubHeader {
@@ -586,6 +600,7 @@ fn parse_dvd_audio_pcm_sub_header(bytes: &[u8]) -> DvdaPcmSubHeader {
         group2_bits: decode_pcm_bits_code(group2_bits_code),
         group1_sample_rate: decode_pcm_sample_rate_code(group1_sample_rate_code),
         group2_sample_rate: decode_pcm_sample_rate_code(group2_sample_rate_code),
+        channel_count: None,
         channel_assignment: bytes[10],
         cci: bytes[12],
     }
@@ -601,7 +616,6 @@ fn parse_dvd_video_pcm_sub_header(bytes: &[u8]) -> Option<DvdaPcmSubHeader> {
     let bits_code = format >> 6;
     let sample_rate_code = (format >> 4) & 0x03;
     let channel_count = (format & 0x07).saturating_add(1);
-    let channel_assignment = dvd_video_lpcm_channel_assignment_for_count(channel_count)?;
     let group1_bits = decode_pcm_bits_code(bits_code)?;
     let group1_sample_rate = decode_dvd_video_lpcm_sample_rate_code(sample_rate_code)?;
 
@@ -615,20 +629,27 @@ fn parse_dvd_video_pcm_sub_header(bytes: &[u8]) -> Option<DvdaPcmSubHeader> {
         group2_bits: None,
         group1_sample_rate: Some(group1_sample_rate),
         group2_sample_rate: None,
-        channel_assignment,
+        channel_count: Some(channel_count),
+        // DVD-Video LPCM encodes channel count directly in the packet format
+        // byte. Do not reject 7/8-channel packets just because there is no
+        // DVD-Audio channel-assignment value for them.
+        channel_assignment: dvd_video_lpcm_channel_assignment_for_count(channel_count),
         cci: bytes[6],
     })
 }
 
-fn dvd_video_lpcm_channel_assignment_for_count(channel_count: u8) -> Option<u8> {
+fn dvd_video_lpcm_channel_assignment_for_count(channel_count: u8) -> u8 {
     match channel_count {
-        1 => Some(0),
-        2 => Some(1),
-        3 => Some(7),
-        4 => Some(3),
-        5 => Some(10),
-        6 => Some(12),
-        _ => None,
+        1 => 0,
+        2 => 1,
+        3 => 7,
+        4 => 3,
+        5 => 10,
+        6 => 12,
+        // Neutral compatibility value. DVD-Video probing and realization use
+        // channel_count, not this DVD-Audio-oriented assignment field.
+        7 | 8 => 0,
+        _ => 0,
     }
 }
 
@@ -1158,6 +1179,7 @@ mod tests {
         assert_eq!(pcm.first_audio_frame, 0x0058);
         assert_eq!(pcm.group1_bits, Some(24));
         assert_eq!(pcm.group1_sample_rate, Some(48_000));
+        assert_eq!(pcm.channel_count, Some(2));
         assert_eq!(pcm.channel_assignment, 1);
         assert_eq!(pcm.cci, 0x7F);
     }
@@ -1184,7 +1206,76 @@ mod tests {
         assert_eq!(pcm.first_audio_frame, 0x0190);
         assert_eq!(pcm.group1_bits, Some(24));
         assert_eq!(pcm.group1_sample_rate, Some(96_000));
+        assert_eq!(pcm.channel_count, Some(2));
         assert_eq!(pcm.channel_assignment, 1);
+    }
+
+    #[test]
+    fn dvd_video_lpcm_parses_seven_and_eight_channel_counts() {
+        for (channels, format_byte) in [(7_u8, 0x86_u8), (8_u8, 0x87_u8)] {
+            let mut sector = new_pack_sector();
+            write_private_stream_packet(
+                &mut sector,
+                14,
+                &dvd_video_pcm_sub_header_with(0x0058, format_byte),
+                &[0x55],
+            );
+
+            let packets =
+                parse_private_stream_1_packets_with_mode(&sector, DvdaSubHeaderMode::DvdVideo)
+                    .expect("DVD-Video LPCM packet should parse");
+
+            assert_eq!(packets.len(), 1);
+            let header = packets[0].sub_header;
+            assert_eq!(header.kind(), DvdaSubstreamKind::Pcm);
+            let pcm = header.pcm.expect("pcm");
+            assert_eq!(pcm.group1_bits, Some(24));
+            assert_eq!(pcm.group1_sample_rate, Some(48_000));
+            assert_eq!(pcm.channel_count, Some(channels));
+        }
+    }
+
+    #[test]
+    fn dvd_video_lpcm_mode_treats_substream_a1_with_seven_and_eight_channels_as_pcm() {
+        for (channels, format_byte) in [(7_u8, 0x86_u8), (8_u8, 0x87_u8)] {
+            let mut sector = new_pack_sector();
+            let mut sub_header = dvd_video_pcm_sub_header_with(0x0058, format_byte);
+            sub_header[0] = 0xA1;
+            write_private_stream_packet(&mut sector, 14, &sub_header, &[0x55]);
+
+            let packets =
+                parse_private_stream_1_packets_with_mode(&sector, DvdaSubHeaderMode::DvdVideo)
+                    .expect("DVD-Video LPCM packet should parse for substream A1");
+
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0].sub_header.stream_id, 0xA1);
+            assert_eq!(packets[0].sub_header.kind(), DvdaSubstreamKind::Pcm);
+            assert_eq!(packets[0].sub_header.pcm.expect("pcm").channel_count, Some(channels));
+        }
+    }
+
+    #[test]
+    fn dvd_video_lpcm_mode_treats_substream_a1_as_pcm() {
+        let mut sector = new_pack_sector();
+        write_private_stream_packet(
+            &mut sector,
+            14,
+            &dvd_video_pcm_sub_header_with(0x0058, 0x91),
+            &[0x55],
+        );
+        let offset = 14;
+        let payload_len = 3 + dvd_video_pcm_sub_header_with(0x0058, 0x91).len() + 1;
+        sector[offset + 4..offset + 6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        let sub_header_offset = offset + 9;
+        sector[sub_header_offset] = 0xA1;
+
+        let packets =
+            parse_private_stream_1_packets_with_mode(&sector, DvdaSubHeaderMode::DvdVideo)
+                .expect("DVD-Video LPCM packet should parse for substream A1");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].sub_header.stream_id, 0xA1);
+        assert_eq!(packets[0].sub_header.kind(), DvdaSubstreamKind::Pcm);
+        assert_eq!(packets[0].sub_header.pcm.expect("pcm").channel_count, Some(2));
     }
 
     #[test]
