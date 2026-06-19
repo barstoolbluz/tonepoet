@@ -234,11 +234,11 @@ fn prepared_source(
         loaded_metabase,
     );
     let mut tool_versions = BTreeMap::new();
-    tool_versions.insert("dvda-phase1".to_string(), "in-process".to_string());
+    tool_versions.insert("dvda-demuxer".to_string(), "in-process".to_string());
     if loaded_metabase.is_some() {
         tool_versions.insert(
             "dvda-metabase".to_string(),
-            "foo_input_dvda-compatible".to_string(),
+            "in-process".to_string(),
         );
     }
 
