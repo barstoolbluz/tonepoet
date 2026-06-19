@@ -179,7 +179,7 @@ impl Materializer for DvdVideoMaterializer {
 
         let mut tool_versions = BTreeMap::new();
         tool_versions.insert("dvdvideo".to_string(), "in-process".to_string());
-        tool_versions.insert("ffmpeg".to_string(), "required-for-compressed-dvdv-audio".to_string());
+        tool_versions.insert("ffmpeg".to_string(), "in-process".to_string());
 
         Ok(PreparedSource {
             container: req.container.clone(),
