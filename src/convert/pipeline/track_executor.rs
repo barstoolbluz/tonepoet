@@ -823,9 +823,9 @@ mod tests {
     };
     use crate::convert::pipeline::tool::StubToolRunner;
     use crate::convert::pipeline::types::{
-        CueSidecarPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy, NamingCollisionPolicy,
-        NamingPolicy, OverwritePolicy, PipelineStage, PublishPolicy, SacdArea,
-        SourceAudioDescriptor, SourceOptions, StagePolicy, StageRequirement, TrackId,
+        CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy,
+        NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineStage, PublishPolicy,
+        SacdArea, SourceAudioDescriptor, SourceOptions, StagePolicy, StageRequirement, TrackId,
         TrackMetadata, TrackSelection, TrackSourceRef,
     };
     use tempfile::TempDir;
@@ -876,6 +876,12 @@ mod tests {
                 sacd_area: Some(SacdArea::Stereo),
                 dvda_group: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -906,6 +912,10 @@ mod tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }

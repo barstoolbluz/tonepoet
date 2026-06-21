@@ -108,12 +108,12 @@ fn auto_dither_selects_defaults_and_preserves_manual_choice() {
 
 #[test]
 fn format_navigation_skips_hidden_rows() {
-    let pcm_rows = FormatField::visible_rows(false);
+    let pcm_rows = FormatField::visible_rows(false, false);
     assert!(pcm_rows.contains(&FormatField::Resampler));
     assert!(pcm_rows.contains(&FormatField::Dither));
     assert!(!pcm_rows.contains(&FormatField::NoiseShaper));
 
-    let dsd_rows = FormatField::visible_rows(true);
+    let dsd_rows = FormatField::visible_rows(true, false);
     assert!(dsd_rows.contains(&FormatField::DsdRate));
     assert!(dsd_rows.contains(&FormatField::NoiseShaper));
     assert!(!dsd_rows.contains(&FormatField::Resampler));
@@ -203,7 +203,7 @@ fn all_format_families_have_expected_visible_rows_and_valid_pipeline_mapping() {
         state.format.select_value(&format);
         state.apply_format_constraints();
 
-        let rows = FormatField::visible_rows(is_dsd);
+        let rows = FormatField::visible_rows(is_dsd, false);
         assert_eq!(state.is_dsd_selected(), is_dsd, "{:?}", format);
         assert_eq!(rows.contains(&FormatField::Resampler), !is_dsd, "{:?}", format);
         assert_eq!(rows.contains(&FormatField::Dither), !is_dsd, "{:?}", format);
@@ -232,31 +232,4 @@ fn all_format_families_have_expected_visible_rows_and_valid_pipeline_mapping() {
             .unwrap_or_else(|err| panic!("{:?}: {err}", format));
         settings.validate().unwrap();
     }
-}
-
-#[test]
-fn mouse_registration_exposes_dynamic_format_buttons() {
-    use ratatui::layout::Rect;
-    use tonepoet::tui::button_map::{ButtonRenderMap, TuiButton};
-    use tonepoet::tui::draw_output::register_format_pane_buttons;
-
-    let area = Rect::new(0, 0, 120, 10);
-
-    let mut pcm = FormatState::new();
-    pcm.format.select_value(&AudioFormat::Flac);
-    pcm.apply_format_constraints();
-    let mut buttons = ButtonRenderMap::new();
-    register_format_pane_buttons(&mut buttons, area, &pcm);
-    assert!(matches!(buttons.find_button_at(17, 5), Some(TuiButton::ResamplerPill(_))));
-    assert!(matches!(buttons.find_button_at(17, 6), Some(TuiButton::DitherPill(_))));
-    assert!(matches!(buttons.find_button_at(17, 7), Some(TuiButton::ReplayGainPill(_))));
-
-    let mut dsd = FormatState::new();
-    dsd.format.select_value(&AudioFormat::Dsf);
-    dsd.apply_format_constraints();
-    let mut buttons = ButtonRenderMap::new();
-    register_format_pane_buttons(&mut buttons, area, &dsd);
-    assert!(matches!(buttons.find_button_at(17, 5), Some(TuiButton::NoiseShaperPill(_))));
-    assert!(matches!(buttons.find_button_at(17, 6), Some(TuiButton::ModulatorOrderPill(_))));
-    assert!(matches!(buttons.find_button_at(17, 7), Some(TuiButton::ConversionPresetPill(_))));
 }

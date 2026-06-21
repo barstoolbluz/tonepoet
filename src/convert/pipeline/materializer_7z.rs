@@ -102,10 +102,11 @@ impl super::stages::Materializer for SevenZipMaterializer {
         let album_metadata = derive_album_metadata(&tracks);
 
         // 6. Build provenance.
+        let tool_versions = sevenzip_tool_versions(runner);
         let provenance = ExtractionProvenance {
             source_kind: SourceKind::SevenZip,
             source_sha256: None,
-            tool_versions: BTreeMap::new(),
+            tool_versions,
             extracted_at: chrono::Utc::now(),
         };
 
@@ -117,6 +118,15 @@ impl super::stages::Materializer for SevenZipMaterializer {
             provenance,
         })
     }
+}
+
+
+fn sevenzip_tool_versions(runner: &dyn ToolRunner) -> BTreeMap<String, String> {
+    let mut tool_versions = BTreeMap::new();
+    if let Some(version) = runner.tool_version(ToolBinary::SevenZip) {
+        tool_versions.insert("7z".to_string(), version);
+    }
+    tool_versions
 }
 
 // =========================================================================
@@ -548,6 +558,42 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    struct VersionOnlyRunner(HashMap<ToolBinary, String>);
+
+    #[async_trait::async_trait]
+    impl ToolRunner for VersionOnlyRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<super::super::tool::ToolOutput, ToolRunnerError> {
+            panic!("VersionOnlyRunner must not execute commands")
+        }
+
+        fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+            self.0.get(&binary).cloned()
+        }
+    }
+
+    #[test]
+    fn sevenzip_materializer_provenance_records_detected_7z_version() {
+        let runner = VersionOnlyRunner(HashMap::from([
+            (ToolBinary::SevenZip, "25.01".to_string()),
+        ]));
+        let versions = sevenzip_tool_versions(&runner);
+
+        assert_eq!(versions.get("7z").map(String::as_str), Some("25.01"));
+    }
+
+    #[test]
+    fn sevenzip_materializer_provenance_omits_missing_external_version() {
+        let runner = VersionOnlyRunner(HashMap::new());
+        let versions = sevenzip_tool_versions(&runner);
+
+        assert!(versions.is_empty(), "missing external versions must not be mislabeled as in-process");
+    }
 
     #[test]
     fn parse_ffprobe_json_extracts_bit_depth_from_raw_sample_field() {

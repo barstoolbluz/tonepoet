@@ -659,12 +659,12 @@ mod tests {
         DsdPlannerSourceKind,
     };
     use crate::convert::pipeline::types::{
-        AlbumMetadata, CueSidecarPolicy, DvdaGroupSelection, ExtractionProvenance, FailurePolicy,
-        LogPolicy, CueSegmentCarrier, PlannedMetadataSatisfaction, NamingCollisionPolicy,
-        NamingPolicy, OverwritePolicy, PipelineRequest, PreparedSource, PreparedTrack,
-        PublishPolicy, SacdArea, SourceAudioDescriptor, SourceKind, SourceOptions, StagePolicy,
-        StageRequirement, TrackId, TrackMetadata, TrackSelection, TrackSourceRef,
-        CUE_ARTWORK_PATH_EXTRA_KEY,
+        AlbumMetadata, CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection,
+        ExtractionProvenance, FailurePolicy, LogPolicy, CueSegmentCarrier,
+        PlannedMetadataSatisfaction, NamingCollisionPolicy, NamingPolicy, OverwritePolicy,
+        PipelineRequest, PreparedSource, PreparedTrack, PublishPolicy, SacdArea,
+        SourceAudioDescriptor, SourceKind, SourceOptions, StagePolicy, StageRequirement, TrackId,
+        TrackMetadata, TrackSelection, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
     };
 
     fn request(root: &Path) -> PipelineRequest {
@@ -713,6 +713,10 @@ mod tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }

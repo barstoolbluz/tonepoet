@@ -217,10 +217,11 @@ impl Materializer for CueImageMaterializer {
         }
         cue_annotations.add_album_extras(&mut album_metadata.extra);
 
+        let tool_versions = cue_tool_versions(runner);
         let provenance = ExtractionProvenance {
             source_kind: SourceKind::CueImage,
             source_sha256: None,
-            tool_versions: BTreeMap::new(),
+            tool_versions,
             extracted_at: chrono::Utc::now(),
         };
 
@@ -231,6 +232,55 @@ impl Materializer for CueImageMaterializer {
             album_metadata,
             provenance,
         })
+    }
+}
+
+
+fn cue_tool_versions(runner: &dyn ToolRunner) -> BTreeMap<String, String> {
+    let mut tool_versions = BTreeMap::new();
+    if let Some(version) = runner.tool_version(ToolBinary::Ffmpeg) {
+        tool_versions.insert("ffmpeg".to_string(), version);
+    }
+    tool_versions
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    struct VersionOnlyRunner(HashMap<ToolBinary, String>);
+
+    #[async_trait::async_trait]
+    impl ToolRunner for VersionOnlyRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<super::super::tool::ToolOutput, ToolRunnerError> {
+            panic!("VersionOnlyRunner must not execute commands")
+        }
+
+        fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+            self.0.get(&binary).cloned()
+        }
+    }
+
+    #[test]
+    fn cue_materializer_provenance_records_detected_ffmpeg_version() {
+        let runner = VersionOnlyRunner(HashMap::from([
+            (ToolBinary::Ffmpeg, "7.1.3".to_string()),
+        ]));
+        let versions = cue_tool_versions(&runner);
+
+        assert_eq!(versions.get("ffmpeg").map(String::as_str), Some("7.1.3"));
+    }
+
+    #[test]
+    fn cue_materializer_provenance_omits_missing_external_version() {
+        let runner = VersionOnlyRunner(HashMap::new());
+        let versions = cue_tool_versions(&runner);
+
+        assert!(versions.is_empty(), "missing external versions must not be mislabeled as in-process");
     }
 }
 
@@ -2714,6 +2764,12 @@ FILE "album.flac" WAVE
                 sacd_area: None,
                 dvda_group: None,
                 dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -2744,6 +2800,10 @@ FILE "album.flac" WAVE
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }

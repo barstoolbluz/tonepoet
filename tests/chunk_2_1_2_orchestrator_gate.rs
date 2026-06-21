@@ -47,6 +47,7 @@ fn publish_policy(overwrite: OverwritePolicy) -> PublishPolicy {
     PublishPolicy {
         overwrite,
         same_filesystem_required: false,
+        write_manifest: false,
     }
 }
 

@@ -6074,6 +6074,10 @@ mod completion_tests {
             dvda_group_selection: crate::convert::pipeline::DvdaGroupSelection::Default,
             dvda_assume_decrypted: false,
             dvda_downmix_policy: crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
         }

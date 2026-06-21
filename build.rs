@@ -1,4 +1,6 @@
+mod build_native_mlp_decoder;
 fn main() {
+    build_native_mlp_decoder::build();
     // Read the pipeline crate version from its Cargo.toml directly.
     let toml = std::fs::read_to_string("tonepoet-pipeline/Cargo.toml")
         .unwrap_or_else(|_| String::new());

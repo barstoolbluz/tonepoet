@@ -1729,6 +1729,8 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: vec![],
+            active_tab: 0,
         };
         assert!(metadata_editor_has_changes(&state));
     }
@@ -1762,6 +1764,8 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: vec![],
+            active_tab: 0,
         };
         // Both entries currently show the MB value → has changes.
         assert!(metadata_editor_has_changes(&state));

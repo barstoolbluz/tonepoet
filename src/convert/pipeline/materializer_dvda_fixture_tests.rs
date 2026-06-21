@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::convert::pipeline::tool::StubToolRunner;
 use crate::tui::dvda::model::DVD_BLOCK_SIZE;
 use crate::tui::dvda::sector::AobSectorReader;
 use tokio_util::sync::CancellationToken;
@@ -104,6 +105,12 @@ fn request_for_fixture(
             sacd_area: None,
             dvda_group_selection: group_selection,
             dvda_group: None,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
             cue_sidecar: CueSidecarPolicy::PreferSidecar,
             track_selection,
         },
@@ -134,6 +141,10 @@ fn request_for_fixture(
             generate_cue: false,
         },
         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        album_batch: None,
+        album_batch_track: None,
+        suppress_incremental_conversion_log_append: false,
+        expected_album_track_count: None,
         container_extension: None,
         container_ffmpeg_flags: Vec::new(),
     }
@@ -150,7 +161,11 @@ fn materialize_fixture(
     let volume_source = DvdaVolumeSourceRef::Directory {
         root: fixture.to_path_buf(),
     };
-    materialize_prepared_source(&req, &volume_source, &volume, &cancel)
+    let staging_root = std::env::temp_dir().join("tonepoet-dvda-fixture-test");
+    let staging = StagingDir::new(staging_root, "fixture-test".to_string());
+    let runner = StubToolRunner::new();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(materialize_prepared_source(&req, &volume_source, &volume, &staging, &runner, &cancel))
 }
 
 fn expected_track_count_for_group_model(
@@ -625,6 +640,13 @@ fn assert_tracks_are_structure_only_dvda_tracks(source: &PreparedSource, expecte
                         assert!(title_len_in_pts.is_some());
                         assert!(title_track_count_declared.is_some());
                         assert!(title_index_count_declared.is_some());
+                    }
+                    DvdaSectorAddressSpace::DiscAbsolute { .. } => {
+                        assert!(
+                            track_type.is_some(),
+                            "DVD-Audio DiscAbsolute PreparedTrack {} lacks typed track_type",
+                            track.id.source_ordinal
+                        );
                     }
                     DvdaSectorAddressSpace::SamgAbsolute => {
                         assert_eq!(*track_type, None);

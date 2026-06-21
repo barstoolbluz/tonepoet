@@ -2187,6 +2187,8 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: vec![],
+            active_tab: 0,
         };
         (state, td)
     }
@@ -2580,6 +2582,8 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: vec![],
+            active_tab: 0,
         };
         let release = rel(
             "rid",
@@ -2620,6 +2624,8 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: vec![],
+            active_tab: 0,
         };
         let release = rel("rid", vec![trk(1, "T", "A", None)]);
         assert!(track_count_mismatch_message(&state, &release).is_none());
@@ -2655,6 +2661,8 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: vec![],
+            active_tab: 0,
         };
         let release = rel(
             "rid",

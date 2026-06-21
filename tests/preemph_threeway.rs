@@ -25,7 +25,8 @@ fn score_file(path: &PathBuf) -> Result<(f64, f64, f64, usize), String> {
     let model_scores = models::score_models(&selected, &stft_result, &corpus_model);
     let deemph_delta =
         scoring::virtual_deemphasis_score(&stft_result, &selected, &corpus_model, info.sample_rate);
-    let verdict = scoring::compute_verdict(&model_scores, deemph_delta, &selected, &corpus_model);
+    #[allow(deprecated)]
+    let verdict = scoring::compute_verdict_legacy_alpha(&model_scores, deemph_delta, &selected, &corpus_model);
 
     Ok((
         model_scores.z_score,

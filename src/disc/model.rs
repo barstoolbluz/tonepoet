@@ -189,6 +189,7 @@ pub struct AobProbeResult {
     /// presentation derived from a multichannel carrier. `channels` remains the
     /// carrier channel count from the actual probed stream.
     pub stereo_downmix_source_label: Option<String>,
+    pub mlp_num_substreams: Option<u32>,
 }
 
 /// Unified browsable representation of an optical disc.

@@ -1639,6 +1639,8 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            presentation_tabs: vec![],
+            active_tab: 0,
         };
 
         // Row 0 = TITLE: no View entry.

@@ -9,13 +9,244 @@ use crate::tui::dvda::sector::AobSectorReader;
 use crate::tui::dvda::{
     channel_assignment, parse_dvda_volume, AudioAttributes, AudioChapter, AudioTitle,
     ChannelAssignment, DirectoryDvdaVolume, DvdaDisc, DvdaGroup, DvdaVolume, IsoUdfDvdaVolume,
-    SamgTrack, SamgZone, TitleRefKind,
+    SamgTrack, SamgZone, TitleRef, TitleRefKind, TitleSet,
 };
 
 use super::dvda_mapper::map_dvda_disc_with_metabase;
 use super::model::DiscContents;
 use super::model::{AobProbeResult, AudioPresentationFormat, FormatProvenance};
 use crate::tui::dvda_metabase::{self, DvdaMetabase};
+
+const DVDA_AOB_FORMAT_PROBE_SECTORS: u32 = 512;
+const DVDA_AOB_FORMAT_PROBE_MIN_SECTORS: u32 = 8;
+
+
+/// Authored source context for an AOB probe.
+///
+/// The bytes may come from a backing ATS AOB inventory while the authored group
+/// still comes from an AOB-less cross-ATS title set. Downmix detection must use
+/// the authored origin, not only the physical file that supplied the bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AobProbeOrigin {
+    pub authored_cross_ats: bool,
+    pub source_title_set_nr: u8,
+    pub backing_title_set_nr: u8,
+}
+
+impl AobProbeOrigin {
+    pub const fn local(title_set_nr: u8) -> Self {
+        Self {
+            authored_cross_ats: false,
+            source_title_set_nr: title_set_nr,
+            backing_title_set_nr: title_set_nr,
+        }
+    }
+
+    pub const fn cross_ats(source_title_set_nr: u8, backing_title_set_nr: u8) -> Self {
+        Self {
+            authored_cross_ats: true,
+            source_title_set_nr,
+            backing_title_set_nr,
+        }
+    }
+}
+
+/// AOB probe result plus packet-level evidence gathered before format facts were resolved.
+///
+/// High-rate MLP streams can begin far from the next major-sync frame. In that case
+/// the packet scanner can prove that MLP packets are present even when it cannot yet
+/// report sample rate, depth, or channel layout.
+pub struct AobProbeOutcome {
+    pub result: Option<AobProbeResult>,
+    pub saw_mlp_packets: bool,
+    pub saw_lpcm_packets: bool,
+    pub scanned_sectors: u32,
+    pub origin: AobProbeOrigin,
+}
+
+
+/// Sector translation selected for an AOB-less source ATS that borrows audio
+/// sectors from a backing ATS with real AOB files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossAtsAobSectorTranslation {
+    /// Raw chapter sectors already address the backing ATS AOB inventory.
+    Identity,
+    /// Raw chapter sectors must be translated through source/resolved
+    /// disc-absolute bases before addressing the backing ATS AOB inventory.
+    CrossAtsAob {
+        source_disc_absolute_base: u32,
+        resolved_disc_absolute_base: u32,
+    },
+}
+
+/// Shared cross-ATS AOB resolution used by both the materializer and the
+/// browse/disc-info probe path. Keeping the candidate selection here prevents
+/// those paths from choosing different backing ATS inventories for the same
+/// AOB-less source ATS.
+#[derive(Clone, Debug)]
+pub struct CrossAtsAobResolution<'a> {
+    pub source_title_set_nr: u8,
+    pub resolved_title_set: &'a TitleSet,
+    pub source_disc_absolute_base: u32,
+    pub resolved_disc_absolute_base: u32,
+    pub sector_translation: CrossAtsAobSectorTranslation,
+}
+
+struct CrossAtsAobCandidate<'a> {
+    resolution: CrossAtsAobResolution<'a>,
+}
+
+/// Resolve a source ATS with no AOB files to the single backing ATS whose AOB
+/// inventory covers every chapter range after either disc-absolute or identity
+/// translation.
+///
+/// Returns `Ok(None)` when no backing ATS fits. Returns `Err` when more than one
+/// backing ATS fits, because falling through to an ISO absolute-sector read can
+/// mask an ambiguous or stale disc model.
+pub fn resolve_cross_ats_backing_aob_title_set<'a>(
+    disc: &'a DvdaDisc,
+    source_title_set_nr: u8,
+    title: &AudioTitle,
+    source_disc_absolute_base: u32,
+) -> Result<Option<CrossAtsAobResolution<'a>>, String> {
+    let mut candidates = Vec::new();
+
+    for candidate in &disc.title_sets {
+        if candidate.number == source_title_set_nr || !title_set_has_existing_aobs(candidate) {
+            continue;
+        }
+
+        let Some(resolved_disc_absolute_base) = title_set_disc_absolute_base(disc, candidate) else {
+            continue;
+        };
+
+        let Some(sector_translation) = title_ranges_fit_cross_ats_aobs(
+            title,
+            source_disc_absolute_base,
+            resolved_disc_absolute_base,
+            &candidate.aobs,
+        ) else {
+            continue;
+        };
+
+        candidates.push(CrossAtsAobCandidate {
+            resolution: CrossAtsAobResolution {
+                source_title_set_nr,
+                resolved_title_set: candidate,
+                source_disc_absolute_base,
+                resolved_disc_absolute_base,
+                sector_translation,
+            },
+        });
+    }
+
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.into_iter().next().map(|candidate| candidate.resolution)),
+        _ => {
+            let alternatives = candidates
+                .iter()
+                .map(|candidate| candidate.resolution.resolved_title_set.number.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "DVD-Audio ATS {source_title_set_nr} has no AOB files and maps into multiple backing ATS AOB inventories: {alternatives}"
+            ))
+        }
+    }
+}
+
+fn title_ranges_fit_cross_ats_aobs(
+    title: &AudioTitle,
+    source_disc_absolute_base: u32,
+    resolved_disc_absolute_base: u32,
+    aobs: &[crate::tui::dvda::AobFileEntry],
+) -> Option<CrossAtsAobSectorTranslation> {
+    let translated = CrossAtsAobSectorTranslation::CrossAtsAob {
+        source_disc_absolute_base,
+        resolved_disc_absolute_base,
+    };
+    if title_ranges_fit_aobs_using_translation(title, aobs, translated) {
+        return Some(translated);
+    }
+
+    if title_ranges_fit_aobs_using_translation(
+        title,
+        aobs,
+        CrossAtsAobSectorTranslation::Identity,
+    ) {
+        return Some(CrossAtsAobSectorTranslation::Identity);
+    }
+
+    None
+}
+
+fn title_ranges_fit_aobs_using_translation(
+    title: &AudioTitle,
+    aobs: &[crate::tui::dvda::AobFileEntry],
+    translation: CrossAtsAobSectorTranslation,
+) -> bool {
+    if title.chapters.is_empty() {
+        return false;
+    }
+
+    for chapter in &title.chapters {
+        if chapter.sector_ranges.is_empty() {
+            return false;
+        }
+        for range in &chapter.sector_ranges {
+            let Some((first, last)) = translate_cross_ats_aob_range(
+                range.first,
+                range.last,
+                translation,
+            ) else {
+                return false;
+            };
+            if !aob_entries_cover_range(first, last, aobs) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+pub fn translate_cross_ats_aob_range(
+    first: u32,
+    last: u32,
+    translation: CrossAtsAobSectorTranslation,
+) -> Option<(u32, u32)> {
+    if last < first {
+        return None;
+    }
+
+    match translation {
+        CrossAtsAobSectorTranslation::Identity => Some((first, last)),
+        CrossAtsAobSectorTranslation::CrossAtsAob {
+            source_disc_absolute_base,
+            resolved_disc_absolute_base,
+        } => {
+            let first = translate_cross_ats_sector(
+                first,
+                source_disc_absolute_base,
+                resolved_disc_absolute_base,
+            )?;
+            let last = translate_cross_ats_sector(
+                last,
+                source_disc_absolute_base,
+                resolved_disc_absolute_base,
+            )?;
+            (last >= first).then_some((first, last))
+        }
+    }
+}
+
+pub fn translate_cross_ats_aob_sector(
+    sector: u32,
+    translation: CrossAtsAobSectorTranslation,
+) -> Option<u32> {
+    translate_cross_ats_aob_range(sector, sector, translation).map(|(sector, _)| sector)
+}
 
 /// Return true when `path` is a DVD-Audio ISO image.
 ///
@@ -224,75 +455,418 @@ pub fn probe_group_aob_format_with_path(
             .find(|t| t.title_nr == title_ref.title_nr),
     }?;
     let chapter = title.chapters.first()?;
-    let first_sector = chapter.sector_ranges.first()?.first;
 
-    // Try reading from this title set's AOBs. Read up to 8 sectors so the
-    // MLP major sync scan has enough data (some streams don't place the
-    // major sync in the very first access unit frame).
+    probe_title_chapter_aob_format_with_path(
+        volume,
+        disc,
+        group,
+        title_ref,
+        title_set,
+        title,
+        chapter,
+        source_path,
+    )
+}
+
+/// Probe a specific ATS title chapter to determine its actual stream codec and
+/// audio format. Unlike `probe_group_aob_format_with_path`, this does not
+/// assume that every track in a group has the same presentation.
+pub fn probe_title_chapter_aob_format_with_path(
+    volume: &dyn DvdaVolume,
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    title_set: &TitleSet,
+    title: &AudioTitle,
+    chapter: &AudioChapter,
+    source_path: Option<&Path>,
+) -> Option<AobProbeResult> {
+    probe_title_chapter_aob_format_with_path_outcome(
+        volume,
+        disc,
+        group,
+        title_ref,
+        title_set,
+        title,
+        chapter,
+        source_path,
+    )
+    .and_then(|outcome| outcome.result)
+}
+
+/// Probe a specific ATS title chapter and retain packet-level evidence for callers
+/// that can inherit stream facts from another track in the same group.
+pub fn probe_title_chapter_aob_format_with_path_outcome(
+    volume: &dyn DvdaVolume,
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    title_set: &TitleSet,
+    title: &AudioTitle,
+    chapter: &AudioChapter,
+    source_path: Option<&Path>,
+) -> Option<AobProbeOutcome> {
+    probe_title_chapter_aob_format_with_path_outcome_with_origin(
+        volume,
+        disc,
+        group,
+        title_ref,
+        title_set,
+        title,
+        chapter,
+        source_path,
+        AobProbeOrigin::local(title_set.number),
+    )
+}
+
+/// Probe a chapter using an explicit authored-origin context. This is used when
+/// the physical bytes come from a resolved backing ATS but the authored title is
+/// still cross-ATS.
+#[allow(clippy::too_many_arguments)]
+pub fn probe_title_chapter_aob_format_with_path_outcome_with_origin(
+    volume: &dyn DvdaVolume,
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    title_set: &TitleSet,
+    title: &AudioTitle,
+    chapter: &AudioChapter,
+    source_path: Option<&Path>,
+    origin: AobProbeOrigin,
+) -> Option<AobProbeOutcome> {
+    let first_sector = chapter.first_sector()?;
+
+    // Try reading from this title set's own AOBs. Read a bounded 512-sector
+    // prefix (~1 MiB), with smaller fallbacks for short or unusual AOBs.
     let reader = AobSectorReader::new(volume, &title_set.aobs);
     let from_aob = reader
-        .read_blocks(first_sector, 8)
+        .read_blocks(first_sector, DVDA_AOB_FORMAT_PROBE_SECTORS)
+        .or_else(|_| reader.read_blocks(first_sector, DVDA_AOB_FORMAT_PROBE_MIN_SECTORS))
         .or_else(|_| reader.read_blocks(first_sector, 1))
         .ok();
-    let cross_ats = from_aob.is_none();
+
+    let mut probe_origin = origin;
     let mut demux_mode = DvdaSubHeaderMode::DvdAudio;
-    let sector_data = from_aob.or_else(|| {
-        // Title set has no AOBs. Prefer SAMG VOB absolute sectors when
-        // they correlate exactly with the ATS chapter sector ranges; this
-        // avoids probing an unrelated AOB/VOB area when AOTT offsets are
-        // relative to another filesystem structure.
+    let sector_data = if let Some(data) = from_aob {
+        data
+    } else if let Some(read) = read_cross_ats_aob_probe_prefix(
+        volume,
+        disc,
+        group,
+        title_ref,
+        title_set,
+        title,
+        chapter,
+    ) {
+        probe_origin = AobProbeOrigin::cross_ats(title_set.number, read.backing_title_set_nr);
+        read.data
+    } else {
+        // Title set has no usable AOBs. Prefer SAMG VOB absolute sectors when
+        // they correlate exactly with the ATS chapter sector ranges; otherwise
+        // fall back to AMG/AOTT + ATSI metadata and read directly from the ISO.
         let iso_path = source_path?;
-        if !iso_path.is_file() {
-            return None;
-        }
         let samg_disc_absolute_base = samg_disc_absolute_base_for_title(disc, title);
         if samg_disc_absolute_base.is_some() {
             demux_mode = DvdaSubHeaderMode::DvdVideo;
         }
         let disc_absolute_base = samg_disc_absolute_base.or_else(|| {
-            let aott_entry = disc
-                .amg
-                .audio_title_table
-                .iter()
-                .find(|e| {
-                    e.ordinal == u16::from(group.group_nr)
-                        && e.title_set_nr == title_ref.title_set_nr
-                })
-                .or_else(|| {
-                    disc.amg
-                        .audio_title_table
-                        .iter()
-                        .find(|e| e.title_set_nr == title_ref.title_set_nr)
-                })?;
-            aott_entry
-                .atsi_mat_sector
-                .checked_add(title_set.header.atstt_vobs)
+            title_set_disc_absolute_base_for_group(disc, group, title_ref, title_set)
         })?;
-        let disc_lba = u64::from(disc_absolute_base) + u64::from(first_sector);
-        let byte_offset = disc_lba * 2048;
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(iso_path).ok()?;
-        let file_len = file.metadata().ok()?.len();
-        if byte_offset + 2048 > file_len {
-            return None;
-        }
-        file.seek(SeekFrom::Start(byte_offset)).ok()?;
-        // Read up to 512 sectors (~1 MB) — the MLP major sync may not
-        // appear in the first access unit of a cross-ATS stream.
-        let probe_sectors = 512u64;
-        let read_len = (probe_sectors * 2048).min(file_len - byte_offset) as usize;
-        let mut buf = vec![0u8; read_len];
-        file.read_exact(&mut buf).ok()?;
-        Some(buf)
+        let disc_lba = disc_absolute_base.checked_add(first_sector)?;
+        probe_origin = AobProbeOrigin::cross_ats(title_set.number, title_set.number);
+        log::debug!(
+            "DVD-Audio AOB probe: cross-ATS ISO read for group {} track {}: disc_absolute_base={} first_sector={} disc_lba={} probe_sectors={}",
+            group.group_nr, chapter.track_nr, disc_absolute_base, first_sector, disc_lba, DVDA_AOB_FORMAT_PROBE_SECTORS
+        );
+        read_iso_sector_prefix(iso_path, disc_lba, DVDA_AOB_FORMAT_PROBE_SECTORS)?
+    };
+
+    Some(probe_aob_sector_data_with_evidence(
+        disc,
+        group,
+        probe_origin,
+        demux_mode,
+        &sector_data,
+    ))
+}
+
+struct CrossAtsAobProbeRead {
+    data: Vec<u8>,
+    backing_title_set_nr: u8,
+}
+
+fn read_cross_ats_aob_probe_prefix(
+    volume: &dyn DvdaVolume,
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    source_title_set: &TitleSet,
+    title: &AudioTitle,
+    chapter: &AudioChapter,
+) -> Option<CrossAtsAobProbeRead> {
+    if title_set_has_existing_aobs(source_title_set) {
+        return None;
+    }
+
+    let source_disc_absolute_base = samg_disc_absolute_base_for_title(disc, title).or_else(|| {
+        title_set_disc_absolute_base_for_group(disc, group, title_ref, source_title_set)
     })?;
 
-    // Demux sectors and probe. For multi-sector reads (cross-ATS fallback),
-    // demux each 2048-byte sector independently and concatenate MLP payloads
-    // to find the major sync which may span multiple sectors.
+    let resolution = match resolve_cross_ats_backing_aob_title_set(
+        disc,
+        source_title_set.number,
+        title,
+        source_disc_absolute_base,
+    ) {
+        Ok(Some(resolution)) => resolution,
+        Ok(None) => return None,
+        Err(err) => {
+            log::warn!("DVD-Audio AOB probe: {err}");
+            return None;
+        }
+    };
+
+    let first_sector = translate_cross_ats_aob_sector(
+        chapter.first_sector()?,
+        resolution.sector_translation,
+    )?;
+    let translation_label = match resolution.sector_translation {
+        CrossAtsAobSectorTranslation::Identity => "identity",
+        CrossAtsAobSectorTranslation::CrossAtsAob { .. } => "translated",
+    };
+
+    let reader = AobSectorReader::new(volume, &resolution.resolved_title_set.aobs);
+    log::debug!(
+        "DVD-Audio AOB probe: source ATS {} track {} reads backing ATS {} AOBs at sector {} using {} translation",
+        source_title_set.number,
+        chapter.track_nr,
+        resolution.resolved_title_set.number,
+        first_sector,
+        translation_label
+    );
+    reader
+        .read_blocks(first_sector, DVDA_AOB_FORMAT_PROBE_SECTORS)
+        .or_else(|_| reader.read_blocks(first_sector, DVDA_AOB_FORMAT_PROBE_MIN_SECTORS))
+        .or_else(|_| reader.read_blocks(first_sector, 1))
+        .ok()
+        .map(|data| CrossAtsAobProbeRead {
+            data,
+            backing_title_set_nr: resolution.resolved_title_set.number,
+        })
+}
+
+fn title_set_has_existing_aobs(title_set: &TitleSet) -> bool {
+    title_set.aobs.iter().any(|aob| aob.exists)
+}
+
+fn title_set_disc_absolute_base_for_group(
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    title_set: &TitleSet,
+) -> Option<u32> {
+    let aott_entry = disc
+        .amg
+        .audio_title_table
+        .iter()
+        .find(|entry| {
+            entry.ordinal == u16::from(group.group_nr)
+                && entry.title_set_nr == title_ref.title_set_nr
+        })
+        .or_else(|| {
+            disc.amg
+                .audio_title_table
+                .iter()
+                .find(|entry| entry.title_set_nr == title_ref.title_set_nr)
+        })?;
+    title_set_audio_vobs_disc_absolute_base(aott_entry, title_set)
+}
+
+fn title_set_disc_absolute_base(disc: &DvdaDisc, title_set: &TitleSet) -> Option<u32> {
+    disc.amg
+        .audio_title_table
+        .iter()
+        .filter(|entry| entry.title_set_nr == title_set.number)
+        .filter_map(|entry| title_set_audio_vobs_disc_absolute_base(entry, title_set))
+        .min()
+}
+
+fn title_set_audio_vobs_disc_absolute_base(
+    aott_entry: &crate::tui::dvda::AudioTitleTableEntry,
+    title_set: &TitleSet,
+) -> Option<u32> {
+    if title_set.header.atsm_vobs != 0 {
+        return Some(title_set.header.atsm_vobs);
+    }
+
+    aott_entry
+        .atsi_mat_sector
+        .checked_add(title_set.header.atstt_vobs)
+}
+
+fn chapter_first_sector_for_identity_translation(
+    chapter: &AudioChapter,
+    aobs: &[crate::tui::dvda::AobFileEntry],
+) -> Option<u32> {
+    chapter_first_sector_for_translation(chapter, aobs, |first, last| {
+        (last >= first).then_some((first, last))
+    })
+}
+
+fn chapter_first_sector_for_cross_ats_translation(
+    chapter: &AudioChapter,
+    source_disc_absolute_base: u32,
+    resolved_disc_absolute_base: u32,
+    aobs: &[crate::tui::dvda::AobFileEntry],
+) -> Option<u32> {
+    chapter_first_sector_for_translation(chapter, aobs, |first, last| {
+        let first = translate_cross_ats_sector(first, source_disc_absolute_base, resolved_disc_absolute_base)?;
+        let last = translate_cross_ats_sector(last, source_disc_absolute_base, resolved_disc_absolute_base)?;
+        (last >= first).then_some((first, last))
+    })
+}
+
+fn chapter_first_sector_for_translation<F>(
+    chapter: &AudioChapter,
+    aobs: &[crate::tui::dvda::AobFileEntry],
+    mut translate: F,
+) -> Option<u32>
+where
+    F: FnMut(u32, u32) -> Option<(u32, u32)>,
+{
+    let mut translated_first_sector = None;
+    for range in &chapter.sector_ranges {
+        let (first, last) = translate(range.first, range.last)?;
+        if !aob_entries_cover_range(first, last, aobs) {
+            return None;
+        }
+        if translated_first_sector.is_none() || Some(first) < translated_first_sector {
+            translated_first_sector = Some(first);
+        }
+    }
+    translated_first_sector
+}
+
+fn translate_cross_ats_sector(
+    sector: u32,
+    source_disc_absolute_base: u32,
+    resolved_disc_absolute_base: u32,
+) -> Option<u32> {
+    let absolute = u64::from(source_disc_absolute_base).checked_add(u64::from(sector))?;
+    let relative = absolute.checked_sub(u64::from(resolved_disc_absolute_base))?;
+    u32::try_from(relative).ok()
+}
+
+fn aob_entries_cover_range(
+    first: u32,
+    last: u32,
+    aobs: &[crate::tui::dvda::AobFileEntry],
+) -> bool {
+    if last < first {
+        return false;
+    }
+    let mut cursor = first;
+    while cursor <= last {
+        let Some(aob) = aobs
+            .iter()
+            .filter(|aob| aob.exists)
+            .find(|aob| aob.block_first <= cursor && cursor <= aob.block_last)
+        else {
+            return false;
+        };
+        if aob.block_last >= last {
+            return true;
+        }
+        if aob.block_last == u32::MAX {
+            return false;
+        }
+        cursor = aob.block_last + 1;
+    }
+    true
+}
+
+/// Probe one SAMG-only track by its own absolute sector span instead of using a
+/// representative group track.
+pub fn probe_samg_track_aob_format_with_path(
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    track: &SamgTrack,
+    source_path: Option<&Path>,
+) -> Option<AobProbeResult> {
+    let iso_path = source_path?;
+    let demux_mode = match track.zone {
+        SamgZone::Aob => DvdaSubHeaderMode::DvdAudio,
+        SamgZone::Vob => DvdaSubHeaderMode::DvdVideo,
+    };
+    let cross_ats = matches!(track.zone, SamgZone::Vob);
+    let sector_data = read_iso_sector_prefix(
+        iso_path,
+        track.abs_first_sector,
+        DVDA_AOB_FORMAT_PROBE_SECTORS,
+    )?;
+
+    probe_aob_sector_data(disc, group, cross_ats, demux_mode, &sector_data)
+}
+
+fn read_iso_sector_prefix(
+    iso_path: &Path,
+    first_sector: u32,
+    max_sectors: u32,
+) -> Option<Vec<u8>> {
+    if !iso_path.is_file() {
+        return None;
+    }
+
+    let byte_offset = u64::from(first_sector).checked_mul(2048)?;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(iso_path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if byte_offset + 2048 > file_len {
+        return None;
+    }
+    file.seek(SeekFrom::Start(byte_offset)).ok()?;
+    let read_len = (u64::from(max_sectors) * 2048).min(file_len - byte_offset) as usize;
+    let mut buf = vec![0u8; read_len];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn probe_aob_sector_data(
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    cross_ats: bool,
+    demux_mode: DvdaSubHeaderMode,
+    sector_data: &[u8],
+) -> Option<AobProbeResult> {
+    let source_title_set_nr = group
+        .title_refs
+        .first()
+        .map(|tr| tr.title_set_nr)
+        .unwrap_or(0);
+    let origin = if cross_ats {
+        AobProbeOrigin::cross_ats(source_title_set_nr, 0)
+    } else {
+        AobProbeOrigin::local(source_title_set_nr)
+    };
+    probe_aob_sector_data_with_evidence(disc, group, origin, demux_mode, sector_data).result
+}
+
+fn probe_aob_sector_data_with_evidence(
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    origin: AobProbeOrigin,
+    demux_mode: DvdaSubHeaderMode,
+    sector_data: &[u8],
+) -> AobProbeOutcome {
+    // Demux sectors and probe. For multi-sector reads, demux each 2048-byte
+    // sector independently and concatenate MLP payloads to find the major sync,
+    // which may span multiple sectors.
     let sector_count = sector_data.len() / 2048;
     let mut codec_kind = None;
     let mut pcm_result = None;
     let mut mlp_payload = Vec::new();
+    let mut saw_mlp_packets = false;
+    let mut saw_lpcm_packets = false;
 
     for i in 0..sector_count {
         let sector = &sector_data[i * 2048..(i + 1) * 2048];
@@ -303,11 +877,10 @@ pub fn probe_group_aob_format_with_path(
         for packet in &packets {
             match packet.sub_header.kind() {
                 DvdaSubstreamKind::Pcm => {
+                    saw_lpcm_packets = true;
                     if pcm_result.is_none() {
                         if let Some(pcm) = packet.sub_header.pcm.as_ref() {
-                            let rate = pcm
-                                .group1_sample_rate
-                                .or(pcm.group2_sample_rate);
+                            let rate = pcm.group1_sample_rate.or(pcm.group2_sample_rate);
                             let bits = pcm.group1_bits.or(pcm.group2_bits);
                             if let (Some(rate), Some(bits)) = (rate, bits) {
                                 if let Some(ca) = channel_assignment(pcm.channel_assignment) {
@@ -323,6 +896,7 @@ pub fn probe_group_aob_format_with_path(
                                         channel_assignment_code: pcm.channel_assignment,
                                         channel_label: ch_label,
                                         stereo_downmix_source_label: None,
+                                        mlp_num_substreams: None,
                                     });
                                 }
                             }
@@ -331,6 +905,7 @@ pub fn probe_group_aob_format_with_path(
                     codec_kind = Some(DvdaSubstreamKind::Pcm);
                 }
                 DvdaSubstreamKind::Mlp => {
+                    saw_mlp_packets = true;
                     mlp_payload.extend_from_slice(packet.payload);
                     codec_kind = Some(DvdaSubstreamKind::Mlp);
                 }
@@ -339,12 +914,15 @@ pub fn probe_group_aob_format_with_path(
         }
     }
 
-    match codec_kind? {
-        DvdaSubstreamKind::Pcm => pcm_result,
-        DvdaSubstreamKind::Mlp => {
-            let info = probe_mlp_major_sync(&mlp_payload)?;
-            let stereo_downmix_source_label =
-                detect_stereo_downmix_source(disc, group, cross_ats, info.channel_count);
+    let result = match codec_kind {
+        Some(DvdaSubstreamKind::Pcm) => pcm_result,
+        Some(DvdaSubstreamKind::Mlp) => probe_mlp_major_sync(&mlp_payload).map(|info| {
+            let stereo_downmix_source_label = detect_stereo_downmix_source(
+                disc,
+                group,
+                origin.authored_cross_ats,
+                info.channel_count,
+            );
             let ch_label = if let Some(source_label) = stereo_downmix_source_label.as_deref() {
                 format!("Stereo (derived from {})", source_label)
             } else {
@@ -353,7 +931,7 @@ pub fn probe_group_aob_format_with_path(
                     info.channel_count as u8,
                 )
             };
-            Some(AobProbeResult {
+            AobProbeResult {
                 codec: "MLP",
                 sample_rate: info.group1_sample_rate,
                 bit_depth: info.group1_bits,
@@ -361,9 +939,18 @@ pub fn probe_group_aob_format_with_path(
                 channel_assignment_code: info.channel_arrangement as u8,
                 channel_label: ch_label,
                 stereo_downmix_source_label,
-            })
-        }
+                mlp_num_substreams: Some(info.num_substreams),
+            }
+        }),
         _ => None,
+    };
+
+    AobProbeOutcome {
+        result,
+        saw_mlp_packets,
+        saw_lpcm_packets,
+        scanned_sectors: u32::try_from(sector_count).unwrap_or(u32::MAX),
+        origin,
     }
 }
 
@@ -668,4 +1255,75 @@ fn durations_near_match(a: f64, b: f64) -> bool {
     let diff = (a - b).abs();
     let max_dur = a.max(b);
     diff <= max_dur * 0.01 || diff <= 30.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::dvda::{AobFileEntry, SectorRange};
+
+    fn chapter_with_ranges(ranges: &[(u32, u32)]) -> AudioChapter {
+        AudioChapter {
+            track_nr: 1,
+            track_type: 0,
+            track_type_low_bits_candidate: 0,
+            downmix_matrix: None,
+            index_start: 1,
+            first_pts: 0,
+            len_in_pts: 90_000,
+            sector_ranges: ranges
+                .iter()
+                .enumerate()
+                .map(|(idx, (first, last))| SectorRange {
+                    index_nr: u8::try_from(idx + 1).unwrap(),
+                    first: *first,
+                    last: *last,
+                })
+                .collect(),
+        }
+    }
+
+    fn aob_entry(block_first: u32, block_last: u32) -> AobFileEntry {
+        AobFileEntry {
+            title_set_nr: 1,
+            part_nr: 1,
+            file_name: "ATS_01_1.AOB".to_string(),
+            exists: true,
+            byte_len: 2048 * u64::from(block_last - block_first + 1),
+            block_first,
+            block_last,
+        }
+    }
+
+    #[test]
+    fn cross_ats_disc_info_probe_prefers_identity_when_raw_ranges_fit_backing_aobs() {
+        let chapter = chapter_with_ranges(&[(0, 48_190), (48_191, 86_926)]);
+        let aobs = vec![aob_entry(0, 2_556_832)];
+
+        assert_eq!(
+            chapter_first_sector_for_cross_ats_translation(
+                &chapter,
+                2_576_316,
+                12_239,
+                &aobs,
+            ),
+            None
+        );
+        assert_eq!(
+            chapter_first_sector_for_identity_translation(&chapter, &aobs),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn cross_ats_disc_info_probe_accepts_translated_ranges_when_they_fit() {
+        let chapter = chapter_with_ranges(&[(10, 20)]);
+        let aobs = vec![aob_entry(110, 120)];
+
+        assert_eq!(
+            chapter_first_sector_for_cross_ats_translation(&chapter, 1_100, 1_000, &aobs),
+            Some(110)
+        );
+        assert_eq!(chapter_first_sector_for_identity_translation(&chapter, &aobs), None);
+    }
 }

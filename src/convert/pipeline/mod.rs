@@ -11,12 +11,13 @@
 //! do not add or alter public contract types, stage signatures,
 //! terminal statuses, core errors, or source/artifact identity.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub(crate) mod dvda_channel_layout;
 pub(crate) mod dvda_demux;
 pub(crate) mod dvda_lpcm;
 pub(crate) mod dvda_mlp;
+pub(crate) mod dvda_mlp_native;
 pub(crate) mod dvda_realize;
 pub(crate) mod dvdv_realize;
 pub mod errors;
@@ -119,6 +120,10 @@ mod tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }

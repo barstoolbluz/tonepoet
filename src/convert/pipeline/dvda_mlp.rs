@@ -70,6 +70,7 @@ pub struct MlpMajorSyncInfo {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum MlpInspectError {
     Io(io::Error),
     Empty,
@@ -445,13 +446,31 @@ fn parse_mlp_major_sync(bytes: &[u8], offset: u64) -> Result<MlpMajorSyncInfo, M
     let channel_arrangement = bits
         .read(5)
         .ok_or(MlpInspectError::MajorSyncBitRead { offset, field: "channel_arrangement" })?;
-    let channel_count = mlp_channel_count_for_arrangement(channel_arrangement).ok_or(
-        MlpInspectError::UnsupportedMajorSyncValue {
+    let channel_layout = u8::try_from(channel_arrangement)
+        .ok()
+        .and_then(layout_for_assignment_code)
+        .ok_or(MlpInspectError::UnsupportedMajorSyncValue {
             offset,
             field: "channel_arrangement",
             value: channel_arrangement,
-        },
-    )?;
+        })?;
+    let channel_count = channel_layout.total_channel_count();
+    if channel_layout.group2_channel_count() > 0 {
+        if group2_bits == 0 {
+            return Err(MlpInspectError::UnsupportedMajorSyncValue {
+                offset,
+                field: "group2_bits",
+                value: group2_quant,
+            });
+        }
+        if group2_sample_rate == 0 {
+            return Err(MlpInspectError::UnsupportedMajorSyncValue {
+                offset,
+                field: "group2_samplerate",
+                value: group2_rate_bits,
+            });
+        }
+    }
 
     let access_unit_size = 40_u32 << (group1_rate_bits & 7);
     bits.skip(48).ok_or(MlpInspectError::MajorSyncBitRead {
@@ -493,6 +512,7 @@ fn parse_mlp_major_sync(bytes: &[u8], offset: u64) -> Result<MlpMajorSyncInfo, M
 }
 
 
+#[allow(dead_code)]
 fn mlp_channel_count_for_arrangement(channel_arrangement: u32) -> Option<u32> {
     let code = u8::try_from(channel_arrangement).ok()?;
     layout_for_assignment_code(code).map(|layout| layout.total_channel_count())
@@ -514,8 +534,36 @@ fn compare_repeated_major_sync(
         first.group1_sample_rate,
         later.group1_sample_rate,
     )?;
+    compare_major_sync_field(
+        offset,
+        "channel_arrangement",
+        first.channel_arrangement,
+        later.channel_arrangement,
+    )?;
     compare_major_sync_field(offset, "channels", first.channel_count, later.channel_count)?;
+
+    // Group 2 rate/depth fields are only meaningful when the channel
+    // arrangement includes a second channel group. Some one-group streams carry
+    // placeholder values in the group 2 major-sync slots; do not make those
+    // ignored placeholders part of the validation contract.
+    if major_sync_has_group2_channels(*first) || major_sync_has_group2_channels(later) {
+        compare_major_sync_field(offset, "group2_bits", first.group2_bits, later.group2_bits)?;
+        compare_major_sync_field(
+            offset,
+            "group2_samplerate",
+            first.group2_sample_rate,
+            later.group2_sample_rate,
+        )?;
+    }
+
     compare_major_sync_field(offset, "num_substreams", first.num_substreams, later.num_substreams)
+}
+
+fn major_sync_has_group2_channels(info: MlpMajorSyncInfo) -> bool {
+    u8::try_from(info.channel_arrangement)
+        .ok()
+        .and_then(layout_for_assignment_code)
+        .map_or(false, |layout| layout.group2_channel_count() > 0)
 }
 
 fn compare_major_sync_field(
@@ -580,67 +628,71 @@ fn validate_expected_facts(
     info: MlpMajorSyncInfo,
     expectation: MlpStreamExpectation,
 ) -> Result<(), MlpInspectError> {
-    if let Some(expected) = expectation.sample_rate {
-        if info.group1_sample_rate != expected {
-            return Err(MlpInspectError::SampleRateMismatch {
-                expected,
-                actual: info.group1_sample_rate,
-            });
-        }
-    }
-    if let Some(expected) = expectation.channel_count {
-        if info.channel_count != expected {
-            return Err(MlpInspectError::ChannelCountMismatch {
-                expected,
-                actual: info.channel_count,
-            });
-        }
-    }
-    if let Some(expected) = expectation.bit_depth {
-        if info.group1_bits != expected {
-            return Err(MlpInspectError::BitDepthMismatch {
-                expected,
-                actual: info.group1_bits,
-            });
-        }
-    }
-    if let Some(expected) = expectation.group1_sample_rate {
-        if info.group1_sample_rate != expected {
-            return Err(MlpInspectError::GroupSampleRateMismatch {
-                group: 1,
-                expected,
-                actual: info.group1_sample_rate,
-            });
-        }
-    }
-    if let Some(expected) = expectation.group2_sample_rate {
-        if info.group2_sample_rate != expected {
-            return Err(MlpInspectError::GroupSampleRateMismatch {
-                group: 2,
-                expected,
-                actual: info.group2_sample_rate,
-            });
-        }
-    }
-    if let Some(expected) = expectation.group1_bit_depth {
-        if info.group1_bits != expected {
-            return Err(MlpInspectError::GroupBitDepthMismatch {
-                group: 1,
-                expected,
-                actual: info.group1_bits,
-            });
-        }
-    }
-    if let Some(expected) = expectation.group2_bit_depth {
-        if info.group2_bits != expected {
-            return Err(MlpInspectError::GroupBitDepthMismatch {
-                group: 2,
-                expected,
-                actual: info.group2_bits,
-            });
-        }
-    }
+    warn_if_expected_fact_differs(
+        "sample rate",
+        expectation.sample_rate,
+        Some(info.group1_sample_rate),
+        "IFO expected {expected} Hz, MLP major-sync reports {actual} Hz; using MLP major-sync",
+    );
+    warn_if_expected_fact_differs(
+        "channel count",
+        expectation.channel_count,
+        Some(info.channel_count),
+        "IFO expected {expected} channels, MLP major-sync reports {actual}; using MLP major-sync",
+    );
+    warn_if_expected_fact_differs(
+        "bit depth",
+        expectation.bit_depth,
+        Some(info.group1_bits),
+        "IFO expected {expected}-bit, MLP major-sync reports {actual}-bit; using MLP major-sync",
+    );
+    warn_if_expected_fact_differs(
+        "group 1 sample rate",
+        expectation.group1_sample_rate,
+        Some(info.group1_sample_rate),
+        "IFO expected group 1 {expected} Hz, MLP major-sync reports {actual} Hz; using MLP major-sync",
+    );
+    warn_if_expected_fact_differs(
+        "group 2 sample rate",
+        expectation.group2_sample_rate,
+        Some(info.group2_sample_rate),
+        "IFO expected group 2 {expected} Hz, MLP major-sync reports {actual} Hz; using MLP major-sync",
+    );
+    warn_if_expected_fact_differs(
+        "group 1 bit depth",
+        expectation.group1_bit_depth,
+        Some(info.group1_bits),
+        "IFO expected group 1 {expected}-bit, MLP major-sync reports {actual}-bit; using MLP major-sync",
+    );
+    warn_if_expected_fact_differs(
+        "group 2 bit depth",
+        expectation.group2_bit_depth,
+        Some(info.group2_bits),
+        "IFO expected group 2 {expected}-bit, MLP major-sync reports {actual}-bit; using MLP major-sync",
+    );
+
     Ok(())
+}
+
+fn warn_if_expected_fact_differs(
+    field: &'static str,
+    expected: Option<u32>,
+    actual: Option<u32>,
+    detail: &'static str,
+) {
+    let (Some(expected), Some(actual)) = (expected, actual) else {
+        return;
+    };
+    if expected == actual {
+        return;
+    }
+
+    log::warn!(
+        "DVD-Audio MLP {field} metadata mismatch: {}",
+        detail
+            .replace("{expected}", &expected.to_string())
+            .replace("{actual}", &actual.to_string())
+    );
 }
 
 fn mlp_sample_rate(value: u32) -> u32 {
@@ -723,10 +775,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_expected_sample_rate_mismatch() {
+    fn accepts_expected_sample_rate_mismatch_as_advisory() {
         let path = write_temp_mlp(&[major_sync_frame(40, 2, 2, 1, 1)]);
 
-        let err = inspect_mlp_file(
+        let inspection = inspect_mlp_file(
             &path,
             MlpStreamExpectation {
                 sample_rate: Some(96_000),
@@ -735,26 +787,166 @@ mod tests {
                 ..MlpStreamExpectation::default()
             },
         )
-        .expect_err("sample-rate mismatch should fail");
+        .expect("IFO/MLP sample-rate mismatch should be advisory");
 
-        assert!(matches!(err, MlpInspectError::SampleRateMismatch { .. }));
+        assert_eq!(
+            inspection
+                .first_major_sync
+                .expect("major sync info")
+                .group1_sample_rate,
+            192_000
+        );
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn rejects_expected_group_bit_depth_mismatch() {
+    fn accepts_expected_group_bit_depth_mismatch_as_advisory() {
         let path = write_temp_mlp(&[major_sync_frame(40, 2, 2, 1, 1)]);
 
-        let err = inspect_mlp_file(
+        let inspection = inspect_mlp_file(
             &path,
             MlpStreamExpectation {
                 group1_bit_depth: Some(20),
                 ..MlpStreamExpectation::default()
             },
         )
-        .expect_err("group bit-depth mismatch should fail");
+        .expect("IFO/MLP group bit-depth mismatch should be advisory");
 
-        assert!(matches!(err, MlpInspectError::GroupBitDepthMismatch { group: 1, .. }));
+        assert_eq!(
+            inspection
+                .first_major_sync
+                .expect("major sync info")
+                .group1_bits,
+            24
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_invalid_group2_bit_depth_when_arrangement_has_group2_channels() {
+        let path = write_temp_mlp(&[major_sync_frame_with_group2(40, 2, 2, 3, 0, 2, 1)]);
+
+        let err = inspect_mlp_file(&path, MlpStreamExpectation::default())
+            .expect_err("invalid group 2 bit depth should fail when group 2 channels exist");
+
+        assert!(
+            matches!(
+                err,
+                MlpInspectError::UnsupportedMajorSyncValue {
+                    field: "group2_bits",
+                    value: 3,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_invalid_group2_sample_rate_when_arrangement_has_group2_channels() {
+        let path = write_temp_mlp(&[major_sync_frame_with_group2(40, 2, 2, 1, 15, 2, 1)]);
+
+        let err = inspect_mlp_file(&path, MlpStreamExpectation::default())
+            .expect_err("invalid group 2 sample rate should fail when group 2 channels exist");
+
+        assert!(
+            matches!(
+                err,
+                MlpInspectError::UnsupportedMajorSyncValue {
+                    field: "group2_samplerate",
+                    value: 15,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ignores_invalid_group2_placeholders_when_arrangement_has_one_group() {
+        let path = write_temp_mlp(&[major_sync_frame_with_group2(40, 2, 2, 3, 15, 1, 1)]);
+
+        let inspection = inspect_mlp_file(&path, MlpStreamExpectation::default())
+            .expect("group 2 placeholders should be ignored for one-group arrangements");
+
+        assert_eq!(inspection.first_major_sync.expect("major sync").channel_arrangement, 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_repeated_major_sync_group2_sample_rate_change() {
+        let path = write_temp_mlp(&[
+            major_sync_frame_with_group2(40, 2, 2, 1, 0, 2, 1),
+            major_sync_frame_with_group2(40, 2, 2, 1, 1, 2, 1),
+        ]);
+
+        let err = inspect_mlp_file(&path, MlpStreamExpectation::default())
+            .expect_err("changed group 2 rate should fail consistency validation");
+
+        assert!(
+            matches!(
+                err,
+                MlpInspectError::MajorSyncChanged {
+                    field: "group2_samplerate",
+                    first: 48_000,
+                    later: 96_000,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_repeated_major_sync_group2_bit_depth_change() {
+        let path = write_temp_mlp(&[
+            major_sync_frame_with_group2(40, 2, 2, 1, 0, 2, 1),
+            major_sync_frame_with_group2(40, 2, 2, 0, 0, 2, 1),
+        ]);
+
+        let err = inspect_mlp_file(&path, MlpStreamExpectation::default())
+            .expect_err("changed group 2 bit depth should fail consistency validation");
+
+        assert!(
+            matches!(
+                err,
+                MlpInspectError::MajorSyncChanged {
+                    field: "group2_bits",
+                    first: 20,
+                    later: 16,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_repeated_major_sync_channel_arrangement_change_even_when_total_channels_match() {
+        let path = write_temp_mlp(&[
+            major_sync_frame_with_group2(40, 2, 2, 1, 0, 2, 1),
+            major_sync_frame_with_group2(40, 2, 2, 1, 0, 4, 1),
+        ]);
+
+        let err = inspect_mlp_file(&path, MlpStreamExpectation::default())
+            .expect_err("changed channel arrangement should fail consistency validation");
+
+        assert!(
+            matches!(
+                err,
+                MlpInspectError::MajorSyncChanged {
+                    field: "channel_arrangement",
+                    first: 2,
+                    later: 4,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -957,6 +1149,27 @@ mod tests {
         set_bits(&mut frame[MLP_MAJOR_SYNC_OFFSET..], 112, 1, 1);
         set_bits(&mut frame[MLP_MAJOR_SYNC_OFFSET..], 113, 15, 256);
         set_bits(&mut frame[MLP_MAJOR_SYNC_OFFSET..], 128, 4, num_substreams);
+        frame
+    }
+
+    fn major_sync_frame_with_group2(
+        frame_len: usize,
+        group1_quant: u32,
+        group1_rate_bits: u32,
+        group2_quant: u32,
+        group2_rate_bits: u32,
+        channel_arrangement: u32,
+        num_substreams: u32,
+    ) -> Vec<u8> {
+        let mut frame = major_sync_frame(
+            frame_len,
+            group1_quant,
+            group1_rate_bits,
+            channel_arrangement,
+            num_substreams,
+        );
+        set_bits(&mut frame[MLP_MAJOR_SYNC_OFFSET..], 36, 4, group2_quant);
+        set_bits(&mut frame[MLP_MAJOR_SYNC_OFFSET..], 44, 4, group2_rate_bits);
         frame
     }
 

@@ -5,9 +5,12 @@
 //! backed stub runner for materializer/orchestrator unit tests.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant as StdInstant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -155,6 +158,14 @@ pub trait ToolRunner: Send + Sync {
         cmd: ToolCommand,
         cancel: &CancellationToken,
     ) -> Result<ToolOutput, ToolRunnerError>;
+
+    /// Return the detected version for an external binary, if available.
+    ///
+    /// Test runners and in-process tool implementations inherit the default
+    /// `None`; real runners override this with best-effort, cached detection.
+    fn tool_version(&self, _binary: ToolBinary) -> Option<String> {
+        None
+    }
 }
 
 // ===========================================================================
@@ -285,6 +296,7 @@ impl ToolRunner for StubToolRunner {
 /// `CommandRecord`s on both success and failure.
 pub struct RealToolRunner {
     tool_paths: HashMap<String, PathBuf>,
+    version_cache: Arc<Mutex<HashMap<ToolBinary, String>>>,
 }
 
 impl RealToolRunner {
@@ -292,7 +304,21 @@ impl RealToolRunner {
     /// (e.g. `"ffmpeg"`, `"sox"`) matching `ToolBinary::default_name()`.
     /// An empty map means all tools are resolved from `$PATH`.
     pub fn new(tool_paths: HashMap<String, PathBuf>) -> Self {
-        Self { tool_paths }
+        Self::with_version_cache(tool_paths, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// Create a runner with a caller-supplied per-session version cache.
+    /// Production workers pass the same `Arc` here so first-use detection is
+    /// shared across the session; tests and legacy call sites can keep using
+    /// `RealToolRunner::new(tool_paths)` for an isolated empty cache.
+    pub fn with_version_cache(
+        tool_paths: HashMap<String, PathBuf>,
+        version_cache: Arc<Mutex<HashMap<ToolBinary, String>>>,
+    ) -> Self {
+        Self {
+            tool_paths,
+            version_cache,
+        }
     }
 
     /// Resolve a `ToolBinary` to an executable path.
@@ -312,6 +338,44 @@ impl RealToolRunner {
             }
         }
         PathBuf::from(name)
+    }
+
+    fn tool_version_for_resolved_path(&self, binary: ToolBinary, path: &Path) -> Option<String> {
+        let wait_started_at = StdInstant::now();
+
+        loop {
+            let should_probe = {
+                let mut cache = self.version_cache.lock().ok()?;
+                match cache.get(&binary) {
+                    Some(cached) if cached == TOOL_VERSION_CACHE_IN_PROGRESS => false,
+                    Some(cached) => return cached_version_to_option(cached),
+                    None => {
+                        cache.insert(binary, TOOL_VERSION_CACHE_IN_PROGRESS.to_string());
+                        true
+                    }
+                }
+            };
+
+            if should_probe {
+                // Do the potentially blocking probe outside the mutex so
+                // unrelated workers can continue reading already-cached
+                // versions. The in-progress marker above prevents concurrent
+                // first-use callers for the same binary from spawning duplicate
+                // probes; they wait briefly for this owner to publish the
+                // cached result.
+                let detected = detect_tool_version(binary, path);
+                let cache_value = detected.clone().unwrap_or_default();
+                if let Ok(mut cache) = self.version_cache.lock() {
+                    cache.insert(binary, cache_value);
+                }
+                return detected;
+            }
+
+            if wait_started_at.elapsed() >= TOOL_VERSION_CACHE_WAIT_TIMEOUT {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Build a sanitized `CommandRecord` from a `ToolCommand` and
@@ -335,6 +399,197 @@ impl RealToolRunner {
             elapsed,
         }
     }
+}
+
+const TOOL_VERSION_DETECTION_TIMEOUT: Duration = Duration::from_millis(100);
+const TOOL_VERSION_CACHE_WAIT_TIMEOUT: Duration = Duration::from_millis(150);
+const TOOL_VERSION_CAPTURE_BYTES: u64 = 1024 * 1024;
+static TOOL_VERSION_CAPTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const TOOL_VERSION_CACHE_IN_PROGRESS: &str = "\0tonepoet-tool-version-in-progress";
+
+fn cached_version_to_option(cached: &str) -> Option<String> {
+    if cached.is_empty() || cached == TOOL_VERSION_CACHE_IN_PROGRESS {
+        None
+    } else {
+        Some(cached.to_string())
+    }
+}
+
+fn version_command_args(binary: ToolBinary) -> &'static [&'static str] {
+    match binary {
+        ToolBinary::SevenZip | ToolBinary::Ssrc => &[],
+        ToolBinary::Sox | ToolBinary::Opustags => &["--help"],
+        ToolBinary::Ffmpeg
+        | ToolBinary::Ffprobe
+        | ToolBinary::Loudgain
+        | ToolBinary::Metaflac
+        | ToolBinary::Flac
+        | ToolBinary::Wvunpack
+        | ToolBinary::Wvtag
+        | ToolBinary::AtomicParsley => &["--version"],
+    }
+}
+
+fn normalize_version_token(token: &str) -> Option<String> {
+    let trimmed = token
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'));
+    if trimmed.is_empty() || !trimmed.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    if !trimmed.chars().any(|c| c == '.') {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn first_version_like_token(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(normalize_version_token)
+}
+
+fn first_version_after_marker(line: &str, marker: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let marker = marker.to_ascii_lowercase();
+    let start = lower.find(&marker)? + marker.len();
+    first_version_like_token(&line[start..])
+}
+
+fn parse_tool_version_output(binary: ToolBinary, stdout: &str, stderr: &str) -> Option<String> {
+    let combined = [stdout, stderr].join("\n");
+    for line in combined.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let parsed = match binary {
+            ToolBinary::Ffmpeg | ToolBinary::Ffprobe | ToolBinary::Ssrc | ToolBinary::Opustags => {
+                first_version_after_marker(line, "version")
+            }
+            ToolBinary::Sox => first_version_after_marker(line, "SoX_ng")
+                .or_else(|| first_version_after_marker(line, "SoX"))
+                .or_else(|| first_version_after_marker(line, "version")),
+            ToolBinary::SevenZip => first_version_after_marker(line, "7-Zip")
+                .or_else(|| first_version_after_marker(line, "7z")),
+            ToolBinary::Loudgain
+            | ToolBinary::Metaflac
+            | ToolBinary::Flac
+            | ToolBinary::Wvunpack
+            | ToolBinary::Wvtag
+            | ToolBinary::AtomicParsley => first_version_like_token(line),
+        };
+        if parsed.is_some() {
+            return parsed;
+        }
+    }
+    None
+}
+
+fn unique_tool_version_capture_path(binary: ToolBinary, stream: &str) -> PathBuf {
+    let counter = TOOL_VERSION_CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let name = format!(
+        "tool-version-{}-{}-{}-{}-{stream}.tmp",
+        binary.canonical_name(),
+        std::process::id(),
+        timestamp,
+        counter
+    );
+    std::env::temp_dir().join(name)
+}
+
+fn remove_version_probe_capture(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+fn read_version_probe_capture(path: &Path) -> Vec<u8> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut reader = file.take(TOOL_VERSION_CAPTURE_BYTES);
+    let mut captured = Vec::new();
+    let _ = reader.read_to_end(&mut captured);
+    captured
+}
+
+fn wait_for_version_probe(child: &mut std::process::Child) -> bool {
+    let deadline = StdInstant::now() + TOOL_VERSION_DETECTION_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return true,
+            Ok(None) => {
+                if StdInstant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Best-effort synchronous version detection for external tools.
+///
+/// The probe is intentionally bounded and never connects stdout/stderr to
+/// pipes. Probe output is redirected to unique temp files, the child is killed
+/// on timeout, and only a bounded amount of captured output is read back. This
+/// avoids pipe backpressure for verbose `--help` output while keeping version
+/// detection non-fatal for conversion.
+pub(crate) fn detect_tool_version(binary: ToolBinary, path: &Path) -> Option<String> {
+    let stdout_path = unique_tool_version_capture_path(binary, "stdout");
+    let stderr_path = unique_tool_version_capture_path(binary, "stderr");
+
+    let stdout_file = match std::fs::File::create(&stdout_path) {
+        Ok(file) => file,
+        Err(_) => return None,
+    };
+    let stderr_file = match std::fs::File::create(&stderr_path) {
+        Ok(file) => file,
+        Err(_) => {
+            remove_version_probe_capture(&stdout_path);
+            return None;
+        }
+    };
+
+    let spawn_result = std::process::Command::new(path)
+        .args(version_command_args(binary))
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn();
+
+    let mut child = match spawn_result {
+        Ok(child) => child,
+        Err(_) => {
+            remove_version_probe_capture(&stdout_path);
+            remove_version_probe_capture(&stderr_path);
+            return None;
+        }
+    };
+
+    let completed = wait_for_version_probe(&mut child);
+    let stdout = read_version_probe_capture(&stdout_path);
+    let stderr = read_version_probe_capture(&stderr_path);
+    remove_version_probe_capture(&stdout_path);
+    remove_version_probe_capture(&stderr_path);
+
+    if !completed {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+    parse_tool_version_output(binary, &stdout, &stderr)
 }
 
 /// Read an async reader to completion and return at most the last
@@ -374,11 +629,24 @@ fn map_exit_status(status: std::process::ExitStatus) -> ProcessExit {
 
 #[async_trait]
 impl ToolRunner for RealToolRunner {
+    fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+        let path = self.resolve_binary(binary);
+        self.tool_version_for_resolved_path(binary, &path)
+    }
+
     async fn run(
         &self,
         cmd: ToolCommand,
         cancel: &CancellationToken,
     ) -> Result<ToolOutput, ToolRunnerError> {
+        // Capture the external tool's real version on first use, before the
+        // command itself is spawned. This is deliberately best-effort and
+        // non-fatal: failed probes cache an empty value so conversion does not
+        // block or retry repeatedly. Keep this outside the command timer so
+        // provenance collection does not inflate the recorded runtime of the
+        // user's actual tool invocation.
+        let _ = self.tool_version(cmd.binary);
+
         let binary_path = self.resolve_binary(cmd.binary);
         let start = Instant::now();
 
@@ -1004,6 +1272,268 @@ mod real_tool_runner_tests {
             output.stdout_tail.contains("hello"),
             "stdout should contain 'hello', got: {}",
             output.stdout_tail
+        );
+    }
+
+    #[test]
+    fn parses_supported_tool_version_formats() {
+        let cases = [
+            (ToolBinary::Ffmpeg, "ffmpeg version 7.1.3 Copyright...", "", "7.1.3"),
+            (ToolBinary::Ffprobe, "ffprobe version 7.1.3 Copyright...", "", "7.1.3"),
+            (ToolBinary::Sox, "sox:      SoX_ng v14.6.1", "", "14.6.1"),
+            (ToolBinary::Ssrc, "", "Shibatch Sample Rate Converter  Version 2.4.2", "2.4.2"),
+            (ToolBinary::SevenZip, "7-Zip 25.01 (x64) : Copyright...", "", "25.01"),
+            (ToolBinary::Metaflac, "metaflac 1.5.0", "", "1.5.0"),
+            (ToolBinary::Flac, "flac 1.5.0", "", "1.5.0"),
+            (ToolBinary::Loudgain, "loudgain 0.6.8 - using:", "", "0.6.8"),
+            (ToolBinary::Opustags, "opustags version 1.10.1", "", "1.10.1"),
+            (ToolBinary::Wvtag, "wvtag 5.8.1", "", "5.8.1"),
+            (ToolBinary::Wvunpack, "wvunpack 5.8.1", "", "5.8.1"),
+        ];
+
+        for (binary, stdout, stderr, expected) in cases {
+            assert_eq!(
+                parse_tool_version_output(binary, stdout, stderr),
+                Some(expected.to_string()),
+                "unexpected parse result for {binary:?}"
+            );
+        }
+        assert_eq!(
+            parse_tool_version_output(ToolBinary::Ffmpeg, "ffmpeg build info without a version", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn stub_tool_runner_default_version_is_none() {
+        let runner = StubToolRunner::new();
+        assert_eq!(runner.tool_version(ToolBinary::Ffmpeg), None);
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(name: &str, body: &str) -> PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "tonepoet-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&dir).expect("script temp dir");
+        let path = dir.join(name);
+        fs::write(&path, body).expect("write script");
+        let mut perms = fs::metadata(&path).expect("script metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod script");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_caches_detected_version() {
+        let count_file = std::env::temp_dir().join(format!(
+            "tonepoet-version-count-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&count_file);
+        let script = write_executable_script(
+            "fake-ffmpeg",
+            &format!(
+                r#"#!/bin/sh
+COUNT='{}'
+if [ -f "$COUNT" ]; then n=$(cat "$COUNT"); else n=0; fi
+n=$((n + 1))
+printf '%s\n' "$n" > "$COUNT"
+printf 'ffmpeg version 9.9.%s\n' "$n"
+"#,
+                count_file.display()
+            ),
+        );
+        let runner = runner_with_override(ToolBinary::Ffmpeg, script.to_str().unwrap());
+
+        assert_eq!(runner.tool_version(ToolBinary::Ffmpeg), Some("9.9.1".to_string()));
+        assert_eq!(runner.tool_version(ToolBinary::Ffmpeg), Some("9.9.1".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&count_file).expect("count file").trim(),
+            "1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_runner_detects_version_on_first_run_and_reuses_cache() {
+        let count_file = std::env::temp_dir().join(format!(
+            "tonepoet-first-use-version-count-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&count_file);
+        let script = write_executable_script(
+            "fake-ffmpeg-first-use",
+            &format!(
+                r#"#!/bin/sh
+COUNT='{}'
+if [ "$1" = "--version" ]; then
+  if [ -f "$COUNT" ]; then n=$(cat "$COUNT"); else n=0; fi
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$COUNT"
+  printf 'ffmpeg version 12.3.4\n'
+  exit 0
+fi
+printf 'actual run\n'
+exit 0
+"#,
+                count_file.display()
+            ),
+        );
+        let runner = runner_with_override(ToolBinary::Ffmpeg, script.to_str().unwrap());
+        let cancel = CancellationToken::new();
+        let command = || ToolCommand {
+            binary: ToolBinary::Ffmpeg,
+            args: vec!["encode".to_string()],
+            secret_args: vec![],
+            cwd: None,
+            env: vec![],
+            timeout: Duration::from_secs(5),
+        };
+
+        runner
+            .run(command(), &cancel)
+            .await
+            .expect("first command succeeds");
+        runner
+            .run(command(), &cancel)
+            .await
+            .expect("second command succeeds");
+
+        assert_eq!(runner.tool_version(ToolBinary::Ffmpeg), Some("12.3.4".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&count_file).expect("count file").trim(),
+            "1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_caches_failed_detection_as_none() {
+        let count_file = std::env::temp_dir().join(format!(
+            "tonepoet-version-fail-count-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&count_file);
+        let script = write_executable_script(
+            "fake-ffmpeg-no-version",
+            &format!(
+                r#"#!/bin/sh
+COUNT='{}'
+if [ -f "$COUNT" ]; then n=$(cat "$COUNT"); else n=0; fi
+n=$((n + 1))
+printf '%s\n' "$n" > "$COUNT"
+printf 'ffmpeg build metadata unavailable\n'
+"#,
+                count_file.display()
+            ),
+        );
+        let runner = runner_with_override(ToolBinary::Ffmpeg, script.to_str().unwrap());
+
+        // Failed external detections are omitted from provenance by returning
+        // None; they must not be mislabeled as "in-process".
+        assert_eq!(runner.tool_version(ToolBinary::Ffmpeg), None);
+        assert_ne!(
+            runner.tool_version(ToolBinary::Ffmpeg),
+            Some("in-process".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&count_file).expect("count file").trim(),
+            "1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_first_use_runs_only_one_version_probe() {
+        use std::sync::{Arc, Barrier};
+
+        let count_file = std::env::temp_dir().join(format!(
+            "tonepoet-version-concurrent-count-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&count_file);
+        let script = write_executable_script(
+            "fake-ffmpeg-concurrent-version",
+            &format!(
+                r#"#!/bin/sh
+COUNT='{}'
+if [ "$1" = "--version" ]; then
+  printf 'probe\n' >> "$COUNT"
+  printf 'ffmpeg version 55.66.77\n'
+  exit 0
+fi
+printf 'actual run\n'
+exit 0
+"#,
+                count_file.display()
+            ),
+        );
+        let runner = Arc::new(runner_with_override(
+            ToolBinary::Ffmpeg,
+            script.to_str().unwrap(),
+        ));
+        let thread_count = 8;
+        let barrier = Arc::new(Barrier::new(thread_count));
+        let mut handles = Vec::new();
+
+        for _ in 0..thread_count {
+            let runner = Arc::clone(&runner);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                runner.tool_version(ToolBinary::Ffmpeg)
+            }));
+        }
+
+        for handle in handles {
+            assert_eq!(
+                handle.join().expect("thread should not panic"),
+                Some("55.66.77".to_string())
+            );
+        }
+
+        let probe_count = std::fs::read_to_string(&count_file)
+            .expect("count file")
+            .lines()
+            .count();
+        assert_eq!(probe_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_captures_verbose_output_without_pipe_backpressure() {
+        let script = write_executable_script(
+            "fake-sox-verbose-help",
+            r#"#!/bin/sh
+printf 'sox:      SoX_ng v14.6.1\n'
+i=0
+while [ $i -lt 3000 ]; do
+  printf 'verbose help line from a very chatty help command %05d\n' "$i"
+  i=$((i + 1))
+done
+exit 0
+"#,
+        );
+
+        let started = std::time::Instant::now();
+        let version = detect_tool_version(ToolBinary::Sox, &script);
+        let elapsed = started.elapsed();
+
+        assert_eq!(version, Some("14.6.1".to_string()));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "version probe should avoid pipe backpressure and complete promptly, took {elapsed:?}"
         );
     }
 }

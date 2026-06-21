@@ -1,0 +1,36 @@
+DVD-Audio MLP fixture reassembly manifest
+
+All byte counts below refer to MLP payload bytes after the DVD-Audio Private
+Stream 1 sub-header has been stripped.
+
+aob_sectors_0_99.bin:
+  sectors: 100
+  mlp_packets: 100
+  input_payload_bytes: 200479
+  leading_fragment_bytes: 0
+  complete_access_units: 704
+  framed_output_bytes: 200350
+  final_incomplete_carry_bytes: 129
+  padding_bytes: 0
+  resync_events: 0
+  resync_bytes: 0
+  ffmpeg_decoded_samples_from_framed_fragment: 28160
+
+aob_sectors_48191_48210.bin:
+  sectors: 20
+  mlp_packets: 20
+  input_payload_bytes: 40100
+  first_packet_pointer: 0x0173
+  first_packet_payload_start_skip: 366
+  leading_fragment_bytes: 366
+  complete_access_units: 80
+  framed_output_bytes: 39694
+  final_incomplete_carry_bytes: 40
+  padding_bytes: 0
+  resync_events: 0
+  resync_bytes: 0
+  ffmpeg_decoded_samples_from_framed_fragment: 3040
+
+These fragments are corpus slices, not whole tracks. The Rust unit tests do not
+call finish() on them because each fixture intentionally ends with a partial MLP
+access unit that continues in the next sector outside the fixture window.

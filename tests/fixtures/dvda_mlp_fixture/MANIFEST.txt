@@ -1,0 +1,36 @@
+DVD-Audio MLP PS1 Fixture Data
+Source: Bowie David Live DVD-A, ATS 1 AOB 1
+AOB 1 starts at ISO LBA 14143
+Sector size: 2048 bytes
+
+aob_sectors_0_99.bin:
+  100 raw MPEG-2 program stream sectors from AOB sector 0
+  204800 bytes total
+  Each sector: 14-byte pack header, then PES private stream 1
+  Sector 0: PES starts at offset 32 (18 bytes of system header first)
+  Sectors 1-99: PES starts at offset 14 (immediately after pack header)
+  PES private stream 1 (0x000001BD) contains:
+    - PES header (variable length, includes PTS)
+    - sub_stream_id: 0xA1 (MLP)
+    - DVD-Audio private header: cyclic counter (1 byte) + first_access_unit_pointer (2 bytes)
+    - MLP payload data
+
+ps1_mlp_payloads_sectors_0_99.bin:
+  PS1 payloads extracted from those sectors, concatenated
+  201479 bytes, 100 packets
+  Each packet: sub_stream_id (0xA1) + cyclic (1 byte) + AU_ptr (2 bytes) + MLP data
+  Packet 0: 1994 bytes (sector 0 has shorter PES due to system header)
+  Packets 1-99: 2015 bytes each
+  Packet boundaries at offsets: 0, 1994, 4009, 6024, 8039, ...
+  NOT a pure MLP elementary stream — includes PS1 framing per packet
+
+aob_sectors_48191_48210.bin:
+  20 raw sectors from AOB sector 48191 (Group 2 track 2 start)
+  40960 bytes, mid-stream MLP data
+  For comparing cross-ATS extraction at track boundaries
+
+MLP access unit headers (f8726fbb pattern):
+  Appear every ~2000-2500 bytes throughout the data
+  Sector 0 alone contains ~10 access unit headers
+  This is a dense MLP stream (48kHz/24-bit/6ch)
+  The MLP major sync word on this disc is f8726fbb (not f8726fba)

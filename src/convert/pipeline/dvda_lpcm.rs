@@ -697,6 +697,7 @@ mod tests {
             group2_bits,
             group1_sample_rate: Some(rate),
             group2_sample_rate: group2_rate,
+            channel_count: None,
             channel_assignment,
             cci: 0,
         }

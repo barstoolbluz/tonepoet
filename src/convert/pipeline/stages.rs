@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
@@ -2130,6 +2130,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
             staging.job_id.clone(),
             convert_root.clone(),
             tool_paths.clone(),
+            None,
             cancel.clone(),
             tool_concurrency_limits.clone(),
             reporter,
@@ -2192,6 +2193,16 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     }
 }
 
+fn real_tool_runner_with_optional_version_cache(
+    tool_paths: HashMap<String, PathBuf>,
+    version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
+) -> RealToolRunner {
+    match version_cache {
+        Some(version_cache) => RealToolRunner::with_version_cache(tool_paths, version_cache),
+        None => RealToolRunner::new(tool_paths),
+    }
+}
+
 async fn convert_one_track_work(
     track_index: usize,
     track: PreparedTrack,
@@ -2201,12 +2212,13 @@ async fn convert_one_track_work(
     staging_job: String,
     convert_root: PathBuf,
     tool_paths: HashMap<String, PathBuf>,
+    version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
     cancel: CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     reporter: Option<&dyn PipelineReporter>,
 ) -> Result<ScheduledTrackOutput, String> {
     let staging = StagingDir::borrowed(staging_root, staging_job);
-    let runner = RealToolRunner::new(tool_paths.clone());
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
     let realized = match realize_track_with_tool_limits_and_stats(
@@ -5548,7 +5560,7 @@ pub async fn run_features(
     source: &PreparedSource,
     req: &PipelineRequest,
     staging: &StagingDir,
-    _runner: &dyn ToolRunner,
+    runner: &dyn ToolRunner,
     _cancel: &CancellationToken,
 ) -> Result<(ArtifactSet, StageRecord), FeatureError> {
     if req.stages.features == StageRequirement::Disabled {
@@ -5562,7 +5574,14 @@ pub async fn run_features(
         ));
     }
 
-    let artifacts = stage_conversion_log_sidecars(artifacts, outcome, source, req, staging)?;
+    let artifacts = stage_conversion_log_sidecars(
+        artifacts,
+        outcome,
+        source,
+        req,
+        staging,
+        Some(runner),
+    )?;
 
     Ok((
         artifacts,
@@ -5580,6 +5599,7 @@ fn stage_conversion_log_sidecars(
     source: &PreparedSource,
     req: &PipelineRequest,
     staging: &StagingDir,
+    runner: Option<&dyn ToolRunner>,
 ) -> io::Result<ArtifactSet> {
     let album_dir = conversion_log_album_dir(source, req, &artifacts);
 
@@ -5601,6 +5621,7 @@ fn stage_conversion_log_sidecars(
             Some(settings_fingerprint_text),
             log_generated_at,
             staging,
+            runner,
         )?;
         artifacts.sidecars.push(SidecarArtifact {
             kind: SidecarKind::Other(CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string()),
@@ -5616,13 +5637,14 @@ fn stage_conversion_log_sidecars(
         );
     } else {
         let log_staged = staging.root.join("conversion.log");
-        let log_content = build_conversion_log_at(
+        let log_content = build_conversion_log_at_with_runner(
             outcome,
             source,
             req,
             &artifacts,
             Some(settings_fingerprint_text.as_str()),
             log_generated_at,
+            runner,
         );
         fs::write(&log_staged, &log_content)?;
         artifacts.sidecars.push(SidecarArtifact {
@@ -5677,6 +5699,7 @@ fn publish_terminal_conversion_log_fragment_if_needed(
     artifacts: Option<&ArtifactSet>,
     outcome: &AlbumOutcome,
     staging: StagingDir,
+    runner: Option<&dyn ToolRunner>,
 ) -> Option<PublishedAlbum> {
     let Some(source) = source else {
         return publish_pre_materialization_conversion_log_fragment_if_needed(req, outcome, staging);
@@ -5694,6 +5717,7 @@ fn publish_terminal_conversion_log_fragment_if_needed(
         source,
         req,
         &staging,
+        runner,
     ) {
         Ok(artifacts) => artifacts,
         Err(err) => {
@@ -6006,6 +6030,7 @@ fn build_conversion_log(
     )
 }
 
+#[cfg(test)]
 fn build_conversion_log_at(
     outcome: &AlbumOutcome,
     source: &PreparedSource,
@@ -6013,6 +6038,26 @@ fn build_conversion_log_at(
     artifacts: &ArtifactSet,
     settings_fingerprint: Option<&str>,
     generated_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    build_conversion_log_at_with_runner(
+        outcome,
+        source,
+        req,
+        artifacts,
+        settings_fingerprint,
+        generated_at,
+        None,
+    )
+}
+
+fn build_conversion_log_at_with_runner(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+    settings_fingerprint: Option<&str>,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    runner: Option<&dyn ToolRunner>,
 ) -> String {
     let tracks = collect_outcome_tracks(outcome);
     let source_tracks_by_ordinal = build_source_track_index(source);
@@ -6053,7 +6098,8 @@ fn build_conversion_log_at(
     append_source_blocking_lines(&mut source_blocking_lines, source);
 
     let mut provenance_section = String::new();
-    append_provenance_section(&mut provenance_section, &source.provenance);
+    let provenance = effective_conversion_log_provenance(source, &tracks, runner);
+    append_provenance_section(&mut provenance_section, &provenance);
 
     let mut artwork_section = String::new();
     append_artwork_section(&mut artwork_section, source, req, outcome, artifacts);
@@ -6515,6 +6561,7 @@ fn stage_conversion_log_fragment(
     settings_fingerprint: Option<String>,
     generated_at: chrono::DateTime<chrono::Utc>,
     staging: &StagingDir,
+    runner: Option<&dyn ToolRunner>,
 ) -> io::Result<(PathBuf, String)> {
     let track_record = conversion_log_fragment_track_record(outcome).ok_or_else(|| {
         io::Error::new(
@@ -6552,7 +6599,13 @@ fn stage_conversion_log_fragment(
         generated_at,
         settings_fingerprint,
         batch_identity,
-        common: build_conversion_log_common_fragment(outcome, source, req, artifacts),
+        common: build_conversion_log_common_fragment_with_runner(
+            outcome,
+            source,
+            req,
+            artifacts,
+            runner,
+        ),
         track: ConversionLogTrackFragment {
             section: track_section,
         },
@@ -6594,22 +6647,35 @@ impl ConversionLogTrackSummary {
     }
 }
 
+#[cfg(test)]
 fn build_conversion_log_common_fragment(
     outcome: &AlbumOutcome,
     source: &PreparedSource,
     req: &PipelineRequest,
     artifacts: &ArtifactSet,
 ) -> ConversionLogCommonFragment {
+    build_conversion_log_common_fragment_with_runner(outcome, source, req, artifacts, None)
+}
+
+fn build_conversion_log_common_fragment_with_runner(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+    runner: Option<&dyn ToolRunner>,
+) -> ConversionLogCommonFragment {
     let mut source_blocking_lines = String::new();
     append_source_blocking_lines(&mut source_blocking_lines, source);
 
+    let tracks = collect_outcome_tracks(outcome);
+
     let mut provenance_section = String::new();
-    append_provenance_section(&mut provenance_section, &source.provenance);
+    let provenance = effective_conversion_log_provenance(source, &tracks, runner);
+    append_provenance_section(&mut provenance_section, &provenance);
 
     let mut artwork_section = String::new();
     append_artwork_section(&mut artwork_section, source, req, outcome, artifacts);
 
-    let tracks = collect_outcome_tracks(outcome);
     let mut conversion_settings_section = String::new();
     append_conversion_settings_section(
         &mut conversion_settings_section,
@@ -7302,10 +7368,7 @@ fn merge_conversion_log_common_fragments(
             ordered.iter().map(|fragment| fragment.common.source_blocking_lines.as_str()),
         )
         .unwrap_or_default(),
-        provenance_section: first_non_empty_common_string(
-            ordered.iter().map(|fragment| fragment.common.provenance_section.as_str()),
-        )
-        .unwrap_or_default(),
+        provenance_section: merge_conversion_log_provenance_sections(ordered),
         artwork_section: first_non_empty_common_string(
             ordered.iter().map(|fragment| fragment.common.artwork_section.as_str()),
         )
@@ -7330,6 +7393,130 @@ fn conversion_log_common_has_source_context(common: &ConversionLogCommonFragment
         || non_empty_common_string(&common.source_blocking_lines).is_some()
         || non_empty_common_string(&common.provenance_section).is_some()
         || non_empty_common_string(&common.artwork_section).is_some()
+}
+
+fn merge_conversion_log_provenance_sections(ordered: &[ConversionLogFragment]) -> String {
+    let mut merged_tool_versions = BTreeMap::new();
+    let mut first_with_tool_versions: Option<&str> = None;
+
+    for fragment in ordered {
+        let parsed = parse_conversion_log_tool_versions(&fragment.common.provenance_section);
+        if first_with_tool_versions.is_none() && !parsed.is_empty() {
+            first_with_tool_versions = Some(fragment.common.provenance_section.as_str());
+        }
+        for (tool, version) in parsed {
+            merge_conversion_log_tool_version_value(&mut merged_tool_versions, tool, version);
+        }
+    }
+
+    let base_owned: String;
+    let base = if let Some(s) = first_with_tool_versions {
+        s
+    } else if let Some(s) = first_non_empty_common_string(
+        ordered.iter().map(|fragment| fragment.common.provenance_section.as_str()),
+    ) {
+        base_owned = s;
+        base_owned.as_str()
+    } else {
+        ""
+    };
+
+    if merged_tool_versions.is_empty() {
+        return base.to_string();
+    }
+
+    provenance_section_with_tool_versions(base, &merged_tool_versions)
+}
+
+fn parse_conversion_log_tool_versions(section: &str) -> BTreeMap<String, String> {
+    let mut versions = BTreeMap::new();
+    for line in section.lines() {
+        let Some(rest) = line.strip_prefix("Tool versions: ") else {
+            continue;
+        };
+        for entry in rest.split(',') {
+            let entry = entry.trim();
+            let Some((tool, version)) = entry.rsplit_once(' ') else {
+                continue;
+            };
+            let tool = tool.trim();
+            let version = version.trim();
+            if tool.is_empty() || version.is_empty() {
+                continue;
+            }
+            versions.insert(tool.to_string(), version.to_string());
+        }
+    }
+    versions
+}
+
+fn merge_conversion_log_tool_version_value(
+    versions: &mut BTreeMap<String, String>,
+    tool: String,
+    version: String,
+) {
+    let incoming = version.trim();
+    if incoming.is_empty() {
+        return;
+    }
+    match versions.get(tool.as_str()).map(|existing| existing.trim()) {
+        Some(existing) if !existing.is_empty() && existing != "in-process" => {}
+        Some(_) | None => {
+            versions.insert(tool, incoming.to_string());
+        }
+    }
+}
+
+fn provenance_section_with_tool_versions(
+    base: &str,
+    tool_versions: &BTreeMap<String, String>,
+) -> String {
+    let version_entries = tool_versions
+        .iter()
+        .filter_map(|(tool, version)| {
+            let tool = tool.trim();
+            let version = version.trim();
+            if tool.is_empty() || version.is_empty() {
+                None
+            } else {
+                Some(format!("{tool} {version}"))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if version_entries.is_empty() {
+        return base.to_string();
+    }
+
+    let version_line = format!("Tool versions: {}", version_entries.join(", "));
+    let mut merged = String::new();
+    let mut inserted = false;
+
+    for line in base.lines() {
+        if line.strip_prefix("Tool versions: ").is_some() {
+            continue;
+        }
+        merged.push_str(line);
+        merged.push('\n');
+        if !inserted && line.strip_prefix("Extracted at: ").is_some() {
+            merged.push_str(&version_line);
+            merged.push('\n');
+            inserted = true;
+        }
+    }
+
+    if !inserted {
+        if !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+        merged.push_str(&version_line);
+        merged.push('\n');
+    }
+
+    if !merged.ends_with("\n\n") {
+        merged.push('\n');
+    }
+    merged
 }
 
 fn first_non_empty_common_option<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
@@ -7878,6 +8065,7 @@ fn publish_cancelled_conversion_log_fragment_and_finalize(
     artifacts: Option<&ArtifactSet>,
     outcome: &AlbumOutcome,
     staging: StagingDir,
+    runner: Option<&dyn ToolRunner>,
 ) -> Option<PublishedAlbum> {
     let fragment_publish = publish_terminal_conversion_log_fragment_if_needed(
         req,
@@ -7885,6 +8073,7 @@ fn publish_cancelled_conversion_log_fragment_and_finalize(
         artifacts,
         outcome,
         staging,
+        runner,
     );
     finalize_cancelled_conversion_log_batch_if_needed(req).or(fragment_publish)
 }
@@ -8124,6 +8313,65 @@ fn append_track_log(
         }
     }
     log.push('\n');
+}
+
+
+fn conversion_log_tool_name(binary: ToolBinary) -> Option<&'static str> {
+    match binary {
+        ToolBinary::SevenZip => Some("7z"),
+        ToolBinary::Ffmpeg => Some("ffmpeg"),
+        ToolBinary::Ffprobe => Some("ffprobe"),
+        ToolBinary::Sox => Some("sox"),
+        ToolBinary::Ssrc => Some("ssrc"),
+        ToolBinary::Loudgain => Some("loudgain"),
+        ToolBinary::Metaflac => Some("metaflac"),
+        ToolBinary::Flac => Some("flac"),
+        ToolBinary::Opustags => Some("opustags"),
+        ToolBinary::Wvunpack => Some("wvunpack"),
+        ToolBinary::Wvtag => Some("wvtag"),
+        ToolBinary::AtomicParsley => Some("AtomicParsley"),
+    }
+}
+
+fn merge_detected_tool_version(
+    tool_versions: &mut BTreeMap<String, String>,
+    runner: &dyn ToolRunner,
+    binary: ToolBinary,
+) {
+    let Some(tool_name) = conversion_log_tool_name(binary) else {
+        return;
+    };
+    if tool_versions
+        .get(tool_name)
+        .map(|version| {
+            let version = version.trim();
+            !version.is_empty() && version != "in-process"
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Some(version) = runner.tool_version(binary) {
+        tool_versions.insert(tool_name.to_string(), version);
+    }
+}
+
+fn effective_conversion_log_provenance(
+    source: &PreparedSource,
+    tracks: &[&TrackRecord],
+    runner: Option<&dyn ToolRunner>,
+) -> ExtractionProvenance {
+    let mut provenance = source.provenance.clone();
+    let Some(runner) = runner else {
+        return provenance;
+    };
+
+    for track in tracks {
+        for command in &track.commands {
+            merge_detected_tool_version(&mut provenance.tool_versions, runner, command.binary);
+        }
+    }
+    provenance
 }
 
 fn append_provenance_section(log: &mut String, provenance: &ExtractionProvenance) {
@@ -11006,6 +11254,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
                 None,
                 &outcome,
                 staging,
+                Some(runner),
             );
             return ScheduledMaterialization::Finished(
                 finalize_report(
@@ -11044,6 +11293,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
                     None,
                     &outcome,
                     staging,
+                    Some(runner),
                 )
             };
             return ScheduledMaterialization::Finished(
@@ -11096,6 +11346,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
                 None,
                 &outcome,
                 staging,
+                Some(runner),
             );
             return ScheduledMaterialization::Finished(
                 finalize_report(&req, reporter, Some(prepared), None, None, published, outcome).await,
@@ -11158,6 +11409,37 @@ pub async fn encode_track_for_scheduler_with_tool_limits(
     reporter: &dyn PipelineReporter,
     cancel: CancellationToken,
 ) -> Result<ScheduledTrackOutput, String> {
+    encode_track_for_scheduler_with_tool_limits_and_version_cache(
+        track_index,
+        track,
+        final_path,
+        req,
+        staging_root,
+        staging_job,
+        convert_root,
+        tool_paths,
+        tool_concurrency_limits,
+        None,
+        reporter,
+        cancel,
+    )
+    .await
+}
+
+pub async fn encode_track_for_scheduler_with_tool_limits_and_version_cache(
+    track_index: usize,
+    track: PreparedTrack,
+    final_path: PathBuf,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
+    reporter: &dyn PipelineReporter,
+    cancel: CancellationToken,
+) -> Result<ScheduledTrackOutput, String> {
     convert_one_track_work(
         track_index,
         track,
@@ -11167,6 +11449,7 @@ pub async fn encode_track_for_scheduler_with_tool_limits(
         staging_job,
         convert_root,
         tool_paths,
+        version_cache,
         cancel,
         tool_concurrency_limits,
         Some(reporter),
@@ -11218,8 +11501,39 @@ pub async fn realize_track_for_scheduler_with_tool_limits(
     reporter: &dyn PipelineReporter,
     cancel: CancellationToken,
 ) -> Result<ScheduledRealizedTrack, ScheduledTrackOutput> {
+    realize_track_for_scheduler_with_tool_limits_and_version_cache(
+        track_index,
+        track,
+        final_path,
+        req,
+        staging_root,
+        staging_job,
+        convert_root,
+        tool_paths,
+        tool_concurrency_limits,
+        None,
+        reporter,
+        cancel,
+    )
+    .await
+}
+
+pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
+    track_index: usize,
+    track: PreparedTrack,
+    final_path: PathBuf,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
+    reporter: &dyn PipelineReporter,
+    cancel: CancellationToken,
+) -> Result<ScheduledRealizedTrack, ScheduledTrackOutput> {
     let staging = StagingDir::borrowed(staging_root.clone(), staging_job.clone());
-    let runner = RealToolRunner::new(tool_paths);
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths, version_cache);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, Some(reporter));
     match realize_track_with_tool_limits_and_stats(
@@ -11270,7 +11584,24 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits(
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     reporter: &dyn PipelineReporter,
 ) -> Result<ScheduledTrackOutput, String> {
-    let runner = RealToolRunner::new(tool_paths.clone());
+    encode_realized_track_for_scheduler_with_tool_limits_and_version_cache(
+        realized,
+        tool_paths,
+        tool_concurrency_limits,
+        None,
+        reporter,
+    )
+    .await
+}
+
+pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_cache(
+    realized: ScheduledRealizedTrack,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
+    reporter: &dyn PipelineReporter,
+) -> Result<ScheduledTrackOutput, String> {
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache);
     let staged_path = staged_audio_path(
         &realized.convert_root,
         &realized.final_path,
@@ -11533,6 +11864,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
@@ -11553,6 +11885,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
@@ -11585,6 +11918,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                     artifacts.as_ref(),
                     &current_outcome,
                     staging,
+                    Some(runner),
                 );
                 return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
             }
@@ -11634,6 +11968,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                         artifacts.as_ref(),
                         &current_outcome,
                         staging,
+                        Some(runner),
                     );
                     return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
                 }
@@ -11671,6 +12006,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                     artifacts.as_ref(),
                     &current_outcome,
                     staging,
+                    Some(runner),
                 );
                 return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
             }
@@ -11689,6 +12025,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
@@ -11722,6 +12059,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                     artifacts.as_ref(),
                     &current_outcome,
                     staging,
+                    Some(runner),
                 );
                 return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
             }
@@ -11741,6 +12079,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
@@ -11751,6 +12090,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
@@ -11993,6 +12333,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 artifacts.as_ref(),
                 &outcome,
                 staging,
+                Some(runner),
             );
             return finalize_report(
                 &req,
@@ -12033,6 +12374,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                     artifacts.as_ref(),
                     &outcome,
                     staging,
+                    Some(runner),
                 )
             };
             return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
@@ -12089,6 +12431,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 None,
                 &outcome,
                 staging,
+                Some(runner),
             );
             return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
                 .await;
@@ -12123,6 +12466,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(
             &req,
@@ -12152,6 +12496,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(
             &req,
@@ -12195,6 +12540,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                     artifacts.as_ref(),
                     &current_outcome,
                     staging,
+                    Some(runner),
                 );
                 return finalize_report(
                     &req,
@@ -12254,6 +12600,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                         artifacts.as_ref(),
                         &current_outcome,
                         staging,
+                        Some(runner),
                     );
                     return finalize_report(
                         &req,
@@ -12304,6 +12651,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                     artifacts.as_ref(),
                     &current_outcome,
                     staging,
+                    Some(runner),
                 );
                 return finalize_report(
                     &req,
@@ -12331,6 +12679,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(
             &req,
@@ -12377,6 +12726,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                     artifacts.as_ref(),
                     &current_outcome,
                     staging,
+                    Some(runner),
                 );
                 return finalize_report(
                     &req,
@@ -12405,6 +12755,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(
             &req,
@@ -12424,6 +12775,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             artifacts.as_ref(),
             &current_outcome,
             staging,
+            Some(runner),
         );
         return finalize_report(
             &req,
@@ -14483,10 +14835,10 @@ fn failed_tracks_from(outcome: &AlbumOutcome) -> Vec<TrackRecord> {
 }
 
 #[cfg(test)]
-mod conversion_log_tests {
+mod pipeline_test_helpers {
     use super::*;
 
-    fn log_test_source() -> PreparedSource {
+    pub(super) fn log_test_source() -> PreparedSource {
         let mut album_extra = BTreeMap::new();
         album_extra.insert("catalog_number".to_string(), "CAT-123".to_string());
         PreparedSource {
@@ -14558,7 +14910,7 @@ mod conversion_log_tests {
         }
     }
 
-    fn log_test_request() -> PipelineRequest {
+    pub(super) fn log_test_request() -> PipelineRequest {
         PipelineRequest {
             job_id: "job-1".to_string(),
             item_id: "item-1".to_string(),
@@ -14613,10 +14965,14 @@ mod conversion_log_tests {
         }
     }
 
-    fn command_record() -> CommandRecord {
+    pub(super) fn command_record() -> CommandRecord {
+        command_record_for(ToolBinary::Ffmpeg)
+    }
+
+    pub(super) fn command_record_for(binary: ToolBinary) -> CommandRecord {
         CommandRecord {
             description: None,
-            binary: ToolBinary::Ffmpeg,
+            binary,
             sanitized_args: vec![
                 "-i".to_string(),
                 "/tmp/in file.wav".to_string(),
@@ -14631,7 +14987,7 @@ mod conversion_log_tests {
         }
     }
 
-    fn ok_record() -> TrackRecord {
+    pub(super) fn ok_record() -> TrackRecord {
         TrackRecord {
             track_id: TrackId {
                 source_ordinal: 1,
@@ -14650,7 +15006,7 @@ mod conversion_log_tests {
         }
     }
 
-    fn failed_record() -> TrackRecord {
+    pub(super) fn failed_record() -> TrackRecord {
         TrackRecord {
             track_id: TrackId {
                 source_ordinal: 2,
@@ -14669,7 +15025,7 @@ mod conversion_log_tests {
         }
     }
 
-    fn stage_records() -> Vec<StageRecord> {
+    pub(super) fn stage_records() -> Vec<StageRecord> {
         vec![
             StageRecord {
                 stage: PipelineStage::Materialize,
@@ -14689,7 +15045,7 @@ mod conversion_log_tests {
         ]
     }
 
-    fn log_test_artifacts() -> ArtifactSet {
+    pub(super) fn log_test_artifacts() -> ArtifactSet {
         ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![
                 TrackArtifact {
@@ -14720,6 +15076,29 @@ mod conversion_log_tests {
                 },
             ]),
             sidecars: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod conversion_log_tests {
+    use super::*;
+    use super::pipeline_test_helpers::*;
+
+    struct VersionOnlyRunner(HashMap<ToolBinary, String>);
+
+    #[async_trait::async_trait]
+    impl ToolRunner for VersionOnlyRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<super::super::tool::ToolOutput, ToolRunnerError> {
+            panic!("VersionOnlyRunner should not execute commands")
+        }
+
+        fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+            self.0.get(&binary).cloned()
         }
     }
 
@@ -15191,6 +15570,71 @@ mod conversion_log_tests {
         assert!(log.contains("Target sample rate: DSD64"));
         assert!(log.contains("Conversion: 24-bit/96kHz WAV → DSD64 DSF"));
         assert!(!log.contains("2822.4kHz DSF"));
+    }
+
+    #[test]
+    fn conversion_log_merges_runner_versions_from_recorded_commands() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let runner = VersionOnlyRunner(HashMap::from([
+            (ToolBinary::Ffmpeg, "7.1.3".to_string()),
+        ]));
+
+        let log = build_conversion_log_at_with_runner(
+            &outcome,
+            &source,
+            &req,
+            &artifacts,
+            None,
+            chrono::Utc::now(),
+            Some(&runner),
+        );
+
+        assert!(log.contains("Tool versions: ffmpeg 7.1.3"));
+    }
+
+    #[test]
+    fn conversion_log_merges_multiple_runner_versions_from_command_records() {
+        let mut source = log_test_source();
+        source
+            .provenance
+            .tool_versions
+            .insert("ffmpeg".to_string(), "in-process".to_string());
+        let req = log_test_request();
+        let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.commands = vec![
+            command_record_for(ToolBinary::Ffmpeg),
+            command_record_for(ToolBinary::Sox),
+            command_record_for(ToolBinary::Ssrc),
+        ];
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let runner = VersionOnlyRunner(HashMap::from([
+            (ToolBinary::Ffmpeg, "7.1.3".to_string()),
+            (ToolBinary::Sox, "14.6.1".to_string()),
+            (ToolBinary::Ssrc, "2.4.2".to_string()),
+        ]));
+
+        let log = build_conversion_log_at_with_runner(
+            &outcome,
+            &source,
+            &req,
+            &artifacts,
+            None,
+            chrono::Utc::now(),
+            Some(&runner),
+        );
+
+        assert!(log.contains("Tool versions: ffmpeg 7.1.3, sox 14.6.1, ssrc 2.4.2"));
+        assert!(!log.contains("ffmpeg in-process"));
     }
 
     #[test]
@@ -16005,12 +16449,14 @@ mod rich_progress_stage_tests {
 #[cfg(test)]
 mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     use super::*;
+    use super::pipeline_test_helpers::*;
     use crate::convert::pipeline::manifest::{manifest_path, read_manifest, ValidationStatus};
     use crate::convert::pipeline::reporter::{PipelineEvent, PipelineReporter, RecordingReporter};
     use crate::convert::pipeline::tool::blocking_test_runner::{
         tool_gate, BlockingToolRunner, ToolBehavior,
     };
-    use crate::convert::pipeline::tool::{CommandRecord, ProcessExit, StubToolRunner, ToolBinary, ToolOutput};
+    use crate::convert::pipeline::tool::{CommandRecord, ProcessExit, StubToolRunner, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
+    use crate::convert::pipeline::errors::ToolRunnerError;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -16155,6 +16601,37 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             bytes_out: None,
             duration: None,
             dsd_dst_stats: None,
+        }
+    }
+
+    fn fragment_command_record_for(binary: ToolBinary) -> CommandRecord {
+        CommandRecord {
+            description: None,
+            binary,
+            sanitized_args: vec!["-i".to_string(), "input.wav".to_string(), "output.flac".to_string()],
+            cwd: None,
+            env_keys: Vec::new(),
+            exit: Some(ProcessExit::Code(0)),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(25),
+        }
+    }
+
+    struct FragmentVersionRunner(HashMap<ToolBinary, String>);
+
+    #[async_trait]
+    impl ToolRunner for FragmentVersionRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            panic!("FragmentVersionRunner must not execute commands")
+        }
+
+        fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+            self.0.get(&binary).cloned()
         }
     }
 
@@ -18439,6 +18916,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             &source,
             &req,
             &staging,
+            None,
         )
         .expect("fragment sidecar staging succeeds");
 
@@ -18658,6 +19136,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             None,
             fragment_test_time(44),
             &staging,
+            None,
         )
         .expect("fragment uses dispatcher batch count, not tag totals");
         let fragment = read_conversion_log_fragment_file(&staging.root.join(".conversion-log-fragment.json"))
@@ -19142,6 +19621,83 @@ Source-aware setting: yes
         assert!(format!("{err:?}").contains("expected track count"));
     }
 
+
+    #[test]
+    fn fragment_common_provenance_merges_tool_versions_from_all_fragments() {
+        let album_dir = PathBuf::from("/out/Artist/Album");
+        let mut first = fragment_test_fragment(
+            &album_dir,
+            "batch-tool-version-merge",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Status: Success\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        first.common.provenance_section = "Provenance\n----------\nExtracted at: 2026-06-16 00:00:01 UTC\nTool versions: ffmpeg in-process\n\n".to_string();
+
+        let mut second = fragment_test_fragment(
+            &album_dir,
+            "batch-tool-version-merge",
+            Some("settings-a"),
+            2,
+            2,
+            "Track 2\n  Status: Success\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        second.common.provenance_section = "Provenance\n----------\nExtracted at: 2026-06-16 00:00:02 UTC\nTool versions: ffmpeg 7.1.3, sox 14.6.1, ssrc 2.4.2\n\n".to_string();
+
+        let log = build_conversion_log_from_fragments(&[second, first]);
+
+        assert!(log.contains("Tool versions: ffmpeg 7.1.3, sox 14.6.1, ssrc 2.4.2"));
+        assert!(!log.contains("ffmpeg in-process"));
+        assert_eq!(log.matches("Tool versions:").count(), 1);
+    }
+
+    #[test]
+    fn album_fragment_file_assembly_merges_tool_versions_from_all_fragments() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let identity = fragment_test_identity(&album_dir, "batch-tool-version-file-merge", Some("settings-a"));
+
+        let mut first = fragment_test_fragment(
+            &album_dir,
+            "batch-tool-version-file-merge",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Status: Success\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        first.common.provenance_section = "Provenance\n----------\nExtracted at: 2026-06-16 00:00:01 UTC\nTool versions: ffmpeg 7.1.3\n\n".to_string();
+
+        let mut second = fragment_test_fragment(
+            &album_dir,
+            "batch-tool-version-file-merge",
+            Some("settings-a"),
+            2,
+            2,
+            "Track 2\n  Status: Success\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        second.common.provenance_section = "Provenance\n----------\nExtracted at: 2026-06-16 00:00:02 UTC\nTool versions: sox 14.6.1\n\n".to_string();
+
+        write_album_fragment(&album_dir, "track-two.json", &second);
+        write_album_fragment(&album_dir, "track-one.json", &first);
+
+        let assembled = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&identity))
+            .expect("full fragment set assembles")
+            .expect("complete fragment set returns an album log");
+
+        assert!(assembled.contains("Tool versions: ffmpeg 7.1.3, sox 14.6.1"));
+        assert_eq!(assembled.matches("Tool versions:").count(), 1);
+    }
+
     #[test]
     fn fragment_publishes_assemble_out_of_order_tracks_and_cleanup_after_full_count() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -19325,7 +19881,11 @@ Source-aware setting: yes
 
         let failed_track_id = track_id(1);
         let source = prepared_source(temp.path(), &[failed_track_id.clone()]);
-        let failed_record = track_record(failed_track_id, false, None);
+        let mut failed_record = track_record(failed_track_id, false, None);
+        failed_record.commands = vec![fragment_command_record_for(ToolBinary::Sox)];
+        let runner = FragmentVersionRunner(HashMap::from([
+            (ToolBinary::Sox, "14.6.1".to_string()),
+        ]));
         let outcome = AlbumOutcome::Blocked {
             successful: Vec::new(),
             failed: vec![failed_record],
@@ -19352,6 +19912,7 @@ Source-aware setting: yes
             Some(&artifacts),
             &outcome,
             staging,
+            Some(&runner),
         )
         .expect("terminal failed track publishes a forensic fragment");
 
@@ -19363,6 +19924,7 @@ Source-aware setting: yes
         assert!(log.contains("Track 2"));
         assert!(log.contains("Status: Failure"));
         assert!(log.contains("1 successful / 1 failed / 2 total"));
+        assert!(log.contains("Tool versions: sox 14.6.1"));
         assert!(!conversion_log_fragment_dir(&album_dir).exists(), "terminal failure assembly cleans fragments");
     }
 
@@ -19448,6 +20010,7 @@ Source-aware setting: yes
             None,
             &corrupt_outcome,
             corrupt_staging,
+            None,
         )
         .expect("pre-materialization failure publishes a forensic fragment");
 
@@ -20205,6 +20768,7 @@ Source-aware setting: yes
             &failed_source,
             &failed_req,
             &count_staging,
+            None,
         )
         .expect("terminal failed track stages only a fragment");
         let failed_plan = build_publish_plan(&staged_failed, &failed_req)
@@ -20224,6 +20788,7 @@ Source-aware setting: yes
             Some(&real_fragment_empty_artifacts()),
             &failed_outcome,
             terminal_staging,
+            None,
         )
         .expect("terminal failed track publishes its forensic fragment");
 
@@ -20296,6 +20861,7 @@ Source-aware setting: yes
             None,
             &failed_outcome,
             terminal_staging,
+            None,
         )
         .expect("PlanFailed publishes its forensic fragment");
 
@@ -21273,6 +21839,7 @@ mod validate_encoded_output_tests {
                 expected_group2_channel_count: None,
                 sector_ranges: Vec::new(),
                 aob_files: Vec::new(),
+                elementary_stream_kind_hint: None,
             },
             metadata: TrackMetadata::default(),
             expected_samples,
@@ -21358,6 +21925,7 @@ mod validate_encoded_output_tests {
                 samples: 58_299_906,
                 sample_rate: Some(88_200),
                 resampled: true,
+                ssrc_fft_length: None,
             })
         );
         assert_eq!(runner.transcript().len(), 1);
@@ -21390,6 +21958,7 @@ mod validate_encoded_output_tests {
                 samples: 19_712_540,
                 sample_rate: Some(88_200),
                 resampled: true,
+                ssrc_fft_length: None,
             })
         );
         assert_eq!(runner.transcript().len(), 1);
@@ -21487,6 +22056,7 @@ mod validate_encoded_output_tests {
                 samples: 19_712_540,
                 sample_rate: Some(88_200),
                 resampled: true,
+                ssrc_fft_length: None,
             })
         );
     }
@@ -21516,6 +22086,7 @@ mod validate_encoded_output_tests {
                     samples: expected_samples,
                     sample_rate: Some(target_rate),
                     resampled: true,
+                    ssrc_fft_length: None,
                 }),
                 "{source_rate} Hz -> {target_rate} Hz should round {source_samples} samples to {expected_samples}"
             );
@@ -21536,6 +22107,7 @@ mod validate_encoded_output_tests {
                 samples: 19_712_540,
                 sample_rate: Some(88_200),
                 resampled: true,
+                ssrc_fft_length: None,
             }),
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,
@@ -21564,6 +22136,7 @@ mod validate_encoded_output_tests {
                 samples: 19_712_540,
                 sample_rate: Some(88_200),
                 resampled: true,
+                ssrc_fft_length: None,
             }),
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,
@@ -21617,6 +22190,7 @@ mod validate_encoded_output_tests {
                 samples: 19_712_540,
                 sample_rate: Some(88_200),
                 resampled: true,
+                ssrc_fft_length: None,
             }),
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,

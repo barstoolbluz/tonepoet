@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use super::errors::{MaterializeError, SourceDetectError};
 use super::reporter::PipelineReporter;
 use super::stages::Materializer;
-use super::tool::ToolRunner;
+use super::tool::{ToolBinary, ToolRunner};
 use super::types::*;
 
 pub struct DvdVideoMaterializer;
@@ -39,7 +39,7 @@ impl Materializer for DvdVideoMaterializer {
         &self,
         req: &PipelineRequest,
         staging: &StagingDir,
-        _runner: &dyn ToolRunner,
+        runner: &dyn ToolRunner,
         _reporter: Option<&dyn PipelineReporter>,
         _tool_paths: &HashMap<String, PathBuf>,
         cancel: &CancellationToken,
@@ -177,9 +177,7 @@ impl Materializer for DvdVideoMaterializer {
             "scored-main-program-track-count-duration-then-stream".to_string(),
         );
 
-        let mut tool_versions = BTreeMap::new();
-        tool_versions.insert("dvdvideo".to_string(), "in-process".to_string());
-        tool_versions.insert("ffmpeg".to_string(), "in-process".to_string());
+        let tool_versions = dvdv_tool_versions(runner);
 
         Ok(PreparedSource {
             container: req.container.clone(),
@@ -207,6 +205,16 @@ impl Materializer for DvdVideoMaterializer {
             },
         })
     }
+}
+
+
+fn dvdv_tool_versions(runner: &dyn ToolRunner) -> BTreeMap<String, String> {
+    let mut tool_versions = BTreeMap::new();
+    tool_versions.insert("dvdvideo".to_string(), "in-process".to_string());
+    if let Some(version) = runner.tool_version(ToolBinary::Ffmpeg) {
+        tool_versions.insert("ffmpeg".to_string(), version);
+    }
+    tool_versions
 }
 
 /// Route DVD-Video sources after DVD-Audio has had first refusal.
@@ -1175,6 +1183,50 @@ fn has_extension(path: &Path, ext: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    use super::dvdv_tool_versions;
+    use super::super::errors::ToolRunnerError;
+    use super::super::tool::{ToolBinary, ToolCommand, ToolRunner};
+    use std::collections::{BTreeMap, HashMap};
+    use tokio_util::sync::CancellationToken;
+
+    struct VersionOnlyRunner(HashMap<ToolBinary, String>);
+
+    #[async_trait::async_trait]
+    impl ToolRunner for VersionOnlyRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<super::super::tool::ToolOutput, ToolRunnerError> {
+            panic!("VersionOnlyRunner must not execute commands")
+        }
+
+        fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+            self.0.get(&binary).cloned()
+        }
+    }
+
+    #[test]
+    fn dvdv_materializer_provenance_records_in_process_dvdvideo_and_detected_ffmpeg() {
+        let runner = VersionOnlyRunner(HashMap::from([
+            (ToolBinary::Ffmpeg, "7.1.3".to_string()),
+        ]));
+        let versions = dvdv_tool_versions(&runner);
+
+        assert_eq!(versions.get("dvdvideo").map(String::as_str), Some("in-process"));
+        assert_eq!(versions.get("ffmpeg").map(String::as_str), Some("7.1.3"));
+    }
+
+    #[test]
+    fn dvdv_materializer_provenance_keeps_only_in_process_tool_when_ffmpeg_missing() {
+        let runner = VersionOnlyRunner(HashMap::new());
+        let versions = dvdv_tool_versions(&runner);
+        let expected = BTreeMap::from([("dvdvideo".to_string(), "in-process".to_string())]);
+
+        assert_eq!(versions, expected);
+    }
+
     use super::{
         classify_cell_for_extraction, coalesce_authored_adjacent_ranges, selected_chapter_ordinals,
         DvdvDefaultProgramScore, ReverseDvdvIdentity, CellExtractionKind,

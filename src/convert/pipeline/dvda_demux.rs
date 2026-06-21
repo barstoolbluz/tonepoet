@@ -20,6 +20,14 @@ pub const MLP_STREAM_ID: u8 = 0xA1;
 /// The CCI byte remains at offset 8; byte 9 is currently treated as reserved/padding.
 pub const MLP_EXTRA_HEADER_LENGTH: u8 = 6;
 pub const PCM_EXTRA_HEADER_LENGTH: u8 = 9;
+const MLP_ACCESS_UNIT_LENGTH_MASK: usize = 0x0fff;
+const MLP_ACCESS_UNIT_LENGTH_BYTES_PER_WORD: usize = 2;
+const MLP_MIN_ACCESS_UNIT_BYTES: usize = 4;
+const MLP_MAX_ACCESS_UNIT_BYTES: usize = MLP_ACCESS_UNIT_LENGTH_MASK * MLP_ACCESS_UNIT_LENGTH_BYTES_PER_WORD;
+pub const MLP_FIRST_ACCESS_UNIT_POINTER_PAYLOAD_BIAS: usize = 5;
+const MLP_RESYNC_LOOKAHEAD_UNITS: usize = 2;
+const MLP_MAJOR_SYNC_FBA: [u8; 4] = [0xF8, 0x72, 0x6F, 0xBA];
+const MLP_MAJOR_SYNC_FBB: [u8; 4] = [0xF8, 0x72, 0x6F, 0xBB];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DvdaSubstreamKind {
@@ -84,6 +92,7 @@ pub struct DvdaSubHeader {
     pub cyclic: u8,
     pub extra_header_length: u8,
     pub total_header_length: usize,
+    pub first_access_unit_pointer: Option<u16>,
     pub cci: Option<u8>,
     pub pcm: Option<DvdaPcmSubHeader>,
 }
@@ -96,6 +105,15 @@ impl DvdaSubHeader {
         } else {
             DvdaSubstreamKind::from_stream_id(self.stream_id)
         }
+    }
+
+    #[must_use]
+    pub fn mlp_first_access_unit_payload_offset(self) -> Option<usize> {
+        if !matches!(self.kind(), DvdaSubstreamKind::Mlp) {
+            return None;
+        }
+        usize::from(self.first_access_unit_pointer?)
+            .checked_sub(MLP_FIRST_ACCESS_UNIT_POINTER_PAYLOAD_BIAS)
     }
 }
 
@@ -123,6 +141,415 @@ pub struct DvdaDemuxStats {
     pub extra_header_length_change_count: u64,
     pub nonstandard_mlp_extra_header_packets: u64,
     pub nonstandard_pcm_extra_header_packets: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum MlpReassemblyMode {
+    Strict,
+    Tolerant {
+        max_resync_bytes: usize,
+        max_resync_events: usize,
+    },
+}
+
+impl Default for MlpReassemblyMode {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MlpStartConfidence {
+    MajorSync,
+    ConsecutiveAccessUnits,
+}
+
+impl MlpStartConfidence {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MajorSync => "MajorSync",
+            Self::ConsecutiveAccessUnits => "ConsecutiveAccessUnits",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifiedMlpStart {
+    offset: usize,
+    declared_len: usize,
+    confidence: MlpStartConfidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MlpAccessUnitReassemblyStats {
+    pub packets_seen: u64,
+    pub access_units: u64,
+    pub input_payload_bytes: u64,
+    pub framed_bytes: u64,
+    pub padding_bytes: u64,
+    pub leading_fragment_bytes: u64,
+    pub carry_bytes_max: usize,
+    pub trailing_fragment_bytes: u64,
+    pub resync_events: u64,
+    pub resync_bytes: u64,
+    pub first_resync_offset: Option<u64>,
+    pub first_resync_reason: Option<&'static str>,
+}
+
+pub struct MlpAccessUnitReassembler<W: Write> {
+    writer: W,
+    pending: Vec<u8>,
+    mode: MlpReassemblyMode,
+    stream_started: bool,
+    absolute_input_bytes: u64,
+    stats: MlpAccessUnitReassemblyStats,
+}
+
+impl<W: Write> MlpAccessUnitReassembler<W> {
+    pub fn new(writer: W) -> Self {
+        Self::new_with_mode(writer, MlpReassemblyMode::Strict)
+    }
+
+    pub fn new_with_mode(writer: W, mode: MlpReassemblyMode) -> Self {
+        Self {
+            writer,
+            pending: Vec::new(),
+            mode,
+            stream_started: false,
+            absolute_input_bytes: 0,
+            stats: MlpAccessUnitReassemblyStats::default(),
+        }
+    }
+
+    pub fn push_packet(
+        &mut self,
+        sub_header: DvdaSubHeader,
+        payload: &[u8],
+    ) -> Result<(), DvdaDemuxError> {
+        self.stats.packets_seen = self.stats.packets_seen.saturating_add(1);
+        self.stats.input_payload_bytes = self
+            .stats
+            .input_payload_bytes
+            .saturating_add(payload.len() as u64);
+        let packet_input_offset = self.absolute_input_bytes;
+        self.absolute_input_bytes = self
+            .absolute_input_bytes
+            .saturating_add(payload.len() as u64);
+
+        let payload = self.trim_initial_packet_fragment(sub_header, payload, packet_input_offset)?;
+        self.push_payload_after_accounting(payload)
+    }
+
+    #[allow(dead_code)]
+    pub fn push_payload(&mut self, payload: &[u8]) -> Result<(), DvdaDemuxError> {
+        self.stats.input_payload_bytes = self
+            .stats
+            .input_payload_bytes
+            .saturating_add(payload.len() as u64);
+        self.absolute_input_bytes = self
+            .absolute_input_bytes
+            .saturating_add(payload.len() as u64);
+        if !payload.is_empty() {
+            self.stream_started = true;
+        }
+        self.push_payload_after_accounting(payload)
+    }
+
+    pub fn finish(&mut self) -> Result<(), DvdaDemuxError> {
+        self.drain_complete_access_units()?;
+        if self.pending.is_empty() {
+            self.writer.flush().map_err(DvdaDemuxError::Write)?;
+            return Ok(());
+        }
+
+        if self.pending.iter().all(|byte| *byte == 0) {
+            self.stats.padding_bytes = self
+                .stats
+                .padding_bytes
+                .saturating_add(self.pending.len() as u64);
+            self.pending.clear();
+            self.writer.flush().map_err(DvdaDemuxError::Write)?;
+            return Ok(());
+        }
+
+        // Track-end trailing fragments are expected for DVD-Audio tracks cut from
+        // a continuous MLP bitstream.  The track window ends mid-access-unit; the
+        // remaining bytes are a partial AU tail, not corruption.
+        log::debug!(
+            "MLP reassembly dropping {} trailing fragment byte(s) at end of track",
+            self.pending.len()
+        );
+        self.stats.trailing_fragment_bytes = self.pending.len() as u64;
+        self.pending.clear();
+        self.writer.flush().map_err(DvdaDemuxError::Write)?;
+        Ok(())
+    }
+
+    pub const fn stats(&self) -> MlpAccessUnitReassemblyStats {
+        self.stats
+    }
+
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+
+    fn trim_initial_packet_fragment<'a>(
+        &mut self,
+        sub_header: DvdaSubHeader,
+        payload: &'a [u8],
+        packet_input_offset: u64,
+    ) -> Result<&'a [u8], DvdaDemuxError> {
+        if self.stream_started || payload.is_empty() {
+            return Ok(payload);
+        }
+
+        if let Some(first_access_unit_offset) = sub_header.mlp_first_access_unit_payload_offset() {
+            if first_access_unit_offset > payload.len() {
+                return Err(DvdaDemuxError::PacketHandler(format!(
+                    "MLP first access-unit pointer {} maps to payload offset {}, beyond {} payload byte(s)",
+                    sub_header.first_access_unit_pointer.unwrap_or_default(),
+                    first_access_unit_offset,
+                    payload.len()
+                )));
+            }
+
+            let skipped = &payload[..first_access_unit_offset];
+            if skipped.iter().all(|byte| *byte == 0) {
+                self.stats.padding_bytes = self
+                    .stats
+                    .padding_bytes
+                    .saturating_add(skipped.len() as u64);
+            } else {
+                self.stats.leading_fragment_bytes = self
+                    .stats
+                    .leading_fragment_bytes
+                    .saturating_add(skipped.len() as u64);
+            }
+            self.stream_started = true;
+            return Ok(&payload[first_access_unit_offset..]);
+        }
+
+        if payload.iter().all(|byte| *byte == 0) {
+            self.stats.padding_bytes = self
+                .stats
+                .padding_bytes
+                .saturating_add(payload.len() as u64);
+            return Ok(&payload[payload.len()..]);
+        }
+
+        if verified_mlp_start_at(payload, 0).is_some() {
+            self.stream_started = true;
+            return Ok(payload);
+        }
+
+        Err(DvdaDemuxError::PacketHandler(format!(
+            "first MLP packet at payload byte {} has no usable first access-unit pointer and does not start at a verified access unit",
+            packet_input_offset
+        )))
+    }
+
+    fn push_payload_after_accounting(&mut self, payload: &[u8]) -> Result<(), DvdaDemuxError> {
+        self.pending.extend_from_slice(payload);
+        self.note_carry_bytes();
+        self.drain_complete_access_units()
+    }
+
+    fn drain_complete_access_units(&mut self) -> Result<(), DvdaDemuxError> {
+        loop {
+            self.note_carry_bytes();
+            if self.pending.is_empty() {
+                return Ok(());
+            }
+
+            if self.pending.len() < 2 {
+                return Ok(());
+            }
+
+            if self.pending.iter().all(|byte| *byte == 0) {
+                self.stats.padding_bytes = self
+                    .stats
+                    .padding_bytes
+                    .saturating_add(self.pending.len() as u64);
+                self.pending.clear();
+                continue;
+            }
+
+            let Some(access_unit_bytes) = mlp_declared_access_unit_bytes(&self.pending[..2]) else {
+                self.resync_or_fail("invalid or zero MLP access-unit length")?;
+                continue;
+            };
+
+            if self.pending.len() < access_unit_bytes {
+                return Ok(());
+            }
+
+            let after = &self.pending[access_unit_bytes..];
+            if after.len() >= 2
+                && !after.iter().all(|byte| *byte == 0)
+                && mlp_declared_access_unit_bytes(&after[..2]).is_none()
+            {
+                self.resync_or_fail("MLP access-unit length did not land on the next boundary")?;
+                continue;
+            }
+
+            self.writer
+                .write_all(&self.pending[..access_unit_bytes])
+                .map_err(DvdaDemuxError::Write)?;
+            self.pending.drain(..access_unit_bytes);
+            self.stats.access_units = self.stats.access_units.saturating_add(1);
+            self.stats.framed_bytes = self
+                .stats
+                .framed_bytes
+                .saturating_add(access_unit_bytes as u64);
+        }
+    }
+
+    fn resync_or_fail(&mut self, reason: &'static str) -> Result<(), DvdaDemuxError> {
+        let Some(start) = find_next_verified_mlp_access_unit_start(&self.pending[1..]) else {
+            return Err(DvdaDemuxError::PacketHandler(format!(
+                "MLP reassembly could not recover after {reason}; no verified access-unit start found in {} pending byte(s)",
+                self.pending.len()
+            )));
+        };
+
+        let discard = start.offset + 1;
+        let skipped = &self.pending[..discard];
+        if skipped.iter().all(|byte| *byte == 0) {
+            self.stats.padding_bytes = self.stats.padding_bytes.saturating_add(discard as u64);
+            self.pending.drain(..discard);
+            return Ok(());
+        }
+
+        match self.mode {
+            MlpReassemblyMode::Strict => Err(DvdaDemuxError::MlpStrictResyncRejected {
+                input_byte: self
+                    .absolute_input_bytes
+                    .saturating_sub(self.pending.len() as u64),
+                skipped_bytes: discard,
+                confidence: start.confidence.label(),
+                declared_len: start.declared_len,
+                reason,
+            }),
+            MlpReassemblyMode::Tolerant {
+                max_resync_bytes,
+                max_resync_events,
+            } => {
+                let next_resync_bytes = self.stats.resync_bytes.saturating_add(discard as u64);
+                let next_resync_events = self.stats.resync_events.saturating_add(1);
+                if next_resync_bytes > max_resync_bytes as u64
+                    || next_resync_events > max_resync_events as u64
+                {
+                    return Err(DvdaDemuxError::PacketHandler(format!(
+                        "MLP reassembly resync limit exceeded: events={} bytes={} limits events={} bytes={} ({reason})",
+                        next_resync_events,
+                        next_resync_bytes,
+                        max_resync_events,
+                        max_resync_bytes
+                    )));
+                }
+
+                if self.stats.first_resync_offset.is_none() {
+                    self.stats.first_resync_offset = Some(
+                        self.absolute_input_bytes
+                            .saturating_sub(self.pending.len() as u64),
+                    );
+                    self.stats.first_resync_reason = Some(reason);
+                }
+                self.stats.resync_bytes = next_resync_bytes;
+                self.stats.resync_events = next_resync_events;
+                self.pending.drain(..discard);
+                Ok(())
+            }
+        }
+    }
+
+    fn note_carry_bytes(&mut self) {
+        self.stats.carry_bytes_max = self.stats.carry_bytes_max.max(self.pending.len());
+    }
+}
+
+fn mlp_declared_access_unit_bytes(prefix: &[u8]) -> Option<usize> {
+    if prefix.len() < 2 {
+        return None;
+    }
+    let words = (u16::from_be_bytes([prefix[0], prefix[1]]) as usize) & MLP_ACCESS_UNIT_LENGTH_MASK;
+    let bytes = words.checked_mul(MLP_ACCESS_UNIT_LENGTH_BYTES_PER_WORD)?;
+    if (MLP_MIN_ACCESS_UNIT_BYTES..=MLP_MAX_ACCESS_UNIT_BYTES).contains(&bytes) {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
+fn find_next_verified_mlp_access_unit_start(bytes: &[u8]) -> Option<VerifiedMlpStart> {
+    bytes
+        .windows(2)
+        .enumerate()
+        .find_map(|(offset, _)| verified_mlp_start_at(bytes, offset))
+}
+
+fn verified_mlp_start_at(bytes: &[u8], offset: usize) -> Option<VerifiedMlpStart> {
+    if offset + 2 > bytes.len() {
+        return None;
+    }
+    let declared_len = mlp_declared_access_unit_bytes(&bytes[offset..offset + 2])?;
+    if offset + declared_len > bytes.len() {
+        return None;
+    }
+
+    let candidate = &bytes[offset..offset + declared_len];
+    let after = &bytes[offset + declared_len..];
+    if mlp_access_unit_has_major_sync(candidate)
+        && (after.is_empty()
+            || after.iter().all(|byte| *byte == 0)
+            || verified_following_access_unit(after))
+    {
+        return Some(VerifiedMlpStart {
+            offset,
+            declared_len,
+            confidence: MlpStartConfidence::MajorSync,
+        });
+    }
+
+    if count_consecutive_mlp_access_units(&bytes[offset..], MLP_RESYNC_LOOKAHEAD_UNITS)
+        >= MLP_RESYNC_LOOKAHEAD_UNITS
+    {
+        return Some(VerifiedMlpStart {
+            offset,
+            declared_len,
+            confidence: MlpStartConfidence::ConsecutiveAccessUnits,
+        });
+    }
+
+    None
+}
+
+fn verified_following_access_unit(bytes: &[u8]) -> bool {
+    let Some(len) = mlp_declared_access_unit_bytes(bytes) else {
+        return false;
+    };
+    len <= bytes.len()
+}
+
+fn count_consecutive_mlp_access_units(mut bytes: &[u8], max_units: usize) -> usize {
+    let mut units = 0;
+    while units < max_units {
+        let Some(len) = mlp_declared_access_unit_bytes(bytes) else {
+            break;
+        };
+        if len > bytes.len() {
+            break;
+        }
+        units += 1;
+        bytes = &bytes[len..];
+    }
+    units
+}
+
+fn mlp_access_unit_has_major_sync(access_unit: &[u8]) -> bool {
+    access_unit.len() >= 8
+        && (access_unit[4..8] == MLP_MAJOR_SYNC_FBA || access_unit[4..8] == MLP_MAJOR_SYNC_FBB)
 }
 
 #[derive(Debug)]
@@ -163,7 +590,20 @@ pub enum DvdaDemuxError {
         stream_id: u8,
     },
     PacketHandler(String),
+    MlpStrictResyncRejected {
+        input_byte: u64,
+        skipped_bytes: usize,
+        confidence: &'static str,
+        declared_len: usize,
+        reason: &'static str,
+    },
     Write(io::Error),
+}
+
+impl DvdaDemuxError {
+    pub const fn is_mlp_strict_resync_rejection(&self) -> bool {
+        matches!(self, Self::MlpStrictResyncRejected { .. })
+    }
 }
 
 impl fmt::Display for DvdaDemuxError {
@@ -217,6 +657,16 @@ impl fmt::Display for DvdaDemuxError {
                 "unexpected DVD-Audio Private Stream 1 substream id 0x{stream_id:02X}; expected MLP 0x{MLP_STREAM_ID:02X} or LPCM 0x{PCM_STREAM_ID:02X}"
             ),
             Self::PacketHandler(err) => write!(f, "DVD-Audio Private Stream 1 packet handler failed: {err}"),
+            Self::MlpStrictResyncRejected {
+                input_byte,
+                skipped_bytes,
+                confidence,
+                declared_len,
+                reason,
+            } => write!(
+                f,
+                "MLP reassembly strict mode rejected nonzero resync at input byte {input_byte}: skipped {skipped_bytes} byte(s) before {confidence} candidate with declared length {declared_len} ({reason})"
+            ),
             Self::Write(err) => write!(f, "failed to write demuxed DVD-Audio payload: {err}"),
         }
     }
@@ -519,17 +969,21 @@ fn parse_dvd_audio_sub_header(
         });
     }
 
-    let (cci, pcm) = match DvdaSubstreamKind::from_stream_id(stream_id) {
-        DvdaSubstreamKind::Mlp => (bytes.get(8).copied(), None),
+    let (first_access_unit_pointer, cci, pcm) = match DvdaSubstreamKind::from_stream_id(stream_id) {
+        DvdaSubstreamKind::Mlp => (
+            (extra_header_length >= 2).then(|| u16::from_be_bytes([bytes[4], bytes[5]])),
+            bytes.get(8).copied(),
+            None,
+        ),
         DvdaSubstreamKind::Pcm => {
             if extra_header_length >= PCM_EXTRA_HEADER_LENGTH {
                 let pcm = parse_dvd_audio_pcm_sub_header(bytes);
-                (Some(pcm.cci), Some(pcm))
+                (None, Some(pcm.cci), Some(pcm))
             } else {
-                (None, None)
+                (None, None, None)
             }
         }
-        DvdaSubstreamKind::Unknown(_) => (None, None),
+        DvdaSubstreamKind::Unknown(_) => (None, None, None),
     };
 
     Ok(DvdaSubHeader {
@@ -537,6 +991,7 @@ fn parse_dvd_audio_sub_header(
         cyclic,
         extra_header_length,
         total_header_length,
+        first_access_unit_pointer,
         cci,
         pcm,
     })
@@ -576,6 +1031,7 @@ fn parse_dvd_video_sub_header(
         cyclic,
         extra_header_length: DVD_VIDEO_LPCM_EXTRA_HEADER_LENGTH,
         total_header_length: DVD_VIDEO_LPCM_TOTAL_HEADER_LENGTH,
+        first_access_unit_pointer: None,
         cci,
         pcm,
     })
@@ -744,6 +1200,11 @@ mod tests {
     fn mlp_sub_header_with(cyclic: u8, extra_header_length: u8, cci: u8) -> Vec<u8> {
         let mut sub_header = vec![MLP_STREAM_ID, cyclic, 0, extra_header_length];
         sub_header.resize(4 + usize::from(extra_header_length), 0);
+        if sub_header.len() > 5 {
+            let pointer = (MLP_FIRST_ACCESS_UNIT_POINTER_PAYLOAD_BIAS as u16).to_be_bytes();
+            sub_header[4] = pointer[0];
+            sub_header[5] = pointer[1];
+        }
         if sub_header.len() > 8 {
             sub_header[8] = cci;
         }
@@ -956,6 +1417,261 @@ mod tests {
                 );
             }
         }
+    }
+
+
+    fn mlp_access_unit(byte_len: usize, marker: u8) -> Vec<u8> {
+        assert!(byte_len >= MLP_MIN_ACCESS_UNIT_BYTES);
+        assert_eq!(byte_len % 2, 0);
+        let words = (byte_len / MLP_ACCESS_UNIT_LENGTH_BYTES_PER_WORD) as u16;
+        let mut out = vec![0_u8; byte_len];
+        let encoded = words & MLP_ACCESS_UNIT_LENGTH_MASK as u16;
+        out[0] = ((encoded >> 8) & 0x0f) as u8;
+        out[1] = (encoded & 0xff) as u8;
+        out[2] = marker;
+        out[3] = marker.wrapping_add(1);
+        if byte_len >= 8 {
+            out[4..8].copy_from_slice(&[0xF8, 0x72, 0x6F, 0xBA]);
+        }
+        out
+    }
+
+    #[test]
+    fn mlp_reassembler_writes_access_units_and_drops_packet_padding() {
+        let first = mlp_access_unit(8, 0x10);
+        let second = mlp_access_unit(10, 0x20);
+        let mut first_packet = Vec::new();
+        first_packet.extend_from_slice(&first);
+        first_packet.extend_from_slice(&[0, 0, 0, 0]);
+        let mut second_packet = Vec::new();
+        second_packet.extend_from_slice(&second);
+        second_packet.extend_from_slice(&[0, 0]);
+
+        let mut out = Vec::new();
+        let mut reassembler = MlpAccessUnitReassembler::new(&mut out);
+        reassembler
+            .push_payload(&first_packet)
+            .expect("first packet should reassemble");
+        reassembler
+            .push_payload(&second_packet)
+            .expect("second packet should reassemble");
+        reassembler.finish().expect("zero padding tail should finish");
+        let stats = reassembler.stats();
+        drop(reassembler);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&second);
+        assert_eq!(out, expected);
+        assert_eq!(stats.access_units, 2);
+        assert_eq!(stats.framed_bytes, expected.len() as u64);
+        assert_eq!(stats.padding_bytes, 6);
+        assert_eq!(stats.resync_bytes, 0);
+    }
+
+    #[test]
+    fn mlp_reassembler_carries_access_unit_across_packet_boundaries() {
+        let frame = mlp_access_unit(12, 0x33);
+        let mut out = Vec::new();
+        let mut reassembler = MlpAccessUnitReassembler::new(&mut out);
+        reassembler.push_payload(&frame[..5]).expect("prefix should buffer");
+        assert_eq!(reassembler.stats().access_units, 0);
+        reassembler.push_payload(&frame[5..]).expect("suffix should complete frame");
+        reassembler.finish().expect("complete frame should finish");
+        drop(reassembler);
+
+        assert_eq!(out, frame);
+    }
+
+    #[test]
+    fn mlp_reassembler_accepts_non_padding_tail_as_trailing_fragment() {
+        let frame = mlp_access_unit(8, 0x44);
+        let mut out = Vec::new();
+        let mut reassembler = MlpAccessUnitReassembler::new(&mut out);
+        reassembler.push_payload(&frame).expect("frame should reassemble");
+        reassembler.push_payload(&[0x12, 0x34, 0x56]).expect("tail buffers until finish");
+        reassembler
+            .finish()
+            .expect("trailing fragment at track end should succeed");
+        assert_eq!(reassembler.stats().trailing_fragment_bytes, 3);
+        assert_eq!(reassembler.stats().access_units, 1);
+    }
+
+
+    #[test]
+    fn mlp_reassembler_strict_rejects_nonzero_resync() {
+        let first = mlp_access_unit(8, 0x55);
+        let second = mlp_access_unit(8, 0x66);
+        let mut payload = vec![0, 0, 0x7E];
+        payload.extend_from_slice(&first);
+        payload.extend_from_slice(&second);
+
+        let mut out = Vec::new();
+        let mut reassembler = MlpAccessUnitReassembler::new(&mut out);
+        let err = reassembler
+            .push_payload(&payload)
+            .expect_err("strict mode should reject nonzero resync");
+        assert!(format!("{err}").contains("strict mode rejected nonzero resync"));
+    }
+
+    #[test]
+    fn mlp_reassembler_tolerant_resync_is_bounded_and_reported() {
+        let first = mlp_access_unit(8, 0x77);
+        let second = mlp_access_unit(8, 0x88);
+        let mut payload = vec![0, 0, 0x7E];
+        payload.extend_from_slice(&first);
+        payload.extend_from_slice(&second);
+
+        let mut out = Vec::new();
+        let mut reassembler = MlpAccessUnitReassembler::new_with_mode(
+            &mut out,
+            MlpReassemblyMode::Tolerant {
+                max_resync_bytes: 3,
+                max_resync_events: 1,
+            },
+        );
+        reassembler
+            .push_payload(&payload)
+            .expect("bounded tolerant resync should recover");
+        reassembler.finish().expect("recovered stream should finish");
+        let stats = reassembler.stats();
+        drop(reassembler);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&second);
+        assert_eq!(out, expected);
+        assert_eq!(stats.resync_events, 1);
+        assert_eq!(stats.resync_bytes, 3);
+        assert_eq!(stats.first_resync_reason, Some("invalid or zero MLP access-unit length"));
+    }
+
+    #[test]
+    fn mlp_reassembler_rejects_false_positive_length_resync() {
+        let payload = [0, 0, 0x7E, 0x00, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        let mut strict_out = Vec::new();
+        let mut strict = MlpAccessUnitReassembler::new(&mut strict_out);
+        let strict_err = strict
+            .push_payload(&payload)
+            .expect_err("strict mode should reject unsupported candidate");
+        assert!(format!("{strict_err}").contains("no verified access-unit start"));
+
+        let mut tolerant_out = Vec::new();
+        let mut tolerant = MlpAccessUnitReassembler::new_with_mode(
+            &mut tolerant_out,
+            MlpReassemblyMode::Tolerant {
+                max_resync_bytes: 16,
+                max_resync_events: 1,
+            },
+        );
+        let tolerant_err = tolerant
+            .push_payload(&payload)
+            .expect_err("tolerant mode also needs supporting frame evidence");
+        assert!(format!("{tolerant_err}").contains("no verified access-unit start"));
+    }
+
+    #[test]
+    fn mlp_reassembler_counts_trailing_fragment_bytes() {
+        let mut out = Vec::new();
+        let mut reassembler = MlpAccessUnitReassembler::new(&mut out);
+        reassembler
+            .push_payload(&[0x01, 0x00, 0xAA, 0xBB, 0xCC])
+            .expect("oversized declared length buffers until end of stream");
+        reassembler
+            .finish()
+            .expect("trailing fragment at track end should succeed");
+        assert_eq!(reassembler.stats().trailing_fragment_bytes, 5);
+    }
+
+    #[test]
+    fn mlp_reassembler_is_independent_of_packet_split_points() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&mlp_access_unit(8, 0x91));
+        stream.extend_from_slice(&mlp_access_unit(10, 0x92));
+        stream.extend_from_slice(&mlp_access_unit(12, 0x93));
+
+        for split in 0..=stream.len() {
+            let mut out = Vec::new();
+            let mut reassembler = MlpAccessUnitReassembler::new(&mut out);
+            reassembler
+                .push_payload(&stream[..split])
+                .expect("prefix should reassemble or carry");
+            reassembler
+                .push_payload(&stream[split..])
+                .expect("suffix should reassemble or carry");
+            reassembler.finish().expect("complete stream should finish");
+            drop(reassembler);
+            assert_eq!(out, stream, "split at {split}");
+        }
+    }
+
+    fn reassemble_aob_fixture_fragment(
+        name: &str,
+    ) -> (Vec<u8>, MlpAccessUnitReassemblyStats, DvdaDemuxStats) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dvda_mlp_fixture")
+            .join(name);
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        assert_eq!(bytes.len() % DVD_SECTOR_SIZE, 0, "fixture must contain whole sectors");
+
+        let mut demux_stats = DvdaDemuxStats::default();
+        let mut out = Vec::new();
+        let mut reassembler = MlpAccessUnitReassembler::new(&mut out);
+        for sector in bytes.chunks_exact(DVD_SECTOR_SIZE) {
+            let packets = parse_private_stream_1_packets(sector)
+                .unwrap_or_else(|err| panic!("{} failed to parse: {err}", path.display()));
+            record_private_stream_1_packets(&mut demux_stats, &packets);
+            for packet in packets {
+                if matches!(packet.sub_header.kind(), DvdaSubstreamKind::Mlp) {
+                    reassembler
+                        .push_packet(packet.sub_header, packet.payload)
+                        .unwrap_or_else(|err| panic!("{} failed to reassemble: {err}", path.display()));
+                }
+            }
+        }
+        let reassembly_stats = reassembler.stats();
+        drop(reassembler);
+        (out, reassembly_stats, demux_stats)
+    }
+
+    #[test]
+    fn bowie_first_100_sector_fixture_reassembles_without_resync() {
+        let (out, reassembly, demux) =
+            reassemble_aob_fixture_fragment("aob_sectors_0_99.bin");
+
+        assert_eq!(demux.sectors_seen, 100);
+        assert_eq!(demux.mlp_packets, 100);
+        assert_eq!(demux.mlp_payload_bytes, 200_479);
+        assert_eq!(reassembly.packets_seen, 100);
+        assert_eq!(reassembly.input_payload_bytes, 200_479);
+        assert_eq!(reassembly.access_units, 704);
+        assert_eq!(reassembly.framed_bytes, 200_350);
+        assert_eq!(out.len(), 200_350);
+        assert_eq!(reassembly.leading_fragment_bytes, 0);
+        assert_eq!(reassembly.padding_bytes, 0);
+        assert_eq!(reassembly.resync_events, 0);
+        assert_eq!(reassembly.resync_bytes, 0);
+        assert_eq!(&out[4..8], &MLP_MAJOR_SYNC_FBB);
+    }
+
+    #[test]
+    fn bowie_midstream_fixture_uses_packet_pointer_without_resync() {
+        let (out, reassembly, demux) =
+            reassemble_aob_fixture_fragment("aob_sectors_48191_48210.bin");
+
+        assert_eq!(demux.sectors_seen, 20);
+        assert_eq!(demux.mlp_packets, 20);
+        assert_eq!(demux.mlp_payload_bytes, 40_100);
+        assert_eq!(reassembly.packets_seen, 20);
+        assert_eq!(reassembly.input_payload_bytes, 40_100);
+        assert_eq!(reassembly.leading_fragment_bytes, 366);
+        assert_eq!(reassembly.access_units, 80);
+        assert_eq!(reassembly.framed_bytes, 39_694);
+        assert_eq!(out.len(), 39_694);
+        assert_eq!(reassembly.resync_events, 0);
+        assert_eq!(reassembly.resync_bytes, 0);
     }
 
     #[test]

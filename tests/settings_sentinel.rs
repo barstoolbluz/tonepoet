@@ -120,6 +120,7 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
         flac: FlacSettings {
             compression_level: 8,
             verify: true,
+            write_md5: true,
         },
         mp3: Mp3Settings {
             mode: Mp3Mode::Abr,
@@ -251,6 +252,8 @@ fn queue_format_for_settings(settings: &PipelineSettings) -> QueueAudioFormat {
         AudioFormat::Alac => QueueAudioFormat::Alac,
         AudioFormat::Dsf => QueueAudioFormat::Dsf,
         AudioFormat::Dff => QueueAudioFormat::Dff,
+        AudioFormat::Dts => QueueAudioFormat::Dts,
+        AudioFormat::Ac3 => QueueAudioFormat::Ac3,
         AudioFormat::Custom { .. } => QueueAudioFormat::Flac,
     }
 }

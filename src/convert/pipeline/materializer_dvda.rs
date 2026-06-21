@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -20,18 +20,25 @@ mod materializer_dvda_metabase;
 use self::materializer_dvda_metabase::DvdaTrackMetadataKeys;
 #[cfg(test)]
 use super::dvda_demux::DVD_SECTOR_SIZE;
+use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::errors::{MaterializeError, SourceDetectError};
 use super::reporter::PipelineReporter;
 use super::stages::Materializer;
 use super::tool::ToolRunner;
 use super::types::*;
-use crate::disc::dvda_utils::probe_group_aob_format_with_path;
+use crate::disc::dvda_utils::{
+    probe_samg_track_aob_format_with_path, probe_title_chapter_aob_format_with_path_outcome,
+    probe_title_chapter_aob_format_with_path_outcome_with_origin,
+    resolve_cross_ats_backing_aob_title_set, translate_cross_ats_aob_range, AobProbeOrigin,
+    AobProbeOutcome, CrossAtsAobSectorTranslation,
+};
+use crate::disc::model::AobProbeResult;
 use crate::tui::dvda::{
-    parse_dvda_volume, refine_copy_protection_from_aob_probe, AobFileEntry, AudioAttributes,
-    AudioChapter, AudioTitle, ChannelAssignment, ChannelFormat, CopyProtectionSource,
+    channel_assignment, parse_dvda_volume, refine_copy_protection_from_aob_probe, AobFileEntry, AudioAttributes,
+    AudioChapter, AudioTitle, AudioTitleTableEntry, ChannelAssignment, ChannelFormat, CopyProtectionSource,
     DirectoryDvdaVolume, DvdaDisc, DvdaError, DvdaFile, DvdaGroup, DvdaVolume, GroupCorrelation,
-    Iso9660DvdaVolume, IsoUdfDvdaVolume, SamgTrack, SamgTrackRef, SamgZone, TitleRef, TitleRefKind,
-    TitleSet,
+    Iso9660DvdaVolume, IsoUdfDvdaVolume, SamgTrack, SamgTrackRef, SamgZone, SectorRange,
+    TitleRef, TitleRefKind, TitleSet,
 };
 use crate::tui::dvda_metabase::{self, DvdaMetabase, LoadedDvdaMetabase};
 
@@ -54,8 +61,8 @@ impl Materializer for DvdaAudioMaterializer {
     async fn materialize(
         &self,
         req: &PipelineRequest,
-        _staging: &StagingDir,
-        _runner: &dyn ToolRunner,
+        staging: &StagingDir,
+        runner: &dyn ToolRunner,
         _reporter: Option<&dyn PipelineReporter>,
         _tool_paths: &HashMap<String, PathBuf>,
         cancel: &CancellationToken,
@@ -65,7 +72,7 @@ impl Materializer for DvdaAudioMaterializer {
         }
 
         let volume = open_dvda_volume_for_request(req)?;
-        materialize_prepared_source(req, volume.source_ref(), &volume, cancel)
+        materialize_prepared_source(req, volume.source_ref(), &volume, staging, runner, cancel).await
     }
 }
 
@@ -150,10 +157,12 @@ fn explicit_dvda_requested(req: &PipelineRequest) -> bool {
     req.source.explicit_dvda_requested()
 }
 
-fn materialize_prepared_source(
+async fn materialize_prepared_source(
     req: &PipelineRequest,
     volume_source: &DvdaVolumeSourceRef,
     volume: &dyn DvdaVolume,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<PreparedSource, MaterializeError> {
     if cancel.is_cancelled() {
@@ -204,6 +213,8 @@ fn materialize_prepared_source(
         });
     }
 
+    repair_unverified_audio_facts_from_realized_wav(&mut tracks, staging, runner, cancel).await?;
+
     Ok(prepared_source(
         req,
         &disc,
@@ -253,6 +264,255 @@ fn prepared_source(
             tool_versions,
             extracted_at: chrono::Utc::now(),
         },
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RealizedWavCarrierFacts {
+    sample_rate: u32,
+    channels: u8,
+}
+
+async fn repair_unverified_audio_facts_from_realized_wav(
+    tracks: &mut [PreparedTrack],
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    for index in 0..tracks.len() {
+        if cancel.is_cancelled() {
+            return Err(MaterializeError::Cancelled);
+        }
+        if !track_needs_realized_wav_audio_facts_validation(&tracks[index]) {
+            continue;
+        }
+
+        let source_ref = tracks[index].source_ref.clone();
+        let expectation = DvdaSourceAudioExpectation::from_prepared_track_and_source(
+            Some(&tracks[index]),
+            &source_ref,
+        );
+        let policy = DvdaRealizationAudioPolicy::new(
+            "source-audio-facts-repair".to_string(),
+            tracks[index].bit_depth,
+            DvdaDownmixPolicy::None,
+        );
+
+        let wav_path = realize_dvda_track(
+            &source_ref,
+            expectation,
+            policy,
+            staging,
+            runner,
+            cancel,
+            None,
+            None,
+        )
+        .await
+        .map_err(|err| {
+            MaterializeError::Extraction(format!(
+                "DVD-Audio could not realize track {} to validate stream-authored audio facts from the WAV carrier: {err}",
+                tracks[index].id.source_ordinal
+            ))
+        })?;
+        let carrier = read_realized_wav_carrier_facts(&wav_path).map_err(|err| {
+            MaterializeError::Extraction(format!(
+                "DVD-Audio realized WAV carrier probe failed for track {} at {}: {err}",
+                tracks[index].id.source_ordinal,
+                wav_path.display()
+            ))
+        })?;
+        apply_realized_wav_carrier_facts(&mut tracks[index], carrier);
+    }
+
+    Ok(())
+}
+
+fn track_needs_realized_wav_audio_facts_validation(track: &PreparedTrack) -> bool {
+    if !matches!(track.source_ref, TrackSourceRef::DvdaTrack { .. }) {
+        return false;
+    }
+
+    if track.scalar_sample_rate().is_none() {
+        return true;
+    }
+
+    !track_has_stream_authoritative_audio_facts(track)
+}
+
+fn track_has_stream_authoritative_audio_facts(track: &PreparedTrack) -> bool {
+    let extra = &track.metadata.extra;
+    if matches!(
+        extra.get("dvda_realized_wav_carrier_probe").map(String::as_str),
+        Some("true")
+    ) {
+        return true;
+    }
+
+    matches!(
+        extra.get("dvda_audio_format_resolution").map(String::as_str),
+        Some(label) if label == audio_format_resolution_label(AudioFormatResolution::StreamProbeOverride)
+    )
+}
+
+fn read_realized_wav_carrier_facts(path: &Path) -> Result<RealizedWavCarrierFacts, String> {
+    let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
+    let mut riff = [0_u8; 12];
+    file.read_exact(&mut riff).map_err(|err| err.to_string())?;
+    if (&riff[0..4] != b"RIFF" && &riff[0..4] != b"RF64") || &riff[8..12] != b"WAVE" {
+        return Err("not a RIFF/RF64 WAVE file".to_string());
+    }
+
+    loop {
+        let mut header = [0_u8; 8];
+        match file.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err("WAV fmt chunk not found".to_string());
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+        let chunk_id = &header[0..4];
+        let chunk_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if chunk_id == b"fmt " {
+            return read_wav_fmt_chunk(&mut file, chunk_size);
+        }
+        skip_wav_chunk_payload(&mut file, chunk_size).map_err(|err| err.to_string())?;
+    }
+}
+
+fn read_wav_fmt_chunk(
+    file: &mut fs::File,
+    chunk_size: u32,
+) -> Result<RealizedWavCarrierFacts, String> {
+    if chunk_size < 16 {
+        return Err(format!("WAV fmt chunk is too short: {chunk_size} bytes"));
+    }
+
+    let mut fmt = [0_u8; 16];
+    file.read_exact(&mut fmt).map_err(|err| err.to_string())?;
+    let channels = u16::from_le_bytes([fmt[2], fmt[3]]);
+    let sample_rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
+    if sample_rate == 0 {
+        return Err("WAV fmt chunk reports a zero sample rate".to_string());
+    }
+    if channels == 0 {
+        return Err("WAV fmt chunk reports zero channels".to_string());
+    }
+    let channels = u8::try_from(channels)
+        .map_err(|_| format!("WAV channel count {channels} exceeds supported range"))?;
+
+    let remaining = chunk_size - 16;
+    skip_wav_chunk_payload(file, remaining).map_err(|err| err.to_string())?;
+
+    Ok(RealizedWavCarrierFacts {
+        sample_rate,
+        channels,
+    })
+}
+
+fn skip_wav_chunk_payload(file: &mut fs::File, chunk_size: u32) -> std::io::Result<()> {
+    let padded = i64::from(chunk_size) + i64::from(chunk_size % 2);
+    file.seek(SeekFrom::Current(padded))?;
+    Ok(())
+}
+
+fn apply_realized_wav_carrier_facts(
+    track: &mut PreparedTrack,
+    carrier: RealizedWavCarrierFacts,
+) {
+    let source_bit_depth = track.source_audio.bit_depth.or(track.bit_depth);
+    track.sample_rate = Some(carrier.sample_rate);
+    track.expected_samples = dvda_track_len_in_pts(&track.source_ref)
+        .and_then(|len_in_pts| expected_samples_from_pts_len(len_in_pts, carrier.sample_rate));
+    track.source_audio = SourceAudioDescriptor {
+        coding: track.source_audio.coding.or(Some(SourceAudioCoding::DvdaUnknown)),
+        channel_groups: vec![ChannelGroupDescriptor {
+            group_nr: 1,
+            channels: Some(carrier.channels),
+            assignment: None,
+            sample_rate: Some(carrier.sample_rate),
+            bit_depth: source_bit_depth,
+        }],
+        primary_sample_rate: Some(carrier.sample_rate),
+        bit_depth: source_bit_depth,
+    };
+
+    if let TrackSourceRef::DvdaTrack {
+        expected_sample_rate,
+        expected_channel_count,
+        expected_bit_depth,
+        expected_channel_assignment_code,
+        expected_group1_sample_rate,
+        expected_group2_sample_rate,
+        expected_group1_bit_depth,
+        expected_group2_bit_depth,
+        expected_group1_channel_count,
+        expected_group2_channel_count,
+        ..
+    } = &mut track.source_ref
+    {
+        *expected_sample_rate = Some(carrier.sample_rate);
+        *expected_channel_count = Some(u32::from(carrier.channels));
+        *expected_bit_depth = (*expected_bit_depth).or(source_bit_depth);
+        *expected_channel_assignment_code = None;
+        *expected_group1_sample_rate = Some(carrier.sample_rate);
+        *expected_group2_sample_rate = None;
+        *expected_group1_bit_depth = (*expected_group1_bit_depth).or(source_bit_depth);
+        *expected_group2_bit_depth = None;
+        *expected_group1_channel_count = Some(u32::from(carrier.channels));
+        *expected_group2_channel_count = None;
+    }
+
+    rewrite_realized_wav_carrier_metadata(&mut track.metadata.extra, carrier, source_bit_depth);
+
+    log::warn!(
+        "DVD-Audio PreparedTrack {} audio facts validated from realized WAV carrier: sample_rate={} Hz, channels={}",
+        track.id.source_ordinal,
+        carrier.sample_rate,
+        carrier.channels
+    );
+}
+
+fn dvda_track_len_in_pts(source_ref: &TrackSourceRef) -> Option<u32> {
+    let TrackSourceRef::DvdaTrack { len_in_pts, .. } = source_ref else {
+        return None;
+    };
+    Some(*len_in_pts)
+}
+
+fn rewrite_realized_wav_carrier_metadata(
+    extra: &mut BTreeMap<String, String>,
+    carrier: RealizedWavCarrierFacts,
+    source_bit_depth: Option<u32>,
+) {
+    for key in [
+        "dvda_group1_sample_rate",
+        "dvda_group2_sample_rate",
+        "dvda_group1_bit_depth",
+        "dvda_group2_bit_depth",
+        "dvda_channel_assignment_code",
+        "dvda_channel_layout",
+        "dvda_channel_count",
+    ] {
+        extra.remove(key);
+    }
+
+    insert_nonempty(
+        extra,
+        "dvda_audio_format_resolution",
+        "realized_wav_carrier_probe".to_string(),
+    );
+    insert_nonempty(extra, "dvda_audio_format_known", "true".to_string());
+    insert_nonempty(extra, "dvda_realized_wav_carrier_probe", "true".to_string());
+    insert_nonempty(
+        extra,
+        "dvda_group1_sample_rate",
+        carrier.sample_rate.to_string(),
+    );
+    insert_nonempty(extra, "dvda_channel_count", carrier.channels.to_string());
+    if let Some(bits) = source_bit_depth {
+        insert_nonempty(extra, "dvda_group1_bit_depth", bits.to_string());
     }
 }
 
@@ -802,8 +1062,8 @@ fn authored_stereo_downmix_source_label(
     // SAMG-facing facts say "2 channels". On discs such as the Brothers in
     // Arms DVD-Audio, that stereo value describes the authored presentation,
     // while the reused/cross-ATS MLP carrier is still multichannel. This
-    // fallback is only for group ranking; extraction policy uses the probed MLP
-    // carrier result from disc-info.
+    // fallback is used for group ranking and, after an AOB probe has proved an
+    // MLP multichannel carrier, for the automatic extraction downmix policy.
     for sibling in &disc.groups {
         if sibling.group_nr == group.group_nr {
             continue;
@@ -843,6 +1103,7 @@ fn title_set_has_existing_aobs(title_set: &TitleSet) -> bool {
     title_set.aobs.iter().any(|aob| aob.exists)
 }
 
+#[allow(dead_code)]
 fn group_uses_disc_absolute_addressing(disc: &DvdaDisc, group: &DvdaGroup) -> bool {
     group.title_refs.iter().any(|title_ref| {
         find_title_set(disc, title_ref.title_set_nr)
@@ -868,6 +1129,537 @@ fn existing_aob_file_refs(title_set: &TitleSet) -> Vec<DvdaAobFileRef> {
         .filter(|aob| aob.exists)
         .map(aob_file_ref)
         .collect()
+}
+
+
+#[derive(Clone, Debug)]
+struct TitleSetAobResolution {
+    source_title_set_nr: u8,
+    resolved_title_set_nr: u8,
+    sector_address_space: DvdaSectorAddressSpace,
+    sector_translation: SectorRangeTranslation,
+    aob_files: Vec<DvdaAobFileRef>,
+    source_disc_absolute_base: Option<u32>,
+    resolved_disc_absolute_base: Option<u32>,
+}
+
+impl TitleSetAobResolution {
+    fn is_cross_ats(&self) -> bool {
+        matches!(
+            self.sector_address_space,
+            DvdaSectorAddressSpace::AtsAobRelative { title_set_nr }
+                if title_set_nr != self.source_title_set_nr
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SectorRangeTranslation {
+    Identity,
+    DiscAbsolute { base: u32 },
+    CrossAtsAob {
+        source_disc_absolute_base: u32,
+        resolved_disc_absolute_base: u32,
+    },
+}
+
+fn resolve_title_set_aob_resolution(
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    title_set: &TitleSet,
+    title: &AudioTitle,
+    samg_sector_correlation: Option<&SamgSectorCorrelation<'_>>,
+) -> Result<TitleSetAobResolution, MaterializeError> {
+    if title_set_has_existing_aobs(title_set) {
+        return Ok(TitleSetAobResolution {
+            source_title_set_nr: title_set.number,
+            resolved_title_set_nr: title_set.number,
+            sector_address_space: DvdaSectorAddressSpace::AtsAobRelative {
+                title_set_nr: title_set.number,
+            },
+            sector_translation: SectorRangeTranslation::Identity,
+            aob_files: existing_aob_file_refs(title_set),
+            source_disc_absolute_base: None,
+            resolved_disc_absolute_base: None,
+        });
+    }
+
+    let source_disc_absolute_base = title_disc_absolute_sector_base(
+        disc,
+        group,
+        title_ref,
+        title_set,
+        title,
+        samg_sector_correlation,
+    )
+    .ok_or_else(|| {
+        MaterializeError::Parse(format!(
+            "DVD-Audio ATS {} has no existing AOB files and no AMG/AOTT or SAMG sector base for group {} title {}",
+            title_set.number, group.group_nr, title.title_ordinal
+        ))
+    })?;
+
+    log::info!(
+        "DVD-Audio cross-ATS probe: ATS {} has_existing_aobs={} source_disc_absolute_base={} title_chapters={}",
+        title_set.number,
+        title_set_has_existing_aobs(title_set),
+        source_disc_absolute_base,
+        title.chapters.len(),
+    );
+    for (i, ch) in title.chapters.iter().enumerate().take(3) {
+        for sr in &ch.sector_ranges {
+            log::info!(
+                "DVD-Audio cross-ATS probe: ATS {} chapter {} sector_range: first={} last={}",
+                title_set.number, i, sr.first, sr.last,
+            );
+        }
+    }
+    if let Some(resolution) = resolve_cross_ats_aob_resolution(
+        disc,
+        title_set.number,
+        title,
+        source_disc_absolute_base,
+    )? {
+        log::info!(
+            "DVD-Audio cross-ATS resolution: ATS {} resolved to ATS {}",
+            title_set.number,
+            resolution.resolved_title_set_nr,
+        );
+        return Ok(resolution);
+    }
+    log::warn!(
+        "DVD-Audio cross-ATS resolution: ATS {} found no candidate ATS with matching AOB range",
+        title_set.number,
+    );
+
+    Ok(TitleSetAobResolution {
+        source_title_set_nr: title_set.number,
+        resolved_title_set_nr: title_set.number,
+        sector_address_space: DvdaSectorAddressSpace::DiscAbsolute {
+            title_set_nr: title_set.number,
+        },
+        sector_translation: SectorRangeTranslation::DiscAbsolute {
+            base: source_disc_absolute_base,
+        },
+        aob_files: Vec::new(),
+        source_disc_absolute_base: Some(source_disc_absolute_base),
+        resolved_disc_absolute_base: None,
+    })
+}
+
+
+fn resolve_cross_ats_aob_resolution(
+    disc: &DvdaDisc,
+    source_title_set_nr: u8,
+    title: &AudioTitle,
+    source_disc_absolute_base: u32,
+) -> Result<Option<TitleSetAobResolution>, MaterializeError> {
+    let Some(shared_resolution) = resolve_cross_ats_backing_aob_title_set(
+        disc,
+        source_title_set_nr,
+        title,
+        source_disc_absolute_base,
+    )
+    .map_err(MaterializeError::Parse)? else {
+        return Ok(None);
+    };
+
+    let sector_translation = match shared_resolution.sector_translation {
+        CrossAtsAobSectorTranslation::Identity => SectorRangeTranslation::Identity,
+        CrossAtsAobSectorTranslation::CrossAtsAob {
+            source_disc_absolute_base,
+            resolved_disc_absolute_base,
+        } => SectorRangeTranslation::CrossAtsAob {
+            source_disc_absolute_base,
+            resolved_disc_absolute_base,
+        },
+    };
+
+    log::info!(
+        "DVD-Audio cross-ATS: ATS {} ranges fit backing ATS {} using {:?} translation",
+        source_title_set_nr,
+        shared_resolution.resolved_title_set.number,
+        sector_translation,
+    );
+
+    Ok(Some(TitleSetAobResolution {
+        source_title_set_nr,
+        resolved_title_set_nr: shared_resolution.resolved_title_set.number,
+        sector_address_space: DvdaSectorAddressSpace::AtsAobRelative {
+            title_set_nr: shared_resolution.resolved_title_set.number,
+        },
+        sector_translation,
+        aob_files: existing_aob_file_refs(shared_resolution.resolved_title_set),
+        source_disc_absolute_base: Some(shared_resolution.source_disc_absolute_base),
+        resolved_disc_absolute_base: Some(shared_resolution.resolved_disc_absolute_base),
+    }))
+}
+
+fn title_set_aob_disc_absolute_base(disc: &DvdaDisc, title_set: &TitleSet) -> Option<u32> {
+    disc.amg
+        .audio_title_table
+        .iter()
+        .filter(|entry| entry.title_set_nr == title_set.number)
+        .filter_map(|entry| title_set_audio_vobs_disc_absolute_base(entry, title_set))
+        .min()
+}
+
+fn title_set_audio_vobs_disc_absolute_base(
+    aott_entry: &AudioTitleTableEntry,
+    title_set: &TitleSet,
+) -> Option<u32> {
+    // Contract: return the disc-absolute sector where this ATS's audio title
+    // VOB/AOB stream begins. The parser names ATSI_MAT offset 0xC0
+    // `atsm_vobs`; the Bowie David Live disc proves that this field can carry
+    // the already disc-absolute VOB start for an AOB-less audio ATS. In that
+    // case, do not add the AOTT ATSI_MAT sector again. When that field is not
+    // populated, use the parser's normal title-VOB offset model: AOTT
+    // ATSI_MAT sector plus `atstt_vobs`.
+    if title_set.header.atsm_vobs != 0 {
+        return Some(title_set.header.atsm_vobs);
+    }
+
+    u64::from(aott_entry.atsi_mat_sector)
+        .checked_add(u64::from(title_set.header.atstt_vobs))
+        .and_then(|base| u32::try_from(base).ok())
+}
+
+fn sector_ranges_for_translation(
+    chapter: &AudioChapter,
+    translation: SectorRangeTranslation,
+) -> Result<Vec<DvdaSectorRangeRef>, MaterializeError> {
+    chapter
+        .sector_ranges
+        .iter()
+        .map(|range| {
+            let first = translate_sector_for_materialized_range(
+                range.first,
+                translation,
+                chapter.track_nr,
+                range.index_nr,
+                "first",
+            )?;
+            let last = translate_sector_for_materialized_range(
+                range.last,
+                translation,
+                chapter.track_nr,
+                range.index_nr,
+                "last",
+            )?;
+            Ok(DvdaSectorRangeRef {
+                index_nr: range.index_nr,
+                first,
+                last,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct ResolvedTitleChapterAobProbeContext<'a> {
+    title_ref: TitleRef,
+    title_set: &'a TitleSet,
+    title: AudioTitle,
+    chapter: AudioChapter,
+}
+
+fn resolved_title_chapter_aob_probe_context<'a>(
+    disc: &'a DvdaDisc,
+    title_ref: &TitleRef,
+    title: &AudioTitle,
+    chapter: &AudioChapter,
+    aob_resolution: &TitleSetAobResolution,
+) -> Result<Option<ResolvedTitleChapterAobProbeContext<'a>>, MaterializeError> {
+    if !aob_resolution.is_cross_ats() {
+        return Ok(None);
+    }
+
+    let resolved_title_set = find_title_set(disc, aob_resolution.resolved_title_set_nr)?;
+    let translated_ranges = sector_ranges_for_translation(
+        chapter,
+        aob_resolution.sector_translation,
+    )?;
+
+    let mut resolved_chapter = chapter.clone();
+    resolved_chapter.sector_ranges = translated_ranges
+        .into_iter()
+        .map(|range| SectorRange {
+            index_nr: range.index_nr,
+            first: range.first,
+            last: range.last,
+        })
+        .collect();
+
+    let mut resolved_title = title.clone();
+    resolved_title.title_set_nr = resolved_title_set.number;
+    resolved_title.chapters = vec![resolved_chapter.clone()];
+
+    Ok(Some(ResolvedTitleChapterAobProbeContext {
+        title_ref: TitleRef {
+            title_set_nr: resolved_title_set.number,
+            title_nr: title_ref.title_nr,
+            kind: title_ref.kind.clone(),
+        },
+        title_set: resolved_title_set,
+        title: resolved_title,
+        chapter: resolved_chapter,
+    }))
+}
+
+
+#[derive(Debug)]
+struct MaterializedTitleStructure<'a> {
+    title_ref: TitleRef,
+    title_set: &'a TitleSet,
+    title: &'a AudioTitle,
+    aob_resolution: TitleSetAobResolution,
+    uses_backing_chapters: bool,
+}
+
+fn materialized_title_structure<'a>(
+    disc: &'a DvdaDisc,
+    title_ref: &TitleRef,
+    title_set: &'a TitleSet,
+    title: &'a AudioTitle,
+    aob_resolution: TitleSetAobResolution,
+) -> Result<MaterializedTitleStructure<'a>, MaterializeError> {
+    if !aob_resolution.is_cross_ats() {
+        return Ok(MaterializedTitleStructure {
+            title_ref: title_ref.clone(),
+            title_set,
+            title,
+            aob_resolution,
+            uses_backing_chapters: false,
+        });
+    }
+
+    let backing_title_set = find_title_set(disc, aob_resolution.resolved_title_set_nr)?;
+    let backing_title = find_cross_ats_backing_title(
+        title_ref,
+        title,
+        backing_title_set,
+        aob_resolution.source_title_set_nr,
+    )?;
+
+    let mut backing_resolution = aob_resolution.clone();
+    backing_resolution.sector_address_space = DvdaSectorAddressSpace::AtsAobRelative {
+        title_set_nr: backing_title_set.number,
+    };
+    backing_resolution.sector_translation = SectorRangeTranslation::Identity;
+    backing_resolution.aob_files = existing_aob_file_refs(backing_title_set);
+
+    log::info!(
+        "DVD-Audio cross-ATS stereo presentation: source ATS {} will use backing ATS {} title {} chapter boundaries ({} track(s))",
+        aob_resolution.source_title_set_nr,
+        backing_title_set.number,
+        backing_title.title_ordinal,
+        backing_title.chapters.len()
+    );
+
+    Ok(MaterializedTitleStructure {
+        title_ref: materialized_title_ref_for_backing_title(
+            title_ref,
+            backing_title_set,
+            backing_title,
+        ),
+        title_set: backing_title_set,
+        title: backing_title,
+        aob_resolution: backing_resolution,
+        uses_backing_chapters: true,
+    })
+}
+
+fn materialized_title_ref_for_backing_title(
+    source_title_ref: &TitleRef,
+    backing_title_set: &TitleSet,
+    backing_title: &AudioTitle,
+) -> TitleRef {
+    TitleRef {
+        title_set_nr: backing_title_set.number,
+        title_nr: match source_title_ref.kind {
+            TitleRefKind::AottTitleOrdinal => backing_title.title_ordinal,
+            TitleRefKind::AtsPgcTitleNr => backing_title.title_nr,
+        },
+        kind: source_title_ref.kind,
+    }
+}
+
+fn find_cross_ats_backing_title<'a>(
+    source_title_ref: &TitleRef,
+    source_title: &AudioTitle,
+    backing_title_set: &'a TitleSet,
+    source_title_set_nr: u8,
+) -> Result<&'a AudioTitle, MaterializeError> {
+    if let Some(title) = backing_title_set
+        .titles
+        .iter()
+        .find(|title| title.title_ordinal == source_title.title_ordinal)
+    {
+        return Ok(title);
+    }
+
+    if let Some(title) = backing_title_set
+        .titles
+        .iter()
+        .find(|title| title.title_nr == source_title.title_nr)
+    {
+        return Ok(title);
+    }
+
+    if let [title] = backing_title_set.titles.as_slice() {
+        return Ok(title);
+    }
+
+    Err(MaterializeError::Parse(format!(
+        "DVD-Audio cross-ATS source ATS {source_title_set_nr} {:?} title {} resolved to backing ATS {}, but no matching backing title was found",
+        source_title_ref.kind,
+        source_title_ref.title_nr,
+        backing_title_set.number
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
+    volume: &dyn DvdaVolume,
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    title_set: &TitleSet,
+    title: &AudioTitle,
+    chapter: &AudioChapter,
+    source_path: Option<&Path>,
+    aob_resolution: &TitleSetAobResolution,
+) -> Result<Option<AobProbeOutcome>, MaterializeError> {
+    if let Some(context) = resolved_title_chapter_aob_probe_context(
+        disc,
+        title_ref,
+        title,
+        chapter,
+        aob_resolution,
+    )? {
+        let outcome = probe_title_chapter_aob_format_with_path_outcome_with_origin(
+            volume,
+            disc,
+            group,
+            &context.title_ref,
+            context.title_set,
+            &context.title,
+            &context.chapter,
+            source_path,
+            AobProbeOrigin::cross_ats(
+                aob_resolution.source_title_set_nr,
+                aob_resolution.resolved_title_set_nr,
+            ),
+        );
+
+        match outcome.as_ref().and_then(|outcome| outcome.result.as_ref()) {
+            Some(probe) => {
+                log::debug!(
+                    "DVD-Audio cross-ATS stream probe for source ATS {} track {} used backing ATS {} AOB inventory and found codec={}, sample_rate={} Hz, channels={}",
+                    aob_resolution.source_title_set_nr,
+                    chapter.track_nr,
+                    context.title_set.number,
+                    probe.codec,
+                    probe.sample_rate,
+                    probe.channels
+                );
+            }
+            None => {
+                if let Some(outcome) = outcome.as_ref() {
+                    log::debug!(
+                        "DVD-Audio cross-ATS stream probe for source ATS {} track {} used backing ATS {} AOB inventory; result unavailable after {} sector(s), saw_mlp_packets={}, saw_lpcm_packets={}",
+                        aob_resolution.source_title_set_nr,
+                        chapter.track_nr,
+                        context.title_set.number,
+                        outcome.scanned_sectors,
+                        outcome.saw_mlp_packets,
+                        outcome.saw_lpcm_packets
+                    );
+                } else {
+                    log::debug!(
+                        "DVD-Audio cross-ATS stream probe for source ATS {} track {} used backing ATS {} AOB inventory but found no MLP/LPCM packets",
+                        aob_resolution.source_title_set_nr,
+                        chapter.track_nr,
+                        context.title_set.number
+                    );
+                }
+            }
+        }
+
+        return Ok(outcome);
+    }
+
+    Ok(probe_title_chapter_aob_format_with_path_outcome(
+        volume,
+        disc,
+        group,
+        title_ref,
+        title_set,
+        title,
+        chapter,
+        source_path,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_title_chapter_aob_format_with_resolved_aob_path(
+    volume: &dyn DvdaVolume,
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    title_set: &TitleSet,
+    title: &AudioTitle,
+    chapter: &AudioChapter,
+    source_path: Option<&Path>,
+    aob_resolution: &TitleSetAobResolution,
+) -> Result<Option<AobProbeResult>, MaterializeError> {
+    Ok(probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
+        volume,
+        disc,
+        group,
+        title_ref,
+        title_set,
+        title,
+        chapter,
+        source_path,
+        aob_resolution,
+    )?
+    .and_then(|outcome| outcome.result))
+}
+
+fn translate_sector_for_materialized_range(
+    sector: u32,
+    translation: SectorRangeTranslation,
+    track_nr: u8,
+    range_index: u8,
+    boundary_label: &str,
+) -> Result<u32, MaterializeError> {
+    match translation {
+        SectorRangeTranslation::Identity => Ok(sector),
+        SectorRangeTranslation::DiscAbsolute { base } => base.checked_add(sector).ok_or_else(|| {
+            MaterializeError::Parse(format!(
+                "DVD-Audio disc-absolute {boundary_label} sector overflowed for track {track_nr} range {range_index}"
+            ))
+        }),
+        SectorRangeTranslation::CrossAtsAob {
+            source_disc_absolute_base,
+            resolved_disc_absolute_base,
+        } => translate_cross_ats_aob_range(
+            sector,
+            sector,
+            CrossAtsAobSectorTranslation::CrossAtsAob {
+                source_disc_absolute_base,
+                resolved_disc_absolute_base,
+            },
+        )
+        .map(|(first, _)| first)
+        .ok_or_else(|| {
+            MaterializeError::Parse(format!(
+                "DVD-Audio cross-ATS {boundary_label} sector for track {track_nr} range {range_index} resolves before backing ATS AOB start"
+            ))
+        }),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1014,45 +1806,20 @@ fn title_disc_absolute_sector_base(
                 .find(|entry| entry.title_set_nr == title_ref.title_set_nr)
         })?;
 
-    let base = u64::from(aott_entry.atsi_mat_sector)
-        .checked_add(u64::from(title_set.header.atstt_vobs))?;
-    u32::try_from(base).ok()
+    title_set_audio_vobs_disc_absolute_base(aott_entry, title_set)
 }
 
+#[allow(dead_code)]
 fn sector_ranges_for_address_space(
     chapter: &AudioChapter,
     sector_base: Option<u32>,
 ) -> Result<Vec<DvdaSectorRangeRef>, MaterializeError> {
-    chapter
-        .sector_ranges
-        .iter()
-        .map(|range| {
-            let (first, last) = if let Some(base) = sector_base {
-                (
-                    base.checked_add(range.first).ok_or_else(|| {
-                        MaterializeError::Parse(format!(
-                            "DVD-Audio disc-absolute first sector overflowed for track {} range {}",
-                            chapter.track_nr, range.index_nr
-                        ))
-                    })?,
-                    base.checked_add(range.last).ok_or_else(|| {
-                        MaterializeError::Parse(format!(
-                            "DVD-Audio disc-absolute last sector overflowed for track {} range {}",
-                            chapter.track_nr, range.index_nr
-                        ))
-                    })?,
-                )
-            } else {
-                (range.first, range.last)
-            };
-            Ok(DvdaSectorRangeRef {
-                index_nr: range.index_nr,
-                first,
-                last,
-            })
-        })
-        .collect()
+    let translation = sector_base
+        .map(|base| SectorRangeTranslation::DiscAbsolute { base })
+        .unwrap_or(SectorRangeTranslation::Identity);
+    sector_ranges_for_translation(chapter, translation)
 }
+
 
 fn materializer_group_track_count(disc: &DvdaDisc, group: &DvdaGroup) -> usize {
     if !group.title_refs.is_empty() {
@@ -1167,42 +1934,15 @@ fn prepared_tracks_for_groups(
         if cancel.is_cancelled() {
             return Err(MaterializeError::Cancelled);
         }
-        let group_uses_disc_absolute = group_uses_disc_absolute_addressing(disc, group);
-        let disc_info_probe = if group_uses_disc_absolute
-            || matches!(requested_downmix_policy, DvdaDownmixPolicy::Auto)
-        {
-            let source_path = volume_source.original_container();
-            let source_path = source_path.is_file().then_some(source_path.as_path());
-            probe_group_aob_format_with_path(volume, disc, group, source_path)
-        } else {
-            None
-        };
-        let disc_info_downmix_source_label =
-            if matches!(requested_downmix_policy, DvdaDownmixPolicy::Auto) {
-                disc_info_probe.as_ref().and_then(|probe| {
-                    if probe.codec.eq_ignore_ascii_case("MLP") && probe.channels > 2 {
-                        probe.stereo_downmix_source_label.clone()
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            };
-        let disc_absolute_stream_kind_hint = group_uses_disc_absolute
-            .then(|| {
-                disc_info_probe
-                    .as_ref()
-                    .and_then(|probe| elementary_stream_kind_hint_from_codec(probe.codec.as_ref()))
-            })
-            .flatten();
+        let source_path = volume_source.original_container();
+        let source_path = source_path.is_file().then_some(source_path.as_path());
         append_tracks_for_group(
             volume_source,
+            volume,
+            source_path,
             disc,
             group,
             requested_downmix_policy,
-            disc_info_downmix_source_label.as_deref(),
-            disc_absolute_stream_kind_hint,
             metabase,
             &mut tracks,
             cancel,
@@ -1218,18 +1958,26 @@ fn prepared_tracks_for_groups(
 
 fn append_tracks_for_group(
     volume_source: &DvdaVolumeSourceRef,
+    volume: &dyn DvdaVolume,
+    source_path: Option<&Path>,
     disc: &DvdaDisc,
     group: &DvdaGroup,
     requested_downmix_policy: DvdaDownmixPolicy,
-    disc_info_downmix_source_label: Option<&str>,
-    disc_absolute_stream_kind_hint: Option<DvdaElementaryStreamKind>,
     metabase: Option<&DvdaMetabase>,
     tracks: &mut Vec<PreparedTrack>,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
     let start_len = tracks.len();
+    let mut group_stream_probe_cache = GroupStreamProbeCache::default();
 
     if !group.title_refs.is_empty() {
+        prime_group_mlp_probe_cache(
+            volume,
+            source_path,
+            disc,
+            group,
+            &mut group_stream_probe_cache,
+        )?;
         for title_ref in &group.title_refs {
             if cancel.is_cancelled() {
                 return Err(MaterializeError::Cancelled);
@@ -1238,22 +1986,24 @@ fn append_tracks_for_group(
             let title = find_title(title_set, title_ref)?;
             append_title_tracks(
                 volume_source,
+                volume,
+                source_path,
                 disc,
                 group,
                 title_ref,
                 title_set,
                 title,
                 requested_downmix_policy,
-                disc_info_downmix_source_label,
-                disc_absolute_stream_kind_hint,
                 metabase,
                 tracks,
                 start_len,
+                &mut group_stream_probe_cache,
             )?;
         }
     } else if !group.samg_tracks.is_empty() {
         append_samg_only_tracks(
             volume_source,
+            source_path,
             disc,
             group,
             requested_downmix_policy,
@@ -1272,70 +2022,133 @@ fn append_tracks_for_group(
     Ok(())
 }
 
-fn append_title_tracks(
-    volume_source: &DvdaVolumeSourceRef,
+
+fn prime_group_mlp_probe_cache(
+    volume: &dyn DvdaVolume,
+    source_path: Option<&Path>,
     disc: &DvdaDisc,
     group: &DvdaGroup,
-    title_ref: &TitleRef,
-    title_set: &TitleSet,
-    title: &AudioTitle,
-    requested_downmix_policy: DvdaDownmixPolicy,
-    disc_info_downmix_source_label: Option<&str>,
-    disc_absolute_stream_kind_hint: Option<DvdaElementaryStreamKind>,
-    metabase: Option<&DvdaMetabase>,
-    tracks: &mut Vec<PreparedTrack>,
-    group_start_len: usize,
+    cache: &mut GroupStreamProbeCache,
 ) -> Result<(), MaterializeError> {
-    let title_set_has_existing_aobs = title_set_has_existing_aobs(title_set);
-    let relative_aob_files = existing_aob_file_refs(title_set);
-    let samg_sector_correlation = if title_set_has_existing_aobs {
-        None
-    } else {
-        find_samg_sector_correlation(disc, title)
-    };
-    let disc_absolute_base = if title_set_has_existing_aobs {
-        None
-    } else {
-        Some(title_disc_absolute_sector_base(
+    if cache.has_mlp_facts() {
+        return Ok(());
+    }
+
+    for title_ref in &group.title_refs {
+        let title_set = find_title_set(disc, title_ref.title_set_nr)?;
+        let title = find_title(title_set, title_ref)?;
+        let samg_sector_correlation = if title_set_has_existing_aobs(title_set) {
+            None
+        } else {
+            find_samg_sector_correlation(disc, title)
+        };
+        let aob_resolution = resolve_title_set_aob_resolution(
             disc,
             group,
             title_ref,
             title_set,
             title,
             samg_sector_correlation.as_ref(),
-        ).ok_or_else(|| {
-            MaterializeError::Parse(format!(
-                "DVD-Audio ATS {} has no existing AOB files and no AMG/AOTT or SAMG sector base for group {} title {}",
-                title_set.number, group.group_nr, title.title_ordinal
-            ))
-        })?)
-    };
-    let sector_address_space = if title_set_has_existing_aobs {
-        DvdaSectorAddressSpace::AtsAobRelative {
-            title_set_nr: title_set.number,
+        )?;
+
+        for chapter in &title.chapters {
+            let outcome = probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
+                volume,
+                disc,
+                group,
+                title_ref,
+                title_set,
+                title,
+                chapter,
+                source_path,
+                &aob_resolution,
+            )?;
+            if let Some(outcome) = outcome.as_ref() {
+                cache.remember_probe_outcome(outcome);
+                if cache.has_mlp_facts() {
+                    log::debug!(
+                        "DVD-Audio stream probe primed group {} MLP facts from ATS {} track {}",
+                        group.group_nr,
+                        title_set.number,
+                        chapter.track_nr
+                    );
+                    return Ok(());
+                }
+            }
         }
+    }
+
+    Ok(())
+}
+
+fn append_title_tracks(
+    volume_source: &DvdaVolumeSourceRef,
+    volume: &dyn DvdaVolume,
+    source_path: Option<&Path>,
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    title_ref: &TitleRef,
+    title_set: &TitleSet,
+    title: &AudioTitle,
+    requested_downmix_policy: DvdaDownmixPolicy,
+    metabase: Option<&DvdaMetabase>,
+    tracks: &mut Vec<PreparedTrack>,
+    group_start_len: usize,
+    group_stream_probe_cache: &mut GroupStreamProbeCache,
+) -> Result<(), MaterializeError> {
+    let title_set_has_existing_aobs = title_set_has_existing_aobs(title_set);
+    let samg_sector_correlation = if title_set_has_existing_aobs {
+        None
     } else {
-        DvdaSectorAddressSpace::DiscAbsolute {
-            title_set_nr: title_set.number,
-        }
+        find_samg_sector_correlation(disc, title)
     };
-    let aob_files = if title_set_has_existing_aobs {
-        relative_aob_files
+    let authored_title_set = title_set;
+    let aob_resolution = resolve_title_set_aob_resolution(
+        disc,
+        group,
+        title_ref,
+        title_set,
+        title,
+        samg_sector_correlation.as_ref(),
+    )?;
+    let materialized = materialized_title_structure(
+        disc,
+        title_ref,
+        title_set,
+        title,
+        aob_resolution,
+    )?;
+    let MaterializedTitleStructure {
+        title_ref: materialized_title_ref,
+        title_set,
+        title,
+        aob_resolution,
+        uses_backing_chapters,
+    } = materialized;
+    let samg_sector_correlation = if uses_backing_chapters {
+        None
     } else {
-        Vec::new()
+        samg_sector_correlation
     };
-    let track_stream_kind_hint = if matches!(
+    let title_ref = &materialized_title_ref;
+    let sector_address_space = aob_resolution.sector_address_space;
+    let aob_files = aob_resolution.aob_files.clone();
+    let fallback_stream_kind_hint = if matches!(
         sector_address_space,
         DvdaSectorAddressSpace::DiscAbsolute { .. }
-    ) {
+    ) || aob_resolution.is_cross_ats()
+    {
         samg_sector_correlation
             .as_ref()
             .and_then(SamgSectorCorrelation::elementary_stream_kind_hint)
-            .or(disc_absolute_stream_kind_hint)
     } else {
         None
     };
-    let group_total_tracks = ats_group_track_count(disc, group);
+    let group_total_tracks = if uses_backing_chapters {
+        u32::try_from(title.chapters.len()).unwrap_or(u32::MAX)
+    } else {
+        ats_group_track_count(disc, group)
+    };
 
     for (chapter_index, chapter) in title.chapters.iter().enumerate() {
         if chapter.sector_ranges.is_empty() {
@@ -1351,7 +2164,14 @@ fn append_title_tracks(
         let correlated_samg_track = samg_sector_correlation
             .as_ref()
             .and_then(|correlation| correlation.track_for_chapter_index(chapter_index));
-        let audio_facts = correlated_samg_track
+        let matched_samg_track = if uses_backing_chapters {
+            None
+        } else {
+            correlated_samg_track.or_else(|| {
+                samg_track_for_group_ordinal(disc, group, group_track_ordinal)
+            })
+        };
+        let audio_facts = matched_samg_track
             .map(audio_facts_for_samg_track)
             .unwrap_or_else(|| audio_facts_for_title_chapter(title_set, chapter));
         // Orphan PGC titles share a title set with another title whose IFO
@@ -1363,14 +2183,82 @@ fn append_title_tracks(
         } else {
             audio_facts
         };
+        let track_probe_outcome = probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
+            volume,
+            disc,
+            group,
+            title_ref,
+            title_set,
+            title,
+            chapter,
+            source_path,
+            &aob_resolution,
+        )?;
+        let selected_stream_probe = select_stream_probe_for_track(
+            group,
+            title_set,
+            chapter,
+            track_probe_outcome.as_ref(),
+            group_stream_probe_cache,
+        );
+        if let Some(selected) = selected_stream_probe.as_ref() {
+            if matches!(selected.source, StreamProbeSelectionSource::Direct) {
+                if let Some(kind) = elementary_stream_kind_hint_from_probed_facts(selected.facts) {
+                    log::debug!(
+                        "DVD-Audio stream probe selected {} for group {} ATS {} track {}",
+                        match kind {
+                            DvdaElementaryStreamKind::Mlp => "MLP",
+                            DvdaElementaryStreamKind::Lpcm => "LPCM",
+                            DvdaElementaryStreamKind::DvdVideoLpcm => "DVD-Video LPCM",
+                        },
+                        group.group_nr,
+                        title_set.number,
+                        chapter.track_nr
+                    );
+                }
+            }
+        }
+        let audio_facts = audio_facts_with_stream_probe(
+            audio_facts,
+            selected_stream_probe.as_ref().map(|selected| selected.facts),
+        );
         let source_audio = source_audio_descriptor_for_facts(audio_facts);
+        let sector_ranges = sector_ranges_for_translation(
+            chapter,
+            aob_resolution.sector_translation,
+        )?;
         let aob_inventory_covers_track =
-            title_set_has_existing_aobs && sector_ranges_are_covered(chapter, &aob_files);
-        let sector_ranges = sector_ranges_for_address_space(chapter, disc_absolute_base)?;
+            !aob_files.is_empty() && sector_range_refs_are_covered(&sector_ranges, &aob_files);
+        let stream_downmix_source_label =
+            if matches!(requested_downmix_policy, DvdaDownmixPolicy::Auto) {
+                selected_stream_downmix_source_label(selected_stream_probe.as_ref()).or_else(|| {
+                    cross_ats_authored_stereo_downmix_source_label(
+                        disc,
+                        group,
+                        authored_title_set,
+                        &aob_resolution,
+                        selected_stream_probe.as_ref(),
+                    )
+                })
+            } else {
+                None
+            };
         let dvda_downmix_policy = resolve_dvda_track_downmix_policy(
             requested_downmix_policy,
-            disc_info_downmix_source_label,
+            stream_downmix_source_label.as_deref(),
         );
+        let track_stream_kind_hint = if matches!(
+            sector_address_space,
+            DvdaSectorAddressSpace::DiscAbsolute { .. }
+        ) || aob_resolution.is_cross_ats()
+        {
+            selected_stream_probe
+                .as_ref()
+                .and_then(|selected| elementary_stream_kind_hint_from_probed_facts(selected.facts))
+                .or(fallback_stream_kind_hint)
+        } else {
+            None
+        };
 
         tracks.push(PreparedTrack {
             id: TrackId {
@@ -1390,7 +2278,7 @@ fn append_title_tracks(
                 sector_ranges,
                 dvda_downmix_policy,
                 track_stream_kind_hint,
-                correlated_samg_track,
+                matched_samg_track,
                 aob_files.clone(),
             ),
             metadata: track_metadata(
@@ -1401,6 +2289,7 @@ fn append_title_tracks(
                 group_track_ordinal,
                 audio_facts,
                 aob_inventory_covers_track,
+                &aob_resolution,
                 source_ordinal,
                 group_total_tracks,
                 metabase,
@@ -1418,6 +2307,7 @@ fn append_title_tracks(
 
 fn append_samg_only_tracks(
     volume_source: &DvdaVolumeSourceRef,
+    source_path: Option<&Path>,
     disc: &DvdaDisc,
     group: &DvdaGroup,
     requested_downmix_policy: DvdaDownmixPolicy,
@@ -1430,6 +2320,8 @@ fn append_samg_only_tracks(
         }
 
         let samg_track = find_samg_track(disc, samg_ref)?;
+        let track_probe =
+            probe_samg_track_aob_format_with_path(disc, group, samg_track, source_path);
         let source_ordinal = tracks.len() as u32 + 1;
         tracks.push(prepared_track_from_samg_track(
             volume_source,
@@ -1439,6 +2331,10 @@ fn append_samg_only_tracks(
             source_ordinal,
             u32::from(samg_track.track_nr),
             resolve_non_auto_downmix_policy(requested_downmix_policy),
+            track_probe.as_ref().map(probed_audio_facts_from_probe),
+            track_probe
+                .as_ref()
+                .and_then(|probe| elementary_stream_kind_hint_from_codec(probe.codec.as_ref())),
         )?);
     }
 
@@ -1510,6 +2406,8 @@ fn prepared_track_from_samg_track(
     source_ordinal: u32,
     group_track_ordinal: u32,
     dvda_downmix_policy: DvdaDownmixPolicy,
+    probed_stream_audio: Option<ProbedStreamAudioFacts>,
+    elementary_stream_kind_hint: Option<DvdaElementaryStreamKind>,
 ) -> Result<PreparedTrack, MaterializeError> {
     if samg_track.abs_last_sector < samg_track.abs_first_sector {
         return Err(MaterializeError::Parse(format!(
@@ -1522,6 +2420,7 @@ fn prepared_track_from_samg_track(
     }
 
     let audio_facts = audio_facts_for_samg_track(samg_track);
+    let audio_facts = audio_facts_with_stream_probe(audio_facts, probed_stream_audio);
     let source_audio = source_audio_descriptor_for_facts(audio_facts);
 
     Ok(PreparedTrack {
@@ -1541,7 +2440,7 @@ fn prepared_track_from_samg_track(
             samg_track_nr: Some(samg_track.track_nr),
             samg_ordinal: Some(samg_track.ordinal),
             sector_address_space: DvdaSectorAddressSpace::SamgAbsolute,
-            elementary_stream_kind_hint: None,
+            elementary_stream_kind_hint,
             first_pts: samg_track.first_pts,
             len_in_pts: samg_track.len_in_pts,
             track_type: None,
@@ -1586,6 +2485,16 @@ fn prepared_track_from_samg_track(
         source_audio,
         bit_depth: audio_facts.bit_depth.map(u32::from),
     })
+}
+
+fn samg_track_for_group_ordinal<'a>(
+    disc: &'a DvdaDisc,
+    group: &DvdaGroup,
+    group_track_ordinal: u32,
+) -> Option<&'a SamgTrack> {
+    let index = usize::try_from(group_track_ordinal.checked_sub(1)?).ok()?;
+    let samg_ref = group.samg_tracks.get(index)?;
+    find_samg_track(disc, samg_ref).ok()
 }
 
 fn find_samg_track<'a>(
@@ -1687,6 +2596,24 @@ fn validate_sector_ranges_are_well_formed(
     Ok(())
 }
 
+fn dvda_sector_address_space_label(space: DvdaSectorAddressSpace) -> &'static str {
+    match space {
+        DvdaSectorAddressSpace::AtsAobRelative { .. } => "ats_aob_relative",
+        DvdaSectorAddressSpace::DiscAbsolute { .. } => "disc_absolute",
+        DvdaSectorAddressSpace::SamgAbsolute => "samg_absolute",
+    }
+}
+
+fn sector_range_refs_are_covered(
+    sector_ranges: &[DvdaSectorRangeRef],
+    aob_files: &[DvdaAobFileRef],
+) -> bool {
+    sector_ranges
+        .iter()
+        .all(|range| sector_range_is_covered(range.first, range.last, aob_files))
+}
+
+#[allow(dead_code)]
 fn sector_ranges_are_covered(chapter: &AudioChapter, aob_files: &[DvdaAobFileRef]) -> bool {
     chapter
         .sector_ranges
@@ -1717,6 +2644,233 @@ fn sector_range_is_covered(first: u32, last: u32, aob_files: &[DvdaAobFileRef]) 
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbedStreamCodec {
+    Mlp,
+    Lpcm,
+}
+
+impl ProbedStreamCodec {
+    fn from_label(label: &str) -> Option<Self> {
+        if label.eq_ignore_ascii_case("MLP") {
+            Some(Self::Mlp)
+        } else if label.eq_ignore_ascii_case("LPCM") {
+            Some(Self::Lpcm)
+        } else {
+            None
+        }
+    }
+
+    const fn elementary_stream_kind(self) -> DvdaElementaryStreamKind {
+        match self {
+            Self::Mlp => DvdaElementaryStreamKind::Mlp,
+            Self::Lpcm => DvdaElementaryStreamKind::Lpcm,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbedStreamAudioFacts {
+    codec: Option<ProbedStreamCodec>,
+    sample_rate: u32,
+    bit_depth: Option<u8>,
+    channels: Option<u8>,
+    channel_assignment_code: Option<u8>,
+    mlp_num_substreams: Option<u32>,
+    mlp_num_substreams_source: Option<MlpSubstreamFactSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MlpSubstreamFactSource {
+    DirectTrackProbe,
+    InheritedGroupProbe,
+}
+
+impl MlpSubstreamFactSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectTrackProbe => "direct-track-major-sync-probe",
+            Self::InheritedGroupProbe => "inherited-group-major-sync-probe",
+        }
+    }
+}
+
+impl ProbedStreamAudioFacts {
+    const fn with_inherited_mlp_substream_source(mut self) -> Self {
+        if self.mlp_num_substreams.is_some() {
+            self.mlp_num_substreams_source = Some(MlpSubstreamFactSource::InheritedGroupProbe);
+        }
+        self
+    }
+}
+
+fn probed_audio_facts_from_probe(probe: &AobProbeResult) -> ProbedStreamAudioFacts {
+    ProbedStreamAudioFacts {
+        codec: ProbedStreamCodec::from_label(probe.codec.as_ref()),
+        sample_rate: probe.sample_rate,
+        bit_depth: u8::try_from(probe.bit_depth).ok(),
+        channels: Some(probe.channels),
+        channel_assignment_code: Some(probe.channel_assignment_code),
+        mlp_num_substreams: probe.mlp_num_substreams,
+        mlp_num_substreams_source: probe
+            .mlp_num_substreams
+            .map(|_| MlpSubstreamFactSource::DirectTrackProbe),
+    }
+}
+
+fn elementary_stream_kind_hint_from_probed_facts(
+    facts: ProbedStreamAudioFacts,
+) -> Option<DvdaElementaryStreamKind> {
+    facts.codec.map(ProbedStreamCodec::elementary_stream_kind)
+}
+
+fn stream_probe_downmix_source_label(probe: &AobProbeResult) -> Option<&str> {
+    if probe.codec.eq_ignore_ascii_case("MLP") && probe.channels > 2 {
+        probe.stereo_downmix_source_label.as_deref()
+    } else {
+        None
+    }
+}
+
+fn selected_stream_downmix_source_label(
+    selected_stream_probe: Option<&SelectedStreamProbe>,
+) -> Option<String> {
+    selected_stream_probe
+        .and_then(|selected| selected.downmix_source_label.as_deref())
+        .map(str::to_string)
+}
+
+fn cross_ats_authored_stereo_downmix_source_label(
+    disc: &DvdaDisc,
+    group: &DvdaGroup,
+    authored_title_set: &TitleSet,
+    aob_resolution: &TitleSetAobResolution,
+    selected_stream_probe: Option<&SelectedStreamProbe>,
+) -> Option<String> {
+    if !aob_resolution.is_cross_ats() || !title_set_presents_stereo(authored_title_set) {
+        return None;
+    }
+
+    let selected = selected_stream_probe?;
+    if !matches!(selected.facts.codec, Some(ProbedStreamCodec::Mlp)) {
+        return None;
+    }
+    let channels = selected.facts.channels?;
+    if channels <= 2 {
+        return None;
+    }
+
+    disc.groups
+        .iter()
+        .find(|candidate| {
+            candidate.group_nr != group.group_nr
+                && candidate
+                    .title_refs
+                    .iter()
+                    .any(|title_ref| title_ref.title_set_nr == aob_resolution.resolved_title_set_nr)
+        })
+        .map(|backing_group| {
+            multichannel_group_label(disc, backing_group, Some(channels))
+        })
+        .or_else(|| Some(format!("{}ch", channels)))
+}
+
+fn title_set_presents_stereo(title_set: &TitleSet) -> bool {
+    present_audio_formats(title_set).iter().any(|attr| {
+        attr.channel_format
+            .total_channels(attr.channel_assignment.as_ref())
+            == Some(2)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamProbeSelectionSource {
+    Direct,
+    InheritedGroupMlp,
+}
+
+#[derive(Clone, Debug)]
+struct SelectedStreamProbe {
+    facts: ProbedStreamAudioFacts,
+    downmix_source_label: Option<String>,
+    origin: AobProbeOrigin,
+    source: StreamProbeSelectionSource,
+}
+
+#[derive(Default)]
+struct GroupStreamProbeCache {
+    mlp_facts: Option<ProbedStreamAudioFacts>,
+    mlp_downmix_source_label: Option<String>,
+    mlp_origin: Option<AobProbeOrigin>,
+}
+
+impl GroupStreamProbeCache {
+    fn has_mlp_facts(&self) -> bool {
+        self.mlp_facts.is_some()
+    }
+
+    fn remember_probe_outcome(&mut self, outcome: &AobProbeOutcome) {
+        let Some(probe) = outcome.result.as_ref() else {
+            return;
+        };
+        let facts = probed_audio_facts_from_probe(probe);
+        if matches!(facts.codec, Some(ProbedStreamCodec::Mlp)) {
+            self.mlp_facts = Some(facts);
+            self.mlp_downmix_source_label =
+                stream_probe_downmix_source_label(probe).map(str::to_string);
+            self.mlp_origin = Some(outcome.origin.clone());
+        }
+    }
+}
+
+fn select_stream_probe_for_track(
+    group: &DvdaGroup,
+    title_set: &TitleSet,
+    chapter: &AudioChapter,
+    outcome: Option<&AobProbeOutcome>,
+    cache: &mut GroupStreamProbeCache,
+) -> Option<SelectedStreamProbe> {
+    if let Some(outcome) = outcome {
+        if let Some(probe) = outcome.result.as_ref() {
+            let facts = probed_audio_facts_from_probe(probe);
+            let downmix_source_label =
+                stream_probe_downmix_source_label(probe).map(str::to_string);
+            cache.remember_probe_outcome(outcome);
+            return Some(SelectedStreamProbe {
+                facts,
+                downmix_source_label,
+                origin: outcome.origin.clone(),
+                source: StreamProbeSelectionSource::Direct,
+            });
+        }
+    }
+
+    let outcome = outcome?;
+    if !outcome.saw_mlp_packets || outcome.saw_lpcm_packets {
+        return None;
+    }
+
+    let facts = cache.mlp_facts?.with_inherited_mlp_substream_source();
+    if !matches!(facts.codec, Some(ProbedStreamCodec::Mlp)) {
+        return None;
+    }
+
+    log::warn!(
+        "DVD-Audio stream probe for group {} ATS {} track {} saw MLP packets but no major sync in {} sector(s); inheriting MLP format from another track in the same group",
+        group.group_nr,
+        title_set.number,
+        chapter.track_nr,
+        outcome.scanned_sectors
+    );
+
+    Some(SelectedStreamProbe {
+        facts,
+        downmix_source_label: cache.mlp_downmix_source_label.clone(),
+        origin: cache.mlp_origin.clone()?,
+        source: StreamProbeSelectionSource::InheritedGroupMlp,
+    })
+}
+
 #[derive(Clone, Copy)]
 struct AudioFacts<'a> {
     format_index: Option<u8>,
@@ -1725,6 +2879,7 @@ struct AudioFacts<'a> {
     channel_assignment: Option<&'a ChannelAssignment>,
     sample_rate: Option<u32>,
     bit_depth: Option<u8>,
+    stream_probe: Option<ProbedStreamAudioFacts>,
     resolution: AudioFormatResolution,
 }
 
@@ -1735,6 +2890,7 @@ enum AudioFormatResolution {
     TrackTypeAudioFormatIndex,
     MultiplePresentFormats,
     SamgTrackRecord,
+    StreamProbeOverride,
 }
 
 #[allow(dead_code)]
@@ -1800,6 +2956,7 @@ fn audio_facts_from_attr(
         channel_assignment: attr.channel_assignment.as_ref(),
         sample_rate: primary_sample_rate(&attr.channel_format),
         bit_depth: primary_bit_depth(&attr.channel_format),
+        stream_probe: None,
         resolution,
     }
 }
@@ -1812,7 +2969,66 @@ fn unknown_audio_facts<'a>(resolution: AudioFormatResolution) -> AudioFacts<'a> 
         channel_assignment: None,
         sample_rate: None,
         bit_depth: None,
+        stream_probe: None,
         resolution,
+    }
+}
+
+fn audio_facts_with_stream_probe<'a>(
+    audio_facts: AudioFacts<'a>,
+    probed_stream_audio: Option<ProbedStreamAudioFacts>,
+) -> AudioFacts<'a> {
+    let Some(probed) = probed_stream_audio else {
+        return audio_facts;
+    };
+
+    let sample_rate = Some(probed.sample_rate);
+    let bit_depth = probed.bit_depth;
+    let scalar_mismatch =
+        audio_facts.sample_rate != sample_rate || audio_facts.bit_depth != bit_depth;
+    let channel_count_mismatch = match (
+        audio_facts.channel_assignment.map(channel_count),
+        probed.channels,
+    ) {
+        (Some(expected), Some(actual)) => expected != actual,
+        _ => false,
+    };
+    let assignment_mismatch = match (
+        audio_facts.channel_format.map(|format| format.assignment_code),
+        probed.channel_assignment_code,
+    ) {
+        (Some(expected), Some(actual)) => expected != actual,
+        _ => false,
+    };
+    let stale_channel_facts_present =
+        audio_facts.channel_format.is_some() || audio_facts.channel_assignment.is_some();
+
+    if scalar_mismatch || channel_count_mismatch || assignment_mismatch {
+        log::warn!(
+            "DVD-Audio stream probe overrides IFO/SAMG audio facts: sample_rate={:?}->{:?}, bit_depth={:?}->{:?}, channels={:?}->{:?}, assignment_code={:?}->{:?}; clearing IFO/SAMG channel-group expectations",
+            audio_facts.sample_rate,
+            sample_rate,
+            audio_facts.bit_depth,
+            bit_depth,
+            audio_facts.channel_assignment.map(channel_count),
+            probed.channels,
+            audio_facts.channel_format.map(|format| format.assignment_code),
+            probed.channel_assignment_code
+        );
+    } else if stale_channel_facts_present || audio_facts.stream_probe != Some(probed) {
+        log::debug!(
+            "DVD-Audio stream probe confirms IFO/SAMG scalar facts; using stream-authored channel-group expectations"
+        );
+    }
+
+    AudioFacts {
+        channel_format: None,
+        channel_assignment: None,
+        sample_rate,
+        bit_depth,
+        stream_probe: Some(probed),
+        resolution: AudioFormatResolution::StreamProbeOverride,
+        ..audio_facts
     }
 }
 
@@ -1824,11 +3040,16 @@ fn audio_facts_for_samg_track(track: &SamgTrack) -> AudioFacts<'_> {
         channel_assignment: track.channel_assignment.as_ref(),
         sample_rate: primary_sample_rate(&track.channel_format),
         bit_depth: primary_bit_depth(&track.channel_format),
+        stream_probe: None,
         resolution: AudioFormatResolution::SamgTrackRecord,
     }
 }
 
 fn expected_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    if let Some(probed) = audio_facts.stream_probe {
+        return probed.channels.map(u32::from);
+    }
+
     audio_facts.channel_assignment.and_then(|assignment| {
         let channels = channel_count(assignment);
         (channels > 0).then_some(u32::from(channels))
@@ -1836,24 +3057,40 @@ fn expected_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> 
 }
 
 fn expected_channel_assignment_code_for_facts(audio_facts: AudioFacts<'_>) -> Option<u8> {
+    if let Some(probed) = audio_facts.stream_probe {
+        return probed.channel_assignment_code;
+    }
+
     audio_facts
         .channel_format
         .map(|format| format.assignment_code)
 }
 
 fn expected_group1_sample_rate_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    if let Some(probed) = audio_facts.stream_probe {
+        return Some(probed.sample_rate);
+    }
+
     audio_facts
         .channel_format
         .and_then(|format| format.group1_sample_rate)
 }
 
 fn expected_group2_sample_rate_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    if audio_facts.stream_probe.is_some() {
+        return None;
+    }
+
     audio_facts
         .channel_format
         .and_then(|format| format.group2_sample_rate)
 }
 
 fn expected_group1_bit_depth_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    if let Some(probed) = audio_facts.stream_probe {
+        return probed.bit_depth.map(u32::from);
+    }
+
     audio_facts
         .channel_format
         .and_then(|format| format.group1_bits)
@@ -1861,6 +3098,10 @@ fn expected_group1_bit_depth_for_facts(audio_facts: AudioFacts<'_>) -> Option<u3
 }
 
 fn expected_group2_bit_depth_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    if audio_facts.stream_probe.is_some() {
+        return None;
+    }
+
     audio_facts
         .channel_format
         .and_then(|format| format.group2_bits)
@@ -1868,18 +3109,35 @@ fn expected_group2_bit_depth_for_facts(audio_facts: AudioFacts<'_>) -> Option<u3
 }
 
 fn expected_group1_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    if let Some(probed) = audio_facts.stream_probe {
+        return probed.channels.map(u32::from);
+    }
+
     audio_facts.channel_assignment.and_then(|assignment| {
         (assignment.group1_channels > 0).then_some(u32::from(assignment.group1_channels))
     })
 }
 
 fn expected_group2_channel_count_for_facts(audio_facts: AudioFacts<'_>) -> Option<u32> {
+    if audio_facts.stream_probe.is_some() {
+        return None;
+    }
+
     audio_facts.channel_assignment.and_then(|assignment| {
         (assignment.group2_channels > 0).then_some(u32::from(assignment.group2_channels))
     })
 }
 
 fn source_audio_descriptor_for_facts(audio_facts: AudioFacts<'_>) -> SourceAudioDescriptor {
+    if let Some(probed) = audio_facts.stream_probe {
+        return SourceAudioDescriptor {
+            coding: Some(SourceAudioCoding::DvdaUnknown),
+            channel_groups: stream_probe_channel_group_descriptors(probed),
+            primary_sample_rate: Some(probed.sample_rate),
+            bit_depth: probed.bit_depth.map(u32::from),
+        };
+    }
+
     let channel_groups = audio_facts
         .channel_format
         .map(|format| channel_group_descriptors(format, audio_facts.channel_assignment))
@@ -1891,6 +3149,27 @@ fn source_audio_descriptor_for_facts(audio_facts: AudioFacts<'_>) -> SourceAudio
         primary_sample_rate: audio_facts.sample_rate,
         bit_depth: audio_facts.bit_depth.map(u32::from),
     }
+}
+
+fn stream_probe_channel_group_descriptors(
+    probed: ProbedStreamAudioFacts,
+) -> Vec<ChannelGroupDescriptor> {
+    let assignment = probed.channel_assignment_code.and_then(channel_assignment);
+    let channels = probed
+        .channels
+        .or_else(|| assignment.as_ref().map(channel_count));
+    let assignment_label = assignment.as_ref().map(channel_layout);
+
+    let mut groups = Vec::new();
+    maybe_push_channel_group(
+        &mut groups,
+        1,
+        Some(probed.sample_rate),
+        probed.bit_depth,
+        channels,
+        assignment_label,
+    );
+    groups
 }
 
 fn channel_group_descriptors(
@@ -1947,21 +3226,11 @@ fn channel_assignment_label(channels: &[&str]) -> Option<String> {
 }
 
 fn primary_sample_rate(format: &ChannelFormat) -> Option<u32> {
-    match (format.group1_sample_rate, format.group2_sample_rate) {
-        (Some(group1), Some(group2)) if group1 != group2 => None,
-        (Some(group1), _) => Some(group1),
-        (None, Some(group2)) => Some(group2),
-        (None, None) => None,
-    }
+    format.group1_sample_rate.or(format.group2_sample_rate)
 }
 
 fn primary_bit_depth(format: &ChannelFormat) -> Option<u8> {
-    match (format.group1_bits, format.group2_bits) {
-        (Some(group1), Some(group2)) if group1 != group2 => None,
-        (Some(group1), _) => Some(group1),
-        (None, Some(group2)) => Some(group2),
-        (None, None) => None,
-    }
+    format.group1_bits.or(format.group2_bits)
 }
 
 fn audio_format_resolution_label(resolution: AudioFormatResolution) -> &'static str {
@@ -1973,7 +3242,12 @@ fn audio_format_resolution_label(resolution: AudioFormatResolution) -> &'static 
             "multiple_present_formats_unknown_until_aob_demux"
         }
         AudioFormatResolution::SamgTrackRecord => "samg_track_record",
+        AudioFormatResolution::StreamProbeOverride => "stream_probe_override",
     }
+}
+
+fn audio_format_known_for_facts(audio_facts: AudioFacts<'_>) -> bool {
+    audio_facts.format_index.is_some() || audio_facts.stream_probe.is_some()
 }
 
 fn expected_samples_from_pts(chapter: &AudioChapter, sample_rate: u32) -> Option<u64> {
@@ -2223,6 +3497,7 @@ fn track_metadata(
     group_track_ordinal: u32,
     audio_facts: AudioFacts<'_>,
     aob_inventory_covers_track: bool,
+    aob_resolution: &TitleSetAobResolution,
     source_ordinal: u32,
     total_tracks: u32,
     metabase: Option<&DvdaMetabase>,
@@ -2238,9 +3513,27 @@ fn track_metadata(
     insert_nonempty(
         &mut extra,
         "dvda_sector_address_space",
-        "ats_aob_relative".to_string(),
+        dvda_sector_address_space_label(aob_resolution.sector_address_space).to_string(),
     );
     insert_nonempty(&mut extra, "dvda_title_set", title_set.number.to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_resolved_aob_title_set",
+        aob_resolution.resolved_title_set_nr.to_string(),
+    );
+    if aob_resolution.source_title_set_nr != title_set.number {
+        insert_nonempty(
+            &mut extra,
+            "dvda_authored_presentation_title_set",
+            aob_resolution.source_title_set_nr.to_string(),
+        );
+    }
+    if let Some(base) = aob_resolution.source_disc_absolute_base {
+        insert_nonempty(&mut extra, "dvda_source_disc_absolute_base", base.to_string());
+    }
+    if let Some(base) = aob_resolution.resolved_disc_absolute_base {
+        insert_nonempty(&mut extra, "dvda_resolved_disc_absolute_base", base.to_string());
+    }
     insert_nonempty(&mut extra, "dvda_title_nr", title.title_nr.to_string());
     insert_nonempty(
         &mut extra,
@@ -2296,7 +3589,7 @@ fn track_metadata(
     insert_nonempty(
         &mut extra,
         "dvda_audio_format_known",
-        audio_facts.format_index.is_some().to_string(),
+        audio_format_known_for_facts(audio_facts).to_string(),
     );
     insert_nonempty(
         &mut extra,
@@ -2304,8 +3597,9 @@ fn track_metadata(
         audio_format_resolution_label(audio_facts.resolution).to_string(),
     );
     if let Some(attr) = audio_facts.attr {
-        insert_audio_attributes(&mut extra, attr);
+        insert_audio_type_raw(&mut extra, attr);
     }
+    insert_audio_facts(&mut extra, audio_facts);
 
     let base = TrackMetadata {
         title: None,
@@ -2338,8 +3632,12 @@ fn track_metadata(
             sample_rate: audio_facts.sample_rate,
             bit_depth: audio_facts.bit_depth.map(u32::from),
             channel_count: expected_channel_count_for_facts(audio_facts).map(|c| c as u8),
-            codec: audio_facts.attr.map(|_| "DVD-Audio".to_string()),
-            channel_layout: audio_facts.channel_assignment.map(channel_layout),
+            codec: if audio_facts.attr.is_some() || audio_facts.stream_probe.is_some() {
+                Some("DVD-Audio".to_string())
+            } else {
+                None
+            },
+            channel_layout: channel_layout_for_facts(audio_facts),
         },
         metabase,
     )
@@ -2410,17 +3708,17 @@ fn samg_track_metadata(
         "dvda_aob_inventory_covers_track",
         "false".to_string(),
     );
-    insert_nonempty(&mut extra, "dvda_audio_format_known", "false".to_string());
+    insert_nonempty(
+        &mut extra,
+        "dvda_audio_format_known",
+        audio_format_known_for_facts(audio_facts).to_string(),
+    );
     insert_nonempty(
         &mut extra,
         "dvda_audio_format_resolution",
         audio_format_resolution_label(audio_facts.resolution).to_string(),
     );
-    insert_channel_format(
-        &mut extra,
-        &track.channel_format,
-        track.channel_assignment.as_ref(),
-    );
+    insert_audio_facts(&mut extra, audio_facts);
 
     TrackMetadata {
         title: None,
@@ -2441,17 +3739,57 @@ fn samg_track_metadata(
     }
 }
 
-fn insert_audio_attributes(extra: &mut BTreeMap<String, String>, attr: &AudioAttributes) {
+fn insert_audio_type_raw(extra: &mut BTreeMap<String, String>, attr: &AudioAttributes) {
     insert_nonempty(
         extra,
         "dvda_audio_type_raw",
         format!("0x{:04x}", attr.audio_type_raw),
     );
-    insert_channel_format(
-        extra,
-        &attr.channel_format,
-        attr.channel_assignment.as_ref(),
-    );
+}
+
+fn insert_audio_facts(extra: &mut BTreeMap<String, String>, audio_facts: AudioFacts<'_>) {
+    if let Some(probed) = audio_facts.stream_probe {
+        insert_stream_probe_channel_format(extra, probed);
+        return;
+    }
+
+    if let Some(format) = audio_facts.channel_format {
+        insert_channel_format(extra, format, audio_facts.channel_assignment);
+    }
+}
+
+fn insert_stream_probe_channel_format(
+    extra: &mut BTreeMap<String, String>,
+    probed: ProbedStreamAudioFacts,
+) {
+    let assignment = probed.channel_assignment_code.and_then(channel_assignment);
+    let channels = probed
+        .channels
+        .or_else(|| assignment.as_ref().map(channel_count));
+
+    insert_nonempty(extra, "dvda_group1_sample_rate", probed.sample_rate.to_string());
+    if let Some(bits) = probed.bit_depth {
+        insert_nonempty(extra, "dvda_group1_bit_depth", bits.to_string());
+    }
+    if let Some(code) = probed.channel_assignment_code {
+        insert_nonempty(extra, "dvda_channel_assignment_code", code.to_string());
+    }
+    if let Some(channels) = channels {
+        insert_nonempty(extra, "dvda_channel_count", channels.to_string());
+    }
+    if let Some(num_substreams) = probed.mlp_num_substreams {
+        insert_nonempty(extra, "dvda_mlp_num_substreams", num_substreams.to_string());
+        if let Some(source) = probed.mlp_num_substreams_source {
+            insert_nonempty(
+                extra,
+                "dvda_mlp_num_substreams_source",
+                source.as_str().to_string(),
+            );
+        }
+    }
+    if let Some(assignment) = assignment.as_ref() {
+        insert_nonempty(extra, "dvda_channel_layout", channel_layout(assignment));
+    }
 }
 
 fn insert_channel_format(
@@ -2507,6 +3845,17 @@ fn sector_block_count(chapter: &AudioChapter) -> u64 {
         .iter()
         .map(|range| u64::from(range.block_count()))
         .sum()
+}
+
+fn channel_layout_for_facts(audio_facts: AudioFacts<'_>) -> Option<String> {
+    if let Some(probed) = audio_facts.stream_probe {
+        return probed
+            .channel_assignment_code
+            .and_then(channel_assignment)
+            .map(|assignment| channel_layout(&assignment));
+    }
+
+    audio_facts.channel_assignment.map(channel_layout)
 }
 
 fn channel_count(assignment: &ChannelAssignment) -> u8 {
@@ -2638,9 +3987,12 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::pipeline::dvda_demux::{
+        MLP_EXTRA_HEADER_LENGTH, MLP_STREAM_ID, PACK_START_CODE, PRIVATE_STREAM_1,
+    };
     use crate::tui::dvda::{
-        AmgInfo, AmgPointers, AtsiHeader, AudioCoding, CopyProtectionInfo, CopyProtectionSource,
-        SamgCopyValidation, SamgInfo, TitleSetKind,
+        AmgInfo, AmgPointers, AtsiHeader, AudioCoding, AudioPlaybackType, AudioTitleTableEntry,
+        CopyProtectionInfo, CopyProtectionSource, SamgCopyValidation, SamgInfo, TitleSetKind,
     };
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -2848,6 +4200,166 @@ mod tests {
         }
     }
 
+    fn write_minimal_wav(path: &Path, sample_rate: u32, channels: u16) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"JUNK");
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(0);
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        let byte_rate = sample_rate * u32::from(channels) * 4;
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        let block_align = channels * 4;
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&32_u16.to_le_bytes());
+        let riff_size = u32::try_from(bytes.len() - 8).unwrap();
+        bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn realized_wav_carrier_probe_reads_fmt_after_padded_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrier.wav");
+        write_minimal_wav(&path, 88_200, 2);
+
+        let facts = read_realized_wav_carrier_facts(&path).unwrap();
+
+        assert_eq!(facts.sample_rate, 88_200);
+        assert_eq!(facts.channels, 2);
+    }
+
+    #[test]
+    fn realized_wav_carrier_repair_updates_prepared_track_and_source_ref() {
+        let mut track = dummy_track(1);
+        track.sample_rate = None;
+        track.expected_samples = None;
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            None,
+            Some(24),
+            Some(SourceAudioCoding::DvdaUnknown),
+        );
+        track
+            .metadata
+            .extra
+            .insert("dvda_group2_sample_rate".to_string(), "48000".to_string());
+        track
+            .metadata
+            .extra
+            .insert("dvda_channel_assignment_code".to_string(), "1".to_string());
+        if let TrackSourceRef::DvdaTrack {
+            expected_sample_rate,
+            expected_group1_sample_rate,
+            expected_group2_sample_rate,
+            expected_channel_assignment_code,
+            ..
+        } = &mut track.source_ref
+        {
+            *expected_sample_rate = None;
+            *expected_group1_sample_rate = None;
+            *expected_group2_sample_rate = Some(48_000);
+            *expected_channel_assignment_code = Some(1);
+        }
+
+        apply_realized_wav_carrier_facts(
+            &mut track,
+            RealizedWavCarrierFacts {
+                sample_rate: 88_200,
+                channels: 2,
+            },
+        );
+
+        assert_eq!(track.scalar_sample_rate(), Some(88_200));
+        assert_eq!(track.expected_samples, Some(88_200));
+        assert_eq!(track.source_audio.primary_sample_rate, Some(88_200));
+        assert_eq!(track.source_audio.channel_groups.len(), 1);
+        assert_eq!(track.source_audio.channel_groups[0].sample_rate, Some(88_200));
+        assert_eq!(track.source_audio.channel_groups[0].channels, Some(2));
+        assert_eq!(track.source_audio.channel_groups[0].bit_depth, Some(24));
+
+        let TrackSourceRef::DvdaTrack {
+            expected_sample_rate,
+            expected_channel_count,
+            expected_channel_assignment_code,
+            expected_group1_sample_rate,
+            expected_group2_sample_rate,
+            expected_group1_channel_count,
+            expected_group2_channel_count,
+            ..
+        } = &track.source_ref
+        else {
+            panic!("expected DVD-Audio source ref");
+        };
+        assert_eq!(*expected_sample_rate, Some(88_200));
+        assert_eq!(*expected_channel_count, Some(2));
+        assert_eq!(*expected_channel_assignment_code, None);
+        assert_eq!(*expected_group1_sample_rate, Some(88_200));
+        assert_eq!(*expected_group2_sample_rate, None);
+        assert_eq!(*expected_group1_channel_count, Some(2));
+        assert_eq!(*expected_group2_channel_count, None);
+        assert_eq!(
+            track.metadata.extra.get("dvda_audio_format_resolution"),
+            Some(&"realized_wav_carrier_probe".to_string())
+        );
+        assert_eq!(
+            track.metadata.extra.get("dvda_group1_sample_rate"),
+            Some(&"88200".to_string())
+        );
+        assert!(!track.metadata.extra.contains_key("dvda_group2_sample_rate"));
+        assert!(!track
+            .metadata
+            .extra
+            .contains_key("dvda_channel_assignment_code"));
+    }
+
+    #[test]
+    fn realized_wav_validation_runs_for_known_but_non_authoritative_rate() {
+        let mut track = dummy_track(1);
+        track.sample_rate = Some(48_000);
+        track.metadata.extra.insert(
+            "dvda_audio_format_resolution".to_string(),
+            audio_format_resolution_label(AudioFormatResolution::SamgTrackRecord).to_string(),
+        );
+
+        assert!(track_needs_realized_wav_audio_facts_validation(&track));
+    }
+
+    #[test]
+    fn realized_wav_validation_skips_stream_authoritative_tracks() {
+        let mut track = dummy_track(1);
+        track.metadata.extra.insert(
+            "dvda_audio_format_resolution".to_string(),
+            audio_format_resolution_label(AudioFormatResolution::StreamProbeOverride).to_string(),
+        );
+        assert!(!track_needs_realized_wav_audio_facts_validation(&track));
+
+        track.metadata.extra.clear();
+        track.metadata.extra.insert(
+            "dvda_realized_wav_carrier_probe".to_string(),
+            "true".to_string(),
+        );
+        assert!(!track_needs_realized_wav_audio_facts_validation(&track));
+    }
+
+    #[test]
+    fn realized_wav_validation_runs_for_missing_rate_even_with_stream_label() {
+        let mut track = dummy_track(1);
+        track.sample_rate = None;
+        track.metadata.extra.insert(
+            "dvda_audio_format_resolution".to_string(),
+            audio_format_resolution_label(AudioFormatResolution::StreamProbeOverride).to_string(),
+        );
+
+        assert!(track_needs_realized_wav_audio_facts_validation(&track));
+    }
+
     fn chapter_with_sector_range(first: u32, last: u32) -> AudioChapter {
         AudioChapter {
             track_nr: 1,
@@ -2891,6 +4403,24 @@ mod tests {
             byte_len: if exists { 4096 } else { 0 },
             block_first,
             block_last,
+        }
+    }
+
+
+    fn aott_entry_for_test(ordinal: u16, title_set_nr: u8, atsi_mat_sector: u32) -> AudioTitleTableEntry {
+        AudioTitleTableEntry {
+            ordinal,
+            playback_type: AudioPlaybackType {
+                is_audio: true,
+                type_ext: 0,
+                title_set_nr,
+                raw: 0,
+            },
+            track_count: 1,
+            len_in_pts: 90_000,
+            title_set_nr,
+            title_nr: 1,
+            atsi_mat_sector,
         }
     }
 
@@ -3053,6 +4583,832 @@ mod tests {
             },
         ];
         disc
+    }
+
+    #[test]
+    fn cross_ats_resolution_maps_aobless_title_to_backing_aob_inventory() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut backing_title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        backing_title_set.header.atstt_vobs = 0;
+        backing_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 999)];
+
+        let mut borrowed_title = audio_title_for_test(2, 1, 90_000);
+        borrowed_title.chapters[0].sector_ranges[0].first = 10;
+        borrowed_title.chapters[0].sector_ranges[0].last = 20;
+
+        let mut aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        aobless_title_set.header.atstt_vobs = 0;
+        aobless_title_set.titles = vec![borrowed_title.clone()];
+
+        disc.title_sets = vec![backing_title_set, aobless_title_set.clone()];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 1_000),
+            aott_entry_for_test(2, 2, 1_500),
+        ];
+
+        let group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            &group.title_refs[0],
+            &aobless_title_set,
+            &borrowed_title,
+            None,
+        )
+        .expect("cross-ATS resolution should succeed");
+
+        assert!(resolution.is_cross_ats());
+        assert_eq!(resolution.resolved_title_set_nr, 1);
+        assert_eq!(
+            resolution.sector_translation,
+            SectorRangeTranslation::CrossAtsAob {
+                source_disc_absolute_base: 1_500,
+                resolved_disc_absolute_base: 1_000,
+            }
+        );
+        assert_eq!(
+            resolution.sector_address_space,
+            DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 }
+        );
+        let ranges = sector_ranges_for_translation(
+            &borrowed_title.chapters[0],
+            resolution.sector_translation,
+        )
+        .expect("range translation should succeed");
+        assert_eq!(ranges[0].first, 510);
+        assert_eq!(ranges[0].last, 520);
+        assert!(sector_range_refs_are_covered(&ranges, &resolution.aob_files));
+    }
+
+    #[test]
+    fn cross_ats_resolved_probe_context_uses_backing_title_set_and_translated_ranges() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut backing_title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        backing_title_set.header.atstt_vobs = 0;
+        backing_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 999)];
+
+        let mut borrowed_title = audio_title_for_test(2, 1, 90_000);
+        borrowed_title.chapters[0].sector_ranges[0].first = 10;
+        borrowed_title.chapters[0].sector_ranges[0].last = 20;
+
+        let mut aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        aobless_title_set.header.atstt_vobs = 0;
+        aobless_title_set.titles = vec![borrowed_title.clone()];
+
+        disc.title_sets = vec![backing_title_set, aobless_title_set.clone()];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 1_000),
+            aott_entry_for_test(2, 2, 1_500),
+        ];
+
+        let group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            &group.title_refs[0],
+            &aobless_title_set,
+            &borrowed_title,
+            None,
+        )
+        .expect("cross-ATS resolution should succeed");
+
+        let context = resolved_title_chapter_aob_probe_context(
+            &disc,
+            &group.title_refs[0],
+            &borrowed_title,
+            &borrowed_title.chapters[0],
+            &resolution,
+        )
+        .expect("probe context resolution should succeed")
+        .expect("cross-ATS resolution should produce a backing probe context");
+
+        assert_eq!(context.title_ref.title_set_nr, 1);
+        assert_eq!(context.title_set.number, 1);
+        assert!(context.title_set.aobs.iter().any(|aob| aob.exists));
+        assert_eq!(context.title.title_set_nr, 1);
+        assert_eq!(context.chapter.sector_ranges[0].first, 510);
+        assert_eq!(context.chapter.sector_ranges[0].last, 520);
+        assert_eq!(context.title.chapters[0].sector_ranges[0].first, 510);
+        assert_eq!(context.title.chapters[0].sector_ranges[0].last, 520);
+    }
+
+    #[test]
+    fn cross_ats_resolution_falls_back_to_identity_when_raw_ranges_fit_backing_aobs() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut backing_title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        backing_title_set.header.atstt_vobs = 0;
+        backing_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 2_556_832)];
+
+        let mut borrowed_title = audio_title_for_test(2, 1, 90_000);
+        borrowed_title.chapters[0].sector_ranges[0].first = 0;
+        borrowed_title.chapters[0].sector_ranges[0].last = 48_190;
+
+        let mut aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        aobless_title_set.header.atsm_vobs = 2_576_316;
+        aobless_title_set.header.atstt_vobs = 0;
+        aobless_title_set.titles = vec![borrowed_title.clone()];
+
+        disc.title_sets = vec![backing_title_set, aobless_title_set.clone()];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 12_239),
+            aott_entry_for_test(2, 2, 2_576_316),
+        ];
+
+        let group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            &group.title_refs[0],
+            &aobless_title_set,
+            &borrowed_title,
+            None,
+        )
+        .expect("identity cross-ATS resolution should succeed");
+
+        assert!(resolution.is_cross_ats());
+        assert_eq!(resolution.resolved_title_set_nr, 1);
+        assert_eq!(resolution.sector_translation, SectorRangeTranslation::Identity);
+        assert_eq!(resolution.source_disc_absolute_base, Some(2_576_316));
+        assert_eq!(resolution.resolved_disc_absolute_base, Some(12_239));
+
+        let ranges = sector_ranges_for_translation(
+            &borrowed_title.chapters[0],
+            resolution.sector_translation,
+        )
+        .expect("identity range materialization should succeed");
+        assert_eq!(ranges[0].first, 0);
+        assert_eq!(ranges[0].last, 48_190);
+        assert!(sector_range_refs_are_covered(&ranges, &resolution.aob_files));
+
+        let context = resolved_title_chapter_aob_probe_context(
+            &disc,
+            &group.title_refs[0],
+            &borrowed_title,
+            &borrowed_title.chapters[0],
+            &resolution,
+        )
+        .expect("identity cross-ATS probe context should resolve")
+        .expect("identity cross-ATS resolution should produce a backing probe context");
+        assert_eq!(context.title_ref.title_set_nr, 1);
+        assert_eq!(context.title_set.number, 1);
+        assert_eq!(context.chapter.sector_ranges[0].first, 0);
+        assert_eq!(context.chapter.sector_ranges[0].last, 48_190);
+    }
+
+    #[test]
+    fn cross_ats_materialized_title_structure_uses_backing_chapters() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut backing_title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        backing_title_set.header.atstt_vobs = 0;
+        backing_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 999)];
+        let mut first_backing_chapter = chapter_with_sector_range(0, 99);
+        first_backing_chapter.track_nr = 1;
+        first_backing_chapter.len_in_pts = 90_000;
+        let mut second_backing_chapter = chapter_with_sector_range(100, 199);
+        second_backing_chapter.track_nr = 2;
+        second_backing_chapter.first_pts = 90_000;
+        second_backing_chapter.len_in_pts = 90_000;
+        let mut backing_title = audio_title_for_test(1, 1, 180_000);
+        backing_title.track_count_declared = 2;
+        backing_title.index_count_declared = 2;
+        backing_title.chapters = vec![first_backing_chapter, second_backing_chapter];
+        backing_title_set.titles = vec![backing_title.clone()];
+
+        let mut borrowed_title = audio_title_for_test(2, 1, 90_000);
+        borrowed_title.chapters[0].sector_ranges[0].first = 0;
+        borrowed_title.chapters[0].sector_ranges[0].last = 199;
+
+        let mut aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        aobless_title_set.header.atsm_vobs = 1_000;
+        aobless_title_set.header.atstt_vobs = 0;
+        aobless_title_set.titles = vec![borrowed_title.clone()];
+
+        disc.title_sets = vec![backing_title_set, aobless_title_set.clone()];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 0),
+            aott_entry_for_test(2, 2, 1_000),
+        ];
+
+        let group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let title_ref = &group.title_refs[0];
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            title_ref,
+            &aobless_title_set,
+            &borrowed_title,
+            None,
+        )
+        .expect("cross-ATS resolution should succeed");
+
+        let materialized = materialized_title_structure(
+            &disc,
+            title_ref,
+            &aobless_title_set,
+            &borrowed_title,
+            resolution,
+        )
+        .expect("cross-ATS materialized title structure should resolve");
+
+        assert!(materialized.uses_backing_chapters);
+        assert_eq!(materialized.title_ref.title_set_nr, 1);
+        assert_eq!(materialized.title_set.number, 1);
+        assert_eq!(materialized.title.title_set_nr, 1);
+        assert_eq!(materialized.title.chapters.len(), 2);
+        assert_eq!(materialized.title.chapters[0].sector_ranges[0].first, 0);
+        assert_eq!(materialized.title.chapters[0].sector_ranges[0].last, 99);
+        assert_eq!(materialized.title.chapters[1].sector_ranges[0].first, 100);
+        assert_eq!(materialized.title.chapters[1].sector_ranges[0].last, 199);
+        assert_eq!(
+            materialized.aob_resolution.sector_address_space,
+            DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 }
+        );
+        assert_eq!(
+            materialized.aob_resolution.sector_translation,
+            SectorRangeTranslation::Identity
+        );
+        assert_eq!(materialized.aob_resolution.source_title_set_nr, 2);
+        assert_eq!(materialized.aob_resolution.resolved_title_set_nr, 1);
+    }
+
+    #[test]
+    fn normal_ats_probe_context_keeps_original_probe_path() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        title_set.aobs = vec![aob_entry_for_test(1, true, 0, 99)];
+        let title = audio_title_for_test(1, 1, 90_000);
+        let group = DvdaGroup {
+            group_nr: 1,
+            title_refs: vec![TitleRef {
+                title_set_nr: 1,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+        disc.title_sets = vec![title_set.clone()];
+
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            &group.title_refs[0],
+            &title_set,
+            &title,
+            None,
+        )
+        .expect("normal ATS resolution should succeed");
+
+        assert!(
+            resolved_title_chapter_aob_probe_context(
+                &disc,
+                &group.title_refs[0],
+                &title,
+                &title.chapters[0],
+                &resolution,
+            )
+            .expect("normal probe context check should succeed")
+            .is_none(),
+            "normal ATS tracks should continue using the original probe path"
+        );
+    }
+
+    #[test]
+    fn bowie_aobless_ats_source_base_uses_atsi_mat_vobs_start_at_0xc0() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut borrowed_title = audio_title_for_test(2, 1, 90_000);
+        borrowed_title.chapters[0].sector_ranges[0].first = 0;
+        borrowed_title.chapters[0].sector_ranges[0].last = 10;
+
+        let mut aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        aobless_title_set.header.atsm_vobs = 2_576_316;
+        aobless_title_set.header.atstt_vobs = 123;
+        aobless_title_set.titles = vec![borrowed_title.clone()];
+
+        disc.title_sets = vec![aobless_title_set.clone()];
+        disc.amg.audio_title_table = vec![aott_entry_for_test(2, 2, 42_000)];
+
+        let group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let ats2_aott = &disc.amg.audio_title_table[0];
+        assert_eq!(
+            title_set_audio_vobs_disc_absolute_base(ats2_aott, &aobless_title_set),
+            Some(2_576_316),
+            "Bowie David Live ATS 2 empirical VOB start at ATSI_MAT offset 0xC0 must be treated as an already disc-absolute sector"
+        );
+        assert_eq!(
+            title_disc_absolute_sector_base(
+                &disc,
+                &group,
+                &group.title_refs[0],
+                &aobless_title_set,
+                &borrowed_title,
+                None,
+            ),
+            Some(2_576_316),
+            "source-base derivation must use the centralized helper"
+        );
+    }
+
+    #[test]
+    fn title_set_audio_vobs_disc_absolute_base_falls_back_to_aott_plus_atstt_vobs() {
+        let mut title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        title_set.header.atsm_vobs = 0;
+        title_set.header.atstt_vobs = 456;
+        let aott = aott_entry_for_test(1, 1, 1_234);
+
+        assert_eq!(
+            title_set_audio_vobs_disc_absolute_base(&aott, &title_set),
+            Some(1_690),
+            "when ATSI_MAT offset 0xC0 is not populated, the base is AOTT ATSI_MAT sector plus ATSTT_VOBS"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the Bowie David Live ISO; set BOWIE_DAVID_LIVE_ISO or use the brief path"]
+    fn bowie_iso_ats2_source_base_matches_empirical_disc_absolute_sector() {
+        let path = std::env::var_os("BOWIE_DAVID_LIVE_ISO")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    PathBuf::from(home).join(
+                        "library/bowie/David Bowie - David Live (1974) [ISO] {DVD-A  24-48}/BOWIE LIVE.iso",
+                    )
+                })
+            })
+            .expect("BOWIE_DAVID_LIVE_ISO or HOME must be set");
+
+        let volume = open_dvda_volume(&path).expect("Bowie ISO should open as DVD-Audio");
+        let disc = parse_dvda_volume(&volume).expect("Bowie ISO should parse as DVD-Audio");
+        let group = disc
+            .groups
+            .iter()
+            .find(|group| group.group_nr == 2)
+            .expect("Bowie stereo group should be group 2");
+        let title_ref = group
+            .title_refs
+            .iter()
+            .find(|title_ref| title_ref.title_set_nr == 2)
+            .expect("Bowie group 2 should reference ATS 2");
+        let title_set = find_title_set(&disc, 2).expect("Bowie ATS 2 should exist");
+        let title = find_title(title_set, title_ref).expect("Bowie ATS 2 title should exist");
+
+        assert!(!title_set_has_existing_aobs(title_set));
+        assert_eq!(
+            title_disc_absolute_sector_base(&disc, group, title_ref, title_set, title, None),
+            Some(2_576_316),
+            "Bowie David Live ATS 2 source VOB base must match the empirical disc-absolute sector from ATSI_MAT offset 0xC0"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the Bowie David Live ISO; set BOWIE_DAVID_LIVE_ISO or use the brief path"]
+    fn bowie_iso_ats2_resolved_stream_probe_reads_backing_ats1_aobs() {
+        let path = std::env::var_os("BOWIE_DAVID_LIVE_ISO")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    PathBuf::from(home).join(
+                        "library/bowie/David Bowie - David Live (1974) [ISO] {DVD-A  24-48}/BOWIE LIVE.iso",
+                    )
+                })
+            })
+            .expect("BOWIE_DAVID_LIVE_ISO or HOME must be set");
+
+        let volume = open_dvda_volume(&path).expect("Bowie ISO should open as DVD-Audio");
+        let disc = parse_dvda_volume(&volume).expect("Bowie ISO should parse as DVD-Audio");
+        let group = disc
+            .groups
+            .iter()
+            .find(|group| group.group_nr == 2)
+            .expect("Bowie stereo group should be group 2");
+        let title_ref = group
+            .title_refs
+            .iter()
+            .find(|title_ref| title_ref.title_set_nr == 2)
+            .expect("Bowie group 2 should reference ATS 2");
+        let title_set = find_title_set(&disc, 2).expect("Bowie ATS 2 should exist");
+        let title = find_title(title_set, title_ref).expect("Bowie ATS 2 title should exist");
+        let chapter = title
+            .chapters
+            .first()
+            .expect("Bowie ATS 2 title should contain at least one chapter");
+
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            group,
+            title_ref,
+            title_set,
+            title,
+            None,
+        )
+        .expect("Bowie ATS 2 should resolve to backing ATS 1 AOB inventory");
+
+        assert!(resolution.is_cross_ats());
+        assert_eq!(resolution.resolved_title_set_nr, 1);
+
+        let context = resolved_title_chapter_aob_probe_context(
+            &disc,
+            title_ref,
+            title,
+            chapter,
+            &resolution,
+        )
+        .expect("Bowie cross-ATS probe context should resolve")
+        .expect("Bowie ATS 2 should use a backing ATS probe context");
+        assert_eq!(context.title_set.number, 1);
+        assert!(context.title_set.aobs.iter().any(|aob| aob.exists));
+
+        let probe = probe_title_chapter_aob_format_with_resolved_aob_path(
+            &volume,
+            &disc,
+            group,
+            title_ref,
+            title_set,
+            title,
+            chapter,
+            Some(&path),
+            &resolution,
+        )
+        .expect("Bowie resolved stream probe should not fail")
+        .expect("Bowie resolved stream probe should find MLP or LPCM packets in backing ATS 1 AOBs");
+
+        assert!(
+            elementary_stream_kind_hint_from_codec(probe.codec.as_ref()).is_some(),
+            "Bowie resolved stream probe must produce an elementary stream hint, got codec={}",
+            probe.codec
+        );
+        assert!(probe.sample_rate > 0);
+        assert!(probe.channels > 0);
+    }
+
+    #[test]
+    fn cross_ats_resolution_errors_on_multiple_backing_inventories_even_if_one_is_closer() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut loose_backing_title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        loose_backing_title_set.header.atstt_vobs = 0;
+        loose_backing_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 999)];
+
+        let mut tight_backing_title_set = title_set_with_number_and_audio_formats(3, Vec::new());
+        tight_backing_title_set.header.atstt_vobs = 0;
+        tight_backing_title_set.aobs = vec![aob_entry_for_test(3, true, 0, 100)];
+
+        let mut borrowed_title = audio_title_for_test(2, 1, 90_000);
+        borrowed_title.chapters[0].sector_ranges[0].first = 10;
+        borrowed_title.chapters[0].sector_ranges[0].last = 20;
+
+        let mut aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        aobless_title_set.header.atstt_vobs = 0;
+        aobless_title_set.titles = vec![borrowed_title.clone()];
+
+        disc.title_sets = vec![
+            loose_backing_title_set,
+            aobless_title_set.clone(),
+            tight_backing_title_set,
+        ];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 1_000),
+            aott_entry_for_test(2, 2, 1_500),
+            aott_entry_for_test(3, 3, 1_490),
+        ];
+
+        let group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let err = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            &group.title_refs[0],
+            &aobless_title_set,
+            &borrowed_title,
+            None,
+        )
+        .expect_err("multiple fitting backing inventories should fail closed");
+
+        let err = format!("{err}");
+        assert!(err.contains("multiple backing ATS AOB inventories"));
+        assert!(err.contains("1, 3"));
+    }
+
+    #[test]
+    fn cross_ats_resolution_errors_on_multiple_equal_backing_inventories() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut first_backing_title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        first_backing_title_set.header.atstt_vobs = 0;
+        first_backing_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 999)];
+
+        let mut second_backing_title_set = title_set_with_number_and_audio_formats(3, Vec::new());
+        second_backing_title_set.header.atstt_vobs = 0;
+        second_backing_title_set.aobs = vec![aob_entry_for_test(3, true, 0, 999)];
+
+        let borrowed_title = audio_title_for_test(2, 1, 90_000);
+        let mut aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        aobless_title_set.header.atstt_vobs = 0;
+        aobless_title_set.titles = vec![borrowed_title.clone()];
+
+        disc.title_sets = vec![
+            first_backing_title_set,
+            aobless_title_set.clone(),
+            second_backing_title_set,
+        ];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 1_000),
+            aott_entry_for_test(2, 2, 1_500),
+            aott_entry_for_test(3, 3, 1_000),
+        ];
+
+        let group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let err = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            &group.title_refs[0],
+            &aobless_title_set,
+            &borrowed_title,
+            None,
+        )
+        .expect_err("multiple fitting backing inventories should require explicit resolution");
+
+        let err = format!("{err}");
+        assert!(err.contains("multiple backing ATS AOB inventories"));
+        assert!(err.contains("1, 3"));
+    }
+
+
+    #[test]
+    fn multiple_aobless_title_sets_resolve_independently_to_backing_aob_inventory() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut backing_title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        backing_title_set.header.atstt_vobs = 0;
+        backing_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 999)];
+
+        let mut first_borrowed_title = audio_title_for_test(2, 1, 90_000);
+        first_borrowed_title.chapters[0].sector_ranges[0].first = 10;
+        first_borrowed_title.chapters[0].sector_ranges[0].last = 20;
+        let mut first_aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        first_aobless_title_set.header.atsm_vobs = 1_500;
+        first_aobless_title_set.titles = vec![first_borrowed_title.clone()];
+
+        let mut second_borrowed_title = audio_title_for_test(3, 1, 90_000);
+        second_borrowed_title.chapters[0].sector_ranges[0].first = 30;
+        second_borrowed_title.chapters[0].sector_ranges[0].last = 40;
+        let mut second_aobless_title_set = title_set_with_number_and_audio_formats(3, Vec::new());
+        second_aobless_title_set.header.atsm_vobs = 1_700;
+        second_aobless_title_set.titles = vec![second_borrowed_title.clone()];
+
+        disc.title_sets = vec![
+            backing_title_set,
+            first_aobless_title_set.clone(),
+            second_aobless_title_set.clone(),
+        ];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 1_000),
+            aott_entry_for_test(2, 2, 1_500),
+            aott_entry_for_test(3, 3, 1_700),
+        ];
+
+        let first_group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+        let second_group = DvdaGroup {
+            group_nr: 3,
+            title_refs: vec![TitleRef {
+                title_set_nr: 3,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let first_resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &first_group,
+            &first_group.title_refs[0],
+            &first_aobless_title_set,
+            &first_borrowed_title,
+            None,
+        )
+        .expect("first AOB-less ATS should resolve to backing ATS 1");
+        let second_resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &second_group,
+            &second_group.title_refs[0],
+            &second_aobless_title_set,
+            &second_borrowed_title,
+            None,
+        )
+        .expect("second AOB-less ATS should resolve to backing ATS 1");
+
+        assert_eq!(first_resolution.resolved_title_set_nr, 1);
+        assert_eq!(second_resolution.resolved_title_set_nr, 1);
+        assert_eq!(first_resolution.source_disc_absolute_base, Some(1_500));
+        assert_eq!(second_resolution.source_disc_absolute_base, Some(1_700));
+        assert_eq!(first_resolution.resolved_disc_absolute_base, Some(1_000));
+        assert_eq!(second_resolution.resolved_disc_absolute_base, Some(1_000));
+
+        let first_ranges = sector_ranges_for_translation(
+            &first_borrowed_title.chapters[0],
+            first_resolution.sector_translation,
+        )
+        .expect("first AOB-less ATS range translation should succeed");
+        let second_ranges = sector_ranges_for_translation(
+            &second_borrowed_title.chapters[0],
+            second_resolution.sector_translation,
+        )
+        .expect("second AOB-less ATS range translation should succeed");
+
+        assert_eq!(first_ranges[0].first, 510);
+        assert_eq!(first_ranges[0].last, 520);
+        assert_eq!(second_ranges[0].first, 730);
+        assert_eq!(second_ranges[0].last, 740);
+    }
+
+    #[test]
+    fn no_samg_zero_atsi_formats_cross_ats_probe_context_uses_backing_aob_inventory() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+
+        let mut backing_title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        backing_title_set.header.atstt_vobs = 0;
+        backing_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 999)];
+
+        let borrowed_title = audio_title_for_test(2, 1, 90_000);
+        let mut aobless_title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        aobless_title_set.header.atsm_vobs = 1_500;
+        aobless_title_set.titles = vec![borrowed_title.clone()];
+
+        disc.title_sets = vec![backing_title_set, aobless_title_set.clone()];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 1_000),
+            aott_entry_for_test(2, 2, 1_500),
+        ];
+
+        let group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        assert!(disc.samg.is_none());
+        assert!(disc.title_sets[0].audio_formats.is_empty());
+        assert!(disc.title_sets[1].audio_formats.is_empty());
+
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            &group.title_refs[0],
+            &aobless_title_set,
+            &borrowed_title,
+            None,
+        )
+        .expect("no-SAMG / zero-format AOB-less ATS should still resolve through AOB evidence");
+        let context = resolved_title_chapter_aob_probe_context(
+            &disc,
+            &group.title_refs[0],
+            &borrowed_title,
+            &borrowed_title.chapters[0],
+            &resolution,
+        )
+        .expect("resolved probe context should not fail")
+        .expect("AOB-less ATS must probe through backing ATS 1, not the empty source ATS");
+
+        assert_eq!(context.title_ref.title_set_nr, 1);
+        assert_eq!(context.title_set.number, 1);
+        assert!(context.title_set.aobs.iter().any(|aob| aob.exists));
+        assert_eq!(context.chapter.sector_ranges[0].first, 510);
+        assert_eq!(context.chapter.sector_ranges[0].last, 520);
+    }
+
+    #[test]
+    fn normal_ats_resolution_keeps_current_aob_inventory() {
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+        let mut title_set = title_set_with_number_and_audio_formats(1, Vec::new());
+        title_set.aobs = vec![aob_entry_for_test(1, true, 0, 99)];
+        let title = audio_title_for_test(1, 1, 90_000);
+        let group = DvdaGroup {
+            group_nr: 1,
+            title_refs: vec![TitleRef {
+                title_set_nr: 1,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+        disc.title_sets = vec![title_set.clone()];
+
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &group,
+            &group.title_refs[0],
+            &title_set,
+            &title,
+            None,
+        )
+        .expect("normal ATS resolution should succeed");
+
+        assert!(!resolution.is_cross_ats());
+        assert_eq!(resolution.resolved_title_set_nr, 1);
+        assert_eq!(resolution.sector_translation, SectorRangeTranslation::Identity);
+        assert_eq!(resolution.aob_files.len(), 1);
     }
 
     #[test]
@@ -3298,6 +5654,10 @@ mod tests {
             dvda_group: Some(4),
             dvda_assume_decrypted: false,
             dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
             cue_sidecar: CueSidecarPolicy::PreferSidecar,
             track_selection: TrackSelection::All,
         };
@@ -3447,6 +5807,10 @@ mod tests {
                 dvda_group: None,
                 dvda_assume_decrypted: false,
                 dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -3477,6 +5841,10 @@ mod tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -3999,7 +6367,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_group_rates_do_not_collapse_to_one_reported_rate() {
+    fn mixed_group_rates_use_group1_as_primary_rate() {
         let title_set = title_set_with_audio_formats(vec![AudioAttributes {
             format_index: 0,
             present: true,
@@ -4017,7 +6385,7 @@ mod tests {
         }]);
         let facts = audio_facts_for_title_set(&title_set);
         assert_eq!(facts.format_index, Some(0));
-        assert_eq!(facts.sample_rate, None);
+        assert_eq!(facts.sample_rate, Some(96_000));
         assert_eq!(facts.bit_depth, Some(24));
         assert_eq!(facts.resolution, AudioFormatResolution::SinglePresentFormat);
     }
@@ -4039,6 +6407,8 @@ mod tests {
             1,
             2,
             DvdaDownmixPolicy::None,
+            None,
+            None,
         )
         .expect("SAMG-only groups should produce a structure-only PreparedTrack");
 
@@ -4147,7 +6517,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_group_rates_are_carried_as_channel_groups_not_scalar_sentinel() {
+    fn mixed_group_rates_keep_channel_groups_and_use_group1_scalar_facts() {
         let title_set = title_set_with_audio_formats(vec![AudioAttributes {
             format_index: 0,
             present: true,
@@ -4166,15 +6536,561 @@ mod tests {
         let facts = audio_facts_for_title_set(&title_set);
         let descriptor = source_audio_descriptor_for_facts(facts);
 
-        assert_eq!(facts.sample_rate, None);
-        assert_eq!(descriptor.primary_sample_rate, None);
-        assert_eq!(descriptor.bit_depth, None);
+        assert_eq!(facts.sample_rate, Some(96_000));
+        assert_eq!(descriptor.primary_sample_rate, Some(96_000));
+        assert_eq!(descriptor.bit_depth, Some(24));
         assert_eq!(descriptor.coding, Some(SourceAudioCoding::DvdaUnknown));
         assert_eq!(descriptor.channel_groups.len(), 2);
         assert_eq!(descriptor.channel_groups[0].sample_rate, Some(96_000));
         assert_eq!(descriptor.channel_groups[0].bit_depth, Some(24));
         assert_eq!(descriptor.channel_groups[1].sample_rate, Some(48_000));
         assert_eq!(descriptor.channel_groups[1].bit_depth, Some(16));
+    }
+
+    #[test]
+    fn stream_probe_replaces_stale_channel_facts_everywhere() {
+        let title_set = title_set_with_audio_formats(vec![audio_attr_with_channels(
+            0,
+            Some(48_000),
+            Some(16),
+            Some(2),
+        )]);
+        let ifo_facts = audio_facts_for_title_set(&title_set);
+        let facts = audio_facts_with_stream_probe(
+            ifo_facts,
+            Some(ProbedStreamAudioFacts {
+                codec: Some(ProbedStreamCodec::Mlp),
+                sample_rate: 96_000,
+                bit_depth: Some(24),
+                channels: Some(6),
+                channel_assignment_code: Some(12),
+                mlp_num_substreams: Some(2),
+                mlp_num_substreams_source: Some(MlpSubstreamFactSource::DirectTrackProbe),
+            }),
+        );
+        let descriptor = source_audio_descriptor_for_facts(facts);
+        let mut extra = BTreeMap::new();
+        insert_audio_facts(&mut extra, facts);
+
+        assert_eq!(facts.sample_rate, Some(96_000));
+        assert_eq!(facts.bit_depth, Some(24));
+        assert_eq!(facts.channel_format, None);
+        assert_eq!(facts.channel_assignment, None);
+        assert_eq!(expected_channel_count_for_facts(facts), Some(6));
+        assert_eq!(expected_channel_assignment_code_for_facts(facts), Some(12));
+        assert_eq!(expected_group1_sample_rate_for_facts(facts), Some(96_000));
+        assert_eq!(expected_group2_sample_rate_for_facts(facts), None);
+        assert_eq!(expected_group1_bit_depth_for_facts(facts), Some(24));
+        assert_eq!(expected_group2_bit_depth_for_facts(facts), None);
+        assert_eq!(expected_group1_channel_count_for_facts(facts), Some(6));
+        assert_eq!(expected_group2_channel_count_for_facts(facts), None);
+
+        assert_eq!(descriptor.primary_sample_rate, Some(96_000));
+        assert_eq!(descriptor.bit_depth, Some(24));
+        assert_eq!(descriptor.channel_groups.len(), 1);
+        assert_eq!(descriptor.channel_groups[0].sample_rate, Some(96_000));
+        assert_eq!(descriptor.channel_groups[0].bit_depth, Some(24));
+        assert_eq!(descriptor.channel_groups[0].channels, Some(6));
+
+        assert_eq!(extra.get("dvda_group1_sample_rate"), Some(&"96000".to_string()));
+        assert_eq!(extra.get("dvda_group1_bit_depth"), Some(&"24".to_string()));
+        assert_eq!(extra.get("dvda_channel_assignment_code"), Some(&"12".to_string()));
+        assert_eq!(extra.get("dvda_channel_count"), Some(&"6".to_string()));
+        assert_eq!(extra.get("dvda_mlp_num_substreams"), Some(&"2".to_string()));
+        assert_eq!(
+            extra.get("dvda_mlp_num_substreams_source"),
+            Some(&"direct-track-major-sync-probe".to_string())
+        );
+        assert!(!extra.contains_key("dvda_group2_sample_rate"));
+        assert!(!extra.contains_key("dvda_group2_bit_depth"));
+    }
+
+    #[test]
+    fn stream_probe_marks_audio_format_known_without_ifo_format_index() {
+        let facts = audio_facts_with_stream_probe(
+            unknown_audio_facts(AudioFormatResolution::MultiplePresentFormats),
+            Some(ProbedStreamAudioFacts {
+                codec: Some(ProbedStreamCodec::Mlp),
+                sample_rate: 96_000,
+                bit_depth: Some(24),
+                channels: Some(2),
+                channel_assignment_code: Some(1),
+                mlp_num_substreams: None,
+                mlp_num_substreams_source: None,
+            }),
+        );
+        let mut extra = BTreeMap::new();
+        insert_nonempty(
+            &mut extra,
+            "dvda_audio_format_known",
+            audio_format_known_for_facts(facts).to_string(),
+        );
+        insert_nonempty(
+            &mut extra,
+            "dvda_audio_format_resolution",
+            audio_format_resolution_label(facts.resolution).to_string(),
+        );
+        insert_audio_facts(&mut extra, facts);
+
+        assert_eq!(facts.format_index, None);
+        assert_eq!(facts.stream_probe.is_some(), true);
+        assert_eq!(extra.get("dvda_audio_format_known"), Some(&"true".to_string()));
+        assert_eq!(
+            extra.get("dvda_audio_format_resolution"),
+            Some(&"stream_probe_override".to_string())
+        );
+        assert_eq!(extra.get("dvda_group1_sample_rate"), Some(&"96000".to_string()));
+    }
+
+    #[test]
+    fn stream_probe_overrides_are_track_scoped() {
+        let title_set = title_set_with_audio_formats(vec![audio_attr_with_channels(
+            0,
+            Some(48_000),
+            Some(16),
+            Some(2),
+        )]);
+        let ifo_facts = audio_facts_for_title_set(&title_set);
+        let first_track_facts = audio_facts_with_stream_probe(
+            ifo_facts,
+            Some(ProbedStreamAudioFacts {
+                codec: Some(ProbedStreamCodec::Lpcm),
+                sample_rate: 48_000,
+                bit_depth: Some(16),
+                channels: Some(2),
+                channel_assignment_code: Some(1),
+                mlp_num_substreams: None,
+                mlp_num_substreams_source: None,
+            }),
+        );
+        let second_track_facts = audio_facts_with_stream_probe(
+            ifo_facts,
+            Some(ProbedStreamAudioFacts {
+                codec: Some(ProbedStreamCodec::Mlp),
+                sample_rate: 96_000,
+                bit_depth: Some(24),
+                channels: Some(6),
+                channel_assignment_code: Some(12),
+                mlp_num_substreams: Some(2),
+                mlp_num_substreams_source: Some(MlpSubstreamFactSource::DirectTrackProbe),
+            }),
+        );
+
+        assert_eq!(first_track_facts.sample_rate, Some(48_000));
+        assert_eq!(first_track_facts.bit_depth, Some(16));
+        assert_eq!(expected_channel_count_for_facts(first_track_facts), Some(2));
+        assert_eq!(second_track_facts.sample_rate, Some(96_000));
+        assert_eq!(second_track_facts.bit_depth, Some(24));
+        assert_eq!(expected_channel_count_for_facts(second_track_facts), Some(6));
+    }
+
+    fn mlp_probe_result_for_test(downmix_source_label: Option<&str>) -> AobProbeResult {
+        AobProbeResult {
+            codec: "MLP",
+            sample_rate: 96_000,
+            bit_depth: 24,
+            channels: 6,
+            channel_assignment_code: 20,
+            channel_label: "5.1".to_string(),
+            stereo_downmix_source_label: downmix_source_label.map(str::to_string),
+            mlp_num_substreams: Some(2),
+        }
+    }
+
+
+    fn synthetic_mlp_major_sync_payload_96k_24bit_5_1() -> Vec<u8> {
+        // Minimal MLP major-sync header: f8726fbb sync, 24-bit group 1,
+        // 96 kHz group 1, and channel arrangement 20 (6 channels / 5.1).
+        // The remaining bytes are neutral header fields sufficient for the
+        // in-crate major-sync probe used by the materializer tests.
+        vec![
+            0xF8, 0x72, 0x6F, 0xBB, 0x20, 0x10, 0x00, 0x14,
+            0xB7, 0x52, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00,
+            0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    fn synthetic_mlp_pack_sector(payload: &[u8]) -> [u8; DVD_SECTOR_SIZE] {
+        let mut sector = [0_u8; DVD_SECTOR_SIZE];
+        sector[..4].copy_from_slice(&PACK_START_CODE);
+        sector[13] = 0;
+
+        let pes_offset = 14;
+        sector[pes_offset..pes_offset + 4]
+            .copy_from_slice(&[0x00, 0x00, 0x01, PRIVATE_STREAM_1]);
+        sector[pes_offset + 6] = 0x80;
+        sector[pes_offset + 7] = 0x80;
+        sector[pes_offset + 8] = 0;
+
+        let mut sub_header = vec![MLP_STREAM_ID, 0, 0, MLP_EXTRA_HEADER_LENGTH];
+        sub_header.resize(4 + usize::from(MLP_EXTRA_HEADER_LENGTH), 0);
+        if sub_header.len() > 8 {
+            sub_header[8] = 0;
+        }
+
+        let pes_payload_len = 3 + sub_header.len() + payload.len();
+        sector[pes_offset + 4..pes_offset + 6]
+            .copy_from_slice(&(pes_payload_len as u16).to_be_bytes());
+
+        let sub_offset = pes_offset + 9;
+        sector[sub_offset..sub_offset + sub_header.len()].copy_from_slice(&sub_header);
+        let payload_offset = sub_offset + sub_header.len();
+        sector[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
+        sector
+    }
+
+    fn write_synthetic_aob_sectors(
+        root: &Path,
+        file_name: &str,
+        sectors: &[[u8; DVD_SECTOR_SIZE]],
+    ) {
+        let audio_ts = root.join("AUDIO_TS");
+        std::fs::create_dir_all(&audio_ts).expect("create synthetic AUDIO_TS directory");
+        let path = audio_ts.join(file_name);
+        let root_path = root.join(file_name);
+        let mut bytes = Vec::with_capacity(sectors.len() * DVD_SECTOR_SIZE);
+        for sector in sectors {
+            bytes.extend_from_slice(sector);
+        }
+        std::fs::write(path, &bytes).expect("write synthetic AOB sectors under AUDIO_TS");
+        std::fs::write(root_path, bytes).expect("write synthetic AOB sectors at direct root fallback");
+    }
+
+    fn probe_cache_group_for_test() -> DvdaGroup {
+        DvdaGroup {
+            group_nr: 2,
+            title_refs: Vec::new(),
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        }
+    }
+
+    #[test]
+    fn stream_probe_codec_override_routes_ifo_lpcm_claim_to_mlp() {
+        let title_set = title_set_with_audio_formats(vec![audio_attr_with_channels(
+            0,
+            Some(48_000),
+            Some(16),
+            Some(2),
+        )]);
+        let ifo_facts = audio_facts_for_title_set(&title_set);
+        let probe = mlp_probe_result_for_test(Some("5.1"));
+        let facts = audio_facts_with_stream_probe(
+            ifo_facts,
+            Some(probed_audio_facts_from_probe(&probe)),
+        );
+
+        assert_eq!(expected_channel_count_for_facts(facts), Some(6));
+        assert_eq!(expected_channel_assignment_code_for_facts(facts), Some(20));
+        assert_eq!(facts.sample_rate, Some(96_000));
+        assert_eq!(facts.bit_depth, Some(24));
+        assert_eq!(
+            facts
+                .stream_probe
+                .and_then(elementary_stream_kind_hint_from_probed_facts),
+            Some(DvdaElementaryStreamKind::Mlp)
+        );
+    }
+
+    #[test]
+    fn cross_ats_stereo_identity_chain_materializes_mlp_hint_and_auto_downmix() {
+        let mut carrier_title_set = title_set_with_number_and_audio_formats(
+            1,
+            vec![audio_attr_with_channels(1, Some(96_000), Some(24), Some(6))],
+        );
+        carrier_title_set.header.atstt_vobs = 0;
+        carrier_title_set.aobs = vec![aob_entry_for_test(1, true, 0, 2_556_832)];
+        carrier_title_set.titles = vec![audio_title_for_test(1, 1, 90_000)];
+
+        let mut borrowed_title = audio_title_for_test(2, 1, 90_000);
+        borrowed_title.chapters[0].sector_ranges[0].first = 0;
+        borrowed_title.chapters[0].sector_ranges[0].last = 48_190;
+
+        let mut stereo_title_set = title_set_with_number_and_audio_formats(
+            2,
+            vec![audio_attr_with_channels(1, Some(48_000), Some(16), Some(2))],
+        );
+        stereo_title_set.header.atsm_vobs = 2_576_316;
+        stereo_title_set.header.atstt_vobs = 0;
+        stereo_title_set.titles = vec![borrowed_title.clone()];
+
+        let carrier_group = DvdaGroup {
+            group_nr: 1,
+            title_refs: vec![TitleRef {
+                title_set_nr: 1,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+        let stereo_group = DvdaGroup {
+            group_nr: 2,
+            title_refs: vec![TitleRef {
+                title_set_nr: 2,
+                title_nr: 1,
+                kind: TitleRefKind::AottTitleOrdinal,
+            }],
+            samg_tracks: Vec::new(),
+            correlation: GroupCorrelation::FromAmgAott,
+        };
+
+        let mut disc = disc_with_samg_track_for_test(samg_track_for_test());
+        disc.samg = None;
+        disc.title_sets = vec![carrier_title_set, stereo_title_set.clone()];
+        disc.groups = vec![carrier_group, stereo_group.clone()];
+        disc.amg.audio_title_table = vec![
+            aott_entry_for_test(1, 1, 12_239),
+            aott_entry_for_test(2, 2, 2_576_316),
+        ];
+
+        let temp = tempfile::tempdir().expect("create synthetic DVD-Audio directory");
+        let mlp_sector = synthetic_mlp_pack_sector(&synthetic_mlp_major_sync_payload_96k_24bit_5_1());
+        write_synthetic_aob_sectors(temp.path(), "ATS_01_1.AOB", &[mlp_sector]);
+        let volume = DirectoryDvdaVolume::new(temp.path());
+
+        let title_ref = &stereo_group.title_refs[0];
+        let resolution = resolve_title_set_aob_resolution(
+            &disc,
+            &stereo_group,
+            title_ref,
+            &stereo_title_set,
+            &borrowed_title,
+            None,
+        )
+        .expect("identity cross-ATS resolution should succeed");
+        assert!(resolution.is_cross_ats());
+        assert_eq!(resolution.resolved_title_set_nr, 1);
+        assert_eq!(resolution.sector_translation, SectorRangeTranslation::Identity);
+
+        let probe_outcome = probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
+            &volume,
+            &disc,
+            &stereo_group,
+            title_ref,
+            &stereo_title_set,
+            &borrowed_title,
+            &borrowed_title.chapters[0],
+            None,
+            &resolution,
+        )
+        .expect("resolved AOB probe should not fail")
+        .expect("resolved AOB probe should read the backing ATS1 sector bytes");
+        assert!(probe_outcome.saw_mlp_packets);
+        assert!(!probe_outcome.saw_lpcm_packets);
+        assert_eq!(probe_outcome.scanned_sectors, 1);
+        assert_eq!(
+            probe_outcome.result.as_ref().map(|probe| probe.codec.as_ref()),
+            Some("MLP")
+        );
+
+        let mut cache = GroupStreamProbeCache::default();
+        let selected_probe = select_stream_probe_for_track(
+            &stereo_group,
+            &stereo_title_set,
+            &borrowed_title.chapters[0],
+            Some(&probe_outcome),
+            &mut cache,
+        )
+        .expect("resolved AOB byte probe should select MLP stream facts");
+
+        assert_eq!(selected_probe.source, StreamProbeSelectionSource::Direct);
+        assert_eq!(
+            elementary_stream_kind_hint_from_probed_facts(selected_probe.facts),
+            Some(DvdaElementaryStreamKind::Mlp)
+        );
+        assert!(probe_outcome.origin.authored_cross_ats);
+        assert_eq!(probe_outcome.origin.source_title_set_nr, 2);
+        assert_eq!(probe_outcome.origin.backing_title_set_nr, 1);
+        assert_eq!(
+            probe_outcome
+                .result
+                .as_ref()
+                .and_then(|probe| probe.stereo_downmix_source_label.as_deref()),
+            Some("6ch")
+        );
+        assert_eq!(selected_probe.downmix_source_label.as_deref(), Some("6ch"));
+        assert!(selected_probe.origin.authored_cross_ats);
+
+        let stream_downmix_source_label =
+            selected_stream_downmix_source_label(Some(&selected_probe));
+        assert_eq!(stream_downmix_source_label.as_deref(), Some("6ch"));
+        let dvda_downmix_policy = resolve_dvda_track_downmix_policy(
+            DvdaDownmixPolicy::Auto,
+            stream_downmix_source_label.as_deref(),
+        );
+        assert_eq!(dvda_downmix_policy, DvdaDownmixPolicy::FooInputDvdaCompatible);
+
+        let audio_facts = audio_facts_with_stream_probe(
+            audio_facts_for_title_chapter(&stereo_title_set, &borrowed_title.chapters[0]),
+            Some(selected_probe.facts),
+        );
+        let sector_ranges = sector_ranges_for_translation(
+            &borrowed_title.chapters[0],
+            resolution.sector_translation,
+        )
+        .expect("identity ranges should materialize");
+        let source_ref = ats_track_source_ref(
+            &DvdaVolumeSourceRef::Iso {
+                path: PathBuf::from("/tmp/dvda.iso"),
+                backend: DvdaIsoBackend::Udf,
+            },
+            &stereo_group,
+            &stereo_title_set,
+            &borrowed_title,
+            &borrowed_title.chapters[0],
+            1,
+            audio_facts,
+            resolution.sector_address_space,
+            sector_ranges,
+            dvda_downmix_policy,
+            elementary_stream_kind_hint_from_probed_facts(selected_probe.facts),
+            None,
+            resolution.aob_files.clone(),
+        );
+
+        let TrackSourceRef::DvdaTrack {
+            title_set_nr,
+            sector_address_space,
+            elementary_stream_kind_hint,
+            dvda_downmix_policy,
+            expected_channel_count,
+            expected_sample_rate,
+            expected_bit_depth,
+            sector_ranges,
+            aob_files,
+            ..
+        } = source_ref
+        else {
+            panic!("expected DVD-Audio source ref");
+        };
+
+        assert_eq!(title_set_nr, Some(2));
+        assert_eq!(
+            sector_address_space,
+            DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 }
+        );
+        assert_eq!(elementary_stream_kind_hint, Some(DvdaElementaryStreamKind::Mlp));
+        assert_eq!(dvda_downmix_policy, DvdaDownmixPolicy::FooInputDvdaCompatible);
+        assert_eq!(expected_channel_count, Some(6));
+        assert_eq!(expected_sample_rate, Some(96_000));
+        assert_eq!(expected_bit_depth, Some(24));
+        assert_eq!(sector_ranges[0].first, 0);
+        assert_eq!(sector_ranges[0].last, 48_190);
+        assert_eq!(aob_files[0].title_set_nr, 1);
+    }
+
+    #[test]
+    fn group_mlp_probe_cache_inherits_format_for_track_without_major_sync() {
+        let group = probe_cache_group_for_test();
+        let title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        let first_chapter = chapter_with_sector_range(0, 48_190);
+        let mut second_chapter = chapter_with_sector_range(48_191, 86_926);
+        second_chapter.track_nr = 2;
+        let first_outcome = AobProbeOutcome {
+            result: Some(mlp_probe_result_for_test(Some("5.1"))),
+            saw_mlp_packets: true,
+            saw_lpcm_packets: false,
+            scanned_sectors: 512,
+            origin: AobProbeOrigin::local(2),
+        };
+        let second_outcome = AobProbeOutcome {
+            result: None,
+            saw_mlp_packets: true,
+            saw_lpcm_packets: false,
+            scanned_sectors: 512,
+            origin: AobProbeOrigin::local(2),
+        };
+        let mut cache = GroupStreamProbeCache::default();
+
+        let direct = select_stream_probe_for_track(
+            &group,
+            &title_set,
+            &first_chapter,
+            Some(&first_outcome),
+            &mut cache,
+        )
+        .expect("first track should publish an MLP probe");
+        assert_eq!(direct.source, StreamProbeSelectionSource::Direct);
+        assert_eq!(
+            elementary_stream_kind_hint_from_probed_facts(direct.facts),
+            Some(DvdaElementaryStreamKind::Mlp)
+        );
+
+        let inherited = select_stream_probe_for_track(
+            &group,
+            &title_set,
+            &second_chapter,
+            Some(&second_outcome),
+            &mut cache,
+        )
+        .expect("second track should inherit the group MLP format");
+        assert_eq!(inherited.source, StreamProbeSelectionSource::InheritedGroupMlp);
+        assert_eq!(inherited.facts.sample_rate, 96_000);
+        assert_eq!(inherited.facts.channels, Some(6));
+        assert_eq!(
+            elementary_stream_kind_hint_from_probed_facts(inherited.facts),
+            Some(DvdaElementaryStreamKind::Mlp)
+        );
+        assert_eq!(inherited.downmix_source_label.as_deref(), Some("5.1"));
+        assert_eq!(inherited.facts.mlp_num_substreams, Some(2));
+        assert_eq!(
+            inherited.facts.mlp_num_substreams_source,
+            Some(MlpSubstreamFactSource::InheritedGroupProbe)
+        );
+        assert_eq!(
+            resolve_dvda_track_downmix_policy(
+                DvdaDownmixPolicy::Auto,
+                inherited.downmix_source_label.as_deref(),
+            ),
+            DvdaDownmixPolicy::FooInputDvdaCompatible
+        );
+    }
+
+
+    #[test]
+    fn group_mlp_probe_cache_inherits_from_later_successful_track_after_prime() {
+        let group = probe_cache_group_for_test();
+        let title_set = title_set_with_number_and_audio_formats(2, Vec::new());
+        let mut first_chapter = chapter_with_sector_range(48_191, 86_926);
+        first_chapter.track_nr = 1;
+        let mut later_chapter = chapter_with_sector_range(0, 48_190);
+        later_chapter.track_nr = 2;
+        let first_outcome = AobProbeOutcome {
+            result: None,
+            saw_mlp_packets: true,
+            saw_lpcm_packets: false,
+            scanned_sectors: 512,
+            origin: AobProbeOrigin::local(2),
+        };
+        let later_outcome = AobProbeOutcome {
+            result: Some(mlp_probe_result_for_test(Some("5.1"))),
+            saw_mlp_packets: true,
+            saw_lpcm_packets: false,
+            scanned_sectors: 512,
+            origin: AobProbeOrigin::local(2),
+        };
+        let mut cache = GroupStreamProbeCache::default();
+        cache.remember_probe_outcome(&later_outcome);
+
+        let inherited = select_stream_probe_for_track(
+            &group,
+            &title_set,
+            &first_chapter,
+            Some(&first_outcome),
+            &mut cache,
+        )
+        .expect("earlier track should inherit MLP facts found later in the same group");
+
+        assert_eq!(inherited.source, StreamProbeSelectionSource::InheritedGroupMlp);
+        assert_eq!(inherited.facts.sample_rate, 96_000);
+        assert_eq!(inherited.facts.channels, Some(6));
+        assert_eq!(inherited.downmix_source_label.as_deref(), Some("5.1"));
+        assert_eq!(
+            elementary_stream_kind_hint_from_probed_facts(inherited.facts),
+            Some(DvdaElementaryStreamKind::Mlp)
+        );
     }
 
     #[test]
