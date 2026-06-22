@@ -8,7 +8,7 @@ But tonepoet is absolutely usable by normies, too: it exposes an intuitive, mous
 
 ## What it does
 
-tonepoet is a music library workstation in your terminal: browse and manage your collection, verify disc rips, analyze audio quality, tag from MusicBrainz, and convert between any format — all through a keyboard-and-mouse-driven TUI or batch CLI. It handles single files, multi-track archives, CUE+image decomposition, and SACD ISO extraction.
+tonepoet is a music library workstation in your terminal: browse and manage your collection, verify disc rips, analyze audio quality, tag from MusicBrainz, and convert between any format — all through a keyboard-and-mouse-driven TUI or batch CLI. It handles single files, multi-track archives, CUE+image decomposition, SACD ISO extraction, DVD-Audio ISO extraction, and DVD-Video ISO audio extraction.
 
 ### Browsing and file management
 
@@ -21,10 +21,10 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 
 ### Metadata and tagging
 
-- **MusicBrainz** — disc-TOC-based release lookup, interactive release picker, per-track title/artist/ISRC population
+- **MusicBrainz** — disc-TOC-based release lookup (CD, SACD, DVD-Audio, DVD-Video via synthetic TOC), interactive release picker, per-track title/artist/ISRC population
 - **GNUDB** — freedb/gnudb disc ID lookup with multi-disc support
-- **Per-track metadata editor** — inline tag editing with MusicBrainz integration, CUE preview, revert/restore
-- **SACD sidecar XML** — persistent metadata sidecars for SACD ISOs (MusicBrainz tagging workflow)
+- **Per-track metadata editor** — inline tag editing with MusicBrainz integration, CUE preview, revert/restore, multi-presentation tabs and dropdown selector for disc sources
+- **Disc metadata sidecars** — persistent metadata sidecars for SACD ISOs (XML), DVD-Audio (foo_input_dvda-compatible XML), and DVD-Video (TOML with multi-presentation support)
 - **CUE sheet parsing** — legacy encoding support (CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1252), embedded CUESHEET preferred over sidecar
 - **CUESHEET embedding** — regenerate and embed CUESHEET tags on metadata save
 - **Typed metadata effects** — pipeline tracks source-tag transfer, artwork preservation, and authoritative metadata application independently to prevent silent metadata loss
@@ -48,7 +48,7 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 
 **Output:** FLAC, Opus, AAC (libfdk_aac), MP3, ALAC, WAV, WavPack, DSF, DFF, W64, RF64, AIFF, LPCM, WebM, MKV
 
-**Input (decode-only):** All output formats plus ISO (SACD), CUE+image, 7z/zip/rar archives, SHN, APE, DTS, AC3
+**Input (decode-only):** All output formats plus ISO (SACD, DVD-Audio, DVD-Video), CUE+image, 7z/zip/rar archives, SHN, APE, DTS, AC3
 
 **Resamplers:**
 
@@ -59,7 +59,15 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 
 ### SACD support
 
-Native SACD ISO extraction via the built-in sacd-rs crate (byte-exact against sacd_extract, validated across 70+ tracks). DSD-to-PCM conversion through sox with auto-gain peak normalization (`norm` effect), configurable safety margin, and rate-dependent lowpass filtering. DST frame decoding for compressed SACD layers.
+Native SACD ISO extraction via the built-in sacd-rs crate (byte-exact against sacd_extract). DSD-to-PCM conversion through sox with auto-gain peak normalization (`norm` effect), configurable safety margin, and rate-dependent lowpass filtering. DST frame decoding for compressed SACD layers.
+
+### DVD-Audio support
+
+Native DVD-Audio ISO and directory extraction via the built-in dvda-demuxer crate. IFO/AOB parsing, MLP and LPCM demuxing with framed MLP access-unit reassembly and strict/tolerant fallback. foo_input_dvda-compatible stereo extraction: cross-ATS presentations use the backing multichannel group's chapter boundaries, native MLP substream 0 extraction for authored stereo via in-process libavcodec, coefficient pan-filter fallback for single-substream MLP and PCM. IFO-authored downmix matrix support. Disc browser with stream picker, multi-group metadata editor with MusicBrainz integration via synthetic CD TOC lookup.
+
+### DVD-Video support
+
+DVD-Video ISO and directory audio extraction with per-chapter track splitting. LPCM extraction via in-process demuxer with IFO audio attribute override from packet sub-headers (corrects unreliable IFO sample rate and bit depth). Disc browser with stream picker showing all VTS/title/audio-stream combinations. Multi-presentation TOML metadata sidecars with MusicBrainz integration via synthetic CD TOC lookup and text search fallback. Metadata editor with dropdown presentation selector for discs with many programs, smart default selection preferring LPCM with existing sidecar metadata.
 
 ## Building
 
@@ -123,6 +131,7 @@ tonepoet/
 │   └── plan.rs             # Conversion planner
 └── crates/
     ├── sacd-rs/            # SACD ISO reader + DST decoder
+    ├── dvda-demuxer/       # DVD-Audio IFO/AOB parser + LPCM/MLP demuxer
     ├── tonepoet-backend/   # FFmpeg/Sox command builders
     └── tonepoet-features/  # Log writer, CUE sheet generator
 ```
