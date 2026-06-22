@@ -2,7 +2,7 @@
 
 A standalone CLI + TUI audio conversion and metadata management toolkit for music collectors who're fastidious as fuck about every. bloody. detail. of their libraries.
 
-But tonepoet is absolutely usable by normies, too: it exposes an intuitive, mouse- and keyboard-driven UX for working with audio file metadata, as well as sensible, opinionated defaults for converting audio files. Convert from DSD to PCM, PCM to PCM, PCM to DSD, etc., inheriting sensible, high-performance defaults ... or specifying your own.
+But tonepoet is absolutely usable by normies, too: it exposes an intuitive, mouse- and keyboard-driven UX for working with audio file metadata, as well as sensible, opinionated defaults for converting audio files. Extract and demux audio from SACD, DVD-Audio, and DVD-Video ISOs. Convert from DSD to PCM, PCM to PCM, PCM to DSD, etc., inheriting sensible, high-performance defaults ... or specifying your own.
 
 > **Status:** tonepoet is unfinished and under active development, with multiple commits landing daily. Features described below are at varying stages of completeness. Expect a few rough edges, occasional breaking changes, and documentation / help gaps.
 
