@@ -442,6 +442,31 @@ pub fn convert_overlay_cursor(app: &mut AppState) {
     }
 }
 
+/// Open the metadata editor for the currently highlighted DVD-Video stream and
+/// preload the sidecar entry for that exact presentation. This is the safe
+/// keybinding target for `:tags-mb`-style disc-browser activation because it
+/// carries the selected `PresentationId` through to the editor preload path.
+pub fn open_dvdv_metadata_editor_for_overlay_cursor(app: &mut AppState) -> Result<bool, String> {
+    let (source_path, selected_presentation_id) = match &app.active_overlay {
+        ActiveOverlay::DiscBrowser(state) => {
+            let Some(presentation) = state.selected_presentation() else {
+                return Ok(false);
+            };
+            if !matches!(presentation.id, PresentationId::DvdVideoTitle { .. }) {
+                return Ok(false);
+            }
+            (state.source_path.clone(), presentation.id.clone())
+        }
+        _ => return Ok(false),
+    };
+
+    crate::tui::command::open_metadata_editor_for_dvdv_with_sidecar_preload(
+        app,
+        source_path,
+        Some(selected_presentation_id),
+    )
+}
+
 /// Trigger the async disc probe after the browse cursor/selection changes.
 ///
 /// This is the cursor-move hook required by Phase 4c: when the highlighted row

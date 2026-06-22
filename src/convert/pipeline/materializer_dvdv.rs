@@ -89,11 +89,46 @@ impl Materializer for DvdVideoMaterializer {
                 vts.vts_number, stream.stream_index, stream.coding_mode
             ))
         })?;
-
         let selected_chapters = selected_chapter_ordinals(
             title.chapter_count as u32,
             &req.source.track_selection,
         )?;
+        let presentation_identity = dvdv_presentation_identity(vts, title, stream, angle_number);
+        let supported_presentation_count = dvdv_supported_audio_presentation_count(&vts_ifos);
+        let dvdv_sidecar = match load_dvdv_metadata_sidecars(&req.container)? {
+            Some(sidecars) => {
+                let mut matching = sidecars.into_iter().filter(|sidecar| {
+                    dvdv_sidecar_matches_selection(
+                        sidecar,
+                        &presentation_identity,
+                        title.angle_count,
+                        title.chapters.len(),
+                        selected_chapters.len(),
+                        supported_presentation_count,
+                    )
+                });
+                let first = matching.next();
+                if matching.next().is_some() {
+                    log::warn!(
+                        "ignoring DVD-Video metadata sidecar for {} because multiple presentations match {:?}",
+                        req.container.display(),
+                        presentation_identity
+                    );
+                    None
+                } else if first.is_none() {
+                    log::warn!(
+                        "ignoring DVD-Video metadata sidecar for {} because no presentation matches {:?}",
+                        req.container.display(),
+                        presentation_identity
+                    );
+                    None
+                } else {
+                    first
+                }
+            }
+            None => None,
+        };
+
         let mut tracks = Vec::with_capacity(selected_chapters.len());
         for chapter in title
             .chapters
@@ -127,11 +162,12 @@ impl Materializer for DvdVideoMaterializer {
                 cancel,
             )?;
             let source_ordinal = u32::from(chapter.number);
+            let output_track_number = dvdv_output_track_number(tracks.len());
             tracks.push(PreparedTrack {
                 id: TrackId {
                     source_ordinal,
                     disc_number: None,
-                    track_number: source_ordinal,
+                    track_number: output_track_number,
                 },
                 source_ref: TrackSourceRef::DvdVideoTrack {
                     source: req.container.clone(),
@@ -147,7 +183,12 @@ impl Materializer for DvdVideoMaterializer {
                     bit_depth: stream.bit_depth,
                     channels: Some(stream.channels),
                 },
-                metadata: track_metadata(title.number, chapter.number),
+                metadata: track_metadata(
+                    title.number,
+                    chapter.number,
+                    output_track_number,
+                    dvdv_sidecar.as_ref(),
+                ),
                 expected_samples: None,
                 sample_rate: stream.sample_frequency,
                 source_audio: SourceAudioDescriptor::from_scalar(
@@ -178,12 +219,8 @@ impl Materializer for DvdVideoMaterializer {
         );
 
         let tool_versions = dvdv_tool_versions(runner);
-
-        Ok(PreparedSource {
-            container: req.container.clone(),
-            kind: SourceKind::DvdVideo,
-            tracks,
-            album_metadata: AlbumMetadata {
+        let album_metadata = overlay_dvdv_album_metadata(
+            AlbumMetadata {
                 album: req
                     .container
                     .file_stem()
@@ -192,11 +229,19 @@ impl Materializer for DvdVideoMaterializer {
                 album_artist: None,
                 genre: None,
                 date: None,
-                total_tracks: title.chapter_count as u32,
+                total_tracks: dvdv_album_total_tracks(tracks.len()),
                 total_discs: None,
                 disc_number: None,
                 extra,
             },
+            dvdv_sidecar.as_ref(),
+        );
+
+        Ok(PreparedSource {
+            container: req.container.clone(),
+            kind: SourceKind::DvdVideo,
+            tracks,
+            album_metadata,
             provenance: ExtractionProvenance {
                 source_kind: SourceKind::DvdVideo,
                 source_sha256: None,
@@ -1126,12 +1171,303 @@ fn source_audio_coding(coding: DvdVideoAudioCoding) -> Option<SourceAudioCoding>
     }
 }
 
-fn track_metadata(title_number: u8, chapter_number: u16) -> TrackMetadata {
-    TrackMetadata {
-        title: Some(format!("Title {} Chapter {}", title_number, chapter_number)),
-        track_number: Some(u32::from(chapter_number)),
-        ..TrackMetadata::default()
+fn load_dvdv_metadata_sidecars(
+    source: &Path,
+) -> Result<Option<Vec<crate::tui::command::DvdVideoMetadataSidecar>>, MaterializeError> {
+    crate::tui::command::load_dvdv_metadata_sidecar_presentations(source)
+        .map(|loaded| loaded.map(|(_, sidecars)| sidecars))
+        .map_err(MaterializeError::Parse)
+}
+
+
+fn dvdv_presentation_identity(
+    vts: &VtsIfo,
+    title: &dvdvideo::DvdTitle,
+    stream: &AudioStreamAttr,
+    angle_number: u8,
+) -> crate::tui::command::DvdVideoPresentationIdentity {
+    let durations = dvdv_presentation_track_durations(vts, title, angle_number);
+    crate::tui::command::DvdVideoPresentationIdentity {
+        vts_number: vts.vts_number,
+        title_number: title.number,
+        audio_stream_index: stream.stream_index,
+        angle_number: (title.angle_count.max(1) > 1).then_some(angle_number),
+        track_count: Some(title.chapters.len()),
+        duration_fingerprint: durations
+            .as_deref()
+            .map(crate::tui::command::dvdv_track_duration_fingerprint_from_secs),
     }
+}
+
+fn dvdv_presentation_track_durations(
+    vts: &VtsIfo,
+    title: &dvdvideo::DvdTitle,
+    angle_number: u8,
+) -> Option<Vec<f64>> {
+    title
+        .chapters
+        .iter()
+        .map(|chapter| chapter_duration_secs(vts, title, chapter, angle_number))
+        .collect()
+}
+
+fn dvdv_supported_audio_presentation_count(vts_ifos: &[VtsIfo]) -> usize {
+    let mut count = 0usize;
+    for vts in vts_ifos {
+        let supported_streams = vts
+            .audio_streams
+            .iter()
+            .filter(|stream| dvdv_coding(stream).is_some())
+            .count();
+        if supported_streams == 0 {
+            continue;
+        }
+        for title in &vts.titles {
+            if title.chapters.is_empty() {
+                continue;
+            }
+            let angle_count = usize::from(title.angle_count.max(1));
+            count = count.saturating_add(supported_streams.saturating_mul(angle_count));
+        }
+    }
+    count
+}
+
+fn dvdv_sidecar_matches_selection(
+    sidecar: &crate::tui::command::DvdVideoMetadataSidecar,
+    current: &crate::tui::command::DvdVideoPresentationIdentity,
+    title_angle_count: u8,
+    full_track_count: usize,
+    selected_track_count: usize,
+    supported_presentation_count: usize,
+) -> bool {
+    if sidecar.source.sidecar_kind != "dvd_video" {
+        return false;
+    }
+
+    match sidecar.source.presentation.as_ref() {
+        Some(stored) => {
+            crate::tui::command::dvdv_presentation_identity_compatible(Some(stored), Some(current))
+                // Sparse angle identity keeps ordinary single-angle TOML readable.
+                // Multi-angle selections carry `Some(angle)`, so the shared
+                // compatibility check rejects angle-less sidecar presentations.
+                && (stored.angle_number.is_some() || title_angle_count <= 1)
+        }
+        None => {
+            supported_presentation_count == 1
+                && selected_track_count == full_track_count
+                && (sidecar.tracks.is_empty() || sidecar.tracks.len() == full_track_count)
+        }
+    }
+}
+
+fn dvdv_album_total_tracks(materialized_track_count: usize) -> u32 {
+    materialized_track_count.min(u32::MAX as usize) as u32
+}
+
+fn dvdv_output_track_number(output_index_zero_based: usize) -> u32 {
+    output_index_zero_based
+        .saturating_add(1)
+        .min(u32::MAX as usize) as u32
+}
+
+fn overlay_dvdv_album_metadata(
+    mut base: AlbumMetadata,
+    sidecar: Option<&crate::tui::command::DvdVideoMetadataSidecar>,
+) -> AlbumMetadata {
+    let Some(sidecar) = sidecar else {
+        return base;
+    };
+
+    if let Some(value) = dvdv_album_value(sidecar, &["ALBUM"]) {
+        base.album = Some(value);
+    }
+    if let Some(value) = dvdv_album_value(sidecar, &["ALBUMARTIST", "ARTIST"]) {
+        base.album_artist = Some(value);
+    }
+    if let Some(value) = dvdv_album_value(sidecar, &["GENRE"]) {
+        base.genre = Some(value);
+    }
+    if let Some(value) = dvdv_album_value(sidecar, &["DATE", "YEAR"]) {
+        base.date = Some(value);
+    }
+    if let Some(value) = dvdv_album_value(sidecar, &["DISCNUMBER"]).and_then(|v| parse_positive_u32(&v)) {
+        base.disc_number = Some(value);
+    }
+
+    for (key, value) in &sidecar.album {
+        if !is_dvdv_standard_album_key(key) {
+            insert_nonempty(&mut base.extra, &metadata_extra_key(key), value.clone());
+        }
+    }
+    if sidecar.schema_version != 0 {
+        insert_nonempty(
+            &mut base.extra,
+            "dvdv_metadata_schema_version",
+            sidecar.schema_version.to_string(),
+        );
+    }
+    insert_nonempty(
+        &mut base.extra,
+        "dvdv_metadata_sidecar_kind",
+        sidecar.source.sidecar_kind.clone(),
+    );
+    base
+}
+
+fn track_metadata(
+    title_number: u8,
+    chapter_number: u16,
+    output_track_number: u32,
+    sidecar: Option<&crate::tui::command::DvdVideoMetadataSidecar>,
+) -> TrackMetadata {
+    let sidecar_track = sidecar.and_then(|sidecar| {
+        dvdv_sidecar_track_for_chapter(sidecar, title_number, chapter_number, output_track_number)
+    });
+    let mut extra = BTreeMap::new();
+    insert_nonempty(&mut extra, "dvdv_title_number", title_number.to_string());
+    insert_nonempty(&mut extra, "dvdv_chapter_number", chapter_number.to_string());
+
+    if let Some(track) = sidecar_track {
+        for (key, value) in &track.tags {
+            if !is_dvdv_standard_track_key(key) {
+                insert_nonempty(&mut extra, &metadata_extra_key(key), value.clone());
+            }
+        }
+        if let Some(sidecar_number) = dvdv_track_value(Some(track), &["TRACKNUMBER"]) {
+            if parse_positive_u32(&sidecar_number) != Some(output_track_number) {
+                insert_nonempty(&mut extra, "dvdv_sidecar_track_number", sidecar_number);
+            }
+        }
+    }
+
+    let synthetic_title = format!("Title {} Chapter {}", title_number, chapter_number);
+    let artist = dvdv_track_value(sidecar_track, &["ARTIST"]);
+    let performer = dvdv_track_value(sidecar_track, &["PERFORMER"]).or_else(|| artist.clone());
+    TrackMetadata {
+        title: dvdv_track_value(sidecar_track, &["TITLE"]).or(Some(synthetic_title)),
+        artist: artist.clone(),
+        album_artist: dvdv_track_value(sidecar_track, &["ALBUMARTIST"]),
+        composer: dvdv_track_value(sidecar_track, &["COMPOSER"]),
+        performer,
+        genre: dvdv_track_value(sidecar_track, &["GENRE"]),
+        date: dvdv_track_value(sidecar_track, &["DATE", "YEAR"]),
+        track_number: Some(output_track_number),
+        disc_number: dvdv_track_value(sidecar_track, &["DISCNUMBER"])
+            .and_then(|value| parse_positive_u32(&value)),
+        isrc: dvdv_track_value(sidecar_track, &["ISRC"]),
+        publisher: dvdv_track_value(sidecar_track, &["PUBLISHER"]),
+        copyright: dvdv_track_value(sidecar_track, &["COPYRIGHT"]),
+        comment: dvdv_track_value(sidecar_track, &["COMMENT"]),
+        pre_emphasis: false,
+        extra,
+    }
+}
+
+fn dvdv_sidecar_track_for_chapter<'a>(
+    sidecar: &'a crate::tui::command::DvdVideoMetadataSidecar,
+    title_number: u8,
+    chapter_number: u16,
+    output_track_number: u32,
+) -> Option<&'a crate::tui::command::DvdVideoMetadataTrack> {
+    sidecar
+        .tracks
+        .iter()
+        .find(|track| track.source_title == Some(title_number) && track.source_chapter == Some(chapter_number))
+        .or_else(|| sidecar.tracks.iter().find(|track| track.source_chapter == Some(chapter_number)))
+        .or_else(|| sidecar.tracks.iter().find(|track| track.number == usize::from(chapter_number)))
+        .or_else(|| sidecar.tracks.get(output_track_number.saturating_sub(1) as usize))
+}
+
+fn dvdv_album_value(
+    sidecar: &crate::tui::command::DvdVideoMetadataSidecar,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| nonempty_cloned(sidecar.album.get(*key)))
+}
+
+fn dvdv_track_value(
+    track: Option<&crate::tui::command::DvdVideoMetadataTrack>,
+    keys: &[&str],
+) -> Option<String> {
+    let track = track?;
+    keys.iter().find_map(|key| nonempty_cloned(track.tags.get(*key)))
+}
+
+fn nonempty_cloned(value: Option<&String>) -> Option<String> {
+    value
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_positive_u32(value: &str) -> Option<u32> {
+    let parsed = value.trim().parse::<u32>().ok()?;
+    (parsed > 0).then_some(parsed)
+}
+
+fn metadata_extra_key(key: &str) -> String {
+    musicbrainz_standard_tag_key(key)
+        .unwrap_or_else(|| key.trim().to_ascii_lowercase().replace(' ', "_"))
+}
+
+fn musicbrainz_standard_tag_key(key: &str) -> Option<String> {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_uppercase())
+        .collect();
+    let tag = match normalized.as_str() {
+        "MUSICBRAINZALBUMID" | "MUSICBRAINZRELEASEID" => "MUSICBRAINZ_ALBUMID",
+        "MUSICBRAINZALBUMARTISTID" | "MUSICBRAINZRELEASEARTISTID" => {
+            "MUSICBRAINZ_ALBUMARTISTID"
+        }
+        "MUSICBRAINZRELEASEGROUPID" => "MUSICBRAINZ_RELEASEGROUPID",
+        "MUSICBRAINZTRACKID" | "MUSICBRAINZRECORDINGID" => "MUSICBRAINZ_TRACKID",
+        "MUSICBRAINZRELEASETRACKID" => "MUSICBRAINZ_RELEASETRACKID",
+        "MUSICBRAINZARTISTID" => "MUSICBRAINZ_ARTISTID",
+        _ => return None,
+    };
+    Some(tag.to_string())
+}
+
+fn insert_nonempty(extra: &mut BTreeMap<String, String>, key: &str, value: String) {
+    if !value.trim().is_empty() {
+        extra.insert(key.to_string(), value);
+    }
+}
+
+fn is_dvdv_standard_album_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ALBUM"
+            | "ALBUMARTIST"
+            | "ARTIST"
+            | "GENRE"
+            | "DATE"
+            | "YEAR"
+            | "DISCNUMBER"
+    )
+}
+
+fn is_dvdv_standard_track_key(key: &str) -> bool {
+    matches!(
+        key,
+        "TITLE"
+            | "ARTIST"
+            | "ALBUMARTIST"
+            | "PERFORMER"
+            | "COMPOSER"
+            | "GENRE"
+            | "DATE"
+            | "YEAR"
+            | "TRACKNUMBER"
+            | "DISCNUMBER"
+            | "ISRC"
+            | "PUBLISHER"
+            | "COPYRIGHT"
+            | "COMMENT"
+    )
 }
 
 fn selected_chapter_ordinals(
@@ -1188,6 +1524,7 @@ mod tests {
     use super::super::errors::ToolRunnerError;
     use super::super::tool::{ToolBinary, ToolCommand, ToolRunner};
     use std::collections::{BTreeMap, HashMap};
+    use std::path::PathBuf;
     use tokio_util::sync::CancellationToken;
 
     struct VersionOnlyRunner(HashMap<ToolBinary, String>);
@@ -1228,8 +1565,9 @@ mod tests {
     }
 
     use super::{
-        classify_cell_for_extraction, coalesce_authored_adjacent_ranges, selected_chapter_ordinals,
-        DvdvDefaultProgramScore, ReverseDvdvIdentity, CellExtractionKind,
+        classify_cell_for_extraction, coalesce_authored_adjacent_ranges, dvdv_album_total_tracks,
+        dvdv_sidecar_matches_selection, overlay_dvdv_album_metadata, selected_chapter_ordinals,
+        track_metadata, CellExtractionKind, DvdvDefaultProgramScore, ReverseDvdvIdentity,
     };
     use super::TrackSelection;
     use dvdvideo::ifo::{CellPlaybackInfo, FrameRate, PgcTime};
@@ -1311,6 +1649,80 @@ mod tests {
 
 
     #[test]
+    fn dvdv_album_total_tracks_uses_materialized_selection_count() {
+        assert_eq!(dvdv_album_total_tracks(0), 0);
+        assert_eq!(dvdv_album_total_tracks(1), 1);
+        assert_eq!(dvdv_album_total_tracks(3), 3);
+    }
+
+    #[test]
+    fn dvdv_sidecar_overlay_maps_album_and_track_musicbrainz_ids_to_standard_extras() {
+        let sidecar = crate::tui::command::DvdVideoMetadataSidecar {
+            schema_version: 2,
+            source: crate::tui::command::DvdVideoMetadataSource {
+                path: PathBuf::from("concert.iso"),
+                sidecar_kind: "dvd_video".to_string(),
+                presentation: Some(crate::tui::command::DvdVideoPresentationIdentity {
+                    vts_number: 1,
+                    title_number: 1,
+                    audio_stream_index: 0,
+                    angle_number: Some(1),
+                    track_count: Some(1),
+                    duration_fingerprint: Some("dvdv-ms-v1:1:abc".to_string()),
+                }),
+                extra: BTreeMap::new(),
+            },
+            album: BTreeMap::from([
+                ("ALBUM".to_string(), "Live at the Theater".to_string()),
+                ("ALBUMARTIST".to_string(), "Example Band".to_string()),
+                ("MUSICBRAINZ_ALBUMID".to_string(), "release-id".to_string()),
+                ("MUSICBRAINZ_RELEASEGROUPID".to_string(), "group-id".to_string()),
+                ("CATALOGNUMBER".to_string(), "DVD-001".to_string()),
+            ]),
+            tracks: vec![crate::tui::command::DvdVideoMetadataTrack {
+                number: 1,
+                label: "01".to_string(),
+                source_title: None,
+                source_chapter: None,
+                tags: BTreeMap::from([
+                    ("TITLE".to_string(), "Opening".to_string()),
+                    ("ARTIST".to_string(), "Example Band".to_string()),
+                    ("MUSICBRAINZ_TRACKID".to_string(), "recording-id".to_string()),
+                    ("MUSICBRAINZ_RELEASETRACKID".to_string(), "release-track-id".to_string()),
+                ]),
+                extra: BTreeMap::new(),
+            }],
+            extra: BTreeMap::new(),
+        };
+
+        let album = overlay_dvdv_album_metadata(
+            super::AlbumMetadata {
+                total_tracks: dvdv_album_total_tracks(1),
+                ..super::AlbumMetadata::default()
+            },
+            Some(&sidecar),
+        );
+        let track = track_metadata(1, 1, 1, Some(&sidecar));
+
+        assert_eq!(album.album.as_deref(), Some("Live at the Theater"));
+        assert_eq!(album.album_artist.as_deref(), Some("Example Band"));
+        assert_eq!(album.total_tracks, 1);
+        assert_eq!(album.extra.get("MUSICBRAINZ_ALBUMID").map(String::as_str), Some("release-id"));
+        assert_eq!(
+            album.extra.get("MUSICBRAINZ_RELEASEGROUPID").map(String::as_str),
+            Some("group-id")
+        );
+        assert_eq!(album.extra.get("catalognumber").map(String::as_str), Some("DVD-001"));
+        assert_eq!(track.title.as_deref(), Some("Opening"));
+        assert_eq!(track.artist.as_deref(), Some("Example Band"));
+        assert_eq!(track.extra.get("MUSICBRAINZ_TRACKID").map(String::as_str), Some("recording-id"));
+        assert_eq!(
+            track.extra.get("MUSICBRAINZ_RELEASETRACKID").map(String::as_str),
+            Some("release-track-id")
+        );
+    }
+
+    #[test]
     fn default_program_score_prefers_computable_selected_angle_path() {
         let unsafe_interleaved_main = default_score_with_duration_flag(
             false,
@@ -1378,6 +1790,148 @@ mod tests {
             last_vobu_start_sector: 0,
             last_vobu_end_sector: 0,
         }
+    }
+
+    fn dvdv_test_identity(
+        vts_number: u8,
+        title_number: u8,
+        audio_stream_index: u8,
+        angle_number: Option<u8>,
+        track_count: usize,
+        fingerprint: &str,
+    ) -> crate::tui::command::DvdVideoPresentationIdentity {
+        crate::tui::command::DvdVideoPresentationIdentity {
+            vts_number,
+            title_number,
+            audio_stream_index,
+            angle_number,
+            track_count: Some(track_count),
+            duration_fingerprint: Some(fingerprint.to_string()),
+        }
+    }
+
+    #[test]
+    fn dvdv_sidecar_matches_bound_presentation_only() {
+        let sidecar = crate::tui::command::DvdVideoMetadataSidecar {
+            schema_version: 3,
+            source: crate::tui::command::DvdVideoMetadataSource {
+                path: PathBuf::from("concert.iso"),
+                sidecar_kind: "dvd_video".to_string(),
+                presentation: Some(dvdv_test_identity(2, 4, 1, Some(1), 12, "fp-a")),
+                extra: BTreeMap::new(),
+            },
+            album: BTreeMap::new(),
+            tracks: Vec::new(),
+            extra: BTreeMap::new(),
+        };
+
+        assert!(dvdv_sidecar_matches_selection(
+            &sidecar,
+            &dvdv_test_identity(2, 4, 1, Some(1), 12, "fp-a"),
+            1,
+            12,
+            12,
+            2,
+        ));
+        assert!(!dvdv_sidecar_matches_selection(
+            &sidecar,
+            &dvdv_test_identity(2, 5, 1, Some(1), 12, "fp-a"),
+            1,
+            12,
+            12,
+            2,
+        ));
+        assert!(!dvdv_sidecar_matches_selection(
+            &sidecar,
+            &dvdv_test_identity(2, 4, 2, Some(1), 12, "fp-a"),
+            1,
+            12,
+            12,
+            2,
+        ));
+        assert!(!dvdv_sidecar_matches_selection(
+            &sidecar,
+            &dvdv_test_identity(2, 4, 1, Some(1), 11, "fp-a"),
+            1,
+            12,
+            12,
+            2,
+        ));
+        assert!(!dvdv_sidecar_matches_selection(
+            &sidecar,
+            &dvdv_test_identity(2, 4, 1, Some(1), 12, "fp-b"),
+            1,
+            12,
+            12,
+            2,
+        ));
+    }
+
+    #[test]
+    fn legacy_dvdv_sidecar_applies_only_to_unambiguous_full_selection() {
+        let sidecar = crate::tui::command::DvdVideoMetadataSidecar {
+            schema_version: 1,
+            source: crate::tui::command::DvdVideoMetadataSource {
+                path: PathBuf::from("concert.iso"),
+                sidecar_kind: "dvd_video".to_string(),
+                presentation: None,
+                extra: BTreeMap::new(),
+            },
+            album: BTreeMap::new(),
+            tracks: vec![
+                crate::tui::command::DvdVideoMetadataTrack {
+                    number: 1,
+                    label: "01".to_string(),
+                    source_title: None,
+                    source_chapter: None,
+                    tags: BTreeMap::new(),
+                    extra: BTreeMap::new(),
+                },
+                crate::tui::command::DvdVideoMetadataTrack {
+                    number: 2,
+                    label: "02".to_string(),
+                    source_title: None,
+                    source_chapter: None,
+                    tags: BTreeMap::new(),
+                    extra: BTreeMap::new(),
+                },
+            ],
+            extra: BTreeMap::new(),
+        };
+        let current = dvdv_test_identity(1, 1, 0, Some(1), 2, "fp");
+
+        assert!(dvdv_sidecar_matches_selection(&sidecar, &current, 1, 2, 2, 1));
+        assert!(!dvdv_sidecar_matches_selection(&sidecar, &current, 1, 2, 1, 1));
+        assert!(!dvdv_sidecar_matches_selection(&sidecar, &current, 1, 2, 2, 2));
+    }
+
+    #[test]
+    fn selected_subset_track_metadata_uses_output_order_but_overlays_source_chapter() {
+        let sidecar = crate::tui::command::DvdVideoMetadataSidecar {
+            schema_version: 3,
+            source: crate::tui::command::DvdVideoMetadataSource {
+                path: PathBuf::from("concert.iso"),
+                sidecar_kind: "dvd_video".to_string(),
+                presentation: Some(dvdv_test_identity(1, 1, 0, Some(1), 4, "fp")),
+                extra: BTreeMap::new(),
+            },
+            album: BTreeMap::new(),
+            tracks: vec![
+                crate::tui::command::DvdVideoMetadataTrack { number: 1, label: "01".to_string(), source_title: None, source_chapter: None, tags: BTreeMap::from([("TITLE".to_string(), "One".to_string())]), extra: BTreeMap::new() },
+                crate::tui::command::DvdVideoMetadataTrack { number: 2, label: "02".to_string(), source_title: None, source_chapter: None, tags: BTreeMap::from([("TITLE".to_string(), "Two".to_string()), ("TRACKNUMBER".to_string(), "2".to_string())]), extra: BTreeMap::new() },
+                crate::tui::command::DvdVideoMetadataTrack { number: 3, label: "03".to_string(), source_title: None, source_chapter: None, tags: BTreeMap::from([("TITLE".to_string(), "Three".to_string()), ("TRACKNUMBER".to_string(), "3".to_string())]), extra: BTreeMap::new() },
+            ],
+            extra: BTreeMap::new(),
+        };
+
+        let track = track_metadata(1, 3, 1, Some(&sidecar));
+
+        assert_eq!(track.title.as_deref(), Some("Three"));
+        assert_eq!(track.track_number, Some(1));
+        assert_eq!(
+            track.extra.get("dvdv_sidecar_track_number").map(String::as_str),
+            Some("3")
+        );
     }
 
     #[test]

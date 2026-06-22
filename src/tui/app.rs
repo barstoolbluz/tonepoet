@@ -954,6 +954,37 @@ impl SourceMode {
             }
         }
 
+        // DVD-Video ISO/directory detection. Prefer LPCM presentations,
+        // especially those with sidecar metadata already populated.
+        if crate::disc::dvdv_utils::is_dvdv_source(&path) {
+            if let Ok(contents) = crate::disc::dvdv_utils::map_dvdv_source(&path) {
+                if !contents.presentations.is_empty() {
+                    let best = contents
+                        .presentations
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            p.format
+                                .codec
+                                .as_deref()
+                                .is_some_and(|c| c.eq_ignore_ascii_case("lpcm"))
+                        })
+                        .max_by_key(|(_, p)| {
+                            // Prefer presentations that have sidecar metadata
+                            (p.album_title.is_some() as u8, p.tracks.len())
+                        })
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let meta = crate::tui::disc_browser::metadata_for_disc(&contents);
+                    if let Ok(mode) =
+                        crate::tui::disc_browser::source_mode_for_presentation(contents, best, meta)
+                    {
+                        return mode;
+                    }
+                }
+            }
+        }
+
         // SACD ISO detection
         if crate::tui::sacd::is_sacd_iso(&path) {
             if let Ok(sacd) = crate::tui::sacd::parse_sacd_iso(&path) {
@@ -2762,6 +2793,17 @@ pub struct PresentationTab {
     pub sacd_area_kind: Option<crate::tui::sacd::AreaKind>,
     pub sacd_stereo_durations: Option<Vec<f64>>,
     pub sacd_multi_channel_durations: Option<Vec<f64>>,
+    /// DVD-Video-only: per-track source chapter numbers for the active presentation.
+    /// This keeps persisted TOML source identity independent from display labels.
+    pub dvdv_source_chapters: Option<Vec<u16>>,
+    /// DVD-Video-only: per-chapter durations (seconds) for the active presentation.
+    pub dvdv_track_durations: Option<Vec<f64>>,
+    /// DVD-Video-only: selected camera angle when the title has multiple angles.
+    /// Single-angle titles keep this as `None` so generated TOML stays sparse.
+    pub dvdv_angle_number: Option<u8>,
+    /// DVD-Video-only: number of authored angles for this title when known.
+    /// Values greater than one make angle identity mandatory.
+    pub dvdv_title_angle_count: Option<u8>,
 }
 
 /// State for the metadata editor overlay.
@@ -2832,6 +2874,20 @@ pub struct MetadataEditorState {
     /// editor is currently surfacing — the sibling-area mirror
     /// (future C-2c) needs both available.
     pub sacd_multi_channel_durations: Option<Vec<f64>>,
+    /// DVD-Video-only: per-track source chapter numbers for the active VTS/title/stream.
+    /// The sidecar save path uses this to persist source identity without scraping
+    /// user-visible row labels.
+    pub dvdv_source_chapters: Option<Vec<u16>>,
+    /// DVD-Video-only: per-chapter durations (seconds) for the active VTS/title/stream.
+    /// The MusicBrainz populate path uses these to warn when positional track
+    /// assignment differs from MusicBrainz `length_ms` by more than the DVD-Video
+    /// tolerance.
+    pub dvdv_track_durations: Option<Vec<f64>>,
+    /// DVD-Video-only: selected camera angle when angle identity is required.
+    /// Single-angle presentations keep this as `None`.
+    pub dvdv_angle_number: Option<u8>,
+    /// DVD-Video-only: authored angle count or equivalent ambiguity signal.
+    pub dvdv_title_angle_count: Option<u8>,
     /// Disc-backed editor tabs. Empty for plain file editors and
     /// single-presentation disc editors. When non-empty, the active tab is
     /// mirrored into the legacy top-level editor fields for rendering and
@@ -2869,6 +2925,10 @@ impl MetadataEditorState {
         tab.sacd_area_kind = self.sacd_area_kind.clone();
         tab.sacd_stereo_durations = self.sacd_stereo_durations.clone();
         tab.sacd_multi_channel_durations = self.sacd_multi_channel_durations.clone();
+        tab.dvdv_source_chapters = self.dvdv_source_chapters.clone();
+        tab.dvdv_track_durations = self.dvdv_track_durations.clone();
+        tab.dvdv_angle_number = self.dvdv_angle_number;
+        tab.dvdv_title_angle_count = self.dvdv_title_angle_count;
     }
 
     pub fn switch_presentation_tab(&mut self, next: usize) -> bool {
@@ -2886,6 +2946,10 @@ impl MetadataEditorState {
         self.sacd_area_kind = tab.sacd_area_kind;
         self.sacd_stereo_durations = tab.sacd_stereo_durations;
         self.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
+        self.dvdv_source_chapters = tab.dvdv_source_chapters;
+        self.dvdv_track_durations = tab.dvdv_track_durations;
+        self.dvdv_angle_number = tab.dvdv_angle_number;
+        self.dvdv_title_angle_count = tab.dvdv_title_angle_count;
         self.cursor = self.cursor.min(self.entries.len());
         self.scroll = 0;
         self.last_click = None;
@@ -2919,17 +2983,44 @@ impl MetadataEditorState {
         self.switch_presentation_tab(next)
     }
 
+    pub fn mark_active_presentation_saved(&mut self) {
+        self.sync_active_presentation();
+        if let Some(tab) = self.presentation_tabs.get_mut(self.active_tab) {
+            mark_presentation_tab_saved(tab);
+            let tab = tab.clone();
+            self.entries = tab.entries;
+            self.deleted = tab.deleted;
+            self.dirty = false;
+        } else {
+            self.dirty = false;
+            self.deleted.clear();
+            for entry in &mut self.entries {
+                mark_tag_entry_saved(entry);
+            }
+        }
+    }
+
+    pub fn dirty_presentation_count(&mut self) -> usize {
+        self.sync_active_presentation();
+        if self.presentation_tabs.is_empty() {
+            if self.dirty { 1 } else { 0 }
+        } else {
+            self.presentation_tabs.iter().filter(|tab| tab.dirty).count()
+        }
+    }
+
+    pub fn active_presentation_is_dirty(&mut self) -> bool {
+        self.sync_active_presentation();
+        self.presentation_tabs
+            .get(self.active_tab)
+            .map(|tab| tab.dirty)
+            .unwrap_or(self.dirty)
+    }
+
     pub fn mark_all_presentations_saved(&mut self) {
         self.sync_active_presentation();
         for tab in &mut self.presentation_tabs {
-            tab.dirty = false;
-            for entry in &mut tab.entries {
-                entry.per_file_originals = entry.per_file_values.clone();
-                entry.original = entry.value.clone();
-                entry.mb_proposed_value = None;
-                entry.mb_proposed_per_file = None;
-            }
-            tab.deleted.clear();
+            mark_presentation_tab_saved(tab);
         }
         if let Some(tab) = self.presentation_tabs.get(self.active_tab).cloned() {
             self.entries = tab.entries;
@@ -2939,10 +3030,7 @@ impl MetadataEditorState {
             self.dirty = false;
             self.deleted.clear();
             for entry in &mut self.entries {
-                entry.per_file_originals = entry.per_file_values.clone();
-                entry.original = entry.value.clone();
-                entry.mb_proposed_value = None;
-                entry.mb_proposed_per_file = None;
+                mark_tag_entry_saved(entry);
             }
         }
     }
@@ -2982,6 +3070,21 @@ impl MetadataEditorState {
         }
         changed_tabs
     }
+}
+
+fn mark_presentation_tab_saved(tab: &mut PresentationTab) {
+    tab.dirty = false;
+    for entry in &mut tab.entries {
+        mark_tag_entry_saved(entry);
+    }
+    tab.deleted.clear();
+}
+
+fn mark_tag_entry_saved(entry: &mut crate::tui::probe::TagEntry) {
+    entry.per_file_originals = entry.per_file_values.clone();
+    entry.original = entry.value.clone();
+    entry.mb_proposed_value = None;
+    entry.mb_proposed_per_file = None;
 }
 
 fn copy_musicbrainz_entries_preserving_originals(
@@ -5947,6 +6050,10 @@ mod metadata_presentation_tab_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
         }
     }
 
@@ -5975,6 +6082,10 @@ mod metadata_presentation_tab_tests {
             sacd_area_kind: active.sacd_area_kind,
             sacd_stereo_durations: active.sacd_stereo_durations,
             sacd_multi_channel_durations: active.sacd_multi_channel_durations,
+            dvdv_source_chapters: active.dvdv_source_chapters,
+            dvdv_track_durations: active.dvdv_track_durations,
+            dvdv_angle_number: active.dvdv_angle_number,
+            dvdv_title_angle_count: active.dvdv_title_angle_count,
             presentation_tabs: tabs,
             active_tab,
         }
@@ -6008,6 +6119,70 @@ mod metadata_presentation_tab_tests {
 
         assert!(state.switch_presentation_tab(0));
         assert_eq!(state.entries[0].value, "edited mch");
+    }
+
+    #[test]
+    fn mark_active_presentation_saved_does_not_mark_dirty_sibling_tabs_saved() {
+        let mut dirty_active = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![tag("TITLE", "old active", vec!["old active"])],
+            1,
+        );
+        dirty_active.dirty = true;
+        dirty_active.entries[0].value = "edited active".to_string();
+        dirty_active.entries[0].per_file_values = vec!["edited active".to_string()];
+
+        let mut dirty_sibling = tab(
+            PresentationId::DvdAudioGroup(3),
+            "Group 3",
+            vec![tag("TITLE", "old sibling", vec!["old sibling"])],
+            1,
+        );
+        dirty_sibling.dirty = true;
+        dirty_sibling.entries[0].value = "edited sibling".to_string();
+        dirty_sibling.entries[0].per_file_values = vec!["edited sibling".to_string()];
+
+        let mut state = state_with_tabs(vec![dirty_active, dirty_sibling], 0);
+        state.entries[0].value = "edited active".to_string();
+        state.entries[0].per_file_values = vec!["edited active".to_string()];
+        state.dirty = true;
+
+        state.mark_active_presentation_saved();
+
+        assert!(!state.presentation_tabs[0].dirty);
+        assert_eq!(
+            state.presentation_tabs[0].entries[0].original,
+            "edited active"
+        );
+        assert!(state.presentation_tabs[1].dirty);
+        assert_eq!(
+            state.presentation_tabs[1].entries[0].original,
+            "old sibling"
+        );
+        assert_eq!(state.dirty_presentation_count(), 1);
+    }
+
+    #[test]
+    fn active_presentation_is_dirty_does_not_treat_dirty_sibling_as_active() {
+        let active = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![tag("TITLE", "active", vec!["active"])],
+            1,
+        );
+        let mut dirty_sibling = tab(
+            PresentationId::DvdAudioGroup(3),
+            "Group 3",
+            vec![tag("TITLE", "sibling", vec!["sibling"])],
+            1,
+        );
+        dirty_sibling.dirty = true;
+        let mut state = state_with_tabs(vec![active, dirty_sibling], 0);
+
+        assert!(state.any_presentation_dirty());
+        assert!(!state.active_presentation_is_dirty());
+        assert_eq!(state.dirty_presentation_count(), 1);
     }
 
     #[test]

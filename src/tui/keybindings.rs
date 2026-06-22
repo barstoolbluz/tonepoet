@@ -2956,7 +2956,9 @@ pub(super) fn metadata_editor_save(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     if state.read_only {
-        if state.sacd_sidecar_path.is_some() && state.sacd_area_kind.is_none() {
+        if metadata_editor_is_dvdv_source(state) {
+            app.set_status("read-only editor — cannot save (DVD-Video sidecar)");
+        } else if state.sacd_sidecar_path.is_some() && state.sacd_area_kind.is_none() {
             app.set_status("read-only editor — cannot save (DVD-Audio metabase)");
         } else {
             app.set_status("read-only editor — cannot save (SACD ISO)");
@@ -2968,7 +2970,53 @@ pub(super) fn metadata_editor_save(
         app.set_status("No changes to save");
         return;
     }
-    // Disc-image save: route XML-backed editors away from the lofty / per-file path.
+    // Disc-image save: route sidecar-backed editors away from the lofty / per-file path.
+    if metadata_editor_is_dvdv_source(state) {
+        if !state.active_presentation_is_dirty() {
+            app.set_status(
+                "DVD-Video sidecar save skipped: active presentation has no changes; switch tabs to save other dirty presentations",
+            );
+            return;
+        }
+        let Some(source_path) = state.paths.first().cloned() else {
+            app.set_status("DVD-Video sidecar save failed: editor has no source");
+            return;
+        };
+        match super::command::save_dvdv_metadata_sidecar(&source_path, state) {
+            Ok(outcome) => {
+                state.mark_active_presentation_saved();
+                let remaining = state.dirty_presentation_count();
+                let file_name = outcome
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| outcome.path.display().to_string());
+                let verb = match outcome.kind {
+                    super::command::DvdVideoSidecarSaveKind::Created => "created",
+                    super::command::DvdVideoSidecarSaveKind::AddedPresentation => "added presentation to",
+                    super::command::DvdVideoSidecarSaveKind::UpdatedPresentation => "updated presentation in",
+                };
+                let presentation = outcome
+                    .presentation_id
+                    .as_deref()
+                    .map(|id| format!(" ({id})"))
+                    .unwrap_or_default();
+                if remaining == 0 {
+                    app.set_status(format!("DVD-Video sidecar {verb}: {file_name}{presentation}"));
+                } else {
+                    app.set_status(format!(
+                        "DVD-Video sidecar {verb}: {file_name}{presentation}; {} unsaved presentation(s) remain",
+                        remaining
+                    ));
+                }
+            }
+            Err(reason) => {
+                app.set_status(format!("DVD-Video sidecar save failed: {}", reason));
+            }
+        }
+        return;
+    }
+
     if let Some(sidecar_path) = state.sacd_sidecar_path.clone() {
         if state.sacd_area_kind.is_none() {
             match save_dvda_metabase(state, &sidecar_path) {
@@ -4212,6 +4260,10 @@ pub fn open_metadata_editor(app: &mut AppState) {
             open_metadata_editor_for_dvda(app, sel[0].clone());
             return;
         }
+        if is_dvdv_source_for_editor(&sel[0]) {
+            open_metadata_editor_for_dvdv(app, sel[0].clone());
+            return;
+        }
         if sel[0].is_dir() {
             if let Some(iso) = find_single_sacd_in_dir(&sel[0]) {
                 open_metadata_editor_for_sacd(app, iso);
@@ -4219,6 +4271,17 @@ pub fn open_metadata_editor(app: &mut AppState) {
             }
             if let Some(source) = find_single_dvda_source_in_dir(&sel[0]) {
                 open_metadata_editor_for_dvda(app, source);
+                return;
+            }
+            if let Some(source) = find_single_dvdv_source_in_dir(&sel[0]) {
+                let loaded = crate::tui::disc_browser_actions::open_dvdv_metadata_editor_for_overlay_cursor(app)
+                    .unwrap_or(false);
+                if !loaded {
+                    open_metadata_editor_for_dvdv(app, source.clone());
+                    if let Err(err) = crate::tui::command::preload_active_dvdv_metadata_editor_from_sidecar(app, &source) {
+                        app.set_status(format!("DVD-Video metadata sidecar preload failed: {err}"));
+                    }
+                }
                 return;
             }
         }
@@ -4451,6 +4514,10 @@ pub fn open_metadata_editor(app: &mut AppState) {
         sacd_area_kind: None,
         sacd_stereo_durations: None,
         sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
     }));
@@ -4934,6 +5001,10 @@ pub fn build_dvda_editor_state(
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
         },
@@ -4998,6 +5069,10 @@ pub fn build_dvda_multitab_editor_state(
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
         });
         states.push((state, spec.label.clone(), n_tracks, spec.group_nr));
     }
@@ -5065,13 +5140,649 @@ pub(super) fn metadata_editor_is_dvda_source(state: &super::app::MetadataEditorS
     state.paths.iter().all(|p| p == first_path)
 }
 
-// TODO: DVD-Video metadata editor — full implementation pending
-pub(super) fn metadata_editor_is_dvdv_source(_state: &super::app::MetadataEditorState) -> bool {
-    false
+pub(super) fn metadata_editor_is_dvdv_source(state: &super::app::MetadataEditorState) -> bool {
+    let Some(first_path) = state.paths.first() else {
+        return false;
+    };
+    if !is_dvdv_source_for_editor(first_path) {
+        return false;
+    }
+    state.paths.iter().all(|path| path == first_path)
 }
 
-pub(super) fn open_metadata_editor_for_dvdv(_app: &mut super::app::AppState, _source_path: std::path::PathBuf) {
-    // Stub — DVD-Video metadata editor not yet implemented
+pub(super) fn open_metadata_editor_for_dvdv(
+    app: &mut super::app::AppState,
+    source_path: std::path::PathBuf,
+) {
+    open_metadata_editor_for_dvdv_at_track(app, source_path, None, None);
+}
+
+fn open_metadata_editor_for_dvdv_at_track(
+    app: &mut super::app::AppState,
+    source_path: std::path::PathBuf,
+    initial_track: Option<usize>,
+    requested_presentation_id: Option<crate::disc::model::PresentationId>,
+) {
+    let contents = match crate::disc::dvdv_utils::map_dvdv_source(&source_path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            app.set_status(format!("DVD-Video metadata: {}", err));
+            return;
+        }
+    };
+    let default_presentation_index = match super::command::select_default_disc_presentation_index(&contents) {
+        Some(index) => index,
+        None => {
+            app.set_status("DVD-Video metadata: no selectable audio presentation".to_string());
+            return;
+        }
+    };
+    let sidecars = match super::command::load_dvdv_metadata_sidecar_presentations(&source_path) {
+        Ok(Some((_path, sidecars))) => sidecars,
+        Ok(None) => Vec::new(),
+        Err(err) => {
+            app.set_status(format!("DVD-Video metadata sidecar ignored: {}", err));
+            Vec::new()
+        }
+    };
+
+    let dvdv_presentation_count = contents
+        .presentations
+        .iter()
+        .filter(|presentation| matches!(presentation.id, crate::disc::model::PresentationId::DvdVideoTitle { .. }))
+        .count();
+    let mut sidecar_used = false;
+    let mut tabs: Vec<super::app::PresentationTab> = Vec::new();
+    let mut states: Vec<(super::app::MetadataEditorState, String, usize)> = Vec::new();
+    for (presentation_index, presentation) in contents.presentations.iter().enumerate() {
+        if !matches!(presentation.id, crate::disc::model::PresentationId::DvdVideoTitle { .. }) {
+            continue;
+        }
+        let matching_sidecars: Vec<&super::command::DvdVideoMetadataSidecar> = sidecars
+            .iter()
+            .filter(|sidecar| {
+                dvdv_sidecar_matches_presentation(
+                    sidecar,
+                    &contents,
+                    presentation_index,
+                    dvdv_presentation_count,
+                )
+            })
+            .collect();
+        let sidecar_for_presentation = if matching_sidecars.len() == 1 {
+            sidecar_used = true;
+            matching_sidecars.first().copied()
+        } else {
+            None
+        };
+        let (mut state, label, n_tracks) = match build_dvdv_editor_state(
+            &source_path,
+            &contents,
+            presentation_index,
+            sidecar_for_presentation,
+        ) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let (dvdv_angle_number, dvdv_title_angle_count) =
+            dvdv_presentation_angle_context_for_editor(&contents, presentation_index);
+        state.dvdv_angle_number = dvdv_angle_number;
+        state.dvdv_title_angle_count = dvdv_title_angle_count;
+        let label = dvdv_presentation_label_with_sparse_angle(label, dvdv_angle_number, dvdv_title_angle_count);
+        tabs.push(super::app::PresentationTab {
+            id: presentation.id.clone(),
+            label: label.clone(),
+            paths: state.paths.clone(),
+            entries: state.entries.clone(),
+            file_labels: state.file_labels.clone(),
+            deleted: state.deleted.clone(),
+            dirty: state.dirty,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+            dvdv_source_chapters: state.dvdv_source_chapters.clone(),
+            dvdv_track_durations: state.dvdv_track_durations.clone(),
+            dvdv_angle_number: state.dvdv_angle_number,
+            dvdv_title_angle_count: state.dvdv_title_angle_count,
+        });
+        states.push((state, label, n_tracks));
+    }
+
+    if states.is_empty() {
+        app.set_status("DVD-Video metadata: no selectable audio presentation".to_string());
+        return;
+    }
+
+    let active_idx = requested_presentation_id
+        .as_ref()
+        .and_then(|wanted| tabs.iter().position(|tab| &tab.id == wanted))
+        .unwrap_or_else(|| {
+            let default_id = contents
+                .presentations
+                .get(default_presentation_index)
+                .map(|presentation| &presentation.id);
+            default_id
+                .and_then(|wanted| tabs.iter().position(|tab| &tab.id == wanted))
+                .unwrap_or(0)
+        });
+
+    let (mut state, label, n_tracks) = states.remove(active_idx);
+    state.presentation_tabs = tabs;
+    state.active_tab = active_idx;
+    if let Some(tab) = state.presentation_tabs.get(active_idx).cloned() {
+        state.paths = tab.paths;
+        state.entries = tab.entries;
+        state.file_labels = tab.file_labels;
+        state.deleted = tab.deleted;
+        state.dirty = tab.dirty;
+        state.sacd_area_kind = tab.sacd_area_kind;
+        state.sacd_stereo_durations = tab.sacd_stereo_durations;
+        state.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
+        state.dvdv_source_chapters = tab.dvdv_source_chapters;
+        state.dvdv_track_durations = tab.dvdv_track_durations;
+        state.dvdv_angle_number = tab.dvdv_angle_number;
+        state.dvdv_title_angle_count = tab.dvdv_title_angle_count;
+    }
+    if let Some(track) = initial_track {
+        if n_tracks > 0 {
+            state.detail_cursor = track.min(n_tracks - 1);
+        }
+    }
+    app.active_overlay = super::app::ActiveOverlay::MetadataEditor(Box::new(state));
+    let mut status = format!(
+        "DVD-Video metadata editor: {} ({} track{})",
+        label,
+        n_tracks,
+        if n_tracks == 1 { "" } else { "s" }
+    );
+    if !sidecars.is_empty() && !sidecar_used {
+        status.push_str(" [existing sidecar ignored: presentation identity did not match]");
+    }
+    app.set_status(status);
+}
+
+fn is_dvdv_source_for_editor(path: &std::path::Path) -> bool {
+    if path.is_dir() {
+        crate::disc::dvdv_utils::dvdv_directory_root(path).is_some()
+    } else if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+    {
+        crate::disc::dvdv_utils::map_dvdv_source(path).is_ok()
+    } else {
+        false
+    }
+}
+
+fn find_single_dvdv_source_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut found: Option<std::path::PathBuf> = None;
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !is_dvdv_source_for_editor(&path) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(path);
+    }
+    found
+}
+
+pub fn build_dvdv_editor_state(
+    source_path: &std::path::Path,
+    contents: &crate::disc::model::DiscContents,
+    presentation_index: usize,
+    sidecar: Option<&super::command::DvdVideoMetadataSidecar>,
+) -> Result<(super::app::MetadataEditorState, String, usize), String> {
+    let presentation = contents.presentations.get(presentation_index).ok_or_else(|| {
+        format!(
+            "DVD-Video presentation index {} is out of range",
+            presentation_index
+        )
+    })?;
+    if presentation.tracks.is_empty() {
+        return Err("selected DVD-Video presentation has no chapter tracks".to_string());
+    }
+
+    let n_tracks = presentation.tracks.len();
+    let dvdv_source_chapters = Some(dvdv_source_chapters_for_editor(presentation));
+    let dvdv_track_durations = Some(
+        presentation
+            .tracks
+            .iter()
+            .map(|track| track.duration_secs.unwrap_or(0.0))
+            .collect::<Vec<_>>(),
+    );
+    let paths = vec![source_path.to_path_buf(); n_tracks];
+    let file_labels: Vec<String> = presentation
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(idx, track)| {
+            sidecar_track_label(sidecar, idx)
+                .unwrap_or_else(|| dvdv_track_label(presentation, idx, track.duration_secs))
+        })
+        .collect();
+
+    let mut entries = Vec::new();
+    push_dvdv_album_entry(
+        &mut entries,
+        n_tracks,
+        "ALBUM",
+        lofty::tag::ItemKey::AlbumTitle,
+        sidecar_album_value(sidecar, &["ALBUM"]).or_else(|| non_empty(&presentation.album_title).map(str::to_string)),
+    );
+    push_dvdv_album_entry(
+        &mut entries,
+        n_tracks,
+        "ALBUMARTIST",
+        lofty::tag::ItemKey::AlbumArtist,
+        sidecar_album_value(sidecar, &["ALBUMARTIST", "ARTIST"])
+            .or_else(|| non_empty(&presentation.album_artist).map(str::to_string)),
+    );
+    push_dvdv_album_entry(
+        &mut entries,
+        n_tracks,
+        "DATE",
+        lofty::tag::ItemKey::Year,
+        sidecar_album_value(sidecar, &["DATE", "YEAR"]).or_else(|| non_empty(&presentation.year).map(str::to_string)),
+    );
+    push_dvdv_album_entry(
+        &mut entries,
+        n_tracks,
+        "GENRE",
+        lofty::tag::ItemKey::Genre,
+        sidecar_album_value(sidecar, &["GENRE"]).or_else(|| non_empty(&presentation.genre).map(str::to_string)),
+    );
+    for (display_key, item_key, keys) in [
+        (
+            "CATALOGNUMBER",
+            lofty::tag::ItemKey::CatalogNumber,
+            &["CATALOGNUMBER"][..],
+        ),
+        (
+            "PUBLISHER",
+            lofty::tag::ItemKey::Unknown("PUBLISHER".to_string()),
+            &["PUBLISHER"][..],
+        ),
+        (
+            "MUSICBRAINZ_ALBUMID",
+            lofty::tag::ItemKey::MusicBrainzReleaseId,
+            &["MUSICBRAINZ_ALBUMID"][..],
+        ),
+        (
+            "MUSICBRAINZ_ALBUMARTISTID",
+            lofty::tag::ItemKey::MusicBrainzReleaseArtistId,
+            &["MUSICBRAINZ_ALBUMARTISTID"][..],
+        ),
+        (
+            "MUSICBRAINZ_RELEASEGROUPID",
+            lofty::tag::ItemKey::MusicBrainzReleaseGroupId,
+            &["MUSICBRAINZ_RELEASEGROUPID"][..],
+        ),
+        (
+            "ORIGINALDATE",
+            lofty::tag::ItemKey::OriginalReleaseDate,
+            &["ORIGINALDATE"][..],
+        ),
+        (
+            "RELEASECOUNTRY",
+            lofty::tag::ItemKey::Unknown("RELEASECOUNTRY".to_string()),
+            &["RELEASECOUNTRY"][..],
+        ),
+    ] {
+        push_dvdv_album_entry(
+            &mut entries,
+            n_tracks,
+            display_key,
+            item_key,
+            sidecar_album_value(sidecar, keys),
+        );
+    }
+
+    let track_numbers: Vec<String> = (0..n_tracks)
+        .map(|idx| {
+            sidecar_track_value(sidecar, idx, &["TRACKNUMBER"])
+                .unwrap_or_else(|| (idx + 1).to_string())
+        })
+        .collect();
+    push_dvdv_track_entry(
+        &mut entries,
+        "TRACKNUMBER",
+        lofty::tag::ItemKey::TrackNumber,
+        track_numbers,
+        true,
+    );
+
+    let titles: Vec<String> = presentation
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(idx, _track)| {
+            sidecar_track_value(sidecar, idx, &["TITLE"])
+                .unwrap_or_else(|| dvdv_synthetic_title(presentation, idx))
+        })
+        .collect();
+    push_dvdv_track_entry(
+        &mut entries,
+        "TITLE",
+        lofty::tag::ItemKey::TrackTitle,
+        titles,
+        true,
+    );
+
+    for (display_key, item_key, keys) in [
+        ("ARTIST", lofty::tag::ItemKey::TrackArtist, &["ARTIST"][..]),
+        ("PERFORMER", lofty::tag::ItemKey::Performer, &["PERFORMER"][..]),
+        ("COMPOSER", lofty::tag::ItemKey::Composer, &["COMPOSER"][..]),
+        ("LYRICIST", lofty::tag::ItemKey::Lyricist, &["LYRICIST"][..]),
+        ("ARRANGER", lofty::tag::ItemKey::Arranger, &["ARRANGER"][..]),
+        ("ISRC", lofty::tag::ItemKey::Isrc, &["ISRC"][..]),
+        (
+            "MUSICBRAINZ_TRACKID",
+            lofty::tag::ItemKey::MusicBrainzRecordingId,
+            &["MUSICBRAINZ_TRACKID"][..],
+        ),
+        (
+            "MUSICBRAINZ_RELEASETRACKID",
+            lofty::tag::ItemKey::MusicBrainzTrackId,
+            &["MUSICBRAINZ_RELEASETRACKID"][..],
+        ),
+        (
+            "MUSICBRAINZ_ARTISTID",
+            lofty::tag::ItemKey::MusicBrainzArtistId,
+            &["MUSICBRAINZ_ARTISTID"][..],
+        ),
+    ] {
+        let values: Vec<String> = (0..n_tracks)
+            .map(|idx| sidecar_track_value(sidecar, idx, keys).unwrap_or_default())
+            .collect();
+        push_dvdv_track_entry(&mut entries, display_key, item_key, values, false);
+    }
+
+    let target_path = super::command::dvdv_metadata_sidecar_path_for_source(source_path).ok();
+    let writable = super::command::dvdv_metadata_sidecar_target_is_writable(source_path);
+    let label = dvdv_presentation_label(presentation);
+
+    Ok((
+        super::app::MetadataEditorState {
+            paths,
+            entries,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: super::app::MetadataEditorPhase::Editing,
+            dirty: false,
+            deleted: Vec::new(),
+            file_labels,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: !writable,
+            sacd_sidecar_path: target_path,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+            dvdv_source_chapters,
+            dvdv_track_durations,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
+            presentation_tabs: Vec::new(),
+            active_tab: 0,
+        },
+        label,
+        n_tracks,
+    ))
+}
+
+fn push_dvdv_album_entry(
+    entries: &mut Vec<super::probe::TagEntry>,
+    n_tracks: usize,
+    display_key: &str,
+    item_key: lofty::tag::ItemKey,
+    value: Option<String>,
+) {
+    let value = value.unwrap_or_default();
+    if value.is_empty() && !matches!(display_key, "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE") {
+        return;
+    }
+    entries.push(super::probe::TagEntry {
+        display_key: display_key.to_string(),
+        item_key,
+        value: value.clone(),
+        original: value.clone(),
+        is_binary: false,
+        is_mixed: false,
+        per_file_values: vec![value.clone(); n_tracks],
+        per_file_originals: vec![value; n_tracks],
+        mb_proposed_value: None,
+        mb_proposed_per_file: None,
+    });
+}
+
+fn push_dvdv_track_entry(
+    entries: &mut Vec<super::probe::TagEntry>,
+    display_key: &str,
+    item_key: lofty::tag::ItemKey,
+    values: Vec<String>,
+    keep_when_empty: bool,
+) {
+    if !keep_when_empty && values.iter().all(|value| value.trim().is_empty()) {
+        return;
+    }
+    let all_same = values.windows(2).all(|window| window[0] == window[1]);
+    let value = if !all_same && values.len() > 1 {
+        "<multiple values>".to_string()
+    } else {
+        values.first().cloned().unwrap_or_default()
+    };
+    entries.push(super::probe::TagEntry {
+        display_key: display_key.to_string(),
+        item_key,
+        value: value.clone(),
+        original: value,
+        is_binary: false,
+        is_mixed: !all_same && values.len() > 1,
+        per_file_values: values.clone(),
+        per_file_originals: values,
+        mb_proposed_value: None,
+        mb_proposed_per_file: None,
+    });
+}
+
+
+fn dvdv_presentation_label_with_sparse_angle(
+    label: String,
+    angle_number: Option<u8>,
+    title_angle_count: Option<u8>,
+) -> String {
+    match (angle_number, title_angle_count) {
+        (Some(angle), Some(count)) if count > 1 && !label.to_ascii_lowercase().contains("angle") => {
+            format!("{} angle {}", label, angle)
+        }
+        _ => label,
+    }
+}
+
+fn dvdv_sidecar_matches_presentation(
+    sidecar: &super::command::DvdVideoMetadataSidecar,
+    contents: &crate::disc::model::DiscContents,
+    presentation_index: usize,
+    dvdv_presentation_count: usize,
+) -> bool {
+    if sidecar.source.sidecar_kind != "dvd_video" {
+        return false;
+    }
+    let Some(presentation) = contents.presentations.get(presentation_index) else {
+        return false;
+    };
+    let Some(current) = dvdv_presentation_identity_for_editor(contents, presentation_index) else {
+        return false;
+    };
+    match sidecar.source.presentation.as_ref() {
+        Some(stored) => super::command::dvdv_presentation_identity_compatible(Some(stored), Some(&current)),
+        None => {
+            dvdv_presentation_count == 1
+                && (sidecar.tracks.is_empty() || sidecar.tracks.len() == presentation.tracks.len())
+        }
+    }
+}
+
+fn dvdv_presentation_identity_for_editor(
+    contents: &crate::disc::model::DiscContents,
+    presentation_index: usize,
+) -> Option<super::command::DvdVideoPresentationIdentity> {
+    let presentation = contents.presentations.get(presentation_index)?;
+    let (vts_number, title_number, audio_stream_index) = presentation.id.dvd_video_parts()?;
+    let (angle_number, _title_angle_count) =
+        dvdv_presentation_angle_context_for_editor(contents, presentation_index);
+    let durations = presentation
+        .tracks
+        .iter()
+        .map(|track| track.duration_secs)
+        .collect::<Option<Vec<_>>>();
+    Some(super::command::DvdVideoPresentationIdentity {
+        vts_number,
+        title_number,
+        audio_stream_index,
+        angle_number,
+        track_count: Some(presentation.tracks.len()),
+        duration_fingerprint: durations
+            .as_deref()
+            .map(super::command::dvdv_track_duration_fingerprint_from_secs),
+    })
+}
+
+fn dvdv_presentation_angle_context_for_editor(
+    contents: &crate::disc::model::DiscContents,
+    presentation_index: usize,
+) -> (Option<u8>, Option<u8>) {
+    let Some(presentation) = contents.presentations.get(presentation_index) else {
+        return (None, None);
+    };
+    let Some((vts_number, title_number, audio_stream_index)) = presentation.id.dvd_video_parts() else {
+        return (None, None);
+    };
+    let matching_indices: Vec<usize> = contents
+        .presentations
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, candidate)| {
+            let parts = candidate.id.dvd_video_parts()?;
+            (parts == (vts_number, title_number, audio_stream_index)).then_some(idx)
+        })
+        .collect();
+    let count = matching_indices.len().min(u8::MAX as usize) as u8;
+    if count <= 1 {
+        return (None, Some(1));
+    }
+    let angle = matching_indices
+        .iter()
+        .position(|idx| *idx == presentation_index)
+        .map(|idx| (idx + 1).min(u8::MAX as usize) as u8);
+    (angle, Some(count))
+}
+
+fn sidecar_album_value(
+    sidecar: Option<&super::command::DvdVideoMetadataSidecar>,
+    keys: &[&str],
+) -> Option<String> {
+    let sidecar = sidecar?;
+    keys.iter().find_map(|key| nonempty_owned(sidecar.album.get(*key)))
+}
+
+
+fn sidecar_track_label(
+    sidecar: Option<&super::command::DvdVideoMetadataSidecar>,
+    idx: usize,
+) -> Option<String> {
+    let sidecar = sidecar?;
+    sidecar
+        .tracks
+        .iter()
+        .find(|track| track.number == idx + 1)
+        .or_else(|| sidecar.tracks.get(idx))
+        .and_then(|track| {
+            let label = track.label.trim();
+            (!label.is_empty()).then(|| label.to_string())
+        })
+}
+
+fn sidecar_track_value(
+    sidecar: Option<&super::command::DvdVideoMetadataSidecar>,
+    idx: usize,
+    keys: &[&str],
+) -> Option<String> {
+    let sidecar = sidecar?;
+    let sidecar_track = sidecar
+        .tracks
+        .iter()
+        .find(|track| track.number == idx + 1)
+        .or_else(|| sidecar.tracks.get(idx))?;
+    keys.iter().find_map(|key| nonempty_owned(sidecar_track.tags.get(*key)))
+}
+
+fn nonempty_owned(value: Option<&String>) -> Option<String> {
+    value
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn dvdv_source_chapters_for_editor(
+    presentation: &crate::disc::model::DiscPresentation,
+) -> Vec<u16> {
+    (0..presentation.tracks.len())
+        .map(|idx| (idx + 1).min(u16::MAX as usize) as u16)
+        .collect()
+}
+
+fn dvdv_presentation_label(presentation: &crate::disc::model::DiscPresentation) -> String {
+    if !presentation.label.trim().is_empty() {
+        return presentation.label.trim().to_string();
+    }
+    if let Some((vts, title, stream)) = presentation.id.dvd_video_parts() {
+        return format!("VTS {} title {} stream {}", vts, title, stream);
+    }
+    "DVD-Video audio presentation".to_string()
+}
+
+fn dvdv_synthetic_title(
+    presentation: &crate::disc::model::DiscPresentation,
+    idx: usize,
+) -> String {
+    if let Some((_vts, title, _stream)) = presentation.id.dvd_video_parts() {
+        return format!("Title {} Chapter {}", title, idx + 1);
+    }
+    format!("Chapter {}", idx + 1)
+}
+
+fn dvdv_track_label(
+    presentation: &crate::disc::model::DiscPresentation,
+    idx: usize,
+    duration_secs: Option<f64>,
+) -> String {
+    let base = dvdv_synthetic_title(presentation, idx);
+    match duration_secs {
+        Some(duration) if duration.is_finite() && duration > 0.0 => {
+            format!("{:02} {} ({})", idx + 1, base, dvdv_duration_label(duration))
+        }
+        _ => format!("{:02} {}", idx + 1, base),
+    }
+}
+
+fn dvdv_duration_label(duration_secs: f64) -> String {
+    let total = duration_secs.round().max(0.0) as u64;
+    let minutes = total / 60;
+    let seconds = total % 60;
+    format!("{}:{:02}", minutes, seconds)
 }
 
 pub fn save_dvda_metabase(
@@ -5760,6 +6471,10 @@ pub fn build_sacd_editor_state(
         sacd_area_kind: Some(area.header.kind),
         sacd_stereo_durations,
         sacd_multi_channel_durations,
+        dvdv_track_durations: None,
+        dvdv_angle_number: None,
+        dvdv_title_angle_count: None,
+        dvdv_source_chapters: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
     };
@@ -5818,6 +6533,10 @@ pub fn build_sacd_multitab_editor_state(
             sacd_area_kind: state.sacd_area_kind.clone(),
             sacd_stereo_durations: state.sacd_stereo_durations.clone(),
             sacd_multi_channel_durations: state.sacd_multi_channel_durations.clone(),
+            dvdv_source_chapters: state.dvdv_source_chapters.clone(),
+            dvdv_track_durations: state.dvdv_track_durations.clone(),
+            dvdv_angle_number: state.dvdv_angle_number,
+            dvdv_title_angle_count: state.dvdv_title_angle_count,
         });
         states.push((state, label, n_tracks));
     }
@@ -10598,6 +11317,22 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         open_metadata_editor_for_dvda_at_track(app, path, initial_track);
         return;
     }
+    if is_dvdv_source_for_editor(&path) {
+        let requested_presentation_id = match &app.convert.source.mode {
+            SourceMode::MultiTrack {
+                selected_presentation_id,
+                ..
+            } => selected_presentation_id.clone(),
+            _ => None,
+        };
+        open_metadata_editor_for_dvdv_at_track(
+            app,
+            path,
+            initial_track,
+            requested_presentation_id,
+        );
+        return;
+    }
 
     let mut paths = vec![path];
     let mut entries = match super::probe::read_all_tags_merged(&paths) {
@@ -10647,6 +11382,10 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         sacd_area_kind: None,
         sacd_stereo_durations: None,
         sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
     };
@@ -13071,6 +13810,10 @@ mod phase4_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
         }
@@ -13101,6 +13844,10 @@ mod phase4_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: tabs,
             active_tab: 0,
         }
@@ -13121,6 +13868,10 @@ mod phase4_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
         }
     }
 
@@ -13933,6 +14684,10 @@ mod phase4_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
         }
@@ -14148,6 +14903,10 @@ mod phase4_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
         };

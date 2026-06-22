@@ -1639,6 +1639,10 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
+            dvdv_source_chapters: None,
             presentation_tabs: vec![],
             active_tab: 0,
         };

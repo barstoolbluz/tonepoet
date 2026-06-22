@@ -293,6 +293,34 @@ pub async fn lookup_release_by_toc(
 /// `n_tracks` is the track count implied by the queried TOC; it
 /// disambiguates the correct medium for multi-disc releases.
 pub fn parse_mb_response_all(body: &str, n_tracks: usize) -> Result<Vec<MbRelease>, String> {
+    parse_mb_response_all_with_sort(body, n_tracks, ReleaseSortMode::MusicBrainzScore)
+}
+
+/// Parse a text-search response with DVD-Video/DVD media preference.
+///
+/// Text search is the fallback for DVD-Video sources that do not match a
+/// synthetic CD TOC. When MusicBrainz returns multiple plausible releases,
+/// favor rows with a DVD-Video or DVD medium, and favor an exact track-count
+/// match inside that subset. TOC lookups keep their native MusicBrainz score
+/// ordering through `parse_mb_response_all`.
+pub fn parse_mb_search_response_all(
+    body: &str,
+    n_tracks: usize,
+) -> Result<Vec<MbRelease>, String> {
+    parse_mb_response_all_with_sort(body, n_tracks, ReleaseSortMode::TextSearchPreferDvdVideo)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseSortMode {
+    MusicBrainzScore,
+    TextSearchPreferDvdVideo,
+}
+
+fn parse_mb_response_all_with_sort(
+    body: &str,
+    n_tracks: usize,
+    mode: ReleaseSortMode,
+) -> Result<Vec<MbRelease>, String> {
     use serde_json::Value;
     let v: Value =
         serde_json::from_str(body).map_err(|e| format!("MusicBrainz JSON parse error: {}", e))?;
@@ -307,16 +335,30 @@ pub fn parse_mb_response_all(body: &str, n_tracks: usize) -> Result<Vec<MbReleas
         _ => return Ok(Vec::new()),
     };
 
-    // Stable sort by descending score (default 0 when absent).
-    let mut indexed: Vec<(i64, &Value)> = releases
+    let mut indexed: Vec<(usize, i64, usize, &Value)> = releases
         .iter()
-        .map(|r| (r.get("score").and_then(|s| s.as_i64()).unwrap_or(0), r))
+        .enumerate()
+        .map(|(idx, r)| {
+            let score = r.get("score").and_then(|s| s.as_i64()).unwrap_or(0);
+            let media_rank = match mode {
+                ReleaseSortMode::MusicBrainzScore => 0,
+                ReleaseSortMode::TextSearchPreferDvdVideo => {
+                    dvd_video_release_preference_rank(r, n_tracks)
+                }
+            };
+            (media_rank, score, idx, r)
+        })
         .collect();
-    indexed.sort_by(|a, b| b.0.cmp(&a.0));
+
+    indexed.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
 
     Ok(indexed
         .into_iter()
-        .map(|(_, r)| release_from_json(r, n_tracks))
+        .map(|(_, _, _, r)| release_from_json(r, n_tracks))
         .collect())
 }
 
@@ -429,7 +471,7 @@ async fn fire_search_cached(
 ) -> Result<Vec<MbRelease>, String> {
     let key = format!("search:v1:{}", query);
     if let Some(body) = cached.get(&key) {
-        return parse_mb_response_all(body, n_tracks);
+        return parse_mb_search_response_all(body, n_tracks);
     }
     let (releases, body) = fire_search(client, query, n_tracks).await?;
     writes.push((key, body));
@@ -485,7 +527,7 @@ async fn fire_search(
         return Err(format!("MusicBrainz returned HTTP {}", status));
     }
 
-    let releases = parse_mb_response_all(&body, n_tracks)?;
+    let releases = parse_mb_search_response_all(&body, n_tracks)?;
     Ok((releases, body))
 }
 
@@ -611,6 +653,85 @@ pub fn parse_mb_detail_response(body: &str, n_tracks: usize) -> Result<MbRelease
     Ok(release_from_json(&v, n_tracks))
 }
 
+
+fn medium_track_count(medium: &serde_json::Value) -> u64 {
+    medium
+        .get("track-count")
+        .and_then(|c| c.as_u64())
+        .unwrap_or_else(|| {
+            medium
+                .get("tracks")
+                .and_then(|t| t.as_array())
+                .map(|a| a.len() as u64)
+                .unwrap_or(0)
+        })
+}
+
+fn medium_format(medium: &serde_json::Value) -> Option<&str> {
+    medium
+        .get("format")
+        .and_then(|format| format.as_str())
+        .map(str::trim)
+        .filter(|format| !format.is_empty())
+}
+
+fn is_dvd_video_medium_format(format: &str) -> bool {
+    let normalized = format
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', " ")
+        .replace('-', " ");
+    matches!(normalized.as_str(), "dvd" | "dvd video")
+}
+
+fn dvd_video_medium_rank(medium: &serde_json::Value, n_tracks: usize) -> usize {
+    let Some(format) = medium_format(medium) else {
+        return 0;
+    };
+    if !is_dvd_video_medium_format(format) {
+        return 0;
+    }
+    if n_tracks > 0 && medium_track_count(medium) == n_tracks as u64 {
+        2
+    } else {
+        1
+    }
+}
+
+fn dvd_video_release_preference_rank(rel: &serde_json::Value, n_tracks: usize) -> usize {
+    rel.get("media")
+        .and_then(|v| v.as_array())
+        .map(|media| {
+            media
+                .iter()
+                .map(|medium| dvd_video_medium_rank(medium, n_tracks))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+fn pick_medium_for_release<'a>(
+    media: &'a [serde_json::Value],
+    n_tracks: usize,
+) -> Option<&'a serde_json::Value> {
+    if n_tracks > 0 {
+        if let Some(medium) = media.iter().find(|medium| {
+            medium_track_count(medium) == n_tracks as u64
+                && medium_format(medium).is_some_and(is_dvd_video_medium_format)
+        }) {
+            return Some(medium);
+        }
+        if let Some(medium) = media
+            .iter()
+            .find(|medium| medium_track_count(medium) == n_tracks as u64)
+        {
+            return Some(medium);
+        }
+    }
+    media.first()
+}
+
 fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
     let release_id = rel
         .get("id")
@@ -670,28 +791,16 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
         });
 
     // For multi-disc releases, MB returns a media[] entry per disc. Pick the
-    // medium whose track count matches the queried TOC; fall back to the
-    // first medium if no exact match (single-disc releases or unusual data).
+    // medium whose track count matches the queried TOC/search track count.
+    // If more than one medium has that count, prefer DVD-Video/DVD so
+    // DVD-Video text-search results populate the authored video track list
+    // rather than a sibling CD medium with the same number of tracks.
     let media = rel
         .get("media")
         .and_then(|v| v.as_array())
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let pick_medium = media
-        .iter()
-        .find(|m| {
-            let count = m
-                .get("track-count")
-                .and_then(|c| c.as_u64())
-                .unwrap_or_else(|| {
-                    m.get("tracks")
-                        .and_then(|t| t.as_array())
-                        .map(|a| a.len() as u64)
-                        .unwrap_or(0)
-                });
-            count == n_tracks as u64
-        })
-        .or_else(|| media.first());
+    let pick_medium = pick_medium_for_release(media, n_tracks);
     let tracks = pick_medium
         .and_then(|m| m.get("tracks"))
         .and_then(|t| t.as_array())
@@ -1173,6 +1282,155 @@ pub(super) fn count_mismatch_text(n_files: usize, n_mb: usize) -> Option<String>
         if n_mb == 1 { "" } else { "s" },
         n_files,
     ))
+}
+
+const DVDV_TRACK_DURATION_WARNING_TOLERANCE_MS: u64 = 5_000;
+const DVDV_DURATION_WARNING_KEY: &str = "DVDV_DURATION_WARNING";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DvdvTrackDurationMismatch {
+    track_number: usize,
+    dvd_ms: u64,
+    mb_ms: u64,
+    diff_ms: u64,
+}
+
+/// Compare the active DVD-Video editor presentation against the selected
+/// MusicBrainz release after positional assignment. Mismatches beyond five
+/// seconds are non-fatal: the editor keeps the MB tags, shows a synthetic
+/// warning row, and returns a status-line summary.
+pub fn apply_dvdv_duration_warnings(
+    state: &mut crate::tui::app::MetadataEditorState,
+    release: &MbRelease,
+) -> Option<String> {
+    let Some(durations) = state.dvdv_track_durations.as_deref() else {
+        return None;
+    };
+    if durations.is_empty() || state.paths.len() != durations.len() {
+        return None;
+    }
+
+    let mismatches = dvdv_duration_mismatches(
+        durations,
+        release,
+        DVDV_TRACK_DURATION_WARNING_TOLERANCE_MS,
+    );
+    upsert_dvdv_duration_warning_entry(state, &mismatches);
+    dvdv_duration_warning_summary(&mismatches, DVDV_TRACK_DURATION_WARNING_TOLERANCE_MS)
+}
+
+fn dvdv_duration_mismatches(
+    durations: &[f64],
+    release: &MbRelease,
+    tolerance_ms: u64,
+) -> Vec<DvdvTrackDurationMismatch> {
+    let mut mismatches = Vec::new();
+    for (idx, duration_secs) in durations.iter().enumerate() {
+        if !(duration_secs.is_finite() && *duration_secs > 0.0) {
+            continue;
+        }
+        let track_number = idx + 1;
+        let Some(mb_ms) = release
+            .tracks
+            .iter()
+            .find(|track| track.position as usize == track_number)
+            .and_then(|track| track.length_ms)
+        else {
+            continue;
+        };
+        let dvd_ms = (*duration_secs * 1000.0).round().max(0.0) as u64;
+        let mb_ms = u64::from(mb_ms);
+        let diff_ms = dvd_ms.abs_diff(mb_ms);
+        if diff_ms > tolerance_ms {
+            mismatches.push(DvdvTrackDurationMismatch {
+                track_number,
+                dvd_ms,
+                mb_ms,
+                diff_ms,
+            });
+        }
+    }
+    mismatches
+}
+
+fn dvdv_duration_warning_summary(
+    mismatches: &[DvdvTrackDurationMismatch],
+    tolerance_ms: u64,
+) -> Option<String> {
+    let first = mismatches.first()?;
+    Some(format!(
+        "DVD-Video duration warning: {} track{} differ by >{}s; first is track {} (DVD {}, MB {}, diff {})",
+        mismatches.len(),
+        if mismatches.len() == 1 { "" } else { "s" },
+        tolerance_ms / 1000,
+        first.track_number,
+        format_duration_ms(first.dvd_ms),
+        format_duration_ms(first.mb_ms),
+        format_duration_ms(first.diff_ms),
+    ))
+}
+
+fn upsert_dvdv_duration_warning_entry(
+    state: &mut crate::tui::app::MetadataEditorState,
+    mismatches: &[DvdvTrackDurationMismatch],
+) {
+    let n = state.paths.len();
+    if n == 0 {
+        return;
+    }
+    let mut per_file_values = vec![String::new(); n];
+    for mismatch in mismatches {
+        if let Some(slot) = per_file_values.get_mut(mismatch.track_number.saturating_sub(1)) {
+            *slot = format!(
+                "DVD {} vs MB {} (diff {})",
+                format_duration_ms(mismatch.dvd_ms),
+                format_duration_ms(mismatch.mb_ms),
+                format_duration_ms(mismatch.diff_ms),
+            );
+        }
+    }
+    let summary = dvdv_duration_warning_summary(
+        mismatches,
+        DVDV_TRACK_DURATION_WARNING_TOLERANCE_MS,
+    )
+    .unwrap_or_default();
+    let all_same = per_file_values.windows(2).all(|window| window[0] == window[1]);
+
+    if let Some(idx) = state
+        .entries
+        .iter()
+        .position(|entry| entry.display_key.eq_ignore_ascii_case(DVDV_DURATION_WARNING_KEY))
+    {
+        let entry = &mut state.entries[idx];
+        entry.value = summary.clone();
+        entry.original.clear();
+        entry.is_binary = false;
+        entry.is_mixed = !all_same && n > 1;
+        entry.per_file_values = per_file_values;
+        entry.per_file_originals = vec![String::new(); n];
+        entry.mb_proposed_value = None;
+        entry.mb_proposed_per_file = None;
+    } else if !mismatches.is_empty() {
+        state.entries.push(crate::tui::probe::TagEntry {
+            display_key: DVDV_DURATION_WARNING_KEY.to_string(),
+            item_key: lofty::tag::ItemKey::Unknown(DVDV_DURATION_WARNING_KEY.to_string()),
+            value: summary,
+            original: String::new(),
+            is_binary: false,
+            is_mixed: !all_same && n > 1,
+            per_file_values,
+            per_file_originals: vec![String::new(); n],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    let total_secs = (ms + 500) / 1000;
+    let minutes = total_secs / 60;
+    let seconds = total_secs % 60;
+    format!("{}:{:02}", minutes, seconds)
 }
 
 /// release) — no per-track expectation in those cases, no message
@@ -1864,6 +2122,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_mb_search_response_prefers_dvd_video_media() {
+        let body = r#"{
+            "releases": [
+                {
+                    "id": "cd-high", "score": 100, "title": "CD",
+                    "media": [{ "format": "CD", "track-count": 10 }]
+                },
+                {
+                    "id": "dvd-lower", "score": 80, "title": "DVD",
+                    "media": [{ "format": "DVD-Video", "track-count": 10 }]
+                }
+            ]
+        }"#;
+        let releases = parse_mb_search_response_all(body, 10).unwrap();
+        assert_eq!(releases[0].release_id, "dvd-lower");
+    }
+
+    #[test]
+    fn parse_mb_detail_response_prefers_dvd_video_medium_with_matching_count() {
+        let body = r#"{
+            "id": "abc-123", "title": "Album",
+            "media": [
+                {
+                    "format": "CD",
+                    "track-count": 2,
+                    "tracks": [
+                        { "position": 1, "title": "CD 1" },
+                        { "position": 2, "title": "CD 2" }
+                    ]
+                },
+                {
+                    "format": "DVD-Video",
+                    "track-count": 2,
+                    "tracks": [
+                        { "position": 1, "title": "DVD 1" },
+                        { "position": 2, "title": "DVD 2" }
+                    ]
+                }
+            ]
+        }"#;
+        let release = parse_mb_detail_response(body, 2).unwrap();
+        assert_eq!(release.tracks[0].title, "DVD 1");
+    }
+
+    #[test]
     fn parse_mb_response_returns_none_on_empty() {
         assert!(parse_mb_response(r#"{"releases":[]}"#, 0)
             .unwrap()
@@ -2187,6 +2490,10 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: vec![],
             active_tab: 0,
         };
@@ -2554,6 +2861,48 @@ mod tests {
     }
 
     #[test]
+    fn dvdv_duration_mismatches_warn_over_tolerance() {
+        let mut release = rel(
+            "rid",
+            vec![
+                trk(1, "One", "Artist", None),
+                trk(2, "Two", "Artist", None),
+            ],
+        );
+        release.tracks[0].length_ms = Some(240_000);
+        release.tracks[1].length_ms = Some(210_000);
+        let mismatches = dvdv_duration_mismatches(&[240.0, 201.0], &release, 5_000);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].track_number, 2);
+        assert_eq!(mismatches[0].diff_ms, 9_000);
+    }
+
+    #[test]
+    fn apply_dvdv_duration_warnings_adds_editor_row() {
+        let (mut state, _td) = empty_editor_state(2);
+        state.dvdv_track_durations = Some(vec![240.0, 201.0]);
+        let mut release = rel(
+            "rid",
+            vec![
+                trk(1, "One", "Artist", None),
+                trk(2, "Two", "Artist", None),
+            ],
+        );
+        release.tracks[0].length_ms = Some(240_000);
+        release.tracks[1].length_ms = Some(210_000);
+
+        let msg = apply_dvdv_duration_warnings(&mut state, &release).expect("warning");
+        assert!(msg.contains("DVD-Video duration warning"));
+        let entry = state
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == DVDV_DURATION_WARNING_KEY)
+            .expect("duration warning row");
+        assert!(entry.per_file_values[0].is_empty());
+        assert!(entry.per_file_values[1].contains("DVD 3:21 vs MB 3:30"));
+    }
+
+    #[test]
     fn track_count_mismatch_message_single_image_no_warning() {
         // paths.len() == 1 with N>1 MB tracks is the legitimate
         // single-image rip case (titles ride in the CUESHEET tag).
@@ -2582,6 +2931,10 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: vec![],
             active_tab: 0,
         };
@@ -2624,6 +2977,10 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: vec![],
             active_tab: 0,
         };
@@ -2661,6 +3018,10 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
             presentation_tabs: vec![],
             active_tab: 0,
         };

@@ -1739,7 +1739,7 @@ async fn run_tags_mb(
         PathKind::DvdVideoSource(ref source) => {
             match tonepoet::tui::command::save_dvdv_metadata_sidecar(source, &state) {
                 Ok(sidecar_path) => {
-                    say!("DVD-Video sidecar written: {}", sidecar_path.display());
+                    say!("DVD-Video sidecar written: {}", sidecar_path.path.display());
                     0
                 }
                 Err(e) => {
@@ -1885,6 +1885,10 @@ fn build_audio_state_for_cli(
         sacd_area_kind: None,
         sacd_stereo_durations: None,
         sacd_multi_channel_durations: None,
+        dvdv_track_durations: None,
+        dvdv_angle_number: None,
+        dvdv_title_angle_count: None,
+        dvdv_source_chapters: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
     })
@@ -1941,6 +1945,10 @@ fn build_dvdv_state_for_cli(
         sacd_area_kind: None,
         sacd_stereo_durations: None,
         sacd_multi_channel_durations: None,
+        dvdv_track_durations: None,
+        dvdv_angle_number: None,
+        dvdv_title_angle_count: None,
+        dvdv_source_chapters: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
     })

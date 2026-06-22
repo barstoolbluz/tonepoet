@@ -2445,6 +2445,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tonepoet-backend",
  "tonepoet-features",
  "tonepoet-pipeline",

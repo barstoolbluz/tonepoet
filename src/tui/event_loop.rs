@@ -1706,6 +1706,9 @@ pub(super) enum TextSearchMode {
     /// User typed `:tags-mb …` with explicit args (Phase C item 2a).
     /// No prior TOC attempt; status just names the search.
     DirectRequest,
+    /// DVD-Video editor durations were absent, zero, or invalid, so the
+    /// command skipped synthetic TOC lookup and used the editor seed directly.
+    DvdvTocSkippedInvalidDurations,
     /// Spawned by the TOC handler's zero-match branch (C-2b). Status
     /// keeps the "TOC missed" breadcrumb so the user sees the chain.
     TocFallback,
@@ -1763,6 +1766,11 @@ pub(super) fn spawn_tags_mb_text_search(
     let status = match mode {
         TextSearchMode::DirectRequest => format!(
             ":tags-mb: {} search for \"{}\"…",
+            if cache_hit { "cached" } else { "running" },
+            label,
+        ),
+        TextSearchMode::DvdvTocSkippedInvalidDurations => format!(
+            ":tags-mb: DVD-Video TOC skipped: chapter durations are missing or invalid; {} text search for \"{}\"…",
             if cache_hit { "cached" } else { "running" },
             label,
         ),
@@ -2008,6 +2016,8 @@ pub(super) fn open_editor_with_mb_release(
     // active presentation into matching sibling presentations.
     state.sync_active_presentation();
     super::musicbrainz::populate_editor_from_mb(&mut state, release);
+    let dvdv_duration_warning =
+        super::musicbrainz::apply_dvdv_duration_warnings(&mut state, release);
     state.phase = super::app::MetadataEditorPhase::Editing;
     state.dirty = true;
     state.sync_active_presentation();
@@ -2022,6 +2032,9 @@ pub(super) fn open_editor_with_mb_release(
         msg.push_str(&format!(" [{}]", reason));
     }
     if let Some(warn) = track_count_warning {
+        msg.push_str(&format!(" [{}]", warn));
+    }
+    if let Some(warn) = dvdv_duration_warning {
         msg.push_str(&format!(" [{}]", warn));
     }
     // Cache release list for :mb-back when there's more than
@@ -2217,6 +2230,10 @@ mod musicbrainz_completion_dispatch_tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
         }
     }
 
@@ -2258,6 +2275,10 @@ mod musicbrainz_completion_dispatch_tests {
             sacd_area_kind: active.sacd_area_kind,
             sacd_stereo_durations: active.sacd_stereo_durations,
             sacd_multi_channel_durations: active.sacd_multi_channel_durations,
+            dvdv_source_chapters: active.dvdv_source_chapters,
+            dvdv_track_durations: active.dvdv_track_durations,
+            dvdv_angle_number: active.dvdv_angle_number,
+            dvdv_title_angle_count: active.dvdv_title_angle_count,
             presentation_tabs: tabs,
             active_tab,
         })

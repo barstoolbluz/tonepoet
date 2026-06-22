@@ -235,9 +235,21 @@ fn probe_dvda_disc(path: &Path) -> Result<SourceInfo, String> {
     Ok(crate::tui::disc_browser::source_info_for_presentation(&contents, presentation))
 }
 
+fn probe_dvdv_disc(path: &Path) -> Result<SourceInfo, String> {
+    let contents = crate::disc::dvdv_utils::map_dvdv_source(path)?;
+    let presentation = contents
+        .presentations
+        .first()
+        .ok_or_else(|| format!("DVD-Video disc has no audio streams: {}", path.display()))?;
+    Ok(crate::tui::disc_browser::source_info_for_presentation(&contents, presentation))
+}
+
 pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     if crate::disc::dvda_utils::is_dvda_source(path) {
         return probe_dvda_disc(path);
+    }
+    if crate::disc::dvdv_utils::is_dvdv_source(path) {
+        return probe_dvdv_disc(path);
     }
     // SACD ISOs are ScarletBook-format DSD streams that ffmpeg can't open
     // (it'll either error out on the unrecognised container or mis-detect
@@ -1729,6 +1741,10 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
+            dvdv_source_chapters: None,
             presentation_tabs: vec![],
             active_tab: 0,
         };
@@ -1764,6 +1780,10 @@ mod tests {
             sacd_area_kind: None,
             sacd_stereo_durations: None,
             sacd_multi_channel_durations: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
+            dvdv_source_chapters: None,
             presentation_tabs: vec![],
             active_tab: 0,
         };
