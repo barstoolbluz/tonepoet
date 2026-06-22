@@ -3178,50 +3178,108 @@ fn draw_metadata_presentation_tabs(
         return;
     }
 
+    // 2-line box-drawing tab rendering.
+    // Line 1: ┌─ Active ─┐   Inactive
+    // Line 2: ┘           └───────────
     let tab_count = state.presentation_tabs.len().max(1);
     let max_label_chars = ((area.width as usize).saturating_sub(6 * tab_count) / tab_count)
         .max(8)
         .min(32);
-    let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    let mut x = area.x + 1;
 
+    let border_style = Style::default().fg(theme::CYAN);
+    let active_label_style = Style::default()
+        .fg(theme::CYAN)
+        .add_modifier(Modifier::BOLD);
+    let inactive_label_style = Style::default().fg(theme::TEXT_DIM);
+
+    // Build per-tab geometry: (label_text, total_width, is_active)
+    struct TabSlot {
+        label: String,
+        width: u16,
+        active: bool,
+    }
+    let mut slots: Vec<TabSlot> = Vec::new();
+    let mut total_width: u16 = 1; // leading space
     for (idx, tab) in state.presentation_tabs.iter().enumerate() {
         let label = truncate_to_chars(&metadata_presentation_base_label(tab), max_label_chars);
-        let text = if idx == state.active_tab {
-            format!("[ {}{} ]", label, metadata_presentation_dirty_suffix(state, idx, tab))
+        let dirty = metadata_presentation_dirty_suffix(state, idx, tab);
+        let text = format!("{}{}", label, dirty);
+        let active = idx == state.active_tab;
+        // Active: "┌─ label ─┐" = 2 + 1 + label_len + 1 + 2 = label_len + 6
+        // Inactive: " label " = 1 + label_len + 1 = label_len + 2
+        let slot_width = if active {
+            (text.chars().count() + 6) as u16  // ┌─ + space + label + space + ─┐
         } else {
-            format!("( {}{} )", label, metadata_presentation_dirty_suffix(state, idx, tab))
+            (text.chars().count() + 2) as u16  // space + label + space
         };
-        let width = text.chars().count() as u16;
-        if width == 0 || x >= area.x.saturating_add(area.width) {
+        if total_width.saturating_add(slot_width) > area.width {
             break;
         }
-        let remaining = area.x.saturating_add(area.width).saturating_sub(x);
-        if width > remaining {
-            break;
-        }
-
-        let style = if idx == state.active_tab {
-            Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::CYAN)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::TEXT_BRIGHT)
-        };
-        spans.push(Span::styled(text, style));
-        button_map.record_button(
-            super::button_map::TuiButton::MetadataEditorTab(idx),
-            Rect::new(x, area.y, width, 1),
-        );
-        x = x.saturating_add(width);
+        slots.push(TabSlot { label: text, width: slot_width, active });
+        total_width = total_width.saturating_add(slot_width);
         if idx + 1 < state.presentation_tabs.len() {
-            spans.push(Span::raw(" "));
-            x = x.saturating_add(1);
+            total_width = total_width.saturating_add(1); // separator
         }
     }
 
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Line 1: tab labels
+    let mut line1_spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut x = area.x + 1;
+    for (idx, slot) in slots.iter().enumerate() {
+        if slot.active {
+            line1_spans.push(Span::styled("┌─", border_style));
+            line1_spans.push(Span::styled(format!(" {} ", slot.label), active_label_style));
+            line1_spans.push(Span::styled("─┐", border_style));
+        } else {
+            line1_spans.push(Span::styled(format!(" {} ", slot.label), inactive_label_style));
+        }
+        button_map.record_button(
+            super::button_map::TuiButton::MetadataEditorTab(idx),
+            Rect::new(x, area.y, slot.width, 1),
+        );
+        x = x.saturating_add(slot.width);
+        if idx + 1 < slots.len() {
+            line1_spans.push(Span::raw(" "));
+            x = x.saturating_add(1);
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(line1_spans)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    // Line 2: bottom border with gap under active tab
+    if area.height >= 2 {
+        let mut line2 = String::new();
+        line2.push(' '); // leading space to match line 1
+        for (idx, slot) in slots.iter().enumerate() {
+            if slot.active {
+                line2.push('┘');
+                // Interior spaces (slot width minus the 2 corner chars)
+                for _ in 0..slot.width.saturating_sub(2) {
+                    line2.push(' ');
+                }
+                line2.push('└');
+            } else {
+                for _ in 0..slot.width {
+                    line2.push('─');
+                }
+            }
+            if idx + 1 < slots.len() {
+                line2.push('─'); // separator becomes part of the line
+            }
+        }
+        // Fill remaining width with ─
+        let line2_chars = line2.chars().count();
+        let remaining = (area.width as usize).saturating_sub(line2_chars);
+        for _ in 0..remaining {
+            line2.push('─');
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(line2, border_style))),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+    }
 }
 
 fn draw_metadata_presentation_dropdown_control(
@@ -3680,11 +3738,16 @@ fn draw_metadata_editor(
         return;
     }
 
+    let tab_height = if state.shows_presentation_control() && !state.uses_presentation_dropdown() {
+        2
+    } else {
+        1
+    };
     let chunks = if state.shows_presentation_control() {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(tab_height),
                 Constraint::Min(1),
                 Constraint::Length(1),
             ])

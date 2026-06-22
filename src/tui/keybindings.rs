@@ -9668,8 +9668,9 @@ fn handle_metadata_editor_mouse(
         let mut content_y = content_y;
         let mut content_h = content_h;
         if state.shows_presentation_control() {
-            content_y = content_y.saturating_add(1);
-            content_h = content_h.saturating_sub(1);
+            let tab_height: u16 = if !state.uses_presentation_dropdown() { 2 } else { 1 };
+            content_y = content_y.saturating_add(tab_height);
+            content_h = content_h.saturating_sub(tab_height as usize);
         }
         let in_content = mx >= inner_x
             && mx < inner_x + inner_w
