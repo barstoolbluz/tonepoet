@@ -1226,22 +1226,25 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
 
 /// Priority order for standard fields (displayed first, in this order).
 pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
-    "TITLE",
     "ARTIST",
+    "TITLE",
     "ALBUM",
-    "ALBUMARTIST",
-    "GENRE",
     "DATE",
+    "GENRE",
+    "COMPOSER",
+    "PERFORMER",
+    "ALBUMARTIST",
+    "TRACKNUMBER",
+    "TOTALTRACKS",
+    "DISCNUMBER",
+    "TOTALDISCS",
+    "COMMENT",
     "ORIGINALDATE",
     "YEAR",
-    "TRACKNUMBER",
     "TRACKTOTAL",
-    "DISCNUMBER",
     "DISCTOTAL",
     "CATALOGNUMBER",
     "RELEASECOUNTRY",
-    "COMMENT",
-    "COMPOSER",
     "CONDUCTOR",
     "LABEL",
     "ISRC",
@@ -1254,12 +1257,58 @@ pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "MUSICBRAINZ_ARTISTID",
 ];
 
+/// Core fields that should always appear in the metadata editor,
+/// even when empty. Matches foobar2000's default field set.
+const CORE_EDITOR_FIELDS: &[&str] = &[
+    "ARTIST",
+    "TITLE",
+    "ALBUM",
+    "DATE",
+    "GENRE",
+    "COMPOSER",
+    "PERFORMER",
+    "ALBUMARTIST",
+    "TRACKNUMBER",
+    "TOTALTRACKS",
+    "DISCNUMBER",
+    "TOTALDISCS",
+    "COMMENT",
+];
+
+/// Ensure the core editor fields are present in the entry list.
+/// Missing fields are added as empty entries so the editor always
+/// shows them and saved sidecars always contain them.
+pub fn ensure_standard_fields_present(entries: &mut Vec<TagEntry>, n_files: usize) {
+    for &field in CORE_EDITOR_FIELDS {
+        let exists = entries
+            .iter()
+            .any(|e| e.display_key.eq_ignore_ascii_case(field));
+        if !exists {
+            entries.push(TagEntry {
+                display_key: field.to_string(),
+                item_key: lofty::tag::ItemKey::Unknown(field.to_string()),
+                value: String::new(),
+                original: String::new(),
+                is_binary: false,
+                is_mixed: false,
+                per_file_values: vec![String::new(); n_files],
+                per_file_originals: vec![String::new(); n_files],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            });
+        }
+    }
+}
+
 /// Sort `entries` so STANDARD_KEY_ORDER fields lead in their listed
 /// order, with the remainder sorted alphabetically by display key.
-/// Used by `read_all_tags_merged` and the MusicBrainz / GNUDB populate
-/// paths so post-populate entries fall into their logical positions
-/// instead of trailing.
+/// Also ensures core editor fields are present (empty if not already
+/// populated). Used by `read_all_tags_merged` and the MusicBrainz /
+/// GNUDB populate paths so post-populate entries fall into their
+/// logical positions instead of trailing.
 pub fn sort_entries_standard_first(entries: &mut Vec<TagEntry>) {
+    let n_files = entries.first().map(|e| e.per_file_values.len()).unwrap_or(1);
+    ensure_standard_fields_present(entries, n_files);
     entries.sort_by(|a, b| {
         let a_upper = a.display_key.to_ascii_uppercase();
         let b_upper = b.display_key.to_ascii_uppercase();
