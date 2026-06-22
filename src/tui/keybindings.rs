@@ -3132,7 +3132,7 @@ pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
     mut state: Box<super::app::MetadataEditorState>,
 ) {
     state.sync_active_presentation();
-    if state.has_presentation_tabs() {
+    if state.has_multiple_presentations() {
         app.pending_metadata_editor = Some(state.clone());
         app.active_overlay = ActiveOverlay::Confirmation {
             message: "Apply MusicBrainz tags to all matching presentations?".to_string(),
@@ -3155,6 +3155,65 @@ fn handle_metadata_editor_key(
 
     match state.phase {
         MetadataEditorPhase::Editing => {
+            if state.presentation_selector_open {
+                match key.code {
+                    KeyCode::Esc => {
+                        state.close_presentation_selector();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.move_presentation_selector_cursor(-1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.move_presentation_selector_cursor(1);
+                    }
+                    KeyCode::Home => {
+                        state.set_presentation_selector_cursor(0);
+                    }
+                    KeyCode::End => {
+                        let last = state.presentation_tabs.len().saturating_sub(1);
+                        state.set_presentation_selector_cursor(last);
+                    }
+                    KeyCode::PageUp => {
+                        state.move_presentation_selector_cursor(-5);
+                    }
+                    KeyCode::PageDown => {
+                        state.move_presentation_selector_cursor(5);
+                    }
+                    KeyCode::Tab => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            state.move_presentation_selector_cursor(-1);
+                        } else {
+                            state.move_presentation_selector_cursor(1);
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        state.move_presentation_selector_cursor(-1);
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        let changed = state.select_presentation_selector_cursor();
+                        if changed {
+                            if let Some(label) = state.active_presentation_label() {
+                                app.set_status(format!("metadata editor: {}", label));
+                            }
+                        }
+                    }
+                    KeyCode::Char(c) if key.modifiers.is_empty() && ('1'..='9').contains(&c) => {
+                        let idx = (c as u8 - b'1') as usize;
+                        if idx < state.presentation_tabs.len() {
+                            state.set_presentation_selector_cursor(idx);
+                            let changed = state.select_presentation_selector_cursor();
+                            if changed {
+                                if let Some(label) = state.active_presentation_label() {
+                                    app.set_status(format!("metadata editor: {}", label));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             match key.code {
                 // Command mode: park editor state, open command input.
                 KeyCode::Char(':') => {
@@ -3191,6 +3250,9 @@ fn handle_metadata_editor_key(
                             app.set_status(format!("metadata editor: {}", label));
                         }
                     }
+                }
+                KeyCode::Char(' ') if key.modifiers.is_empty() && state.uses_presentation_dropdown() => {
+                    state.open_presentation_selector();
                 }
                 KeyCode::Char(c) if key.modifiers.is_empty() && ('1'..='9').contains(&c) => {
                     let idx = (c as u8 - b'1') as usize;
@@ -4520,6 +4582,9 @@ pub fn open_metadata_editor(app: &mut AppState) {
             dvdv_title_angle_count: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
+        presentation_selector_open: false,
+        presentation_selector_cursor: 0,
+        presentation_selector_scroll: 0,
     }));
 }
 
@@ -4750,15 +4815,34 @@ fn dvda_presentation_tab_label(
     presentation: &crate::disc::model::DiscPresentation,
     group_nr: u8,
 ) -> String {
-    let detail = if presentation.label.trim().is_empty() {
-        dvda_audio_format_label(&presentation.format).unwrap_or_else(|| "audio presentation".to_string())
-    } else {
-        presentation.label.trim().to_string()
+    let album_title = non_empty(&presentation.album_title).map(str::to_string);
+    let structural_label = non_empty(&Some(presentation.label.clone())).map(str::to_string);
+    let format = dvda_audio_format_label(&presentation.format);
+    let has_album_metadata = album_title.is_some();
+    let base = album_title.or(structural_label);
+    let mut detail = match (base, format) {
+        (Some(base), Some(format)) => {
+            let base_lower = base.to_ascii_lowercase();
+            if base_lower.contains(&format.to_ascii_lowercase()) {
+                base
+            } else {
+                format!("{} ({})", base, format)
+            }
+        }
+        (Some(base), None) => base,
+        (None, Some(format)) => format,
+        (None, None) => "audio presentation".to_string(),
     };
+    if presentation.total_duration_secs.is_finite() && presentation.total_duration_secs > 0.0 {
+        let duration = dvdv_duration_label(presentation.total_duration_secs);
+        if !detail.to_ascii_lowercase().contains(&duration) {
+            detail = format!("{} [{}]", detail, duration);
+        }
+    }
 
     let lower = detail.to_ascii_lowercase();
     let group_prefix = format!("group {}", group_nr).to_ascii_lowercase();
-    if lower.starts_with(&group_prefix) {
+    if has_album_metadata || lower.starts_with(&group_prefix) {
         detail
     } else {
         format!("Group {}: {}", group_nr, detail)
@@ -5007,6 +5091,9 @@ pub fn build_dvda_editor_state(
             dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         },
         dvda_presentation_label_for_group(disc, disc_contents, group.group_nr),
         n_tracks,
@@ -5028,7 +5115,7 @@ pub fn build_dvda_multitab_editor_state(
     // whenever that unified disc model is available.
     let tab_specs = dvda_presentation_tab_specs(disc, disc_contents, &groups);
 
-    if tab_specs.len() <= 1 {
+    if tab_specs.is_empty() {
         return build_dvda_editor_state(
             source_path,
             disc,
@@ -5036,7 +5123,7 @@ pub fn build_dvda_multitab_editor_state(
             store_id,
             existing_metabase_path,
             metabase,
-            selected_group_nr.or_else(|| tab_specs.first().map(|spec| spec.group_nr)),
+            selected_group_nr,
         );
     }
 
@@ -5504,7 +5591,7 @@ pub fn build_dvdv_editor_state(
 
     let target_path = super::command::dvdv_metadata_sidecar_path_for_source(source_path).ok();
     let writable = super::command::dvdv_metadata_sidecar_target_is_writable(source_path);
-    let label = dvdv_presentation_label(presentation);
+    let label = dvdv_presentation_label(presentation, sidecar);
 
     Ok((
         super::app::MetadataEditorState {
@@ -5536,6 +5623,9 @@ pub fn build_dvdv_editor_state(
             dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         },
         label,
         n_tracks,
@@ -5744,14 +5834,32 @@ fn dvdv_source_chapters_for_editor(
         .collect()
 }
 
-fn dvdv_presentation_label(presentation: &crate::disc::model::DiscPresentation) -> String {
-    if !presentation.label.trim().is_empty() {
-        return presentation.label.trim().to_string();
+fn dvdv_presentation_label(
+    presentation: &crate::disc::model::DiscPresentation,
+    sidecar: Option<&super::command::DvdVideoMetadataSidecar>,
+) -> String {
+    let structural = if let Some((vts, title, stream)) = presentation.id.dvd_video_parts() {
+        format!(
+            "VTS {} Title {} Stream {}",
+            vts,
+            title,
+            crate::disc::model::dvd_video_audio_stream_display_number(stream)
+        )
+    } else {
+        "DVD-Video audio presentation".to_string()
+    };
+    let base = sidecar_album_value(sidecar, &["ALBUM"])
+        .or_else(|| non_empty(&presentation.album_title).map(str::to_string))
+        .or_else(|| non_empty(&Some(presentation.label.clone())).map(str::to_string))
+        .unwrap_or(structural);
+    let format = dvda_audio_format_label(&presentation.format);
+
+    match format {
+        Some(format) if !base.to_ascii_lowercase().contains(&format.to_ascii_lowercase()) => {
+            format!("{} ({})", base, format)
+        }
+        _ => base,
     }
-    if let Some((vts, title, stream)) = presentation.id.dvd_video_parts() {
-        return format!("VTS {} title {} stream {}", vts, title, stream);
-    }
-    "DVD-Video audio presentation".to_string()
 }
 
 fn dvdv_synthetic_title(
@@ -6477,6 +6585,9 @@ pub fn build_sacd_editor_state(
         dvdv_source_chapters: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
+        presentation_selector_open: false,
+        presentation_selector_cursor: 0,
+        presentation_selector_scroll: 0,
     };
 
     Ok((state, area_label, n_tracks))
@@ -6499,7 +6610,7 @@ pub fn build_sacd_multitab_editor_state(
         area_views.push((super::sacd::AreaKind::MultiChannel, view));
     }
 
-    if area_views.len() <= 1 {
+    if area_views.is_empty() {
         return build_sacd_editor_state(iso_path, md, sidecar);
     }
 
@@ -9556,7 +9667,7 @@ fn handle_metadata_editor_mouse(
         let total_rows = state.entries.len() + 1;
         let mut content_y = content_y;
         let mut content_h = content_h;
-        if state.has_presentation_tabs() {
+        if state.shows_presentation_control() {
             content_y = content_y.saturating_add(1);
             content_h = content_h.saturating_sub(1);
         }
@@ -9567,16 +9678,66 @@ fn handle_metadata_editor_mouse(
         let in_footer = mx >= inner_x && mx < inner_x + inner_w && my == footer_y;
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if let Some(super::button_map::TuiButton::MetadataEditorTab(idx)) =
-                app.button_map.find_button_at(mx, my)
-            {
-                if state.switch_presentation_tab(idx) {
-                    if let Some(label) = state.active_presentation_label() {
-                        app.set_status(format!("metadata editor: {}", label));
+            match app.button_map.find_button_at(mx, my) {
+                Some(super::button_map::TuiButton::MetadataPresentationSelectorToggle) => {
+                    if state.presentation_selector_open {
+                        state.close_presentation_selector();
+                    } else {
+                        state.open_presentation_selector();
                     }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
                 }
-                app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                return;
+                Some(super::button_map::TuiButton::MetadataPresentationSelectorRow(idx)) => {
+                    if idx < state.presentation_tabs.len() {
+                        state.set_presentation_selector_cursor(idx);
+                        let changed = state.select_presentation_selector_cursor();
+                        if changed {
+                            if let Some(label) = state.active_presentation_label() {
+                                app.set_status(format!("metadata editor: {}", label));
+                            }
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataEditorTab(idx)) => {
+                    if state.switch_presentation_tab(idx) {
+                        if let Some(label) = state.active_presentation_label() {
+                            app.set_status(format!("metadata editor: {}", label));
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if state.presentation_selector_open {
+            match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let visible_rows = state
+                        .presentation_tabs
+                        .len()
+                        .min(10)
+                        .min(content_h.saturating_sub(2))
+                        .max(1);
+                    let delta = match mouse.kind {
+                        MouseEventKind::ScrollUp => -1,
+                        MouseEventKind::ScrollDown => 1,
+                        _ => 0,
+                    };
+                    state.scroll_presentation_selector(delta, visible_rows);
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    state.close_presentation_selector();
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                _ => {}
             }
         }
 
@@ -11388,6 +11549,9 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
             dvdv_title_angle_count: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
+        presentation_selector_open: false,
+        presentation_selector_cursor: 0,
+        presentation_selector_scroll: 0,
     };
     if let Some(track_index) = initial_track {
         focus_metadata_editor_on_track(&mut state, track_index);
@@ -13613,7 +13777,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserExpand(_)
             | TuiButton::DiscBrowserConvert
             | TuiButton::DiscBrowserClose
-            | TuiButton::MetadataEditorTab(_) => {
+            | TuiButton::MetadataEditorTab(_)
+            | TuiButton::MetadataPresentationSelectorToggle
+            | TuiButton::MetadataPresentationSelectorRow(_) => {
                 // Handled in dedicated mouse/overlay handlers; no-op here.
             }
         }
@@ -13744,6 +13910,25 @@ mod phase4_tests {
     }
 
     #[test]
+    fn dvda_tab_label_uses_album_title_before_group_identity() {
+        let mut presentation = dvd_audio_presentation(
+            2,
+            "MLP 96kHz/24-bit 5.1",
+            Some("MLP"),
+            Some(96_000),
+            Some(24),
+            Some(6),
+            Some("5.1"),
+        );
+        presentation.album_title = Some("Live at the Fillmore East".to_string());
+
+        assert_eq!(
+            dvda_presentation_tab_label(&presentation, 2),
+            "Live at the Fillmore East (MLP 96kHz/24-bit 5.1)"
+        );
+    }
+
+    #[test]
     fn dvda_tab_label_falls_back_to_structured_format_fields() {
         let presentation = dvd_audio_presentation(
             2,
@@ -13816,6 +14001,9 @@ mod phase4_tests {
             dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         }
     }
 
@@ -13850,6 +14038,9 @@ mod phase4_tests {
             dvdv_title_angle_count: None,
             presentation_tabs: tabs,
             active_tab: 0,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         }
     }
 
@@ -13887,6 +14078,136 @@ mod phase4_tests {
             id: id.to_string(),
             meta,
         }
+    }
+
+
+    fn selector_test_tabs() -> Vec<super::super::app::PresentationTab> {
+        (1..=12)
+            .map(|group_nr| {
+                let first = format!("Group {} One", group_nr);
+                let second = format!("Group {} Two", group_nr);
+                dvda_save_tab(
+                    group_nr,
+                    vec![entry(
+                        "TITLE",
+                        ItemKey::TrackTitle,
+                        &[first.as_str(), second.as_str()],
+                        &[first.as_str(), second.as_str()],
+                    )],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn closed_presentation_dropdown_space_opens_but_enter_edits_grid() {
+        let (tx, _rx) = mpsc::channel(1);
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        let mut enter_state = Box::new(dvda_multitab_state(selector_test_tabs()));
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut enter_state,
+            &tx,
+        );
+        assert!(!enter_state.presentation_selector_open);
+        assert_eq!(enter_state.phase, MetadataEditorPhase::DetailEdit);
+        assert_eq!(enter_state.active_tab, 0);
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        let mut space_state = Box::new(dvda_multitab_state(selector_test_tabs()));
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &mut space_state,
+            &tx,
+        );
+        assert!(space_state.presentation_selector_open);
+        assert_eq!(space_state.presentation_selector_cursor, 0);
+        assert_eq!(space_state.active_tab, 0);
+    }
+
+    #[test]
+    fn presentation_selector_mouse_row_click_selects_row() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let mut state = dvda_multitab_state(selector_test_tabs());
+        assert!(state.open_presentation_selector());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        app.button_map.record_button(
+            TuiButton::MetadataPresentationSelectorRow(2),
+            Rect::new(5, 5, 40, 1),
+        );
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert_eq!(state.active_tab, 2);
+                assert!(!state.presentation_selector_open);
+                assert_eq!(state.entries[0].per_file_values[0], "Group 3 One");
+            }
+            other => panic!("expected metadata editor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn presentation_selector_mouse_wheel_scrolls_without_selecting() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let mut state = dvda_multitab_state(selector_test_tabs());
+        assert!(state.open_presentation_selector());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 8,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert_eq!(state.active_tab, 0);
+                assert!(state.presentation_selector_open);
+                assert!(state.presentation_selector_scroll > 0 || state.presentation_selector_cursor > 0);
+            }
+            other => panic!("expected metadata editor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn musicbrainz_reopen_does_not_prompt_for_single_presentation_control() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let tabs = vec![dvda_save_tab(
+            1,
+            vec![entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["Populated One", "Populated Two"],
+                &["Old One", "Old Two"],
+            )],
+        )];
+        let state = Box::new(dvda_multitab_state(tabs));
+
+        reopen_metadata_editor_after_musicbrainz_population(&mut app, state);
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)));
+        assert!(app.pending_metadata_editor.is_none());
     }
 
     #[test]
@@ -14690,6 +15011,9 @@ mod phase4_tests {
             dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         }
     }
 
@@ -14909,6 +15233,9 @@ mod phase4_tests {
             dvdv_title_angle_count: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         };
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());

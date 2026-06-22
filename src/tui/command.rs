@@ -4916,14 +4916,15 @@ pub fn select_default_disc_presentation_index(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct DvdvTocScore {
+    has_sidecar_metadata: bool,
+    stereo: bool,
+    bit_depth: u32,
     duration_complete: bool,
     track_count: usize,
     duration_frames: u64,
-    stereo: bool,
     lossless: bool,
     coding_rank: u8,
     sample_rate: u32,
-    bit_depth: u32,
     reverse_identity: ReverseDvdvIdentity,
 }
 
@@ -4943,20 +4944,21 @@ fn dvdv_default_presentation_score(
         .unwrap_or((u8::MAX, u8::MAX, u8::MAX));
 
     DvdvTocScore {
-        duration_complete: dvdv_presentation_has_complete_positive_durations(presentation),
-        track_count: presentation.tracks.len(),
-        duration_frames: (presentation.total_duration_secs.max(0.0) * CD_FRAMES_PER_SECOND)
-            .round() as u64,
+        has_sidecar_metadata: presentation.album_title.is_some(),
         stereo: presentation.format.channels == Some(2)
             || presentation
                 .format
                 .channel_layout
                 .as_deref()
                 .is_some_and(|layout| layout.eq_ignore_ascii_case("stereo")),
+        bit_depth: presentation.format.bit_depth.unwrap_or(0),
+        duration_complete: dvdv_presentation_has_complete_positive_durations(presentation),
+        track_count: presentation.tracks.len(),
+        duration_frames: (presentation.total_duration_secs.max(0.0) * CD_FRAMES_PER_SECOND)
+            .round() as u64,
         lossless: presentation.format.lossless,
         coding_rank: dvdv_codec_rank(presentation.format.codec.as_deref()),
         sample_rate: presentation.format.sample_rate.unwrap_or(0),
-        bit_depth: presentation.format.bit_depth.unwrap_or(0),
         reverse_identity: ReverseDvdvIdentity {
             vts_number: u8::MAX.saturating_sub(vts_number),
             title_number: u8::MAX.saturating_sub(title_number),

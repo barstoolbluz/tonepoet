@@ -139,6 +139,11 @@ pub enum TuiButton {
     /// MetadataEditor presentation-tab selector. Argument is the
     /// 0-based index into `MetadataEditorState.presentation_tabs`.
     MetadataEditorTab(usize),
+    /// MetadataEditor 3+-presentation dropdown toggle row.
+    MetadataPresentationSelectorToggle,
+    /// MetadataEditor 3+-presentation dropdown row. Argument is the
+    /// 0-based index into `MetadataEditorState.presentation_tabs`.
+    MetadataPresentationSelectorRow(usize),
 
     /// MetadataEditor per-row revert/use-MB pill. Argument is the
     /// 0-based index into `MetadataEditorState.entries`.
@@ -232,6 +237,8 @@ impl TuiButton {
             | Self::OverlayConfirm
             | Self::OverlayCancel
             | Self::MetadataEditorTab(_)
+            | Self::MetadataPresentationSelectorToggle
+            | Self::MetadataPresentationSelectorRow(_)
             | Self::MetadataEntryRevert(_)
             | Self::MetadataEntryView(_)
             | Self::MetadataDetailRevert

@@ -1891,6 +1891,9 @@ fn build_audio_state_for_cli(
         dvdv_source_chapters: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
+        presentation_selector_open: false,
+        presentation_selector_cursor: 0,
+        presentation_selector_scroll: 0,
     })
 }
 
@@ -1951,6 +1954,9 @@ fn build_dvdv_state_for_cli(
         dvdv_source_chapters: None,
         presentation_tabs: Vec::new(),
         active_tab: 0,
+        presentation_selector_open: false,
+        presentation_selector_cursor: 0,
+        presentation_selector_scroll: 0,
     })
 }
 

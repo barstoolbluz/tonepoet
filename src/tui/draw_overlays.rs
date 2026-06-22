@@ -3119,25 +3119,14 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
     );
 }
 
-/// Compose the editor's title bar string. Three mutually exclusive
-/// branches in priority order:
+/// Compose the editor's title bar string. Branch priority:
 ///   1. SACD case (any `sacd_area_kind`): `" SACD: <iso> [<area>[· read-only]] "`.
-///      Wins regardless of path count so single-track SACDs aren't
-///      misclassified as plain single-file edits.
-///   2. Single non-SACD file: `" Metadata: <name> "`.
-///   3. Multi-file non-SACD edit: `" Metadata: <N> files "`.
+///      Wins regardless of path count or presentation-tab count so
+///      single-track SACDs keep the SACD marker.
+///   2. Other disc-backed presentation editors: `" Metadata: <source> [<presentation>] "`.
+///   3. Single non-SACD file: `" Metadata: <name> "`.
+///   4. Multi-file non-SACD edit: `" Metadata: <N> files "`.
 pub(super) fn editor_title(state: &super::app::MetadataEditorState) -> String {
-    if state.has_presentation_tabs() {
-        let src_name = state
-            .paths
-            .first()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let label = state.active_presentation_label().unwrap_or("presentation");
-        let ro = if state.read_only { " · read-only" } else { "" };
-        return format!(" Metadata: {}  [{}{}] ", src_name, label, ro);
-    }
     if let Some(area) = state.sacd_area_kind {
         // SACD editor: paths are the ISO repeated per virtual track;
         // surface the disc name + which area is being edited.
@@ -3147,12 +3136,26 @@ pub(super) fn editor_title(state: &super::app::MetadataEditorState) -> String {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let area_label = match area {
+        let fallback_area_label = match area {
             crate::tui::sacd::AreaKind::Stereo => "stereo",
             crate::tui::sacd::AreaKind::MultiChannel => "MCH",
         };
+        let area_label = state
+            .active_presentation_label()
+            .unwrap_or(fallback_area_label);
         let ro = if state.read_only { " · read-only" } else { "" };
-        format!(" SACD: {}  [{}{}] ", iso_name, area_label, ro)
+        return format!(" SACD: {}  [{}{}] ", iso_name, area_label, ro);
+    }
+    if state.shows_presentation_control() {
+        let src_name = state
+            .paths
+            .first()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let label = state.active_presentation_label().unwrap_or("presentation");
+        let ro = if state.read_only { " · read-only" } else { "" };
+        format!(" Metadata: {}  [{}{}] ", src_name, label, ro)
     } else if state.paths.len() == 1 {
         let name = state.paths[0]
             .file_name()
@@ -3170,37 +3173,468 @@ fn draw_metadata_presentation_tabs(
     area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
 ) {
+    if state.uses_presentation_dropdown() {
+        draw_metadata_presentation_dropdown_control(f, state, area, button_map);
+        return;
+    }
+
+    let tab_count = state.presentation_tabs.len().max(1);
+    let max_label_chars = ((area.width as usize).saturating_sub(6 * tab_count) / tab_count)
+        .max(8)
+        .min(32);
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     let mut x = area.x + 1;
+
     for (idx, tab) in state.presentation_tabs.iter().enumerate() {
-        let label = truncate_to_chars(&tab.label, 28);
-        let text = format!(" {}{} ", label, if tab.dirty { " *" } else { "" });
-        let width = text.chars().count() as u16;
-        if idx == state.active_tab {
-            spans.push(Span::styled(
-                text,
-                Style::default()
-                    .fg(theme::PILL_ACTIVE_FG)
-                    .bg(theme::CYAN)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let label = truncate_to_chars(&metadata_presentation_base_label(tab), max_label_chars);
+        let text = if idx == state.active_tab {
+            format!("[ {}{} ]", label, metadata_presentation_dirty_suffix(state, idx, tab))
         } else {
-            spans.push(Span::styled(text, Style::default().fg(theme::TEXT_DIM)));
-        }
-        if width > 0 {
-            button_map.record_button(
-                super::button_map::TuiButton::MetadataEditorTab(idx),
-                Rect::new(x, area.y, width, 1),
-            );
-            x = x.saturating_add(width);
-        }
-        spans.push(Span::raw(" "));
-        x = x.saturating_add(1);
-        if x >= area.x.saturating_add(area.width) {
+            format!("( {}{} )", label, metadata_presentation_dirty_suffix(state, idx, tab))
+        };
+        let width = text.chars().count() as u16;
+        if width == 0 || x >= area.x.saturating_add(area.width) {
             break;
         }
+        let remaining = area.x.saturating_add(area.width).saturating_sub(x);
+        if width > remaining {
+            break;
+        }
+
+        let style = if idx == state.active_tab {
+            Style::default()
+                .fg(theme::PILL_ACTIVE_FG)
+                .bg(theme::CYAN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT_BRIGHT)
+        };
+        spans.push(Span::styled(text, style));
+        button_map.record_button(
+            super::button_map::TuiButton::MetadataEditorTab(idx),
+            Rect::new(x, area.y, width, 1),
+        );
+        x = x.saturating_add(width);
+        if idx + 1 < state.presentation_tabs.len() {
+            spans.push(Span::raw(" "));
+            x = x.saturating_add(1);
+        }
     }
+
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_metadata_presentation_dropdown_control(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    area: Rect,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
+    let Some(tab) = state.presentation_tabs.get(state.active_tab) else {
+        return;
+    };
+    let indicator = if state.presentation_selector_open { "▴" } else { "▾" };
+    let mut label = metadata_presentation_label_with_stats(tab);
+    if metadata_presentation_has_saved_tags(tab) {
+        label.push_str(" ◆");
+    }
+    label.push_str(metadata_presentation_dirty_suffix(state, state.active_tab, tab));
+
+    let hint = if state.presentation_selector_open {
+        "  Enter choose · Esc close"
+    } else {
+        "  Space opens selector"
+    };
+    let usable = area.width.saturating_sub(4) as usize;
+    let hint_chars = hint.chars().count();
+    let label_max = usable.saturating_sub(hint_chars + 3).max(8);
+    let label = truncate_to_chars(&label, label_max);
+    let selector_text = format!(" {} {} ", indicator, label);
+    let selector_width = selector_text.chars().count() as u16;
+
+    let mut spans = vec![Span::raw(" ")];
+    spans.push(Span::styled(
+        selector_text,
+        Style::default()
+            .fg(theme::PILL_ACTIVE_FG)
+            .bg(theme::CYAN)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if area.width as usize > selector_width as usize + hint_chars + 1 {
+        spans.push(Span::styled(hint, Style::default().fg(theme::TEXT_DIM)));
+    }
+
+    button_map.record_button(
+        super::button_map::TuiButton::MetadataPresentationSelectorToggle,
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_metadata_presentation_dropdown_popup(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    content_area: Rect,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
+    if !state.uses_presentation_dropdown() || !state.presentation_selector_open {
+        return;
+    }
+    if content_area.width < 20 || content_area.height < 3 {
+        return;
+    }
+
+    let option_labels: Vec<String> = state
+        .presentation_tabs
+        .iter()
+        .enumerate()
+        .map(|(idx, tab)| {
+            let mut label = metadata_presentation_label_with_stats(tab);
+            if metadata_presentation_has_saved_tags(tab) {
+                label.push_str(" ◆");
+            }
+            label.push_str(metadata_presentation_dirty_suffix(state, idx, tab));
+            label
+        })
+        .collect();
+    let widest = option_labels
+        .iter()
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let popup_width = content_area
+        .width
+        .min((widest + 8).max(32).min(96) as u16)
+        .max(20);
+    let visible_rows = (state.presentation_tabs.len() as u16)
+        .min(10)
+        .min(content_area.height.saturating_sub(2))
+        .max(1);
+    let popup = Rect::new(
+        content_area.x,
+        content_area.y,
+        popup_width,
+        visible_rows.saturating_add(2),
+    );
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::CYAN))
+        .title(Span::styled(
+            " Presentation ",
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let scroll = metadata_presentation_selector_scroll(state, inner.height as usize);
+    let cursor = state
+        .presentation_selector_cursor
+        .min(state.presentation_tabs.len().saturating_sub(1));
+    let visible_rows = inner.height as usize;
+    let overflow = state.presentation_tabs.len() > visible_rows;
+    let can_scroll_up = scroll > 0;
+    let can_scroll_down = scroll.saturating_add(visible_rows) < state.presentation_tabs.len();
+    let mut lines = Vec::new();
+    for row in 0..visible_rows {
+        let idx = scroll + row;
+        if idx >= state.presentation_tabs.len() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let active = idx == state.active_tab;
+        let highlighted = idx == cursor;
+        let marker = if active { "●" } else { " " };
+        let pointer = if highlighted { "›" } else { " " };
+        let max_label = inner
+            .width
+            .saturating_sub(if overflow { 6 } else { 4 }) as usize;
+        let label = truncate_to_chars(&option_labels[idx], max_label);
+        let body = format!("{}{} {}", pointer, marker, label);
+        let text = metadata_presentation_selector_line_text(
+            body,
+            inner.width as usize,
+            overflow,
+            metadata_presentation_selector_scroll_glyph(
+                row,
+                visible_rows,
+                can_scroll_up,
+                can_scroll_down,
+            ),
+        );
+        let style = if highlighted {
+            Style::default()
+                .fg(theme::AMBER)
+                .bg(theme::SURFACE)
+                .add_modifier(Modifier::BOLD)
+        } else if active {
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT_BRIGHT)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+        button_map.record_button(
+            super::button_map::TuiButton::MetadataPresentationSelectorRow(idx),
+            Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+        );
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn metadata_presentation_selector_scroll_glyph(
+    row: usize,
+    visible_rows: usize,
+    can_scroll_up: bool,
+    can_scroll_down: bool,
+) -> Option<&'static str> {
+    if visible_rows == 0 {
+        return None;
+    }
+    if row == 0 && can_scroll_up {
+        Some("↑")
+    } else if row + 1 == visible_rows && can_scroll_down {
+        Some("↓")
+    } else if can_scroll_up || can_scroll_down {
+        Some("│")
+    } else {
+        None
+    }
+}
+
+fn metadata_presentation_selector_line_text(
+    body: String,
+    width: usize,
+    overflow: bool,
+    scroll_glyph: Option<&str>,
+) -> String {
+    if !overflow || width == 0 {
+        return truncate_to_chars(&body, width);
+    }
+    let body_width = width.saturating_sub(2);
+    let body = truncate_to_chars(&body, body_width);
+    let body_chars = body.chars().count();
+    let pad = width.saturating_sub(body_chars + 1);
+    format!("{}{}{}", body, " ".repeat(pad), scroll_glyph.unwrap_or("│"))
+}
+
+fn metadata_presentation_selector_scroll(
+    state: &super::app::MetadataEditorState,
+    visible_rows: usize,
+) -> usize {
+    let len = state.presentation_tabs.len();
+    if len == 0 || visible_rows == 0 {
+        return 0;
+    }
+    let cursor = state.presentation_selector_cursor.min(len - 1);
+    let max_scroll = len.saturating_sub(visible_rows);
+    let mut scroll = state.presentation_selector_scroll.min(max_scroll);
+    if cursor >= scroll.saturating_add(visible_rows) {
+        scroll = cursor.saturating_add(1).saturating_sub(visible_rows);
+    }
+    scroll.min(max_scroll)
+}
+
+fn metadata_presentation_base_label(tab: &super::app::PresentationTab) -> String {
+    let trimmed = tab.label.trim();
+    if trimmed.is_empty() {
+        tab.id.compact_label()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn metadata_presentation_label_with_stats(tab: &super::app::PresentationTab) -> String {
+    let label = metadata_presentation_base_label(tab);
+    let lower = label.to_ascii_lowercase();
+    let mut details = Vec::new();
+    let track_count = tab.paths.len();
+    if track_count > 0 && !lower.contains(" track") && !lower.contains("tracks") {
+        details.push(format!(
+            "{} track{}",
+            track_count,
+            if track_count == 1 { "" } else { "s" }
+        ));
+    }
+    if let Some(duration) = metadata_presentation_duration_secs(tab) {
+        let duration_label = metadata_duration_label(duration);
+        if !lower.contains(&duration_label) {
+            details.push(duration_label);
+        }
+    }
+    if details.is_empty() {
+        label
+    } else {
+        format!("{} ({})", label, details.join(", "))
+    }
+}
+
+fn metadata_presentation_duration_secs(tab: &super::app::PresentationTab) -> Option<f64> {
+    let durations = if let Some(durations) = tab.dvdv_track_durations.as_ref() {
+        Some(durations)
+    } else {
+        match tab.sacd_area_kind {
+            Some(crate::tui::sacd::AreaKind::Stereo) => tab.sacd_stereo_durations.as_ref(),
+            Some(crate::tui::sacd::AreaKind::MultiChannel) => {
+                tab.sacd_multi_channel_durations.as_ref()
+            }
+            None => None,
+        }
+    }?;
+    let total: f64 = durations
+        .iter()
+        .copied()
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .sum();
+    (total > 0.0).then_some(total)
+}
+
+fn metadata_duration_label(duration_secs: f64) -> String {
+    let total = duration_secs.round().max(0.0) as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{}:{:02}:{:02}", hours, minutes, seconds)
+    } else {
+        format!("{}:{:02}", minutes, seconds)
+    }
+}
+
+fn metadata_presentation_dirty_suffix(
+    state: &super::app::MetadataEditorState,
+    idx: usize,
+    tab: &super::app::PresentationTab,
+) -> &'static str {
+    let dirty = if idx == state.active_tab {
+        state.dirty || !state.deleted.is_empty()
+    } else {
+        tab.dirty
+    };
+    if dirty { " *" } else { "" }
+}
+
+fn metadata_presentation_has_saved_tags(tab: &super::app::PresentationTab) -> bool {
+    tab.entries.iter().any(|entry| {
+        metadata_presentation_entry_has_saved_tag(tab, entry)
+    })
+}
+
+fn metadata_presentation_entry_has_saved_tag(
+    tab: &super::app::PresentationTab,
+    entry: &super::probe::TagEntry,
+) -> bool {
+    let key = entry.display_key.trim().to_ascii_uppercase();
+    if matches!(
+        key.as_str(),
+        "DVDA_GROUP"
+            | "DVDV_VTS"
+            | "DVDV_TITLE"
+            | "DVDV_AUDIO_STREAM"
+            | "DVDV_ANGLE"
+            | "DISCNUMBER"
+            | "TRACKNUMBER"
+    ) {
+        return false;
+    }
+
+    if matches!(tab.id, crate::disc::model::PresentationId::DvdVideoTitle { .. }) {
+        return metadata_dvdv_entry_has_sidecar_tag(tab, entry, key.as_str());
+    }
+
+    metadata_entry_has_nonempty_value(entry)
+}
+
+fn metadata_dvdv_entry_has_sidecar_tag(
+    tab: &super::app::PresentationTab,
+    entry: &super::probe::TagEntry,
+    key: &str,
+) -> bool {
+    match key {
+        // DVD-Video editors synthesize TITLE values from title/chapter numbers.
+        // Count TITLE as saved metadata only when a value differs from that
+        // generated fallback. This keeps the marker conservative when no
+        // sidecar exists.
+        "TITLE" => metadata_dvdv_title_entry_has_saved_value(tab, entry),
+        // These DVD-Video fields are populated only from the sidecar path in
+        // build_dvdv_editor_state; unlike ALBUM/DATE/GENRE, they have no
+        // DiscPresentation fallback in that builder.
+        "CATALOGNUMBER"
+        | "PUBLISHER"
+        | "MUSICBRAINZ_ALBUMID"
+        | "MUSICBRAINZ_ALBUMARTISTID"
+        | "MUSICBRAINZ_RELEASEGROUPID"
+        | "ORIGINALDATE"
+        | "RELEASECOUNTRY"
+        | "ARTIST"
+        | "PERFORMER"
+        | "COMPOSER"
+        | "LYRICIST"
+        | "ARRANGER"
+        | "ISRC"
+        | "MUSICBRAINZ_TRACKID"
+        | "MUSICBRAINZ_RELEASETRACKID"
+        | "MUSICBRAINZ_ARTISTID" => metadata_entry_has_nonempty_value(entry),
+        // ALBUM, ALBUMARTIST, DATE, and GENRE can be DiscPresentation
+        // fallbacks as well as sidecar values. Without changing the tab data
+        // model to carry provenance, do not use them for the saved-tags marker.
+        _ => false,
+    }
+}
+
+fn metadata_dvdv_title_entry_has_saved_value(
+    tab: &super::app::PresentationTab,
+    entry: &super::probe::TagEntry,
+) -> bool {
+    if entry.per_file_values.is_empty() {
+        return metadata_dvdv_title_value_is_saved(tab, 0, &entry.value);
+    }
+
+    entry
+        .per_file_values
+        .iter()
+        .enumerate()
+        .any(|(idx, value)| metadata_dvdv_title_value_is_saved(tab, idx, value))
+}
+
+fn metadata_dvdv_title_value_is_saved(
+    tab: &super::app::PresentationTab,
+    idx: usize,
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value == "<multiple values>" {
+        return false;
+    }
+    metadata_dvdv_synthetic_title(tab, idx)
+        .map(|synthetic| value != synthetic)
+        .unwrap_or(true)
+}
+
+fn metadata_dvdv_synthetic_title(
+    tab: &super::app::PresentationTab,
+    idx: usize,
+) -> Option<String> {
+    match &tab.id {
+        crate::disc::model::PresentationId::DvdVideoTitle { title_number, .. } => {
+            Some(format!("Title {} Chapter {}", title_number, idx + 1))
+        }
+        _ => None,
+    }
+}
+
+fn metadata_entry_has_nonempty_value(entry: &super::probe::TagEntry) -> bool {
+    let value_has_tag =
+        !entry.value.trim().is_empty() && entry.value.trim() != "<multiple values>";
+    let per_file_has_tag = entry
+        .per_file_values
+        .iter()
+        .any(|value| !value.trim().is_empty() && value.trim() != "<multiple values>");
+    value_has_tag || per_file_has_tag
 }
 
 /// Draw the full metadata editor overlay.
@@ -3246,7 +3680,7 @@ fn draw_metadata_editor(
         return;
     }
 
-    let chunks = if state.has_presentation_tabs() {
+    let chunks = if state.shows_presentation_control() {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -3262,7 +3696,7 @@ fn draw_metadata_editor(
             .split(inner)
     };
 
-    let (tab_area, content_area, footer_area) = if state.has_presentation_tabs() {
+    let (tab_area, content_area, footer_area) = if state.shows_presentation_control() {
         (Some(chunks[0]), chunks[1], chunks[2])
     } else {
         (None, chunks[0], chunks[1])
@@ -3280,6 +3714,7 @@ fn draw_metadata_editor(
         draw_metadata_detail(
             f, state, content_area, footer_area, inner_w, content_h, button_map,
         );
+        draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
         return;
     }
 
@@ -3740,6 +4175,7 @@ fn draw_metadata_editor(
         Paragraph::new(footer).alignment(Alignment::Center),
         footer_area,
     );
+    draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
 }
 
 /// Render the per-file detail view within the metadata editor.
@@ -5834,9 +6270,52 @@ fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::app::{MetadataEditorPhase, MetadataEditorState};
+    use super::super::app::{MetadataEditorPhase, MetadataEditorState, PresentationTab};
     use super::*;
+    use crate::tui::probe::TagEntry;
+    use lofty::tag::ItemKey;
     use std::path::PathBuf;
+
+
+    fn tag(display_key: &str, value: &str, per_file_values: Vec<&str>) -> TagEntry {
+        TagEntry {
+            display_key: display_key.to_string(),
+            item_key: ItemKey::TrackTitle,
+            value: value.to_string(),
+            original: value.to_string(),
+            is_binary: false,
+            is_mixed: per_file_values.len() > 1,
+            per_file_values: per_file_values.iter().map(|v| (*v).to_string()).collect(),
+            per_file_originals: per_file_values.iter().map(|v| (*v).to_string()).collect(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    fn presentation_tab(
+        id: crate::disc::model::PresentationId,
+        entries: Vec<TagEntry>,
+        n_paths: usize,
+    ) -> PresentationTab {
+        PresentationTab {
+            id,
+            label: "Presentation".to_string(),
+            paths: (0..n_paths)
+                .map(|idx| PathBuf::from(format!("/disc/track{:02}.flac", idx + 1)))
+                .collect(),
+            entries,
+            file_labels: (0..n_paths).map(|idx| format!("Track {:02}", idx + 1)).collect(),
+            deleted: Vec::new(),
+            dirty: false,
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
+        }
+    }
 
     /// Minimal MetadataEditorState fixture for title tests. Caller
     /// overrides only the fields they care about.
@@ -5870,7 +6349,171 @@ mod tests {
             dvdv_source_chapters: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         }
+    }
+
+
+
+    #[test]
+    fn active_dirty_suffix_uses_live_editor_state() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::DvdAudioGroup(1),
+            vec![tag("TITLE", "stored", vec!["stored"])],
+            1,
+        );
+        let mut state = fixture();
+        state.presentation_tabs = vec![tab.clone()];
+        state.active_tab = 0;
+        state.dirty = true;
+
+        assert_eq!(metadata_presentation_dirty_suffix(&state, 0, &tab), " *");
+    }
+
+    #[test]
+    fn inactive_dirty_suffix_uses_tab_snapshot() {
+        let active = presentation_tab(
+            crate::disc::model::PresentationId::DvdAudioGroup(1),
+            vec![tag("TITLE", "active", vec!["active"])],
+            1,
+        );
+        let mut sibling = presentation_tab(
+            crate::disc::model::PresentationId::DvdAudioGroup(2),
+            vec![tag("TITLE", "sibling", vec!["sibling"])],
+            1,
+        );
+        sibling.dirty = true;
+        let mut state = fixture();
+        state.presentation_tabs = vec![active, sibling.clone()];
+        state.active_tab = 0;
+        state.dirty = false;
+
+        assert_eq!(metadata_presentation_dirty_suffix(&state, 1, &sibling), " *");
+    }
+
+    #[test]
+    fn dvdv_structural_fallback_album_does_not_count_as_saved_tags() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::DvdVideoTitle {
+                vts_number: 1,
+                title_number: 2,
+                audio_stream_index: 0,
+            },
+            vec![tag("ALBUM", "Disc presentation fallback", vec!["Disc presentation fallback"])],
+            2,
+        );
+
+        assert!(!metadata_presentation_has_saved_tags(&tab));
+    }
+
+    #[test]
+    fn selector_scroll_affordance_marks_hidden_rows_below() {
+        let text = metadata_presentation_selector_line_text(
+            "›● Presentation".to_string(),
+            24,
+            true,
+            metadata_presentation_selector_scroll_glyph(2, 3, false, true),
+        );
+
+        assert!(text.ends_with('↓'));
+    }
+
+    #[test]
+    fn selector_scroll_affordance_marks_hidden_rows_above() {
+        let text = metadata_presentation_selector_line_text(
+            "›● Presentation".to_string(),
+            24,
+            true,
+            metadata_presentation_selector_scroll_glyph(0, 3, true, false),
+        );
+
+        assert!(text.ends_with('↑'));
+    }
+
+    #[test]
+    fn single_presentation_tab_renders_clickable_control() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::DvdAudioGroup(1),
+            vec![tag("TITLE", "one", vec!["one"])],
+            1,
+        );
+        let mut state = fixture();
+        state.presentation_tabs = vec![tab];
+        state.active_tab = 0;
+        let mut button_map = super::super::button_map::ButtonRenderMap::new();
+        let backend = ratatui::backend::TestBackend::new(80, 3);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|f| {
+                draw_metadata_presentation_tabs(
+                    f,
+                    &state,
+                    Rect::new(0, 0, 80, 1),
+                    &mut button_map,
+                );
+            })
+            .expect("draw tab row");
+
+        assert_eq!(
+            button_map.find_button_at(2, 0),
+            Some(super::super::button_map::TuiButton::MetadataEditorTab(0))
+        );
+    }
+
+    #[test]
+    fn dvdv_generated_titles_do_not_count_as_saved_tags() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::DvdVideoTitle {
+                vts_number: 1,
+                title_number: 2,
+                audio_stream_index: 0,
+            },
+            vec![tag(
+                "TITLE",
+                "<multiple values>",
+                vec!["Title 2 Chapter 1", "Title 2 Chapter 2"],
+            )],
+            2,
+        );
+
+        assert!(!metadata_presentation_has_saved_tags(&tab));
+    }
+
+    #[test]
+    fn dvdv_custom_title_counts_as_saved_tags() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::DvdVideoTitle {
+                vts_number: 1,
+                title_number: 2,
+                audio_stream_index: 0,
+            },
+            vec![tag(
+                "TITLE",
+                "<multiple values>",
+                vec!["Opening", "Title 2 Chapter 2"],
+            )],
+            2,
+        );
+
+        assert!(metadata_presentation_has_saved_tags(&tab));
+    }
+
+    #[test]
+    fn dvdv_sidecar_only_metadata_counts_as_saved_tags() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::DvdVideoTitle {
+                vts_number: 1,
+                title_number: 2,
+                audio_stream_index: 0,
+            },
+            vec![tag("MUSICBRAINZ_ALBUMID", "release-id", vec!["release-id"])],
+            2,
+        );
+
+        assert!(metadata_presentation_has_saved_tags(&tab));
     }
 
     #[test]

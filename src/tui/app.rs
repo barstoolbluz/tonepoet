@@ -970,8 +970,12 @@ impl SourceMode {
                                 .is_some_and(|c| c.eq_ignore_ascii_case("lpcm"))
                         })
                         .max_by_key(|(_, p)| {
-                            // Prefer presentations that have sidecar metadata
-                            (p.album_title.is_some() as u8, p.tracks.len())
+                            // Prefer: (1) has sidecar metadata, (2) stereo,
+                            // (3) higher bit depth, (4) more tracks
+                            let has_meta = p.album_title.is_some() as u8;
+                            let is_stereo = (p.format.channels.unwrap_or(0) <= 2) as u8;
+                            let bit_depth = p.format.bit_depth.unwrap_or(0);
+                            (has_meta, is_stereo, bit_depth, p.tracks.len())
                         })
                         .map(|(i, _)| i)
                         .unwrap_or(0);
@@ -2888,19 +2892,128 @@ pub struct MetadataEditorState {
     pub dvdv_angle_number: Option<u8>,
     /// DVD-Video-only: authored angle count or equivalent ambiguity signal.
     pub dvdv_title_angle_count: Option<u8>,
-    /// Disc-backed editor tabs. Empty for plain file editors and
-    /// single-presentation disc editors. When non-empty, the active tab is
-    /// mirrored into the legacy top-level editor fields for rendering and
-    /// editing.
+    /// Disc-backed editor tabs. Empty for plain file editors. Disc editors
+    /// keep one entry per selectable presentation, including the single-
+    /// presentation case, so rendering can show the same styled control for
+    /// the whole <=2-presentation path. The active tab is mirrored into the
+    /// legacy top-level editor fields for rendering and editing.
     pub presentation_tabs: Vec<PresentationTab>,
     /// Active index into `presentation_tabs`. Ignored when the tab vector is
     /// empty.
     pub active_tab: usize,
+    /// True while the 3+-presentation dropdown is open inside the metadata editor.
+    pub presentation_selector_open: bool,
+    /// Highlighted dropdown row. It is intentionally separate from `active_tab` so
+    /// Up/Down navigation does not switch presentations until the user confirms.
+    pub presentation_selector_cursor: usize,
+    /// First visible dropdown row. Rendering clamps this against current viewport
+    /// height, so stale values from resize or tab-count changes are harmless.
+    pub presentation_selector_scroll: usize,
 }
 
 impl MetadataEditorState {
-    pub fn has_presentation_tabs(&self) -> bool {
+    pub fn shows_presentation_control(&self) -> bool {
+        !self.presentation_tabs.is_empty()
+    }
+
+    pub fn has_multiple_presentations(&self) -> bool {
         self.presentation_tabs.len() > 1
+    }
+
+    pub fn has_presentation_tabs(&self) -> bool {
+        self.has_multiple_presentations()
+    }
+
+    pub fn uses_presentation_dropdown(&self) -> bool {
+        self.presentation_tabs.len() > 2
+    }
+
+    pub fn open_presentation_selector(&mut self) -> bool {
+        if !self.uses_presentation_dropdown() {
+            return false;
+        }
+        self.sync_active_presentation();
+        self.presentation_selector_open = true;
+        self.presentation_selector_cursor = self.active_tab.min(self.presentation_tabs.len() - 1);
+        self.presentation_selector_scroll = self.presentation_selector_cursor;
+        true
+    }
+
+    pub fn close_presentation_selector(&mut self) {
+        self.presentation_selector_open = false;
+        self.presentation_selector_cursor = self
+            .active_tab
+            .min(self.presentation_tabs.len().saturating_sub(1));
+        self.presentation_selector_scroll = self
+            .presentation_selector_scroll
+            .min(self.presentation_tabs.len().saturating_sub(1));
+    }
+
+    pub fn move_presentation_selector_cursor(&mut self, delta: isize) -> bool {
+        if !self.uses_presentation_dropdown() {
+            return false;
+        }
+        let len = self.presentation_tabs.len();
+        let old = self.presentation_selector_cursor.min(len - 1);
+        let step = delta.checked_abs().unwrap_or(isize::MAX) as usize;
+        let next = if delta < 0 {
+            old.saturating_sub(step)
+        } else {
+            old.saturating_add(step).min(len - 1)
+        };
+        self.presentation_selector_cursor = next;
+        if next < self.presentation_selector_scroll {
+            self.presentation_selector_scroll = next;
+        }
+        next != old
+    }
+
+    pub fn set_presentation_selector_cursor(&mut self, next: usize) -> bool {
+        if !self.uses_presentation_dropdown() || next >= self.presentation_tabs.len() {
+            return false;
+        }
+        let changed = self.presentation_selector_cursor != next;
+        self.presentation_selector_cursor = next;
+        if next < self.presentation_selector_scroll {
+            self.presentation_selector_scroll = next;
+        }
+        changed
+    }
+
+    pub fn scroll_presentation_selector(&mut self, delta: isize, visible_rows: usize) -> bool {
+        if !self.uses_presentation_dropdown() || visible_rows == 0 {
+            return false;
+        }
+        let len = self.presentation_tabs.len();
+        let visible_rows = visible_rows.min(len).max(1);
+        let max_scroll = len.saturating_sub(visible_rows);
+        let old_scroll = self.presentation_selector_scroll.min(max_scroll);
+        let old_cursor = self.presentation_selector_cursor.min(len - 1);
+        let step = delta.checked_abs().unwrap_or(isize::MAX) as usize;
+        let next_scroll = if delta < 0 {
+            old_scroll.saturating_sub(step)
+        } else {
+            old_scroll.saturating_add(step).min(max_scroll)
+        };
+        self.presentation_selector_scroll = next_scroll;
+
+        let last_visible = next_scroll
+            .saturating_add(visible_rows)
+            .saturating_sub(1)
+            .min(len - 1);
+        self.presentation_selector_cursor = old_cursor.clamp(next_scroll, last_visible);
+
+        self.presentation_selector_scroll != old_scroll
+            || self.presentation_selector_cursor != old_cursor
+    }
+
+    pub fn select_presentation_selector_cursor(&mut self) -> bool {
+        if !self.uses_presentation_dropdown() {
+            return false;
+        }
+        let next = self.presentation_selector_cursor.min(self.presentation_tabs.len() - 1);
+        self.presentation_selector_open = false;
+        self.switch_presentation_tab(next)
     }
 
     pub fn active_presentation_label(&self) -> Option<&str> {
@@ -2960,6 +3073,11 @@ impl MetadataEditorState {
         self.detail_scroll = 0;
         self.detail_edit = None;
         self.phase = MetadataEditorPhase::Editing;
+        self.presentation_selector_open = false;
+        self.presentation_selector_cursor = self.active_tab;
+        self.presentation_selector_scroll = self
+            .presentation_selector_scroll
+            .min(self.presentation_tabs.len().saturating_sub(1));
         true
     }
 
@@ -6088,6 +6206,9 @@ mod metadata_presentation_tab_tests {
             dvdv_title_angle_count: active.dvdv_title_angle_count,
             presentation_tabs: tabs,
             active_tab,
+            presentation_selector_open: false,
+            presentation_selector_cursor: active_tab,
+            presentation_selector_scroll: 0,
         }
     }
 
@@ -6224,6 +6345,160 @@ mod metadata_presentation_tab_tests {
         assert_eq!(state.presentation_tabs[2].entries[0].value, "bonus");
     }
 
+
+
+    #[test]
+    fn presentation_selector_uses_dropdown_only_above_two_tabs() {
+        let one = vec![tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![tag("TITLE", "one", vec!["one"])],
+            1,
+        )];
+        let two = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+        ];
+        let three = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(3),
+                "Group 3",
+                vec![tag("TITLE", "three", vec!["three"])],
+                1,
+            ),
+        ];
+
+        let one_state = state_with_tabs(one, 0);
+        assert!(one_state.shows_presentation_control());
+        assert!(!one_state.has_multiple_presentations());
+        assert!(!one_state.has_presentation_tabs());
+        assert!(!one_state.uses_presentation_dropdown());
+
+        let two_state = state_with_tabs(two, 0);
+        assert!(two_state.shows_presentation_control());
+        assert!(two_state.has_multiple_presentations());
+        assert!(two_state.has_presentation_tabs());
+        assert!(!two_state.uses_presentation_dropdown());
+
+        let three_state = state_with_tabs(three, 0);
+        assert!(three_state.shows_presentation_control());
+        assert!(three_state.has_multiple_presentations());
+        assert!(three_state.uses_presentation_dropdown());
+    }
+
+    #[test]
+    fn presentation_selector_navigation_defers_switch_until_selection() {
+        let tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(3),
+                "Group 3",
+                vec![tag("TITLE", "three", vec!["three"])],
+                1,
+            ),
+        ];
+        let mut state = state_with_tabs(tabs, 0);
+
+        assert!(state.open_presentation_selector());
+        assert!(state.presentation_selector_open);
+        assert_eq!(state.presentation_selector_cursor, 0);
+        assert!(state.move_presentation_selector_cursor(2));
+        assert_eq!(state.presentation_selector_cursor, 2);
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.entries[0].value, "one");
+
+        assert!(state.select_presentation_selector_cursor());
+        assert!(!state.presentation_selector_open);
+        assert_eq!(state.active_tab, 2);
+        assert_eq!(state.entries[0].value, "three");
+    }
+
+    #[test]
+    fn presentation_selector_mouse_scroll_keeps_cursor_in_view_without_selecting() {
+        let tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(3),
+                "Group 3",
+                vec![tag("TITLE", "three", vec!["three"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(4),
+                "Group 4",
+                vec![tag("TITLE", "four", vec!["four"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(5),
+                "Group 5",
+                vec![tag("TITLE", "five", vec!["five"])],
+                1,
+            ),
+        ];
+        let mut state = state_with_tabs(tabs, 0);
+
+        assert!(state.open_presentation_selector());
+        assert!(state.scroll_presentation_selector(1, 3));
+        assert_eq!(state.presentation_selector_scroll, 1);
+        assert_eq!(state.presentation_selector_cursor, 1);
+        assert_eq!(state.active_tab, 0);
+
+        assert!(state.scroll_presentation_selector(1, 3));
+        assert_eq!(state.presentation_selector_scroll, 2);
+        assert_eq!(state.presentation_selector_cursor, 2);
+        assert_eq!(state.active_tab, 0);
+
+        assert!(state.scroll_presentation_selector(-1, 3));
+        assert_eq!(state.presentation_selector_scroll, 1);
+        assert_eq!(state.presentation_selector_cursor, 2);
+        assert_eq!(state.active_tab, 0);
+    }
+
     #[test]
     fn apply_active_musicbrainz_values_preserves_internal_and_non_mb_fields() {
         let tabs = vec![
@@ -6261,9 +6536,15 @@ mod metadata_presentation_tab_tests {
                 .expect(key)
         };
 
-        assert_eq!(by_key("TITLE").per_file_values, vec!["MB 01".to_string(), "MB 02".to_string()]);
+        assert_eq!(
+            by_key("TITLE").per_file_values,
+            vec!["MB 01".to_string(), "MB 02".to_string()]
+        );
         assert_eq!(by_key("DVDA_GROUP").value, "3");
-        assert_eq!(by_key("DVDA_GROUP").per_file_values, vec!["3".to_string(), "3".to_string()]);
+        assert_eq!(
+            by_key("DVDA_GROUP").per_file_values,
+            vec!["3".to_string(), "3".to_string()]
+        );
         assert_eq!(by_key("COMMENT").value, "destination note");
         assert_eq!(
             by_key("COMMENT").per_file_values,
