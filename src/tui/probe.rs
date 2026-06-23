@@ -244,12 +244,38 @@ fn probe_dvdv_disc(path: &Path) -> Result<SourceInfo, String> {
     Ok(crate::tui::disc_browser::source_info_for_presentation(&contents, presentation))
 }
 
+fn probe_bluray_disc(path: &Path) -> Result<SourceInfo, String> {
+    let contents = crate::disc::bluray_utils::map_bluray_source(path)?;
+    let presentation = contents
+        .presentations
+        .first()
+        .ok_or_else(|| format!("Blu-ray disc has no audio streams: {}", path.display()))?;
+    Ok(crate::tui::disc_browser::source_info_for_presentation(
+        &contents,
+        presentation,
+    ))
+}
+
 pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     if crate::disc::dvda_utils::is_dvda_source(path) {
         return probe_dvda_disc(path);
     }
     if crate::disc::dvdv_utils::is_dvdv_source(path) {
         return probe_dvdv_disc(path);
+    }
+    let mut bluray_probe_error = None;
+    if crate::disc::bluray_utils::is_bluray_source(path) {
+        match probe_bluray_disc(path) {
+            Ok(info) => return Ok(info),
+            Err(err) => {
+                log::debug!(
+                    "Blu-ray probe failed for '{}'; continuing with remaining source probes: {}",
+                    path.display(),
+                    err
+                );
+                bluray_probe_error = Some(err);
+            }
+        }
     }
     // SACD ISOs are ScarletBook-format DSD streams that ffmpeg can't open
     // (it'll either error out on the unrecognised container or mis-detect
@@ -265,8 +291,15 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
 
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-    let ctx = ffmpeg_next::format::input(&path)
-        .map_err(|e| format!("Failed to open '{}': {}", path.display(), e))?;
+    let ctx = ffmpeg_next::format::input(&path).map_err(|e| {
+        let ffmpeg_error = format!("Failed to open '{}': {}", path.display(), e);
+        match bluray_probe_error.as_deref() {
+            Some(bluray_error) => {
+                format!("{ffmpeg_error}; Blu-ray probe also failed: {bluray_error}")
+            }
+            None => ffmpeg_error,
+        }
+    })?;
 
     // Find the best audio stream
     let stream = ctx

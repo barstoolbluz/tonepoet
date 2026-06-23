@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub use super::bluray_backend::BlurayDisplayAngle;
+
 use super::diagnostics::DiscDiagnostic;
 
 /// Disc format identifier.
@@ -10,6 +12,7 @@ pub enum DiscFormat {
     DvdAudio,
     Sacd,
     DvdVideo,
+    BluRay,
 }
 
 impl DiscFormat {
@@ -18,6 +21,7 @@ impl DiscFormat {
             Self::DvdAudio => "DVD-Audio",
             Self::Sacd => "SACD",
             Self::DvdVideo => "DVD-Video",
+            Self::BluRay => "Blu-ray",
         }
     }
 }
@@ -68,6 +72,18 @@ pub enum PresentationId {
         title_number: u8,
         audio_stream_index: u8,
     },
+    /// Blu-ray playlist/audio-stream/display-angle identity. Playlist number and
+    /// PID come from authored MPLS/CLPI metadata; stream index stays zero-based
+    /// for materializer routing, while display helpers render streams one-based.
+    /// The angle value is the one-based user-facing angle. Backend adapters must
+    /// convert it at their FFI boundary when a lower-level API uses another base.
+    BluRayTitle {
+        playlist_number: u32,
+        audio_pid: u16,
+        audio_stream_index: u8,
+        #[serde(rename = "display_angle", alias = "angle_number")]
+        display_angle: BlurayDisplayAngle,
+    },
 }
 
 impl PresentationId {
@@ -79,6 +95,35 @@ impl PresentationId {
             title_number,
             audio_stream_index,
         }
+    }
+
+    /// Construct a Blu-ray presentation identity from authored playlist, PID,
+    /// zero-based audio stream index, and a validated one-based display angle.
+    pub fn blu_ray_title(
+        playlist_number: u32,
+        audio_pid: u16,
+        audio_stream_index: u8,
+        display_angle: BlurayDisplayAngle,
+    ) -> Self {
+        Self::BluRayTitle {
+            playlist_number,
+            audio_pid,
+            audio_stream_index,
+            display_angle,
+        }
+    }
+
+    /// Construct a Blu-ray presentation identity from a raw display angle.
+    /// Returns an error for `0`, because Blu-ray display angles are one-based.
+    pub fn try_blu_ray_title(
+        playlist_number: u32,
+        audio_pid: u16,
+        audio_stream_index: u8,
+        display_angle: u8,
+    ) -> Result<Self, &'static str> {
+        BlurayDisplayAngle::new(display_angle).map(|display_angle| {
+            Self::blu_ray_title(playlist_number, audio_pid, audio_stream_index, display_angle)
+        })
     }
 
     /// Return the authored DVD-Video identity tuple when this is a DVD-Video
@@ -95,7 +140,22 @@ impl PresentationId {
         }
     }
 
-    /// Stable, short user-facing label. DVD-Video stream numbers are displayed
+    /// Return the authored Blu-ray identity tuple for playlist/PID/stream/display-angle.
+    /// The audio stream index stays zero-based because that is the value carried
+    /// into the future demux/materializer path. The angle is one-based.
+    pub fn blu_ray_parts(&self) -> Option<(u32, u16, u8, u8)> {
+        match self {
+            Self::BluRayTitle {
+                playlist_number,
+                audio_pid,
+                audio_stream_index,
+                display_angle,
+            } => Some((*playlist_number, *audio_pid, *audio_stream_index, display_angle.get())),
+            _ => None,
+        }
+    }
+
+    /// Stable, short user-facing label. DVD-Video and Blu-ray stream numbers are displayed
     /// one-based, while persisted/source-option state keeps the zero-based
     /// stream index required by the demux layer.
     pub fn display_label(&self) -> String {
@@ -110,6 +170,16 @@ impl PresentationId {
             } => format!(
                 "DVD-Video VTS {vts_number} title {title_number} audio stream {}",
                 dvd_video_audio_stream_display_number(*audio_stream_index)
+            ),
+            Self::BluRayTitle {
+                playlist_number,
+                audio_pid,
+                audio_stream_index,
+                display_angle,
+            } => format!(
+                "Blu-ray Playlist {playlist_number:05} Stream {} PID 0x{audio_pid:04x} Angle {}",
+                blu_ray_audio_stream_display_number(*audio_stream_index),
+                display_angle.get()
             ),
         }
     }
@@ -128,6 +198,16 @@ impl PresentationId {
                 "VTS {vts_number} Title {title_number} Stream {}",
                 dvd_video_audio_stream_display_number(*audio_stream_index)
             ),
+            Self::BluRayTitle {
+                playlist_number,
+                audio_pid,
+                audio_stream_index,
+                display_angle,
+            } => format!(
+                "Playlist {playlist_number:05} Stream {} PID 0x{audio_pid:04x} Angle {}",
+                blu_ray_audio_stream_display_number(*audio_stream_index),
+                display_angle.get()
+            ),
         }
     }
 }
@@ -135,6 +215,12 @@ impl PresentationId {
 /// Convert the persisted/materializer zero-based DVD-Video audio stream index to
 /// the one-based stream number shown to users.
 pub fn dvd_video_audio_stream_display_number(audio_stream_index: u8) -> u16 {
+    u16::from(audio_stream_index) + 1
+}
+
+/// Convert the persisted/materializer zero-based Blu-ray audio stream index to
+/// the one-based stream number shown to users.
+pub fn blu_ray_audio_stream_display_number(audio_stream_index: u8) -> u16 {
     u16::from(audio_stream_index) + 1
 }
 
@@ -232,5 +318,66 @@ mod presentation_id_tests {
         assert_eq!(id.display_label(), "DVD-Video VTS 1 title 2 audio stream 1");
         assert_eq!(id.compact_label(), "VTS 1 Title 2 Stream 1");
         assert_eq!(id.dvd_video_parts(), Some((1, 2, 0)));
+    }
+
+    #[test]
+    fn blu_ray_presentation_id_serializes_full_identity() {
+        let id = PresentationId::blu_ray_title(12, 0x1100, 0, BlurayDisplayAngle::first());
+        let value = serde_json::to_value(id).expect("serialize Blu-ray presentation id");
+        assert_eq!(value["kind"], "blu_ray_title");
+        assert_eq!(value["value"]["playlist_number"], 12);
+        assert_eq!(value["value"]["audio_pid"], 0x1100);
+        assert_eq!(value["value"]["audio_stream_index"], 0);
+        assert_eq!(value["value"]["display_angle"], 1);
+
+        let round_trip: PresentationId =
+            serde_json::from_value(value).expect("deserialize Blu-ray presentation id");
+        assert_eq!(round_trip, id);
+    }
+
+    #[test]
+    fn blu_ray_presentation_id_accepts_legacy_angle_number_field() {
+        let value = serde_json::json!({
+            "kind": "blu_ray_title",
+            "value": {
+                "playlist_number": 12,
+                "audio_pid": 0x1100,
+                "audio_stream_index": 0,
+                "angle_number": 2
+            }
+        });
+
+        let id: PresentationId =
+            serde_json::from_value(value).expect("deserialize legacy Blu-ray presentation id");
+        assert_eq!(id.blu_ray_parts(), Some((12, 0x1100, 0, 2)));
+    }
+
+    #[test]
+    fn blu_ray_presentation_id_rejects_zero_display_angle() {
+        assert!(PresentationId::try_blu_ray_title(12, 0x1100, 0, 0).is_err());
+
+        let value = serde_json::json!({
+            "kind": "blu_ray_title",
+            "value": {
+                "playlist_number": 12,
+                "audio_pid": 0x1100,
+                "audio_stream_index": 0,
+                "display_angle": 0
+            }
+        });
+
+        let decoded = serde_json::from_value::<PresentationId>(value);
+        assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn blu_ray_labels_display_one_based_stream_numbers() {
+        let id = PresentationId::blu_ray_title(12, 0x1100, 0, BlurayDisplayAngle::first());
+        assert_eq!(
+            id.display_label(),
+            "Blu-ray Playlist 00012 Stream 1 PID 0x1100 Angle 1"
+        );
+        assert_eq!(id.compact_label(), "Playlist 00012 Stream 1 PID 0x1100 Angle 1");
+        assert_eq!(id.blu_ray_parts(), Some((12, 0x1100, 0, 1)));
     }
 }

@@ -4,11 +4,12 @@
 //! data reaches the rest of tonepoet. This keeps libbluray FFI isolated and
 //! leaves room for another backend behind the same trait.
 
+use std::convert::TryFrom;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 /// BD-ROM primary audio coding values used by tonepoet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -150,6 +151,82 @@ impl BlurayTitleInfo {
     pub fn duration_secs(&self) -> f64 {
         self.duration_pts_90k as f64 / 90_000.0
     }
+}
+
+/// One-based Blu-ray angle shown to users and persisted in presentation identity.
+///
+/// libbluray's title-selection APIs use a zero-based angle argument. This type
+/// marks the boundary explicitly: code outside a concrete backend deals in
+/// display angles (`1..=angle_count`), and the libbluray adapter converts to
+/// `BlurayLibblurayAngleArg` immediately before calling libbluray.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct BlurayDisplayAngle(u8);
+
+impl BlurayDisplayAngle {
+    #[must_use]
+    pub const fn first() -> Self {
+        Self(1)
+    }
+
+    pub fn new(display_angle: u8) -> Result<Self, &'static str> {
+        if display_angle == 0 {
+            Err("Blu-ray display angle numbers are one-based")
+        } else {
+            Ok(Self(display_angle))
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn to_libbluray_arg(self) -> BlurayLibblurayAngleArg {
+        BlurayLibblurayAngleArg(self.0 - 1)
+    }
+}
+
+impl TryFrom<u8> for BlurayDisplayAngle {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for BlurayDisplayAngle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+/// Zero-based angle argument passed to libbluray (`bd_get_title_info`,
+/// `bd_select_angle`). This must be created from `BlurayDisplayAngle`; callers
+/// should not pass persisted/display angle numbers directly to libbluray.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlurayLibblurayAngleArg(u8);
+
+impl BlurayLibblurayAngleArg {
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn to_display_angle(self) -> BlurayDisplayAngle {
+        BlurayDisplayAngle(self.0.saturating_add(1))
+    }
+}
+
+pub fn bluray_display_angle_to_libbluray_arg(display_angle: u8) -> Result<u8, &'static str> {
+    BlurayDisplayAngle::new(display_angle).map(|angle| angle.to_libbluray_arg().get())
 }
 
 /// A title chapter in BD-ROM 90 kHz clock units.
@@ -332,6 +409,190 @@ pub struct BlurayAudioStreamInfo {
     pub language: Option<String>,
 }
 
+
+/// AACS status reported by libbluray disc metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlurayAacsStatus {
+    pub handled: bool,
+    pub libaacs_detected: bool,
+    pub error_code: Option<i32>,
+    pub mkb_version: Option<i32>,
+}
+
+/// BD+ status reported by libbluray disc metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlurayBdPlusStatus {
+    pub handled: bool,
+    pub libbdplus_detected: bool,
+    pub generation: Option<u8>,
+    pub date: Option<u32>,
+}
+
+/// Disc-level Blu-ray content-protection status from `bd_get_disc_info()`.
+///
+/// This is a typed domain result, not an interpretation of operation error
+/// strings. `Unencrypted` only means the backend positively reported no AACS or
+/// BD+ protection in disc metadata. `Unknown` means the backend could not answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum BlurayProtectionStatus {
+    Unencrypted,
+    AacsDetectedHandled { details: BlurayAacsStatus },
+    AacsDetectedNotHandled { details: BlurayAacsStatus },
+    BdPlusDetectedHandled { details: BlurayBdPlusStatus },
+    BdPlusDetectedNotHandled { details: BlurayBdPlusStatus },
+    AacsAndBdPlusDetected {
+        aacs: BlurayAacsStatus,
+        bdplus: BlurayBdPlusStatus,
+    },
+    Unknown { reason: String },
+}
+
+impl BlurayProtectionStatus {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Unencrypted => "Unencrypted".to_string(),
+            Self::Unknown { reason } => format!("Unknown / probe failed: {reason}"),
+            Self::AacsDetectedHandled { details }
+            | Self::AacsDetectedNotHandled { details } => details.summary(),
+            Self::BdPlusDetectedHandled { details }
+            | Self::BdPlusDetectedNotHandled { details } => details.summary(),
+            Self::AacsAndBdPlusDetected { aacs, bdplus } => {
+                format!("{}; {}", aacs.summary(), bdplus.summary())
+            }
+        }
+    }
+
+    /// Whether media-byte reads are expected to work for optional probes.
+    ///
+    /// Metadata enumeration may still work on protected discs. The mapper uses
+    /// this typed status to decide whether to attempt an LPCM media-byte probe;
+    /// it does not parse backend error text to infer encryption.
+    #[must_use]
+    pub fn may_read_media_for_probe(&self) -> bool {
+        match self {
+            Self::Unencrypted
+            | Self::AacsDetectedHandled { .. }
+            | Self::BdPlusDetectedHandled { .. } => true,
+            Self::Unknown { .. }
+            | Self::AacsDetectedNotHandled { .. }
+            | Self::BdPlusDetectedNotHandled { .. } => false,
+            Self::AacsAndBdPlusDetected { aacs, bdplus } => aacs.handled && bdplus.handled,
+        }
+    }
+}
+
+impl BlurayAacsStatus {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut suffix = Vec::new();
+        if !self.libaacs_detected {
+            suffix.push("libaacs unavailable".to_string());
+        }
+        if let Some(code) = self.error_code {
+            if code != 0 {
+                suffix.push(format!("error code {code}"));
+            }
+        }
+        if let Some(mkbv) = self.mkb_version {
+            suffix.push(format!("MKB v{mkbv}"));
+        }
+        mechanism_summary("AACS", self.handled, suffix)
+    }
+}
+
+impl BlurayBdPlusStatus {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut suffix = Vec::new();
+        if !self.libbdplus_detected {
+            suffix.push("libbdplus unavailable".to_string());
+        }
+        if let Some(generation) = self.generation {
+            if generation != 0 {
+                suffix.push(format!("generation {generation}"));
+            }
+        }
+        if let Some(date) = self.date {
+            if date != 0 {
+                suffix.push(format!("date 0x{date:08x}"));
+            }
+        }
+        mechanism_summary("BD+", self.handled, suffix)
+    }
+}
+
+fn mechanism_summary(name: &str, handled: bool, suffix: Vec<String>) -> String {
+    let state = if handled { "handled" } else { "not handled" };
+    if suffix.is_empty() {
+        format!("{name} detected / {state}")
+    } else {
+        format!("{name} detected / {state} ({})", suffix.join(", "))
+    }
+}
+
+/// One unsupported or ignored libbluray audio stream entry. These diagnostics
+/// never make stream enumeration fail by themselves; the mapper can still expose
+/// any supported primary streams from the same playlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlurayUnsupportedStreamDiagnostic {
+    pub kind: BluRayAudioStreamKind,
+    pub clip_index: Option<u32>,
+    pub stream_index: Option<u8>,
+    pub pid: Option<u16>,
+    pub coding_type: Option<u8>,
+    pub format: Option<u8>,
+    pub rate: Option<u8>,
+    pub language: Option<String>,
+    pub reason: String,
+}
+
+impl BlurayUnsupportedStreamDiagnostic {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let stream = self
+            .stream_index
+            .map(bluray_audio_stream_display_number)
+            .map(|value| format!(" stream {value}"))
+            .unwrap_or_default();
+        let pid = self
+            .pid
+            .map(|pid| format!(" pid 0x{pid:04x}"))
+            .unwrap_or_default();
+        let clip = self
+            .clip_index
+            .map(|clip| format!(" clip {clip}"))
+            .unwrap_or_default();
+        let coding = self
+            .coding_type
+            .map(|coding| format!(" coding 0x{coding:02x}"))
+            .unwrap_or_default();
+        format!(
+            "Blu-ray {} audio{stream}{pid}{clip}{coding}: {}",
+            self.kind.label(),
+            self.reason
+        )
+    }
+}
+
+/// Supported streams plus non-fatal stream diagnostics for one title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlurayStreamEnumeration {
+    pub supported_streams: Vec<BlurayAudioStreamInfo>,
+    pub stream_diagnostics: Vec<BlurayUnsupportedStreamDiagnostic>,
+}
+
+impl BlurayStreamEnumeration {
+    #[must_use]
+    pub fn supported(streams: Vec<BlurayAudioStreamInfo>) -> Self {
+        Self {
+            supported_streams: streams,
+            stream_diagnostics: Vec::new(),
+        }
+    }
+}
+
 /// Materializer-level validation error for a stream that cannot be rendered
 /// safely from metadata alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,7 +715,7 @@ pub trait BlurayBackend {
     fn chapters(
         disc: &Self::Disc,
         title: BlurayTitleKey,
-        angle_number: u8,
+        display_angle: BlurayDisplayAngle,
     ) -> Result<Vec<BlurayChapterInfo>, String>;
 
     fn streams(
@@ -470,12 +731,27 @@ pub trait BlurayBackend {
         policy: ProbeDepth,
     ) -> Result<Vec<BlurayAudioStreamInfo>, String>;
 
+    fn stream_enumeration_with_probe_policy(
+        disc: &Self::Disc,
+        title: BlurayTitleKey,
+        policy: ProbeDepth,
+    ) -> Result<BlurayStreamEnumeration, String> {
+        Self::streams_with_probe_policy(disc, title, policy).map(BlurayStreamEnumeration::supported)
+    }
+
+    fn protection_status(disc: &Self::Disc) -> BlurayProtectionStatus {
+        let _ = disc;
+        BlurayProtectionStatus::Unknown {
+            reason: "backend does not expose Blu-ray protection status".to_string(),
+        }
+    }
+
     fn max_angle(disc: &Self::Disc, title: BlurayTitleKey) -> Result<u8, String>;
 
     fn open_title(
         disc: &Self::Disc,
         title: BlurayTitleKey,
-        angle_number: u8,
+        display_angle: BlurayDisplayAngle,
         decryptor: Option<&mut dyn BlurayStreamDecryptor>,
     ) -> Result<Self::TitleSource, String>;
 
@@ -527,6 +803,17 @@ mod tests {
     fn stream_display_number_is_one_based() {
         assert_eq!(bluray_audio_stream_display_number(0), 1);
         assert_eq!(bluray_audio_stream_display_number(7), 8);
+    }
+
+    #[test]
+    fn display_angle_converts_to_zero_based_libbluray_argument() {
+        assert_eq!(bluray_display_angle_to_libbluray_arg(1), Ok(0));
+        assert_eq!(bluray_display_angle_to_libbluray_arg(2), Ok(1));
+        assert!(bluray_display_angle_to_libbluray_arg(0).is_err());
+
+        let alternate = BlurayDisplayAngle::new(3).unwrap();
+        assert_eq!(alternate.to_libbluray_arg().get(), 2);
+        assert_eq!(alternate.to_libbluray_arg().to_display_angle().get(), 3);
     }
 
     #[test]
@@ -611,6 +898,82 @@ mod tests {
         ];
 
         validate_bluray_streams_for_materialization(&streams).unwrap();
+    }
+
+    #[test]
+    fn protection_summary_reports_explicit_unencrypted_status() {
+        assert_eq!(BlurayProtectionStatus::Unencrypted.summary(), "Unencrypted");
+    }
+
+    #[test]
+    fn protection_summary_reports_aacs_and_bdplus_handling() {
+        let status = BlurayProtectionStatus::AacsAndBdPlusDetected {
+            aacs: BlurayAacsStatus {
+                handled: false,
+                libaacs_detected: false,
+                error_code: Some(4),
+                mkb_version: Some(78),
+            },
+            bdplus: BlurayBdPlusStatus {
+                handled: true,
+                libbdplus_detected: true,
+                generation: Some(12),
+                date: Some(0x20260622),
+            },
+        };
+
+        let summary = status.summary();
+        assert!(summary.contains("AACS detected / not handled"));
+        assert!(summary.contains("libaacs unavailable"));
+        assert!(summary.contains("BD+ detected / handled"));
+    }
+
+    #[test]
+    fn protection_status_controls_media_probe_without_error_string_parsing() {
+        let unhandled = BlurayProtectionStatus::AacsDetectedNotHandled {
+            details: BlurayAacsStatus {
+                handled: false,
+                libaacs_detected: true,
+                error_code: Some(1),
+                mkb_version: Some(78),
+            },
+        };
+        let handled = BlurayProtectionStatus::BdPlusDetectedHandled {
+            details: BlurayBdPlusStatus {
+                handled: true,
+                libbdplus_detected: true,
+                generation: Some(12),
+                date: None,
+            },
+        };
+
+        let unknown = BlurayProtectionStatus::Unknown {
+            reason: "disc info unavailable".to_string(),
+        };
+
+        assert!(!unhandled.may_read_media_for_probe());
+        assert!(handled.may_read_media_for_probe());
+        assert!(!unknown.may_read_media_for_probe());
+    }
+
+    #[test]
+    fn unsupported_stream_diagnostic_summary_keeps_stream_identity() {
+        let diagnostic = BlurayUnsupportedStreamDiagnostic {
+            kind: BluRayAudioStreamKind::Primary,
+            clip_index: Some(0),
+            stream_index: Some(1),
+            pid: Some(0x1200),
+            coding_type: Some(0x90),
+            format: Some(0x03),
+            rate: Some(0x01),
+            language: Some("eng".to_string()),
+            reason: "unsupported audio coding type".to_string(),
+        };
+
+        assert_eq!(
+            diagnostic.summary(),
+            "Blu-ray primary audio stream 2 pid 0x1200 clip 0 coding 0x90: unsupported audio coding type"
+        );
     }
 
     #[test]

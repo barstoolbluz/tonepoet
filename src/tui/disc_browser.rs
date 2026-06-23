@@ -556,6 +556,7 @@ pub fn source_info_for_presentation(
             DiscFormat::DvdAudio => "DVD-Audio".to_string(),
             DiscFormat::Sacd => "SACD ISO".to_string(),
             DiscFormat::DvdVideo => "DVD-Video".to_string(),
+            DiscFormat::BluRay => "Blu-ray".to_string(),
         },
         codec: fmt.codec.clone().unwrap_or_else(|| presentation.label.clone()),
         bit_depth: fmt.bit_depth,
@@ -632,6 +633,9 @@ pub fn apply_presentation_to_source_options(
         }
         PresentationId::SacdArea(SacdAreaId::MultiChannel) => {
             options.sacd_area = Some(crate::convert::pipeline::SacdArea::MultiChannel);
+        }
+        PresentationId::BluRayTitle { .. } => {
+            // Phase 2: set bluray_playlist, bluray_audio_pid, etc. on SourceOptions
         }
     }
 }

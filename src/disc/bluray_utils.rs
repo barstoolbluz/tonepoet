@@ -1,9 +1,214 @@
-//! Blu-ray helper parsing that does not depend on libbluray.
+//! Blu-ray source detection, mapping glue, and LPCM PES helper parsing.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use super::bluray_backend::BlurayBackend;
+use super::bluray_backend_libbluray::BlurayBackendLibbluray;
 
 const TS_PACKET_SIZE: usize = 188;
 const MAX_PES_PREFIX_BYTES: usize = 9 + 255 + 4;
+
+const MIN_BLURAY_ISO_BYTES: u64 = 64 * 1024;
+const BLURAY_ISO_SCAN_BYTES: u64 = 1024 * 1024;
+
+/// Check whether a path is any supported Blu-ray source.
+#[must_use]
+pub fn is_bluray_source(path: &Path) -> bool {
+    if path.is_file() {
+        is_bluray_iso(path)
+    } else if path.is_dir() {
+        is_bluray_directory(path)
+    } else {
+        false
+    }
+}
+
+/// Check whether an ISO file is a Blu-ray disc image.
+///
+/// This intentionally performs cheap structural checks before calling
+/// libbluray, so random ISO-like media files do not trigger expensive Blu-ray
+/// probing.
+#[must_use]
+pub fn is_bluray_iso(path: &Path) -> bool {
+    if !path.is_file() || !bluray_iso_has_bounded_candidate_markers(path) {
+        return false;
+    }
+
+    BlurayBackendLibbluray::open(path).is_ok()
+}
+
+/// Check whether a directory contains a Blu-ray disc root.
+///
+/// Accepts either the disc root (`.../DISC/BDMV`) or the `BDMV` directory
+/// itself, resolving the latter to its parent for backend calls.
+#[must_use]
+pub fn is_bluray_directory(path: &Path) -> bool {
+    let Some(root) = bluray_directory_root(path) else {
+        return false;
+    };
+    let Some(bdmv) = resolve_child_case_insensitive(&root, "BDMV") else {
+        return false;
+    };
+    bdmv.is_dir() && bdmv_has_expected_layout(&bdmv)
+}
+
+/// Return the disc root for a Blu-ray directory source.
+#[must_use]
+pub fn bluray_directory_root(path: &Path) -> Option<PathBuf> {
+    if !path.is_dir() {
+        return None;
+    }
+
+    if path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("BDMV"))
+    {
+        return path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .or_else(|| Some(PathBuf::from(".")));
+    }
+
+    let bdmv = resolve_child_case_insensitive(path, "BDMV")?;
+    bdmv.is_dir().then(|| path.to_path_buf())
+}
+
+/// Open and map a Blu-ray source into the unified disc browsing model.
+pub fn map_bluray_source(path: &Path) -> Result<crate::disc::DiscContents, String> {
+    let source = bluray_source_path_for_backend(path)?;
+    let disc = BlurayBackendLibbluray::open(&source)
+        .map_err(|err| format!("Blu-ray open failed for '{}': {err}", source.display()))?;
+    let mut contents = crate::disc::bluray_mapper::map_bluray_disc::<BlurayBackendLibbluray>(
+        &disc,
+        &source,
+    )?;
+    overlay_bluray_sidecar_metadata(path, &mut contents);
+    crate::disc::bluray_mapper::refresh_bluray_presentation_labels(&mut contents);
+    Ok(contents)
+}
+
+fn bluray_source_path_for_backend(path: &Path) -> Result<PathBuf, String> {
+    if path.is_file() {
+        if bluray_iso_has_bounded_candidate_markers(path) {
+            return Ok(path.to_path_buf());
+        }
+        return Err(format!("Not a Blu-ray ISO: {}", path.display()));
+    }
+
+    if path.is_dir() {
+        let root = bluray_directory_root(path).ok_or_else(|| {
+            format!("Not a Blu-ray directory source: {}", path.display())
+        })?;
+        if is_bluray_directory(&root) {
+            return Ok(root);
+        }
+        return Err(format!("Not a Blu-ray directory source: {}", path.display()));
+    }
+
+    Err(format!("Not a Blu-ray source: {}", path.display()))
+}
+
+fn overlay_bluray_sidecar_metadata(_source: &Path, _contents: &mut crate::disc::DiscContents) {
+    // Phase 5: load and overlay a TOML sidecar, then refresh presentation labels.
+}
+
+fn bluray_iso_has_bounded_candidate_markers(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < MIN_BLURAY_ISO_BYTES {
+        return false;
+    }
+
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if file
+        .by_ref()
+        .take(BLURAY_ISO_SCAN_BYTES.min(meta.len()))
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+
+    contains_bytes(&buf, b"NSR02") || contains_bytes(&buf, b"NSR03")
+}
+
+fn bdmv_has_expected_layout(bdmv: &Path) -> bool {
+    // A single BDMV marker is too weak for source routing: unrelated folders,
+    // partial copies, or work directories can contain one of these names. Require
+    // the authored navigation files plus at least one playlist and transport
+    // stream before the probe path claims Blu-ray ownership.
+    if !child_is_file_case_insensitive(bdmv, "index.bdmv") {
+        return false;
+    }
+    if !child_is_file_case_insensitive(bdmv, "MovieObject.bdmv") {
+        return false;
+    }
+
+    let Some(playlist) = child_dir_case_insensitive(bdmv, "PLAYLIST") else {
+        return false;
+    };
+    let Some(stream) = child_dir_case_insensitive(bdmv, "STREAM") else {
+        return false;
+    };
+
+    directory_contains_extension(&playlist, "mpls") && directory_contains_extension(&stream, "m2ts")
+}
+
+fn child_is_file_case_insensitive(parent: &Path, wanted: &str) -> bool {
+    resolve_child_case_insensitive(parent, wanted).is_some_and(|path| path.is_file())
+}
+
+fn child_dir_case_insensitive(parent: &Path, wanted: &str) -> Option<PathBuf> {
+    resolve_child_case_insensitive(parent, wanted).filter(|path| path.is_dir())
+}
+
+fn directory_contains_extension(dir: &Path, extension: &str) -> bool {
+    fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .any(|entry| {
+            let path = entry.path();
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(extension))
+        })
+}
+
+fn resolve_child_case_insensitive(parent: &Path, wanted: &str) -> Option<PathBuf> {
+    let exact = parent.join(wanted);
+    if exact.exists() {
+        return Some(exact);
+    }
+
+    let entries = fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(wanted))
+        {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
 
 /// Parsed BD-ROM LPCM four-byte PES payload header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,7 +607,73 @@ const fn align_to_even(channels: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+
+    fn unique_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bluray-utils-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn write_fixture_file(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        fs::write(path, b"fixture").expect("write fixture file");
+    }
+
+    #[test]
+    fn directory_detection_rejects_single_marker_bdmv_trees() {
+        let root = unique_dir("single-marker");
+        let bdmv = root.join("BDMV");
+        fs::create_dir_all(&bdmv).expect("create BDMV dir");
+
+        assert!(!is_bluray_directory(&root));
+
+        write_fixture_file(&bdmv.join("index.bdmv"));
+        assert!(!is_bluray_directory(&root));
+
+        fs::create_dir_all(bdmv.join("PLAYLIST")).expect("create PLAYLIST dir");
+        assert!(!is_bluray_directory(&root));
+
+        fs::create_dir_all(bdmv.join("STREAM")).expect("create STREAM dir");
+        assert!(!is_bluray_directory(&root));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_detection_requires_navigation_and_media_assets() {
+        let root = unique_dir("full-layout");
+        let bdmv = root.join("bdmv");
+        let playlist = bdmv.join("playlist");
+        let stream = bdmv.join("stream");
+        fs::create_dir_all(&playlist).expect("create playlist dir");
+        fs::create_dir_all(&stream).expect("create stream dir");
+        write_fixture_file(&bdmv.join("INDEX.BDMV"));
+        write_fixture_file(&bdmv.join("MovieObject.bdmv"));
+
+        assert!(!is_bluray_directory(&root));
+
+        write_fixture_file(&playlist.join("00012.MPLS"));
+        assert!(!is_bluray_directory(&root));
+
+        write_fixture_file(&stream.join("00012.m2ts"));
+        assert!(is_bluray_directory(&root));
+        assert!(is_bluray_directory(&bdmv));
+        assert_eq!(bluray_directory_root(&bdmv), Some(root.clone()));
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn parses_stereo_48khz_16_bit_header() {

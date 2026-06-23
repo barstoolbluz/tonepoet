@@ -989,6 +989,24 @@ impl SourceMode {
             }
         }
 
+        // Blu-ray ISO/directory detection. Prefer the mapper-selected
+        // presentation so audio-only Blu-rays start on the most likely album.
+        if crate::disc::bluray_utils::is_bluray_source(&path) {
+            if let Ok(contents) = crate::disc::bluray_utils::map_bluray_source(&path) {
+                if !contents.presentations.is_empty() {
+                    let best =
+                        crate::disc::bluray_mapper::best_bluray_presentation_index(&contents)
+                            .unwrap_or(0);
+                    let meta = crate::tui::disc_browser::metadata_for_disc(&contents);
+                    if let Ok(mode) =
+                        crate::tui::disc_browser::source_mode_for_presentation(contents, best, meta)
+                    {
+                        return mode;
+                    }
+                }
+            }
+        }
+
         // SACD ISO detection
         if crate::tui::sacd::is_sacd_iso(&path) {
             if let Ok(sacd) = crate::tui::sacd::parse_sacd_iso(&path) {

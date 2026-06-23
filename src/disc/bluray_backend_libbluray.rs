@@ -16,11 +16,13 @@ use std::time::Instant;
 use libbluray_sys as ffi;
 
 use super::bluray_backend::{
-    bluray_source_stem, BluRayAudioCoding, BluRayAudioStreamKind, BlurayAudioStreamInfo,
-    BlurayBackend, BlurayBackendCapability, BlurayChapterInfo, BlurayLpcmBitDepth,
-    BlurayLpcmBitDepthProbeFailure, BlurayLpcmNotProbedReason, BlurayLpcmPidProbeFailure,
-    BlurayLpcmPidProbeFailureReason, BlurayLpcmProbeStopReason, BlurayPtsContinuitySegment,
-    BlurayStreamDecryptor, BlurayTitleInfo, BlurayTitleKey, ProbeDepth,
+    bluray_source_stem, BluRayAudioCoding, BluRayAudioStreamKind, BlurayAacsStatus,
+    BlurayAudioStreamInfo, BlurayBackend, BlurayBackendCapability, BlurayBdPlusStatus,
+    BlurayChapterInfo, BlurayDisplayAngle, BlurayLpcmBitDepth, BlurayLpcmBitDepthProbeFailure,
+    BlurayLpcmNotProbedReason, BlurayLpcmPidProbeFailure, BlurayLpcmPidProbeFailureReason,
+    BlurayLpcmProbeStopReason, BlurayProtectionStatus, BlurayPtsContinuitySegment,
+    BlurayStreamDecryptor, BlurayStreamEnumeration, BlurayTitleInfo, BlurayTitleKey,
+    BlurayUnsupportedStreamDiagnostic, ProbeDepth,
 };
 use super::bluray_utils::{
     bluray_audio_layout_from_libbluray_code, bluray_audio_rate_from_libbluray_code,
@@ -76,7 +78,16 @@ impl BlurayBackendLibbluray {
         title: BlurayTitleKey,
         policy: ProbeDepth,
     ) -> Result<Vec<BlurayAudioStreamInfo>, String> {
-        streams_with_probe_policy_impl(disc, title, policy)
+        stream_enumeration_with_probe_policy_impl(disc, title, policy)
+            .map(|enumeration| enumeration.supported_streams)
+    }
+
+    pub fn stream_enumeration_with_probe_policy(
+        disc: &BlurayDisc,
+        title: BlurayTitleKey,
+        policy: ProbeDepth,
+    ) -> Result<BlurayStreamEnumeration, String> {
+        stream_enumeration_with_probe_policy_impl(disc, title, policy)
     }
 }
 
@@ -112,7 +123,7 @@ impl Drop for BlurayHandle {
 pub struct BlurayTitleSource {
     handle: BlurayHandle,
     title: BlurayTitleKey,
-    angle_number: u8,
+    display_angle: BlurayDisplayAngle,
 }
 
 impl BlurayDisc {
@@ -138,7 +149,7 @@ impl BlurayDisc {
 
     pub fn title_info(&self, index: u32) -> Result<BlurayTitleInfo, String> {
         let mut handle = self.metadata_handle.borrow_mut();
-        let guard = handle.title_info_guard(index, 0, self.title_count)?;
+        let guard = handle.title_info_guard(index, BlurayDisplayAngle::first(), self.title_count)?;
         let info = guard.as_ref();
         Ok(title_info_from_ffi(info))
     }
@@ -147,20 +158,20 @@ impl BlurayDisc {
         self.title_info(index).map(|info| info.key)
     }
 
-    fn title_info_guard(&self, index: u32, angle_number: u8) -> Result<TitleInfoGuard, String> {
+    fn title_info_guard(&self, index: u32, display_angle: BlurayDisplayAngle) -> Result<TitleInfoGuard, String> {
         let mut handle = self.metadata_handle.borrow_mut();
-        handle.title_info_guard(index, angle_number, self.title_count)
+        handle.title_info_guard(index, display_angle, self.title_count)
     }
 
     fn open_title_handle(
         &self,
         title_index: u32,
-        angle_number: u8,
+        display_angle: BlurayDisplayAngle,
     ) -> Result<BlurayHandle, String> {
         BlurayHandle::open_for_title(
             &self.source_path,
             title_index,
-            angle_number,
+            display_angle,
             self.title_count,
         )
     }
@@ -190,7 +201,7 @@ impl BlurayHandle {
     fn open_for_title(
         path: &Path,
         title_index: u32,
-        angle_number: u8,
+        display_angle: BlurayDisplayAngle,
         expected_title_count: u32,
     ) -> Result<Self, String> {
         if title_index >= expected_title_count {
@@ -206,7 +217,7 @@ impl BlurayHandle {
                 expected_title_count, title_count
             ));
         }
-        handle.select_title_and_angle(title_index, angle_number, title_count)?;
+        handle.select_title_and_angle(title_index, display_angle, title_count)?;
         Ok(handle)
     }
 
@@ -220,6 +231,14 @@ impl BlurayHandle {
         unsafe { ffi::bd_get_titles(self.handle.as_ptr(), TITLES_ALL, 0) }
     }
 
+    fn protection_status(&self) -> Result<BlurayProtectionStatus, String> {
+        let info = unsafe { ffi::bd_get_disc_info(self.handle.as_ptr()) };
+        let Some(info) = NonNull::new(info as *mut ffi::BLURAY_DISC_INFO) else {
+            return Err("libbluray bd_get_disc_info returned NULL".to_string());
+        };
+        Ok(protection_status_from_disc_info(unsafe { info.as_ref() }))
+    }
+
     fn check_events(&mut self) -> Result<(), String> {
         drain_events(self.handle.as_ptr()).map_err(|err| err.to_string())
     }
@@ -231,7 +250,7 @@ impl BlurayHandle {
     fn title_info_guard(
         &mut self,
         index: u32,
-        angle_number: u8,
+        display_angle: BlurayDisplayAngle,
         title_count: u32,
     ) -> Result<TitleInfoGuard, String> {
         if index >= title_count {
@@ -240,10 +259,11 @@ impl BlurayHandle {
             ));
         }
 
+        let angle_arg = display_angle.to_libbluray_arg();
         let raw = unsafe {
-            ffi::bd_get_title_info(self.handle.as_ptr(), index, angle_number.into())
+            ffi::bd_get_title_info(self.handle.as_ptr(), index, angle_arg.get().into())
         };
-        let ptr = complete_title_info_after_events(raw, index, angle_number, drain_events(self.handle.as_ptr()), |ptr| {
+        let ptr = complete_title_info_after_events(raw, index, display_angle, angle_arg, drain_events(self.handle.as_ptr()), |ptr| {
             unsafe {
                 ffi::bd_free_title_info(ptr.as_ptr());
             }
@@ -254,7 +274,7 @@ impl BlurayHandle {
     fn select_title_and_angle(
         &mut self,
         title_index: u32,
-        angle_number: u8,
+        display_angle: BlurayDisplayAngle,
         title_count: u32,
     ) -> Result<(), String> {
         if title_index >= title_count {
@@ -273,12 +293,17 @@ impl BlurayHandle {
         }
         title_events?;
 
-        let angle = unsafe { ffi::bd_select_angle(self.handle.as_ptr(), angle_number.into()) };
+        let angle_arg = display_angle.to_libbluray_arg();
+        let angle = unsafe { ffi::bd_select_angle(self.handle.as_ptr(), angle_arg.get().into()) };
         let angle_events = self.check_events();
-        if angle <= 0 && angle_number != 0 {
+        if angle <= 0 && angle_arg.get() != 0 {
             return match angle_events {
                 Err(event) => Err(event),
-                Ok(()) => Err(format!("libbluray bd_select_angle({angle_number}) failed")),
+                Ok(()) => Err(format!(
+                    "libbluray bd_select_angle({}) failed for Blu-ray display angle {}",
+                    angle_arg.get(),
+                    display_angle.get()
+                )),
             };
         }
         angle_events
@@ -329,7 +354,8 @@ struct TitleInfoGuard {
 fn complete_title_info_after_events<F>(
     raw: *mut ffi::BLURAY_TITLE_INFO,
     index: u32,
-    angle_number: u8,
+    display_angle: BlurayDisplayAngle,
+    angle_arg: super::bluray_backend::BlurayLibblurayAngleArg,
     title_events: Result<(), LibblurayEventError>,
     free_title_info: F,
 ) -> Result<NonNull<ffi::BLURAY_TITLE_INFO>, String>
@@ -340,7 +366,9 @@ where
         return match title_events {
             Err(event) => Err(event.to_string()),
             Ok(()) => Err(format!(
-                "libbluray bd_get_title_info({index}, {angle_number}) returned NULL"
+                "libbluray bd_get_title_info({index}, {}) returned NULL for Blu-ray display angle {}",
+                angle_arg.get(),
+                display_angle.get()
             )),
         };
     };
@@ -398,8 +426,8 @@ impl BlurayTitleSource {
     }
 
     #[must_use]
-    pub fn angle_number(&self) -> u8 {
-        self.angle_number
+    pub fn display_angle(&self) -> BlurayDisplayAngle {
+        self.display_angle
     }
 
     #[allow(dead_code)]
@@ -450,9 +478,9 @@ impl BlurayBackend for BlurayBackendLibbluray {
     fn chapters(
         disc: &Self::Disc,
         title: BlurayTitleKey,
-        angle_number: u8,
+        display_angle: BlurayDisplayAngle,
     ) -> Result<Vec<BlurayChapterInfo>, String> {
-        let guard = disc.title_info_guard(title.title_index(), angle_number)?;
+        let guard = disc.title_info_guard(title.title_index(), display_angle)?;
         let info = guard.as_ref();
         if info.chapters.is_null() || info.chapter_count == 0 {
             return Ok(Vec::new());
@@ -481,7 +509,8 @@ impl BlurayBackend for BlurayBackendLibbluray {
         disc: &Self::Disc,
         title: BlurayTitleKey,
     ) -> Result<Vec<BlurayAudioStreamInfo>, String> {
-        streams_with_probe_policy_impl(disc, title, ProbeDepth::None)
+        stream_enumeration_with_probe_policy_impl(disc, title, ProbeDepth::None)
+            .map(|enumeration| enumeration.supported_streams)
     }
 
     fn streams_with_probe_policy(
@@ -489,28 +518,42 @@ impl BlurayBackend for BlurayBackendLibbluray {
         title: BlurayTitleKey,
         policy: ProbeDepth,
     ) -> Result<Vec<BlurayAudioStreamInfo>, String> {
-        streams_with_probe_policy_impl(disc, title, policy)
+        stream_enumeration_with_probe_policy_impl(disc, title, policy)
+            .map(|enumeration| enumeration.supported_streams)
+    }
+
+    fn stream_enumeration_with_probe_policy(
+        disc: &Self::Disc,
+        title: BlurayTitleKey,
+        policy: ProbeDepth,
+    ) -> Result<BlurayStreamEnumeration, String> {
+        stream_enumeration_with_probe_policy_impl(disc, title, policy)
+    }
+
+    fn protection_status(disc: &Self::Disc) -> BlurayProtectionStatus {
+        let handle = disc.metadata_handle.borrow();
+        handle.protection_status().unwrap_or_else(|reason| BlurayProtectionStatus::Unknown { reason })
     }
 
     fn max_angle(disc: &Self::Disc, title: BlurayTitleKey) -> Result<u8, String> {
-        let guard = disc.title_info_guard(title.title_index(), 0)?;
+        let guard = disc.title_info_guard(title.title_index(), BlurayDisplayAngle::first())?;
         Ok(guard.as_ref().angle_count)
     }
 
     fn open_title(
         disc: &Self::Disc,
         title: BlurayTitleKey,
-        angle_number: u8,
+        display_angle: BlurayDisplayAngle,
         decryptor: Option<&mut dyn BlurayStreamDecryptor>,
     ) -> Result<Self::TitleSource, String> {
         if decryptor.is_some() {
             return Err("external Blu-ray decryptor hooks are Phase 6 work".to_string());
         }
-        let handle = disc.open_title_handle(title.title_index(), angle_number)?;
+        let handle = disc.open_title_handle(title.title_index(), display_angle)?;
         Ok(BlurayTitleSource {
             handle,
             title,
-            angle_number,
+            display_angle,
         })
     }
 
@@ -520,6 +563,34 @@ impl BlurayBackend for BlurayBackendLibbluray {
         Ok(BlurayBackendCapability::unsupported(
             "libbluray Phase 0 does not expose title PTS continuity segments",
         ))
+    }
+}
+
+fn protection_status_from_disc_info(info: &ffi::BLURAY_DISC_INFO) -> BlurayProtectionStatus {
+    let aacs = (info.aacs_detected != 0).then(|| BlurayAacsStatus {
+        handled: info.aacs_handled != 0,
+        libaacs_detected: info.libaacs_detected != 0,
+        error_code: Some(info.aacs_error_code),
+        mkb_version: (info.aacs_mkbv > 0).then_some(info.aacs_mkbv),
+    });
+    let bdplus = (info.bdplus_detected != 0).then(|| BlurayBdPlusStatus {
+        handled: info.bdplus_handled != 0,
+        libbdplus_detected: info.libbdplus_detected != 0,
+        generation: Some(info.bdplus_gen),
+        date: (info.bdplus_date != 0).then_some(info.bdplus_date),
+    });
+
+    match (aacs, bdplus) {
+        (None, None) => BlurayProtectionStatus::Unencrypted,
+        (Some(details), None) if details.handled => {
+            BlurayProtectionStatus::AacsDetectedHandled { details }
+        }
+        (Some(details), None) => BlurayProtectionStatus::AacsDetectedNotHandled { details },
+        (None, Some(details)) if details.handled => {
+            BlurayProtectionStatus::BdPlusDetectedHandled { details }
+        }
+        (None, Some(details)) => BlurayProtectionStatus::BdPlusDetectedNotHandled { details },
+        (Some(aacs), Some(bdplus)) => BlurayProtectionStatus::AacsAndBdPlusDetected { aacs, bdplus },
     }
 }
 
@@ -535,49 +606,65 @@ fn title_info_from_ffi(info: &ffi::BLURAY_TITLE_INFO) -> BlurayTitleInfo {
     }
 }
 
-fn audio_streams_from_title_info(
+fn audio_stream_enumeration_from_title_info(
     info: &ffi::BLURAY_TITLE_INFO,
-) -> Result<Vec<BlurayAudioStreamInfo>, String> {
+) -> Result<BlurayStreamEnumeration, String> {
     if info.clips.is_null() || info.clip_count == 0 {
-        return Ok(Vec::new());
+        return Ok(BlurayStreamEnumeration::supported(Vec::new()));
     }
 
     let clips = unsafe { std::slice::from_raw_parts(info.clips, info.clip_count as usize) };
-    let mut streams = audio_streams_for_kind_from_clips(clips, BluRayAudioStreamKind::Primary)?;
-    streams.extend(audio_streams_for_kind_from_clips(
-        clips,
-        BluRayAudioStreamKind::Secondary,
-    )?);
-    Ok(streams)
+    let mut primary = audio_streams_for_kind_from_clips(clips, BluRayAudioStreamKind::Primary)?;
+    let secondary = audio_streams_for_kind_from_clips(clips, BluRayAudioStreamKind::Secondary)?;
+    primary.supported_streams.extend(secondary.supported_streams);
+    primary.stream_diagnostics.extend(secondary.stream_diagnostics);
+    Ok(primary)
 }
 
 fn audio_streams_for_kind_from_clips(
     clips: &[ffi::BLURAY_CLIP_INFO],
     kind: BluRayAudioStreamKind,
-) -> Result<Vec<BlurayAudioStreamInfo>, String> {
+) -> Result<BlurayStreamEnumeration, String> {
     let mut per_clip = Vec::with_capacity(clips.len());
+    let mut diagnostics = Vec::new();
     for (clip_index, clip) in clips.iter().enumerate() {
-        per_clip.push(audio_stream_descriptors_from_clip(clip, clip_index, kind)?);
+        let clip_streams = audio_stream_descriptors_from_clip(clip, clip_index, kind)?;
+        per_clip.push(clip_streams.supported_descriptors);
+        diagnostics.extend(clip_streams.diagnostics);
     }
 
-    Ok(reconcile_clip_audio_descriptors(kind, &per_clip)?
+    let supported_streams = reconcile_clip_audio_descriptors(kind, &per_clip)?
         .into_iter()
         .map(ClipAudioStreamDescriptor::into_public)
-        .collect())
+        .collect();
+
+    Ok(BlurayStreamEnumeration {
+        supported_streams,
+        stream_diagnostics: diagnostics,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ClipAudioDescriptorEnumeration {
+    supported_descriptors: Vec<ClipAudioStreamDescriptor>,
+    diagnostics: Vec<BlurayUnsupportedStreamDiagnostic>,
 }
 
 fn audio_stream_descriptors_from_clip(
     clip: &ffi::BLURAY_CLIP_INFO,
     clip_index: usize,
     kind: BluRayAudioStreamKind,
-) -> Result<Vec<ClipAudioStreamDescriptor>, String> {
+) -> Result<ClipAudioDescriptorEnumeration, String> {
     let (count, ptr) = match kind {
         BluRayAudioStreamKind::Primary => (clip.audio_stream_count, clip.audio_streams),
         BluRayAudioStreamKind::Secondary => (clip.sec_audio_stream_count, clip.sec_audio_streams),
     };
 
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(ClipAudioDescriptorEnumeration {
+            supported_descriptors: Vec::new(),
+            diagnostics: Vec::new(),
+        });
     }
     if ptr.is_null() {
         return Err(format!(
@@ -587,11 +674,19 @@ fn audio_stream_descriptors_from_clip(
     }
 
     let streams = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
-    streams
-        .iter()
-        .enumerate()
-        .map(|(index, stream)| audio_stream_descriptor_from_ffi(kind, index, stream))
-        .collect()
+    let mut supported_descriptors = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (index, stream) in streams.iter().enumerate() {
+        match audio_stream_descriptor_from_ffi(kind, clip_index, index, stream) {
+            Ok(descriptor) => supported_descriptors.push(descriptor),
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+
+    Ok(ClipAudioDescriptorEnumeration {
+        supported_descriptors,
+        diagnostics,
+    })
 }
 
 fn reconcile_clip_audio_descriptors(
@@ -686,17 +781,22 @@ impl ClipAudioStreamDescriptor {
 
 fn audio_stream_descriptor_from_ffi(
     kind: BluRayAudioStreamKind,
+    clip_index: usize,
     index: usize,
     stream: &ffi::BLURAY_STREAM_INFO,
-) -> Result<ClipAudioStreamDescriptor, String> {
+) -> Result<ClipAudioStreamDescriptor, BlurayUnsupportedStreamDiagnostic> {
     let Some(coding) = audio_coding_from_stream_type(stream.coding_type) else {
-        return Err(format!(
-            "unsupported Blu-ray {} audio coding type 0x{:02x} for stream {} pid 0x{:04x}",
-            kind.label(),
-            stream.coding_type,
-            index + 1,
-            stream.pid
-        ));
+        return Err(BlurayUnsupportedStreamDiagnostic {
+            kind,
+            clip_index: Some(clip_index.min(u32::MAX as usize) as u32),
+            stream_index: Some(index.min(u8::MAX as usize) as u8),
+            pid: Some(stream.pid),
+            coding_type: Some(stream.coding_type),
+            format: Some(stream.format),
+            rate: Some(stream.rate),
+            language: lang_from_libbluray(stream.lang),
+            reason: "unsupported audio coding type".to_string(),
+        });
     };
     let (channels, channel_layout) = bluray_audio_layout_from_libbluray_code(stream.format);
     Ok(ClipAudioStreamDescriptor {
@@ -730,18 +830,19 @@ fn audio_coding_from_stream_type(coding_type: u8) -> Option<BluRayAudioCoding> {
     }
 }
 
-fn streams_with_probe_policy_impl(
+fn stream_enumeration_with_probe_policy_impl(
     disc: &BlurayDisc,
     title: BlurayTitleKey,
     policy: ProbeDepth,
-) -> Result<Vec<BlurayAudioStreamInfo>, String> {
-    let guard = disc.title_info_guard(title.title_index(), 0)?;
+) -> Result<BlurayStreamEnumeration, String> {
+    let guard = disc.title_info_guard(title.title_index(), BlurayDisplayAngle::first())?;
     let info = guard.as_ref();
-    let mut streams = audio_streams_from_title_info(info)?;
+    let mut enumeration = audio_stream_enumeration_from_title_info(info)?;
 
-    initialize_lpcm_probe_statuses(&mut streams, &policy);
+    initialize_lpcm_probe_statuses(&mut enumeration.supported_streams, &policy);
 
-    let primary_lpcm_pids: HashSet<u16> = streams
+    let primary_lpcm_pids: HashSet<u16> = enumeration
+        .supported_streams
         .iter()
         .filter(|stream| {
             stream.kind == BluRayAudioStreamKind::Primary
@@ -752,26 +853,26 @@ fn streams_with_probe_policy_impl(
         .collect();
 
     if !primary_lpcm_pids.is_empty() && !matches!(policy, ProbeDepth::None) {
-        let report = probe_lpcm_headers_for_title(disc, title, 0, &primary_lpcm_pids, &policy)?;
-        apply_lpcm_probe_report(&mut streams, &report);
+        let report = probe_lpcm_headers_for_title(disc, title, BlurayDisplayAngle::first(), &primary_lpcm_pids, &policy)?;
+        apply_lpcm_probe_report(&mut enumeration.supported_streams, &report);
     }
 
-    Ok(streams)
+    Ok(enumeration)
 }
 
 fn probe_lpcm_headers_for_title(
     disc: &BlurayDisc,
     title: BlurayTitleKey,
-    angle_number: u8,
+    display_angle: BlurayDisplayAngle,
     pids: &HashSet<u16>,
     policy: &ProbeDepth,
 ) -> Result<LpcmProbeReport, String> {
     debug_assert!(!matches!(policy, ProbeDepth::None));
-    let handle = disc.open_title_handle(title.title_index(), angle_number)?;
+    let handle = disc.open_title_handle(title.title_index(), display_angle)?;
     let mut source = BlurayTitleSource {
         handle,
         title,
-        angle_number,
+        display_angle,
     };
     source
         .seek(SeekFrom::Start(0))
@@ -1200,6 +1301,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn libbluray_angle_adapter_uses_zero_based_arguments() {
+        let first = BlurayDisplayAngle::first();
+        let alternate = BlurayDisplayAngle::new(2).unwrap();
+
+        assert_eq!(first.get(), 1);
+        assert_eq!(first.to_libbluray_arg().get(), 0);
+        assert_eq!(alternate.get(), 2);
+        assert_eq!(alternate.to_libbluray_arg().get(), 1);
+    }
+
+    #[test]
     fn maps_bd_audio_coding_types() {
         assert_eq!(audio_coding_from_stream_type(0x80), Some(BluRayAudioCoding::Lpcm));
         assert_eq!(audio_coding_from_stream_type(0x81), Some(BluRayAudioCoding::Ac3));
@@ -1618,7 +1730,8 @@ mod tests {
         let err = complete_title_info_after_events(
             std::ptr::null_mut(),
             3,
-            0,
+            BlurayDisplayAngle::first(),
+            BlurayDisplayAngle::first().to_libbluray_arg(),
             Err(LibblurayEventError::new(BD_EVENT_READ_ERROR, 12)),
             |_| panic!("null title info must not be freed"),
         )
@@ -1632,7 +1745,8 @@ mod tests {
         let err = complete_title_info_after_events(
             std::ptr::null_mut(),
             3,
-            0,
+            BlurayDisplayAngle::first(),
+            BlurayDisplayAngle::first().to_libbluray_arg(),
             Ok(()),
             |_| panic!("null title info must not be freed"),
         )
@@ -1649,7 +1763,8 @@ mod tests {
         let err = complete_title_info_after_events(
             raw,
             1,
-            0,
+            BlurayDisplayAngle::first(),
+            BlurayDisplayAngle::first().to_libbluray_arg(),
             Err(LibblurayEventError::new(BD_EVENT_ENCRYPTED, 0)),
             |ptr| {
                 assert_eq!(ptr.as_ptr(), raw);
