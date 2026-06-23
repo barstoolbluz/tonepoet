@@ -276,18 +276,208 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 
-/// Parsed BD-ROM LPCM four-byte PES payload header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlurayLpcmPesHeader {
-    pub channel_assignment_code: u8,
-    pub sample_rate_code: u8,
-    pub bit_depth_code: u8,
-    pub channels: u8,
-    pub coded_channels: u8,
-    pub sample_rate: u32,
-    pub bit_depth: u32,
-    pub channel_layout: &'static str,
+/// Logical channel labels used by Blu-ray LPCM channel-assignment tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Channel {
+    FrontLeft,
+    FrontRight,
+    FrontCenter,
+    LowFrequency,
+    BackLeft,
+    BackRight,
+    BackCenter,
+    SideLeft,
+    SideRight,
 }
+
+const SPEAKER_FRONT_LEFT: u32 = 0x0000_0001;
+const SPEAKER_FRONT_RIGHT: u32 = 0x0000_0002;
+const SPEAKER_FRONT_CENTER: u32 = 0x0000_0004;
+const SPEAKER_LOW_FREQUENCY: u32 = 0x0000_0008;
+const SPEAKER_BACK_LEFT: u32 = 0x0000_0010;
+const SPEAKER_BACK_RIGHT: u32 = 0x0000_0020;
+const SPEAKER_BACK_CENTER: u32 = 0x0000_0100;
+const SPEAKER_SIDE_LEFT: u32 = 0x0000_0200;
+const SPEAKER_SIDE_RIGHT: u32 = 0x0000_0400;
+
+const CH_MONO_BD: &[Channel] = &[Channel::FrontCenter];
+const CH_MONO_WAV: &[Channel] = &[Channel::FrontCenter];
+const CH_STEREO_BD: &[Channel] = &[Channel::FrontLeft, Channel::FrontRight];
+const CH_STEREO_WAV: &[Channel] = &[Channel::FrontLeft, Channel::FrontRight];
+const CH_3_0_BD: &[Channel] = &[Channel::FrontLeft, Channel::FrontRight, Channel::FrontCenter];
+const CH_3_0_WAV: &[Channel] = &[Channel::FrontLeft, Channel::FrontRight, Channel::FrontCenter];
+const CH_2_1_BD: &[Channel] = &[Channel::FrontLeft, Channel::FrontRight, Channel::BackCenter];
+const CH_2_1_WAV: &[Channel] = &[Channel::FrontLeft, Channel::FrontRight, Channel::BackCenter];
+const CH_4_0_BD: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::BackCenter,
+];
+const CH_4_0_WAV: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::BackCenter,
+];
+const CH_2_2_BD: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::SideLeft,
+    Channel::SideRight,
+];
+const CH_2_2_WAV: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::SideLeft,
+    Channel::SideRight,
+];
+const CH_5_0_BD: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::SideLeft,
+    Channel::SideRight,
+];
+const CH_5_0_WAV: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::SideLeft,
+    Channel::SideRight,
+];
+const CH_5_1_BD: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::LowFrequency,
+    Channel::SideLeft,
+    Channel::SideRight,
+];
+const CH_5_1_WAV: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::LowFrequency,
+    Channel::SideLeft,
+    Channel::SideRight,
+];
+const CH_7_0_BD: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::SideLeft,
+    Channel::SideRight,
+    Channel::BackLeft,
+    Channel::BackRight,
+];
+const CH_7_0_WAV: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::BackLeft,
+    Channel::BackRight,
+    Channel::SideLeft,
+    Channel::SideRight,
+];
+const CH_7_1_BD: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::LowFrequency,
+    Channel::SideLeft,
+    Channel::SideRight,
+    Channel::BackLeft,
+    Channel::BackRight,
+];
+const CH_7_1_WAV: &[Channel] = &[
+    Channel::FrontLeft,
+    Channel::FrontRight,
+    Channel::FrontCenter,
+    Channel::LowFrequency,
+    Channel::BackLeft,
+    Channel::BackRight,
+    Channel::SideLeft,
+    Channel::SideRight,
+];
+
+/// Parsed BD-ROM LPCM four-byte PES payload header.
+///
+/// Source of truth: this parser deliberately follows the BD-ROM LPCM layout
+/// used by FFmpeg's pcm_bluray decoder and libavformat Blu-ray fixtures: byte 2
+/// stores the audio-presentation/channel-assignment code in its high nibble and
+/// the sampling-frequency code in its low nibble; byte 3 stores the bit-depth
+/// code in its two high bits. Bytes 0 and 1 are not stream-format selectors and
+/// are intentionally ignored by this stream-format parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlurayLpcmHeader {
+    pub audio_presentation_type: u8,
+    pub sample_rate_code: u8,
+    pub bits_per_sample_code: u8,
+    pub channel_assignment: u8,
+
+    pub sample_rate: u32,
+    pub container_bits: u16,
+    pub valid_bits: u16,
+    pub channels: u8,
+    pub wav_channel_mask: Option<u32>,
+    pub bd_channel_order: &'static [Channel],
+    pub wav_channel_order: &'static [Channel],
+}
+
+impl BlurayLpcmHeader {
+    #[must_use]
+    pub const fn coded_channels(self) -> u8 {
+        align_to_even(self.channels)
+    }
+
+    #[must_use]
+    pub const fn channel_layout_label(self) -> &'static str {
+        match self.channel_assignment {
+            1 => "mono",
+            3 => "stereo",
+            4 => "3.0",
+            5 => "2.1",
+            6 => "4.0",
+            7 => "2.2",
+            8 => "5.0",
+            9 => "5.1",
+            10 => "7.0",
+            11 => "7.1",
+            _ => "unknown",
+        }
+    }
+}
+
+pub type BlurayLpcmPesHeader = BlurayLpcmHeader;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlurayLpcmError {
+    ReservedSampleRateCode(u8),
+    ReservedBitsPerSampleCode(u8),
+    UnsupportedChannelAssignment(u8),
+}
+
+impl std::fmt::Display for BlurayLpcmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReservedSampleRateCode(code) => write!(
+                f,
+                "reserved Blu-ray LPCM sample-rate code {code}; supported codes are 1=48000 Hz, 4=96000 Hz, 5=192000 Hz"
+            ),
+            Self::ReservedBitsPerSampleCode(code) => write!(
+                f,
+                "reserved Blu-ray LPCM bit-depth code {code}; supported codes are 1=16-bit, 2=20-in-24-bit, 3=24-bit"
+            ),
+            Self::UnsupportedChannelAssignment(code) => write!(
+                f,
+                "unsupported Blu-ray LPCM channel assignment code {code}; supported assignments are 1 mono, 3 stereo, 4 3.0, 5 2.1, 6 4.0, 7 2.2, 8 5.0, 9 5.1, 10 7.0, and 11 7.1"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BlurayLpcmError {}
 
 /// Parser-level reason a target PID did not produce a valid LPCM PES payload
 /// header during a probe window.
@@ -488,70 +678,140 @@ enum PesPrefixParseState {
 }
 
 /// Parse the first four bytes of a Blu-ray LPCM PES payload.
-///
-/// The coding follows FFmpeg's pcm_bluray parser: channel assignment lives in
-/// the high nibble of byte 2, sample-rate code in the low nibble of byte 2,
-/// and sample depth in the two high bits of byte 3.
+#[must_use]
 pub fn parse_bluray_lpcm_pes_header(header: [u8; 4]) -> Result<BlurayLpcmPesHeader, String> {
-    let channel_assignment_code = header[2] >> 4;
-    let sample_rate_code = header[2] & 0x0f;
-    let bit_depth_code = header[3] >> 6;
+    parse_bluray_lpcm_header(header).map_err(|err| err.to_string())
+}
 
-    let bit_depth = match bit_depth_code {
-        1 => 16,
-        2 => 20,
-        3 => 24,
-        other => return Err(format!("reserved Blu-ray LPCM bit-depth code {other}")),
+pub fn parse_bluray_lpcm_header(bytes: [u8; 4]) -> Result<BlurayLpcmHeader, BlurayLpcmError> {
+    let audio_presentation_type = bytes[2] >> 4;
+    let channel_assignment = audio_presentation_type;
+    let sample_rate_code = bytes[2] & 0x0f;
+    let bits_per_sample_code = bytes[3] >> 6;
+
+    let (container_bits, valid_bits) = match bits_per_sample_code {
+        1 => (16, 16),
+        2 => (24, 20),
+        3 => (24, 24),
+        other => return Err(BlurayLpcmError::ReservedBitsPerSampleCode(other)),
     };
 
     let sample_rate = match sample_rate_code {
         1 => 48_000,
         4 => 96_000,
         5 => 192_000,
-        other => return Err(format!("reserved Blu-ray LPCM sample-rate code {other}")),
+        other => return Err(BlurayLpcmError::ReservedSampleRateCode(other)),
     };
 
-    let (channels, channel_layout) = match channel_assignment_code {
-        1 => (1, "mono"),
-        3 => (2, "stereo"),
-        4 => (3, "3.0"),
-        5 => (3, "2.1"),
-        6 => (4, "4.0"),
-        7 => (4, "2.2"),
-        8 => (5, "5.0"),
-        9 => (6, "5.1"),
-        10 => (7, "7.0"),
-        11 => (8, "7.1"),
-        other => return Err(format!("reserved Blu-ray LPCM channel code {other}")),
+    let (channels, wav_channel_mask, bd_channel_order, wav_channel_order) = match channel_assignment {
+        1 => (1, Some(SPEAKER_FRONT_CENTER), CH_MONO_BD, CH_MONO_WAV),
+        3 => (2, Some(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT), CH_STEREO_BD, CH_STEREO_WAV),
+        4 => (
+            3,
+            Some(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER),
+            CH_3_0_BD,
+            CH_3_0_WAV,
+        ),
+        5 => (
+            3,
+            Some(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_BACK_CENTER),
+            CH_2_1_BD,
+            CH_2_1_WAV,
+        ),
+        6 => (
+            4,
+            Some(
+                SPEAKER_FRONT_LEFT
+                    | SPEAKER_FRONT_RIGHT
+                    | SPEAKER_FRONT_CENTER
+                    | SPEAKER_BACK_CENTER,
+            ),
+            CH_4_0_BD,
+            CH_4_0_WAV,
+        ),
+        7 => (
+            4,
+            Some(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT),
+            CH_2_2_BD,
+            CH_2_2_WAV,
+        ),
+        8 => (
+            5,
+            Some(
+                SPEAKER_FRONT_LEFT
+                    | SPEAKER_FRONT_RIGHT
+                    | SPEAKER_FRONT_CENTER
+                    | SPEAKER_SIDE_LEFT
+                    | SPEAKER_SIDE_RIGHT,
+            ),
+            CH_5_0_BD,
+            CH_5_0_WAV,
+        ),
+        9 => (
+            6,
+            Some(
+                SPEAKER_FRONT_LEFT
+                    | SPEAKER_FRONT_RIGHT
+                    | SPEAKER_FRONT_CENTER
+                    | SPEAKER_LOW_FREQUENCY
+                    | SPEAKER_SIDE_LEFT
+                    | SPEAKER_SIDE_RIGHT,
+            ),
+            CH_5_1_BD,
+            CH_5_1_WAV,
+        ),
+        10 => (
+            7,
+            Some(
+                SPEAKER_FRONT_LEFT
+                    | SPEAKER_FRONT_RIGHT
+                    | SPEAKER_FRONT_CENTER
+                    | SPEAKER_BACK_LEFT
+                    | SPEAKER_BACK_RIGHT
+                    | SPEAKER_SIDE_LEFT
+                    | SPEAKER_SIDE_RIGHT,
+            ),
+            CH_7_0_BD,
+            CH_7_0_WAV,
+        ),
+        11 => (
+            8,
+            Some(
+                SPEAKER_FRONT_LEFT
+                    | SPEAKER_FRONT_RIGHT
+                    | SPEAKER_FRONT_CENTER
+                    | SPEAKER_LOW_FREQUENCY
+                    | SPEAKER_BACK_LEFT
+                    | SPEAKER_BACK_RIGHT
+                    | SPEAKER_SIDE_LEFT
+                    | SPEAKER_SIDE_RIGHT,
+            ),
+            CH_7_1_BD,
+            CH_7_1_WAV,
+        ),
+        other => return Err(BlurayLpcmError::UnsupportedChannelAssignment(other)),
     };
 
-    Ok(BlurayLpcmPesHeader {
-        channel_assignment_code,
+    Ok(BlurayLpcmHeader {
+        audio_presentation_type,
         sample_rate_code,
-        bit_depth_code,
-        channels,
-        coded_channels: align_to_even(channels),
+        bits_per_sample_code,
+        channel_assignment,
         sample_rate,
-        bit_depth,
-        channel_layout,
+        container_bits,
+        valid_bits,
+        channels,
+        wav_channel_mask,
+        bd_channel_order,
+        wav_channel_order,
     })
 }
 
 #[must_use]
 pub fn bluray_lpcm_channel_layout_from_code(code: u8) -> Option<(&'static str, u8)> {
-    match code {
-        1 => Some(("mono", 1)),
-        3 => Some(("stereo", 2)),
-        4 => Some(("3.0", 3)),
-        5 => Some(("2.1", 3)),
-        6 => Some(("4.0", 4)),
-        7 => Some(("2.2", 4)),
-        8 => Some(("5.0", 5)),
-        9 => Some(("5.1", 6)),
-        10 => Some(("7.0", 7)),
-        11 => Some(("7.1", 8)),
-        _ => None,
-    }
+    parse_bluray_lpcm_header([0, 0, (code << 4) | 1, 1 << 6])
+        .ok()
+        .map(|header| (header.channel_layout_label(), header.channels))
 }
 
 #[must_use]
@@ -745,26 +1005,26 @@ mod tests {
     fn parses_stereo_48khz_16_bit_header() {
         let parsed = parse_bluray_lpcm_pes_header([0, 0, (3 << 4) | 1, 1 << 6]).unwrap();
         assert_eq!(parsed.channels, 2);
-        assert_eq!(parsed.coded_channels, 2);
-        assert_eq!(parsed.channel_layout, "stereo");
+        assert_eq!(parsed.coded_channels(), 2);
+        assert_eq!(parsed.channel_layout_label(), "stereo");
         assert_eq!(parsed.sample_rate, 48_000);
-        assert_eq!(parsed.bit_depth, 16);
+        assert_eq!(parsed.valid_bits, 16);
     }
 
     #[test]
     fn parses_5_1_96khz_24_bit_header() {
         let parsed = parse_bluray_lpcm_pes_header([0, 0, (9 << 4) | 4, 3 << 6]).unwrap();
         assert_eq!(parsed.channels, 6);
-        assert_eq!(parsed.channel_layout, "5.1");
+        assert_eq!(parsed.channel_layout_label(), "5.1");
         assert_eq!(parsed.sample_rate, 96_000);
-        assert_eq!(parsed.bit_depth, 24);
+        assert_eq!(parsed.valid_bits, 24);
     }
 
     #[test]
     fn parses_20_bit_header_even_if_decode_path_may_not_accept_it() {
         let parsed = parse_bluray_lpcm_pes_header([0, 0, (3 << 4) | 5, 2 << 6]).unwrap();
         assert_eq!(parsed.sample_rate, 192_000);
-        assert_eq!(parsed.bit_depth, 20);
+        assert_eq!(parsed.valid_bits, 20);
     }
 
     #[test]
@@ -775,6 +1035,84 @@ mod tests {
     }
 
     #[test]
+    fn parses_common_channel_assignments_from_raw_headers() {
+        let mono = parse_bluray_lpcm_header([0, 0, (1 << 4) | 1, 1 << 6]).unwrap();
+        assert_eq!(mono.channels, 1);
+        assert_eq!(mono.channel_layout_label(), "mono");
+        assert_eq!(mono.wav_channel_order, &[Channel::FrontCenter][..]);
+
+        let stereo = parse_bluray_lpcm_header([0, 0, (3 << 4) | 1, 1 << 6]).unwrap();
+        assert_eq!(stereo.channels, 2);
+        assert_eq!(stereo.channel_layout_label(), "stereo");
+        assert_eq!(stereo.wav_channel_mask, Some(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT));
+
+        let surround_5_1 = parse_bluray_lpcm_header([0, 0, (9 << 4) | 1, 1 << 6]).unwrap();
+        assert_eq!(surround_5_1.channels, 6);
+        assert_eq!(surround_5_1.channel_layout_label(), "5.1");
+        assert_eq!(
+            surround_5_1.bd_channel_order,
+            &[
+                Channel::FrontLeft,
+                Channel::FrontRight,
+                Channel::FrontCenter,
+                Channel::LowFrequency,
+                Channel::SideLeft,
+                Channel::SideRight,
+            ][..]
+        );
+
+        let surround_7_1 = parse_bluray_lpcm_header([0, 0, (11 << 4) | 1, 1 << 6]).unwrap();
+        assert_eq!(surround_7_1.channels, 8);
+        assert_eq!(surround_7_1.channel_layout_label(), "7.1");
+        assert_eq!(
+            surround_7_1.wav_channel_order,
+            &[
+                Channel::FrontLeft,
+                Channel::FrontRight,
+                Channel::FrontCenter,
+                Channel::LowFrequency,
+                Channel::BackLeft,
+                Channel::BackRight,
+                Channel::SideLeft,
+                Channel::SideRight,
+            ][..]
+        );
+    }
+
+    #[test]
+    fn parses_each_supported_sample_rate_code() {
+        let cases = [(1, 48_000), (4, 96_000), (5, 192_000)];
+        for (code, expected_rate) in cases {
+            let parsed = parse_bluray_lpcm_header([0, 0, (3 << 4) | code, 1 << 6]).unwrap();
+            assert_eq!(parsed.sample_rate_code, code);
+            assert_eq!(parsed.sample_rate, expected_rate);
+        }
+    }
+
+    #[test]
+    fn parses_each_supported_bit_depth_code() {
+        let cases = [(1, 16, 16), (2, 24, 20), (3, 24, 24)];
+        for (code, expected_container, expected_valid) in cases {
+            let parsed = parse_bluray_lpcm_header([0, 0, (3 << 4) | 1, code << 6]).unwrap();
+            assert_eq!(parsed.bits_per_sample_code, code);
+            assert_eq!(parsed.container_bits, expected_container);
+            assert_eq!(parsed.valid_bits, expected_valid);
+        }
+    }
+
+    #[test]
+    fn parser_rejects_reserved_codes_with_actionable_errors() {
+        let err = parse_bluray_lpcm_header([0, 0, (2 << 4) | 1, 1 << 6]).unwrap_err();
+        assert!(err.to_string().contains("unsupported Blu-ray LPCM channel assignment code 2"));
+
+        let err = parse_bluray_lpcm_header([0, 0, (3 << 4) | 2, 1 << 6]).unwrap_err();
+        assert!(err.to_string().contains("reserved Blu-ray LPCM sample-rate code 2"));
+
+        let err = parse_bluray_lpcm_header([0, 0, (3 << 4) | 1, 0]).unwrap_err();
+        assert!(err.to_string().contains("reserved Blu-ray LPCM bit-depth code 0"));
+    }
+
+    #[test]
     fn scans_ts_packet_for_lpcm_pes_header() {
         let pid = 0x1100;
         let packet = ts_packet(pid, true, 0, &pes_prefix([0, 0, (3 << 4) | 1, 1 << 6]));
@@ -782,7 +1120,7 @@ mod tests {
         let mut pids = HashSet::new();
         pids.insert(pid);
         let found = probe_bluray_lpcm_pes_headers_from_ts(&packet, &pids);
-        assert_eq!(found.get(&pid).unwrap().bit_depth, 16);
+        assert_eq!(found.get(&pid).unwrap().valid_bits, 16);
     }
 
     #[test]
@@ -798,9 +1136,9 @@ mod tests {
         pids.insert(pid);
         let found = probe_bluray_lpcm_pes_headers_from_ts(&bytes, &pids);
         let header = found.get(&pid).unwrap();
-        assert_eq!(header.channel_layout, "5.1");
+        assert_eq!(header.channel_layout_label(), "5.1");
         assert_eq!(header.sample_rate, 96_000);
-        assert_eq!(header.bit_depth, 24);
+        assert_eq!(header.valid_bits, 24);
     }
 
     #[test]
@@ -812,7 +1150,7 @@ mod tests {
 
         probe.feed(&bytes);
 
-        assert_eq!(probe.found().get(&pid).unwrap().bit_depth, 16);
+        assert_eq!(probe.found().get(&pid).unwrap().valid_bits, 16);
     }
 
     #[test]
@@ -827,7 +1165,7 @@ mod tests {
 
         let header = probe.found().get(&pid).unwrap();
         assert_eq!(header.sample_rate, 192_000);
-        assert_eq!(header.bit_depth, 20);
+        assert_eq!(header.valid_bits, 20);
     }
 
     #[test]
@@ -840,7 +1178,7 @@ mod tests {
         probe.feed(&bad_start);
         probe.feed(&good);
 
-        assert_eq!(probe.found().get(&pid).unwrap().bit_depth, 16);
+        assert_eq!(probe.found().get(&pid).unwrap().valid_bits, 16);
     }
 
     #[test]
@@ -854,7 +1192,7 @@ mod tests {
         assert!(probe.found().is_empty());
         probe.feed(&good);
 
-        assert_eq!(probe.found().get(&pid).unwrap().channel_layout, "mono");
+        assert_eq!(probe.found().get(&pid).unwrap().channel_layout_label(), "mono");
     }
 
     #[test]
@@ -892,7 +1230,7 @@ mod tests {
 
         match probe.failure_reason(pid) {
             BlurayLpcmPesProbeFailureReason::InvalidLpcmHeader { message } => {
-                assert!(message.contains("reserved Blu-ray LPCM channel code"));
+                assert!(message.contains("unsupported Blu-ray LPCM channel assignment code"));
             }
             other => panic!("expected invalid LPCM header, got {other:?}"),
         }

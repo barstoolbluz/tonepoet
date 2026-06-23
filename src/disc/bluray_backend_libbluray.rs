@@ -124,6 +124,7 @@ pub struct BlurayTitleSource {
     handle: BlurayHandle,
     title: BlurayTitleKey,
     display_angle: BlurayDisplayAngle,
+    title_count: u32,
 }
 
 impl BlurayDisc {
@@ -397,6 +398,13 @@ impl Drop for TitleInfoGuard {
     }
 }
 
+impl BlurayTitleSource {
+    fn title_info_guard(&mut self) -> Result<TitleInfoGuard, String> {
+        self.handle
+            .title_info_guard(self.title.title_index(), self.display_angle, self.title_count)
+    }
+}
+
 impl Read for BlurayTitleSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.handle.read(buf)
@@ -556,15 +564,107 @@ impl BlurayBackend for BlurayBackendLibbluray {
             handle,
             title,
             display_angle,
+            title_count: disc.title_count(),
         })
     }
 
     fn pts_continuity_segments(
-        _source: &Self::TitleSource,
+        source: &mut Self::TitleSource,
     ) -> Result<BlurayBackendCapability<Vec<BlurayPtsContinuitySegment>>, String> {
-        Ok(BlurayBackendCapability::unsupported(
-            "libbluray Phase 0 does not expose title PTS continuity segments",
-        ))
+        let guard = source.title_info_guard()?;
+        let segments = pts_continuity_segments_from_title_info(guard.as_ref())?;
+        Ok(BlurayBackendCapability::supported(segments))
+    }
+}
+
+fn pts_continuity_segments_from_title_info(
+    info: &ffi::BLURAY_TITLE_INFO,
+) -> Result<Vec<BlurayPtsContinuitySegment>, String> {
+    let timings = libbluray_clip_timings_from_title_info(info)?;
+    pts_continuity_segments_from_clip_timings(info.playlist, &timings)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LibblurayClipTiming {
+    clip_ref: u32,
+    /// libbluray BLURAY_CLIP_INFO.start_time: title/playlist time in 90 kHz units.
+    title_start_pts_90k: u64,
+    /// libbluray BLURAY_CLIP_INFO.in_time: clip/STC start timestamp in 90 kHz units.
+    clip_start_pts_90k: u64,
+    /// libbluray BLURAY_CLIP_INFO.out_time: clip/STC end timestamp in 90 kHz units.
+    clip_end_pts_90k: u64,
+}
+
+fn libbluray_clip_timings_from_title_info(
+    info: &ffi::BLURAY_TITLE_INFO,
+) -> Result<Vec<LibblurayClipTiming>, String> {
+    if info.clip_count == 0 {
+        return Ok(Vec::new());
+    }
+    if info.clips.is_null() {
+        return Err(format!(
+            "libbluray playlist {:05} reports {} clips but returned a NULL clip table; cannot build title PTS continuity map",
+            info.playlist, info.clip_count
+        ));
+    }
+
+    let clips = unsafe { std::slice::from_raw_parts(info.clips, info.clip_count as usize) };
+    Ok(clips
+        .iter()
+        .enumerate()
+        .map(|(clip_index, clip)| LibblurayClipTiming {
+            clip_ref: clip_index.min(u32::MAX as usize) as u32,
+            title_start_pts_90k: clip.start_time,
+            clip_start_pts_90k: clip.in_time,
+            clip_end_pts_90k: clip.out_time,
+        })
+        .collect())
+}
+
+fn pts_continuity_segments_from_clip_timings(
+    playlist: u32,
+    timings: &[LibblurayClipTiming],
+) -> Result<Vec<BlurayPtsContinuitySegment>, String> {
+    // libbluray documents BLURAY_CLIP_INFO.start_time as "playlist time" and
+    // in_time/out_time as clip timestamps, all in 90 kHz units. The PES PTS we
+    // demux from bd_read() is therefore treated as clip/STC time, and each
+    // PlayItem maps raw PTS to title PTS as:
+    //     title_start + forward_33bit_distance(in_time, raw_pts)
+    // This intentionally supports playlists where each clip restarts raw PTS
+    // at zero and where a clip range crosses the 33-bit PTS wrap point.
+    let mut segments = Vec::with_capacity(timings.len());
+    for timing in timings {
+        let duration = pts_forward_distance_33(timing.clip_start_pts_90k, timing.clip_end_pts_90k);
+        if duration == 0 {
+            return Err(format!(
+                "libbluray playlist {playlist:05} clip {} has an empty PTS range {}..{}; cannot build title PTS continuity map",
+                timing.clip_ref, timing.clip_start_pts_90k, timing.clip_end_pts_90k
+            ));
+        }
+        let title_end_pts_90k = timing.title_start_pts_90k.checked_add(duration).ok_or_else(|| {
+            format!(
+                "libbluray playlist {playlist:05} clip {} title PTS range overflows u64: start {} duration {}",
+                timing.clip_ref, timing.title_start_pts_90k, duration
+            )
+        })?;
+        segments.push(BlurayPtsContinuitySegment {
+            title_start_pts_90k: timing.title_start_pts_90k,
+            title_end_pts_90k,
+            clip_ref: timing.clip_ref,
+            clip_start_pts_90k: timing.clip_start_pts_90k,
+            clip_end_pts_90k: timing.clip_end_pts_90k,
+        });
+    }
+    Ok(segments)
+}
+
+fn pts_forward_distance_33(start: u64, end: u64) -> u64 {
+    let start = start & ((1u64 << 33) - 1);
+    let end = end & ((1u64 << 33) - 1);
+    if end >= start {
+        end - start
+    } else {
+        ((1u64 << 33) - start) + end
     }
 }
 
@@ -875,6 +975,7 @@ fn probe_lpcm_headers_for_title(
         handle,
         title,
         display_angle,
+        title_count: disc.title_count(),
     };
     source
         .seek(SeekFrom::Start(0))
@@ -1084,11 +1185,11 @@ fn apply_lpcm_probe_report(streams: &mut [BlurayAudioStreamInfo], report: &LpcmP
         if let Some(header) = report.headers.get(&stream.pid) {
             stream.sample_rate = Some(header.sample_rate);
             stream.bit_depth = BlurayLpcmBitDepth::Probed {
-                bit_depth: header.bit_depth,
+                bit_depth: u32::from(header.valid_bits),
                 scanned_bytes: report.scanned_bytes,
             };
             stream.channels = Some(header.channels);
-            stream.channel_layout = Some(header.channel_layout.to_string());
+            stream.channel_layout = Some(header.channel_layout_label().to_string());
         } else {
             let stop_reason = match &report.completion {
                 LpcmProbeCompletion::AllTargetsFound => &BlurayLpcmProbeStopReason::EndOfTitle,
@@ -1397,17 +1498,71 @@ mod tests {
 
 
     #[test]
-    fn libbluray_pts_segments_are_explicitly_unsupported() {
-        let result = BlurayBackendCapability::<Vec<BlurayPtsContinuitySegment>>::unsupported(
-            "libbluray Phase 0 does not expose title PTS continuity segments",
-        );
-        assert!(!result.is_supported());
-        match result {
-            BlurayBackendCapability::Unsupported { reason } => {
-                assert!(reason.contains("does not expose"));
-            }
-            BlurayBackendCapability::Supported { .. } => panic!("expected unsupported capability"),
-        }
+    fn libbluray_clip_timing_builds_restart_segments() {
+        let segments = pts_continuity_segments_from_clip_timings(
+            800,
+            &[
+                LibblurayClipTiming {
+                    clip_ref: 0,
+                    title_start_pts_90k: 0,
+                    clip_start_pts_90k: 45_000,
+                    clip_end_pts_90k: 135_000,
+                },
+                LibblurayClipTiming {
+                    clip_ref: 1,
+                    title_start_pts_90k: 90_000,
+                    clip_start_pts_90k: 0,
+                    clip_end_pts_90k: 90_000,
+                },
+            ],
+        )
+        .expect("valid libbluray clip timing");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].title_start_pts_90k, 0);
+        assert_eq!(segments[0].title_end_pts_90k, 90_000);
+        assert_eq!(segments[0].clip_start_pts_90k, 45_000);
+        assert_eq!(segments[0].clip_end_pts_90k, 135_000);
+        assert_eq!(segments[1].title_start_pts_90k, 90_000);
+        assert_eq!(segments[1].title_end_pts_90k, 180_000);
+        assert_eq!(segments[1].clip_start_pts_90k, 0);
+        assert_eq!(segments[1].clip_end_pts_90k, 90_000);
+    }
+
+    #[test]
+    fn libbluray_clip_timing_builds_wrap_segment() {
+        let wrap = (1u64 << 33) - 10;
+        let segments = pts_continuity_segments_from_clip_timings(
+            801,
+            &[LibblurayClipTiming {
+                clip_ref: 0,
+                title_start_pts_90k: 1_000,
+                clip_start_pts_90k: wrap,
+                clip_end_pts_90k: 20,
+            }],
+        )
+        .expect("valid wrapped libbluray clip timing");
+
+        assert_eq!(segments[0].title_start_pts_90k, 1_000);
+        assert_eq!(segments[0].title_end_pts_90k, 1_030);
+        assert_eq!(segments[0].clip_start_pts_90k, wrap);
+        assert_eq!(segments[0].clip_end_pts_90k, 20);
+    }
+
+    #[test]
+    fn libbluray_clip_timing_rejects_empty_clip_range() {
+        let err = pts_continuity_segments_from_clip_timings(
+            802,
+            &[LibblurayClipTiming {
+                clip_ref: 0,
+                title_start_pts_90k: 0,
+                clip_start_pts_90k: 10,
+                clip_end_pts_90k: 10,
+            }],
+        )
+        .unwrap_err();
+
+        assert!(err.contains("empty PTS range"));
     }
 
     #[test]
@@ -1440,8 +1595,8 @@ mod tests {
         assert_eq!(report.scanned_bytes, (TS_PACKET_SIZE * 2) as u64);
         assert_eq!(report.completion, LpcmProbeCompletion::AllTargetsFound);
         assert!(report.missing_pids.is_empty());
-        assert_eq!(report.headers.get(&0x1100).unwrap().bit_depth, 16);
-        assert_eq!(report.headers.get(&0x1101).unwrap().bit_depth, 24);
+        assert_eq!(report.headers.get(&0x1100).unwrap().valid_bits, 16);
+        assert_eq!(report.headers.get(&0x1101).unwrap().valid_bits, 24);
     }
 
     #[test]

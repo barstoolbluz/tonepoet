@@ -671,6 +671,20 @@ pub enum BlurayBackendCapability<T> {
     Unsupported { reason: String },
 }
 
+/// Backend statement about how PES PTS relates to the title timeline.
+///
+/// Chapter extraction must use title-level PTS. A backend may prove that raw
+/// PES PTS already uses the title timeline, return explicit clip-to-title
+/// continuity segments, or report that it cannot answer. Callers must not
+/// treat `Unavailable` as identity for multi-clip playlists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlurayPtsCapability {
+    ContinuousTitleTimeline,
+    SegmentedTitleTimeline(Vec<BlurayPtsContinuitySegment>),
+    Unavailable,
+}
+
 impl<T> BlurayBackendCapability<T> {
     #[must_use]
     pub const fn supported(value: T) -> Self {
@@ -756,8 +770,25 @@ pub trait BlurayBackend {
     ) -> Result<Self::TitleSource, String>;
 
     fn pts_continuity_segments(
-        source: &Self::TitleSource,
+        source: &mut Self::TitleSource,
     ) -> Result<BlurayBackendCapability<Vec<BlurayPtsContinuitySegment>>, String>;
+
+    fn pts_capability(
+        disc: &Self::Disc,
+        title: BlurayTitleKey,
+        source: &mut Self::TitleSource,
+    ) -> Result<BlurayPtsCapability, String> {
+        let _ = (disc, title);
+        match Self::pts_continuity_segments(source)? {
+            BlurayBackendCapability::Supported { value } if value.is_empty() => {
+                Ok(BlurayPtsCapability::ContinuousTitleTimeline)
+            }
+            BlurayBackendCapability::Supported { value } => {
+                Ok(BlurayPtsCapability::SegmentedTitleTimeline(value))
+            }
+            BlurayBackendCapability::Unsupported { .. } => Ok(BlurayPtsCapability::Unavailable),
+        }
+    }
 }
 
 /// One-based display number for a zero-based BD audio stream index.
@@ -986,5 +1017,18 @@ mod tests {
 
         assert!(supported.is_supported());
         assert!(!unsupported.is_supported());
+    }
+
+    #[test]
+    fn pts_capability_has_explicit_three_state_shape() {
+        assert_eq!(
+            BlurayPtsCapability::ContinuousTitleTimeline,
+            BlurayPtsCapability::ContinuousTitleTimeline
+        );
+        assert_eq!(
+            BlurayPtsCapability::SegmentedTitleTimeline(Vec::new()),
+            BlurayPtsCapability::SegmentedTitleTimeline(Vec::new())
+        );
+        assert_eq!(BlurayPtsCapability::Unavailable, BlurayPtsCapability::Unavailable);
     }
 }

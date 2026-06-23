@@ -1134,7 +1134,7 @@ mod tests {
         }
 
         fn pts_continuity_segments(
-            _source: &Self::TitleSource,
+            _source: &mut Self::TitleSource,
         ) -> Result<BlurayBackendCapability<Vec<BlurayPtsContinuitySegment>>, String> {
             Ok(BlurayBackendCapability::unsupported(
                 "FakeBackend does not expose continuity segments",

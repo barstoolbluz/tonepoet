@@ -31,6 +31,7 @@ use super::materializer_dvda::{is_dvda_candidate, DvdaAudioMaterializer};
 use super::materializer_dvdv::{is_dvdv_candidate, DvdVideoMaterializer};
 use super::materializer_bluray::{is_bluray_candidate, BlurayMaterializer};
 use super::dvdv_realize::realize_dvdv_track;
+use super::bluray_realize::realize_bluray_track;
 use super::materializer_single::SingleFileMaterializer;
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
@@ -565,9 +566,16 @@ async fn realize_track_with_tool_limits_and_stats(
         )
         .await
         .map(RealizedTrackInfo::without_stats),
-        TrackSourceRef::BluRayTrack { .. } => Err(ConvertError::Realize(
-            "Blu-ray realization is Phase 3/4 work; materialized source has no Blu-ray realizer yet".to_string(),
-        )),
+        TrackSourceRef::BluRayTrack { .. } => realize_bluray_track(
+            src,
+            staging,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+            progress_tracker,
+        )
+        .await
+        .map(RealizedTrackInfo::without_stats),
         TrackSourceRef::DvdaTrack { dvda_downmix_policy, .. } => {
             let expected_audio = DvdaSourceAudioExpectation::from_prepared_track_and_source(prepared_track, src);
             let audio_policy = DvdaRealizationAudioPolicy::new(
