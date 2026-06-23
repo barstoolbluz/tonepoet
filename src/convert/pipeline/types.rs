@@ -12,6 +12,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tonepoet_pipeline::PipelineSettings;
 
+use crate::disc::bluray_backend::BluRayAudioCoding;
+
 fn deserialize_optional_nonzero_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -365,6 +367,22 @@ pub struct SourceOptions {
     /// through this policy rather than extracting every cell in the angle block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dvdv_angle: Option<u8>,
+    /// Blu-ray playlist number (`00000.mpls` as integer) selected by the caller.
+    /// `None` lets the materializer use the same scored default presentation as
+    /// the disc browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluray_playlist: Option<u32>,
+    /// Blu-ray primary audio PID selected by the caller. When this and
+    /// `bluray_audio_stream` are both set, the materializer validates that they
+    /// name the same stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluray_audio_pid: Option<u16>,
+    /// Zero-based Blu-ray audio stream index from playlist metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluray_audio_stream: Option<u8>,
+    /// One-based Blu-ray display angle. `None` means angle 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluray_angle: Option<u8>,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -396,6 +414,14 @@ impl SourceOptions {
             || self.dvdv_title.is_some()
             || self.dvdv_audio_stream.is_some()
             || self.dvdv_angle.is_some()
+    }
+
+    #[must_use]
+    pub fn explicit_bluray_requested(&self) -> bool {
+        self.bluray_playlist.is_some()
+            || self.bluray_audio_pid.is_some()
+            || self.bluray_audio_stream.is_some()
+            || self.bluray_angle.is_some()
     }
 }
 
@@ -649,6 +675,14 @@ pub struct RedactedSourceOptions {
     pub dvdv_audio_stream: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dvdv_angle: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluray_playlist: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluray_audio_pid: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluray_audio_stream: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bluray_angle: Option<u8>,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -674,6 +708,10 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
                 dvdv_title: req.source.dvdv_title,
                 dvdv_audio_stream: req.source.dvdv_audio_stream,
                 dvdv_angle: req.source.dvdv_angle,
+                bluray_playlist: req.source.bluray_playlist,
+                bluray_audio_pid: req.source.bluray_audio_pid,
+                bluray_audio_stream: req.source.bluray_audio_stream,
+                bluray_angle: req.source.bluray_angle,
                 cue_sidecar: req.source.cue_sidecar,
                 track_selection: req.source.track_selection.clone(),
             },
@@ -904,6 +942,43 @@ pub enum TrackSourceRef {
         /// Channel count when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         channels: Option<u8>,
+    },
+    BluRayTrack {
+        /// User-supplied Blu-ray source path. This can be an ISO image, a disc
+        /// root containing `BDMV/`, or the `BDMV` directory itself.
+        source: PathBuf,
+        /// Five-digit MPLS playlist number as an integer.
+        playlist_number: u32,
+        /// Zero-based backend title index kept for efficient Phase 3 title open.
+        title_index: usize,
+        /// Selected one-based display angle.
+        angle_number: u8,
+        /// Blu-ray chapter number (1-based).
+        chapter_number: u32,
+        /// Chapter start in BD-ROM 90 kHz PTS units.
+        chapter_start_pts_90k: u64,
+        /// Chapter end in BD-ROM 90 kHz PTS units, from the next chapter start
+        /// or from the selected title duration for the final chapter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chapter_end_pts_90k: Option<u64>,
+        /// Primary audio PID selected from playlist/clip metadata.
+        audio_pid: u16,
+        /// Zero-based Blu-ray audio stream index.
+        audio_stream_index: u8,
+        /// BD-ROM audio coding for the selected stream.
+        audio_coding: BluRayAudioCoding,
+        /// Stream sample rate in Hz when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_rate: Option<u32>,
+        /// Probed LPCM bit depth. Compressed streams carry `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bit_depth: Option<u32>,
+        /// Stream channel count when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channels: Option<u8>,
+        /// Backend-reported or derived channel layout label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_layout: Option<String>,
     },
 }
 
@@ -1205,6 +1280,7 @@ pub enum SourceKind {
     SacdIso,
     DvdAudio,
     DvdVideo,
+    BluRay,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

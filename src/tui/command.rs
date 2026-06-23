@@ -4461,6 +4461,10 @@ fn execute_commit_with_source_options_transform(
             dvdv_title: None,
             dvdv_audio_stream: None,
             dvdv_angle: None,
+            bluray_playlist: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream: None,
+            bluray_angle: None,
         };
 
         if matches!(&app.convert.source.mode, SourceMode::MultiTrack { .. }) {
@@ -7072,6 +7076,10 @@ mod completion_tests {
             dvdv_title: None,
             dvdv_audio_stream: None,
             dvdv_angle: None,
+            bluray_playlist: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream: None,
+            bluray_angle: None,
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
         }
@@ -8878,6 +8886,10 @@ mod cue_sidecar_override_source_transform_tests {
             dvdv_title: None,
             dvdv_audio_stream: None,
             dvdv_angle: None,
+            bluray_playlist: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream: None,
+            bluray_angle: None,
         };
         source.cue_sidecar = crate::convert::pipeline::CueSidecarPolicy::PreferEmbedded;
         source

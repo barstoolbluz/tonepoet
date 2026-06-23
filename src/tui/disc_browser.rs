@@ -613,19 +613,15 @@ pub fn presentation_id_label(id: &PresentationId) -> String {
 }
 
 /// Return whether the current conversion pipeline can honor a specific
-/// selected disc-presentation identity.
-///
-/// Blu-ray stream selection is deliberately disabled here until the Phase 2
-/// materializer adds explicit `SourceOptions` fields for playlist, PID, stream,
-/// and angle. Keeping this as a single predicate prevents context-menu,
-/// overlay, and source-option bridge behavior from drifting apart.
+/// selected disc-presentation identity. Keeping this as a single predicate
+/// keeps context-menu, overlay, and source-option bridge behavior aligned.
 #[must_use]
 pub fn presentation_id_supports_stream_conversion(id: &PresentationId) -> bool {
     match id {
         PresentationId::DvdAudioGroup(_)
         | PresentationId::DvdVideoTitle { .. }
-        | PresentationId::SacdArea(_) => true,
-        PresentationId::BluRayTitle { .. } => false,
+        | PresentationId::SacdArea(_)
+        | PresentationId::BluRayTitle { .. } => true,
     }
 }
 
@@ -675,12 +671,17 @@ pub fn apply_presentation_to_source_options(
             options.sacd_area = Some(crate::convert::pipeline::SacdArea::MultiChannel);
             true
         }
-        PresentationId::BluRayTitle { .. } => {
-            // Phase 2 will add explicit Blu-ray SourceOptions fields for
-            // playlist, PID, stream index, and angle. Until then, returning
-            // false lets UI code hide or block stream-specific conversion
-            // rather than silently converting the default Blu-ray stream.
-            false
+        PresentationId::BluRayTitle {
+            playlist_number,
+            audio_pid,
+            audio_stream_index,
+            display_angle,
+        } => {
+            options.bluray_playlist = Some(*playlist_number);
+            options.bluray_audio_pid = Some(*audio_pid);
+            options.bluray_audio_stream = Some(*audio_stream_index);
+            options.bluray_angle = Some(display_angle.get());
+            true
         }
     }
 }
@@ -1024,6 +1025,10 @@ mod cache_tests {
             dvdv_title: None,
             dvdv_audio_stream: None,
             dvdv_angle: None,
+            bluray_playlist: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream: None,
+            bluray_angle: None,
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
         };
@@ -1050,6 +1055,10 @@ mod cache_tests {
             dvdv_title: None,
             dvdv_audio_stream: None,
             dvdv_angle: None,
+            bluray_playlist: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream: None,
+            bluray_angle: None,
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
         };
@@ -1070,8 +1079,8 @@ mod cache_tests {
     }
 
     #[test]
-    fn blu_ray_presentation_selection_is_explicitly_unsupported_until_source_options_exist() {
-        let id = PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
+    fn disc_browser_stream_conversion_populates_all_bluray_source_options() {
+        let id = PresentationId::try_blu_ray_title(12, 0x1100, 0, 2)
             .expect("valid Blu-ray presentation id");
         let mut options = crate::convert::pipeline::SourceOptions {
             archive_password: None,
@@ -1084,18 +1093,20 @@ mod cache_tests {
             dvdv_title: None,
             dvdv_audio_stream: None,
             dvdv_angle: None,
+            bluray_playlist: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream: None,
+            bluray_angle: None,
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
         };
 
-        assert!(!presentation_id_supports_stream_conversion(&id));
-        assert!(!apply_presentation_to_source_options(&mut options, &id));
-        assert_eq!(options.dvda_group_selection, crate::convert::pipeline::DvdaGroupSelection::Default);
-        assert_eq!(options.dvdv_vts, None);
-        assert_eq!(options.dvdv_title, None);
-        assert_eq!(options.dvdv_audio_stream, None);
-        assert_eq!(options.dvdv_angle, None);
-        assert_eq!(options.sacd_area, None);
+        assert!(presentation_id_supports_stream_conversion(&id));
+        assert!(apply_presentation_to_source_options(&mut options, &id));
+        assert_eq!(options.bluray_playlist, Some(12));
+        assert_eq!(options.bluray_audio_pid, Some(0x1100));
+        assert_eq!(options.bluray_audio_stream, Some(0));
+        assert_eq!(options.bluray_angle, Some(2));
     }
 
 }
@@ -1166,6 +1177,10 @@ mod disc_selection_bridge_tests {
             dvdv_title: None,
             dvdv_audio_stream: None,
             dvdv_angle: None,
+            bluray_playlist: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream: None,
+            bluray_angle: None,
             cue_sidecar: CueSidecarPolicy::PreferSidecar,
             track_selection: TrackSelection::All,
         };

@@ -152,7 +152,7 @@ pub fn map_bluray_source(path: &Path) -> Result<crate::disc::DiscContents, Strin
     Ok(contents)
 }
 
-fn bluray_source_path_for_backend(path: &Path) -> Result<PathBuf, String> {
+pub fn bluray_source_path_for_backend(path: &Path) -> Result<PathBuf, String> {
     if path.is_file() {
         if bluray_iso_has_bounded_candidate_markers(path) {
             return Ok(path.to_path_buf());

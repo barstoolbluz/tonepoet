@@ -29,6 +29,7 @@ use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
 use super::materializer_dvda::{is_dvda_candidate, DvdaAudioMaterializer};
 use super::materializer_dvdv::{is_dvdv_candidate, DvdVideoMaterializer};
+use super::materializer_bluray::{is_bluray_candidate, BlurayMaterializer};
 use super::dvdv_realize::realize_dvdv_track;
 use super::materializer_single::SingleFileMaterializer;
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
@@ -223,6 +224,9 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
     }
     if is_dvdv_candidate(req)? {
         return Ok(SourceKind::DvdVideo);
+    }
+    if is_bluray_candidate(req)? {
+        return Ok(SourceKind::BluRay);
     }
     if !matches!(req.source.cue_sidecar, CueSidecarPolicy::IgnoreCue) && is_cue_image_candidate(req)? {
         return Ok(SourceKind::CueImage);
@@ -420,6 +424,7 @@ pub fn materializer_for(kind: SourceKind) -> Result<Box<dyn Materializer>, Sourc
         SourceKind::SacdIso => Ok(Box::new(SacdIsoMaterializer)),
         SourceKind::DvdAudio => Ok(Box::new(DvdaAudioMaterializer)),
         SourceKind::DvdVideo => Ok(Box::new(DvdVideoMaterializer)),
+        SourceKind::BluRay => Ok(Box::new(BlurayMaterializer)),
     }
 }
 
@@ -560,6 +565,9 @@ async fn realize_track_with_tool_limits_and_stats(
         )
         .await
         .map(RealizedTrackInfo::without_stats),
+        TrackSourceRef::BluRayTrack { .. } => Err(ConvertError::Realize(
+            "Blu-ray realization is Phase 3/4 work; materialized source has no Blu-ray realizer yet".to_string(),
+        )),
         TrackSourceRef::DvdaTrack { dvda_downmix_policy, .. } => {
             let expected_audio = DvdaSourceAudioExpectation::from_prepared_track_and_source(prepared_track, src);
             let audio_policy = DvdaRealizationAudioPolicy::new(
@@ -4733,6 +4741,10 @@ FILE "album.flac" WAVE
                 dvdv_title: None,
                 dvdv_audio_stream: None,
                 dvdv_angle: None,
+                bluray_playlist: None,
+                bluray_audio_pid: None,
+                bluray_audio_stream: None,
+                bluray_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -9107,6 +9119,7 @@ fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
         TrackSourceRef::SacdTrack { .. } => return Some("dsd".to_string()),
         TrackSourceRef::DvdaTrack { .. } => return Some("dvda".to_string()),
         TrackSourceRef::DvdVideoTrack { .. } => return Some("dvdv".to_string()),
+        TrackSourceRef::BluRayTrack { .. } => return Some("bluray".to_string()),
     };
     path.extension()
         .and_then(|value| value.to_str())
@@ -9715,6 +9728,7 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
         SourceKind::SacdIso => "SacdIso",
         SourceKind::DvdAudio => "DvdAudio",
         SourceKind::DvdVideo => "DvdVideo",
+        SourceKind::BluRay => "BluRay",
     }
 }
 
@@ -9763,6 +9777,22 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
         } => format!(
             "DVD-Video VTS {vts_number} title {title_number} angle {angle_number} chapter {chapter_number} stream {} ({}) from {}",
             crate::disc::model::dvd_video_audio_stream_display_number(*audio_stream_index),
+            audio_coding.label(),
+            path_log_value(source)
+        ),
+        TrackSourceRef::BluRayTrack {
+            source,
+            playlist_number,
+            title_index,
+            angle_number,
+            chapter_number,
+            audio_pid,
+            audio_stream_index,
+            audio_coding,
+            ..
+        } => format!(
+            "Blu-ray playlist {playlist_number:05} title index {title_index} angle {angle_number} chapter {chapter_number} stream {} PID 0x{audio_pid:04x} ({}) from {}",
+            crate::disc::model::blu_ray_audio_stream_display_number(*audio_stream_index),
             audio_coding.label(),
             path_log_value(source)
         ),
@@ -14732,6 +14762,7 @@ fn build_manifest_for_album(
                             volume_source.original_container().clone()
                         }
                         TrackSourceRef::DvdVideoTrack { source, .. } => source.clone(),
+                        TrackSourceRef::BluRayTrack { source, .. } => source.clone(),
                     })
                     .unwrap_or_else(|| req.container.clone());
 
@@ -14926,6 +14957,10 @@ mod pipeline_test_helpers {
                 dvdv_title: None,
                 dvdv_audio_stream: None,
                 dvdv_angle: None,
+                bluray_playlist: None,
+                bluray_audio_pid: None,
+                bluray_audio_stream: None,
+                bluray_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -15077,6 +15112,28 @@ mod pipeline_test_helpers {
             ]),
             sidecars: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod bluray_routing_tests {
+    use super::*;
+    use super::pipeline_test_helpers::log_test_request;
+
+    #[test]
+    fn pipeline_bluray_explicit_iso_routes_before_archive_or_single_file_handling() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let iso = temp.path().join("explicit-bluray.iso");
+        std::fs::write(&iso, b"not an archive and not a valid BD image").expect("iso fixture");
+
+        let mut req = log_test_request();
+        req.container = iso;
+        req.source.bluray_playlist = Some(12);
+        req.source.bluray_audio_pid = Some(0x1100);
+        req.source.bluray_audio_stream = Some(0);
+        req.source.bluray_angle = Some(1);
+
+        assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::BluRay);
     }
 }
 
@@ -15963,6 +16020,10 @@ mod naming_template_tests {
                 dvdv_title: None,
                 dvdv_audio_stream: None,
                 dvdv_angle: None,
+                bluray_playlist: None,
+                bluray_audio_pid: None,
+                bluray_audio_stream: None,
+                bluray_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -16502,6 +16563,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 dvdv_title: None,
                 dvdv_audio_stream: None,
                 dvdv_angle: None,
+                bluray_playlist: None,
+                bluray_audio_pid: None,
+                bluray_audio_stream: None,
+                bluray_angle: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },

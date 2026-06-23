@@ -28,6 +28,7 @@ pub mod materializer_7z;
 pub mod materializer_cue;
 pub mod materializer_dvda;
 pub mod materializer_dvdv;
+pub mod materializer_bluray;
 pub mod materializer_sacd;
 pub mod materializer_single;
 pub mod orchestrator_rerun_gate;
@@ -90,6 +91,10 @@ mod tests {
                 dvdv_title: None,
                 dvdv_audio_stream: None,
                 dvdv_angle: None,
+                bluray_playlist: None,
+                bluray_audio_pid: None,
+                bluray_audio_stream: None,
+                bluray_angle: None,
                 cue_sidecar: CueSidecarPolicy::IgnoreCue,
                 track_selection: TrackSelection::All,
             },
