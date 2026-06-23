@@ -391,6 +391,9 @@ pub fn probe_disc_contents(path: &Path) -> Result<DiscContents, String> {
     if crate::disc::dvdv_utils::is_dvdv_source(path) {
         return crate::disc::dvdv_utils::map_dvdv_source(path);
     }
+    if crate::disc::bluray_utils::is_bluray_source(path) {
+        return crate::disc::bluray_utils::map_bluray_source(path);
+    }
     Err(format!("Not a supported browsable disc source: {}", path.display()))
 }
 
