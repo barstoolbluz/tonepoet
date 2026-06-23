@@ -9,7 +9,9 @@ use crate::convert::formats::{
 use crate::convert::simple_wizard::ReplayGainMode;
 use tonepoet_pipeline::enums as pipeline_enums;
 use tonepoet_pipeline::PipelineSettings;
-use crate::convert::{ConversionStatus, LifecycleEvent, ProgressUpdate};
+use crate::convert::{
+    queue_identity_path, ConversionItem, ConversionStatus, LifecycleEvent, ProgressUpdate,
+};
 
 use super::app::*;
 use super::message::AppMessage;
@@ -516,6 +518,32 @@ fn cue_sidecar_override_for_commit_path(
         .then_some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly)
 }
 
+fn is_active_commit_item(item: &ConversionItem) -> bool {
+    !matches!(
+        item.status,
+        ConversionStatus::Completed { .. }
+            | ConversionStatus::Failed { .. }
+            | ConversionStatus::Cancelled
+    )
+}
+
+fn active_queue_identity_set(
+    existing: &[ConversionItem],
+) -> std::collections::HashSet<std::path::PathBuf> {
+    existing
+        .iter()
+        .filter(|item| is_active_commit_item(item))
+        .map(|item| queue_identity_path(&item.input_path))
+        .collect()
+}
+
+fn commit_path_already_queued(
+    active_queue_identities: &std::collections::HashSet<std::path::PathBuf>,
+    path: &std::path::Path,
+) -> bool {
+    active_queue_identities.contains(&queue_identity_path(path))
+}
+
 /// Commit a batch and mark paths whose sibling CUE was already suppressed by
 /// browse expansion as sidecar-CUE metadata artifacts.
 pub fn commit_batch_with_cue_artifacts(
@@ -525,23 +553,15 @@ pub fn commit_batch_with_cue_artifacts(
     options: &ConversionOptions,
 ) -> CommitOutcome {
     let existing = app.manager.get_items_clone();
+    let mut active_queue_identities = active_queue_identity_set(&existing);
     let mut outcome = CommitOutcome::default();
 
     for path in paths {
-        let already_queued = existing.iter().any(|item| {
-            item.input_path == *path
-                && !matches!(
-                    item.status,
-                    ConversionStatus::Completed { .. }
-                        | ConversionStatus::Failed { .. }
-                        | ConversionStatus::Cancelled
-                )
-        });
-
-        if already_queued {
+        if commit_path_already_queued(&active_queue_identities, path) {
             outcome.skipped += 1;
             continue;
         }
+        let path_identity = queue_identity_path(path);
 
         // Check if this file was previously converted (non-blocking warning).
         if app.db.was_previously_converted(&path.display().to_string()) {
@@ -572,7 +592,10 @@ pub fn commit_batch_with_cue_artifacts(
             archive_pw,
             cue_sidecar_override,
         ) {
-            Ok(_) => outcome.enqueued += 1,
+            Ok(_) => {
+                outcome.enqueued += 1;
+                active_queue_identities.insert(path_identity);
+            }
             Err(err) => {
                 log::warn!("commit failed for {}: {err}", path.display());
                 outcome.errors += 1;
@@ -904,7 +927,53 @@ mod lifecycle_forwarder_tests {
 mod cue_sidecar_commit_metadata_tests {
     use super::*;
     use std::collections::HashSet;
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "tonepoet-commit-identity-{name}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_minimal_bluray_layout(root: &Path) {
+        let bdmv = root.join("BDMV");
+        fs::create_dir_all(bdmv.join("PLAYLIST")).expect("create PLAYLIST");
+        fs::create_dir_all(bdmv.join("STREAM")).expect("create STREAM");
+        fs::write(bdmv.join("index.bdmv"), b"index").expect("write index.bdmv");
+        fs::write(bdmv.join("MovieObject.bdmv"), b"movie").expect("write MovieObject.bdmv");
+        fs::write(bdmv.join("PLAYLIST").join("00000.mpls"), b"playlist")
+            .expect("write playlist");
+        fs::write(bdmv.join("STREAM").join("00000.m2ts"), b"stream").expect("write stream");
+    }
+
+    fn active_item(path: PathBuf) -> ConversionItem {
+        let mut options = ConversionOptions::default();
+        options.pipeline_settings = Some(PipelineSettings::default());
+        let mut item = ConversionItem::new(path, crate::convert::FileFormat::SevenZip, options);
+        item.status = ConversionStatus::Queued;
+        item
+    }
 
     #[test]
     fn commit_override_is_computed_only_from_current_batch_metadata() {
@@ -924,4 +993,44 @@ mod cue_sidecar_commit_metadata_tests {
             "a later batch with the same path vector must not inherit stale artifact metadata"
         );
     }
+
+    #[test]
+    fn commit_duplicate_detection_skips_bdmv_child_when_disc_root_is_active() {
+        let temp = TempDir::new("root-active");
+        write_minimal_bluray_layout(&temp.path);
+        let bdmv = temp.path.join("BDMV");
+        let existing = vec![active_item(temp.path.clone())];
+        let identities = active_queue_identity_set(&existing);
+
+        assert!(commit_path_already_queued(&identities, &bdmv));
+    }
+
+    #[test]
+    fn commit_duplicate_detection_skips_disc_root_when_bdmv_child_is_active() {
+        let temp = TempDir::new("bdmv-active");
+        write_minimal_bluray_layout(&temp.path);
+        let bdmv = temp.path.join("BDMV");
+        let existing = vec![active_item(bdmv)];
+        let identities = active_queue_identity_set(&existing);
+
+        assert!(commit_path_already_queued(&identities, &temp.path));
+    }
+
+    #[test]
+    fn commit_duplicate_detection_keeps_ordinary_path_identity_semantics() {
+        let temp = TempDir::new("ordinary");
+        let first = temp.path.join("one.flac");
+        let second = temp.path.join("two.flac");
+        fs::write(&first, b"one").expect("write first");
+        fs::write(&second, b"two").expect("write second");
+        let existing = vec![active_item(first.clone())];
+        let identities = active_queue_identity_set(&existing);
+
+        assert!(commit_path_already_queued(
+            &identities,
+            &temp.path.join(".").join("one.flac")
+        ));
+        assert!(!commit_path_already_queued(&identities, &second));
+    }
+
 }

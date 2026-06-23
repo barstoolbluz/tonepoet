@@ -480,7 +480,7 @@ pub enum AacProfile {
 pub struct FormatDetector;
 
 impl FormatDetector {
-    /// Detect file format from file path (archive or audio)
+    /// Detect file format from file path (archive, structured disc source, or audio).
     pub fn detect(path: &Path) -> Result<FileFormat, super::ConversionError> {
         // Check for compound tar extensions first (.tar.gz, .tar.bz2, etc.)
         // because Path::extension() only returns the last component.
@@ -499,16 +499,32 @@ impl FormatDetector {
             return Ok(FileFormat::SevenZip);
         }
 
-        let extension = path
+        // Structured disc directories do not necessarily have filename
+        // extensions. Admit recognized Blu-ray roots/BDMV directories before
+        // extension-based detection so the pipeline source-kind detector can
+        // route them to BlurayMaterializer later. FileFormat has no dedicated
+        // Blu-ray arm today; SevenZip is the existing container admission class
+        // used for ISOs and other non-audio inputs.
+        if path.is_dir() && crate::disc::bluray_utils::is_bluray_source(path) {
+            return Ok(FileFormat::SevenZip);
+        }
+
+        let Some(extension) = path
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_lowercase())
-            .ok_or_else(|| {
-                super::ConversionError::UnsupportedFormat(format!(
-                    "No file extension found for: {}",
-                    path.display()
-                ))
-            })?;
+        else {
+            // Extensionless Blu-ray image files are uncommon, but possible.
+            // Keep this check after the cheap directory fast path so normal
+            // extension-bearing file scans do not pay an ISO probe cost.
+            if path.is_file() && crate::disc::bluray_utils::is_bluray_source(path) {
+                return Ok(FileFormat::SevenZip);
+            }
+            return Err(super::ConversionError::UnsupportedFormat(format!(
+                "No file extension found for: {}",
+                path.display()
+            )));
+        };
 
         match extension.as_str() {
             // Archives — all handled by 7zz/7z extraction pipeline.
@@ -638,7 +654,81 @@ fn default_cue_generation_mode() -> String {
 #[cfg(test)]
 mod tests {
     use super::{AudioFormat, FileFormat, FormatDetector};
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "tonepoet-format-detector-{name}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_minimal_bluray_layout(root: &Path) {
+        let bdmv = root.join("BDMV");
+        fs::create_dir_all(bdmv.join("PLAYLIST")).expect("create PLAYLIST");
+        fs::create_dir_all(bdmv.join("STREAM")).expect("create STREAM");
+        fs::write(bdmv.join("index.bdmv"), b"index").expect("write index.bdmv");
+        fs::write(bdmv.join("MovieObject.bdmv"), b"movie").expect("write MovieObject.bdmv");
+        fs::write(bdmv.join("PLAYLIST").join("00000.mpls"), b"playlist")
+            .expect("write playlist");
+        fs::write(bdmv.join("STREAM").join("00000.m2ts"), b"stream").expect("write stream");
+    }
+
+    #[test]
+    fn detect_accepts_bluray_disc_root_without_extension() {
+        let temp = TempDir::new("bluray-root");
+        write_minimal_bluray_layout(&temp.path);
+
+        assert_eq!(
+            FormatDetector::detect(&temp.path).expect("Blu-ray root is queue-admissible"),
+            FileFormat::SevenZip
+        );
+    }
+
+    #[test]
+    fn detect_accepts_bdmv_directory_without_extension() {
+        let temp = TempDir::new("bdmv-dir");
+        write_minimal_bluray_layout(&temp.path);
+
+        assert_eq!(
+            FormatDetector::detect(&temp.path.join("BDMV"))
+                .expect("BDMV directory is queue-admissible"),
+            FileFormat::SevenZip
+        );
+    }
+
+    #[test]
+    fn detect_still_rejects_non_bluray_directory_without_extension() {
+        let temp = TempDir::new("ordinary-dir");
+        let err = FormatDetector::detect(&temp.path)
+            .expect_err("ordinary extensionless directory must not be admitted")
+            .to_string();
+
+        assert!(
+            err.contains("No file extension found for"),
+            "unexpected detector error: {err}"
+        );
+    }
 
     #[test]
     fn detect_accepts_standalone_dsf_and_dff_as_audio() {

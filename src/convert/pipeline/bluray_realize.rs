@@ -81,7 +81,10 @@ pub async fn realize_bluray_track(
 
     if *audio_coding != BluRayAudioCoding::Lpcm {
         return Err(ConvertError::Realize(format!(
-            "Blu-ray compressed codec extraction not yet implemented for {} stream {} PID 0x{:04x}",
+            concat!(
+                "Blu-ray compressed audio streams are not yet implemented; ",
+                "selected {} stream {} PID 0x{:04x} requires decoder support before WAV realization"
+            ),
             audio_coding.label(),
             u16::from(*audio_stream_index) + 1,
             audio_pid
@@ -659,4 +662,79 @@ fn bluray_stable_hash(
     feed(&mut hash, &audio_pid.to_le_bytes());
     feed(&mut hash, &[audio_stream_index]);
     hash
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::errors::ToolRunnerError;
+    use super::super::tool::{ToolBinary, ToolCommand, ToolOutput};
+
+    struct PanicToolRunner;
+
+    #[async_trait::async_trait]
+    impl ToolRunner for PanicToolRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            panic!("compressed Blu-ray rejection must not execute external tools")
+        }
+
+        fn tool_version(&self, _binary: ToolBinary) -> Option<String> {
+            None
+        }
+    }
+
+    fn compressed_bluray_source(audio_coding: BluRayAudioCoding) -> TrackSourceRef {
+        TrackSourceRef::BluRayTrack {
+            source: PathBuf::from("/nonexistent/fixture.iso"),
+            playlist_number: 12,
+            title_index: 0,
+            angle_number: 1,
+            chapter_number: 1,
+            chapter_start_pts_90k: 0,
+            chapter_end_pts_90k: Some(90_000),
+            audio_pid: 0x1100,
+            audio_stream_index: 0,
+            audio_coding,
+            sample_rate: Some(48_000),
+            bit_depth: None,
+            channels: Some(6),
+            channel_layout: Some("5.1".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_bluray_audio_returns_targeted_error_before_lpcm_realization() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = StagingDir::borrowed(temp.path().join("stage"), "job".to_string());
+        let cancel = CancellationToken::new();
+        let src = compressed_bluray_source(BluRayAudioCoding::DtsHdMaster);
+
+        let err = realize_bluray_track(
+            &src,
+            &staging,
+            &PanicToolRunner,
+            &cancel,
+            None,
+            None,
+        )
+        .await
+        .expect_err("compressed Blu-ray streams must be rejected before LPCM realization");
+
+        match err {
+            ConvertError::Realize(message) => {
+                assert!(
+                    message.contains("Blu-ray compressed audio streams are not yet implemented"),
+                    "unexpected message: {message}"
+                );
+                assert!(message.contains("stream 1"), "unexpected message: {message}");
+                assert!(message.contains("PID 0x1100"), "unexpected message: {message}");
+            }
+            other => panic!("unexpected error type: {other:?}"),
+        }
+    }
 }

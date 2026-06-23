@@ -1,7 +1,7 @@
 //! Conversion queue management
 
 use super::formats::{AudioFormat, ConversionOptions, FileFormat};
-use super::pipeline::CueSidecarPolicy;
+use super::pipeline::{CueSidecarPolicy, PipelineRequest};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -180,7 +180,7 @@ pub struct ConversionItem {
     /// New pipeline request (populated during migration; legacy fields
     /// remain until PR 10 finishes CLI/TUI surface).
     #[serde(default)]
-    pub pipeline_request: Option<crate::convert::pipeline::PipelineRequest>,
+    pub pipeline_request: Option<PipelineRequest>,
     /// Per-track progress for multi-track sources. Keyed by track_index.
     /// Transient display state only — not serialized.
     #[serde(skip)]
@@ -260,6 +260,38 @@ impl ConversionItem {
     ) -> Self {
         let mut item = Self::new(input_path, input_format, options);
         item.cue_sidecar_override = cue_sidecar_override;
+        item
+    }
+
+    /// Create a new conversion item with a prebuilt orchestrator request attached.
+    ///
+    /// This is the lossless handoff path for callers that have already built a
+    /// complete `PipelineRequest`. It intentionally does not require or copy
+    /// `PipelineSettings` onto the legacy queue fields; the request is the exact
+    /// executable contract for this item. Callers must validate that the request
+    /// item id is non-empty and unique before insertion into a queue.
+    pub fn new_with_pipeline_request(
+        input_path: PathBuf,
+        input_format: FileFormat,
+        mut options: ConversionOptions,
+        request: PipelineRequest,
+        cue_sidecar_override: Option<CueSidecarPolicy>,
+    ) -> Self {
+        debug_assert!(
+            !request.item_id.trim().is_empty(),
+            "PipelineRequest item_id must be non-empty before queue insertion"
+        );
+        options.pipeline_settings = None;
+        let mut item = Self::new_with_cue_sidecar_override(
+            input_path,
+            input_format,
+            options,
+            cue_sidecar_override,
+        );
+        item.id = request.item_id.clone();
+        item.pipeline_settings = None;
+        item.options.pipeline_settings = None;
+        item.pipeline_request = Some(request);
         item
     }
 
@@ -361,14 +393,12 @@ impl ConversionQueue {
         &mut self.items
     }
 
-    /// Add an item to the queue only when options already carry exact Chunk 1 planner settings.
+    /// Add an item to the queue for later configuration.
     ///
-    /// Older UI code used this method with legacy `ConversionOptions` only. That is now
-    /// intentionally rejected at the queue boundary instead of failing later in
-    /// `process_queue()`: a queued production item must be lossless before it can enter
-    /// the shared scheduler. Compatibility/import code that cannot yet construct
-    /// `PipelineSettings` should leave the item `NotConfigured` and call
-    /// `set_pipeline_settings()` before marking it `Queued`.
+    /// This path intentionally preserves legacy `NotConfigured` insertion
+    /// semantics: callers may add files/directories before the UI or CLI has
+    /// collected full `PipelineSettings`. The full-settings invariant applies
+    /// only when an item is actually ready to run with `ConversionStatus::Queued`.
     pub fn add_item(&mut self, path: PathBuf, format: FileFormat, options: ConversionOptions) {
         self.add_item_with_cue_sidecar_override(path, format, options, None);
     }
@@ -389,8 +419,11 @@ impl ConversionQueue {
             cue_sidecar_override,
         );
         debug_assert!(
-            item.pipeline_settings.is_some() || item.pipeline_request.is_some(),
-            "ConversionQueue::add_item requires full PipelineSettings for production queued work; use add_item_with_pipeline_settings"
+            item.status != ConversionStatus::Queued
+                || item.pipeline_settings.is_some()
+                || item.pipeline_request.is_some()
+                || item.options.pipeline_settings.is_some(),
+            "queued ConversionItem must contain full PipelineSettings or a prebuilt PipelineRequest"
         );
         self.items.push_back(item);
     }
@@ -755,6 +788,24 @@ mod cue_sidecar_override_queue_tests {
         let items = queue.all_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].cue_sidecar_override, Some(CueSidecarPolicy::EmbeddedOnly));
+    }
+
+    #[test]
+    fn add_item_allows_not_configured_legacy_options_without_pipeline_settings() {
+        let mut queue = ConversionQueue::new();
+
+        queue.add_item(
+            PathBuf::from("/tmp/album/01.flac"),
+            FileFormat::Audio(AudioFormat::Flac),
+            ConversionOptions::default(),
+        );
+
+        let items = queue.all_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, ConversionStatus::NotConfigured);
+        assert!(items[0].pipeline_settings.is_none());
+        assert!(items[0].options.pipeline_settings.is_none());
+        assert!(items[0].pipeline_request.is_none());
     }
 
     #[test]

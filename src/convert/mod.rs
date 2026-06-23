@@ -370,11 +370,77 @@ fn path_list_contains(paths: &[PathBuf], candidate: &Path) -> bool {
         .any(|existing| same_path_for_queue(existing, candidate))
 }
 
+pub(crate) fn queue_identity_path(path: &Path) -> PathBuf {
+    let identity = if path.is_dir() {
+        crate::disc::bluray_utils::bluray_source_path_for_backend(path)
+            .ok()
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+
+    identity.canonicalize().unwrap_or(identity)
+}
+
 fn same_path_for_queue(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
+    queue_identity_path(left) == queue_identity_path(right)
+}
+
+fn validate_pipeline_request_item_id(
+    request: &crate::convert::pipeline::PipelineRequest,
+) -> ConversionResult<()> {
+    if !request.item_id.trim().is_empty() {
+        return Ok(());
     }
+
+    Err(ConversionError::ConversionFailed(
+        "prebuilt PipelineRequest item_id must be non-empty for ready queue insertion".to_string(),
+    ))
+}
+
+fn validate_pipeline_request_container_matches_path(
+    path: &Path,
+    request: &crate::convert::pipeline::PipelineRequest,
+) -> ConversionResult<()> {
+    if same_path_for_queue(path, &request.container) {
+        return Ok(());
+    }
+
+    Err(ConversionError::ConversionFailed(format!(
+        "prebuilt PipelineRequest container '{}' does not match ready queue path '{}'",
+        request.container.display(),
+        path.display()
+    )))
+}
+
+fn validate_pipeline_request_queue_metadata(
+    request: &crate::convert::pipeline::PipelineRequest,
+    archive_password: Option<&str>,
+    cue_sidecar_override: Option<crate::convert::pipeline::CueSidecarPolicy>,
+) -> ConversionResult<()> {
+    let request_archive_password = request
+        .source
+        .archive_password
+        .as_ref()
+        .map(|password| password.expose());
+
+    if let Some(queue_archive_password) = archive_password {
+        if request_archive_password != Some(queue_archive_password) {
+            return Err(ConversionError::ConversionFailed(
+                "prebuilt PipelineRequest is the executable contract; queue archive_password must be omitted or match request.source.archive_password".to_string(),
+            ));
+        }
+    }
+
+    if let Some(queue_cue_policy) = cue_sidecar_override {
+        if queue_cue_policy != request.source.cue_sidecar {
+            return Err(ConversionError::ConversionFailed(
+                "prebuilt PipelineRequest is the executable contract; queue CUE sidecar override must be omitted or match request.source.cue_sidecar".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn _status_progress_for_update(status: &ConversionStatus, progress_hint: f32) -> f32 {
@@ -547,12 +613,12 @@ impl ConversionManager {
         cue_sidecar_override: Option<crate::convert::pipeline::CueSidecarPolicy>,
     ) -> ConversionResult<String> {
         let format = FormatDetector::detect(&file)?;
-        // Use try_write() instead of blocking_write() to avoid panic in async context
-        let mut queue = self.queue.try_write().map_err(|_| {
-            ConversionError::ConversionFailed("Queue is busy, try again".to_string())
-        })?;
 
-        // Create item and mark as Queued (ready for processing)
+        // Create item and mark as Queued (ready for processing). A runnable
+        // queue item must carry the exact pipeline handoff now rather than
+        // relying on later best-effort projection from legacy options. Keep
+        // NotConfigured insertion paths unchanged; this guard only applies to
+        // the ready-to-process admission helper.
         let mut item = ConversionItem::new_with_cue_sidecar_override(
             file.clone(),
             format,
@@ -561,10 +627,107 @@ impl ConversionManager {
         );
         item.archive_password = archive_password;
         item.status = ConversionStatus::Queued;
+        if item.pipeline_settings.is_none() && item.options.pipeline_settings.is_none() {
+            return Err(ConversionError::ConversionFailed(
+                "ready queue insertion requires exact PipelineSettings".to_string(),
+            ));
+        }
+
+        // Use try_write() instead of blocking_write() to avoid panic in async context.
+        let mut queue = self.queue.try_write().map_err(|_| {
+            ConversionError::ConversionFailed("Queue is busy, try again".to_string())
+        })?;
+
         let id = item.id.clone();
         queue.items_mut().push_back(item);
 
         log::info!("Added file ready for processing: {:?} (id: {})", file, id);
+        Ok(id)
+    }
+
+    /// Add a file that is already configured and ready for processing with a
+    /// prebuilt orchestrator request.
+    ///
+    /// This is the explicit ready-queue handoff path for callers that already
+    /// own a complete `PipelineRequest`. The request `item_id` must be non-empty
+    /// and unique in the queue, and its `container` must identify the same
+    /// source as `file` after queue path normalization. Because the request is
+    /// the executable contract, any out-of-band queue archive password or CUE
+    /// sidecar override must be omitted or match the request source options.
+    pub fn add_file_ready_for_processing_with_pipeline_request(
+        &mut self,
+        file: std::path::PathBuf,
+        options: ConversionOptions,
+        request: crate::convert::pipeline::PipelineRequest,
+        archive_password: Option<String>,
+    ) -> ConversionResult<String> {
+        self.add_file_ready_for_processing_with_pipeline_request_and_cue_sidecar_override(
+            file,
+            options,
+            request,
+            archive_password,
+            None,
+        )
+    }
+
+    /// Add a ready-to-run file with a prebuilt `PipelineRequest` and an optional
+    /// queue-time CUE sidecar policy override.
+    pub fn add_file_ready_for_processing_with_pipeline_request_and_cue_sidecar_override(
+        &mut self,
+        file: std::path::PathBuf,
+        options: ConversionOptions,
+        request: crate::convert::pipeline::PipelineRequest,
+        archive_password: Option<String>,
+        cue_sidecar_override: Option<crate::convert::pipeline::CueSidecarPolicy>,
+    ) -> ConversionResult<String> {
+        let format = FormatDetector::detect(&file)?;
+        validate_pipeline_request_item_id(&request)?;
+        validate_pipeline_request_container_matches_path(&file, &request)?;
+        validate_pipeline_request_queue_metadata(
+            &request,
+            archive_password.as_deref(),
+            cue_sidecar_override,
+        )?;
+        let request_item_id = request.item_id.clone();
+
+        let mut item = ConversionItem::new_with_pipeline_request(
+            file.clone(),
+            format,
+            options,
+            request,
+            cue_sidecar_override,
+        );
+        item.archive_password = archive_password;
+        item.status = ConversionStatus::Queued;
+
+        if item.pipeline_request.is_none() {
+            return Err(ConversionError::ConversionFailed(
+                "ready queue insertion requires a prebuilt PipelineRequest".to_string(),
+            ));
+        }
+
+        // Use try_write() instead of blocking_write() to avoid panic in async context.
+        let mut queue = self.queue.try_write().map_err(|_| {
+            ConversionError::ConversionFailed("Queue is busy, try again".to_string())
+        })?;
+        if queue
+            .all_items()
+            .into_iter()
+            .any(|existing| existing.id.as_str() == request_item_id.as_str())
+        {
+            return Err(ConversionError::ConversionFailed(format!(
+                "prebuilt PipelineRequest item_id '{request_item_id}' already exists in the conversion queue"
+            )));
+        }
+
+        let id = item.id.clone();
+        queue.items_mut().push_back(item);
+
+        log::info!(
+            "Added file ready for processing with prebuilt PipelineRequest: {:?} (id: {})",
+            file,
+            id
+        );
         Ok(id)
     }
 
@@ -1102,6 +1265,439 @@ fn parse_track_message(message: &str) -> (String, String, f32) {
     }
 
     (core.to_string(), String::new(), tool_pct)
+}
+
+#[cfg(test)]
+mod bluray_queue_admission_tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "tonepoet-bluray-queue-{name}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn ready_options() -> ConversionOptions {
+        let mut options = ConversionOptions::default();
+        options.pipeline_settings = Some(tonepoet_pipeline::PipelineSettings::default());
+        options
+    }
+
+    fn pipeline_request_for(path: &Path, item_id: &str) -> crate::convert::pipeline::PipelineRequest {
+        use crate::convert::pipeline::{
+            CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy,
+            NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PublishPolicy, SourceOptions,
+            StagePolicy, StageRequirement, TrackSelection,
+        };
+
+        crate::convert::pipeline::PipelineRequest {
+            job_id: format!("job-{item_id}"),
+            item_id: item_id.to_string(),
+            container: path.to_path_buf(),
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_group: None,
+                dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
+                bluray_playlist: None,
+                bluray_audio_pid: None,
+                bluray_audio_stream: None,
+                bluray_angle: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            settings: tonepoet_pipeline::PipelineSettings::default(),
+            worker_count: None,
+            merge: false,
+            output_root: path
+                .parent()
+                .map(|parent| parent.join("out"))
+                .unwrap_or_else(|| PathBuf::from("out")),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: false,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+                write_manifest: false,
+            },
+            log: LogPolicy {
+                root: path
+                    .parent()
+                    .map(|parent| parent.join("logs"))
+                    .unwrap_or_else(|| PathBuf::from("logs")),
+                write_for_blocked: true,
+                write_json_log: false,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Enabled,
+                generate_cue: false,
+            },
+            failure_policy: FailurePolicy::AllowPartialAlbum,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    fn write_minimal_bluray_layout(root: &Path) {
+        let bdmv = root.join("BDMV");
+        fs::create_dir_all(bdmv.join("PLAYLIST")).expect("create PLAYLIST");
+        fs::create_dir_all(bdmv.join("STREAM")).expect("create STREAM");
+        fs::write(bdmv.join("index.bdmv"), b"index").expect("write index.bdmv");
+        fs::write(bdmv.join("MovieObject.bdmv"), b"movie").expect("write MovieObject.bdmv");
+        fs::write(bdmv.join("PLAYLIST").join("00000.mpls"), b"playlist")
+            .expect("write playlist");
+        fs::write(bdmv.join("STREAM").join("00000.m2ts"), b"stream").expect("write stream");
+    }
+
+    fn queued_item<'a>(manager: &'a ConversionManager, item_id: &str) -> ConversionItem {
+        let queue = manager.queue.try_read().expect("queue read lock");
+        queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id.as_str() == item_id)
+            .cloned()
+            .expect("queued item exists")
+    }
+
+    #[test]
+    fn ready_queue_admission_accepts_bluray_disc_root_with_pipeline_settings() {
+        let temp = TempDir::new("disc-root");
+        write_minimal_bluray_layout(&temp.path);
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+
+        let item_id = manager
+            .add_file_ready_for_processing(temp.path.clone(), ready_options(), None)
+            .expect("Blu-ray directory should pass queue admission");
+
+        let item = queued_item(&manager, &item_id);
+        assert_eq!(item.input_path.as_path(), temp.path.as_path());
+        assert_eq!(item.input_format, FileFormat::SevenZip);
+        assert!(matches!(&item.status, ConversionStatus::Queued));
+        assert!(item.pipeline_settings.is_some());
+        assert!(item.options.pipeline_settings.is_some());
+    }
+
+    #[test]
+    fn ready_queue_admission_accepts_bdmv_directory_with_pipeline_settings() {
+        let temp = TempDir::new("bdmv-dir");
+        write_minimal_bluray_layout(&temp.path);
+        let bdmv = temp.path.join("BDMV");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+
+        let item_id = manager
+            .add_file_ready_for_processing(bdmv.clone(), ready_options(), None)
+            .expect("BDMV directory should pass queue admission");
+
+        let item = queued_item(&manager, &item_id);
+        assert_eq!(item.input_path.as_path(), bdmv.as_path());
+        assert_eq!(item.input_format, FileFormat::SevenZip);
+        assert!(matches!(&item.status, ConversionStatus::Queued));
+        assert!(item.pipeline_settings.is_some());
+        assert!(item.options.pipeline_settings.is_some());
+    }
+
+    #[test]
+    fn ready_queue_admission_rejects_missing_pipeline_handoff_without_inserting() {
+        let temp = TempDir::new("missing-settings");
+        let input = temp.path.join("track.flac");
+        fs::write(&input, b"not real audio").expect("write input placeholder");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+
+        let err = manager
+            .add_file_ready_for_processing(input, ConversionOptions::default(), None)
+            .expect_err("ready insertion without settings must fail")
+            .to_string();
+
+        assert!(
+            err.contains("ready queue insertion requires exact PipelineSettings")
+                && !err.contains("PipelineRequest"),
+            "unexpected error: {err}"
+        );
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert_eq!(queue.total_items(), 0);
+    }
+
+    #[test]
+    fn ready_queue_admission_with_pipeline_request_succeeds_without_pipeline_settings() {
+        let temp = TempDir::new("request-ready");
+        let input = temp.path.join("track.flac");
+        fs::write(&input, b"not real audio").expect("write input placeholder");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        let request = pipeline_request_for(&input, "request-item-1");
+
+        let item_id = manager
+            .add_file_ready_for_processing_with_pipeline_request(
+                input.clone(),
+                ConversionOptions::default(),
+                request,
+                None,
+            )
+            .expect("prebuilt PipelineRequest should pass ready admission");
+
+        assert_eq!(item_id, "request-item-1");
+        let item = queued_item(&manager, &item_id);
+        assert_eq!(item.input_path.as_path(), input.as_path());
+        assert!(matches!(&item.status, ConversionStatus::Queued));
+        assert!(item.pipeline_request.is_some());
+        assert!(item.pipeline_settings.is_none());
+        assert!(item.options.pipeline_settings.is_none());
+    }
+
+    #[test]
+    fn ready_queue_admission_with_pipeline_request_rejects_empty_item_id_without_inserting() {
+        let temp = TempDir::new("request-empty-id");
+        let input = temp.path.join("track.flac");
+        fs::write(&input, b"not real audio").expect("write input placeholder");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        let request = pipeline_request_for(&input, "");
+
+        let err = manager
+            .add_file_ready_for_processing_with_pipeline_request(
+                input,
+                ConversionOptions::default(),
+                request,
+                None,
+            )
+            .expect_err("empty PipelineRequest item_id must fail")
+            .to_string();
+
+        assert!(
+            err.contains("prebuilt PipelineRequest item_id must be non-empty"),
+            "unexpected error: {err}"
+        );
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert_eq!(queue.total_items(), 0);
+    }
+
+    #[test]
+    fn ready_queue_admission_with_pipeline_request_rejects_existing_item_id_without_inserting() {
+        let temp = TempDir::new("request-id-collision");
+        let first = temp.path.join("first.flac");
+        let second = temp.path.join("second.flac");
+        fs::write(&first, b"not real audio").expect("write first placeholder");
+        fs::write(&second, b"not real audio").expect("write second placeholder");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+
+        manager
+            .add_file_ready_for_processing_with_pipeline_request(
+                first.clone(),
+                ConversionOptions::default(),
+                pipeline_request_for(&first, "duplicate-request-id"),
+                None,
+            )
+            .expect("first request should insert");
+
+        let err = manager
+            .add_file_ready_for_processing_with_pipeline_request(
+                second.clone(),
+                ConversionOptions::default(),
+                pipeline_request_for(&second, "duplicate-request-id"),
+                None,
+            )
+            .expect_err("duplicate PipelineRequest item_id must fail")
+            .to_string();
+
+        assert!(
+            err.contains("prebuilt PipelineRequest item_id 'duplicate-request-id' already exists"),
+            "unexpected error: {err}"
+        );
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert_eq!(queue.total_items(), 1);
+    }
+
+    #[test]
+    fn ready_queue_admission_with_pipeline_request_rejects_archive_password_mismatch() {
+        let temp = TempDir::new("request-password-mismatch");
+        let input = temp.path.join("track.flac");
+        fs::write(&input, b"not real audio").expect("write input placeholder");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        let mut request = pipeline_request_for(&input, "request-password-mismatch");
+        request.source.archive_password = Some(crate::convert::pipeline::SecretString::new(
+            "request-secret",
+        ));
+
+        let err = manager
+            .add_file_ready_for_processing_with_pipeline_request(
+                input,
+                ConversionOptions::default(),
+                request,
+                Some("queue-secret".to_string()),
+            )
+            .expect_err("queue password must not conflict with PipelineRequest")
+            .to_string();
+
+        assert!(
+            err.contains(
+                "queue archive_password must be omitted or match request.source.archive_password"
+            ),
+            "unexpected error: {err}"
+        );
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert_eq!(queue.total_items(), 0);
+    }
+
+    #[test]
+    fn ready_queue_admission_with_pipeline_request_rejects_cue_sidecar_override_mismatch() {
+        let temp = TempDir::new("request-cue-mismatch");
+        let input = temp.path.join("track.flac");
+        fs::write(&input, b"not real audio").expect("write input placeholder");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        let request = pipeline_request_for(&input, "request-cue-mismatch");
+
+        let err = manager
+            .add_file_ready_for_processing_with_pipeline_request_and_cue_sidecar_override(
+                input,
+                ConversionOptions::default(),
+                request,
+                None,
+                Some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly),
+            )
+            .expect_err("queue CUE policy must not conflict with PipelineRequest")
+            .to_string();
+
+        assert!(
+            err.contains(
+                "queue CUE sidecar override must be omitted or match request.source.cue_sidecar"
+            ),
+            "unexpected error: {err}"
+        );
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert_eq!(queue.total_items(), 0);
+    }
+
+    #[test]
+    fn ready_queue_admission_with_pipeline_request_accepts_bluray_root_bdmv_identity() {
+        let temp = TempDir::new("request-bdmv-identity");
+        write_minimal_bluray_layout(&temp.path);
+        let bdmv = temp.path.join("BDMV");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        let request = pipeline_request_for(&temp.path, "request-bluray-identity");
+
+        let item_id = manager
+            .add_file_ready_for_processing_with_pipeline_request(
+                bdmv.clone(),
+                ConversionOptions::default(),
+                request,
+                None,
+            )
+            .expect("Blu-ray root and BDMV child should share queue identity");
+
+        let item = queued_item(&manager, &item_id);
+        assert_eq!(item.input_path.as_path(), bdmv.as_path());
+        assert!(item.pipeline_request.is_some());
+        assert!(item.pipeline_settings.is_none());
+    }
+
+    #[test]
+    fn ready_queue_admission_with_pipeline_request_rejects_path_mismatch_without_inserting() {
+        let temp = TempDir::new("request-mismatch");
+        let input = temp.path.join("track.flac");
+        let other = temp.path.join("other.flac");
+        fs::write(&input, b"not real audio").expect("write input placeholder");
+        fs::write(&other, b"not real audio").expect("write other placeholder");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        let request = pipeline_request_for(&other, "request-mismatch");
+
+        let err = manager
+            .add_file_ready_for_processing_with_pipeline_request(
+                input,
+                ConversionOptions::default(),
+                request,
+                None,
+            )
+            .expect_err("mismatched request container must fail")
+            .to_string();
+
+        assert!(
+            err.contains("prebuilt PipelineRequest container")
+                && err.contains("does not match ready queue path"),
+            "unexpected error: {err}"
+        );
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert_eq!(queue.total_items(), 0);
+    }
+
+    #[test]
+    fn ready_queue_admission_keeps_iso_extension_admission_and_settings() {
+        let temp = TempDir::new("iso-admission");
+        let iso = temp.path.join("candidate.iso");
+        fs::write(&iso, b"not a real Blu-ray fixture").expect("write iso placeholder");
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+
+        let item_id = manager
+            .add_file_ready_for_processing(iso.clone(), ready_options(), None)
+            .expect(".iso extension admission should remain queueable");
+
+        let item = queued_item(&manager, &item_id);
+        assert_eq!(item.input_path.as_path(), iso.as_path());
+        assert_eq!(item.input_format, FileFormat::SevenZip);
+        assert!(matches!(&item.status, ConversionStatus::Queued));
+        assert!(item.pipeline_settings.is_some());
+        assert!(item.options.pipeline_settings.is_some());
+    }
+
+    #[test]
+    fn queue_identity_normalizes_bluray_root_and_bdmv_child_both_directions() {
+        let temp = TempDir::new("identity");
+        write_minimal_bluray_layout(&temp.path);
+        let bdmv = temp.path.join("BDMV");
+
+        assert_eq!(queue_identity_path(&temp.path), queue_identity_path(&bdmv));
+        assert_eq!(queue_identity_path(&bdmv), queue_identity_path(&temp.path));
+    }
+
+    #[test]
+    fn queue_identity_preserves_ordinary_canonical_path_behavior() {
+        let temp = TempDir::new("ordinary-identity");
+        let first = temp.path.join("one.flac");
+        let second = temp.path.join("two.flac");
+        fs::write(&first, b"one").expect("write first");
+        fs::write(&second, b"two").expect("write second");
+
+        assert_eq!(
+            queue_identity_path(&first),
+            queue_identity_path(&temp.path.join(".").join("one.flac"))
+        );
+        assert_ne!(queue_identity_path(&first), queue_identity_path(&second));
+    }
 }
 
 #[cfg(test)]
