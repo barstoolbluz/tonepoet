@@ -5,6 +5,9 @@ pub mod dvda_utils;
 pub mod dvda_mapper;
 pub mod dvdv_utils;
 pub mod dvdv_mapper;
+pub mod bluray_backend;
+pub mod bluray_backend_libbluray;
+pub mod bluray_utils;
 pub mod sacd_mapper;
 
 pub use model::*;

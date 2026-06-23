@@ -38,10 +38,13 @@
         nativeBuildInputs = with pkgs; [
           rustToolchain
           pkg-config
+          rustPlatform.bindgenHook
         ];
 
         buildInputs = with pkgs; [
           openssl
+          libbluray
+          libudfread
         ];
 
         # opus-tools — fix missing __opus_check_int/_ptr inline helpers
