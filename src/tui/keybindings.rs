@@ -805,6 +805,8 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                     | EntryKind::DvdAudioDir
                     | EntryKind::DvdVideoIso
                     | EntryKind::DvdVideoDir
+                    | EntryKind::BlurayIso
+                    | EntryKind::BlurayDir
                     | EntryKind::OtherFile => {
                         // Toggle selection — converting is via context menu or :queue.
                         app.browse.toggle_selection();

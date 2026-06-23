@@ -73,15 +73,31 @@ pub enum EntryKind {
     /// Filesystem DVD-Video directory (contains VIDEO_TS/VIDEO_TS.IFO and no
     /// non-empty AUDIO_TS DVD-Audio root).
     DvdVideoDir,
+    /// Blu-ray ISO image.
+    BlurayIso,
+    /// Filesystem Blu-ray directory (contains BDMV/).
+    BlurayDir,
     /// Any other file
     OtherFile,
 }
 
-/// Metadata fingerprint for bounded DVD-Audio classification caches.
-/// Compared by len + mtime so unchanged ISOs are not re-probed.
+/// Metadata fingerprint for bounded classification caches.
+///
+/// Simple file-like entries compare by length and mtime. Directory formats may
+/// attach marker fingerprints so cached negative classifications become stale
+/// when any detection-relevant child appears or changes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassificationFingerprint {
     pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub markers: Vec<ClassificationMarkerFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassificationMarkerFingerprint {
+    pub label: &'static str,
+    pub path: Option<PathBuf>,
+    pub len: Option<u64>,
     pub modified: Option<std::time::SystemTime>,
 }
 
@@ -90,6 +106,15 @@ impl ClassificationFingerprint {
         Self {
             len: entry.size,
             modified: entry.modified,
+            markers: Vec::new(),
+        }
+    }
+
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            markers: Vec::new(),
         }
     }
 }
@@ -193,7 +218,17 @@ impl FormatFilter {
     pub fn allows(&self, kind: &EntryKind) -> bool {
         match self {
             Self::Off => true,
-            Self::AudioOnly => matches!(kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir),
+            Self::AudioOnly => matches!(
+                kind,
+                EntryKind::AudioFile(_)
+                    | EntryKind::SacdIso
+                    | EntryKind::DvdAudioIso
+                    | EntryKind::DvdAudioDir
+                    | EntryKind::DvdVideoIso
+                    | EntryKind::DvdVideoDir
+                    | EntryKind::BlurayIso
+                    | EntryKind::BlurayDir
+            ),
             Self::Only(fmt) => matches!(kind, EntryKind::AudioFile(f) if f == fmt),
         }
     }
@@ -208,7 +243,17 @@ impl FormatFilter {
         match self {
             Self::Off => true,
             Self::AudioOnly => {
-                matches!(entry.kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir)
+                matches!(
+                    entry.kind,
+                    EntryKind::AudioFile(_)
+                        | EntryKind::SacdIso
+                        | EntryKind::DvdAudioIso
+                        | EntryKind::DvdAudioDir
+                        | EntryKind::DvdVideoIso
+                        | EntryKind::DvdVideoDir
+                        | EntryKind::BlurayIso
+                        | EntryKind::BlurayDir
+                )
                     || is_cue_sheet_path(&entry.path)
             }
             Self::Only(fmt) => matches!(entry.kind, EntryKind::AudioFile(f) if f == *fmt),
@@ -453,8 +498,25 @@ impl BrowseEntry {
         matches!(self.kind, EntryKind::DvdVideoDir)
     }
 
+    pub fn is_bluray_iso(&self) -> bool {
+        matches!(self.kind, EntryKind::BlurayIso)
+    }
+
+    pub fn is_bluray_dir(&self) -> bool {
+        matches!(self.kind, EntryKind::BlurayDir)
+    }
+
     pub fn is_disc_source(&self) -> bool {
-        matches!(self.kind, EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir)
+        matches!(
+            self.kind,
+            EntryKind::SacdIso
+                | EntryKind::DvdAudioIso
+                | EntryKind::DvdAudioDir
+                | EntryKind::DvdVideoIso
+                | EntryKind::DvdVideoDir
+                | EntryKind::BlurayIso
+                | EntryKind::BlurayDir
+        )
     }
 
     /// Probe-pipeline gate: entries this returns `true` for produce
@@ -479,11 +541,13 @@ impl BrowseEntry {
             EntryKind::Directory => "dir".to_string(),
             EntryKind::DvdAudioDir => "dvda-dir".to_string(),
             EntryKind::DvdVideoDir => "dvdv-dir".to_string(),
+            EntryKind::BlurayDir => "bluray-dir".to_string(),
             EntryKind::AudioFile(fmt) => fmt.name().to_string(),
             EntryKind::Archive => archive_label(&self.path),
             EntryKind::SacdIso => "sacd".to_string(),
             EntryKind::DvdAudioIso => "dvda".to_string(),
             EntryKind::DvdVideoIso => "dvdv".to_string(),
+            EntryKind::BlurayIso => "bluray".to_string(),
             EntryKind::OtherFile => self
                 .path
                 .extension()
@@ -598,6 +662,12 @@ pub struct BrowseState {
     /// Cache of DVD-Video directory classifications keyed by path + IFO len + mtime.
     pub dvdv_dir_classify_cache: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
 
+    /// Cache of Blu-ray ISO classifications keyed by path + len + mtime.
+    pub bluray_iso_classify_cache: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+
+    /// Cache of Blu-ray directory classifications keyed by path plus detection-relevant BDMV marker fingerprints.
+    pub bluray_dir_classify_cache: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+
     /// Async unified disc parse cache with fingerprinted success/error entries.
     pub disc_probe_cache: HashMap<PathBuf, DiscProbeCacheEntry>,
 
@@ -704,6 +774,8 @@ impl BrowseState {
             dvda_dir_classify_cache: HashMap::new(),
             dvdv_iso_classify_cache: HashMap::new(),
             dvdv_dir_classify_cache: HashMap::new(),
+            bluray_iso_classify_cache: HashMap::new(),
+            bluray_dir_classify_cache: HashMap::new(),
             disc_probe_cache: HashMap::new(),
             disc_probe_pending: std::collections::HashSet::new(),
             disc_probe_followup: HashMap::new(),
@@ -965,7 +1037,13 @@ impl BrowseState {
                         is_broken_symlink,
                     );
 
-                    if matches!(kind, EntryKind::Directory) {
+                    if matches!(
+                        kind,
+                        EntryKind::Directory
+                            | EntryKind::DvdAudioDir
+                            | EntryKind::DvdVideoDir
+                            | EntryKind::BlurayDir
+                    ) {
                         self.all_dirs.push(browse_entry);
                     } else {
                         self.all_files.push(browse_entry);
@@ -979,8 +1057,8 @@ impl BrowseState {
     }
 
     /// Walk `all_files` and upgrade any `EntryKind::Archive` entry
-    /// whose extension is `.iso` to `EntryKind::SacdIso` if a
-    /// ScarletBook magic-byte probe succeeds.
+    /// whose extension is `.iso` to a supported disc-image kind when
+    /// the corresponding bounded source check succeeds.
     ///
     /// Uses `sacd_classify_cache` to skip the disk probe when the
     /// (path, mtime) pair has been seen before. The cache stays
@@ -1051,7 +1129,7 @@ impl BrowseState {
                 continue;
             }
 
-            // DVD-Video last: hybrids are intentionally excluded by dvdv_utils,
+            // DVD-Video third: hybrids are intentionally excluded by dvdv_utils,
             // so DVD-Audio wins when both AUDIO_TS and VIDEO_TS exist.
             let is_dvdv = self
                 .dvdv_iso_classify_cache
@@ -1066,15 +1144,34 @@ impl BrowseState {
                 });
             if is_dvdv {
                 entry.kind = EntryKind::DvdVideoIso;
+                continue;
+            }
+
+            // Blu-ray last so DVD-Audio/DVD-Video keep priority on any
+            // malformed or hybrid image that happens to expose Blu-ray markers.
+            let is_bluray = self
+                .bluray_iso_classify_cache
+                .get(&entry.path)
+                .filter(|(cached, _)| *cached == fingerprint)
+                .map(|(_, verdict)| *verdict)
+                .unwrap_or_else(|| {
+                    let verdict = crate::disc::bluray_utils::is_bluray_iso(&entry.path);
+                    self.bluray_iso_classify_cache
+                        .insert(entry.path.clone(), (fingerprint.clone(), verdict));
+                    verdict
+                });
+            if is_bluray {
+                entry.kind = EntryKind::BlurayIso;
             }
         }
     }
 
-    /// Classify scanned directory entries that are DVD-Audio roots.
+    /// Classify scanned directory entries that are disc roots.
     pub(super) fn classify_dvda_directory_entries(&mut self) {
         for entry in self.all_dirs.iter_mut() {
             classify_dvda_directory_entry(entry, &mut self.dvda_dir_classify_cache);
             classify_dvdv_directory_entry(entry, &mut self.dvdv_dir_classify_cache);
+            classify_bluray_directory_entry(entry, &mut self.bluray_dir_classify_cache);
         }
     }
 
@@ -1082,6 +1179,7 @@ impl BrowseState {
         for entry in dirs.iter_mut() {
             classify_dvda_directory_entry(entry, &mut self.dvda_dir_classify_cache);
             classify_dvdv_directory_entry(entry, &mut self.dvdv_dir_classify_cache);
+            classify_bluray_directory_entry(entry, &mut self.bluray_dir_classify_cache);
         }
     }
 
@@ -2194,6 +2292,8 @@ fn scan_directory_blocking(
             } else if crate::disc::dvdv_utils::is_dvdv_directory(&path) {
                 EntryKind::DvdVideoDir
             } else {
+                // Blu-ray directory detection is routed through the
+                // browse-state classification cache after the scan completes.
                 EntryKind::Directory
             }
         } else {
@@ -2210,7 +2310,13 @@ fn scan_directory_blocking(
             is_broken_symlink,
         );
 
-        if matches!(kind, EntryKind::Directory) {
+        if matches!(
+            kind,
+            EntryKind::Directory
+                | EntryKind::DvdAudioDir
+                | EntryKind::DvdVideoDir
+                | EntryKind::BlurayDir
+        ) {
             dirs.push(browse_entry);
         } else {
             files.push(browse_entry);
@@ -2235,7 +2341,13 @@ fn entry_passes_view(
     // Format filter (only applies to non-directory entries). Use the
     // path-aware check so `.cue` stays visible as a convertible source under
     // AudioOnly without widening the filter to all `OtherFile` entries.
-    if !matches!(entry.kind, EntryKind::Directory | EntryKind::DvdAudioDir | EntryKind::DvdVideoDir) && !format_filter.allows_entry(entry) {
+    if !matches!(
+        entry.kind,
+        EntryKind::Directory
+            | EntryKind::DvdAudioDir
+            | EntryKind::DvdVideoDir
+            | EntryKind::BlurayDir
+    ) && !format_filter.allows_entry(entry) {
         return false;
     }
     // Text filter (case-insensitive substring)
@@ -2296,7 +2408,13 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
         EntryKind::AudioFile(AudioFormat::Ac3) => 21,
         EntryKind::AudioFile(AudioFormat::Ape) => 22,
         EntryKind::AudioFile(AudioFormat::Lpcm) => 23,
-        EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir => 25,
+        EntryKind::SacdIso
+        | EntryKind::DvdAudioIso
+        | EntryKind::DvdAudioDir
+        | EntryKind::DvdVideoIso
+        | EntryKind::DvdVideoDir
+        | EntryKind::BlurayIso
+        | EntryKind::BlurayDir => 25,
         EntryKind::Archive => 25,
         EntryKind::OtherFile => 30,
     }
@@ -3118,7 +3236,7 @@ fn classify_dvda_directory_entry(
     let marker = entry.path.join("AUDIO_TS").join("AUDIO_TS.IFO");
     let fingerprint = std::fs::metadata(&marker)
         .ok()
-        .map(|m| ClassificationFingerprint { len: m.len(), modified: m.modified().ok() })
+        .map(|m| ClassificationFingerprint::from_metadata(&m))
         .unwrap_or_else(|| ClassificationFingerprint::from_entry(entry));
 
     let is_dvda = cache
@@ -3148,7 +3266,7 @@ fn classify_dvdv_directory_entry(
     let fingerprint = marker
         .as_ref()
         .and_then(|marker| std::fs::metadata(marker).ok())
-        .map(|m| ClassificationFingerprint { len: m.len(), modified: m.modified().ok() })
+        .map(|m| ClassificationFingerprint::from_metadata(&m))
         .unwrap_or_else(|| ClassificationFingerprint::from_entry(entry));
 
     let is_dvdv = cache
@@ -3167,8 +3285,83 @@ fn classify_dvdv_directory_entry(
     }
 }
 
+fn classify_bluray_directory_entry(
+    entry: &mut BrowseEntry,
+    cache: &mut HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+) {
+    if !matches!(entry.kind, EntryKind::Directory | EntryKind::BlurayDir) {
+        return;
+    }
+    let fingerprint = bluray_directory_classification_fingerprint(entry);
+
+    let is_bluray = cache
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::disc::bluray_utils::is_bluray_directory(&entry.path);
+            cache.insert(entry.path.clone(), (fingerprint.clone(), verdict));
+            verdict
+        });
+    if is_bluray {
+        entry.kind = EntryKind::BlurayDir;
+    } else if matches!(entry.kind, EntryKind::BlurayDir) {
+        entry.kind = EntryKind::Directory;
+    }
+}
+
+fn bluray_directory_classification_fingerprint(entry: &BrowseEntry) -> ClassificationFingerprint {
+    let Some(paths) = crate::disc::bluray_utils::bluray_directory_layout_paths(&entry.path) else {
+        return ClassificationFingerprint::from_entry(entry);
+    };
+
+    let mut fingerprint = paths
+        .index
+        .as_ref()
+        .and_then(|marker| std::fs::metadata(marker).ok())
+        .or_else(|| std::fs::metadata(&paths.bdmv).ok())
+        .map(|metadata| ClassificationFingerprint::from_metadata(&metadata))
+        .unwrap_or_else(|| ClassificationFingerprint::from_entry(entry));
+
+    fingerprint.markers = vec![
+        classification_marker_fingerprint("BDMV", Some(paths.bdmv)),
+        classification_marker_fingerprint("index.bdmv", paths.index),
+        classification_marker_fingerprint("MovieObject.bdmv", paths.movie_object),
+        classification_marker_fingerprint("PLAYLIST", paths.playlist_dir),
+        classification_marker_fingerprint("STREAM", paths.stream_dir),
+        classification_marker_fingerprint("first .mpls", paths.first_playlist),
+        classification_marker_fingerprint("first .m2ts", paths.first_stream),
+    ];
+
+    fingerprint
+}
+
+fn classification_marker_fingerprint(
+    label: &'static str,
+    path: Option<PathBuf>,
+) -> ClassificationMarkerFingerprint {
+    let metadata = path.as_ref().and_then(|path| std::fs::metadata(path).ok());
+    ClassificationMarkerFingerprint {
+        label,
+        path,
+        len: metadata.as_ref().map(std::fs::Metadata::len),
+        modified: metadata.and_then(|metadata| metadata.modified().ok()),
+    }
+}
+
 fn is_audio_filter_visible_entry(entry: &BrowseEntry) -> bool {
-    matches!(entry.kind, EntryKind::AudioFile(_) | EntryKind::SacdIso | EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir | EntryKind::Directory)
+    matches!(
+        entry.kind,
+        EntryKind::AudioFile(_)
+            | EntryKind::SacdIso
+            | EntryKind::DvdAudioIso
+            | EntryKind::DvdAudioDir
+            | EntryKind::DvdVideoIso
+            | EntryKind::DvdVideoDir
+            | EntryKind::BlurayIso
+            | EntryKind::BlurayDir
+            | EntryKind::Directory
+    )
         || is_cue_sheet_path(&entry.path)
 }
 
@@ -3184,8 +3377,8 @@ fn is_audio_file_path(path: &Path) -> bool {
 }
 
 /// A file is queueable for conversion if it's an audio file, a CUE sheet,
-/// a supported archive (7z), or a valid SACD ISO. Generic ISOs, zips, rars,
-/// etc. that the pipeline can't handle are excluded to avoid noisy queue errors.
+/// a supported archive (7z), or a supported disc ISO. Generic ISOs, zips,
+/// rars, etc. that the pipeline can't handle are excluded to avoid noisy queue errors.
 fn is_queueable_file(path: &Path) -> bool {
     if is_cue_sheet_path(path) {
         return true;
@@ -3202,10 +3395,11 @@ fn is_queueable_file(path: &Path) -> bool {
             match ext.as_deref() {
                 // 7z archives are always queueable (pipeline supports them).
                 Some("7z") => true,
-                // ISOs are only queueable if they're SACD ISOs.
+                // ISOs are only queueable if they're supported disc images.
                 Some("iso") => crate::tui::sacd::is_sacd_iso(path)
                     || crate::disc::dvda_utils::is_dvda_iso(path)
-                    || crate::disc::dvdv_utils::is_dvdv_iso(path),
+                    || crate::disc::dvdv_utils::is_dvdv_iso(path)
+                    || crate::disc::bluray_utils::is_bluray_iso(path),
                 // Other archive formats (zip, rar, tar, etc.) are not
                 // supported by the conversion pipeline.
                 _ => false,
@@ -3334,6 +3528,9 @@ mod tests {
         let mut state = BrowseState::new();
         state.all_files.clear();
         state.sacd_classify_cache.clear();
+        state.dvda_iso_classify_cache.clear();
+        state.dvdv_iso_classify_cache.clear();
+        state.bluray_iso_classify_cache.clear();
         let meta = std::fs::metadata(path).expect("metadata");
         let modified = meta.modified().ok();
         state.all_files.push(BrowseEntry::new(
@@ -3344,6 +3541,33 @@ mod tests {
             modified,
         ));
         state
+    }
+
+    fn make_valid_bluray_layout(
+        root: &std::path::Path,
+        bdmv_name: &str,
+        index_name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let bdmv = root.join(bdmv_name);
+        let playlist = bdmv.join("PLAYLIST");
+        let stream = bdmv.join("STREAM");
+        std::fs::create_dir_all(&playlist).expect("create PLAYLIST");
+        std::fs::create_dir_all(&stream).expect("create STREAM");
+        let index = bdmv.join(index_name);
+        std::fs::write(&index, b"index").expect("write index");
+        std::fs::write(bdmv.join("MovieObject.bdmv"), b"movie object")
+            .expect("write MovieObject");
+        std::fs::write(playlist.join("00000.mpls"), b"playlist").expect("write playlist");
+        std::fs::write(stream.join("00000.m2ts"), b"stream").expect("write stream");
+        (bdmv, index)
+    }
+
+    fn marker_len(fingerprint: &ClassificationFingerprint, label: &'static str) -> Option<u64> {
+        fingerprint
+            .markers
+            .iter()
+            .find(|marker| marker.label == label)
+            .and_then(|marker| marker.len)
     }
 
     #[test]
@@ -3426,7 +3650,7 @@ mod tests {
     }
 
     #[test]
-    fn is_probeable_covers_audio_files_and_sacd_isos() {
+    fn is_probeable_covers_audio_files_and_disc_sources() {
         let entry_with_kind = |kind: EntryKind| {
             BrowseEntry::new(
                 std::path::PathBuf::from("/tmp/x"),
@@ -3437,11 +3661,17 @@ mod tests {
             )
         };
 
-        // Probeable: audio files (any format) and SACD ISOs.
+        // Probeable: audio files (any format) and supported disc sources.
         assert!(entry_with_kind(EntryKind::AudioFile(AudioFormat::Flac)).is_probeable());
         assert!(entry_with_kind(EntryKind::AudioFile(AudioFormat::Wav)).is_probeable());
         assert!(entry_with_kind(EntryKind::AudioFile(AudioFormat::Mp3)).is_probeable());
         assert!(entry_with_kind(EntryKind::SacdIso).is_probeable());
+        assert!(entry_with_kind(EntryKind::DvdAudioIso).is_probeable());
+        assert!(entry_with_kind(EntryKind::DvdAudioDir).is_probeable());
+        assert!(entry_with_kind(EntryKind::DvdVideoIso).is_probeable());
+        assert!(entry_with_kind(EntryKind::DvdVideoDir).is_probeable());
+        assert!(entry_with_kind(EntryKind::BlurayIso).is_probeable());
+        assert!(entry_with_kind(EntryKind::BlurayDir).is_probeable());
 
         // Not probeable: directories, archives (data ISOs included here),
         // other files. The probe pipeline produces no useful output for
@@ -3450,6 +3680,338 @@ mod tests {
         assert!(!entry_with_kind(EntryKind::Archive).is_probeable());
         assert!(!entry_with_kind(EntryKind::OtherFile).is_probeable());
         assert!(!entry_with_kind(EntryKind::ParentDir).is_probeable());
+    }
+
+    #[test]
+    fn audio_only_filter_keeps_bluray_sources_visible() {
+        assert!(FormatFilter::AudioOnly.allows(&EntryKind::BlurayIso));
+        assert!(FormatFilter::AudioOnly.allows(&EntryKind::BlurayDir));
+
+        let bluray_dir = BrowseEntry::new(
+            std::path::PathBuf::from("/tmp/movie"),
+            "movie".to_string(),
+            EntryKind::BlurayDir,
+            0,
+            None,
+        );
+        assert!(FormatFilter::AudioOnly.allows_entry(&bluray_dir));
+        assert!(is_audio_filter_visible_entry(&bluray_dir));
+    }
+
+    #[test]
+    fn blu_ray_iso_classification_runs_after_dvd_audio_and_dvd_video() {
+        let source = include_str!("browse.rs");
+        let start = source
+            .find("pub(super) fn upgrade_iso_kinds")
+            .expect("upgrade_iso_kinds source");
+        let tail = &source[start..];
+        let end = tail
+            .find("/// Classify scanned directory entries")
+            .expect("end of upgrade_iso_kinds source");
+        let upgrade_iso_kinds = &tail[..end];
+
+        let sacd = upgrade_iso_kinds.find("is_sacd_iso").expect("SACD classifier");
+        let dvda = upgrade_iso_kinds.find("is_dvda_iso").expect("DVD-Audio classifier");
+        let dvdv = upgrade_iso_kinds.find("is_dvdv_iso").expect("DVD-Video classifier");
+        let bluray = upgrade_iso_kinds.find("is_bluray_iso").expect("Blu-ray classifier");
+
+        assert!(sacd < dvda, "SACD must keep first priority");
+        assert!(dvda < dvdv, "DVD-Audio must win DVD-Audio/DVD-Video hybrids");
+        assert!(dvdv < bluray, "Blu-ray ISO classification must run after DVD-Video");
+    }
+
+    #[test]
+    fn classify_bluray_directory_entry_marks_valid_root() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
+
+        let meta = std::fs::metadata(&root).expect("metadata");
+        let mut entry = BrowseEntry::new(
+            root.clone(),
+            "movie".to_string(),
+            EntryKind::Directory,
+            meta.len(),
+            meta.modified().ok(),
+        );
+        let mut cache = std::collections::HashMap::new();
+
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+
+        assert!(matches!(entry.kind, EntryKind::BlurayDir));
+        assert_eq!(cache.get(&root).map(|(_, verdict)| *verdict), Some(true));
+    }
+
+    #[test]
+    fn classify_bluray_directory_cache_invalidates_negative_to_positive() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        let bdmv = root.join("BDMV");
+        std::fs::create_dir_all(&bdmv).expect("create partial BDMV");
+
+        let meta = std::fs::metadata(&root).expect("metadata");
+        let mut entry = BrowseEntry::new(
+            root.clone(),
+            "movie".to_string(),
+            EntryKind::Directory,
+            meta.len(),
+            meta.modified().ok(),
+        );
+        let mut cache = std::collections::HashMap::new();
+
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        assert!(matches!(entry.kind, EntryKind::Directory));
+        let first = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached negative verdict");
+        assert!(!first.1);
+
+        make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let second = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached positive verdict");
+
+        assert!(second.1);
+        assert_ne!(first.0, second.0);
+        assert!(matches!(entry.kind, EntryKind::BlurayDir));
+    }
+
+    #[test]
+    fn classify_bluray_directory_cache_invalidates_negative_to_positive_with_index_unchanged() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        let bdmv = root.join("BDMV");
+        std::fs::create_dir_all(&bdmv).expect("create BDMV");
+        let index = bdmv.join("index.bdmv");
+        std::fs::write(&index, b"index").expect("write index before layout is complete");
+
+        let meta = std::fs::metadata(&root).expect("metadata");
+        let mut entry = BrowseEntry::new(
+            root.clone(),
+            "movie".to_string(),
+            EntryKind::Directory,
+            meta.len(),
+            meta.modified().ok(),
+        );
+        let mut cache = std::collections::HashMap::new();
+
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let first = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached negative verdict");
+        assert!(!first.1);
+        assert!(matches!(entry.kind, EntryKind::Directory));
+
+        std::fs::write(bdmv.join("MovieObject.bdmv"), b"movie object")
+            .expect("write MovieObject");
+        let playlist = bdmv.join("PLAYLIST");
+        let stream = bdmv.join("STREAM");
+        std::fs::create_dir_all(&playlist).expect("create PLAYLIST");
+        std::fs::create_dir_all(&stream).expect("create STREAM");
+        std::fs::write(playlist.join("00000.mpls"), b"playlist").expect("write playlist");
+        std::fs::write(stream.join("00000.m2ts"), b"stream").expect("write stream");
+
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let second = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached positive verdict");
+
+        assert!(second.1);
+        assert_ne!(first.0, second.0);
+        assert_eq!(
+            marker_len(&first.0, "index.bdmv"),
+            marker_len(&second.0, "index.bdmv"),
+            "index metadata did not need to change"
+        );
+        assert!(matches!(entry.kind, EntryKind::BlurayDir));
+    }
+
+    #[test]
+    fn classify_bluray_directory_cache_invalidates_positive_to_negative() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        let (_bdmv, index) = make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
+
+        let meta = std::fs::metadata(&root).expect("metadata");
+        let mut entry = BrowseEntry::new(
+            root.clone(),
+            "movie".to_string(),
+            EntryKind::Directory,
+            meta.len(),
+            meta.modified().ok(),
+        );
+        let mut cache = std::collections::HashMap::new();
+
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let first = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached positive verdict");
+        assert!(first.1);
+        assert!(matches!(entry.kind, EntryKind::BlurayDir));
+
+        std::fs::remove_file(&index).expect("delete index marker");
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let second = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached negative verdict");
+
+        assert!(!second.1);
+        assert_ne!(first.0, second.0);
+        assert!(matches!(entry.kind, EntryKind::Directory));
+    }
+
+    #[test]
+    fn classify_bluray_directory_cache_invalidates_positive_to_negative_with_index_unchanged() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        let bdmv = root.join("BDMV");
+        let stream_file = bdmv.join("STREAM").join("00000.m2ts");
+        make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
+
+        let meta = std::fs::metadata(&root).expect("metadata");
+        let mut entry = BrowseEntry::new(
+            root.clone(),
+            "movie".to_string(),
+            EntryKind::Directory,
+            meta.len(),
+            meta.modified().ok(),
+        );
+        let mut cache = std::collections::HashMap::new();
+
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let first = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached positive verdict");
+        assert!(first.1);
+        assert!(matches!(entry.kind, EntryKind::BlurayDir));
+
+        std::fs::remove_file(&stream_file).expect("delete stream file");
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let second = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached negative verdict");
+
+        assert!(!second.1);
+        assert_ne!(first.0, second.0);
+        assert_eq!(
+            marker_len(&first.0, "index.bdmv"),
+            marker_len(&second.0, "index.bdmv"),
+            "index metadata did not need to change"
+        );
+        assert!(matches!(entry.kind, EntryKind::Directory));
+    }
+
+    #[test]
+    fn classify_bluray_directory_entry_fingerprints_case_insensitive_marker() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        let (_bdmv, index) = make_valid_bluray_layout(&root, "bdmv", "INDEX.BDMV");
+
+        let meta = std::fs::metadata(&root).expect("metadata");
+        let mut entry = BrowseEntry::new(
+            root.clone(),
+            "movie".to_string(),
+            EntryKind::Directory,
+            meta.len(),
+            meta.modified().ok(),
+        );
+        let mut cache = std::collections::HashMap::new();
+
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let first = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached initial verdict");
+        assert!(first.1);
+
+        std::fs::write(&index, b"index-with-different-length").expect("replace index");
+        entry.kind = EntryKind::Directory;
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+        let second = cache
+            .get(&root)
+            .map(|(fingerprint, verdict)| (fingerprint.clone(), *verdict))
+            .expect("cached replacement verdict");
+
+        assert!(second.1);
+        assert_ne!(first.0, second.0);
+        assert!(matches!(entry.kind, EntryKind::BlurayDir));
+    }
+
+    #[test]
+    fn classify_bluray_directory_entry_accepts_bdmv_directory_as_source() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        let (bdmv, index) = make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
+
+        let meta = std::fs::metadata(&bdmv).expect("metadata");
+        let mut entry = BrowseEntry::new(
+            bdmv.clone(),
+            "BDMV".to_string(),
+            EntryKind::Directory,
+            meta.len(),
+            meta.modified().ok(),
+        );
+        let mut cache = std::collections::HashMap::new();
+
+        classify_bluray_directory_entry(&mut entry, &mut cache);
+
+        let index_meta = std::fs::metadata(&index).expect("index metadata");
+        let cached = cache.get(&bdmv).expect("cached BDMV-source verdict");
+        assert!(matches!(entry.kind, EntryKind::BlurayDir));
+        assert_eq!(cached.1, true);
+        assert_eq!(cached.0.len, index_meta.len());
+    }
+
+    #[test]
+    fn bluray_directory_fingerprint_tracks_existing_bdmv_before_marker_exists() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        let bdmv = root.join("BDMV");
+        std::fs::create_dir_all(&bdmv).expect("create BDMV");
+
+        let meta = std::fs::metadata(&root).expect("metadata");
+        let entry = BrowseEntry::new(
+            root.clone(),
+            "movie".to_string(),
+            EntryKind::Directory,
+            meta.len(),
+            meta.modified().ok(),
+        );
+
+        let fingerprint = bluray_directory_classification_fingerprint(&entry);
+        let bdmv_meta = std::fs::metadata(&bdmv).expect("BDMV metadata");
+        assert_eq!(fingerprint.len, bdmv_meta.len());
+        assert_eq!(fingerprint.modified, bdmv_meta.modified().ok());
+    }
+
+    #[test]
+    fn scan_directory_blocking_leaves_bluray_dirs_for_cached_classifier() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("movie");
+        make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (_parent, mut dirs, _files) = scan_directory_blocking(td.path(), &cancel)
+            .expect("scan directory");
+        let entry = dirs
+            .iter_mut()
+            .find(|entry| entry.path == root)
+            .expect("scanned movie dir");
+
+        assert!(matches!(entry.kind, EntryKind::Directory));
+
+        let mut cache = std::collections::HashMap::new();
+        classify_bluray_directory_entry(entry, &mut cache);
+        assert!(matches!(entry.kind, EntryKind::BlurayDir));
     }
 
     #[test]

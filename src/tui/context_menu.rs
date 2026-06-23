@@ -252,6 +252,30 @@ fn separator() -> ContextMenuEntry {
     ContextMenuEntry::Separator
 }
 
+fn build_disc_convert_stream_submenu(
+    contents: &crate::disc::DiscContents,
+) -> Option<ContextMenuEntry> {
+    let children: Vec<_> = contents
+        .presentations
+        .iter()
+        .enumerate()
+        .filter(|(_, presentation)| {
+            crate::tui::disc_browser::presentation_supports_stream_conversion(presentation)
+        })
+        .map(|(idx, presentation)| {
+            item(
+                &format!("Stream {}: {}", idx + 1, presentation.label),
+                ContextAction::ConvertDiscStream(presentation.id.clone()),
+            )
+        })
+        .collect();
+
+    (!children.is_empty()).then_some(ContextMenuEntry::Submenu {
+        label: "Convert Stream".to_string(),
+        children,
+    })
+}
+
 /// Build the "Convert" submenu. Custom opens the Convert screen for
 /// manual review; Last Used and presets auto-commit (enqueue + start by
 /// default, enqueue-only when Shift is held — configurable via
@@ -479,14 +503,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 .get(&entry.path)
                 .and_then(|cache| cache.contents_if_current(&entry.path))
             {
-                let children: Vec<_> = contents
-                    .presentations
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, p)| item(&format!("Stream {}: {}", idx + 1, p.label), ContextAction::ConvertDiscStream(p.id.clone())))
-                    .collect();
-                if !children.is_empty() {
-                    items.push(ContextMenuEntry::Submenu { label: "Convert Stream".to_string(), children });
+                if let Some(submenu) = build_disc_convert_stream_submenu(contents.as_ref()) {
+                    items.push(submenu);
                 }
             }
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
@@ -502,7 +520,12 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_file_ops_submenu(false));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
-        EntryKind::DvdAudioIso | EntryKind::DvdAudioDir | EntryKind::DvdVideoIso | EntryKind::DvdVideoDir => {
+        EntryKind::DvdAudioIso
+        | EntryKind::DvdAudioDir
+        | EntryKind::DvdVideoIso
+        | EntryKind::DvdVideoDir
+        | EntryKind::BlurayIso
+        | EntryKind::BlurayDir => {
             items.push(item("Convert (default stream)", ContextAction::ConvertDiscDefault));
             items.push(item("Browse Audio Streams...", ContextAction::BrowseDiscStreams));
             if let Some(contents) = app
@@ -511,14 +534,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 .get(&entry.path)
                 .and_then(|cache| cache.contents_if_current(&entry.path))
             {
-                let children: Vec<_> = contents
-                    .presentations
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, p)| item(&format!("Stream {}: {}", idx + 1, p.label), ContextAction::ConvertDiscStream(p.id.clone())))
-                    .collect();
-                if !children.is_empty() {
-                    items.push(ContextMenuEntry::Submenu { label: "Convert Stream".to_string(), children });
+                if let Some(submenu) = build_disc_convert_stream_submenu(contents.as_ref()) {
+                    items.push(submenu);
                 }
             }
             items.push(separator());
@@ -1485,6 +1502,83 @@ mod tests {
                 leaf("B-leaf"),
             ],
         )
+    }
+
+    fn disc_contents_for_context_menu(
+        format: crate::disc::model::DiscFormat,
+        id: crate::disc::model::PresentationId,
+    ) -> crate::disc::DiscContents {
+        crate::disc::DiscContents {
+            format,
+            label: "disc".to_string(),
+            source_path: std::path::PathBuf::from("disc.iso"),
+            presentations: vec![crate::disc::model::DiscPresentation {
+                id,
+                label: "Selectable stream".to_string(),
+                format: crate::disc::model::AudioPresentationFormat {
+                    codec: Some("LPCM".to_string()),
+                    sample_rate: Some(96_000),
+                    bit_depth: Some(24),
+                    channels: Some(2),
+                    channel_layout: Some("Stereo".to_string()),
+                    lossless: true,
+                    provenance: crate::disc::model::FormatProvenance::IfoAttributes,
+                },
+                tracks: vec![crate::disc::model::DiscTrack {
+                    number: 1,
+                    title: None,
+                    performer: None,
+                    duration_secs: Some(60.0),
+                    format_note: None,
+                }],
+                total_duration_secs: 60.0,
+                album_title: None,
+                album_artist: None,
+                genre: None,
+                year: None,
+            }],
+            suppressed: Vec::new(),
+            copy_protection: crate::disc::model::CopyProtectionSummary {
+                description: String::new(),
+            },
+            diagnostics: Vec::new(),
+            album_title: None,
+            album_artist: None,
+            genre: None,
+            year: None,
+        }
+    }
+
+    #[test]
+    fn convert_stream_submenu_includes_supported_dvd_video_presentations() {
+        let contents = disc_contents_for_context_menu(
+            crate::disc::model::DiscFormat::DvdVideo,
+            crate::disc::model::PresentationId::dvd_video(1, 2, 0),
+        );
+
+        let submenu = build_disc_convert_stream_submenu(&contents)
+            .expect("DVD-Video stream conversion submenu");
+
+        let ContextMenuEntry::Submenu { label, children } = submenu else {
+            panic!("expected Convert Stream submenu");
+        };
+        assert_eq!(label, "Convert Stream");
+        assert_eq!(children.len(), 1);
+        let ContextMenuEntry::Item(item) = &children[0] else {
+            panic!("expected stream menu item");
+        };
+        assert!(matches!(item.action, ContextAction::ConvertDiscStream(_)));
+    }
+
+    #[test]
+    fn convert_stream_submenu_excludes_bluray_presentations_until_source_options_exist() {
+        let contents = disc_contents_for_context_menu(
+            crate::disc::model::DiscFormat::BluRay,
+            crate::disc::model::PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
+                .expect("valid Blu-ray presentation id"),
+        );
+
+        assert!(build_disc_convert_stream_submenu(&contents).is_none());
     }
 
     #[test]

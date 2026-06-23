@@ -15,8 +15,36 @@ use crate::disc::{DiscContents, PresentationId};
 use crate::tui::app::{ActiveOverlay, AppScreen, AppState, SourceMode};
 use crate::tui::button_map::TuiButton;
 use crate::tui::command::select_default_disc_presentation_index;
-use crate::tui::disc_browser::{metadata_for_disc_presentation, source_mode_for_presentation, DiscBrowserState, DiscProbeFollowup};
+use crate::tui::disc_browser::{
+    metadata_for_disc_presentation, presentation_supports_stream_conversion,
+    source_mode_for_presentation, DiscBrowserState, DiscProbeFollowup,
+};
 use crate::tui::message::AppMessage;
+
+const BLURAY_STREAM_CONVERSION_UNAVAILABLE: &str =
+    "Blu-ray stream-specific conversion is not available until Blu-ray materializer SourceOptions are implemented";
+
+fn selected_presentation_supports_stream_conversion(
+    contents: &DiscContents,
+    presentation_index: usize,
+) -> Result<bool, String> {
+    let presentation = contents
+        .presentations
+        .get(presentation_index)
+        .ok_or_else(|| format!("No disc stream at index {}", presentation_index + 1))?;
+    Ok(presentation_supports_stream_conversion(presentation))
+}
+
+fn require_selected_presentation_stream_conversion(
+    contents: &DiscContents,
+    presentation_index: usize,
+) -> Result<(), String> {
+    if selected_presentation_supports_stream_conversion(contents, presentation_index)? {
+        Ok(())
+    } else {
+        Err(BLURAY_STREAM_CONVERSION_UNAVAILABLE.to_string())
+    }
+}
 
 /// Open the Audio Streams overlay for the currently highlighted browse entry.
 ///
@@ -143,6 +171,7 @@ pub fn convert_selected_disc_stream_by_id(
         .iter()
         .position(|presentation| &presentation.id == id)
         .ok_or_else(|| format!("Stream is no longer available: {id:?}"))?;
+    require_selected_presentation_stream_conversion(contents.as_ref(), index)?;
     load_disc_presentation_for_convert(app, contents.as_ref().clone(), index)
 }
 
@@ -349,7 +378,9 @@ pub fn handle_disc_browser_key(app: &mut AppState, key: KeyEvent) {
         KeyCode::Enter => {
             let cursor = state.cursor;
             let contents = state.contents.clone();
-            match load_disc_presentation_for_convert(app, contents, cursor) {
+            match require_selected_presentation_stream_conversion(&contents, cursor)
+                .and_then(|()| load_disc_presentation_for_convert(app, contents, cursor))
+            {
                 Ok(()) => {}
                 Err(err) => {
                     app.set_status(format!("Disc stream load failed: {err}"));
@@ -437,7 +468,9 @@ pub fn convert_overlay_cursor(app: &mut AppState) {
         _ => return,
     };
 
-    if let Err(err) = load_disc_presentation_for_convert(app, contents, cursor) {
+    if let Err(err) = require_selected_presentation_stream_conversion(&contents, cursor)
+        .and_then(|()| load_disc_presentation_for_convert(app, contents, cursor))
+    {
         app.set_status(format!("Disc stream load failed: {err}"));
     }
 }
@@ -470,8 +503,8 @@ pub fn open_dvdv_metadata_editor_for_overlay_cursor(app: &mut AppState) -> Resul
 /// Trigger the async disc probe after the browse cursor/selection changes.
 ///
 /// This is the cursor-move hook required by Phase 4c: when the highlighted row
-/// becomes a SACD ISO, DVD-Audio ISO, or DVD-Audio directory, the expensive disc
-/// parse/AOB probe starts on the async `ensure_disc_probe()` path so the info
+/// becomes a SACD ISO, DVD-Audio source, DVD-Video source, or Blu-ray source,
+/// the expensive disc parse starts on the async `ensure_disc_probe()` path so the info
 /// pane can render from cache on the next redraw. This function deliberately
 /// does not force a retry for current cached errors; users use Analyze for an
 /// explicit re-probe, while changed source metadata automatically misses the

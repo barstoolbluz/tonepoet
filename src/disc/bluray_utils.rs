@@ -46,13 +46,73 @@ pub fn is_bluray_iso(path: &Path) -> bool {
 /// itself, resolving the latter to its parent for backend calls.
 #[must_use]
 pub fn is_bluray_directory(path: &Path) -> bool {
-    let Some(root) = bluray_directory_root(path) else {
+    let Some(bdmv) = bluray_bdmv_directory_path(path) else {
         return false;
     };
-    let Some(bdmv) = resolve_child_case_insensitive(&root, "BDMV") else {
-        return false;
-    };
-    bdmv.is_dir() && bdmv_has_expected_layout(&bdmv)
+    bdmv_has_expected_layout(&bdmv)
+}
+
+/// Return the resolved `BDMV` directory for a Blu-ray directory source.
+///
+/// Accepts either the disc root or the `BDMV` directory itself, and resolves
+/// the `BDMV` component case-insensitively to match Blu-ray source detection.
+#[must_use]
+pub fn bluray_bdmv_directory_path(path: &Path) -> Option<PathBuf> {
+    let root = bluray_directory_root(path)?;
+    resolve_child_case_insensitive(&root, "BDMV").filter(|bdmv| bdmv.is_dir())
+}
+
+/// Resolved Blu-ray directory paths that participate in source detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlurayDirectoryLayoutPaths {
+    pub bdmv: PathBuf,
+    pub index: Option<PathBuf>,
+    pub movie_object: Option<PathBuf>,
+    pub playlist_dir: Option<PathBuf>,
+    pub stream_dir: Option<PathBuf>,
+    pub first_playlist: Option<PathBuf>,
+    pub first_stream: Option<PathBuf>,
+}
+
+/// Return a marker file inside the resolved `BDMV` directory.
+///
+/// This uses the same root normalization and case-insensitive child lookup as
+/// `is_bluray_directory()`, so callers get the same path semantics for cache
+/// fingerprints and probe invalidation.
+#[must_use]
+pub fn bluray_directory_marker_path(path: &Path, marker_name: &str) -> Option<PathBuf> {
+    let bdmv = bluray_bdmv_directory_path(path)?;
+    resolve_child_case_insensitive(&bdmv, marker_name).filter(|marker| marker.is_file())
+}
+
+/// Return all detection-relevant Blu-ray directory paths.
+///
+/// The result accepts either the disc root or the `BDMV` directory itself and
+/// resolves required files and directories case-insensitively, matching
+/// `is_bluray_directory()`. Optional fields are deliberately present when a
+/// component is missing so callers can fingerprint negative classifications
+/// against the full predicate rather than only `index.bdmv`.
+#[must_use]
+pub fn bluray_directory_layout_paths(path: &Path) -> Option<BlurayDirectoryLayoutPaths> {
+    let bdmv = bluray_bdmv_directory_path(path)?;
+    let playlist_dir = child_dir_case_insensitive(&bdmv, "PLAYLIST");
+    let stream_dir = child_dir_case_insensitive(&bdmv, "STREAM");
+    let first_playlist = playlist_dir
+        .as_ref()
+        .and_then(|playlist| first_file_with_extension_case_insensitive(playlist, "mpls"));
+    let first_stream = stream_dir
+        .as_ref()
+        .and_then(|stream| first_file_with_extension_case_insensitive(stream, "m2ts"));
+
+    Some(BlurayDirectoryLayoutPaths {
+        bdmv,
+        index: bluray_directory_marker_path(path, "index.bdmv"),
+        movie_object: bluray_directory_marker_path(path, "MovieObject.bdmv"),
+        playlist_dir,
+        stream_dir,
+        first_playlist,
+        first_stream,
+    })
 }
 
 /// Return the disc root for a Blu-ray directory source.
@@ -146,44 +206,50 @@ fn bdmv_has_expected_layout(bdmv: &Path) -> bool {
     // partial copies, or work directories can contain one of these names. Require
     // the authored navigation files plus at least one playlist and transport
     // stream before the probe path claims Blu-ray ownership.
-    if !child_is_file_case_insensitive(bdmv, "index.bdmv") {
-        return false;
-    }
-    if !child_is_file_case_insensitive(bdmv, "MovieObject.bdmv") {
-        return false;
-    }
-
-    let Some(playlist) = child_dir_case_insensitive(bdmv, "PLAYLIST") else {
-        return false;
-    };
-    let Some(stream) = child_dir_case_insensitive(bdmv, "STREAM") else {
+    let Some(paths) = bluray_directory_layout_paths(bdmv) else {
         return false;
     };
 
-    directory_contains_extension(&playlist, "mpls") && directory_contains_extension(&stream, "m2ts")
-}
-
-fn child_is_file_case_insensitive(parent: &Path, wanted: &str) -> bool {
-    resolve_child_case_insensitive(parent, wanted).is_some_and(|path| path.is_file())
+    paths.index.is_some()
+        && paths.movie_object.is_some()
+        && paths.playlist_dir.is_some()
+        && paths.stream_dir.is_some()
+        && paths.first_playlist.is_some()
+        && paths.first_stream.is_some()
 }
 
 fn child_dir_case_insensitive(parent: &Path, wanted: &str) -> Option<PathBuf> {
     resolve_child_case_insensitive(parent, wanted).filter(|path| path.is_dir())
 }
 
-fn directory_contains_extension(dir: &Path, extension: &str) -> bool {
-    fs::read_dir(dir)
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.flatten())
-        .any(|entry| {
-            let path = entry.path();
+fn first_file_with_extension_case_insensitive(dir: &Path, extension: &str) -> Option<PathBuf> {
+    let mut matches: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
             path.is_file()
                 && path
                     .extension()
                     .and_then(|value| value.to_str())
                     .is_some_and(|candidate| candidate.eq_ignore_ascii_case(extension))
         })
+        .collect();
+
+    matches.sort_by(|left, right| {
+        let left_name = left
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let right_name = right
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        left_name
+            .cmp(&right_name)
+            .then_with(|| left.to_string_lossy().cmp(&right.to_string_lossy()))
+    });
+    matches.into_iter().next()
 }
 
 fn resolve_child_case_insensitive(parent: &Path, wanted: &str) -> Option<PathBuf> {

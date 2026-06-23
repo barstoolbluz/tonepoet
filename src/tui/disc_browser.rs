@@ -47,26 +47,28 @@ impl FileProbeFingerprint {
 
 /// Metadata snapshot used to decide whether a cached disc parse is still valid.
 ///
-/// ISO files use the image file metadata. Directory DVD-Audio and DVD-Video
-/// sources also carry their marker IFO metadata because directory mtimes alone
-/// are not a reliable proxy for disc-content changes.
+/// ISO files use the image file metadata. Directory DVD-Audio, DVD-Video, and
+/// Blu-ray sources also carry their marker metadata because directory mtimes
+/// alone are not a reliable proxy for disc-content changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscProbeFingerprint {
     pub source: FileProbeFingerprint,
     pub is_dir: bool,
     pub dvda_audio_ts_ifo: Option<FileProbeFingerprint>,
     pub dvdv_video_ts_ifo: Option<FileProbeFingerprint>,
+    pub bluray_bdmv_index: Option<FileProbeFingerprint>,
 }
 
 impl DiscProbeFingerprint {
     /// Metadata most representative of disc-content identity. For ISO files this
     /// is the image itself; for disc directories this prefers the format marker
-    /// IFO, because directory mtimes do not reliably change when an IFO is
+    /// file, because directory mtimes do not reliably change when a marker is
     /// replaced in place.
     pub fn primary_content(&self) -> &FileProbeFingerprint {
         self.dvda_audio_ts_ifo
             .as_ref()
             .or(self.dvdv_video_ts_ifo.as_ref())
+            .or(self.bluray_bdmv_index.as_ref())
             .unwrap_or(&self.source)
     }
 
@@ -83,8 +85,8 @@ impl DiscProbeFingerprint {
 ///
 /// Both successes and failures carry the same metadata fingerprint. A cached
 /// error is only authoritative while that fingerprint still matches; replacing
-/// an ISO or changing `AUDIO_TS/AUDIO_TS.IFO` for a DVD-Audio directory makes
-/// the entry stale and allows normal probing again. Explicit re-probe actions
+/// an ISO or changing a disc-directory marker makes the entry stale and allows
+/// normal probing again. Explicit re-probe actions
 /// bypass this entry by removing it before scheduling a new probe.
 #[derive(Debug, Clone)]
 pub struct DiscProbeCacheEntry {
@@ -173,12 +175,20 @@ pub fn disc_probe_fingerprint(path: &Path) -> Result<DiscProbeFingerprint, Strin
     } else {
         None
     };
+    let bluray_bdmv_index = if is_dir {
+        crate::disc::bluray_utils::bluray_directory_marker_path(path, "index.bdmv")
+            .and_then(|marker| fs::metadata(marker).ok())
+            .map(|m| FileProbeFingerprint::from_metadata(&m))
+    } else {
+        None
+    };
 
     Ok(DiscProbeFingerprint {
         source: FileProbeFingerprint::from_metadata(&metadata),
         is_dir,
         dvda_audio_ts_ifo,
         dvdv_video_ts_ifo,
+        bluray_bdmv_index,
     })
 }
 
@@ -602,6 +612,30 @@ pub fn presentation_id_label(id: &PresentationId) -> String {
     id.display_label()
 }
 
+/// Return whether the current conversion pipeline can honor a specific
+/// selected disc-presentation identity.
+///
+/// Blu-ray stream selection is deliberately disabled here until the Phase 2
+/// materializer adds explicit `SourceOptions` fields for playlist, PID, stream,
+/// and angle. Keeping this as a single predicate prevents context-menu,
+/// overlay, and source-option bridge behavior from drifting apart.
+#[must_use]
+pub fn presentation_id_supports_stream_conversion(id: &PresentationId) -> bool {
+    match id {
+        PresentationId::DvdAudioGroup(_)
+        | PresentationId::DvdVideoTitle { .. }
+        | PresentationId::SacdArea(_) => true,
+        PresentationId::BluRayTitle { .. } => false,
+    }
+}
+
+/// Return whether a presentation row can be loaded as an explicit stream
+/// conversion from UI affordances such as `Convert Stream` and `Enter Convert`.
+#[must_use]
+pub fn presentation_supports_stream_conversion(presentation: &DiscPresentation) -> bool {
+    presentation_id_supports_stream_conversion(&presentation.id)
+}
+
 
 /// One-shot action to perform after an async disc probe has populated a
 /// current `DiscProbeCacheEntry`.
@@ -619,26 +653,34 @@ pub enum DiscProbeFollowup {
 pub fn apply_presentation_to_source_options(
     options: &mut crate::convert::pipeline::SourceOptions,
     id: &PresentationId,
-) {
+) -> bool {
     match id {
         PresentationId::DvdAudioGroup(group) => {
             options.dvda_group_selection =
                 crate::convert::pipeline::DvdaGroupSelection::Group(*group);
+            true
         }
         PresentationId::DvdVideoTitle { vts_number, title_number, audio_stream_index } => {
             options.dvdv_vts = Some(*vts_number);
             options.dvdv_title = Some(*title_number);
             options.dvdv_audio_stream = Some(*audio_stream_index);
             options.dvdv_angle = Some(1);
+            true
         }
         PresentationId::SacdArea(SacdAreaId::Stereo) => {
             options.sacd_area = Some(crate::convert::pipeline::SacdArea::Stereo);
+            true
         }
         PresentationId::SacdArea(SacdAreaId::MultiChannel) => {
             options.sacd_area = Some(crate::convert::pipeline::SacdArea::MultiChannel);
+            true
         }
         PresentationId::BluRayTitle { .. } => {
-            // Phase 2: set bluray_playlist, bluray_audio_pid, etc. on SourceOptions
+            // Phase 2 will add explicit Blu-ray SourceOptions fields for
+            // playlist, PID, stream index, and angle. Until then, returning
+            // false lets UI code hide or block stream-specific conversion
+            // rather than silently converting the default Blu-ray stream.
+            false
         }
     }
 }
@@ -649,13 +691,15 @@ pub fn apply_presentation_to_source_options(
 pub fn apply_source_mode_disc_selection_to_source_options(
     mode: &SourceMode,
     options: &mut crate::convert::pipeline::SourceOptions,
-) {
+) -> bool {
     if let SourceMode::MultiTrack {
         selected_presentation_id: Some(id),
         ..
     } = mode
     {
-        apply_presentation_to_source_options(options, id);
+        apply_presentation_to_source_options(options, id)
+    } else {
+        false
     }
 }
 
@@ -776,8 +820,16 @@ pub fn draw_disc_browser(
         );
     }
 
+    let can_convert_selected = state
+        .selected_presentation()
+        .is_some_and(presentation_supports_stream_conversion);
+    let convert_footer_label = if can_convert_selected {
+        "Enter Convert"
+    } else {
+        "Stream Convert N/A"
+    };
     let footer = Line::from(vec![
-        footer_pill("Enter Convert", crate::tui::theme::PURPLE),
+        footer_pill(convert_footer_label, crate::tui::theme::PURPLE),
         Span::raw("  "),
         footer_pill("E Expand", crate::tui::theme::PURPLE),
         Span::raw("  "),
@@ -789,14 +841,33 @@ pub fn draw_disc_browser(
 
     let footer_y = chunks[1].y;
     let footer_w = chunks[1].width;
-    let center_x = chunks[1].x + footer_w.saturating_sub(44) / 2;
-    buttons.record_button(
-        crate::tui::button_map::TuiButton::DiscBrowserConvert,
-        Rect::new(center_x, footer_y, 15, 1),
-    );
+    let convert_w = convert_footer_label.chars().count() as u16;
+    let gap_w = 2u16;
+    let expand_w = "E Expand".len() as u16;
+    let select_w = "Space Select".len() as u16;
+    let close_w = "Esc Close".len() as u16;
+    let total_w = convert_w + expand_w + select_w + close_w + gap_w * 3;
+    let center_x = chunks[1].x + footer_w.saturating_sub(total_w) / 2;
+    if can_convert_selected {
+        buttons.record_button(
+            crate::tui::button_map::TuiButton::DiscBrowserConvert,
+            Rect::new(center_x, footer_y, convert_w, 1),
+        );
+    }
     buttons.record_button(
         crate::tui::button_map::TuiButton::DiscBrowserClose,
-        Rect::new(center_x.saturating_add(33), footer_y, 11, 1),
+        Rect::new(
+            center_x
+                .saturating_add(convert_w)
+                .saturating_add(gap_w)
+                .saturating_add(expand_w)
+                .saturating_add(gap_w)
+                .saturating_add(select_w)
+                .saturating_add(gap_w),
+            footer_y,
+            close_w,
+            1,
+        ),
     );
 }
 
@@ -921,6 +992,26 @@ mod cache_tests {
     }
 
     #[test]
+    fn bluray_directory_fingerprint_tracks_bdmv_index_case_insensitively() {
+        let root = unique_path("bluray-dir-cache");
+        let bdmv = root.join("BDMV");
+        fs::create_dir_all(&bdmv).expect("create BDMV");
+        let index = bdmv.join("INDEX.BDMV");
+        fs::write(&index, b"bdmv-index-v1").expect("write initial index");
+
+        let first = disc_probe_fingerprint(&root).expect("fingerprint Blu-ray dir");
+        assert!(first.is_dir);
+        assert!(first.bluray_bdmv_index.is_some());
+
+        fs::write(&index, b"bdmv-index-v2-with-different-length").expect("replace index");
+        let second = disc_probe_fingerprint(&root).expect("fingerprint replaced Blu-ray dir");
+        assert_ne!(first, second);
+        assert_ne!(first.primary_len(), second.primary_len());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn selected_dvd_video_presentation_sets_vts_title_and_stream() {
         let mut options = crate::convert::pipeline::SourceOptions {
             archive_password: None,
@@ -936,10 +1027,10 @@ mod cache_tests {
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
         };
-        apply_presentation_to_source_options(
+        assert!(apply_presentation_to_source_options(
             &mut options,
             &PresentationId::dvd_video(2, 7, 3),
-        );
+        ));
         assert_eq!(options.dvdv_vts, Some(2));
         assert_eq!(options.dvdv_title, Some(7));
         assert_eq!(options.dvdv_audio_stream, Some(3));
@@ -963,10 +1054,10 @@ mod cache_tests {
             track_selection: crate::convert::pipeline::TrackSelection::All,
         };
 
-        apply_presentation_to_source_options(
+        assert!(apply_presentation_to_source_options(
             &mut options,
             &PresentationId::DvdAudioGroup(3),
-        );
+        ));
 
         assert_eq!(
             options.dvda_group_selection,
@@ -976,6 +1067,35 @@ mod cache_tests {
             options.effective_dvda_group_selection(),
             crate::convert::pipeline::DvdaGroupSelection::Group(3)
         );
+    }
+
+    #[test]
+    fn blu_ray_presentation_selection_is_explicitly_unsupported_until_source_options_exist() {
+        let id = PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
+            .expect("valid Blu-ray presentation id");
+        let mut options = crate::convert::pipeline::SourceOptions {
+            archive_password: None,
+            sacd_area: None,
+            dvda_group_selection: crate::convert::pipeline::DvdaGroupSelection::Default,
+            dvda_group: None,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
+            cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+            track_selection: crate::convert::pipeline::TrackSelection::All,
+        };
+
+        assert!(!presentation_id_supports_stream_conversion(&id));
+        assert!(!apply_presentation_to_source_options(&mut options, &id));
+        assert_eq!(options.dvda_group_selection, crate::convert::pipeline::DvdaGroupSelection::Default);
+        assert_eq!(options.dvdv_vts, None);
+        assert_eq!(options.dvdv_title, None);
+        assert_eq!(options.dvdv_audio_stream, None);
+        assert_eq!(options.dvdv_angle, None);
+        assert_eq!(options.sacd_area, None);
     }
 
 }
@@ -1050,7 +1170,7 @@ mod disc_selection_bridge_tests {
             track_selection: TrackSelection::All,
         };
 
-        apply_source_mode_disc_selection_to_source_options(&mode, &mut options);
+        assert!(apply_source_mode_disc_selection_to_source_options(&mode, &mut options));
 
         assert_eq!(options.dvdv_vts, Some(2));
         assert_eq!(options.dvdv_title, Some(3));
