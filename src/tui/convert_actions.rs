@@ -573,7 +573,10 @@ pub fn commit_batch_with_cue_artifacts(
             cue_sidecar_override,
         ) {
             Ok(_) => outcome.enqueued += 1,
-            Err(_) => outcome.errors += 1,
+            Err(err) => {
+                log::warn!("commit failed for {}: {err}", path.display());
+                outcome.errors += 1;
+            }
         }
     }
 
