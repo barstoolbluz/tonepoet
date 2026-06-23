@@ -179,6 +179,8 @@ impl BlurayDisc {
 
 impl BlurayHandle {
     fn open(path: &Path) -> Result<Self, String> {
+        // Suppress libbluray's debug output to stderr — it corrupts the TUI.
+        unsafe { ffi::bd_set_debug_mask(0) };
         let path_c = path_to_cstring(path)?;
         let handle = unsafe { ffi::bd_open(path_c.as_ptr(), ptr::null()) };
         let handle = NonNull::new(handle)
