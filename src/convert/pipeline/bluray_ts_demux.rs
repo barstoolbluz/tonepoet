@@ -9,7 +9,33 @@ use std::collections::VecDeque;
 use super::errors::ConvertError;
 
 pub(crate) const TS_PACKET_SIZE: usize = 188;
+pub(crate) const M2TS_PACKET_SIZE: usize = 192;
+pub(crate) const M2TS_TP_EXTRA_SIZE: usize = 4;
 pub(crate) const TS_RESYNC_CONFIRMATION_PACKETS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TsPacketFormat {
+    /// Standard 188-byte TS packets with 0x47 at offset 0.
+    StandardTs,
+    /// 192-byte M2TS packets: 4-byte TP_extra_header, then a 188-byte TS packet.
+    M2ts,
+}
+
+impl TsPacketFormat {
+    pub(crate) fn packet_size(self) -> usize {
+        match self {
+            Self::StandardTs => TS_PACKET_SIZE,
+            Self::M2ts => M2TS_PACKET_SIZE,
+        }
+    }
+
+    pub(crate) fn sync_byte_offset(self) -> usize {
+        match self {
+            Self::StandardTs => 0,
+            Self::M2ts => M2TS_TP_EXTRA_SIZE,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ParsedPes<'a> {
@@ -465,13 +491,26 @@ fn parse_ts_packet(packet: &[u8]) -> Result<ParsedTsPacket<'_>, ConvertError> {
 
 
 pub(crate) fn find_next_ts_sync_at_cadence(bytes: &[u8]) -> Option<usize> {
-    bytes.iter().enumerate().find_map(|(offset, byte)| {
-        if *byte != 0x47 {
+    find_next_ts_sync_at_cadence_with_format(bytes, TsPacketFormat::StandardTs)
+}
+
+pub(crate) fn find_next_ts_sync_at_cadence_with_format(
+    bytes: &[u8],
+    format: TsPacketFormat,
+) -> Option<usize> {
+    let packet_size = format.packet_size();
+    let sync_offset = format.sync_byte_offset();
+
+    bytes.iter().enumerate().find_map(|(offset, _)| {
+        let first_sync = offset.checked_add(sync_offset)?;
+        if first_sync >= bytes.len() || bytes[first_sync] != 0x47 {
             return None;
         }
         for step in 1..TS_RESYNC_CONFIRMATION_PACKETS {
-            let sync_at = offset.checked_add(step * TS_PACKET_SIZE)?;
-            if sync_at >= bytes.len() || bytes[sync_at] != 0x47 {
+            let next = offset
+                .checked_add(step * packet_size)?
+                .checked_add(sync_offset)?;
+            if next >= bytes.len() || bytes[next] != 0x47 {
                 return None;
             }
         }
@@ -589,7 +628,23 @@ mod tests {
         packet
     }
 
-    fn packetize_pes(pid: u16, start_cc: u8, pes: &[u8], chunk_sizes: &[usize]) -> Vec<[u8; TS_PACKET_SIZE]> {
+    fn m2ts_packet(
+        ts_packet: &[u8; TS_PACKET_SIZE],
+        arrival_time_stamp: u32,
+    ) -> [u8; M2TS_PACKET_SIZE] {
+        let mut packet = [0u8; M2TS_PACKET_SIZE];
+        let tp_extra = arrival_time_stamp & 0x3fff_ffff;
+        packet[..M2TS_TP_EXTRA_SIZE].copy_from_slice(&tp_extra.to_be_bytes());
+        packet[M2TS_TP_EXTRA_SIZE..].copy_from_slice(ts_packet);
+        packet
+    }
+
+    fn packetize_pes(
+        pid: u16,
+        start_cc: u8,
+        pes: &[u8],
+        chunk_sizes: &[usize],
+    ) -> Vec<[u8; TS_PACKET_SIZE]> {
         let mut packets = Vec::new();
         let mut offset = 0usize;
         let mut cc = start_cc;
@@ -698,7 +753,8 @@ mod tests {
     #[test]
     fn ts_scrambled_selected_pid_packet_errors() {
         let pid = 0x1100;
-        let packet = ts_packet_with_payload_opts(pid, true, 0, &[0, 0, 1, 0xbd], false, 2, false);
+        let packet =
+            ts_packet_with_payload_opts(pid, true, 0, &[0, 0, 1, 0xbd], false, 2, false);
         let mut demuxer = SelectedPidPesDemuxer::new(pid);
 
         let err = demuxer.push_ts_packet(&packet).unwrap_err();
@@ -735,6 +791,54 @@ mod tests {
 
         assert_eq!(find_next_ts_sync_at_cadence(&bytes), Some(candidate_offset));
         assert_ne!(find_next_ts_sync_at_cadence(&bytes), Some(5));
+    }
+
+    #[test]
+    fn m2ts_sync_loss_requires_repeated_192_byte_cadence_to_resync() {
+        let pid = 0x1100;
+        let mut bytes = vec![0u8; 19];
+        bytes[0] = 0x47;
+        bytes[7] = 0x47;
+        let candidate_offset = bytes.len();
+        let p0 = m2ts_packet(&ts_packet_adaptation_only(pid, 0, false), 0);
+        let p1 = m2ts_packet(&ts_packet_adaptation_only(pid, 1, false), 1);
+        let p2 = m2ts_packet(&ts_packet_adaptation_only(pid, 2, false), 2);
+        bytes.extend_from_slice(&p0);
+        bytes.extend_from_slice(&p1);
+        bytes.extend_from_slice(&p2);
+
+        assert_eq!(
+            find_next_ts_sync_at_cadence_with_format(&bytes, TsPacketFormat::M2ts),
+            Some(candidate_offset)
+        );
+        assert_ne!(
+            find_next_ts_sync_at_cadence_with_format(&bytes, TsPacketFormat::M2ts),
+            Some(0)
+        );
+        assert_ne!(
+            find_next_ts_sync_at_cadence_with_format(&bytes, TsPacketFormat::M2ts),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn m2ts_sync_loss_and_recovery_finds_valid_cadence_after_garbage() {
+        let pid = 0x1100;
+        let first = m2ts_packet(&ts_packet_adaptation_only(pid, 0, false), 0);
+        let mut bytes = first.to_vec();
+        bytes.extend_from_slice(&[0x00, 0x47, 0x11, 0x22, 0x33, 0x47, 0x44]);
+        let candidate_offset = bytes.len();
+        for cc in 1..=3 {
+            let ts = ts_packet_adaptation_only(pid, cc, false);
+            let m2ts = m2ts_packet(&ts, cc as u32);
+            bytes.extend_from_slice(&m2ts);
+        }
+
+        let search = &bytes[M2TS_PACKET_SIZE + 1..];
+        assert_eq!(
+            find_next_ts_sync_at_cadence_with_format(search, TsPacketFormat::M2ts),
+            Some(candidate_offset - M2TS_PACKET_SIZE - 1)
+        );
     }
 
     #[test]

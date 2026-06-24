@@ -288,15 +288,17 @@ pub(crate) fn validate_bluray_lpcm_wav(path: &Path, expected: &ExpectedAudio) ->
         let expected_bytes = expected_samples
             .checked_mul(u64::from(expected_block_align))
             .ok_or_else(|| "expected byte count overflow".to_string())?;
+        // Blu-ray chapter boundaries are PTS-based, not sample-accurate.
+        // The last chapter's end PTS often extends beyond the actual audio
+        // content. Use a 1-second tolerance instead of 100ms.
         let tolerance_bytes = u64::from(expected_block_align)
             .checked_mul(u64::from(expected.sample_rate))
-            .ok_or_else(|| "WAV size tolerance overflow".to_string())?
-            / 10;
+            .ok_or_else(|| "WAV size tolerance overflow".to_string())?;
         let delta = wav.data_size.abs_diff(expected_bytes);
         require(
             delta <= tolerance_bytes,
             format!(
-                "data size {} differs from chapter-duration estimate {} by {} byte(s), exceeding 100 ms tolerance {}",
+                "data size {} differs from chapter-duration estimate {} by {} byte(s), exceeding 1 s tolerance {}",
                 wav.data_size, expected_bytes, delta, tolerance_bytes
             ),
         )?;
