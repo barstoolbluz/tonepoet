@@ -7,10 +7,14 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::bluray_backend::{
-    BluRayAudioCoding, BluRayAudioStreamKind, BlurayAudioStreamInfo, BlurayBackend,
+    bluray_audio_stream_display_number, BluRayAudioCoding, BluRayAudioStreamKind,
+    BlurayAudioStreamInfo, BlurayBackend,
     BlurayChapterInfo, BlurayDisplayAngle, BlurayTitleInfo,
     BlurayUnsupportedStreamDiagnostic, ProbeDepth,
 };
@@ -23,6 +27,21 @@ pub fn map_bluray_disc<B: BlurayBackend>(
     disc: &B::Disc,
     source_path: &Path,
 ) -> Result<DiscContents, String> {
+    let probe = FfprobeBlurayAudioProbe::default();
+    let control = BlurayProbeControl::bounded_default();
+    map_bluray_disc_with_audio_probe::<B, _>(disc, source_path, &probe, &control)
+}
+
+pub(crate) fn map_bluray_disc_with_audio_probe<B, P>(
+    disc: &B::Disc,
+    source_path: &Path,
+    compressed_audio_probe: &P,
+    probe_control: &BlurayProbeControl<'_>,
+) -> Result<DiscContents, String>
+where
+    B: BlurayBackend,
+    P: BlurayCompressedAudioProbe + ?Sized,
+{
     let label = blu_ray_disc_label::<B>(disc, source_path);
     let titles = B::titles(disc)?;
     let mut presentations = Vec::new();
@@ -136,6 +155,23 @@ pub fn map_bluray_disc<B: BlurayBackend>(
 
         let mut streams = stream_enumeration.supported_streams;
         streams.retain(is_supported_browse_stream);
+        if protection_status.may_read_media_for_probe() {
+            probe_compressed_bluray_streams_for_playlist_with_probe(
+                source_path,
+                playlist_number,
+                &mut streams,
+                compressed_audio_probe,
+                probe_control,
+            );
+        } else if streams
+            .iter()
+            .any(|stream| stream.kind == BluRayAudioStreamKind::Primary && stream.coding.is_compressed())
+        {
+            log::debug!(
+                "skipping Blu-ray ffprobe decoded-audio probe for playlist {playlist_number:05}: {}",
+                protection_status.summary()
+            );
+        }
 
         if streams.is_empty() {
             suppressed.push(suppressed_title(
@@ -366,10 +402,7 @@ fn format_for_stream(stream: &BlurayAudioStreamInfo) -> AudioPresentationFormat 
     AudioPresentationFormat {
         codec: Some(stream.coding.label().to_string()),
         sample_rate: stream.sample_rate,
-        bit_depth: match stream.coding {
-            BluRayAudioCoding::Lpcm => stream.bit_depth.bit_depth(),
-            _ => None,
-        },
+        bit_depth: stream.decoded_bit_depth(),
         channels: stream.channels,
         channel_layout: stream
             .channel_layout
@@ -378,6 +411,693 @@ fn format_for_stream(stream: &BlurayAudioStreamInfo) -> AudioPresentationFormat 
             .or_else(|| stream.channels.map(channel_layout_from_count)),
         lossless: stream.coding.is_lossless(),
         provenance: FormatProvenance::Unknown,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BlurayProbedStreamFacts {
+    pub ffprobe_index: Option<u32>,
+    pub audio_ordinal: Option<u8>,
+    pub pid: Option<u16>,
+    pub codec_name: Option<String>,
+    pub codec_profile: Option<String>,
+    pub bit_depth: Option<u32>,
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BlurayAudioProbeRequest<'a> {
+    pub source_path: &'a Path,
+    pub playlist_number: u32,
+}
+
+pub(crate) trait BlurayCompressedAudioProbe {
+    fn probe_bluray_audio_streams(
+        &self,
+        request: &BlurayAudioProbeRequest<'_>,
+        control: &BlurayProbeControl<'_>,
+    ) -> Result<Vec<BlurayProbedStreamFacts>, String>;
+}
+
+pub(crate) struct BlurayProbeControl<'a> {
+    timeout: Duration,
+    is_cancelled: Option<&'a dyn Fn() -> bool>,
+}
+
+impl<'a> BlurayProbeControl<'a> {
+    #[must_use]
+    pub fn bounded_default() -> Self {
+        Self {
+            timeout: ProbeDepth::DEFAULT_MAX_DURATION,
+            is_cancelled: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_cancellation(mut self, is_cancelled: &'a dyn Fn() -> bool) -> Self {
+        self.is_cancelled = Some(is_cancelled);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled.map_or(false, |is_cancelled| is_cancelled())
+    }
+}
+
+impl<'a> Default for BlurayProbeControl<'a> {
+    fn default() -> Self {
+        Self::bounded_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FfprobeBlurayAudioProbe {
+    ffprobe_path: PathBuf,
+}
+
+impl FfprobeBlurayAudioProbe {
+    #[must_use]
+    pub fn new(ffprobe_path: PathBuf) -> Self {
+        Self { ffprobe_path }
+    }
+
+    #[must_use]
+    pub fn from_tool_paths(tool_paths: &HashMap<String, PathBuf>) -> Self {
+        tool_paths
+            .get("ffprobe")
+            .or_else(|| tool_paths.get("FFPROBE"))
+            .or_else(|| tool_paths.get("Ffprobe"))
+            .cloned()
+            .map(Self::new)
+            .unwrap_or_default()
+    }
+}
+
+impl Default for FfprobeBlurayAudioProbe {
+    fn default() -> Self {
+        Self::new(PathBuf::from("ffprobe"))
+    }
+}
+
+impl BlurayCompressedAudioProbe for FfprobeBlurayAudioProbe {
+    fn probe_bluray_audio_streams(
+        &self,
+        request: &BlurayAudioProbeRequest<'_>,
+        control: &BlurayProbeControl<'_>,
+    ) -> Result<Vec<BlurayProbedStreamFacts>, String> {
+        ffprobe_bluray_playlist_audio_streams(
+            &self.ffprobe_path,
+            request.source_path,
+            request.playlist_number,
+            control,
+        )
+    }
+}
+
+pub(crate) fn probe_compressed_bluray_streams_for_playlist_with_probe<P>(
+    source_path: &Path,
+    playlist_number: u32,
+    streams: &mut [BlurayAudioStreamInfo],
+    probe: &P,
+    control: &BlurayProbeControl<'_>,
+) where
+    P: BlurayCompressedAudioProbe + ?Sized,
+{
+    if !streams.iter().any(is_primary_compressed_stream) {
+        return;
+    }
+
+    if !source_path.exists() {
+        log::debug!(
+            "skipping Blu-ray ffprobe decoded-audio probe for missing source path '{}'",
+            source_path.display()
+        );
+        return;
+    }
+
+    let facts = match probe_bluray_playlist_audio_streams_uncached(
+        source_path,
+        playlist_number,
+        probe,
+        control,
+    ) {
+        Ok(facts) => facts,
+        Err(err) => {
+            log::warn!(
+                "Blu-ray playlist {playlist_number:05} ffprobe decoded-audio probe failed: {err}"
+            );
+            return;
+        }
+    };
+
+    for stream in streams.iter_mut().filter(|stream| is_primary_compressed_stream(stream)) {
+        if let Err(err) = apply_matching_bluray_audio_probe_facts(playlist_number, stream, &facts) {
+            log::warn!(
+                "Blu-ray playlist {playlist_number:05} stream {} PID 0x{:04x} ffprobe decoded-audio probe did not match usable decoded facts: {err}",
+                bluray_audio_stream_display_number(stream.stream_index),
+                stream.pid
+            );
+        }
+    }
+}
+
+pub(crate) fn probe_compressed_bluray_stream_for_playlist_with_probe<P>(
+    source_path: &Path,
+    playlist_number: u32,
+    stream: &mut BlurayAudioStreamInfo,
+    probe: &P,
+    control: &BlurayProbeControl<'_>,
+) -> Result<(), String>
+where
+    P: BlurayCompressedAudioProbe + ?Sized,
+{
+    if !is_primary_compressed_stream(stream) {
+        return Ok(());
+    }
+
+    if !source_path.exists() {
+        return Err(format!(
+            "source path '{}' does not exist",
+            source_path.display()
+        ));
+    }
+
+    let facts = probe_bluray_playlist_audio_streams_uncached(
+        source_path,
+        playlist_number,
+        probe,
+        control,
+    )?;
+    apply_matching_bluray_audio_probe_facts(playlist_number, stream, &facts)
+}
+
+fn is_primary_compressed_stream(stream: &BlurayAudioStreamInfo) -> bool {
+    stream.kind == BluRayAudioStreamKind::Primary && stream.coding.is_compressed()
+}
+
+// Do not keep a process-global cache for ffprobe playlist facts. Even successful
+// probes can be incomplete or probe-dependent: bits_per_raw_sample may be missing
+// with one ffprobe binary but present with another, and a stable mount path can
+// later point at different media. The caller already probes each playlist once
+// per mapping operation, which provides the important performance win without
+// leaking stale or incomplete facts across browse and materialization runs.
+fn probe_bluray_playlist_audio_streams_uncached<P>(
+    source_path: &Path,
+    playlist_number: u32,
+    probe: &P,
+    control: &BlurayProbeControl<'_>,
+) -> Result<Vec<BlurayProbedStreamFacts>, String>
+where
+    P: BlurayCompressedAudioProbe + ?Sized,
+{
+    if control.is_cancelled() {
+        return Err("cancelled before ffprobe decoded-audio probe started".to_string());
+    }
+
+    let request = BlurayAudioProbeRequest {
+        source_path,
+        playlist_number,
+    };
+    probe.probe_bluray_audio_streams(&request, control)
+}
+
+fn apply_matching_bluray_audio_probe_facts(
+    playlist_number: u32,
+    stream: &mut BlurayAudioStreamInfo,
+    facts: &[BlurayProbedStreamFacts],
+) -> Result<(), String> {
+    let facts = match_bluray_audio_probe_facts(stream, facts)?;
+    apply_bluray_audio_probe_facts(playlist_number, stream, facts)
+}
+
+fn match_bluray_audio_probe_facts<'a>(
+    stream: &BlurayAudioStreamInfo,
+    facts: &'a [BlurayProbedStreamFacts],
+) -> Result<&'a BlurayProbedStreamFacts, String> {
+    let mut candidates: Vec<&BlurayProbedStreamFacts> = facts
+        .iter()
+        .filter(|facts| facts.pid == Some(stream.pid))
+        .collect();
+
+    if candidates.is_empty() {
+        candidates = facts.iter().filter(|facts| facts.pid.is_none()).collect();
+    }
+
+    if candidates.is_empty() {
+        return Err(format!(
+            "ffprobe returned no audio stream with PID 0x{:04x}; candidates: {}",
+            stream.pid,
+            summarize_probe_candidates(facts)
+        ));
+    }
+
+    let codec_matches: Vec<&BlurayProbedStreamFacts> = candidates
+        .iter()
+        .copied()
+        .filter(|facts| ffprobe_codec_matches_bluray_coding(
+            stream.coding,
+            facts.codec_name.as_deref(),
+            facts.codec_profile.as_deref(),
+        ))
+        .collect();
+
+    let candidates = if codec_matches.is_empty() {
+        if candidates.len() == 1 && candidates[0].pid == Some(stream.pid) {
+            log::debug!(
+                "using sole ffprobe PID match for Blu-ray stream {} PID 0x{:04x} despite codec mismatch: {}",
+                bluray_audio_stream_display_number(stream.stream_index),
+                stream.pid,
+                describe_probe_candidate(candidates[0])
+            );
+            candidates
+        } else {
+            return Err(format!(
+                "ffprobe returned no {}-compatible audio stream for PID 0x{:04x}; candidates: {}",
+                stream.coding.label(),
+                stream.pid,
+                summarize_probe_candidates(facts)
+            ));
+        }
+    } else {
+        codec_matches
+    };
+
+    let mut scored: Vec<(&BlurayProbedStreamFacts, i32)> = candidates
+        .into_iter()
+        .map(|facts| (facts, probe_match_score(stream, facts)))
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let Some((best, best_score)) = scored.first().copied() else {
+        return Err("ffprobe returned no match candidates".to_string());
+    };
+
+    if scored
+        .get(1)
+        .is_some_and(|(_, score)| *score == best_score)
+    {
+        return Err(format!(
+            "ambiguous ffprobe match for {} stream {} PID 0x{:04x}; candidates: {}",
+            stream.coding.label(),
+            bluray_audio_stream_display_number(stream.stream_index),
+            stream.pid,
+            summarize_probe_candidates(facts)
+        ));
+    }
+
+    Ok(best)
+}
+
+fn probe_match_score(stream: &BlurayAudioStreamInfo, facts: &BlurayProbedStreamFacts) -> i32 {
+    let mut score = 0;
+    if facts.pid == Some(stream.pid) {
+        score += 100;
+    }
+    if ffprobe_codec_matches_bluray_coding(
+        stream.coding,
+        facts.codec_name.as_deref(),
+        facts.codec_profile.as_deref(),
+    ) {
+        score += 40;
+    }
+    if facts.channels.is_some() && facts.channels == stream.channels {
+        score += 12;
+    }
+    if facts.sample_rate.is_some() && facts.sample_rate == stream.sample_rate {
+        score += 12;
+    }
+    if facts.audio_ordinal == Some(stream.stream_index) {
+        score += 8;
+    }
+    if facts.bit_depth.is_some() {
+        score += 4;
+    }
+    score
+}
+
+fn ffprobe_codec_matches_bluray_coding(
+    coding: BluRayAudioCoding,
+    codec_name: Option<&str>,
+    codec_profile: Option<&str>,
+) -> bool {
+    let Some(codec_name) = codec_name else {
+        return false;
+    };
+    let codec = codec_name.trim().to_ascii_lowercase();
+    let profile = codec_profile
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    match coding {
+        BluRayAudioCoding::Lpcm => codec == "pcm_bluray",
+        BluRayAudioCoding::Ac3 => codec == "ac3",
+        BluRayAudioCoding::Eac3 => codec == "eac3",
+        BluRayAudioCoding::TrueHd => codec == "truehd",
+        BluRayAudioCoding::Dts => codec == "dts" && !profile.contains("dts-hd"),
+        BluRayAudioCoding::DtsHd => {
+            codec == "dts"
+                && (profile.is_empty()
+                    || (profile.contains("dts-hd")
+                        && !profile.contains("ma")
+                        && !profile.contains("master")))
+        }
+        BluRayAudioCoding::DtsHdMaster => {
+            codec == "dts"
+                && (profile.is_empty()
+                    || profile.contains("ma")
+                    || profile.contains("master"))
+        }
+    }
+}
+
+fn apply_bluray_audio_probe_facts(
+    playlist_number: u32,
+    stream: &mut BlurayAudioStreamInfo,
+    facts: &BlurayProbedStreamFacts,
+) -> Result<(), String> {
+    if stream.coding.is_lossless() && facts.bit_depth.is_none() {
+        return Err(format!(
+            "ffprobe did not report bits_per_raw_sample for matched {} stream {}",
+            stream.coding.label(),
+            describe_probe_candidate(facts)
+        ));
+    }
+
+    let mut updated = stream.clone();
+    if let Some(sample_rate) = facts.sample_rate {
+        if let Some(clpi_rate) = updated.sample_rate {
+            if clpi_rate != sample_rate {
+                log::warn!(
+                    "Blu-ray playlist {playlist_number:05} stream {} PID 0x{:04x} CLPI sample rate {} Hz differs from ffprobe decoded sample rate {} Hz; using ffprobe value",
+                    bluray_audio_stream_display_number(updated.stream_index),
+                    updated.pid,
+                    clpi_rate,
+                    sample_rate
+                );
+            }
+        }
+        updated.sample_rate = Some(sample_rate);
+    }
+    if let Some(bit_depth) = facts.bit_depth {
+        updated.probed_bit_depth = Some(bit_depth);
+    }
+    if let Some(channels) = facts.channels {
+        updated.channels = Some(channels);
+        updated.channel_layout = Some(channel_layout_from_count(channels));
+    }
+
+    *stream = updated;
+    Ok(())
+}
+
+fn ffprobe_bluray_playlist_audio_streams(
+    ffprobe_path: &Path,
+    source_path: &Path,
+    playlist_number: u32,
+    control: &BlurayProbeControl<'_>,
+) -> Result<Vec<BlurayProbedStreamFacts>, String> {
+    if control.is_cancelled() {
+        return Err("cancelled before ffprobe decoded-audio probe started".to_string());
+    }
+
+    let input = format!("bluray:{}", source_path.display());
+    let playlist_arg = playlist_number.to_string();
+    let child = Command::new(ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-playlist",
+            playlist_arg.as_str(),
+            "-i",
+            input.as_str(),
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index,id,codec_name,profile,bits_per_raw_sample,sample_rate,channels",
+            "-of",
+            "default=noprint_wrappers=0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to start ffprobe '{}': {err}", ffprobe_path.display()))?;
+
+    let output = wait_for_ffprobe_output(child, control)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffprobe exited with status {}{}",
+            output.status,
+            ffprobe_stderr_suffix(&stderr)
+        ));
+    }
+
+    parse_ffprobe_playlist_audio_facts(&output.stdout)
+}
+
+fn wait_for_ffprobe_output(
+    mut child: std::process::Child,
+    control: &BlurayProbeControl<'_>,
+) -> Result<Output, String> {
+    let started = Instant::now();
+    let poll_interval = Duration::from_millis(25);
+
+    loop {
+        if control.is_cancelled() {
+            terminate_ffprobe_child(child);
+            return Err("cancelled while ffprobe decoded-audio probe was running".to_string());
+        }
+
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|err| format!("failed to collect ffprobe output: {err}"));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                terminate_ffprobe_child(child);
+                return Err(format!("failed while waiting for ffprobe: {err}"));
+            }
+        }
+
+        if started.elapsed() >= control.timeout {
+            terminate_ffprobe_child(child);
+            return Err(format!(
+                "ffprobe decoded-audio probe timed out after {:.1}s",
+                control.timeout.as_secs_f64()
+            ));
+        }
+
+        thread::sleep(poll_interval);
+    }
+}
+
+fn terminate_ffprobe_child(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
+fn parse_ffprobe_stream_facts(stdout: &[u8]) -> Result<BlurayProbedStreamFacts, String> {
+    parse_ffprobe_playlist_audio_facts(stdout)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "ffprobe returned no audio stream fields".to_string())
+}
+
+fn parse_ffprobe_playlist_audio_facts(stdout: &[u8]) -> Result<Vec<BlurayProbedStreamFacts>, String> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|err| format!("ffprobe returned non-UTF-8 output: {err}"))?;
+    let mut streams = Vec::new();
+    let mut current: Option<BlurayProbedStreamFacts> = None;
+    let mut saw_stream_field = false;
+
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        match line {
+            "[STREAM]" => {
+                if let Some(facts) = current.take() {
+                    streams.push(facts);
+                }
+                current = Some(BlurayProbedStreamFacts {
+                    audio_ordinal: (streams.len() <= u8::MAX as usize).then_some(streams.len() as u8),
+                    ..BlurayProbedStreamFacts::default()
+                });
+                continue;
+            }
+            "[/STREAM]" => {
+                if let Some(facts) = current.take() {
+                    streams.push(facts);
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let facts = current.get_or_insert_with(|| BlurayProbedStreamFacts {
+            audio_ordinal: Some(0),
+            ..BlurayProbedStreamFacts::default()
+        });
+        saw_stream_field = true;
+        apply_ffprobe_stream_field(facts, key, value);
+    }
+
+    if let Some(facts) = current.take() {
+        streams.push(facts);
+    }
+
+    streams.retain(|facts| {
+        facts.ffprobe_index.is_some()
+            || facts.pid.is_some()
+            || facts.codec_name.is_some()
+            || facts.sample_rate.is_some()
+            || facts.channels.is_some()
+            || facts.bit_depth.is_some()
+    });
+
+    if saw_stream_field && !streams.is_empty() {
+        Ok(streams)
+    } else {
+        Err("ffprobe returned no audio stream fields".to_string())
+    }
+}
+
+fn apply_ffprobe_stream_field(facts: &mut BlurayProbedStreamFacts, key: &str, value: &str) {
+    match key {
+        "index" => {
+            facts.ffprobe_index = parse_u32_allow_zero(value);
+        }
+        "id" => {
+            facts.pid = parse_u16_auto(value);
+        }
+        "codec_name" => {
+            facts.codec_name = parse_nonempty_string(value);
+        }
+        "profile" => {
+            facts.codec_profile = parse_nonempty_string(value);
+        }
+        "bits_per_raw_sample" => {
+            facts.bit_depth = parse_positive_u32(value).filter(|depth| *depth <= 64);
+        }
+        "sample_rate" => {
+            facts.sample_rate = parse_positive_u32(value);
+        }
+        "channels" => {
+            facts.channels = parse_positive_u32(value)
+                .filter(|value| *value <= u8::MAX as u32)
+                .map(|value| value as u8);
+        }
+        _ => {}
+    }
+}
+
+fn parse_nonempty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("N/A") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn parse_u32_allow_zero(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    trimmed.parse::<u32>().ok()
+}
+
+fn parse_positive_u32(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    let parsed = trimmed.parse::<u32>().ok()?;
+    (parsed > 0).then_some(parsed)
+}
+
+fn parse_u16_auto(value: &str) -> Option<u16> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    let parsed = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .map(|hex| u16::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| trimmed.parse::<u16>().ok())?;
+    (parsed > 0).then_some(parsed)
+}
+
+fn summarize_probe_candidates(facts: &[BlurayProbedStreamFacts]) -> String {
+    if facts.is_empty() {
+        return "<none>".to_string();
+    }
+    facts
+        .iter()
+        .map(describe_probe_candidate)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn describe_probe_candidate(facts: &BlurayProbedStreamFacts) -> String {
+    let pid = facts
+        .pid
+        .map(|pid| format!("pid=0x{pid:04x}"))
+        .unwrap_or_else(|| "pid=<unknown>".to_string());
+    let codec = facts
+        .codec_name
+        .as_deref()
+        .unwrap_or("<unknown-codec>");
+    let profile = facts
+        .codec_profile
+        .as_deref()
+        .filter(|profile| !profile.trim().is_empty())
+        .map(|profile| format!(" profile={profile}"))
+        .unwrap_or_default();
+    let ordinal = facts
+        .audio_ordinal
+        .map(|ordinal| format!("a:{ordinal}"))
+        .unwrap_or_else(|| "a:?".to_string());
+    let index = facts
+        .ffprobe_index
+        .map(|index| format!("index={index}"))
+        .unwrap_or_else(|| "index=?".to_string());
+    let rate = facts
+        .sample_rate
+        .map(|rate| format!(" {rate}Hz"))
+        .unwrap_or_default();
+    let channels = facts
+        .channels
+        .map(|channels| format!(" {channels}ch"))
+        .unwrap_or_default();
+    let depth = facts
+        .bit_depth
+        .map(|depth| format!(" {depth}-bit"))
+        .unwrap_or_default();
+
+    format!("{ordinal} {index} {pid} codec={codec}{profile}{rate}{channels}{depth}")
+}
+
+fn ffprobe_stderr_suffix(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(": {trimmed}")
     }
 }
 
@@ -482,7 +1202,7 @@ fn bluray_identity_and_format_label(
 
     format!(
         "Blu-ray Playlist {playlist_number:05} Stream {} PID 0x{pid:04x} · {}{angle}",
-        blu_ray_audio_stream_display_number(stream_index),
+        bluray_audio_stream_display_number(stream_index),
         format_details_from_presentation(presentation, coding)
     )
 }
@@ -655,7 +1375,7 @@ fn playlist_signature(
                 stream_index: stream.stream_index,
                 coding: stream.coding,
                 sample_rate: stream.sample_rate,
-                bit_depth: stream.bit_depth.bit_depth(),
+                bit_depth: stream.decoded_bit_depth(),
                 channels: stream.channels,
                 channel_layout: stream.channel_layout.clone(),
                 language: stream.language.clone(),
@@ -709,9 +1429,12 @@ fn suppressed_stream_diagnostic(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap as TestHashMap;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex as TestMutex, Once, OnceLock as TestOnceLock};
 
     use super::*;
     use crate::disc::bluray_backend::{
@@ -738,6 +1461,135 @@ mod tests {
     }
 
     struct FakeBackend;
+
+    #[derive(Debug)]
+    struct FakeCompressedAudioProbe {
+        facts: Vec<BlurayProbedStreamFacts>,
+        error: Option<String>,
+        calls: Cell<usize>,
+        requests: RefCell<Vec<(PathBuf, u32)>>,
+    }
+
+    impl FakeCompressedAudioProbe {
+        fn success(facts: Vec<BlurayProbedStreamFacts>) -> Self {
+            Self {
+                facts,
+                error: None,
+                calls: Cell::new(0),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn failure(error: impl Into<String>) -> Self {
+            Self {
+                facts: Vec::new(),
+                error: Some(error.into()),
+                calls: Cell::new(0),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.get()
+        }
+    }
+
+    impl BlurayCompressedAudioProbe for FakeCompressedAudioProbe {
+        fn probe_bluray_audio_streams(
+            &self,
+            request: &BlurayAudioProbeRequest<'_>,
+            _control: &BlurayProbeControl<'_>,
+        ) -> Result<Vec<BlurayProbedStreamFacts>, String> {
+            self.calls.set(self.calls.get() + 1);
+            self.requests
+                .borrow_mut()
+                .push((request.source_path.to_path_buf(), request.playlist_number));
+            if let Some(error) = &self.error {
+                Err(error.clone())
+            } else {
+                Ok(self.facts.clone())
+            }
+        }
+    }
+
+    struct RecordingLogger;
+
+    static TEST_LOGGER: RecordingLogger = RecordingLogger;
+    static TEST_LOGGER_SET: Once = Once::new();
+    static TEST_LOGGER_ACTIVE: AtomicBool = AtomicBool::new(false);
+    static TEST_LOG_MESSAGES: TestOnceLock<TestMutex<Vec<String>>> = TestOnceLock::new();
+
+    impl log::Log for RecordingLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            if let Some(messages) = TEST_LOG_MESSAGES.get() {
+                if let Ok(mut messages) = messages.lock() {
+                    messages.push(record.args().to_string());
+                }
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn begin_log_capture() -> bool {
+        let messages = TEST_LOG_MESSAGES.get_or_init(|| TestMutex::new(Vec::new()));
+        if let Ok(mut messages) = messages.lock() {
+            messages.clear();
+        }
+        TEST_LOGGER_SET.call_once(|| {
+            if log::set_logger(&TEST_LOGGER).is_ok() {
+                log::set_max_level(log::LevelFilter::Trace);
+                TEST_LOGGER_ACTIVE.store(true, Ordering::Relaxed);
+            }
+        });
+        TEST_LOGGER_ACTIVE.load(Ordering::Relaxed)
+    }
+
+    fn captured_logs() -> Vec<String> {
+        TEST_LOG_MESSAGES
+            .get()
+            .and_then(|messages| messages.lock().ok().map(|messages| messages.clone()))
+            .unwrap_or_default()
+    }
+
+    impl BlurayProbedStreamFacts {
+        fn test_fact(
+            pid: Option<u16>,
+            audio_ordinal: Option<u8>,
+            codec_name: &str,
+            profile: Option<&str>,
+            sample_rate: Option<u32>,
+            bit_depth: Option<u32>,
+            channels: Option<u8>,
+        ) -> Self {
+            Self {
+                ffprobe_index: audio_ordinal.map(u32::from),
+                audio_ordinal,
+                pid,
+                codec_name: Some(codec_name.to_string()),
+                codec_profile: profile.map(str::to_string),
+                bit_depth,
+                sample_rate,
+                channels,
+            }
+        }
+    }
+
+    fn existing_source_path(test_name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tonepoet_bluray_probe_{test_name}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create fake Blu-ray source path");
+        path
+    }
 
     impl BlurayBackend for FakeBackend {
         type Disc = FakeDisc;
@@ -865,6 +1717,573 @@ mod tests {
             format_aware_bluray_presentation_label(&contents.presentations[0]),
             contents.presentations[0].label
         );
+    }
+
+    #[test]
+    fn mapper_uses_real_probe_result_for_compressed_bit_depth() {
+        let disc = fake_disc(vec![fake_title(
+            12,
+            58 * 60 + 32,
+            12,
+            vec![stream(
+                0x1100,
+                0,
+                BluRayAudioCoding::DtsHdMaster,
+                Some(192_000),
+                None,
+                Some(2),
+            )],
+        )]);
+        let source = existing_source_path("mapper_uses_real_probe_result_for_compressed_bit_depth");
+        let probe = FakeCompressedAudioProbe::success(vec![BlurayProbedStreamFacts::test_fact(
+            Some(0x1100),
+            Some(0),
+            "dts",
+            Some("DTS-HD MA"),
+            Some(192_000),
+            Some(24),
+            Some(2),
+        )]);
+
+        let contents = map_bluray_disc_with_audio_probe::<FakeBackend, _>(
+            &disc,
+            &source,
+            &probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap();
+
+        assert_eq!(probe.call_count(), 1);
+        assert_eq!(contents.presentations.len(), 1);
+        assert_eq!(contents.presentations[0].format.bit_depth, Some(24));
+        assert_eq!(
+            contents.presentations[0].label,
+            "Blu-ray Playlist 00012 Stream 1 PID 0x1100 · DTS-HD MA 192 kHz / 24-bit / Stereo"
+        );
+    }
+
+    #[test]
+    fn parses_ffprobe_playlist_audio_stream_facts_with_pid_and_ordinals() {
+        let facts = parse_ffprobe_playlist_audio_facts(
+            b"[STREAM]
+index=2
+id=0x1100
+codec_name=dts
+profile=DTS-HD MA
+sample_rate=192000
+channels=2
+bits_per_raw_sample=24
+[/STREAM]
+[STREAM]
+index=3
+id=0x1102
+codec_name=truehd
+profile=unknown
+sample_rate=192000
+channels=2
+bits_per_raw_sample=24
+[/STREAM]
+",
+        )
+        .unwrap();
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].ffprobe_index, Some(2));
+        assert_eq!(facts[0].audio_ordinal, Some(0));
+        assert_eq!(facts[0].pid, Some(0x1100));
+        assert_eq!(facts[0].codec_name.as_deref(), Some("dts"));
+        assert_eq!(facts[0].codec_profile.as_deref(), Some("DTS-HD MA"));
+        assert_eq!(facts[0].sample_rate, Some(192_000));
+        assert_eq!(facts[0].bit_depth, Some(24));
+        assert_eq!(facts[0].channels, Some(2));
+        assert_eq!(facts[1].audio_ordinal, Some(1));
+        assert_eq!(facts[1].pid, Some(0x1102));
+    }
+
+    #[test]
+    fn parses_ffprobe_default_stream_facts() {
+        let facts = parse_ffprobe_stream_facts(
+            b"codec_name=truehd
+sample_rate=192000
+channels=2
+bits_per_raw_sample=24
+",
+        )
+        .unwrap();
+
+        assert_eq!(facts.sample_rate, Some(192_000));
+        assert_eq!(facts.bit_depth, Some(24));
+        assert_eq!(facts.channels, Some(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffprobe_command_failure_reports_status_and_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = existing_source_path("ffprobe_command_failure_reports_status_and_stderr");
+        let ffprobe = dir.join("ffprobe-fails.sh");
+        std::fs::write(
+            &ffprobe,
+            "#!/bin/sh
+echo synthetic ffprobe failure >&2
+exit 42
+",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ffprobe).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ffprobe, permissions).unwrap();
+
+        let err = ffprobe_bluray_playlist_audio_streams(
+            &ffprobe,
+            &dir,
+            12,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("ffprobe exited with status"));
+        assert!(err.contains("synthetic ffprobe failure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffprobe_command_uses_injected_path_and_playlist_wide_audio_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = existing_source_path(
+            "ffprobe_command_uses_injected_path_and_playlist_wide_audio_entries",
+        );
+        let ffprobe = dir.join("ffprobe-records-args.sh");
+        let args_file = dir.join("args.txt");
+        std::fs::write(
+            &ffprobe,
+            format!(
+                "#!/bin/sh\nprintf '%s\n' \"$@\" > '{}'\ncat <<'EOF'\n[STREAM]\nindex=7\nid=0x1102\ncodec_name=truehd\nsample_rate=192000\nchannels=2\nbits_per_raw_sample=24\n[/STREAM]\nEOF\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ffprobe).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ffprobe, permissions).unwrap();
+
+        let facts = ffprobe_bluray_playlist_audio_streams(
+            &ffprobe,
+            &dir,
+            777,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap();
+
+        let args = std::fs::read_to_string(args_file).unwrap();
+        assert!(args.contains("-playlist\n777\n"));
+        assert!(args.contains("-select_streams\na\n"));
+        assert!(args.contains(
+            "stream=index,id,codec_name,profile,bits_per_raw_sample,sample_rate,channels"
+        ));
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].pid, Some(0x1102));
+        assert_eq!(facts[0].codec_name.as_deref(), Some("truehd"));
+        assert_eq!(facts[0].sample_rate, Some(192_000));
+        assert_eq!(facts[0].channels, Some(2));
+        assert_eq!(facts[0].bit_depth, Some(24));
+    }
+
+    #[test]
+    fn ffprobe_probe_honors_pre_cancelled_control_before_spawning() {
+        let cancelled = || true;
+        let control = BlurayProbeControl::bounded_default().with_cancellation(&cancelled);
+        let err = ffprobe_bluray_playlist_audio_streams(
+            Path::new("/definitely/not/ffprobe"),
+            Path::new("/definitely/not/a/disc"),
+            12,
+            &control,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("cancelled before ffprobe"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffprobe_probe_times_out_and_terminates_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = existing_source_path("ffprobe_probe_times_out_and_terminates_child");
+        let ffprobe = dir.join("ffprobe-hangs.sh");
+        std::fs::write(
+            &ffprobe,
+            "#!/bin/sh\nwhile :; do :; done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ffprobe).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ffprobe, permissions).unwrap();
+
+        let control = BlurayProbeControl::bounded_default()
+            .with_timeout(Duration::from_millis(50));
+        let err = ffprobe_bluray_playlist_audio_streams(&ffprobe, &dir, 12, &control)
+            .unwrap_err();
+
+        assert!(err.contains("timed out"));
+    }
+
+    #[test]
+    fn ffprobe_probe_uses_configured_tool_path() {
+        let configured = PathBuf::from("/opt/tonepoet/bin/ffprobe-custom");
+        let mut tool_paths = TestHashMap::new();
+        tool_paths.insert("ffprobe".to_string(), configured.clone());
+
+        let probe = FfprobeBlurayAudioProbe::from_tool_paths(&tool_paths);
+
+        assert_eq!(probe.ffprobe_path, configured);
+    }
+
+    #[test]
+    fn missing_required_bit_depth_for_lossless_compressed_stream_is_atomic() {
+        let source = existing_source_path(
+            "missing_required_bit_depth_for_lossless_compressed_stream_is_atomic",
+        );
+        let mut stream = stream(
+            0x1102,
+            2,
+            BluRayAudioCoding::TrueHd,
+            Some(96_000),
+            None,
+            Some(2),
+        );
+        let original = stream.clone();
+        let probe = FakeCompressedAudioProbe::success(vec![BlurayProbedStreamFacts::test_fact(
+            Some(0x1102),
+            Some(2),
+            "truehd",
+            None,
+            Some(192_000),
+            None,
+            Some(6),
+        )]);
+
+        let err = probe_compressed_bluray_stream_for_playlist_with_probe(
+            &source,
+            12,
+            &mut stream,
+            &probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("bits_per_raw_sample"));
+        assert_eq!(stream, original);
+    }
+
+    #[test]
+    fn failed_probe_result_does_not_poison_later_success_for_same_source_playlist() {
+        let source = existing_source_path(
+            "failed_probe_result_does_not_poison_later_success_for_same_source_playlist",
+        );
+        let mut failed_stream = stream(
+            0x1100,
+            0,
+            BluRayAudioCoding::DtsHdMaster,
+            Some(192_000),
+            None,
+            Some(2),
+        );
+        let failing_probe = FakeCompressedAudioProbe::failure("ffprobe missing on PATH");
+
+        let err = probe_compressed_bluray_stream_for_playlist_with_probe(
+            &source,
+            12,
+            &mut failed_stream,
+            &failing_probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("ffprobe missing on PATH"));
+        assert_eq!(failing_probe.call_count(), 1);
+        assert_eq!(failed_stream.probed_bit_depth, None);
+
+        let mut successful_stream = stream(
+            0x1100,
+            0,
+            BluRayAudioCoding::DtsHdMaster,
+            Some(192_000),
+            None,
+            Some(2),
+        );
+        let succeeding_probe = FakeCompressedAudioProbe::success(vec![
+            BlurayProbedStreamFacts::test_fact(
+                Some(0x1100),
+                Some(0),
+                "dts",
+                Some("DTS-HD MA"),
+                Some(192_000),
+                Some(24),
+                Some(2),
+            ),
+        ]);
+
+        probe_compressed_bluray_stream_for_playlist_with_probe(
+            &source,
+            12,
+            &mut successful_stream,
+            &succeeding_probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap();
+
+        assert_eq!(succeeding_probe.call_count(), 1);
+        assert_eq!(successful_stream.probed_bit_depth, Some(24));
+    }
+
+    #[test]
+    fn incomplete_successful_probe_does_not_poison_later_complete_probe_for_same_source_playlist() {
+        let source = existing_source_path(
+            "incomplete_successful_probe_does_not_poison_later_complete_probe_for_same_source_playlist",
+        );
+        let mut incomplete_stream = stream(
+            0x1102,
+            2,
+            BluRayAudioCoding::TrueHd,
+            Some(192_000),
+            None,
+            Some(2),
+        );
+        let incomplete_probe = FakeCompressedAudioProbe::success(vec![
+            BlurayProbedStreamFacts::test_fact(
+                Some(0x1102),
+                Some(2),
+                "truehd",
+                None,
+                Some(192_000),
+                None,
+                Some(2),
+            ),
+        ]);
+
+        let err = probe_compressed_bluray_stream_for_playlist_with_probe(
+            &source,
+            12,
+            &mut incomplete_stream,
+            &incomplete_probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("bits_per_raw_sample"));
+        assert_eq!(incomplete_probe.call_count(), 1);
+        assert_eq!(incomplete_stream.probed_bit_depth, None);
+
+        let mut complete_stream = stream(
+            0x1102,
+            2,
+            BluRayAudioCoding::TrueHd,
+            Some(192_000),
+            None,
+            Some(2),
+        );
+        let complete_probe = FakeCompressedAudioProbe::success(vec![
+            BlurayProbedStreamFacts::test_fact(
+                Some(0x1102),
+                Some(2),
+                "truehd",
+                None,
+                Some(192_000),
+                Some(24),
+                Some(2),
+            ),
+        ]);
+
+        probe_compressed_bluray_stream_for_playlist_with_probe(
+            &source,
+            12,
+            &mut complete_stream,
+            &complete_probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap();
+
+        assert_eq!(complete_probe.call_count(), 1);
+        assert_eq!(complete_stream.probed_bit_depth, Some(24));
+    }
+
+    #[test]
+    fn browse_probe_failure_leaves_compressed_stream_unchanged() {
+        let disc = fake_disc(vec![fake_title(
+            12,
+            3600,
+            12,
+            vec![stream(
+                0x1100,
+                0,
+                BluRayAudioCoding::DtsHdMaster,
+                Some(192_000),
+                None,
+                Some(2),
+            )],
+        )]);
+        let source = existing_source_path("browse_probe_failure_leaves_compressed_stream_unchanged");
+        let probe = FakeCompressedAudioProbe::failure("synthetic ffprobe failure");
+
+        let contents = map_bluray_disc_with_audio_probe::<FakeBackend, _>(
+            &disc,
+            &source,
+            &probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap();
+
+        assert_eq!(probe.call_count(), 1);
+        assert_eq!(contents.presentations.len(), 1);
+        assert_eq!(contents.presentations[0].format.sample_rate, Some(192_000));
+        assert_eq!(contents.presentations[0].format.bit_depth, None);
+        assert_eq!(contents.presentations[0].format.channels, Some(2));
+    }
+
+    #[test]
+    fn sample_rate_mismatch_logs_and_applies_only_after_required_bit_depth_present() {
+        let captures_logs = begin_log_capture();
+        let source = existing_source_path(
+            "sample_rate_mismatch_applies_only_after_required_bit_depth_present",
+        );
+        let mut stream = stream(
+            0x1102,
+            2,
+            BluRayAudioCoding::TrueHd,
+            Some(96_000),
+            None,
+            Some(2),
+        );
+        let probe = FakeCompressedAudioProbe::success(vec![BlurayProbedStreamFacts::test_fact(
+            Some(0x1102),
+            Some(2),
+            "truehd",
+            None,
+            Some(192_000),
+            Some(24),
+            Some(6),
+        )]);
+
+        probe_compressed_bluray_stream_for_playlist_with_probe(
+            &source,
+            12,
+            &mut stream,
+            &probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap();
+
+        assert_eq!(stream.sample_rate, Some(192_000));
+        assert_eq!(stream.probed_bit_depth, Some(24));
+        assert_eq!(stream.channels, Some(6));
+        assert_eq!(stream.channel_layout.as_deref(), Some("5.1"));
+        if captures_logs {
+            assert!(captured_logs().iter().any(|message| {
+                message.contains("CLPI sample rate 96000 Hz differs")
+                    && message.contains("ffprobe decoded sample rate 192000 Hz")
+            }));
+        }
+    }
+
+    #[test]
+    fn protected_disc_skips_compressed_ffprobe_probe() {
+        let disc = {
+            let mut disc = fake_disc(vec![fake_title(
+                12,
+                3600,
+                12,
+                vec![stream(
+                    0x1100,
+                    0,
+                    BluRayAudioCoding::DtsHdMaster,
+                    Some(192_000),
+                    None,
+                    Some(2),
+                )],
+            )]);
+            disc.protection_status = BlurayProtectionStatus::AacsDetectedNotHandled {
+                details: BlurayAacsStatus {
+                    handled: false,
+                    libaacs_detected: true,
+                    error_code: Some(1),
+                    mkb_version: Some(78),
+                },
+            };
+            disc
+        };
+        let source = existing_source_path("protected_disc_skips_compressed_ffprobe_probe");
+        let probe = FakeCompressedAudioProbe::success(vec![BlurayProbedStreamFacts::test_fact(
+            Some(0x1100),
+            Some(0),
+            "dts",
+            Some("DTS-HD MA"),
+            Some(192_000),
+            Some(24),
+            Some(2),
+        )]);
+
+        let contents = map_bluray_disc_with_audio_probe::<FakeBackend, _>(
+            &disc,
+            &source,
+            &probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap();
+
+        assert_eq!(probe.call_count(), 0);
+        assert_eq!(contents.presentations.len(), 1);
+        assert_eq!(contents.presentations[0].format.bit_depth, None);
+    }
+
+    #[test]
+    fn stream_matching_prefers_pid_and_codec_over_audio_ordinal_for_truehd_core_pid() {
+        let source = existing_source_path(
+            "stream_matching_prefers_pid_and_codec_over_audio_ordinal_for_truehd_core_pid",
+        );
+        let mut stream = stream(
+            0x1102,
+            2,
+            BluRayAudioCoding::TrueHd,
+            Some(192_000),
+            None,
+            Some(2),
+        );
+        let probe = FakeCompressedAudioProbe::success(vec![
+            BlurayProbedStreamFacts::test_fact(
+                Some(0x1102),
+                Some(2),
+                "ac3",
+                None,
+                Some(48_000),
+                None,
+                Some(2),
+            ),
+            BlurayProbedStreamFacts::test_fact(
+                Some(0x1102),
+                Some(3),
+                "truehd",
+                None,
+                Some(192_000),
+                Some(24),
+                Some(2),
+            ),
+        ]);
+
+        probe_compressed_bluray_stream_for_playlist_with_probe(
+            &source,
+            12,
+            &mut stream,
+            &probe,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .unwrap();
+
+        assert_eq!(stream.sample_rate, Some(192_000));
+        assert_eq!(stream.probed_bit_depth, Some(24));
+        assert_eq!(stream.channels, Some(2));
     }
 
     #[test]
@@ -1219,16 +2638,20 @@ mod tests {
             stream_index,
             coding,
             sample_rate,
-            bit_depth: match bit_depth {
-                Some(bit_depth) => BlurayLpcmBitDepth::Probed {
-                    bit_depth,
-                    scanned_bytes: 188,
-                },
-                None if coding == BluRayAudioCoding::Lpcm => BlurayLpcmBitDepth::NotProbed {
-                    reason: super::super::bluray_backend::BlurayLpcmNotProbedReason::ProbePolicyNone,
-                },
-                None => BlurayLpcmBitDepth::NotApplicable,
+            bit_depth: if coding == BluRayAudioCoding::Lpcm {
+                match bit_depth {
+                    Some(bit_depth) => BlurayLpcmBitDepth::Probed {
+                        bit_depth,
+                        scanned_bytes: 188,
+                    },
+                    None => BlurayLpcmBitDepth::NotProbed {
+                        reason: super::super::bluray_backend::BlurayLpcmNotProbedReason::ProbePolicyNone,
+                    },
+                }
+            } else {
+                BlurayLpcmBitDepth::NotApplicable
             },
+            probed_bit_depth: if coding.is_compressed() { bit_depth } else { None },
             channels,
             channel_layout: channels.map(channel_layout_from_count),
             language: Some("eng".to_string()),

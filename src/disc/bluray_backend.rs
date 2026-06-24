@@ -43,6 +43,13 @@ impl BluRayAudioCoding {
         matches!(self, Self::Lpcm | Self::TrueHd | Self::DtsHdMaster)
     }
 
+    /// Whether the BD-ROM stream is compressed and therefore lacks a reliable
+    /// decoded PCM bit depth in CLPI metadata.
+    #[must_use]
+    pub const fn is_compressed(self) -> bool {
+        !matches!(self, Self::Lpcm)
+    }
+
     /// Higher values sort ahead of lower values.
     #[must_use]
     pub const fn codec_rank(self) -> u8 {
@@ -404,11 +411,30 @@ pub struct BlurayAudioStreamInfo {
     pub coding: BluRayAudioCoding,
     pub sample_rate: Option<u32>,
     pub bit_depth: BlurayLpcmBitDepth,
+    /// Decoded PCM bit depth reported by ffprobe for compressed Blu-ray streams.
+    /// CLPI does not carry this value for TrueHD, DTS-HD MA, DTS, AC-3, or
+    /// E-AC-3, so this remains `None` until an actual stream probe succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probed_bit_depth: Option<u32>,
     pub channels: Option<u8>,
     pub channel_layout: Option<String>,
     pub language: Option<String>,
 }
 
+impl BlurayAudioStreamInfo {
+    #[must_use]
+    pub fn decoded_bit_depth(&self) -> Option<u32> {
+        match self.coding {
+            BluRayAudioCoding::Lpcm => self.bit_depth.bit_depth(),
+            BluRayAudioCoding::Ac3
+            | BluRayAudioCoding::Eac3
+            | BluRayAudioCoding::Dts
+            | BluRayAudioCoding::TrueHd
+            | BluRayAudioCoding::DtsHd
+            | BluRayAudioCoding::DtsHdMaster => self.probed_bit_depth,
+        }
+    }
+}
 
 /// AACS status reported by libbluray disc metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -889,6 +915,7 @@ mod tests {
                     }],
                 },
             },
+            probed_bit_depth: None,
             channels: Some(2),
             channel_layout: Some("stereo".to_string()),
             language: Some("eng".to_string()),
@@ -911,6 +938,7 @@ mod tests {
                     bit_depth: 24,
                     scanned_bytes: 188,
                 },
+                probed_bit_depth: None,
                 channels: Some(2),
                 channel_layout: Some("stereo".to_string()),
                 language: Some("eng".to_string()),
@@ -922,6 +950,7 @@ mod tests {
                 coding: BluRayAudioCoding::Ac3,
                 sample_rate: Some(48_000),
                 bit_depth: BlurayLpcmBitDepth::NotApplicable,
+                probed_bit_depth: None,
                 channels: Some(6),
                 channel_layout: Some("5.1".to_string()),
                 language: Some("eng".to_string()),

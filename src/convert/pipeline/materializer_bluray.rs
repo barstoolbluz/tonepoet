@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::disc::bluray_backend::{
     bluray_audio_stream_display_number, validate_bluray_streams_for_materialization,
     BluRayAudioCoding, BluRayAudioStreamKind, BlurayAudioStreamInfo, BlurayBackend,
-    BlurayChapterInfo, BlurayDisplayAngle, BlurayTitleInfo, ProbeDepth,
+    BlurayChapterInfo, BlurayDisplayAngle, BlurayLpcmBitDepth, BlurayTitleInfo, ProbeDepth,
 };
 use crate::disc::bluray_backend_libbluray::BlurayBackendLibbluray;
 use crate::disc::model::PresentationId;
@@ -37,7 +37,7 @@ impl Materializer for BlurayMaterializer {
         staging: &StagingDir,
         runner: &dyn ToolRunner,
         _reporter: Option<&dyn PipelineReporter>,
-        _tool_paths: &HashMap<String, PathBuf>,
+        tool_paths: &HashMap<String, PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<PreparedSource, MaterializeError> {
         std::fs::create_dir_all(&staging.root).map_err(|err| {
@@ -62,13 +62,25 @@ impl Materializer for BlurayMaterializer {
             return Err(MaterializeError::Cancelled);
         }
 
-        let mut selection = select_bluray_program::<BlurayBackendLibbluray>(
+        let audio_probe = crate::disc::bluray_mapper::FfprobeBlurayAudioProbe::from_tool_paths(tool_paths);
+        let is_cancelled = || cancel.is_cancelled();
+        let probe_control = crate::disc::bluray_mapper::BlurayProbeControl::bounded_default()
+            .with_cancellation(&is_cancelled);
+
+        let mut selection = select_bluray_program_with_audio_probe::<BlurayBackendLibbluray, _>(
             &disc,
             &source,
             &req.source,
+            &audio_probe,
+            &probe_control,
         )?;
-        selection.stream =
-            selected_stream_with_materialization_facts::<BlurayBackendLibbluray>(&disc, &selection)?;
+        selection.stream = selected_stream_with_materialization_facts_with_audio_probe::<BlurayBackendLibbluray, _>(
+            &disc,
+            &source,
+            &selection,
+            &audio_probe,
+            &probe_control,
+        )?;
 
         build_prepared_bluray_source(
             &req.container,
@@ -121,6 +133,15 @@ impl BlurayPresentationRequest {
         }
     }
 
+    fn default_auto() -> Self {
+        Self {
+            playlist_number: None,
+            audio_pid: None,
+            audio_stream_index: None,
+            display_angle: None,
+        }
+    }
+
     fn exact(
         playlist_number: u32,
         audio_pid: u16,
@@ -136,50 +157,72 @@ impl BlurayPresentationRequest {
     }
 }
 
+#[cfg(test)]
 fn select_bluray_program<B: BlurayBackend>(
     disc: &B::Disc,
     source: &Path,
     options: &SourceOptions,
 ) -> Result<BlurayProgramSelection, MaterializeError> {
+    let probe = crate::disc::bluray_mapper::FfprobeBlurayAudioProbe::default();
+    let control = crate::disc::bluray_mapper::BlurayProbeControl::bounded_default();
+    select_bluray_program_with_audio_probe::<B, _>(disc, source, options, &probe, &control)
+}
+
+fn select_bluray_program_with_audio_probe<B, P>(
+    disc: &B::Disc,
+    source: &Path,
+    options: &SourceOptions,
+    compressed_audio_probe: &P,
+    probe_control: &crate::disc::bluray_mapper::BlurayProbeControl<'_>,
+) -> Result<BlurayProgramSelection, MaterializeError>
+where
+    B: BlurayBackend,
+    P: crate::disc::bluray_mapper::BlurayCompressedAudioProbe + ?Sized,
+{
     if options.explicit_bluray_requested() {
         let request = BlurayPresentationRequest::from_source_options(options);
-        if request.playlist_number.is_some() {
-            return select_bluray_program_direct::<B>(disc, request);
+        match select_filtered_bluray_program_from_mapper_with_audio_probe::<B, P>(
+            disc,
+            source,
+            request,
+            compressed_audio_probe,
+            probe_control,
+        ) {
+            Ok(selection) => return Ok(selection),
+            Err(MaterializeError::InvalidTrackSelection(_)) if request.playlist_number.is_some() => {
+                return select_bluray_program_direct::<B>(disc, request);
+            }
+            Err(err) => return Err(err),
         }
-        return select_filtered_bluray_program_from_mapper::<B>(disc, source, request);
     }
 
-    let contents = crate::disc::bluray_mapper::map_bluray_disc::<B>(disc, source)
-        .map_err(MaterializeError::Parse)?;
-    let index = crate::disc::bluray_mapper::best_bluray_presentation_index(&contents)
-        .ok_or_else(|| {
-            MaterializeError::InvalidTrackSelection(format!(
-                "Blu-ray source '{}' contains no supported audio presentation",
-                source.display()
-            ))
-        })?;
-    let id = contents.presentations[index].id;
-    let (playlist_number, audio_pid, audio_stream_index, display_angle) = id
-        .blu_ray_parts()
-        .ok_or_else(|| MaterializeError::Parse("best Blu-ray presentation has non-Blu-ray identity".to_string()))?;
-    select_bluray_program_direct::<B>(
+    select_filtered_bluray_program_from_mapper_with_audio_probe::<B, P>(
         disc,
-        BlurayPresentationRequest::exact(
-            playlist_number,
-            audio_pid,
-            audio_stream_index,
-            display_angle,
-        ),
+        source,
+        BlurayPresentationRequest::default_auto(),
+        compressed_audio_probe,
+        probe_control,
     )
 }
 
-fn select_filtered_bluray_program_from_mapper<B: BlurayBackend>(
+fn select_filtered_bluray_program_from_mapper_with_audio_probe<B, P>(
     disc: &B::Disc,
     source: &Path,
     request: BlurayPresentationRequest,
-) -> Result<BlurayProgramSelection, MaterializeError> {
-    let contents = crate::disc::bluray_mapper::map_bluray_disc::<B>(disc, source)
-        .map_err(MaterializeError::Parse)?;
+    compressed_audio_probe: &P,
+    probe_control: &crate::disc::bluray_mapper::BlurayProbeControl<'_>,
+) -> Result<BlurayProgramSelection, MaterializeError>
+where
+    B: BlurayBackend,
+    P: crate::disc::bluray_mapper::BlurayCompressedAudioProbe + ?Sized,
+{
+    let contents = crate::disc::bluray_mapper::map_bluray_disc_with_audio_probe::<B, P>(
+        disc,
+        source,
+        compressed_audio_probe,
+        probe_control,
+    )
+    .map_err(MaterializeError::Parse)?;
     let presentation = contents
         .presentations
         .iter()
@@ -199,7 +242,7 @@ fn select_filtered_bluray_program_from_mapper<B: BlurayBackend>(
         .id
         .blu_ray_parts()
         .ok_or_else(|| MaterializeError::Parse("matched Blu-ray presentation has non-Blu-ray identity".to_string()))?;
-    select_bluray_program_direct::<B>(
+    let mut selection = select_bluray_program_direct::<B>(
         disc,
         BlurayPresentationRequest::exact(
             playlist_number,
@@ -207,7 +250,58 @@ fn select_filtered_bluray_program_from_mapper<B: BlurayBackend>(
             audio_stream_index,
             display_angle,
         ),
-    )
+    )?;
+    hydrate_selection_stream_from_presentation(&mut selection, presentation)?;
+    Ok(selection)
+}
+
+
+fn hydrate_selection_stream_from_presentation(
+    selection: &mut BlurayProgramSelection,
+    presentation: &crate::disc::model::DiscPresentation,
+) -> Result<(), MaterializeError> {
+    let Some((playlist_number, audio_pid, audio_stream_index, display_angle)) =
+        presentation.id.blu_ray_parts()
+    else {
+        return Err(MaterializeError::Parse(
+            "matched presentation has non-Blu-ray identity".to_string(),
+        ));
+    };
+
+    if playlist_number != selection.title.playlist_number
+        || audio_pid != selection.stream.pid
+        || audio_stream_index != selection.stream.stream_index
+        || display_angle != selection.display_angle.get()
+    {
+        return Err(MaterializeError::Parse(format!(
+            "mapped Blu-ray presentation identity changed while selecting playlist {:05} stream {} PID 0x{:04x}",
+            selection.title.playlist_number,
+            bluray_audio_stream_display_number(selection.stream.stream_index),
+            selection.stream.pid
+        )));
+    }
+
+    if let Some(sample_rate) = presentation.format.sample_rate {
+        selection.stream.sample_rate = Some(sample_rate);
+    }
+    if let Some(bit_depth) = presentation.format.bit_depth {
+        if selection.stream.coding == BluRayAudioCoding::Lpcm {
+            selection.stream.bit_depth = BlurayLpcmBitDepth::Probed {
+                bit_depth,
+                scanned_bytes: 0,
+            };
+        } else if selection.stream.coding.is_compressed() {
+            selection.stream.probed_bit_depth = Some(bit_depth);
+        }
+    }
+    if let Some(channels) = presentation.format.channels {
+        selection.stream.channels = Some(channels);
+    }
+    if let Some(layout) = presentation.format.channel_layout.clone() {
+        selection.stream.channel_layout = Some(layout);
+    }
+
+    Ok(())
 }
 
 fn presentation_matches_request(id: PresentationId, request: BlurayPresentationRequest) -> bool {
@@ -438,7 +532,7 @@ fn direct_selection_score(selection: &BlurayProgramSelection) -> BlurayDirectSel
         is_lossless: selection.stream.coding.is_lossless(),
         codec_rank: selection.stream.coding.codec_rank(),
         sample_rate: selection.stream.sample_rate.unwrap_or(0),
-        bit_depth: selection.stream.bit_depth.bit_depth().unwrap_or(0),
+        bit_depth: selection.stream.decoded_bit_depth().unwrap_or(0),
         reverse_identity: ReverseBlurayIdentity {
             playlist_number: Reverse(selection.title.playlist_number),
             audio_stream_index: Reverse(selection.stream.stream_index),
@@ -458,12 +552,90 @@ fn has_chapter_durations(chapters: &[BlurayChapterInfo]) -> bool {
         })
 }
 
+#[cfg(test)]
 fn selected_stream_with_materialization_facts<B: BlurayBackend>(
     disc: &B::Disc,
+    source: &Path,
     selection: &BlurayProgramSelection,
 ) -> Result<BlurayAudioStreamInfo, MaterializeError> {
-    if selection.stream.coding != BluRayAudioCoding::Lpcm {
-        return Ok(selection.stream.clone());
+    let probe = crate::disc::bluray_mapper::FfprobeBlurayAudioProbe::default();
+    let control = crate::disc::bluray_mapper::BlurayProbeControl::bounded_default();
+    selected_stream_with_materialization_facts_with_audio_probe::<B, _>(
+        disc,
+        source,
+        selection,
+        &probe,
+        &control,
+    )
+}
+
+fn selected_stream_with_materialization_facts_with_audio_probe<B, P>(
+    disc: &B::Disc,
+    source: &Path,
+    selection: &BlurayProgramSelection,
+    compressed_audio_probe: &P,
+    probe_control: &crate::disc::bluray_mapper::BlurayProbeControl<'_>,
+) -> Result<BlurayAudioStreamInfo, MaterializeError>
+where
+    B: BlurayBackend,
+    P: crate::disc::bluray_mapper::BlurayCompressedAudioProbe + ?Sized,
+{
+    let protection_status = B::protection_status(disc);
+
+    if selection.stream.coding.is_compressed() {
+        let mut stream = selection.stream.clone();
+        if stream.decoded_bit_depth().is_none() {
+            if !protection_status.may_read_media_for_probe() {
+                if stream.coding.is_lossless() {
+                    return Err(MaterializeError::Parse(format!(
+                        "Blu-ray playlist {:05} lossless compressed stream {} PID 0x{:04x} cannot be materialized without probed decoded bit depth; ffprobe media probing was skipped because {}",
+                        selection.title.playlist_number,
+                        bluray_audio_stream_display_number(selection.stream.stream_index),
+                        selection.stream.pid,
+                        protection_status.summary()
+                    )));
+                }
+                return Ok(stream);
+            }
+
+            crate::disc::bluray_mapper::probe_compressed_bluray_stream_for_playlist_with_probe(
+                source,
+                selection.title.playlist_number,
+                &mut stream,
+                compressed_audio_probe,
+                probe_control,
+            )
+            .map_err(|err| {
+                MaterializeError::Parse(format!(
+                    "Blu-ray playlist {:05} stream {} PID 0x{:04x} ffprobe decoded-audio probe failed: {err}",
+                    selection.title.playlist_number,
+                    bluray_audio_stream_display_number(selection.stream.stream_index),
+                    selection.stream.pid
+                ))
+            })?;
+        }
+        if stream.coding.is_lossless() && stream.decoded_bit_depth().is_none() {
+            return Err(MaterializeError::Parse(format!(
+                "Blu-ray playlist {:05} lossless compressed stream {} PID 0x{:04x} is missing probed decoded bit depth",
+                selection.title.playlist_number,
+                bluray_audio_stream_display_number(selection.stream.stream_index),
+                selection.stream.pid
+            )));
+        }
+        return Ok(stream);
+    }
+
+    if !protection_status.may_read_media_for_probe() {
+        if selection.stream.bit_depth.is_probed() {
+            return Ok(selection.stream.clone());
+        }
+        return Err(MaterializeError::Parse(format!(
+            "Blu-ray playlist {:05} LPCM stream {} PID 0x{:04x} cannot be materialized without probed bit depth; LPCM media probing was skipped because {}",
+            selection.title.playlist_number,
+            bluray_audio_stream_display_number(selection.stream.stream_index),
+            selection.stream.pid,
+            protection_status.summary()
+        )));
     }
 
     let streams = B::streams_with_probe_policy(
@@ -514,15 +686,7 @@ fn selected_stream_with_materialization_facts<B: BlurayBackend>(
 }
 
 fn bluray_track_bit_depth(stream: &BlurayAudioStreamInfo) -> Option<u32> {
-    match stream.coding {
-        BluRayAudioCoding::Lpcm => stream.bit_depth.bit_depth(),
-        BluRayAudioCoding::Ac3
-        | BluRayAudioCoding::Eac3
-        | BluRayAudioCoding::Dts
-        | BluRayAudioCoding::TrueHd
-        | BluRayAudioCoding::DtsHd
-        | BluRayAudioCoding::DtsHdMaster => None,
-    }
+    stream.decoded_bit_depth()
 }
 
 fn source_audio_coding(coding: BluRayAudioCoding) -> Option<SourceAudioCoding> {
@@ -556,6 +720,7 @@ fn build_prepared_bluray_source(
             ))
         },
     )?;
+    validate_decoded_bit_depth_for_materialization(selection)?;
 
     let title_chapter_count = bluray_chapter_count_for_selection(selection)?;
     let selected_chapters = selected_chapter_ordinals(title_chapter_count, track_selection)?;
@@ -641,6 +806,20 @@ fn build_prepared_bluray_source(
             extracted_at: chrono::Utc::now(),
         },
     })
+}
+
+fn validate_decoded_bit_depth_for_materialization(
+    selection: &BlurayProgramSelection,
+) -> Result<(), MaterializeError> {
+    if selection.stream.coding.is_lossless() && selection.stream.decoded_bit_depth().is_none() {
+        return Err(MaterializeError::Parse(format!(
+            "Blu-ray playlist {:05} lossless stream {} PID 0x{:04x} cannot be materialized without probed decoded bit depth",
+            selection.title.playlist_number,
+            bluray_audio_stream_display_number(selection.stream.stream_index),
+            selection.stream.pid
+        )));
+    }
+    Ok(())
 }
 
 fn bluray_chapter_count_for_selection(
@@ -945,6 +1124,9 @@ fn bluray_tool_versions(
         if let Some(version) = runner.tool_version(ToolBinary::Ffmpeg) {
             tool_versions.insert("ffmpeg".to_string(), version);
         }
+        if let Some(version) = runner.tool_version(ToolBinary::Ffprobe) {
+            tool_versions.insert("ffprobe".to_string(), version);
+        }
     }
     tool_versions
 }
@@ -1012,8 +1194,10 @@ mod tests {
     use super::{
         bluray_sidecar_overlay_stub_call_count, bluray_track_bit_depth,
         build_prepared_bluray_source, chapter_end_pts_90k, reset_bluray_sidecar_overlay_stub_call_count,
-        select_bluray_program, selected_chapter_ordinals, selected_stream_with_materialization_facts,
-        validate_chapter_pts, validate_explicit_stream_pair, BlurayPresentationRequest,
+        select_bluray_program, select_bluray_program_with_audio_probe, selected_chapter_ordinals,
+        selected_stream_with_materialization_facts,
+        selected_stream_with_materialization_facts_with_audio_probe, validate_chapter_pts,
+        validate_explicit_stream_pair, BlurayPresentationRequest,
     };
     use crate::disc::bluray_backend::{
         BluRayAudioCoding, BluRayAudioStreamKind, BlurayAudioStreamInfo,
@@ -1021,7 +1205,7 @@ mod tests {
         BlurayLpcmBitDepth, BlurayLpcmNotProbedReason, BlurayPtsContinuitySegment,
         BlurayStreamDecryptor, BlurayTitleInfo, BlurayTitleKey, ProbeDepth,
     };
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
@@ -1061,6 +1245,71 @@ mod tests {
     }
 
     struct FakeBackend;
+
+    #[derive(Debug)]
+    struct FakeCompressedAudioProbe {
+        facts: Vec<crate::disc::bluray_mapper::BlurayProbedStreamFacts>,
+        calls: Cell<usize>,
+        requests: RefCell<Vec<(PathBuf, u32)>>,
+    }
+
+    impl FakeCompressedAudioProbe {
+        fn success(facts: Vec<crate::disc::bluray_mapper::BlurayProbedStreamFacts>) -> Self {
+            Self {
+                facts,
+                calls: Cell::new(0),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.get()
+        }
+    }
+
+    impl crate::disc::bluray_mapper::BlurayCompressedAudioProbe for FakeCompressedAudioProbe {
+        fn probe_bluray_audio_streams(
+            &self,
+            request: &crate::disc::bluray_mapper::BlurayAudioProbeRequest<'_>,
+            _control: &crate::disc::bluray_mapper::BlurayProbeControl<'_>,
+        ) -> Result<Vec<crate::disc::bluray_mapper::BlurayProbedStreamFacts>, String> {
+            self.calls.set(self.calls.get() + 1);
+            self.requests
+                .borrow_mut()
+                .push((request.source_path.to_path_buf(), request.playlist_number));
+            Ok(self.facts.clone())
+        }
+    }
+
+    fn probed_fact(
+        pid: Option<u16>,
+        audio_ordinal: Option<u8>,
+        codec_name: &str,
+        profile: Option<&str>,
+        sample_rate: Option<u32>,
+        bit_depth: Option<u32>,
+        channels: Option<u8>,
+    ) -> crate::disc::bluray_mapper::BlurayProbedStreamFacts {
+        crate::disc::bluray_mapper::BlurayProbedStreamFacts {
+            ffprobe_index: audio_ordinal.map(u32::from),
+            audio_ordinal,
+            pid,
+            codec_name: Some(codec_name.to_string()),
+            codec_profile: profile.map(str::to_string),
+            bit_depth,
+            sample_rate,
+            channels,
+        }
+    }
+
+    fn existing_source_path(test_name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tonepoet_bluray_materializer_{test_name}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create fake Blu-ray source path");
+        path
+    }
 
     impl BlurayBackend for FakeBackend {
         type Disc = FakeDisc;
@@ -1122,6 +1371,10 @@ mod tests {
 
         fn max_angle(disc: &Self::Disc, title: BlurayTitleKey) -> Result<u8, String> {
             Ok(fake_title_by_key(disc, title)?.max_angle)
+        }
+
+        fn protection_status(_disc: &Self::Disc) -> crate::disc::bluray_backend::BlurayProtectionStatus {
+            crate::disc::bluray_backend::BlurayProtectionStatus::Unencrypted
         }
 
         fn open_title(
@@ -1281,6 +1534,7 @@ mod tests {
             coding,
             sample_rate: Some(96_000),
             bit_depth,
+            probed_bit_depth: None,
             channels: Some(2),
             channel_layout: Some("stereo".to_string()),
             language: Some("eng".to_string()),
@@ -1301,6 +1555,7 @@ mod tests {
             coding,
             sample_rate,
             bit_depth: BlurayLpcmBitDepth::NotApplicable,
+            probed_bit_depth: None,
             channels,
             channel_layout: channels.map(|channels| match channels {
                 2 => "stereo".to_string(),
@@ -1310,6 +1565,19 @@ mod tests {
             }),
             language: Some("eng".to_string()),
         }
+    }
+
+    fn probed_compressed_stream(
+        pid: u16,
+        stream_index: u8,
+        coding: BluRayAudioCoding,
+        sample_rate: Option<u32>,
+        bit_depth: u32,
+        channels: Option<u8>,
+    ) -> BlurayAudioStreamInfo {
+        let mut stream = compressed_stream(pid, stream_index, coding, sample_rate, channels);
+        stream.probed_bit_depth = Some(bit_depth);
+        stream
     }
 
     fn unprobed_lpcm_stream(pid: u16, stream_index: u8) -> BlurayAudioStreamInfo {
@@ -1390,10 +1658,10 @@ mod tests {
     }
 
     fn version_runner() -> VersionOnlyRunner {
-        VersionOnlyRunner(HashMap::from([(
-            ToolBinary::Ffmpeg,
-            "ffmpeg 7.1.3".to_string(),
-        )]))
+        VersionOnlyRunner(HashMap::from([
+            (ToolBinary::Ffmpeg, "ffmpeg 7.1.3".to_string()),
+            (ToolBinary::Ffprobe, "ffprobe 7.1.3".to_string()),
+        ]))
     }
 
     #[test]
@@ -1610,6 +1878,7 @@ mod tests {
 
         selection.stream = selected_stream_with_materialization_facts::<FakeBackend>(
             &disc,
+            Path::new("/fixtures/Album.iso"),
             &selection,
         )
         .expect("bounded LPCM probe");
@@ -1669,8 +1938,12 @@ mod tests {
         )
         .expect("select LPCM stream");
 
-        let probe_err = selected_stream_with_materialization_facts::<FakeBackend>(&disc, &selection)
-            .unwrap_err();
+        let probe_err = selected_stream_with_materialization_facts::<FakeBackend>(
+            &disc,
+            Path::new("/fixtures/Album.iso"),
+            &selection,
+        )
+        .unwrap_err();
         assert!(matches!(probe_err, MaterializeError::Parse(_)));
         assert!(probe_err.to_string().contains("bit-depth probe"));
         assert_eq!(disc.probe_calls.get(), 1);
@@ -1689,7 +1962,64 @@ mod tests {
     }
 
     #[test]
-    fn materializer_bluray_compressed_codec_materializes_without_bit_depth() {
+    fn materializer_reuses_mapper_probed_compressed_bit_depth_without_reprobe() {
+        let disc = fake_disc(vec![fake_title(
+            12,
+            0,
+            180_000,
+            1,
+            &[0, 90_000],
+            vec![compressed_stream(
+                0x1102,
+                2,
+                BluRayAudioCoding::TrueHd,
+                Some(96_000),
+                Some(2),
+            )],
+        )]);
+        let source = existing_source_path(
+            "materializer_reuses_mapper_probed_compressed_bit_depth_without_reprobe",
+        );
+        let options = explicit_options(12, 0x1102, 2, 1);
+        let probe = FakeCompressedAudioProbe::success(vec![probed_fact(
+            Some(0x1102),
+            Some(2),
+            "truehd",
+            None,
+            Some(192_000),
+            Some(24),
+            Some(2),
+        )]);
+        let control = crate::disc::bluray_mapper::BlurayProbeControl::bounded_default();
+
+        let selection = select_bluray_program_with_audio_probe::<FakeBackend, _>(
+            &disc,
+            &source,
+            &options,
+            &probe,
+            &control,
+        )
+        .expect("selection should use mapper probe facts");
+        assert_eq!(probe.call_count(), 1);
+        assert_eq!(selection.stream.sample_rate, Some(192_000));
+        assert_eq!(selection.stream.probed_bit_depth, Some(24));
+
+        let selected = selected_stream_with_materialization_facts_with_audio_probe::<FakeBackend, _>(
+            &disc,
+            &source,
+            &selection,
+            &probe,
+            &control,
+        )
+        .expect("materializer should reuse mapper-populated bit depth");
+
+        assert_eq!(probe.call_count(), 1);
+        assert_eq!(selected.sample_rate, Some(192_000));
+        assert_eq!(selected.probed_bit_depth, Some(24));
+    }
+
+    #[test]
+    fn materializer_bluray_lossy_compressed_codec_materializes_without_bit_depth() {
         let disc = fake_disc(vec![fake_title(
             12,
             0,
@@ -1699,7 +2029,7 @@ mod tests {
             vec![compressed_stream(
                 0x1102,
                 1,
-                BluRayAudioCoding::DtsHdMaster,
+                BluRayAudioCoding::Ac3,
                 Some(96_000),
                 Some(6),
             )],
@@ -1710,7 +2040,7 @@ mod tests {
             Path::new("/fixtures/Album.iso"),
             &options,
         )
-        .expect("select DTS-HD MA stream");
+        .expect("select AC-3 stream");
         let prepared = build_prepared_bluray_source(
             Path::new("/fixtures/Album.iso"),
             Path::new("/fixtures/Album.iso"),
@@ -1742,7 +2072,7 @@ mod tests {
                     audio_stream_index,
                     ..
                 } => {
-                    assert_eq!(*audio_coding, BluRayAudioCoding::DtsHdMaster);
+                    assert_eq!(*audio_coding, BluRayAudioCoding::Ac3);
                     assert_eq!(*bit_depth, None);
                     assert_eq!(*sample_rate, Some(96_000));
                     assert_eq!(*channels, Some(6));
@@ -1832,12 +2162,17 @@ mod tests {
                 || libbluray == "in-process libbluray backend; linked library version not exposed by build metadata"
         );
         assert!(!lpcm_versions.contains_key("ffmpeg"));
+        assert!(!lpcm_versions.contains_key("ffprobe"));
 
         let compressed_versions = bluray_tool_versions(&version_runner(), BluRayAudioCoding::Ac3);
         assert_eq!(compressed_versions.get("libbluray"), Some(libbluray));
         assert_eq!(
             compressed_versions.get("ffmpeg").map(String::as_str),
             Some("ffmpeg 7.1.3")
+        );
+        assert_eq!(
+            compressed_versions.get("ffprobe").map(String::as_str),
+            Some("ffprobe 7.1.3")
         );
     }
 
@@ -1922,11 +2257,12 @@ mod tests {
             270_000,
             1,
             &[0, 90_000, 180_000],
-            vec![compressed_stream(
+            vec![probed_compressed_stream(
                 0x1100,
                 0,
                 BluRayAudioCoding::TrueHd,
                 Some(96_000),
+                24,
                 Some(2),
             )],
         )]);
@@ -2049,16 +2385,19 @@ mod tests {
     fn lpcm_bit_depth_only_materializes_after_probe() {
         let unprobed = unprobed_lpcm_stream(0x1100, 0);
         let probed = probed_lpcm_stream(0x1100, 0, 24);
-        let compressed = audio_stream(
+        let compressed_unprobed = audio_stream(
             0x1101,
             1,
             BluRayAudioCoding::Ac3,
             BlurayLpcmBitDepth::NotApplicable,
         );
+        let mut compressed_probed = compressed_unprobed.clone();
+        compressed_probed.probed_bit_depth = Some(24);
 
         assert_eq!(bluray_track_bit_depth(&unprobed), None);
         assert_eq!(bluray_track_bit_depth(&probed), Some(24));
-        assert_eq!(bluray_track_bit_depth(&compressed), None);
+        assert_eq!(bluray_track_bit_depth(&compressed_unprobed), None);
+        assert_eq!(bluray_track_bit_depth(&compressed_probed), Some(24));
     }
 
     #[test]

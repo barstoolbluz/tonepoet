@@ -874,6 +874,7 @@ impl ClipAudioStreamDescriptor {
             coding: self.coding,
             sample_rate: self.sample_rate,
             bit_depth,
+            probed_bit_depth: None,
             channels: self.channels,
             channel_layout: self.channel_layout,
             language: self.language,

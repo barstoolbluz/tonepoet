@@ -140,13 +140,30 @@ pub fn bluray_directory_root(path: &Path) -> Option<PathBuf> {
 
 /// Open and map a Blu-ray source into the unified disc browsing model.
 pub fn map_bluray_source(path: &Path) -> Result<crate::disc::DiscContents, String> {
+    let probe = crate::disc::bluray_mapper::FfprobeBlurayAudioProbe::default();
+    let control = crate::disc::bluray_mapper::BlurayProbeControl::bounded_default();
+    map_bluray_source_with_audio_probe(path, &probe, &control)
+}
+
+/// Open and map a Blu-ray source using an explicit compressed-stream probe.
+///
+/// This keeps the normal TUI browse path bounded by default while allowing tests
+/// and callers with configured tool paths to inject their own probe runner.
+pub(crate) fn map_bluray_source_with_audio_probe<P>(
+    path: &Path,
+    compressed_audio_probe: &P,
+    probe_control: &crate::disc::bluray_mapper::BlurayProbeControl<'_>,
+) -> Result<crate::disc::DiscContents, String>
+where
+    P: crate::disc::bluray_mapper::BlurayCompressedAudioProbe + ?Sized,
+{
     let source = bluray_source_path_for_backend(path)?;
     let disc = BlurayBackendLibbluray::open(&source)
         .map_err(|err| format!("Blu-ray open failed for '{}': {err}", source.display()))?;
-    let mut contents = crate::disc::bluray_mapper::map_bluray_disc::<BlurayBackendLibbluray>(
-        &disc,
-        &source,
-    )?;
+    let mut contents = crate::disc::bluray_mapper::map_bluray_disc_with_audio_probe::<
+        BlurayBackendLibbluray,
+        P,
+    >(&disc, &source, compressed_audio_probe, probe_control)?;
     overlay_bluray_sidecar_metadata(path, &mut contents);
     crate::disc::bluray_mapper::refresh_bluray_presentation_labels(&mut contents);
     Ok(contents)

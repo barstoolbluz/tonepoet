@@ -11,7 +11,7 @@ use sacd_rs::{
 };
 use tonepoet_pipeline::{
     AudioCodec as PlannerCodec, AudioFormat as PlannerFormat, BitDepthTarget,
-    PcmBitDepth, PipelineSettings, PlanRequest, SampleKind, SourceInfo,
+    PcmBitDepth, PipelineSettings, PlanRequest, PreferredTool, SampleKind, SourceInfo,
 };
 
 use super::errors::ConvertError;
@@ -39,6 +39,19 @@ pub fn plan_request_for_track(
     }
 
     let mut settings = request.settings.clone();
+    // Blu-ray compressed-codec realization decodes through FFmpeg into a PCM WAV
+    // carrier. In Auto mode, keep the encode leg on FFmpeg as well: FFmpeg
+    // preserves decoded WAV precision without requiring the SoX-only `-b` flag
+    // that previously defaulted unresolved compressed-codec depth to 16-bit.
+    // Explicit user tool preferences remain explicit; the materializer still
+    // provides a concrete decoded bit depth so a requested SoX path receives a
+    // 24-bit target instead of the legacy 16-bit fallback.
+    if matches!(&track.source_ref, TrackSourceRef::BluRayTrack { .. })
+        && matches!(settings.preferred_tool, PreferredTool::Auto)
+    {
+        settings.preferred_tool = PreferredTool::Ffmpeg;
+    }
+
     // CUE materialization now produces an audio-only, validated PCM S32LE WAV
     // carrier. It is a sample-bounded decoded segment, not the original image
     // container, so the planner must not claim source tag/artwork transfer or
@@ -647,7 +660,7 @@ mod tests {
     use tempfile::TempDir;
     use tonepoet_pipeline::{
         AudioFormat as PlannerFormat, PipelineSettings, PlanAction, PlanOperation, PlanRequest,
-        TopologyPlan,
+        PreferredTool, TopologyPlan,
     };
 
     use super::{
@@ -658,6 +671,7 @@ mod tests {
         source_info_for_realized_track, source_needs_authoritative_metadata,
         DsdPlannerSourceKind,
     };
+    use crate::disc::bluray_backend::BluRayAudioCoding;
     use crate::convert::pipeline::types::{
         AlbumMetadata, CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection,
         ExtractionProvenance, FailurePolicy, LogPolicy, CueSegmentCarrier,
@@ -756,6 +770,25 @@ mod tests {
         }
     }
 
+    fn bluray_track_ref(source: PathBuf) -> TrackSourceRef {
+        TrackSourceRef::BluRayTrack {
+            source,
+            playlist_number: 12,
+            title_index: 0,
+            angle_number: 1,
+            chapter_number: 1,
+            chapter_start_pts_90k: 0,
+            chapter_end_pts_90k: 90_000,
+            audio_pid: 0x1100,
+            audio_stream_index: 0,
+            audio_coding: BluRayAudioCoding::TrueHd,
+            sample_rate: Some(192_000),
+            bit_depth: Some(24),
+            channels: Some(2),
+            channel_layout: None,
+        }
+    }
+
     fn source(kind: SourceKind, track: PreparedTrack, root: &Path) -> PreparedSource {
         PreparedSource {
             container: root.join("album.iso"),
@@ -781,6 +814,18 @@ mod tests {
         match plan.action {
             PlanAction::Execute { commands, .. } => commands.into_iter().map(|cmd| cmd.args).collect(),
             PlanAction::PassthroughCopy { .. } => Vec::new(),
+        }
+    }
+
+    fn planned_command_programs(plan_request: &PlanRequest) -> Vec<String> {
+        let plan = tonepoet_pipeline::plan_conversion(plan_request).expect("planner builds command plan");
+        match plan.action {
+            PlanAction::Execute { commands, .. } => {
+                commands.into_iter().map(|cmd| cmd.program).collect()
+            }
+            PlanAction::PassthroughCopy { .. } => {
+                panic!("expected executable command plan, got passthrough copy")
+            }
         }
     }
 
@@ -1030,6 +1075,80 @@ mod tests {
         assert!(
             flac_streaminfo_audio_md5(&input).is_none(),
             "non-FLAC realized inputs must not create a source-MD5 capability"
+        );
+    }
+
+    #[test]
+    fn bluray_auto_plan_request_prefers_ffmpeg_and_resolves_24_bit_depth() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("realized.wav");
+        std::fs::write(&input, b"placeholder pcm wav").expect("placeholder staged WAV");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.preferred_tool = PreferredTool::Auto;
+        let mut track = track(bluray_track_ref(temp.path().join("album.iso")));
+        track.sample_rate = Some(192_000);
+        track.bit_depth = Some(24);
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("Blu-ray plan request builds");
+
+        assert_eq!(planned.settings.preferred_tool, PreferredTool::Ffmpeg);
+        assert_eq!(planned.source.bit_depth, Some(tonepoet_pipeline::PcmBitDepth::Int24));
+        assert_eq!(
+            planned.settings.target_bit_depth,
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24)
+        );
+    }
+
+    #[test]
+    fn bluray_auto_plan_builds_ffmpeg_encode_command_not_sox() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("realized.wav");
+        std::fs::write(&input, b"placeholder pcm wav").expect("placeholder staged WAV");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.preferred_tool = PreferredTool::Auto;
+        let mut track = track(bluray_track_ref(temp.path().join("album.iso")));
+        track.sample_rate = Some(192_000);
+        track.bit_depth = Some(24);
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("Blu-ray plan request builds");
+        let programs = planned_command_programs(&planned);
+
+        assert!(
+            programs.iter().any(|program| program == "ffmpeg"),
+            "Blu-ray Auto FLAC encode should route through ffmpeg; got {programs:?}"
+        );
+        assert!(
+            !programs.iter().any(|program| program == "sox"),
+            "Blu-ray Auto FLAC encode must not route through sox; got {programs:?}"
+        );
+    }
+
+    #[test]
+    fn bluray_plan_request_keeps_explicit_user_tool_preference() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("realized.wav");
+        std::fs::write(&input, b"placeholder pcm wav").expect("placeholder staged WAV");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.preferred_tool = PreferredTool::Sox;
+        let mut track = track(bluray_track_ref(temp.path().join("album.iso")));
+        track.sample_rate = Some(192_000);
+        track.bit_depth = Some(24);
+
+        let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
+            .expect("Blu-ray plan request builds");
+
+        assert_eq!(planned.settings.preferred_tool, PreferredTool::Sox);
+        assert_eq!(
+            planned.settings.target_bit_depth,
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24)
         );
     }
 
