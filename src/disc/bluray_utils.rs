@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use super::bluray_backend::BlurayBackend;
+use super::bluray_backend::{BlurayBackend, BlurayChapterInfo};
 use super::bluray_backend_libbluray::BlurayBackendLibbluray;
 
 const TS_PACKET_SIZE: usize = 188;
@@ -164,7 +164,7 @@ where
         BlurayBackendLibbluray,
         P,
     >(&disc, &source, compressed_audio_probe, probe_control)?;
-    overlay_bluray_sidecar_metadata(path, &mut contents);
+    overlay_bluray_sidecar_metadata::<BlurayBackendLibbluray>(path, &disc, &mut contents);
     crate::disc::bluray_mapper::refresh_bluray_presentation_labels(&mut contents);
     Ok(contents)
 }
@@ -190,8 +190,229 @@ pub fn bluray_source_path_for_backend(path: &Path) -> Result<PathBuf, String> {
     Err(format!("Not a Blu-ray source: {}", path.display()))
 }
 
-fn overlay_bluray_sidecar_metadata(_source: &Path, _contents: &mut crate::disc::DiscContents) {
-    // Phase 5: load and overlay a TOML sidecar, then refresh presentation labels.
+fn overlay_bluray_sidecar_metadata<B>(
+    source: &Path,
+    disc: &B::Disc,
+    contents: &mut crate::disc::DiscContents,
+) where
+    B: BlurayBackend,
+{
+    let mut fingerprint_cache: HashMap<(u32, u8), Option<String>> = HashMap::new();
+    overlay_bluray_sidecar_metadata_with_fingerprint_lookup(source, contents, |playlist_number, display_angle| {
+        let cache_key = (playlist_number, display_angle.get());
+        if let Some(cached) = fingerprint_cache.get(&cache_key) {
+            return cached.clone();
+        }
+        let fingerprint = bluray_duration_fingerprint_for_presentation::<B>(
+            disc,
+            playlist_number,
+            display_angle,
+        )
+        .map_err(|err| {
+            log::warn!(
+                "Blu-ray metadata sidecar fingerprint unavailable for playlist {playlist_number:05} angle {}: {err}",
+                display_angle.get()
+            );
+            err
+        })
+        .ok();
+        fingerprint_cache.insert(cache_key, fingerprint.clone());
+        fingerprint
+    });
+}
+
+fn overlay_bluray_sidecar_metadata_with_fingerprint_lookup<F>(
+    source: &Path,
+    contents: &mut crate::disc::DiscContents,
+    mut current_fingerprint: F,
+) where
+    F: FnMut(u32, crate::disc::model::BlurayDisplayAngle) -> Option<String>,
+{
+    let (sidecar_path, sidecars) = match crate::tui::command::load_bluray_metadata_sidecar_presentations(source) {
+        Ok(Some(found)) => found,
+        Ok(None) => return,
+        Err(err) => {
+            log::warn!(
+                "Blu-ray metadata sidecar overlay skipped for '{}': {}",
+                source.display(),
+                err
+            );
+            return;
+        }
+    };
+
+    for presentation in &mut contents.presentations {
+        let Some(identity) = bluray_presentation_identity_from_disc_presentation(
+            presentation,
+            &mut current_fingerprint,
+        ) else {
+            continue;
+        };
+        let match_report = crate::tui::command::find_unique_matching_bluray_metadata_sidecar(
+            &sidecars,
+            &identity,
+            true,
+        );
+        for warning in &match_report.warnings {
+            log_bluray_sidecar_match_warning(&sidecar_path, &identity, warning);
+        }
+        let Some(sidecar) = match_report.selected else {
+            continue;
+        };
+        apply_bluray_album_sidecar(presentation, sidecar);
+        apply_bluray_track_sidecar(presentation, sidecar);
+    }
+}
+
+fn bluray_presentation_identity_from_disc_presentation<F>(
+    presentation: &crate::disc::model::DiscPresentation,
+    current_fingerprint: &mut F,
+) -> Option<crate::tui::command::BluRayPresentationIdentity>
+where
+    F: FnMut(u32, crate::disc::model::BlurayDisplayAngle) -> Option<String>,
+{
+    match presentation.id {
+        crate::disc::model::PresentationId::BluRayTitle {
+            playlist_number,
+            audio_pid,
+            audio_stream_index,
+            display_angle,
+        } => Some(crate::tui::command::BluRayPresentationIdentity {
+            playlist_number,
+            audio_pid,
+            audio_stream_index,
+            angle_number: Some(display_angle.get()),
+            track_count: u32::try_from(presentation.tracks.len()).ok(),
+            duration_fingerprint: current_fingerprint(playlist_number, display_angle),
+            extra: Default::default(),
+        }),
+        _ => None,
+    }
+}
+
+fn bluray_duration_fingerprint_for_presentation<B>(
+    disc: &B::Disc,
+    playlist_number: u32,
+    display_angle: crate::disc::model::BlurayDisplayAngle,
+) -> Result<String, String>
+where
+    B: BlurayBackend,
+{
+    let title = B::titles(disc)?
+        .into_iter()
+        .find(|title| title.playlist_number == playlist_number)
+        .ok_or_else(|| format!("Blu-ray playlist {playlist_number:05} not found while building sidecar fingerprint"))?;
+    let chapters = B::chapters(disc, title.key, display_angle)?;
+    Ok(bluray_duration_fingerprint_from_title_and_chapters(
+        title.duration_pts_90k,
+        &chapters,
+    ))
+}
+
+/// Build the Blu-ray sidecar duration fingerprint from authored title and chapter PTS data.
+///
+/// This helper is shared by browse overlay and the materializer so both paths
+/// compare exactly the same string. Browse computes it from the already-opened
+/// backend disc before sidecar matching; materialization computes it from the
+/// selected title/chapter metadata. If a fingerprinted sidecar cannot be compared,
+/// matching skips it instead of silently accepting stale metadata.
+#[must_use]
+pub(crate) fn bluray_duration_fingerprint_from_title_and_chapters(
+    title_duration_pts_90k: u64,
+    chapters: &[BlurayChapterInfo],
+) -> String {
+    let mut fingerprint = format!("duration_pts_90k={title_duration_pts_90k};");
+    for chapter in chapters {
+        fingerprint.push_str(&format!(
+            "chapter={}:start={}:end={:?}:duration={:?};",
+            chapter.chapter_number,
+            chapter.start_pts_90k,
+            chapter.end_pts_90k,
+            chapter.duration_pts_90k
+        ));
+    }
+    fingerprint
+}
+
+fn log_bluray_sidecar_match_warning(
+    sidecar_path: &Path,
+    identity: &crate::tui::command::BluRayPresentationIdentity,
+    warning: &crate::tui::command::BluRaySidecarMatchWarning,
+) {
+    match warning {
+        crate::tui::command::BluRaySidecarMatchWarning::MissingPresentationIdentity { sidecar_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar presentation skipped because it has no presentation identity in {} ({})",
+                sidecar_path.display(),
+                sidecar_id
+            );
+        }
+        crate::tui::command::BluRaySidecarMatchWarning::DurationFingerprintUnavailable { sidecar_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar presentation skipped because the current browse duration fingerprint is unavailable in {} ({})",
+                sidecar_path.display(),
+                sidecar_id
+            );
+        }
+        crate::tui::command::BluRaySidecarMatchWarning::DurationFingerprintMismatch { sidecar_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar presentation skipped due to duration fingerprint mismatch in {} ({})",
+                sidecar_path.display(),
+                sidecar_id
+            );
+        }
+        crate::tui::command::BluRaySidecarMatchWarning::Ambiguous { first_id, duplicate_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar overlay skipped for playlist {:05} PID 0x{:04x} stream {}: multiple compatible presentations matched in {} (first={}, duplicate={})",
+                identity.playlist_number,
+                identity.audio_pid,
+                identity.audio_stream_index,
+                sidecar_path.display(),
+                first_id,
+                duplicate_id,
+            );
+        }
+    }
+}
+
+fn apply_bluray_album_sidecar(
+    presentation: &mut crate::disc::model::DiscPresentation,
+    sidecar: &crate::tui::command::BluRayMetadataSidecar,
+) {
+    let overlay = crate::tui::command::bluray_album_tag_overlay(sidecar);
+    if let Some(value) = overlay.album_title {
+        presentation.album_title = Some(value);
+    }
+    if let Some(value) = overlay.album_artist {
+        presentation.album_artist = Some(value);
+    }
+    if let Some(value) = overlay.genre {
+        presentation.genre = Some(value);
+    }
+    if let Some(value) = overlay.year {
+        presentation.year = Some(value);
+    }
+}
+
+fn apply_bluray_track_sidecar(
+    presentation: &mut crate::disc::model::DiscPresentation,
+    sidecar: &crate::tui::command::BluRayMetadataSidecar,
+) {
+    for track in &mut presentation.tracks {
+        let Some(overlay) = crate::tui::command::bluray_track_tag_overlay_for_authored_chapter(
+            sidecar,
+            track.number,
+            true,
+        ) else {
+            continue;
+        };
+        if let Some(ref value) = overlay.title {
+            track.title = Some(value.clone());
+        }
+        if let Some(value) = crate::tui::command::bluray_track_overlay_performer_value(&overlay) {
+            track.performer = Some(value.to_string());
+        }
+    }
 }
 
 fn bluray_iso_has_bounded_candidate_markers(path: &Path) -> bool {
@@ -972,6 +1193,242 @@ mod tests {
             fs::create_dir_all(parent).expect("create fixture parent");
         }
         fs::write(path, b"fixture").expect("write fixture file");
+    }
+
+    fn bluray_test_format() -> crate::disc::model::AudioPresentationFormat {
+        crate::disc::model::AudioPresentationFormat {
+            codec: Some("LPCM".to_string()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            channels: Some(2),
+            channel_layout: Some("stereo".to_string()),
+            lossless: true,
+            provenance: crate::disc::model::FormatProvenance::Unknown,
+        }
+    }
+
+    fn bluray_test_contents(root: &Path, _fingerprint: Option<&str>) -> crate::disc::model::DiscContents {
+        crate::disc::model::DiscContents {
+            format: crate::disc::model::DiscFormat::BluRay,
+            label: "Fixture".to_string(),
+            source_path: root.to_path_buf(),
+            presentations: vec![crate::disc::model::DiscPresentation {
+                id: crate::disc::model::PresentationId::blu_ray_title(
+                    12,
+                    0x1100,
+                    0,
+                    crate::disc::model::BlurayDisplayAngle::first(),
+                ),
+                label: "Playlist 00012".to_string(),
+                format: bluray_test_format(),
+                tracks: vec![
+                    crate::disc::model::DiscTrack {
+                        number: 1,
+                        title: Some("Chapter 1".to_string()),
+                        performer: None,
+                        duration_secs: Some(1.0),
+                        format_note: None,
+                    },
+                    crate::disc::model::DiscTrack {
+                        number: 2,
+                        title: Some("Chapter 2".to_string()),
+                        performer: None,
+                        duration_secs: Some(1.0),
+                        format_note: None,
+                    },
+                ],
+                total_duration_secs: 2.0,
+                album_title: None,
+                album_artist: None,
+                genre: None,
+                year: None,
+            }],
+            suppressed: Vec::new(),
+            copy_protection: crate::disc::model::CopyProtectionSummary {
+                description: "none".to_string(),
+            },
+            diagnostics: Vec::new(),
+            album_title: None,
+            album_artist: None,
+            genre: None,
+            year: None,
+        }
+    }
+
+    fn apply_browse_overlay_for_test(
+        root: &Path,
+        contents: &mut crate::disc::model::DiscContents,
+        fingerprint: Option<&str>,
+    ) {
+        overlay_bluray_sidecar_metadata_with_fingerprint_lookup(root, contents, |_, _| {
+            fingerprint.map(str::to_string)
+        });
+    }
+
+    fn write_bluray_sidecar(root: &Path, fingerprint: &str, duplicate: bool) {
+        let second = if duplicate {
+            r#"
+[[presentations]]
+[presentations.source]
+sidecar_kind = "tonepoet-bluray-metadata"
+[presentations.source.presentation]
+playlist_number = 12
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 2
+[presentations.album]
+ALBUM = "Duplicate Album"
+"#
+        } else {
+            ""
+        };
+        fs::write(
+            root.join(crate::tui::command::BLURAY_METADATA_SIDECAR_NAME),
+            format!(
+                r#"schema_version = 1
+format = "tonepoet-bluray-metadata"
+
+[[presentations]]
+[presentations.source]
+sidecar_kind = "tonepoet-bluray-metadata"
+[presentations.source.presentation]
+playlist_number = 12
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 2
+duration_fingerprint = "{}"
+[presentations.album]
+ALBUM = "Browse Album"
+ALBUMARTIST = "Browse Artist"
+GENRE = "Jazz"
+DATE = "1965"
+[[presentations.tracks]]
+number = 1
+source_chapter = 1
+[presentations.tracks.tags]
+TITLE = "Browse Track One"
+ARTIST = "Track Artist One"
+[[presentations.tracks]]
+number = 2
+source_chapter = 2
+[presentations.tracks.tags]
+TITLE = "Browse Track Two"
+PERFORMER = "Track Performer Two"
+{}"#,
+                fingerprint,
+                second,
+            ),
+        )
+        .expect("write Blu-ray sidecar");
+    }
+
+    #[test]
+    fn browse_sidecar_overlay_applies_album_and_track_metadata() {
+        let root = unique_dir("browse-overlay");
+        fs::create_dir_all(&root).expect("create root");
+        write_bluray_sidecar(&root, "fp-current", false);
+        let mut contents = bluray_test_contents(&root, Some("fp-current"));
+
+        apply_browse_overlay_for_test(&root, &mut contents, Some("fp-current"));
+
+        let presentation = &contents.presentations[0];
+        assert_eq!(presentation.album_title.as_deref(), Some("Browse Album"));
+        assert_eq!(presentation.album_artist.as_deref(), Some("Browse Artist"));
+        assert_eq!(presentation.genre.as_deref(), Some("Jazz"));
+        assert_eq!(presentation.year.as_deref(), Some("1965"));
+        assert_eq!(presentation.tracks[0].title.as_deref(), Some("Browse Track One"));
+        assert_eq!(presentation.tracks[0].performer.as_deref(), Some("Track Artist One"));
+        assert_eq!(presentation.tracks[1].title.as_deref(), Some("Browse Track Two"));
+        assert_eq!(presentation.tracks[1].performer.as_deref(), Some("Track Performer Two"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browse_sidecar_overlay_rejects_fingerprint_mismatch_and_ambiguity() {
+        let root = unique_dir("browse-reject");
+        fs::create_dir_all(&root).expect("create root");
+        write_bluray_sidecar(&root, "fp-stale", false);
+        let mut stale_contents = bluray_test_contents(&root, Some("fp-current"));
+
+        apply_browse_overlay_for_test(&root, &mut stale_contents, Some("fp-current"));
+
+        assert_eq!(stale_contents.presentations[0].album_title, None);
+        assert_eq!(stale_contents.presentations[0].tracks[0].title.as_deref(), Some("Chapter 1"));
+
+        write_bluray_sidecar(&root, "fp-current", true);
+        let mut ambiguous_contents = bluray_test_contents(&root, Some("fp-current"));
+        apply_browse_overlay_for_test(&root, &mut ambiguous_contents, Some("fp-current"));
+        assert_eq!(ambiguous_contents.presentations[0].album_title, None);
+        assert_eq!(ambiguous_contents.presentations[0].tracks[0].title.as_deref(), Some("Chapter 1"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browse_sidecar_overlay_rejects_fingerprinted_sidecar_when_current_fingerprint_missing() {
+        let root = unique_dir("browse-missing-fingerprint");
+        fs::create_dir_all(&root).expect("create root");
+        write_bluray_sidecar(&root, "fp-current", false);
+        let mut contents = bluray_test_contents(&root, None);
+
+        apply_browse_overlay_for_test(&root, &mut contents, None);
+
+        assert_eq!(contents.presentations[0].album_title, None);
+        assert_eq!(contents.presentations[0].tracks[0].title.as_deref(), Some("Chapter 1"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browse_sidecar_overlay_selects_correct_presentation_from_multi_presentation_sidecar() {
+        let root = unique_dir("browse-multi-presentation");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join(crate::tui::command::BLURAY_METADATA_SIDECAR_NAME),
+            r#"schema_version = 1
+format = "tonepoet-bluray-metadata"
+
+[[presentations]]
+[presentations.source]
+sidecar_kind = "tonepoet-bluray-metadata"
+[presentations.source.presentation]
+playlist_number = 13
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 2
+duration_fingerprint = "fp-current"
+[presentations.album]
+ALBUM = "Wrong Playlist"
+
+[[presentations]]
+[presentations.source]
+sidecar_kind = "tonepoet-bluray-metadata"
+[presentations.source.presentation]
+playlist_number = 12
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 2
+duration_fingerprint = "fp-current"
+[presentations.album]
+ALBUM = "Correct Playlist"
+[[presentations.tracks]]
+number = 1
+source_chapter = 1
+[presentations.tracks.tags]
+TITLE = "Correct Track One"
+"#,
+        )
+        .expect("write multi-presentation sidecar");
+        let mut contents = bluray_test_contents(&root, Some("fp-current"));
+
+        apply_browse_overlay_for_test(&root, &mut contents, Some("fp-current"));
+
+        assert_eq!(contents.presentations[0].album_title.as_deref(), Some("Correct Playlist"));
+        assert_eq!(contents.presentations[0].tracks[0].title.as_deref(), Some("Correct Track One"));
+        assert_ne!(contents.presentations[0].album_title.as_deref(), Some("Wrong Playlist"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

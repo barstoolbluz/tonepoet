@@ -725,6 +725,9 @@ fn build_prepared_bluray_source(
     let title_chapter_count = bluray_chapter_count_for_selection(selection)?;
     let selected_chapters = selected_chapter_ordinals(title_chapter_count, track_selection)?;
     let sidecar_identity = bluray_sidecar_identity(selection, title_chapter_count);
+    let sidecar_overlay = load_bluray_sidecar_overlay(source, &sidecar_identity);
+    let allow_legacy_track_number_fallback =
+        bluray_legacy_track_number_fallback_is_safe(&selected_chapters, title_chapter_count);
 
     let mut tracks = Vec::with_capacity(selected_chapters.len());
     for (chapter_index, chapter) in selection.chapters.iter().enumerate() {
@@ -766,9 +769,11 @@ fn build_prepared_bluray_source(
                 channels: selection.stream.channels,
                 channel_layout: selection.stream.channel_layout.clone(),
             },
-            metadata: overlay_bluray_sidecar_metadata_stub(
+            metadata: overlay_bluray_sidecar_track_metadata(
                 track_metadata(selection, chapter.chapter_number, output_track_number),
-                &sidecar_identity,
+                sidecar_overlay.as_ref(),
+                chapter.chapter_number,
+                allow_legacy_track_number_fallback,
             ),
             expected_samples: None,
             sample_rate: selection.stream.sample_rate,
@@ -788,9 +793,9 @@ fn build_prepared_bluray_source(
         )));
     }
 
-    let album_metadata = overlay_bluray_sidecar_metadata_stub(
+    let album_metadata = overlay_bluray_sidecar_album_metadata(
         base_album_metadata(source, selection, title_chapter_count),
-        &sidecar_identity,
+        sidecar_overlay.as_ref(),
     );
     let tool_versions = bluray_tool_versions(runner, selection.stream.coding);
 
@@ -806,6 +811,14 @@ fn build_prepared_bluray_source(
             extracted_at: chrono::Utc::now(),
         },
     })
+}
+
+fn bluray_legacy_track_number_fallback_is_safe(
+    selected_chapters: &BTreeSet<u32>,
+    title_chapter_count: u32,
+) -> bool {
+    u32::try_from(selected_chapters.len()).ok() == Some(title_chapter_count)
+        && (1..=title_chapter_count).all(|chapter| selected_chapters.contains(&chapter))
 }
 
 fn validate_decoded_bit_depth_for_materialization(
@@ -1065,53 +1078,145 @@ fn bluray_sidecar_identity(
 }
 
 fn bluray_duration_fingerprint(selection: &BlurayProgramSelection) -> String {
-    let mut fingerprint = format!("duration_pts_90k={};", selection.title.duration_pts_90k);
-    for chapter in &selection.chapters {
-        fingerprint.push_str(&format!(
-            "chapter={}:start={}:end={:?}:duration={:?};",
-            chapter.chapter_number,
-            chapter.start_pts_90k,
-            chapter.end_pts_90k,
-            chapter.duration_pts_90k
-        ));
-    }
-    fingerprint
+    crate::disc::bluray_utils::bluray_duration_fingerprint_from_title_and_chapters(
+        selection.title.duration_pts_90k,
+        &selection.chapters,
+    )
 }
 
-/// Phase 2 placeholder. Phase 5 will load and apply Blu-ray sidecars.
-/// This function intentionally returns the input metadata unchanged.
-/// TODO(Phase 5): implement Blu-ray sidecar load/save/overlay keyed by
-/// playlist, PID, stream index, angle, chapter count, and duration fingerprint.
-fn overlay_bluray_sidecar_metadata_stub<T>(
-    metadata: T,
+fn load_bluray_sidecar_overlay(
+    source: &Path,
     identity: &BluraySidecarIdentity,
-) -> T {
-    let _ = (
-        identity.playlist_number,
-        identity.audio_pid,
-        identity.audio_stream_index,
-        identity.angle_number,
-        identity.chapter_count,
-        identity.duration_fingerprint.as_str(),
+) -> Option<crate::tui::command::BluRayMetadataSidecar> {
+    let current = bluray_metadata_identity_from_sidecar_identity(identity);
+    let (sidecar_path, sidecars) = match crate::tui::command::load_bluray_metadata_sidecar_presentations(source) {
+        Ok(Some(found)) => found,
+        Ok(None) => return None,
+        Err(err) => {
+            log::warn!(
+                "Blu-ray metadata sidecar overlay skipped for '{}': {}",
+                source.display(),
+                err
+            );
+            return None;
+        }
+    };
+
+    let match_report = crate::tui::command::find_unique_matching_bluray_metadata_sidecar(
+        &sidecars,
+        &current,
+        true,
     );
-    #[cfg(test)]
-    BLURAY_SIDECAR_OVERLAY_STUB_CALLS.with(|calls| calls.set(calls.get() + 1));
+    for warning in &match_report.warnings {
+        log_bluray_sidecar_match_warning(&sidecar_path, &current, warning);
+    }
+    match_report.selected.cloned()
+}
+
+fn bluray_metadata_identity_from_sidecar_identity(
+    identity: &BluraySidecarIdentity,
+) -> crate::tui::command::BluRayPresentationIdentity {
+    crate::tui::command::BluRayPresentationIdentity {
+        playlist_number: identity.playlist_number,
+        audio_pid: identity.audio_pid,
+        audio_stream_index: identity.audio_stream_index,
+        angle_number: Some(identity.angle_number),
+        track_count: Some(identity.chapter_count),
+        duration_fingerprint: Some(identity.duration_fingerprint.clone()),
+        extra: Default::default(),
+    }
+}
+
+fn overlay_bluray_sidecar_album_metadata(
+    mut metadata: AlbumMetadata,
+    sidecar: Option<&crate::tui::command::BluRayMetadataSidecar>,
+) -> AlbumMetadata {
+    let Some(sidecar) = sidecar else {
+        return metadata;
+    };
+    let overlay = crate::tui::command::bluray_album_tag_overlay(sidecar);
+    if let Some(value) = overlay.album_title {
+        metadata.album = Some(value);
+    }
+    if let Some(value) = overlay.album_artist {
+        metadata.album_artist = Some(value);
+    }
+    if let Some(value) = overlay.genre {
+        metadata.genre = Some(value);
+    }
+    if let Some(value) = overlay.year {
+        metadata.date = Some(value);
+    }
     metadata
 }
 
-#[cfg(test)]
-thread_local! {
-    static BLURAY_SIDECAR_OVERLAY_STUB_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+fn overlay_bluray_sidecar_track_metadata(
+    mut metadata: TrackMetadata,
+    sidecar: Option<&crate::tui::command::BluRayMetadataSidecar>,
+    chapter_number: u32,
+    allow_legacy_track_number_fallback: bool,
+) -> TrackMetadata {
+    let Some(sidecar) = sidecar else {
+        return metadata;
+    };
+    let Some(overlay) = crate::tui::command::bluray_track_tag_overlay_for_authored_chapter(
+        sidecar,
+        chapter_number,
+        allow_legacy_track_number_fallback,
+    ) else {
+        return metadata;
+    };
+    if let Some(value) = overlay.title {
+        metadata.title = Some(value);
+    }
+    if let Some(value) = overlay.artist {
+        metadata.artist = Some(value);
+    }
+    if let Some(value) = overlay.performer {
+        metadata.performer = Some(value);
+    }
+    metadata
 }
 
-#[cfg(test)]
-fn reset_bluray_sidecar_overlay_stub_call_count() {
-    BLURAY_SIDECAR_OVERLAY_STUB_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(test)]
-fn bluray_sidecar_overlay_stub_call_count() -> usize {
-    BLURAY_SIDECAR_OVERLAY_STUB_CALLS.with(|calls| calls.get())
+fn log_bluray_sidecar_match_warning(
+    sidecar_path: &Path,
+    current: &crate::tui::command::BluRayPresentationIdentity,
+    warning: &crate::tui::command::BluRaySidecarMatchWarning,
+) {
+    match warning {
+        crate::tui::command::BluRaySidecarMatchWarning::MissingPresentationIdentity { sidecar_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar presentation skipped because it has no presentation identity in {} ({})",
+                sidecar_path.display(),
+                sidecar_id
+            );
+        }
+        crate::tui::command::BluRaySidecarMatchWarning::DurationFingerprintUnavailable { sidecar_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar presentation skipped because the current duration fingerprint is unavailable in {} ({})",
+                sidecar_path.display(),
+                sidecar_id
+            );
+        }
+        crate::tui::command::BluRaySidecarMatchWarning::DurationFingerprintMismatch { sidecar_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar presentation skipped due to duration fingerprint mismatch in {} ({})",
+                sidecar_path.display(),
+                sidecar_id
+            );
+        }
+        crate::tui::command::BluRaySidecarMatchWarning::Ambiguous { first_id, duplicate_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar overlay skipped for playlist {:05} PID 0x{:04x} stream {}: multiple compatible presentations matched in {} (first={}, duplicate={})",
+                current.playlist_number,
+                current.audio_pid,
+                current.audio_stream_index,
+                sidecar_path.display(),
+                first_id,
+                duplicate_id,
+            );
+        }
+    }
 }
 
 fn bluray_tool_versions(
@@ -1192,8 +1297,7 @@ mod tests {
         TrackSourceRef,
     };
     use super::{
-        bluray_sidecar_overlay_stub_call_count, bluray_track_bit_depth,
-        build_prepared_bluray_source, chapter_end_pts_90k, reset_bluray_sidecar_overlay_stub_call_count,
+        bluray_track_bit_depth, build_prepared_bluray_source, chapter_end_pts_90k,
         select_bluray_program, select_bluray_program_with_audio_probe, selected_chapter_ordinals,
         selected_stream_with_materialization_facts,
         selected_stream_with_materialization_facts_with_audio_probe, validate_chapter_pts,
@@ -2304,8 +2408,116 @@ mod tests {
     }
 
     #[test]
-    fn materializer_bluray_calls_phase2_sidecar_overlay_stub() {
-        reset_bluray_sidecar_overlay_stub_call_count();
+    fn materializer_bluray_sidecar_overlays_flac_metadata_by_authored_chapter() {
+        let root = existing_source_path("sidecar_overlay_flow");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create sidecar overlay root");
+        let source = root.join("Subset.iso");
+        let sidecar_path = root.join("Subset.bluray.metadata.toml");
+        let disc = fake_disc(vec![fake_title(
+            12,
+            0,
+            270_000,
+            1,
+            &[0, 90_000, 180_000],
+            vec![compressed_stream(0x1100, 0, BluRayAudioCoding::Ac3, Some(48_000), Some(2))],
+        )]);
+        let mut options = explicit_options(12, 0x1100, 0, 1);
+        options.track_selection = TrackSelection::Range { start: 2, end: 3 };
+        let selection = select_bluray_program::<FakeBackend>(&disc, &source, &options)
+            .expect("select Blu-ray presentation");
+        let fingerprint = crate::disc::bluray_utils::bluray_duration_fingerprint_from_title_and_chapters(
+            selection.title.duration_pts_90k,
+            &selection.chapters,
+        );
+        std::fs::write(
+            &sidecar_path,
+            format!(
+                r#"schema_version = 1
+format = "tonepoet-bluray-metadata"
+
+[[presentations]]
+[presentations.source]
+path = "{}"
+sidecar_kind = "tonepoet-bluray-metadata"
+[presentations.source.presentation]
+playlist_number = 12
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 3
+duration_fingerprint = "{}"
+
+[presentations.album]
+ALBUM = "Sidecar Album"
+ALBUMARTIST = "Sidecar Artist"
+GENRE = "Concert"
+DATE = "1972"
+
+[[presentations.tracks]]
+number = 1
+label = "Legacy output ordinal that must not match chapter 2"
+[presentations.tracks.tags]
+TITLE = "Wrong Chapter One"
+
+[[presentations.tracks]]
+number = 2
+source_chapter = 2
+label = "Authored Chapter Two"
+[presentations.tracks.tags]
+TITLE = "Authored Chapter Two"
+ARTIST = "Chapter Two Artist"
+
+[[presentations.tracks]]
+number = 3
+source_chapter = 3
+label = "Authored Chapter Three"
+[presentations.tracks.tags]
+TITLE = "Authored Chapter Three"
+PERFORMER = "Chapter Three Performer"
+"#,
+                source.display(),
+                fingerprint,
+            ),
+        )
+        .expect("write Blu-ray sidecar");
+
+        let prepared = build_prepared_bluray_source(
+            &source,
+            &source,
+            &options.track_selection,
+            &selection,
+            &version_runner(),
+            None,
+        )
+        .expect("prepared source");
+
+        assert_eq!(prepared.album_metadata.album.as_deref(), Some("Sidecar Album"));
+        assert_eq!(prepared.album_metadata.album_artist.as_deref(), Some("Sidecar Artist"));
+        assert_eq!(prepared.album_metadata.genre.as_deref(), Some("Concert"));
+        assert_eq!(prepared.album_metadata.date.as_deref(), Some("1972"));
+        assert_eq!(prepared.album_metadata.total_tracks, 3);
+        assert_eq!(prepared.tracks.len(), 2);
+        assert_eq!(prepared.tracks[0].id.source_ordinal, 2);
+        assert_eq!(prepared.tracks[0].id.track_number, 1);
+        assert_eq!(prepared.tracks[0].metadata.track_number, Some(1));
+        assert_eq!(prepared.tracks[0].metadata.title.as_deref(), Some("Authored Chapter Two"));
+        assert_eq!(prepared.tracks[0].metadata.artist.as_deref(), Some("Chapter Two Artist"));
+        assert_ne!(prepared.tracks[0].metadata.title.as_deref(), Some("Wrong Chapter One"));
+        assert_eq!(prepared.tracks[1].id.source_ordinal, 3);
+        assert_eq!(prepared.tracks[1].id.track_number, 2);
+        assert_eq!(prepared.tracks[1].metadata.title.as_deref(), Some("Authored Chapter Three"));
+        assert_eq!(prepared.tracks[1].metadata.performer.as_deref(), Some("Chapter Three Performer"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn materializer_bluray_sidecar_rejects_stale_fingerprint() {
+        let root = existing_source_path("sidecar_stale_fingerprint");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create sidecar overlay root");
+        let source = root.join("Stale.iso");
+        let sidecar_path = root.join("Stale.bluray.metadata.toml");
         let disc = fake_disc(vec![fake_title(
             12,
             0,
@@ -2315,16 +2527,44 @@ mod tests {
             vec![compressed_stream(0x1100, 0, BluRayAudioCoding::Ac3, Some(48_000), Some(2))],
         )]);
         let options = explicit_options(12, 0x1100, 0, 1);
-        let selection = select_bluray_program::<FakeBackend>(
-            &disc,
-            Path::new("/music/Sidecar Stub.iso"),
-            &options,
+        let selection = select_bluray_program::<FakeBackend>(&disc, &source, &options)
+            .expect("select Blu-ray presentation");
+
+        std::fs::write(
+            &sidecar_path,
+            format!(
+                r#"schema_version = 1
+format = "tonepoet-bluray-metadata"
+
+[[presentations]]
+[presentations.source]
+path = "{}"
+sidecar_kind = "tonepoet-bluray-metadata"
+[presentations.source.presentation]
+playlist_number = 12
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 2
+duration_fingerprint = "stale-fingerprint"
+
+[presentations.album]
+ALBUM = "Should Not Apply"
+
+[[presentations.tracks]]
+number = 1
+source_chapter = 1
+[presentations.tracks.tags]
+TITLE = "Should Not Apply"
+"#,
+                source.display(),
+            ),
         )
-        .expect("select Blu-ray presentation");
+        .expect("write stale Blu-ray sidecar");
 
         let prepared = build_prepared_bluray_source(
-            Path::new("/music/Sidecar Stub.iso"),
-            Path::new("/music/Sidecar Stub.iso"),
+            &source,
+            &source,
             &options.track_selection,
             &selection,
             &version_runner(),
@@ -2332,14 +2572,11 @@ mod tests {
         )
         .expect("prepared source");
 
-        assert_eq!(
-            bluray_sidecar_overlay_stub_call_count(),
-            prepared.tracks.len() + 1
-        );
-        assert_eq!(prepared.album_metadata.album.as_deref(), Some("Sidecar Stub"));
-        assert_eq!(prepared.album_metadata.total_tracks, 2);
+        assert_eq!(prepared.album_metadata.album.as_deref(), Some("Stale"));
         assert_eq!(prepared.tracks[0].metadata.title.as_deref(), Some("Chapter 1"));
-        assert_eq!(prepared.tracks[1].metadata.title.as_deref(), Some("Chapter 2"));
+        assert_ne!(prepared.album_metadata.album.as_deref(), Some("Should Not Apply"));
+        assert_ne!(prepared.tracks[0].metadata.title.as_deref(), Some("Should Not Apply"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

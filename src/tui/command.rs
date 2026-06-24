@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+use toml_edit::{value, Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
@@ -5114,6 +5114,60 @@ pub struct DvdVideoMetadataTrack {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// TOML metadata sidecar filename used for Blu-ray directory sources.
+pub const BLURAY_METADATA_SIDECAR_NAME: &str = "tonepoet.bluray.metadata.toml";
+pub const BLURAY_METADATA_FORMAT: &str = "tonepoet-bluray-metadata";
+pub const BLURAY_METADATA_SIDECAR_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BluRayMetadataSidecar {
+    pub schema_version: u32,
+    pub source: BluRayMetadataSource,
+    #[serde(default)]
+    pub album: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tracks: Vec<BluRayMetadataTrack>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BluRayMetadataSource {
+    pub path: PathBuf,
+    pub sidecar_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<BluRayPresentationIdentity>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BluRayPresentationIdentity {
+    pub playlist_number: u32,
+    pub audio_pid: u16,
+    pub audio_stream_index: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_number: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_fingerprint: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BluRayMetadataTrack {
+    pub number: u32,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chapter: Option<u32>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
 pub fn dvdv_metadata_sidecar_path_for_source(source: &Path) -> Result<PathBuf, String> {
     dvdv_metadata_sidecar_path_for_source_with_extension(source, "toml", DVDV_METADATA_SIDECAR_NAME)
 }
@@ -5845,6 +5899,1059 @@ fn toml_item_to_string(item: &Item) -> Option<String> {
     item.as_str().map(str::to_string)
         .or_else(|| item.as_integer().map(|v| v.to_string()))
         .or_else(|| item.as_bool().map(|v| v.to_string()))
+}
+
+fn bluray_toml_table_extra_json(table: &Table, reserved: &[&str]) -> BTreeMap<String, serde_json::Value> {
+    let mut extra = BTreeMap::new();
+    for (key, item) in table.iter() {
+        if reserved.iter().any(|reserved| key.eq_ignore_ascii_case(reserved)) {
+            continue;
+        }
+        if let Some(value) = toml_item_to_json_value(item) {
+            extra.insert(key.to_string(), value);
+        }
+    }
+    extra
+}
+
+fn toml_item_to_json_value(item: &Item) -> Option<serde_json::Value> {
+    if let Some(value) = item.as_str() {
+        return Some(serde_json::Value::String(value.to_string()));
+    }
+    if let Some(value) = item.as_integer() {
+        return Some(serde_json::Value::Number(value.into()));
+    }
+    if let Some(value) = item.as_float() {
+        return serde_json::Number::from_f64(value).map(serde_json::Value::Number);
+    }
+    if let Some(value) = item.as_bool() {
+        return Some(serde_json::Value::Bool(value));
+    }
+    if let Some(value) = item.as_datetime() {
+        return Some(serde_json::Value::String(value.to_string()));
+    }
+    if let Some(table) = item.as_table() {
+        let mut out = serde_json::Map::new();
+        for (key, value) in table.iter() {
+            if let Some(value) = toml_item_to_json_value(value) {
+                out.insert(key.to_string(), value);
+            }
+        }
+        return Some(serde_json::Value::Object(out));
+    }
+    if let Some(array) = item.as_array() {
+        return Some(serde_json::Value::Array(
+            array.iter().map(toml_value_to_json_value).collect(),
+        ));
+    }
+    if let Some(array) = item.as_array_of_tables() {
+        let mut out = Vec::new();
+        for table in array.iter() {
+            let mut object = serde_json::Map::new();
+            for (key, item) in table.iter() {
+                if let Some(value) = toml_item_to_json_value(item) {
+                    object.insert(key.to_string(), value);
+                }
+            }
+            out.push(serde_json::Value::Object(object));
+        }
+        return Some(serde_json::Value::Array(out));
+    }
+    let rendered = item.to_string();
+    (!rendered.trim().is_empty()).then_some(serde_json::Value::String(rendered))
+}
+
+fn toml_value_to_json_value(value: &Value) -> serde_json::Value {
+    if let Some(value) = value.as_str() {
+        return serde_json::Value::String(value.to_string());
+    }
+    if let Some(value) = value.as_integer() {
+        return serde_json::Value::Number(value.into());
+    }
+    if let Some(value) = value.as_float() {
+        return serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(value.to_string()));
+    }
+    if let Some(value) = value.as_bool() {
+        return serde_json::Value::Bool(value);
+    }
+    if let Some(value) = value.as_datetime() {
+        return serde_json::Value::String(value.to_string());
+    }
+    if let Some(array) = value.as_array() {
+        return serde_json::Value::Array(array.iter().map(toml_value_to_json_value).collect());
+    }
+    if let Some(table) = value.as_inline_table() {
+        let mut out = serde_json::Map::new();
+        for (key, value) in table.iter() {
+            out.insert(key.to_string(), toml_value_to_json_value(value));
+        }
+        return serde_json::Value::Object(out);
+    }
+    serde_json::Value::String(value.to_string())
+}
+
+pub fn bluray_metadata_sidecar_path_for_source(source: &Path) -> PathBuf {
+    bluray_metadata_sidecar_candidate_paths(source)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| source.join(BLURAY_METADATA_SIDECAR_NAME))
+}
+
+pub fn load_bluray_metadata_sidecar_presentations(
+    source: &Path,
+) -> Result<Option<(PathBuf, Vec<BluRayMetadataSidecar>)>, String> {
+    for toml_path in bluray_metadata_sidecar_candidate_paths(source) {
+        if toml_path.exists() {
+            let payload = fs::read_to_string(&toml_path)
+                .map_err(|e| format!("read Blu-ray metadata sidecar {}: {e}", toml_path.display()))?;
+            return parse_bluray_metadata_sidecar_presentations(&payload, &toml_path)
+                .map(|sidecars| Some((toml_path, sidecars)));
+        }
+    }
+    Ok(None)
+}
+
+pub fn parse_bluray_metadata_sidecar_presentations(
+    text: &str,
+    path: &Path,
+) -> Result<Vec<BluRayMetadataSidecar>, String> {
+    let doc = text
+        .parse::<DocumentMut>()
+        .map_err(|e| format!("parse Blu-ray TOML sidecar {}: {e}", path.display()))?;
+    let schema_version = doc
+        .get("schema_version")
+        .and_then(Item::as_integer)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(BLURAY_METADATA_SIDECAR_SCHEMA_VERSION);
+    if schema_version != BLURAY_METADATA_SIDECAR_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported Blu-ray TOML sidecar schema_version {} in {}",
+            schema_version,
+            path.display()
+        ));
+    }
+    let format = doc.get("format").and_then(Item::as_str).unwrap_or_default();
+    if !format.is_empty() && format != BLURAY_METADATA_FORMAT {
+        return Err(format!(
+            "unsupported Blu-ray TOML sidecar format '{}' in {}",
+            format,
+            path.display()
+        ));
+    }
+    let presentations = doc
+        .get("presentations")
+        .and_then(Item::as_array_of_tables)
+        .ok_or_else(|| format!("Blu-ray TOML sidecar {} has no [[presentations]] entries", path.display()))?;
+    let mut sidecars = Vec::with_capacity(presentations.len());
+    for table in presentations.iter() {
+        sidecars.push(parse_bluray_metadata_toml_presentation(path, schema_version, table)?);
+    }
+    Ok(sidecars)
+}
+
+pub fn save_bluray_metadata_sidecar(
+    path: &Path,
+    sidecars: &[BluRayMetadataSidecar],
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Blu-ray sidecar path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("create Blu-ray sidecar directory {}: {e}", parent.display()))?;
+    let payload = bluray_sidecars_to_toml_string_for_path(path, sidecars)?;
+    let tmp = unique_sidecar_temp_path(path);
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| format!("create temporary Blu-ray sidecar {}: {e}", tmp.display()))?;
+        file.write_all(payload.as_bytes())
+            .map_err(|e| format!("write temporary Blu-ray sidecar {}: {e}", tmp.display()))?;
+        if !payload.ends_with('\n') {
+            file.write_all(b"\n")
+                .map_err(|e| format!("finish temporary Blu-ray sidecar {}: {e}", tmp.display()))?;
+        }
+        file.sync_all()
+            .map_err(|e| format!("sync temporary Blu-ray sidecar {}: {e}", tmp.display()))?;
+        drop(file);
+        atomic_replace_file(&tmp, path)
+            .map_err(|e| format!("atomically publish Blu-ray TOML sidecar {}: {e}", path.display()))?;
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+pub fn bluray_presentation_id(identity: &BluRayPresentationIdentity) -> String {
+    match identity.angle_number {
+        Some(angle) => format!(
+            "playlist{:05}-pid0x{:04x}-stream{}-angle{}",
+            identity.playlist_number, identity.audio_pid, identity.audio_stream_index, angle
+        ),
+        None => format!(
+            "playlist{:05}-pid0x{:04x}-stream{}",
+            identity.playlist_number, identity.audio_pid, identity.audio_stream_index
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BluRayIdentityMismatchReason {
+    MissingStoredIdentity,
+    MissingCurrentIdentity,
+    PlaylistNumber { stored: u32, current: u32 },
+    AudioPid { stored: u16, current: u16 },
+    AudioStreamIndex { stored: u8, current: u8 },
+    AngleNumber { stored: u8, current: u8 },
+    TrackCount { stored: u32, current: u32 },
+    DurationFingerprint { stored: String, current: String },
+}
+
+pub fn bluray_presentation_identity_mismatch_reasons(
+    stored: Option<&BluRayPresentationIdentity>,
+    current: Option<&BluRayPresentationIdentity>,
+) -> Vec<BluRayIdentityMismatchReason> {
+    let Some(stored) = stored else {
+        return vec![BluRayIdentityMismatchReason::MissingStoredIdentity];
+    };
+    let Some(current) = current else {
+        return vec![BluRayIdentityMismatchReason::MissingCurrentIdentity];
+    };
+
+    let mut reasons = Vec::new();
+    if stored.playlist_number != current.playlist_number {
+        reasons.push(BluRayIdentityMismatchReason::PlaylistNumber {
+            stored: stored.playlist_number,
+            current: current.playlist_number,
+        });
+    }
+    if stored.audio_pid != current.audio_pid {
+        reasons.push(BluRayIdentityMismatchReason::AudioPid {
+            stored: stored.audio_pid,
+            current: current.audio_pid,
+        });
+    }
+    if stored.audio_stream_index != current.audio_stream_index {
+        reasons.push(BluRayIdentityMismatchReason::AudioStreamIndex {
+            stored: stored.audio_stream_index,
+            current: current.audio_stream_index,
+        });
+    }
+    if let Some((stored, current)) = stored.angle_number.zip(current.angle_number) {
+        if stored != current {
+            reasons.push(BluRayIdentityMismatchReason::AngleNumber { stored, current });
+        }
+    }
+    if let Some((stored, current)) = stored.track_count.zip(current.track_count) {
+        if stored != current {
+            reasons.push(BluRayIdentityMismatchReason::TrackCount { stored, current });
+        }
+    }
+    if let Some((stored, current)) = stored
+        .duration_fingerprint
+        .as_deref()
+        .zip(current.duration_fingerprint.as_deref())
+    {
+        if stored != current {
+            reasons.push(BluRayIdentityMismatchReason::DurationFingerprint {
+                stored: stored.to_string(),
+                current: current.to_string(),
+            });
+        }
+    }
+    reasons
+}
+
+pub fn bluray_presentation_identity_compatible(
+    stored: Option<&BluRayPresentationIdentity>,
+    current: Option<&BluRayPresentationIdentity>,
+) -> bool {
+    bluray_presentation_identity_mismatch_reasons(stored, current).is_empty()
+}
+
+pub fn bluray_presentation_identity_has_fingerprint_mismatch(
+    stored: Option<&BluRayPresentationIdentity>,
+    current: Option<&BluRayPresentationIdentity>,
+) -> bool {
+    let reasons = bluray_presentation_identity_mismatch_reasons(stored, current);
+    !reasons.is_empty()
+        && reasons
+            .iter()
+            .all(|reason| matches!(reason, BluRayIdentityMismatchReason::DurationFingerprint { .. }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BluRaySidecarMatchWarning {
+    MissingPresentationIdentity { sidecar_id: String },
+    DurationFingerprintUnavailable { sidecar_id: String },
+    DurationFingerprintMismatch { sidecar_id: String },
+    Ambiguous { first_id: String, duplicate_id: String },
+}
+
+#[derive(Debug)]
+pub struct BluRaySidecarMatchReport<'a> {
+    pub selected: Option<&'a BluRayMetadataSidecar>,
+    pub warnings: Vec<BluRaySidecarMatchWarning>,
+}
+
+pub fn find_unique_matching_bluray_metadata_sidecar<'a>(
+    sidecars: &'a [BluRayMetadataSidecar],
+    current: &BluRayPresentationIdentity,
+    reject_missing_current_fingerprint: bool,
+) -> BluRaySidecarMatchReport<'a> {
+    let mut selected = None;
+    let mut warnings = Vec::new();
+
+    for sidecar in sidecars {
+        if !bluray_metadata_sidecar_kind_supported(&sidecar.source.sidecar_kind) {
+            continue;
+        }
+        let stored = sidecar.source.presentation.as_ref();
+        let sidecar_id = || bluray_metadata_sidecar_debug_id(sidecar);
+        if stored.is_none() {
+            warnings.push(BluRaySidecarMatchWarning::MissingPresentationIdentity {
+                sidecar_id: sidecar_id(),
+            });
+            continue;
+        }
+        if reject_missing_current_fingerprint
+            && bluray_presentation_identity_requires_current_fingerprint(stored, current)
+        {
+            warnings.push(BluRaySidecarMatchWarning::DurationFingerprintUnavailable {
+                sidecar_id: sidecar_id(),
+            });
+            continue;
+        }
+        if bluray_presentation_identity_has_fingerprint_mismatch(stored, Some(current)) {
+            warnings.push(BluRaySidecarMatchWarning::DurationFingerprintMismatch {
+                sidecar_id: sidecar_id(),
+            });
+            continue;
+        }
+        if !bluray_presentation_identity_compatible(stored, Some(current)) {
+            continue;
+        }
+        if let Some(first) = selected {
+            warnings.push(BluRaySidecarMatchWarning::Ambiguous {
+                first_id: bluray_metadata_sidecar_debug_id(first),
+                duplicate_id: sidecar_id(),
+            });
+            return BluRaySidecarMatchReport {
+                selected: None,
+                warnings,
+            };
+        }
+        selected = Some(sidecar);
+    }
+
+    BluRaySidecarMatchReport { selected, warnings }
+}
+
+pub fn bluray_presentation_identity_requires_current_fingerprint(
+    stored: Option<&BluRayPresentationIdentity>,
+    current: &BluRayPresentationIdentity,
+) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    stored.duration_fingerprint.is_some()
+        && current.duration_fingerprint.is_none()
+        && stored.playlist_number == current.playlist_number
+        && stored.audio_pid == current.audio_pid
+        && stored.audio_stream_index == current.audio_stream_index
+        && stored
+            .angle_number
+            .zip(current.angle_number)
+            .map_or(true, |(stored, current)| stored == current)
+        && stored
+            .track_count
+            .zip(current.track_count)
+            .map_or(true, |(stored, current)| stored == current)
+}
+
+pub fn bluray_metadata_sidecar_kind_supported(kind: &str) -> bool {
+    let kind = kind.trim();
+    kind.is_empty() || kind == BLURAY_METADATA_FORMAT || kind == "blu_ray" || kind == "bluray"
+}
+
+pub fn bluray_metadata_sidecar_debug_id(sidecar: &BluRayMetadataSidecar) -> String {
+    sidecar
+        .source
+        .presentation
+        .as_ref()
+        .map(bluray_presentation_id)
+        .unwrap_or_else(|| "missing-presentation-identity".to_string())
+}
+
+pub fn bluray_metadata_tag_value<'a>(
+    tags: &'a BTreeMap<String, String>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        tags.get(*key)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BluRayAlbumTagOverlay {
+    pub album_title: Option<String>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
+    pub year: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BluRayTrackTagOverlay {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub performer: Option<String>,
+}
+
+pub fn bluray_album_tag_overlay(sidecar: &BluRayMetadataSidecar) -> BluRayAlbumTagOverlay {
+    BluRayAlbumTagOverlay {
+        album_title: bluray_metadata_tag_value(&sidecar.album, &["ALBUM"]).map(str::to_string),
+        album_artist: bluray_metadata_tag_value(&sidecar.album, &["ALBUMARTIST"]).map(str::to_string),
+        genre: bluray_metadata_tag_value(&sidecar.album, &["GENRE"]).map(str::to_string),
+        year: bluray_metadata_tag_value(&sidecar.album, &["DATE", "YEAR"]).map(str::to_string),
+    }
+}
+
+pub fn bluray_track_tag_overlay(track: &BluRayMetadataTrack) -> BluRayTrackTagOverlay {
+    BluRayTrackTagOverlay {
+        title: bluray_metadata_tag_value(&track.tags, &["TITLE"]).map(str::to_string),
+        artist: bluray_metadata_tag_value(&track.tags, &["ARTIST"]).map(str::to_string),
+        performer: bluray_metadata_tag_value(&track.tags, &["PERFORMER"]).map(str::to_string),
+    }
+}
+
+pub fn bluray_track_overlay_performer_value(overlay: &BluRayTrackTagOverlay) -> Option<&str> {
+    overlay.artist.as_deref().or(overlay.performer.as_deref())
+}
+
+pub fn bluray_track_tag_overlay_for_authored_chapter(
+    sidecar: &BluRayMetadataSidecar,
+    authored_chapter: u32,
+    allow_legacy_track_number_fallback: bool,
+) -> Option<BluRayTrackTagOverlay> {
+    bluray_metadata_sidecar_track_by_authored_chapter(
+        sidecar,
+        authored_chapter,
+        allow_legacy_track_number_fallback,
+    )
+    .map(bluray_track_tag_overlay)
+}
+
+pub fn bluray_metadata_sidecar_track_authored_chapter(
+    track: &BluRayMetadataTrack,
+) -> u32 {
+    track.source_chapter.unwrap_or(track.number)
+}
+
+pub fn bluray_metadata_sidecar_track_by_authored_chapter<'a>(
+    sidecar: &'a BluRayMetadataSidecar,
+    authored_chapter: u32,
+    allow_legacy_track_number_fallback: bool,
+) -> Option<&'a BluRayMetadataTrack> {
+    sidecar
+        .tracks
+        .iter()
+        .find(|track| track.source_chapter == Some(authored_chapter))
+        .or_else(|| {
+            allow_legacy_track_number_fallback
+                .then(|| sidecar.tracks.iter().find(|track| track.number == authored_chapter))
+                .flatten()
+        })
+}
+
+fn bluray_metadata_sidecar_candidate_paths(source: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    let looks_like_iso = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("iso"));
+    if source.is_file() || looks_like_iso {
+        let parent = source.parent().unwrap_or_else(|| Path::new("."));
+        if let Some(stem) = source.file_stem().and_then(|value| value.to_str()) {
+            push_unique_path(&mut candidates, parent.join(format!("{stem}.bluray.metadata.toml")));
+        }
+    }
+
+    if source.is_dir() {
+        if let Some(root) = crate::disc::bluray_utils::bluray_directory_root(source) {
+            push_unique_path(&mut candidates, root.join(BLURAY_METADATA_SIDECAR_NAME));
+        }
+        push_unique_path(&mut candidates, source.join(BLURAY_METADATA_SIDECAR_NAME));
+    }
+
+    if source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("BDMV"))
+    {
+        if let Some(parent) = source.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            push_unique_path(&mut candidates, parent.join(BLURAY_METADATA_SIDECAR_NAME));
+        }
+    }
+
+    if candidates.is_empty() {
+        if let Some(parent) = source.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            push_unique_path(&mut candidates, parent.join(BLURAY_METADATA_SIDECAR_NAME));
+        }
+        push_unique_path(&mut candidates, source.join(BLURAY_METADATA_SIDECAR_NAME));
+    }
+
+    candidates
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn parse_bluray_metadata_toml_presentation(
+    path: &Path,
+    schema_version: u32,
+    presentation_table: &Table,
+) -> Result<BluRayMetadataSidecar, String> {
+    let source_table = presentation_table.get("source").and_then(Item::as_table);
+    let source_path = source_table
+        .and_then(|source| source.get("path"))
+        .and_then(Item::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf());
+    let sidecar_kind = source_table
+        .and_then(|source| source.get("sidecar_kind"))
+        .and_then(Item::as_str)
+        .unwrap_or(BLURAY_METADATA_FORMAT)
+        .to_string();
+    let presentation = bluray_toml_source_identity(source_table);
+    let source_extra = source_table
+        .map(|table| {
+            bluray_toml_table_extra_json(
+                table,
+                &[
+                    "path",
+                    "sidecar_kind",
+                    "presentation",
+                    "playlist_number",
+                    "playlist",
+                    "audio_pid",
+                    "pid",
+                    "audio_stream_index",
+                    "audio_stream",
+                    "angle_number",
+                    "angle",
+                    "track_count",
+                    "chapter_count",
+                    "duration_fingerprint",
+                ],
+            )
+        })
+        .unwrap_or_default();
+    let album = bluray_toml_album_table_to_map(presentation_table.get("album").and_then(Item::as_table));
+    let tracks = bluray_toml_tracks_to_vec(presentation_table.get("tracks").and_then(Item::as_array_of_tables));
+    let extra = bluray_toml_table_extra_json(presentation_table, &["id", "source", "album", "tracks"]);
+
+    Ok(BluRayMetadataSidecar {
+        schema_version,
+        source: BluRayMetadataSource {
+            path: source_path,
+            sidecar_kind,
+            presentation,
+            extra: source_extra,
+        },
+        album,
+        tracks,
+        extra,
+    })
+}
+
+fn bluray_toml_source_identity(source: Option<&Table>) -> Option<BluRayPresentationIdentity> {
+    let source = source?;
+    let presentation = source
+        .get("presentation")
+        .and_then(Item::as_table)
+        .unwrap_or(source);
+    Some(BluRayPresentationIdentity {
+        playlist_number: item_integer_u32(presentation, &["playlist_number", "playlist"])?,
+        audio_pid: item_integer_u16_or_hex(presentation, &["audio_pid", "pid"])?,
+        audio_stream_index: item_integer_u8(presentation, &["audio_stream_index", "audio_stream"])?,
+        angle_number: item_integer_u8(presentation, &["angle_number", "angle"]),
+        track_count: item_integer_u32(presentation, &["track_count", "chapter_count"]),
+        duration_fingerprint: item_string(presentation, &["duration_fingerprint"]),
+        extra: bluray_toml_table_extra_json(
+            presentation,
+            &[
+                "playlist_number",
+                "playlist",
+                "audio_pid",
+                "pid",
+                "audio_stream_index",
+                "audio_stream",
+                "angle_number",
+                "angle",
+                "track_count",
+                "chapter_count",
+                "duration_fingerprint",
+            ],
+        ),
+    })
+}
+
+fn bluray_toml_album_table_to_map(album_table: Option<&Table>) -> BTreeMap<String, String> {
+    let mut album = BTreeMap::new();
+    let Some(album_table) = album_table else {
+        return album;
+    };
+    for (key, item) in album_table.iter() {
+        if key == "extra" {
+            continue;
+        }
+        let Some(internal_key) = bluray_toml_album_key_to_internal(key) else {
+            continue;
+        };
+        if let Some(value) = toml_item_to_string(item) {
+            album.insert(internal_key.to_string(), value);
+        }
+    }
+    if let Some(extra) = album_table.get("extra").and_then(Item::as_table) {
+        for (key, item) in extra.iter() {
+            if let Some(value) = toml_item_to_string(item) {
+                album.insert(key.to_string(), value);
+            }
+        }
+    }
+    album
+}
+
+fn bluray_toml_tracks_to_vec(track_tables: Option<&ArrayOfTables>) -> Vec<BluRayMetadataTrack> {
+    let mut tracks = Vec::new();
+    let Some(track_tables) = track_tables else {
+        return tracks;
+    };
+    for table in track_tables.iter() {
+        let number = table
+            .get("number")
+            .and_then(Item::as_integer)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or_else(|| u32::try_from(tracks.len() + 1).unwrap_or(u32::MAX));
+        let label = table
+            .get("label")
+            .and_then(Item::as_str)
+            .map(str::to_string);
+        let source_chapter = table
+            .get("source_chapter")
+            .and_then(Item::as_integer)
+            .and_then(|v| u32::try_from(v).ok());
+        let mut tags = BTreeMap::new();
+        if let Some(tags_table) = table.get("tags").and_then(Item::as_table) {
+            bluray_toml_tags_table_to_map(tags_table, &mut tags, BLURAY_TRACK_PRIMARY_TOML_KEYS);
+        }
+        for (key, item) in table.iter() {
+            if matches!(key, "number" | "label" | "source_chapter" | "tags" | "extra") {
+                continue;
+            }
+            let Some(internal_key) = bluray_toml_track_key_to_internal(key) else {
+                continue;
+            };
+            if let Some(value) = toml_item_to_string(item) {
+                tags.insert(internal_key.to_string(), value);
+            }
+        }
+        let mut extra = bluray_toml_table_extra_json(
+            table,
+            &["number", "label", "source_chapter", "tags", "extra", "title", "artist", "performer", "TITLE", "ARTIST", "PERFORMER"],
+        );
+        if let Some(extra_table) = table.get("extra").and_then(Item::as_table) {
+            extra.extend(bluray_toml_table_extra_json(extra_table, &[]));
+        }
+        let label = label
+            .or_else(|| tags.get("TITLE").cloned())
+            .unwrap_or_else(|| format!("{:02}", number));
+        tracks.push(BluRayMetadataTrack {
+            number,
+            label,
+            source_chapter,
+            tags,
+            extra,
+        });
+    }
+    tracks
+}
+
+fn bluray_toml_tags_table_to_map(
+    table: &Table,
+    out: &mut BTreeMap<String, String>,
+    primary_keys: &[(&'static str, &'static str)],
+) {
+    for (key, item) in table.iter() {
+        if key == "extra" {
+            continue;
+        }
+        let internal_key = bluray_toml_key_to_internal(key, primary_keys).unwrap_or(key);
+        if let Some(value) = toml_item_to_string(item) {
+            out.insert(internal_key.to_string(), value);
+        }
+    }
+    if let Some(extra) = table.get("extra").and_then(Item::as_table) {
+        for (key, item) in extra.iter() {
+            if let Some(value) = toml_item_to_string(item) {
+                out.insert(key.to_string(), value);
+            }
+        }
+    }
+}
+
+fn bluray_sidecars_to_toml_string_for_path(
+    path: &Path,
+    sidecars: &[BluRayMetadataSidecar],
+) -> Result<String, String> {
+    let mut doc = bluray_toml_document_for_preserving_save(path)?;
+    doc["schema_version"] = value(i64::from(BLURAY_METADATA_SIDECAR_SCHEMA_VERSION));
+    doc["format"] = value(BLURAY_METADATA_FORMAT);
+    for sidecar in sidecars {
+        bluray_upsert_toml_presentation(&mut doc, sidecar);
+    }
+    Ok(doc.to_string())
+}
+
+fn bluray_toml_document_for_preserving_save(path: &Path) -> Result<DocumentMut, String> {
+    if !path.exists() {
+        return Ok(DocumentMut::new());
+    }
+    let payload = fs::read_to_string(path)
+        .map_err(|e| format!("read existing Blu-ray TOML sidecar {}: {e}", path.display()))?;
+    payload
+        .parse::<DocumentMut>()
+        .map_err(|e| format!("parse existing Blu-ray TOML sidecar {}: {e}", path.display()))
+}
+
+fn bluray_upsert_toml_presentation(doc: &mut DocumentMut, sidecar: &BluRayMetadataSidecar) {
+    let target = sidecar.source.presentation.as_ref();
+    let mut updated = false;
+    let existing = doc.get("presentations").and_then(Item::as_array_of_tables).cloned();
+    let mut presentations = ArrayOfTables::new();
+    if let Some(existing) = existing {
+        for table in existing.iter() {
+            let mut table = table.clone();
+            if !updated && bluray_toml_presentation_table_matches_target(&table, target) {
+                bluray_write_presentation_table(&mut table, sidecar);
+                updated = true;
+            }
+            presentations.push(table);
+        }
+    }
+    if !updated {
+        let mut table = Table::new();
+        bluray_write_presentation_table(&mut table, sidecar);
+        presentations.push(table);
+    }
+    doc["presentations"] = Item::ArrayOfTables(presentations);
+}
+
+fn bluray_toml_presentation_table_matches_target(
+    table: &Table,
+    target: Option<&BluRayPresentationIdentity>,
+) -> bool {
+    let stored = table
+        .get("source")
+        .and_then(Item::as_table)
+        .and_then(|source| bluray_toml_source_identity(Some(source)));
+    bluray_presentation_identity_compatible(stored.as_ref(), target)
+}
+
+fn bluray_write_presentation_table(table: &mut Table, sidecar: &BluRayMetadataSidecar) {
+    if let Some(identity) = sidecar.source.presentation.as_ref() {
+        table.insert("id", value(bluray_presentation_id(identity)));
+    }
+    insert_json_extras(
+        table,
+        &sidecar.extra,
+        &["id", "source", "album", "tracks"],
+    );
+    bluray_write_source_subtable(table, &sidecar.source);
+    bluray_write_album_subtable(table, &sidecar.album);
+    bluray_write_track_subtables(table, &sidecar.tracks);
+}
+
+fn bluray_write_source_subtable(table: &mut Table, source: &BluRayMetadataSource) {
+    if !table.get("source").map_or(false, Item::is_table) {
+        table.insert("source", Item::Table(Table::new()));
+    }
+    let source_table = table
+        .get_mut("source")
+        .and_then(Item::as_table_mut)
+        .expect("presentations.source table");
+    source_table.insert("path", value(source.path.to_string_lossy().as_ref()));
+    source_table.insert(
+        "sidecar_kind",
+        value(if source.sidecar_kind.trim().is_empty() {
+            BLURAY_METADATA_FORMAT
+        } else {
+            source.sidecar_kind.as_str()
+        }),
+    );
+    insert_json_extras(
+        source_table,
+        &source.extra,
+        &[
+            "path",
+            "sidecar_kind",
+            "presentation",
+            "playlist_number",
+            "playlist",
+            "audio_pid",
+            "pid",
+            "audio_stream_index",
+            "audio_stream",
+            "angle_number",
+            "angle",
+            "track_count",
+            "chapter_count",
+            "duration_fingerprint",
+        ],
+    );
+    if let Some(identity) = source.presentation.as_ref() {
+        if !source_table.get("presentation").map_or(false, Item::is_table) {
+            source_table.insert("presentation", Item::Table(Table::new()));
+        }
+        let presentation = source_table
+            .get_mut("presentation")
+            .and_then(Item::as_table_mut)
+            .expect("presentations.source.presentation table");
+        presentation.insert("playlist_number", value(i64::from(identity.playlist_number)));
+        presentation.insert("audio_pid", value(i64::from(identity.audio_pid)));
+        presentation.insert("audio_stream_index", value(i64::from(identity.audio_stream_index)));
+        set_toml_optional_i64(&mut *presentation, "angle_number", identity.angle_number.map(i64::from));
+        set_toml_optional_i64(&mut *presentation, "track_count", identity.track_count.map(i64::from));
+        set_toml_optional_string(
+            &mut *presentation,
+            "duration_fingerprint",
+            identity.duration_fingerprint.as_deref(),
+        );
+        insert_json_extras(
+            presentation,
+            &identity.extra,
+            &[
+                "playlist_number",
+                "playlist",
+                "audio_pid",
+                "pid",
+                "audio_stream_index",
+                "audio_stream",
+                "angle_number",
+                "angle",
+                "track_count",
+                "chapter_count",
+                "duration_fingerprint",
+            ],
+        );
+    } else {
+        source_table.remove("presentation");
+    }
+}
+
+fn bluray_write_album_subtable(table: &mut Table, album: &BTreeMap<String, String>) {
+    if !table.get("album").map_or(false, Item::is_table) {
+        table.insert("album", Item::Table(Table::new()));
+    }
+    let album_table = table
+        .get_mut("album")
+        .and_then(Item::as_table_mut)
+        .expect("presentations.album table");
+    for (internal, toml_key) in BLURAY_ALBUM_PRIMARY_TOML_KEYS {
+        set_toml_optional_string(album_table, toml_key, album.get(*internal).map(String::as_str));
+    }
+    if !album_table.get("extra").map_or(false, Item::is_table) {
+        album_table.insert("extra", Item::Table(Table::new()));
+    }
+    let extra = album_table
+        .get_mut("extra")
+        .and_then(Item::as_table_mut)
+        .expect("presentations.album.extra table");
+    for (key, value) in album {
+        if !BLURAY_ALBUM_PRIMARY_TOML_KEYS.iter().any(|(internal, _)| internal == key) {
+            extra.insert(key, toml_edit::value(value.as_str()));
+        }
+    }
+}
+
+fn bluray_write_track_subtables(table: &mut Table, tracks: &[BluRayMetadataTrack]) {
+    let mut existing_by_identity: BTreeMap<(Option<u32>, u32), Table> = BTreeMap::new();
+    if let Some(existing) = table.get("tracks").and_then(Item::as_array_of_tables) {
+        for existing_track in existing.iter() {
+            let number = existing_track
+                .get("number")
+                .and_then(Item::as_integer)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(0);
+            let source_chapter = existing_track
+                .get("source_chapter")
+                .and_then(Item::as_integer)
+                .and_then(|value| u32::try_from(value).ok());
+            existing_by_identity.insert((source_chapter, number), existing_track.clone());
+        }
+    }
+    let mut tracks_array = ArrayOfTables::new();
+    for track in tracks {
+        let key = (track.source_chapter, track.number);
+        let mut track_table = existing_by_identity.remove(&key).unwrap_or_else(Table::new);
+        track_table.insert("number", value(i64::from(track.number)));
+        track_table.insert("label", value(track.label.as_str()));
+        set_toml_optional_i64(&mut track_table, "source_chapter", track.source_chapter.map(i64::from));
+        insert_json_extras(
+            &mut track_table,
+            &track.extra,
+            &["number", "label", "source_chapter", "tags"],
+        );
+        if !track_table.get("tags").map_or(false, Item::is_table) {
+            track_table.insert("tags", Item::Table(Table::new()));
+        }
+        let tags = track_table
+            .get_mut("tags")
+            .and_then(Item::as_table_mut)
+            .expect("presentations.tracks.tags table");
+        for (internal, toml_key) in BLURAY_TRACK_PRIMARY_TOML_KEYS {
+            set_toml_optional_string(tags, toml_key, track.tags.get(*internal).map(String::as_str));
+        }
+        if !tags.get("extra").map_or(false, Item::is_table) {
+            tags.insert("extra", Item::Table(Table::new()));
+        }
+        let extra_tags = tags
+            .get_mut("extra")
+            .and_then(Item::as_table_mut)
+            .expect("presentations.tracks.tags.extra table");
+        for (key, value) in &track.tags {
+            if !BLURAY_TRACK_PRIMARY_TOML_KEYS.iter().any(|(internal, _)| internal == key) {
+                extra_tags.insert(key, toml_edit::value(value.as_str()));
+            }
+        }
+        tracks_array.push(track_table);
+    }
+    table.insert("tracks", Item::ArrayOfTables(tracks_array));
+}
+
+fn insert_json_extras(table: &mut Table, extras: &BTreeMap<String, serde_json::Value>, reserved: &[&str]) {
+    for (key, value) in extras {
+        if reserved.iter().any(|reserved| key.eq_ignore_ascii_case(reserved)) {
+            continue;
+        }
+        table.insert(key, json_value_to_toml_item(value));
+    }
+}
+
+fn json_value_to_toml_item(json: &serde_json::Value) -> Item {
+    match json {
+        serde_json::Value::Null => value(""),
+        serde_json::Value::Bool(flag) => value(*flag),
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                value(integer)
+            } else if let Some(float) = number.as_f64() {
+                value(float)
+            } else {
+                value(number.to_string())
+            }
+        }
+        serde_json::Value::String(text) => value(text.as_str()),
+        serde_json::Value::Array(values) => {
+            let mut array = Array::new();
+            for value in values {
+                array.push(json_value_to_toml_value(value));
+            }
+            Item::Value(Value::Array(array))
+        }
+        serde_json::Value::Object(values) => {
+            let mut table = InlineTable::new();
+            for (key, value) in values {
+                table.insert(key, json_value_to_toml_value(value));
+            }
+            Item::Value(Value::InlineTable(table))
+        }
+    }
+}
+
+fn json_value_to_toml_value(value: &serde_json::Value) -> Value {
+    match json_value_to_toml_item(value) {
+        Item::Value(value) => value,
+        _ => Value::from(value.to_string()),
+    }
+}
+
+fn item_integer_u32(table: &Table, keys: &[&str]) -> Option<u32> {
+    keys.iter()
+        .find_map(|key| table.get(*key))
+        .and_then(Item::as_integer)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn item_integer_u16_or_hex(table: &Table, keys: &[&str]) -> Option<u16> {
+    keys.iter().find_map(|key| table.get(*key)).and_then(|item| {
+        item.as_integer()
+            .and_then(|value| u16::try_from(value).ok())
+            .or_else(|| {
+                item.as_str().and_then(|value| {
+                    let trimmed = value.trim();
+                    let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"));
+                    match hex {
+                        Some(hex) => u16::from_str_radix(hex, 16).ok(),
+                        None => trimmed.parse::<u16>().ok(),
+                    }
+                })
+            })
+    })
+}
+
+fn item_integer_u8(table: &Table, keys: &[&str]) -> Option<u8> {
+    keys.iter()
+        .find_map(|key| table.get(*key))
+        .and_then(Item::as_integer)
+        .and_then(|value| u8::try_from(value).ok())
+}
+
+fn item_string(table: &Table, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| table.get(*key))
+        .and_then(Item::as_str)
+        .map(str::to_string)
+}
+
+const BLURAY_ALBUM_PRIMARY_TOML_KEYS: &[(&str, &str)] = &[
+    ("ALBUM", "album"),
+    ("ALBUMARTIST", "album_artist"),
+    ("GENRE", "genre"),
+    ("DATE", "date"),
+    ("YEAR", "year"),
+];
+const BLURAY_TRACK_PRIMARY_TOML_KEYS: &[(&str, &str)] = &[
+    ("TITLE", "title"),
+    ("ARTIST", "artist"),
+    ("PERFORMER", "performer"),
+];
+fn bluray_toml_album_key_to_internal(key: &str) -> Option<&'static str> {
+    bluray_toml_key_to_internal(key, BLURAY_ALBUM_PRIMARY_TOML_KEYS)
+}
+fn bluray_toml_track_key_to_internal(key: &str) -> Option<&'static str> {
+    bluray_toml_key_to_internal(key, BLURAY_TRACK_PRIMARY_TOML_KEYS)
+}
+fn bluray_toml_key_to_internal(key: &str, table: &[(&'static str, &'static str)]) -> Option<&'static str> {
+    table.iter().find_map(|(internal, toml_key)| {
+        (key == *internal || key.eq_ignore_ascii_case(internal) || key == *toml_key || key.eq_ignore_ascii_case(toml_key))
+            .then_some(*internal)
+    })
 }
 
 pub fn dvdv_metadata_sidecar_from_state(
@@ -7893,6 +9000,7 @@ custom_track_field = "keep-track"
                     angle_number: None,
                     track_count: Some(2),
                     duration_fingerprint: None,
+                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::new(),
             },
@@ -8095,6 +9203,7 @@ title = "Old Angle 2 Song"
                     angle_number: Some(2),
                     track_count: Some(1),
                     duration_fingerprint: None,
+                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::new(),
             },
@@ -8224,6 +9333,7 @@ STALE_TRACK_EXTRA = "keep-a-only"
                     angle_number: None,
                     track_count: None,
                     duration_fingerprint: None,
+                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::from([(
                     "source_vendor_extension".to_string(),
@@ -8371,6 +9481,7 @@ title = "Bonus Song"
                     angle_number: None,
                     track_count: Some(1),
                     duration_fingerprint: None,
+                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::new(),
             },
@@ -8398,6 +9509,433 @@ title = "Bonus Song"
         let _ = std::fs::remove_file(&path);
     }
 
+}
+
+#[cfg(test)]
+mod bluray_sidecar_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tonepoet-bluray-sidecar-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn minimal_sidecar_text(album: &str) -> String {
+        format!(
+            r#"schema_version = 1
+format = "tonepoet-bluray-metadata"
+
+[[presentations]]
+[presentations.source]
+path = "/fixtures/Concert.iso"
+sidecar_kind = "tonepoet-bluray-metadata"
+[presentations.source.presentation]
+playlist_number = 12
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 2
+duration_fingerprint = "fp-a"
+
+[presentations.album]
+ALBUM = "{}"
+ALBUMARTIST = "Artist"
+GENRE = "Classical"
+DATE = "1972"
+
+[[presentations.tracks]]
+number = 1
+label = "Opening"
+source_chapter = 1
+[presentations.tracks.tags]
+TITLE = "Opening"
+ARTIST = "Soloist"
+"#,
+            album
+        )
+    }
+
+    fn identity(fingerprint: Option<&str>) -> BluRayPresentationIdentity {
+        BluRayPresentationIdentity {
+            playlist_number: 12,
+            audio_pid: 0x1100,
+            audio_stream_index: 0,
+            angle_number: Some(1),
+            track_count: Some(2),
+            duration_fingerprint: fingerprint.map(str::to_string),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn sidecar_with_fingerprint(fingerprint: Option<&str>) -> BluRayMetadataSidecar {
+        BluRayMetadataSidecar {
+            schema_version: BLURAY_METADATA_SIDECAR_SCHEMA_VERSION,
+            source: BluRayMetadataSource {
+                path: PathBuf::from("/fixtures/Concert.iso"),
+                sidecar_kind: BLURAY_METADATA_FORMAT.to_string(),
+                presentation: Some(identity(fingerprint)),
+                extra: BTreeMap::new(),
+            },
+            album: BTreeMap::from([("ALBUM".to_string(), "Album".to_string())]),
+            tracks: vec![BluRayMetadataTrack {
+                number: 1,
+                label: "Opening".to_string(),
+                source_chapter: Some(1),
+                tags: BTreeMap::from([("TITLE".to_string(), "Opening".to_string())]),
+                extra: BTreeMap::new(),
+            }],
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn bluray_toml_parser_reads_identity_tags_and_extension_fields() {
+        let text = r#"schema_version = 1
+format = "tonepoet-bluray-metadata"
+
+[[presentations]]
+keep_top = { vendor = "yes" }
+[presentations.source]
+path = "/fixtures/Concert.iso"
+sidecar_kind = "tonepoet-bluray-metadata"
+source_extension = ["keep"]
+[presentations.source.presentation]
+playlist_number = 12
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 2
+duration_fingerprint = "fp-a"
+presentation_extension = "keep-presentation"
+[presentations.album]
+ALBUM = "Sidecar Album"
+ALBUMARTIST = "Sidecar Artist"
+GENRE = "Classical"
+DATE = "1972"
+[presentations.album.extra]
+MUSICBRAINZ_RELEASEGROUPID = "rgid"
+[[presentations.tracks]]
+number = 1
+label = "Opening"
+source_chapter = 1
+track_extension = 9
+[presentations.tracks.tags]
+TITLE = "Opening"
+ARTIST = "Soloist"
+[presentations.tracks.tags.extra]
+MUSICBRAINZ_TRACKID = "recording-id"
+"#;
+
+        let parsed = parse_bluray_metadata_sidecar_presentations(text, Path::new("/tmp/Concert.bluray.metadata.toml"))
+            .expect("parse Blu-ray sidecar");
+
+        assert_eq!(parsed.len(), 1);
+        let sidecar = &parsed[0];
+        assert_eq!(sidecar.source.presentation, Some(identity(Some("fp-a"))));
+        assert_eq!(sidecar.album.get("ALBUM").map(String::as_str), Some("Sidecar Album"));
+        assert_eq!(sidecar.album.get("MUSICBRAINZ_RELEASEGROUPID").map(String::as_str), Some("rgid"));
+        assert_eq!(sidecar.tracks[0].source_chapter, Some(1));
+        assert_eq!(sidecar.tracks[0].tags.get("TITLE").map(String::as_str), Some("Opening"));
+        assert_eq!(sidecar.tracks[0].tags.get("MUSICBRAINZ_TRACKID").map(String::as_str), Some("recording-id"));
+        assert_eq!(sidecar.extra.get("keep_top"), Some(&serde_json::json!({"vendor": "yes"})));
+        assert_eq!(sidecar.source.extra.get("source_extension"), Some(&serde_json::json!(["keep"])));
+        assert_eq!(
+            sidecar.source.presentation.as_ref().and_then(|identity| identity.extra.get("presentation_extension")),
+            Some(&serde_json::json!("keep-presentation"))
+        );
+        assert_eq!(sidecar.tracks[0].extra.get("track_extension"), Some(&serde_json::json!(9)));
+    }
+
+    #[test]
+    fn bluray_sidecar_discovery_finds_iso_root_and_bdmv_paths() {
+        let root = unique_dir("discovery");
+        std::fs::create_dir_all(root.join("BDMV")).expect("create BDMV");
+        let root_sidecar = root.join(BLURAY_METADATA_SIDECAR_NAME);
+        std::fs::write(&root_sidecar, minimal_sidecar_text("Directory Album"))
+            .expect("write directory sidecar");
+
+        let (found_root, parsed_root) = load_bluray_metadata_sidecar_presentations(&root)
+            .expect("load root sidecar")
+            .expect("root sidecar present");
+        assert_eq!(found_root, root_sidecar);
+        assert_eq!(parsed_root[0].album.get("ALBUM").map(String::as_str), Some("Directory Album"));
+
+        let (found_bdmv, _) = load_bluray_metadata_sidecar_presentations(&root.join("BDMV"))
+            .expect("load BDMV sidecar")
+            .expect("BDMV sidecar present");
+        assert_eq!(found_bdmv, root.join(BLURAY_METADATA_SIDECAR_NAME));
+
+        let iso = root.join("Concert.iso");
+        let iso_sidecar = root.join("Concert.bluray.metadata.toml");
+        std::fs::write(&iso_sidecar, minimal_sidecar_text("ISO Album"))
+            .expect("write ISO sidecar");
+        let (found_iso, parsed_iso) = load_bluray_metadata_sidecar_presentations(&iso)
+            .expect("load ISO sidecar")
+            .expect("ISO sidecar present");
+        assert_eq!(found_iso, iso_sidecar);
+        assert_eq!(parsed_iso[0].album.get("ALBUM").map(String::as_str), Some("ISO Album"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bluray_shared_matcher_reports_ambiguity_and_fingerprint_problems() {
+        let current = identity(Some("fp-current"));
+        let stale = vec![sidecar_with_fingerprint(Some("fp-stale"))];
+        let stale_report = find_unique_matching_bluray_metadata_sidecar(&stale, &current, true);
+        assert!(stale_report.selected.is_none());
+        assert!(matches!(
+            stale_report.warnings.as_slice(),
+            [BluRaySidecarMatchWarning::DurationFingerprintMismatch { .. }]
+        ));
+
+        let current_without_fingerprint = identity(None);
+        let unavailable_report = find_unique_matching_bluray_metadata_sidecar(
+            &stale,
+            &current_without_fingerprint,
+            true,
+        );
+        assert!(unavailable_report.selected.is_none());
+        assert!(matches!(
+            unavailable_report.warnings.as_slice(),
+            [BluRaySidecarMatchWarning::DurationFingerprintUnavailable { .. }]
+        ));
+
+        let first = sidecar_with_fingerprint(None);
+        let mut second = sidecar_with_fingerprint(None);
+        second.album.insert("ALBUM".to_string(), "Duplicate".to_string());
+        let duplicates = vec![first, second];
+        let ambiguous_report = find_unique_matching_bluray_metadata_sidecar(&duplicates, &identity(None), true);
+        assert!(ambiguous_report.selected.is_none());
+        assert!(matches!(
+            ambiguous_report.warnings.as_slice(),
+            [BluRaySidecarMatchWarning::Ambiguous { .. }]
+        ));
+
+        let mut anonymous = sidecar_with_fingerprint(None);
+        anonymous.source.presentation = None;
+        let anonymous_report = find_unique_matching_bluray_metadata_sidecar(&[anonymous], &identity(None), true);
+        assert!(anonymous_report.selected.is_none());
+        assert!(matches!(
+            anonymous_report.warnings.as_slice(),
+            [BluRaySidecarMatchWarning::MissingPresentationIdentity { .. }]
+        ));
+    }
+
+    #[test]
+    fn bluray_preserving_save_updates_target_without_dropping_siblings() {
+        let root = unique_dir("preserve");
+        std::fs::create_dir_all(&root).expect("create sidecar dir");
+        let path = root.join("tonepoet.bluray.metadata.toml");
+        let initial = r#"schema_version = 1
+format = "tonepoet-bluray-metadata"
+
+[[presentations]]
+keep_presentation = "main"
+[presentations.source]
+path = "/fixtures/Concert.iso"
+sidecar_kind = "tonepoet-bluray-metadata"
+[presentations.source.presentation]
+playlist_number = 12
+audio_pid = 4352
+audio_stream_index = 0
+angle_number = 1
+track_count = 1
+presentation_extension = "keep-identity"
+[presentations.album]
+ALBUM = "Old Main"
+custom_album_key = "keep-main"
+[[presentations.tracks]]
+number = 1
+source_chapter = 1
+label = "Old Main Song"
+[presentations.tracks.tags]
+TITLE = "Old Main Song"
+[presentations.tracks.extra]
+review_note = "keep-track"
+
+[[presentations]]
+[presentations.source.presentation]
+playlist_number = 99
+audio_pid = 4352
+audio_stream_index = 0
+[presentations.album]
+ALBUM = "Sibling"
+"#;
+        std::fs::write(&path, initial).expect("write initial TOML");
+        let sidecar = BluRayMetadataSidecar {
+            schema_version: BLURAY_METADATA_SIDECAR_SCHEMA_VERSION,
+            source: BluRayMetadataSource {
+                path: PathBuf::from("/fixtures/Concert.iso"),
+                sidecar_kind: BLURAY_METADATA_FORMAT.to_string(),
+                presentation: Some(BluRayPresentationIdentity {
+                    playlist_number: 12,
+                    audio_pid: 0x1100,
+                    audio_stream_index: 0,
+                    angle_number: Some(1),
+                    track_count: Some(1),
+                    duration_fingerprint: None,
+                    extra: BTreeMap::new(),
+                }),
+                extra: BTreeMap::new(),
+            },
+            album: BTreeMap::from([("ALBUM".to_string(), "New Main".to_string())]),
+            tracks: vec![BluRayMetadataTrack {
+                number: 1,
+                label: "New Main Song".to_string(),
+                source_chapter: Some(1),
+                tags: BTreeMap::from([("TITLE".to_string(), "New Main Song".to_string())]),
+                extra: BTreeMap::new(),
+            }],
+            extra: BTreeMap::new(),
+        };
+
+        save_bluray_metadata_sidecar(&path, &[sidecar]).expect("save preserving Blu-ray sidecar");
+        let rewritten = std::fs::read_to_string(&path).expect("read rewritten TOML");
+
+        assert_eq!(rewritten.matches("[[presentations]]").count(), 2);
+        assert!(rewritten.contains("ALBUM = \"New Main\"") || rewritten.contains("album = \"New Main\""));
+        assert!(rewritten.contains("ALBUM = \"Sibling\"") || rewritten.contains("album = \"Sibling\""));
+        assert!(rewritten.contains("keep_presentation = \"main\""));
+        assert!(rewritten.contains("custom_album_key = \"keep-main\""));
+        assert!(rewritten.contains("review_note = \"keep-track\""));
+        assert!(!rewritten.contains("Old Main Song"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bluray_discovery_missing_sidecar_returns_none_and_malformed_toml_errors() {
+        let root = unique_dir("missing-malformed");
+        std::fs::create_dir_all(root.join("BDMV")).expect("create BDMV");
+
+        assert!(
+            load_bluray_metadata_sidecar_presentations(&root)
+                .expect("missing sidecar is not an error")
+                .is_none()
+        );
+
+        let path = root.join(BLURAY_METADATA_SIDECAR_NAME);
+        std::fs::write(&path, "schema_version = [\n").expect("write malformed TOML");
+        let err = load_bluray_metadata_sidecar_presentations(&root)
+            .expect_err("malformed TOML should be reported");
+        assert!(err.contains("parse Blu-ray TOML sidecar"));
+        assert!(err.contains(path.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bluray_identity_matching_reports_structured_mismatch_reasons() {
+        let current = identity(Some("fp-a"));
+        assert!(bluray_presentation_identity_compatible(Some(&current), Some(&current)));
+
+        let mut stored = current.clone();
+        stored.playlist_number = 99;
+        assert!(matches!(
+            bluray_presentation_identity_mismatch_reasons(Some(&stored), Some(&current)).as_slice(),
+            [BluRayIdentityMismatchReason::PlaylistNumber { .. }]
+        ));
+
+        let mut stored = current.clone();
+        stored.audio_pid = 0x1101;
+        assert!(matches!(
+            bluray_presentation_identity_mismatch_reasons(Some(&stored), Some(&current)).as_slice(),
+            [BluRayIdentityMismatchReason::AudioPid { .. }]
+        ));
+
+        let mut stored = current.clone();
+        stored.audio_stream_index = 1;
+        assert!(matches!(
+            bluray_presentation_identity_mismatch_reasons(Some(&stored), Some(&current)).as_slice(),
+            [BluRayIdentityMismatchReason::AudioStreamIndex { .. }]
+        ));
+
+        let mut stored = current.clone();
+        stored.angle_number = Some(2);
+        assert!(matches!(
+            bluray_presentation_identity_mismatch_reasons(Some(&stored), Some(&current)).as_slice(),
+            [BluRayIdentityMismatchReason::AngleNumber { .. }]
+        ));
+
+        let mut stored = current.clone();
+        stored.angle_number = None;
+        assert!(bluray_presentation_identity_compatible(Some(&stored), Some(&current)));
+
+        let mut stored = current.clone();
+        stored.track_count = Some(99);
+        assert!(matches!(
+            bluray_presentation_identity_mismatch_reasons(Some(&stored), Some(&current)).as_slice(),
+            [BluRayIdentityMismatchReason::TrackCount { .. }]
+        ));
+
+        let mut stored = current.clone();
+        stored.duration_fingerprint = Some("fp-b".to_string());
+        assert!(matches!(
+            bluray_presentation_identity_mismatch_reasons(Some(&stored), Some(&current)).as_slice(),
+            [BluRayIdentityMismatchReason::DurationFingerprint { .. }]
+        ));
+    }
+
+    #[test]
+    fn bluray_save_is_deterministic_and_preserves_multiple_presentations() {
+        let root = unique_dir("deterministic-save");
+        std::fs::create_dir_all(&root).expect("create sidecar dir");
+        let path = root.join(BLURAY_METADATA_SIDECAR_NAME);
+        let first = minimal_sidecar_text("Album One");
+        let second = minimal_sidecar_text("Album Two")
+            .replace("playlist_number = 12", "playlist_number = 13")
+            .replace("duration_fingerprint = \"fp-a\"", "duration_fingerprint = \"fp-b\"");
+        let text = format!("{}\n{}", first, second.replace("schema_version = 1\nformat = \"tonepoet-bluray-metadata\"\n\n", ""));
+        let parsed = parse_bluray_metadata_sidecar_presentations(&text, &path)
+            .expect("parse multiple presentations");
+        assert_eq!(parsed.len(), 2);
+
+        save_bluray_metadata_sidecar(&path, &parsed).expect("first save");
+        let saved_once = std::fs::read_to_string(&path).expect("read first save");
+        let reparsed = load_bluray_metadata_sidecar_presentations(&root)
+            .expect("load saved sidecar")
+            .expect("sidecar present")
+            .1;
+        save_bluray_metadata_sidecar(&path, &reparsed).expect("second save");
+        let saved_twice = std::fs::read_to_string(&path).expect("read second save");
+
+        assert_eq!(saved_once, saved_twice);
+        assert_eq!(saved_once.matches("[[presentations]]").count(), 2);
+        assert!(saved_once.contains("Album One"));
+        assert!(saved_once.contains("Album Two"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bluray_shared_tag_helpers_apply_deterministic_precedence_and_safe_track_fallback() {
+        let mut sidecar = sidecar_with_fingerprint(None);
+        sidecar.album.insert("YEAR".to_string(), "1971".to_string());
+        sidecar.album.insert("DATE".to_string(), "1972".to_string());
+        let album_overlay = bluray_album_tag_overlay(&sidecar);
+        assert_eq!(album_overlay.year.as_deref(), Some("1972"));
+
+        sidecar.tracks = vec![BluRayMetadataTrack {
+            number: 1,
+            label: "Legacy".to_string(),
+            source_chapter: None,
+            tags: BTreeMap::from([
+                ("TITLE".to_string(), "Legacy One".to_string()),
+                ("ARTIST".to_string(), "Artist wins".to_string()),
+                ("PERFORMER".to_string(), "Performer fallback".to_string()),
+            ]),
+            extra: BTreeMap::new(),
+        }];
+        let overlay = bluray_track_tag_overlay_for_authored_chapter(&sidecar, 1, true)
+            .expect("legacy fallback allowed");
+        assert_eq!(overlay.title.as_deref(), Some("Legacy One"));
+        assert_eq!(bluray_track_overlay_performer_value(&overlay), Some("Artist wins"));
+        assert!(bluray_track_tag_overlay_for_authored_chapter(&sidecar, 1, false).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -8929,6 +10467,7 @@ mod dvdv_metadata_editor_sidecar_preload_tests {
                     angle_number: None,
                     track_count: Some(2),
                     duration_fingerprint: None,
+                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::new(),
             },
