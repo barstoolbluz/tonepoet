@@ -342,7 +342,7 @@ async fn realize_compressed_bluray_via_ffmpeg(
         "-f".to_string(),
         "wav".to_string(),
         "-c:a".to_string(),
-        "pcm_s32le".to_string(),
+        "pcm_s24le".to_string(),
         tmp_path.to_string_lossy().into_owned(),
     ]);
 
@@ -879,9 +879,9 @@ fn validate_decoded_compressed_wav(
             path.display()
         )));
     }
-    if fmt.bits_per_sample != 32 {
+    if fmt.bits_per_sample != 24 {
         return Err(ConvertError::TrackValidation(format!(
-            "decoded Blu-ray WAV has {} bits per sample for '{}'; expected 32-bit PCM from ffmpeg pcm_s32le output",
+            "decoded Blu-ray WAV has {} bits per sample for '{}'; expected 24-bit PCM from ffmpeg pcm_s24le output",
             fmt.bits_per_sample,
             path.display()
         )));
@@ -1149,7 +1149,7 @@ mod tests {
                     .expect("ffmpeg command must end with the output WAV path")
                     .as_str(),
             );
-            write_test_pcm_s32le_wav(&output_path, self.wav_sample_rate, self.wav_channels);
+            write_test_pcm_s24le_wav(&output_path, self.wav_sample_rate, self.wav_channels);
             *self.observed_tmp_path.lock().unwrap() = Some(output_path);
 
             let command = command_record(&cmd, Some(ProcessExit::Code(0)));
@@ -1192,7 +1192,7 @@ mod tests {
         assert_command_arg_value(&cmd.args, "-chapter", "3");
         assert_command_arg_value(&cmd.args, "-map", "0:a:2");
         assert_command_arg_value(&cmd.args, "-f", "wav");
-        assert_command_arg_value(&cmd.args, "-c:a", "pcm_s32le");
+        assert_command_arg_value(&cmd.args, "-c:a", "pcm_s24le");
         assert!(cmd.args.iter().any(|arg| arg == "-vn"));
         assert!(cmd.args.iter().any(|arg| arg == "-sn"));
         assert!(cmd.args.iter().any(|arg| arg == "-dn"));
@@ -1221,8 +1221,8 @@ mod tests {
         }
     }
 
-    fn write_test_pcm_s32le_wav(path: &Path, sample_rate: u32, channels: u16) {
-        let bits_per_sample = 32u16;
+    fn write_test_pcm_s24le_wav(path: &Path, sample_rate: u32, channels: u16) {
+        let bits_per_sample = 24u16;
         let block_align = channels * (bits_per_sample / 8);
         let byte_rate = sample_rate * u32::from(block_align);
         let data = vec![0u8; usize::from(block_align)];
@@ -1752,11 +1752,11 @@ mod tests {
             "published WAV should live under the staging realization directory: {wav_path:?}"
         );
         let wav = read_wav_info(&wav_path).expect("published mock WAV should parse");
-        assert_eq!(wav.data_size, 24);
+        assert_eq!(wav.data_size, 18);
         let fmt = read_wav_fmt_basics(&wav_path).expect("published mock WAV fmt should parse");
         assert_eq!(fmt.sample_rate, 48_000);
         assert_eq!(fmt.channels, 6);
-        assert_eq!(fmt.bits_per_sample, 32);
+        assert_eq!(fmt.bits_per_sample, 24);
 
         let tmp_path = runner
             .observed_tmp_path
