@@ -5749,7 +5749,7 @@ fn publish_terminal_conversion_log_fragment_if_needed(
         }
     };
 
-    let publish_plan = match build_publish_plan(&staged_artifacts, req) {
+    let publish_plan = match build_publish_plan_for_fragment_or_fallback(&staged_artifacts, req) {
         Ok(plan) => plan,
         Err(err) => {
             log::warn!(
@@ -5837,7 +5837,7 @@ fn publish_pre_materialization_conversion_log_fragment_if_needed(
         }
     };
 
-    let publish_plan = match build_publish_plan(&staged_artifacts, req) {
+    let publish_plan = match build_publish_plan_for_fragment_or_fallback(&staged_artifacts, req) {
         Ok(plan) => plan,
         Err(err) => {
             log::warn!(
@@ -6496,55 +6496,48 @@ fn conversion_log_album_dir(
     req: &PipelineRequest,
     artifacts: &ArtifactSet,
 ) -> PathBuf {
-    // Prefer the artifact path when a successful audio artifact exists; it is
-    // the exact destination chosen by output planning, including any suffixes.
-    match &artifacts.audio {
-        AudioArtifacts::Tracks(tracks) => {
-            if let Some(parent) = tracks
-                .first()
-                .and_then(|track| track.final_path.parent())
-                .map(Path::to_path_buf)
-            {
-                return parent;
-            }
-        }
-        AudioArtifacts::Merged(merged) => {
-            if let Some(parent) = merged.final_path.parent().map(Path::to_path_buf) {
-                return parent;
-            }
-        }
-    }
-
-    // Failed single-track jobs can have no audio artifact, but they still need
-    // to publish their forensic fragment into the same album directory that
-    // output planning selected for successful siblings. When the dispatcher
-    // supplied only a provisional directory, re-run the ordinary planner against
-    // the materialized source and use its album_dir. This keeps fragment identity
-    // aligned with final audio paths for metadata/folder-template naming such as
-    // `%ARTIST%/%ALBUM%`, instead of trusting a source-folder-name guess made
-    // before tags were available.
+    // The conversion-log sidecar belongs at the album root. Track templates can
+    // contain literal `/` separators (for example `%DISC%/%NN% - %TITLE%`), so
+    // deriving the sidecar directory from the first audio artifact's parent can
+    // incorrectly place `conversion.log` in a track subdirectory. Prefer the
+    // same planner/dispatcher-authored album root that publish uses.
     if let Some(album_batch) = req.album_batch.as_ref() {
-        if !album_batch.album_output_dir_is_planner_resolved() {
-            match plan_outputs(source, req) {
-                Ok(plan) => return plan.album_dir,
-                Err(err) => log::warn!(
-                    "conversion log fragment could not planner-bind album directory for {} after output planning failed: {err:?}; using provisional album batch directory {}",
-                    req.item_id,
-                    album_batch.album_output_dir.display()
-                ),
-            }
+        if album_batch.album_output_dir_is_planner_resolved() {
+            return album_batch.album_output_dir.clone();
+        }
+        match plan_outputs(source, req) {
+            Ok(plan) => return plan.album_dir,
+            Err(err) => log::warn!(
+                "conversion log fragment could not planner-bind album directory for {} after output planning failed: {err:?}; using provisional album batch directory {}",
+                req.item_id,
+                album_batch.album_output_dir.display()
+            ),
         }
         return album_batch.album_output_dir.clone();
     }
 
     match plan_outputs(source, req) {
-        Ok(plan) => plan.album_dir,
-        Err(err) => {
-            log::warn!(
-                "conversion log fragment album directory derivation fell back to output root after output planning failed without an album batch contract: {err:?}"
-            );
-            req.output_root.clone()
-        }
+        Ok(plan) => return plan.album_dir,
+        Err(err) => log::warn!(
+            "conversion log album directory derivation could not re-run output planning for {}; falling back to artifact parent: {err:?}",
+            req.item_id
+        ),
+    }
+
+    fallback_conversion_log_album_dir_from_artifacts(artifacts)
+        .unwrap_or_else(|| req.output_root.clone())
+}
+
+fn fallback_conversion_log_album_dir_from_artifacts(artifacts: &ArtifactSet) -> Option<PathBuf> {
+    // Last-resort recovery path only. Normal conversion-log staging uses
+    // `plan_outputs()` above so literal path separators in track templates do
+    // not move the sidecar below the album root.
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => tracks
+            .first()
+            .and_then(|track| track.final_path.parent())
+            .map(Path::to_path_buf),
+        AudioArtifacts::Merged(merged) => merged.final_path.parent().map(Path::to_path_buf),
     }
 }
 
@@ -10057,9 +10050,40 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
 // ===========================================================================
 
 /// Build the staged-to-final publish plan from staged artifacts.
+///
+/// Production publish callers must pass the authoritative album directory from
+/// `AlbumPlan::album_dir` or an equivalent planner/dispatcher-authored value.
+/// This function deliberately has no heuristic fallback: a missing or invalid
+/// album root is a publish-planning error, not something publish should guess.
 pub fn build_publish_plan(
     artifacts: &ArtifactSet,
     req: &PipelineRequest,
+    album_dir: &Path,
+) -> Result<PublishPlan, PublishError> {
+    build_publish_plan_with_album_dir(artifacts, req, album_dir)
+}
+
+/// Build a publish plan for terminal/pre-materialization conversion-log
+/// fragment publishes, where a full `AlbumPlan` may not exist because the job
+/// failed before ordinary output planning completed. This is the only path that
+/// may derive an album directory from staged fragment sidecars. Ordinary
+/// production publish must use `build_publish_plan` and pass the planned root.
+fn build_publish_plan_for_fragment_or_fallback(
+    artifacts: &ArtifactSet,
+    req: &PipelineRequest,
+) -> Result<PublishPlan, PublishError> {
+    let output_root = normalize_path(&req.output_root);
+    let album_dir = match fragment_dispatcher_album_dir_candidate(artifacts, req, &output_root)? {
+        Some(album_dir) => album_dir,
+        None => infer_publish_album_dir(artifacts, &output_root, req.naming.per_album_subdir)?,
+    };
+    build_publish_plan_with_album_dir(artifacts, req, &album_dir)
+}
+
+fn build_publish_plan_with_album_dir(
+    artifacts: &ArtifactSet,
+    req: &PipelineRequest,
+    album_dir: &Path,
 ) -> Result<PublishPlan, PublishError> {
     let output_root = normalize_path(&req.output_root);
     // This is the per-job audio payload count, not the album completion
@@ -10115,7 +10139,12 @@ pub fn build_publish_plan(
     if entries.is_empty() {
         return Err(PublishError::StagingMissing);
     }
-    let album_dir = infer_publish_album_dir(&entries, &output_root, req.naming.per_album_subdir)?;
+    let album_dir = validate_publish_album_dir(
+        album_dir,
+        &output_root,
+        &entries,
+        req.naming.per_album_subdir,
+    )?;
 
     Ok(PublishPlan {
         album_dir,
@@ -12152,7 +12181,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     match artifacts
         .as_ref()
         .ok_or(PublishError::StagingMissing)
-        .and_then(|artifact_set| build_publish_plan(artifact_set, &req))
+        .and_then(|artifact_set| build_publish_plan(artifact_set, &req, &plan_value.album_dir))
         .and_then(|publish_plan| publish_album_output(staging, &publish_plan, req.publish.clone(), conversion_manifest.as_ref()))
     {
         Ok(album) => {
@@ -12831,7 +12860,13 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     match artifacts
         .as_ref()
         .ok_or(PublishError::StagingMissing)
-        .and_then(|artifact_set| build_publish_plan(artifact_set, &req))
+        .and_then(|artifact_set| {
+            let planned_album_dir = plan
+                .as_ref()
+                .map(|plan| plan.album_dir.as_path())
+                .ok_or(PublishError::StagingMissing)?;
+            build_publish_plan(artifact_set, &req, planned_album_dir)
+        })
         .and_then(|publish_plan| publish_album_output(staging, &publish_plan, req.publish.clone(), None))
     {
         Ok(album) => {
@@ -14077,57 +14112,291 @@ fn push_publish_entry(
     Ok(())
 }
 
-fn infer_publish_album_dir(
+fn validate_publish_album_dir(
+    album_dir: &Path,
+    output_root: &Path,
     entries: &[PublishEntry],
+    per_album_subdir: bool,
+) -> Result<PathBuf, PublishError> {
+    if album_dir.as_os_str().is_empty() {
+        return Err(PublishError::PathOutsideOutputRoot(
+            "planned album_dir must not be empty".to_string(),
+        ));
+    }
+
+    let album_dir = normalize_path(album_dir);
+    if !path_is_under_root(&album_dir, output_root) {
+        return Err(PublishError::PathOutsideOutputRoot(
+            album_dir.display().to_string(),
+        ));
+    }
+    if per_album_subdir && album_dir == output_root {
+        return Err(PublishError::PathOutsideOutputRoot(format!(
+            "planned album_dir must name an album directory below output_root: {}",
+            album_dir.display()
+        )));
+    }
+    if !per_album_subdir && album_dir != output_root {
+        return Err(PublishError::PathOutsideOutputRoot(format!(
+            "flat output publish must use output_root as album_dir: {}",
+            album_dir.display()
+        )));
+    }
+
+    for entry in entries {
+        if !path_is_under_root(&entry.final_path, &album_dir) {
+            return Err(PublishError::PathOutsideOutputRoot(format!(
+                "publish entry {} is outside album directory {}",
+                entry.final_path.display(),
+                album_dir.display()
+            )));
+        }
+    }
+
+    Ok(album_dir)
+}
+
+fn fragment_dispatcher_album_dir_candidate(
+    artifacts: &ArtifactSet,
+    req: &PipelineRequest,
+    output_root: &Path,
+) -> Result<Option<PathBuf>, PublishError> {
+    let Some(album_batch) = req.album_batch.as_ref() else {
+        return Ok(None);
+    };
+
+    let candidate = normalize_path(&album_batch.album_output_dir);
+    if candidate.as_os_str().is_empty() || !path_is_under_root(&candidate, output_root) {
+        return Err(PublishError::PathOutsideOutputRoot(
+            candidate.display().to_string(),
+        ));
+    }
+
+    if artifact_final_paths_are_under_album_dir(artifacts, &candidate, output_root)? {
+        return Ok(Some(candidate));
+    }
+
+    if album_batch.album_output_dir_is_planner_resolved() {
+        return Err(PublishError::PathOutsideOutputRoot(format!(
+            "planner-resolved album_batch.album_output_dir {} does not contain all staged publish entries",
+            candidate.display()
+        )));
+    }
+
+    // A dispatcher-authored provisional directory is useful for
+    // pre-materialization fragments, but metadata planning can later move the
+    // real album root for folder templates such as `%ARTIST%/%ALBUM%`. When the
+    // provisional value no longer contains the staged fragment entries, fall
+    // through to the fragment sidecar path instead of guessing from audio paths.
+    Ok(None)
+}
+
+fn artifact_final_paths_are_under_album_dir(
+    artifacts: &ArtifactSet,
+    album_dir: &Path,
+    output_root: &Path,
+) -> Result<bool, PublishError> {
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => {
+            for track in tracks {
+                if !artifact_final_path_is_under_album_dir(
+                    &track.final_path,
+                    album_dir,
+                    output_root,
+                )? {
+                    return Ok(false);
+                }
+            }
+        }
+        AudioArtifacts::Merged(merged) => {
+            if !artifact_final_path_is_under_album_dir(
+                &merged.final_path,
+                album_dir,
+                output_root,
+            )? {
+                return Ok(false);
+            }
+        }
+    }
+
+    for sidecar in &artifacts.sidecars {
+        if !artifact_final_path_is_under_album_dir(&sidecar.final_path, album_dir, output_root)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn artifact_final_path_is_under_album_dir(
+    final_path: &Path,
+    album_dir: &Path,
+    output_root: &Path,
+) -> Result<bool, PublishError> {
+    let final_path = normalize_path(final_path);
+    if !path_is_under_root(&final_path, output_root) {
+        return Err(PublishError::PathOutsideOutputRoot(
+            final_path.display().to_string(),
+        ));
+    }
+    Ok(path_is_under_root(&final_path, album_dir))
+}
+
+fn infer_publish_album_dir(
+    artifacts: &ArtifactSet,
     output_root: &Path,
     per_album_subdir: bool,
 ) -> Result<PathBuf, PublishError> {
-    if !per_album_subdir {
-        return Ok(output_root.to_path_buf());
+    let mut common_parent: Option<PathBuf> = None;
+    let mut saw_artifact = false;
+    let mut saw_fragment = false;
+
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => {
+            for track in tracks {
+                saw_artifact = true;
+                let mut ignored_fragment_component = false;
+                let candidate = publish_album_dir_candidate_from_final_path(
+                    &track.final_path,
+                    output_root,
+                    &mut ignored_fragment_component,
+                )?;
+                common_parent = Some(match common_parent {
+                    Some(existing) => deepest_common_path(&existing, &candidate),
+                    None => candidate,
+                });
+            }
+        }
+        AudioArtifacts::Merged(merged) => {
+            saw_artifact = true;
+            let mut ignored_fragment_component = false;
+            let candidate = publish_album_dir_candidate_from_final_path(
+                &merged.final_path,
+                output_root,
+                &mut ignored_fragment_component,
+            )?;
+            common_parent = Some(match common_parent {
+                Some(existing) => deepest_common_path(&existing, &candidate),
+                None => candidate,
+            });
+        }
     }
 
-    let mut album_component: Option<PathBuf> = None;
-    for entry in entries {
-        let final_path = normalize_path(&entry.final_path);
-        let rel = final_path
-            .strip_prefix(output_root)
-            .map_err(|_| PublishError::PathOutsideOutputRoot(final_path.display().to_string()))?;
-        let first_component = rel.components().find_map(|component| match component {
-            Component::Normal(name) => Some(PathBuf::from(name.to_os_string())),
-            _ => None,
-        });
-        let Some(first_component) = first_component else {
-            return Err(PublishError::PathOutsideOutputRoot(format!(
-                "publish artifact has no album directory below output_root: {}",
-                final_path.display()
-            )));
-        };
-
-        match &album_component {
-            Some(existing) if existing == &first_component => {}
-            Some(existing) => {
+    for sidecar in &artifacts.sidecars {
+        saw_artifact = true;
+        let mut sidecar_fragment_component = false;
+        let candidate = publish_album_dir_candidate_from_final_path(
+            &sidecar.final_path,
+            output_root,
+            &mut sidecar_fragment_component,
+        )?;
+        if is_conversion_log_fragment_role(&PublishRole::Sidecar(sidecar.kind.clone())) {
+            if !sidecar_fragment_component {
                 return Err(PublishError::PathOutsideOutputRoot(format!(
-                    "publish entries cross album boundary: {} and {}",
-                    output_root.join(existing).display(),
-                    output_root.join(first_component).display()
+                    "conversion-log fragment sidecar is not under {}: {}",
+                    CONVERSION_LOG_FRAGMENT_DIR,
+                    sidecar.final_path.display()
                 )));
             }
-            None => album_component = Some(first_component),
+            saw_fragment = true;
         }
+        common_parent = Some(match common_parent {
+            Some(existing) => deepest_common_path(&existing, &candidate),
+            None => candidate,
+        });
     }
 
-    let Some(component) = album_component else {
+    if !saw_artifact {
+        return Err(PublishError::StagingMissing);
+    }
+    if !saw_fragment {
+        return Err(PublishError::PathOutsideOutputRoot(
+            "fragment publish album_dir inference requires a conversion-log fragment sidecar"
+                .to_string(),
+        ));
+    }
+
+    let Some(album_dir) = common_parent else {
         return Err(PublishError::StagingMissing);
     };
-    let album_dir = output_root.join(component);
-    for entry in entries {
-        if !path_is_under_root(&entry.final_path, &album_dir) {
-            return Err(PublishError::PathOutsideOutputRoot(
-                entry.final_path.display().to_string(),
-            ));
+    if !path_is_under_root(&album_dir, output_root) {
+        return Err(PublishError::PathOutsideOutputRoot(format!(
+            "fragment publish entries do not share an album directory under output_root: {}",
+            output_root.display()
+        )));
+    }
+    if per_album_subdir && album_dir == output_root {
+        return Err(PublishError::PathOutsideOutputRoot(format!(
+            "fragment publish entries do not identify an album directory below output_root: {}",
+            output_root.display()
+        )));
+    }
+    if !per_album_subdir && album_dir != output_root {
+        return Err(PublishError::PathOutsideOutputRoot(format!(
+            "flat fragment publish must resolve to output_root: {}",
+            album_dir.display()
+        )));
+    }
+
+    Ok(album_dir)
+}
+
+fn publish_album_dir_candidate_from_final_path(
+    final_path: &Path,
+    output_root: &Path,
+    saw_fragment: &mut bool,
+) -> Result<PathBuf, PublishError> {
+    let final_path = normalize_path(final_path);
+    if !path_is_under_root(&final_path, output_root) {
+        return Err(PublishError::PathOutsideOutputRoot(
+            final_path.display().to_string(),
+        ));
+    }
+
+    let mut before_fragment_dir = PathBuf::new();
+    for component in final_path.components() {
+        if matches!(
+            component,
+            Component::Normal(name)
+                if name == std::ffi::OsStr::new(CONVERSION_LOG_FRAGMENT_DIR)
+        ) {
+            *saw_fragment = true;
+            if before_fragment_dir.as_os_str().is_empty() {
+                return Err(PublishError::PathOutsideOutputRoot(format!(
+                    "conversion-log fragment path has no album directory: {}",
+                    final_path.display()
+                )));
+            }
+            return Ok(before_fragment_dir);
+        }
+        before_fragment_dir.push(component.as_os_str());
+    }
+
+    final_path.parent().map(normalize_path).ok_or_else(|| {
+        PublishError::PathOutsideOutputRoot(format!(
+            "publish artifact has no parent directory below output_root: {}",
+            final_path.display()
+        ))
+    })
+}
+
+fn deepest_common_path(left: &Path, right: &Path) -> PathBuf {
+    let mut common = PathBuf::new();
+    for (left_component, right_component) in left.components().zip(right.components()) {
+        if left_component == right_component {
+            match left_component {
+                Component::Prefix(prefix) => common.push(prefix.as_os_str()),
+                Component::RootDir => common.push(left_component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir | Component::Normal(_) => {
+                    common.push(left_component.as_os_str())
+                }
+            }
+        } else {
+            break;
         }
     }
-    Ok(album_dir)
+    common
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -16098,6 +16367,217 @@ mod naming_template_tests {
         assert_eq!(
             plan.entries[0].final_path,
             PathBuf::from("/out/Miles Davis/A Tribute to Jack Johnson (1971)/01 - Right Off.flac")
+        );
+    }
+
+    fn staged_artifacts_for_plan(staging: &StagingDir, plan: &AlbumPlan) -> ArtifactSet {
+        let staged_path = staging.root.join("01 - Right Off.flac");
+        std::fs::write(&staged_path, b"audio").expect("staged audio");
+        ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                track_id: plan.entries[0].track_id.clone(),
+                staged_path,
+                final_path: plan.entries[0].final_path.clone(),
+                samples: Some(44_100),
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                metadata_required: PlannedMetadataSatisfaction::none(),
+                planned_command_hash: None,
+            }]),
+            sidecars: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn publish_uses_planned_nested_album_dir_not_existing_parent_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM% (%YEAR%)".to_string()));
+        req.output_root = temp.path().join("out");
+        let plan = plan_outputs(&source, &req).unwrap();
+
+        let artist_parent = plan.album_dir.parent().expect("nested artist parent");
+        std::fs::create_dir_all(artist_parent).expect("existing artist parent");
+        assert!(artist_parent.exists());
+        assert!(!plan.album_dir.exists());
+
+        let staging = StagingDir::new(temp.path().join("staging"), "publish-nested".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+        let publish_plan = build_publish_plan(&artifacts, &req, &plan.album_dir)
+            .expect("planned nested album dir builds publish plan");
+        assert_eq!(publish_plan.album_dir, plan.album_dir);
+
+        let published = publish_album_output(staging, &publish_plan, req.publish.clone(), None)
+            .expect("existing parent directory is not an album collision");
+        assert_eq!(published.album_dir, plan.album_dir);
+        assert!(plan.entries[0].final_path.exists());
+    }
+
+    #[test]
+    fn publish_still_rejects_existing_nested_leaf_album_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM% (%YEAR%)".to_string()));
+        req.output_root = temp.path().join("out");
+        let plan = plan_outputs(&source, &req).unwrap();
+        std::fs::create_dir_all(&plan.album_dir).expect("existing leaf album dir");
+
+        let staging = StagingDir::new(temp.path().join("staging"), "publish-leaf-exists".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+        let publish_plan = build_publish_plan(&artifacts, &req, &plan.album_dir)
+            .expect("planned nested album dir builds publish plan");
+
+        let err = publish_album_output(staging, &publish_plan, req.publish.clone(), None)
+            .expect_err("existing leaf album dir remains a collision");
+        assert!(matches!(
+            err,
+            PublishError::DestinationExists(path) if path == plan.album_dir.display().to_string()
+        ));
+    }
+
+    #[test]
+    fn publish_flat_output_uses_output_root_as_album_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(None);
+        req.output_root = temp.path().join("flat-out");
+        req.naming.per_album_subdir = false;
+
+        let plan = plan_outputs(&source, &req).expect("flat output plans");
+        assert_eq!(plan.album_dir, req.output_root);
+        assert_eq!(
+            plan.entries[0].final_path,
+            req.output_root.join("01 - Right Off.flac")
+        );
+
+        let staging = StagingDir::new(temp.path().join("staging"), "publish-flat".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+        let publish_plan = build_publish_plan(&artifacts, &req, &plan.album_dir)
+            .expect("flat output uses output_root as album_dir");
+        assert_eq!(publish_plan.album_dir, req.output_root);
+
+        let published = publish_album_output(staging, &publish_plan, req.publish.clone(), None)
+            .expect("flat output publishes into output_root");
+        assert_eq!(published.album_dir, req.output_root);
+        assert!(plan.entries[0].final_path.exists());
+    }
+
+    #[test]
+    fn publish_single_level_folder_template_uses_leaf_album_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ALBUM% (%YEAR%)".to_string()));
+        req.output_root = temp.path().join("out");
+        let plan = plan_outputs(&source, &req).unwrap();
+        assert_eq!(
+            plan.album_dir,
+            req.output_root.join("A Tribute to Jack Johnson (1971)")
+        );
+
+        let staging = StagingDir::new(
+            temp.path().join("staging"),
+            "publish-single-level-template".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+        let publish_plan = build_publish_plan(&artifacts, &req, &plan.album_dir)
+            .expect("single-level folder template builds publish plan");
+
+        let published = publish_album_output(staging, &publish_plan, req.publish.clone(), None)
+            .expect("single-level folder template publishes");
+        assert_eq!(published.album_dir, plan.album_dir);
+        assert!(plan.entries[0].final_path.exists());
+    }
+
+    #[test]
+    fn build_publish_plan_rejects_planned_album_dir_outside_output_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM%".to_string()));
+        req.output_root = temp.path().join("out");
+        let plan = plan_outputs(&source, &req).unwrap();
+        let staging = StagingDir::new(temp.path().join("staging"), "invalid-outside".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+
+        let err = build_publish_plan(&artifacts, &req, &temp.path().join("elsewhere").join("Album"))
+            .expect_err("album_dir outside output_root is rejected");
+        assert!(matches!(err, PublishError::PathOutsideOutputRoot(_)));
+    }
+
+    #[test]
+    fn build_publish_plan_rejects_album_dir_that_does_not_contain_entries() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM%".to_string()));
+        req.output_root = temp.path().join("out");
+        let plan = plan_outputs(&source, &req).unwrap();
+        let staging = StagingDir::new(temp.path().join("staging"), "invalid-mismatch".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+
+        let err = build_publish_plan(&artifacts, &req, &req.output_root.join("Other Artist").join("Other Album"))
+            .expect_err("album_dir must contain every publish entry");
+        assert!(matches!(err, PublishError::PathOutsideOutputRoot(_)));
+    }
+
+    #[test]
+    fn build_publish_plan_rejects_empty_planned_album_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM%".to_string()));
+        req.output_root = temp.path().join("out");
+        let plan = plan_outputs(&source, &req).unwrap();
+        let staging = StagingDir::new(temp.path().join("staging"), "invalid-empty".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+
+        let err = build_publish_plan(&artifacts, &req, Path::new(""))
+            .expect_err("empty planned album_dir is rejected");
+        assert!(matches!(err, PublishError::PathOutsideOutputRoot(_)));
+    }
+
+    #[test]
+    fn build_publish_plan_rejects_output_root_as_album_dir_when_subdirs_are_enabled() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM%".to_string()));
+        req.output_root = temp.path().join("out");
+        let plan = plan_outputs(&source, &req).unwrap();
+        let staging = StagingDir::new(temp.path().join("staging"), "invalid-root".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+
+        let err = build_publish_plan(&artifacts, &req, &req.output_root)
+            .expect_err("per-album publish cannot use output_root as the album dir");
+        assert!(matches!(err, PublishError::PathOutsideOutputRoot(_)));
+    }
+
+    #[test]
+    fn conversion_log_sidecar_uses_album_root_when_track_template_has_subdirs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM%".to_string()));
+        req.output_root = temp.path().join("out");
+        req.naming.template = "%DISC%/%NN% - %TITLE%".to_string();
+        let plan = plan_outputs(&source, &req).expect("nested track template plans");
+        let track_parent = plan.entries[0]
+            .final_path
+            .parent()
+            .expect("track parent")
+            .to_path_buf();
+        assert_ne!(track_parent, plan.album_dir);
+
+        let staging = StagingDir::new(temp.path().join("staging"), "nested-track-template".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+
+        assert_eq!(
+            conversion_log_album_dir(&source, &req, &artifacts),
+            plan.album_dir,
+            "conversion.log belongs at the album root, not below a track-template subdirectory"
         );
     }
 
@@ -18485,6 +18965,183 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         path
     }
 
+    fn fragment_publish_artifacts(
+        staging: &StagingDir,
+        album_dir: &Path,
+        fragment: &ConversionLogFragment,
+        audio_final_path: Option<PathBuf>,
+    ) -> ArtifactSet {
+        let fragment_name = fragment_file_name(fragment);
+        let staged_fragment = staging.root.join(&fragment_name);
+        write_fragment_json(&staged_fragment, fragment);
+
+        let audio = match audio_final_path {
+            Some(final_path) => {
+                let staged_audio = staging.root.join("01.flac");
+                std::fs::write(&staged_audio, b"audio").expect("staged audio");
+                AudioArtifacts::Tracks(vec![TrackArtifact {
+                    track_id: TrackId {
+                        source_ordinal: 1,
+                        disc_number: Some(1),
+                        track_number: 1,
+                    },
+                    staged_path: staged_audio,
+                    final_path,
+                    samples: Some(44_100),
+                    metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                    metadata_required: PlannedMetadataSatisfaction::none(),
+                    planned_command_hash: None,
+                }])
+            }
+            None => AudioArtifacts::Tracks(Vec::new()),
+        };
+
+        ArtifactSet {
+            audio,
+            sidecars: vec![SidecarArtifact {
+                kind: SidecarKind::Other(CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string()),
+                staged_path: staged_fragment,
+                final_path: conversion_log_fragment_dir(album_dir).join(fragment_name),
+            }],
+        }
+    }
+
+    #[test]
+    fn fragment_publish_fallback_derives_album_dir_from_log_fragment_only() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = real_fragment_unbatched_request(temp.path(), "fragment-log-only");
+        req.album_batch = None;
+        let album_dir = real_fragment_album_dir(temp.path());
+        let fragment = fragment_test_fragment(
+            &album_dir,
+            "fragment-log-only",
+            Some("settings-a"),
+            1,
+            1,
+            "Track 1\n  Result: failed\n",
+            ConversionLogTrackOutcome::Failure,
+            fragment_test_time(1),
+        );
+        let staging = StagingDir::new(
+            temp.path().join("staging"),
+            "fragment-log-only".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = fragment_publish_artifacts(&staging, &album_dir, &fragment, None);
+
+        let plan = build_publish_plan_for_fragment_or_fallback(&artifacts, &req)
+            .expect("fragment sidecar path identifies album dir");
+        assert_eq!(plan.album_dir, album_dir);
+        assert_eq!(plan.source_audio_track_count, 0);
+        assert_eq!(plan.expected_album_track_count, 1);
+    }
+
+    #[test]
+    fn fragment_publish_fallback_derives_album_root_for_mixed_nested_entries() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = real_fragment_unbatched_request(temp.path(), "fragment-mixed");
+        req.album_batch = None;
+        let album_dir = real_fragment_album_dir(temp.path());
+        let fragment = fragment_test_fragment(
+            &album_dir,
+            "fragment-mixed",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        let staging = StagingDir::new(temp.path().join("staging"), "fragment-mixed".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = fragment_publish_artifacts(
+            &staging,
+            &album_dir,
+            &fragment,
+            Some(album_dir.join("Disc 1").join("01.flac")),
+        );
+
+        let plan = build_publish_plan_for_fragment_or_fallback(&artifacts, &req)
+            .expect("fragment fallback uses album root, not nested track parent");
+        assert_eq!(plan.album_dir, album_dir);
+        assert!(plan
+            .entries
+            .iter()
+            .any(|entry| entry.final_path == album_dir.join("Disc 1").join("01.flac")));
+    }
+
+    #[test]
+    fn fragment_publish_fallback_rejects_empty_artifacts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = real_fragment_unbatched_request(temp.path(), "fragment-empty");
+        req.album_batch = None;
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(Vec::new()),
+            sidecars: Vec::new(),
+        };
+
+        let err = build_publish_plan_for_fragment_or_fallback(&artifacts, &req)
+            .expect_err("empty fragment artifacts are not publishable");
+        assert!(matches!(err, PublishError::StagingMissing));
+    }
+
+    #[test]
+    fn fragment_publish_fallback_rejects_entries_outside_output_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = real_fragment_unbatched_request(temp.path(), "fragment-outside");
+        req.album_batch = None;
+        let album_dir = temp.path().join("elsewhere").join("Album");
+        let fragment = fragment_test_fragment(
+            &album_dir,
+            "fragment-outside",
+            Some("settings-a"),
+            1,
+            1,
+            "Track 1\n  Result: failed\n",
+            ConversionLogTrackOutcome::Failure,
+            fragment_test_time(1),
+        );
+        let staging = StagingDir::new(temp.path().join("staging"), "fragment-outside".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = fragment_publish_artifacts(&staging, &album_dir, &fragment, None);
+
+        let err = build_publish_plan_for_fragment_or_fallback(&artifacts, &req)
+            .expect_err("fragment entries outside output_root are rejected");
+        assert!(matches!(err, PublishError::PathOutsideOutputRoot(_)));
+    }
+
+    #[test]
+    fn fragment_publish_fallback_rejects_audio_only_without_fragment_sidecar() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = real_fragment_unbatched_request(temp.path(), "fragment-audio-only");
+        req.album_batch = None;
+        let album_dir = real_fragment_album_dir(temp.path());
+        let staging = StagingDir::new(temp.path().join("staging"), "fragment-audio-only".to_string());
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let staged_audio = staging.root.join("01.flac");
+        std::fs::write(&staged_audio, b"audio").expect("staged audio");
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                track_id: TrackId {
+                    source_ordinal: 1,
+                    disc_number: Some(1),
+                    track_number: 1,
+                },
+                staged_path: staged_audio,
+                final_path: album_dir.join("01.flac"),
+                samples: Some(44_100),
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                metadata_required: PlannedMetadataSatisfaction::none(),
+                planned_command_hash: None,
+            }]),
+            sidecars: Vec::new(),
+        };
+
+        let err = build_publish_plan_for_fragment_or_fallback(&artifacts, &req)
+            .expect_err("audio-only publish must not use fragment fallback inference");
+        assert!(matches!(err, PublishError::PathOutsideOutputRoot(_)));
+    }
+
     fn scheduler_cancel_batch_request(
         temp: &Path,
         batch_id: &str,
@@ -18874,7 +19531,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         )
         .await
         .expect("real feature path stages conversion-log sidecars");
-        let plan = build_publish_plan(&staged, req)
+        let plan = build_publish_plan_for_fragment_or_fallback(&staged, req)
             .expect("real feature path builds publish plan from staged artifacts");
         (staging, plan)
     }
@@ -20844,7 +21501,7 @@ Source-aware setting: yes
             None,
         )
         .expect("terminal failed track stages only a fragment");
-        let failed_plan = build_publish_plan(&staged_failed, &failed_req)
+        let failed_plan = build_publish_plan_for_fragment_or_fallback(&staged_failed, &failed_req)
             .expect("failed fragment-only publish plan is built by production code");
         assert_eq!(
             failed_plan.source_audio_track_count, 0,
