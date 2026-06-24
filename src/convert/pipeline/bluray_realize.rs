@@ -1,19 +1,19 @@
 //! Blu-ray track realization orchestration.
 //!
-//! Phase 3 keeps high-level control flow here: reject Phase 4 compressed codecs,
-//! open libbluray, seek the selected chapter, stream TS bytes through the
-//! selected-PID demuxer, pass complete PES packets to the LPCM extractor, then
-//! validate and atomically publish the temporary WAV. Low-level TS/PES, PTS,
-//! LPCM, and WAV details live in focused sibling modules.
+//! LPCM streams stay in-process: open libbluray, seek the selected chapter,
+//! stream TS bytes through the selected-PID demuxer, pass complete PES packets
+//! to the LPCM extractor, then validate and atomically publish the temporary
+//! WAV. Compressed codecs route to ffmpeg through its `bluray:` protocol.
+//! Low-level TS/PES, PTS, LPCM, and WAV details live in focused sibling modules.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
 
@@ -33,10 +33,10 @@ use super::bluray_ts_demux::{
 use super::bluray_wav_validate::{
     read_wav_info, rewrite_wav_header, validate_bluray_lpcm_wav, write_wav_header,
 };
-use super::errors::ConvertError;
+use super::errors::{ConvertError, ToolRunnerError};
 use super::progress::OperationProgressTracker;
-use super::tool::ToolRunner;
-use super::track_executor::ToolConcurrencyLimits;
+use super::tool::{ToolBinary, ToolCommand, ToolRunner};
+use super::track_executor::{run_tool_command_with_concurrency, ToolConcurrencyLimits};
 use super::types::{StagingDir, TrackSourceRef};
 
 const BLURAY_READ_PACKET_COUNT: usize = 2048;
@@ -45,6 +45,7 @@ const TS_FORMAT_DETECTION_CONFIRMATION_PACKETS: usize = 4;
 const TS_FORMAT_DETECTION_MIN_BYTES: usize = M2TS_TP_EXTRA_SIZE
     + (TS_FORMAT_DETECTION_CONFIRMATION_PACKETS - 1) * M2TS_PACKET_SIZE
     + 1;
+const BLURAY_FFMPEG_REALIZE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 static BLURAY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -139,8 +140,6 @@ pub async fn realize_bluray_track(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     _progress_tracker: Option<&mut OperationProgressTracker<'_>>,
 ) -> Result<PathBuf, ConvertError> {
-    let _ = (runner, tool_concurrency_limits);
-
     let TrackSourceRef::BluRayTrack {
         source,
         playlist_number,
@@ -168,15 +167,25 @@ pub async fn realize_bluray_track(
     }
 
     if *audio_coding != BluRayAudioCoding::Lpcm {
-        return Err(ConvertError::Realize(format!(
-            concat!(
-                "Blu-ray compressed audio streams are not yet implemented; ",
-                "selected {} stream {} PID 0x{:04x} requires decoder support before WAV realization"
-            ),
-            audio_coding.label(),
-            u16::from(*audio_stream_index) + 1,
-            audio_pid
-        )));
+        return realize_compressed_bluray_via_ffmpeg(
+            source,
+            staging,
+            *playlist_number,
+            *title_index,
+            *angle_number,
+            *chapter_number,
+            *chapter_start_pts_90k,
+            *chapter_end_pts_90k,
+            *audio_pid,
+            *audio_stream_index,
+            *audio_coding,
+            *sample_rate,
+            *channels,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await;
     }
 
     validate_bluray_lpcm_materialization_facts(
@@ -230,6 +239,132 @@ pub async fn realize_bluray_track(
     )?;
 
     validate_nonempty_wav(&wav_path)?;
+    Ok(wav_path)
+}
+
+async fn realize_compressed_bluray_via_ffmpeg(
+    source: &Path,
+    staging: &StagingDir,
+    playlist_number: u32,
+    title_index: usize,
+    angle_number: u8,
+    chapter_number: u32,
+    chapter_start_pts_90k: u64,
+    chapter_end_pts_90k: Option<u64>,
+    audio_pid: u16,
+    audio_stream_index: u8,
+    audio_coding: BluRayAudioCoding,
+    expected_sample_rate: Option<u32>,
+    expected_channels: Option<u8>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<PathBuf, ConvertError> {
+    // Prepared Blu-ray tracks use 1-based angle numbers.  ffmpeg expects a
+    // 0-based `-angle` value, so reject impossible metadata before translating
+    // it instead of silently mapping angle 0 to angle 0.
+    if angle_number == 0 {
+        return Err(ConvertError::TrackValidation(format!(
+            "Blu-ray playlist {playlist_number:05}, chapter {chapter_number} has invalid angle number 0; angle numbers are 1-based"
+        )));
+    }
+
+    let chapter_duration_secs = match chapter_end_pts_90k {
+        Some(end_pts) if end_pts > chapter_start_pts_90k => {
+            Some((end_pts - chapter_start_pts_90k) as f64 / 90_000.0)
+        }
+        Some(end_pts) => {
+            return Err(ConvertError::TrackValidation(format!(
+                "Blu-ray playlist {playlist_number:05}, chapter {chapter_number} has non-increasing PTS bounds: start={chapter_start_pts_90k}, end={end_pts}"
+            )));
+        }
+        None => None,
+    };
+
+    let backend_source = bluray_source_path_for_backend(source).map_err(|err| {
+        ConvertError::TrackValidation(format!(
+            "Blu-ray source '{}' is not usable by the ffmpeg bluray protocol: {err}",
+            source.display()
+        ))
+    })?;
+
+    let realized_dir = staging.root.join("bluray-realized");
+    fs::create_dir_all(&realized_dir).map_err(|err| {
+        ConvertError::Realize(format!(
+            "failed to create Blu-ray realization directory '{}': {err}",
+            realized_dir.display()
+        ))
+    })?;
+
+    let stem = bluray_output_stem(
+        source,
+        playlist_number,
+        title_index,
+        angle_number,
+        chapter_number,
+        chapter_start_pts_90k,
+        chapter_end_pts_90k,
+        audio_pid,
+        audio_stream_index,
+        audio_coding,
+    );
+    let wav_path = realized_dir.join(format!("{stem}.wav"));
+
+    let mut tmp = ScopedTempPath::for_final(&wav_path, "bluray-ffmpeg-wav")?;
+    let tmp_path = tmp.path().to_path_buf();
+
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-playlist".to_string(),
+        playlist_number.to_string(),
+        "-angle".to_string(),
+        (angle_number - 1).to_string(),
+        "-chapter".to_string(),
+        chapter_number.to_string(),
+        "-i".to_string(),
+        format!("bluray:{}", backend_source.display()),
+        "-map".to_string(),
+        format!("0:a:{audio_stream_index}"),
+    ];
+
+    if let Some(duration_secs) = chapter_duration_secs {
+        args.push("-t".to_string());
+        args.push(format!("{duration_secs:.6}"));
+    }
+
+    args.extend([
+        "-vn".to_string(),
+        "-sn".to_string(),
+        "-dn".to_string(),
+        "-f".to_string(),
+        "wav".to_string(),
+        "-c:a".to_string(),
+        "pcm_s32le".to_string(),
+        tmp_path.to_string_lossy().into_owned(),
+    ]);
+
+    let cmd = ToolCommand {
+        binary: ToolBinary::Ffmpeg,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: BLURAY_FFMPEG_REALIZE_TIMEOUT,
+    };
+
+    match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await {
+        Ok(_) => {}
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            return Err(ConvertError::Realize("cancelled".to_string()));
+        }
+        Err(err) => return Err(ConvertError::Tool(err)),
+    }
+
+    validate_decoded_compressed_wav(&tmp_path, expected_sample_rate, expected_channels)?;
+    publish_temp_file(&mut tmp, &wav_path)?;
     Ok(wav_path)
 }
 
@@ -719,6 +854,171 @@ fn validate_nonempty_wav(path: &Path) -> Result<(), ConvertError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WavFmtBasics {
+    audio_format: u16,
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    extensible_subformat_pcm: bool,
+}
+
+fn validate_decoded_compressed_wav(
+    path: &Path,
+    expected_sample_rate: Option<u32>,
+    expected_channels: Option<u8>,
+) -> Result<(), ConvertError> {
+    validate_nonempty_wav(path)?;
+
+    let fmt = read_wav_fmt_basics(path)?;
+    let is_pcm = fmt.audio_format == 1 || (fmt.audio_format == 0xfffe && fmt.extensible_subformat_pcm);
+    if !is_pcm {
+        return Err(ConvertError::TrackValidation(format!(
+            "decoded Blu-ray WAV has unsupported format tag {} for '{}'; expected PCM or WAVE_FORMAT_EXTENSIBLE PCM",
+            fmt.audio_format,
+            path.display()
+        )));
+    }
+    if fmt.bits_per_sample != 32 {
+        return Err(ConvertError::TrackValidation(format!(
+            "decoded Blu-ray WAV has {} bits per sample for '{}'; expected 32-bit PCM from ffmpeg pcm_s32le output",
+            fmt.bits_per_sample,
+            path.display()
+        )));
+    }
+
+    if let Some(expected) = expected_sample_rate {
+        if fmt.sample_rate != expected {
+            return Err(ConvertError::TrackValidation(format!(
+                "decoded Blu-ray WAV sample-rate mismatch for '{}': expected {expected} Hz from Blu-ray stream metadata, got {} Hz",
+                path.display(),
+                fmt.sample_rate
+            )));
+        }
+    }
+
+    if let Some(expected) = expected_channels {
+        if fmt.channels != u16::from(expected) {
+            return Err(ConvertError::TrackValidation(format!(
+                "decoded Blu-ray WAV channel-count mismatch for '{}': expected {expected} channel(s) from Blu-ray stream metadata, got {}",
+                path.display(),
+                fmt.channels
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn read_wav_fmt_basics(path: &Path) -> Result<WavFmtBasics, ConvertError> {
+    let mut file = File::open(path).map_err(|err| {
+        ConvertError::TrackValidation(format!(
+            "failed to open decoded Blu-ray WAV '{}' for metadata validation: {err}",
+            path.display()
+        ))
+    })?;
+
+    let mut riff = [0u8; 12];
+    file.read_exact(&mut riff).map_err(|err| {
+        ConvertError::TrackValidation(format!(
+            "decoded Blu-ray WAV '{}' is too short to contain a RIFF/WAVE header: {err}",
+            path.display()
+        ))
+    })?;
+    if (&riff[0..4] != b"RIFF" && &riff[0..4] != b"RF64") || &riff[8..12] != b"WAVE" {
+        return Err(ConvertError::TrackValidation(format!(
+            "decoded Blu-ray WAV '{}' is not a RIFF/RF64 WAVE file",
+            path.display()
+        )));
+    }
+
+    loop {
+        let mut chunk_header = [0u8; 8];
+        match file.read_exact(&mut chunk_header) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(ConvertError::TrackValidation(format!(
+                    "decoded Blu-ray WAV '{}' is missing a fmt chunk",
+                    path.display()
+                )));
+            }
+            Err(err) => {
+                return Err(ConvertError::TrackValidation(format!(
+                    "failed to read decoded Blu-ray WAV '{}' chunk header: {err}",
+                    path.display()
+                )));
+            }
+        }
+
+        let chunk_size = u32::from_le_bytes([
+            chunk_header[4],
+            chunk_header[5],
+            chunk_header[6],
+            chunk_header[7],
+        ]) as u64;
+
+        if &chunk_header[0..4] == b"fmt " {
+            if chunk_size < 16 {
+                return Err(ConvertError::TrackValidation(format!(
+                    "decoded Blu-ray WAV '{}' has a truncated fmt chunk of {chunk_size} byte(s)",
+                    path.display()
+                )));
+            }
+
+            let fmt_read_len = chunk_size.min(40) as usize;
+            let mut fmt = vec![0u8; fmt_read_len];
+            file.read_exact(&mut fmt).map_err(|err| {
+                ConvertError::TrackValidation(format!(
+                    "failed to read decoded Blu-ray WAV '{}' fmt chunk: {err}",
+                    path.display()
+                ))
+            })?;
+
+            let audio_format = u16::from_le_bytes([fmt[0], fmt[1]]);
+            let extensible_subformat_pcm = if audio_format == 0xfffe {
+                if chunk_size < 40 {
+                    return Err(ConvertError::TrackValidation(format!(
+                        "decoded Blu-ray WAV '{}' has a truncated WAVE_FORMAT_EXTENSIBLE fmt chunk of {chunk_size} byte(s)",
+                        path.display()
+                    )));
+                }
+                let cb_size = u16::from_le_bytes([fmt[16], fmt[17]]);
+                if cb_size < 22 {
+                    return Err(ConvertError::TrackValidation(format!(
+                        "decoded Blu-ray WAV '{}' has WAVE_FORMAT_EXTENSIBLE cbSize {cb_size}; expected at least 22",
+                        path.display()
+                    )));
+                }
+                &fmt[24..40]
+                    == [
+                        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00,
+                        0xaa, 0x00, 0x38, 0x9b, 0x71,
+                    ]
+                    .as_slice()
+            } else {
+                false
+            };
+
+            return Ok(WavFmtBasics {
+                audio_format,
+                channels: u16::from_le_bytes([fmt[2], fmt[3]]),
+                sample_rate: u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]),
+                bits_per_sample: u16::from_le_bytes([fmt[14], fmt[15]]),
+                extensible_subformat_pcm,
+            });
+        }
+
+        let padded_chunk_size = chunk_size + (chunk_size & 1);
+        file.seek(SeekFrom::Current(padded_chunk_size as i64))
+            .map_err(|err| {
+                ConvertError::TrackValidation(format!(
+                    "failed to skip decoded Blu-ray WAV '{}' chunk while seeking fmt chunk: {err}",
+                    path.display()
+                ))
+            })?;
+    }
+}
+
 fn bluray_output_stem(
     source: &Path,
     playlist_number: u32,
@@ -802,9 +1102,70 @@ fn bluray_stable_hash(
 mod tests {
     use super::*;
     use super::super::errors::ToolRunnerError;
-    use super::super::tool::{ToolBinary, ToolCommand, ToolOutput};
+    use super::super::tool::{CommandRecord, ProcessExit, ToolBinary, ToolCommand, ToolOutput};
+
+    struct RejectingToolRunner {
+        expect_duration: Option<&'static str>,
+    }
+
+    struct SuccessfulWavToolRunner {
+        expect_duration: Option<&'static str>,
+        observed_tmp_path: std::sync::Mutex<Option<PathBuf>>,
+        wav_sample_rate: u32,
+        wav_channels: u16,
+    }
 
     struct PanicToolRunner;
+
+    #[async_trait::async_trait]
+    impl ToolRunner for RejectingToolRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            assert_ffmpeg_bluray_command(&cmd, self.expect_duration);
+            Err(ToolRunnerError::Spawn {
+                command: command_record(&cmd, None),
+            })
+        }
+
+        fn tool_version(&self, _binary: ToolBinary) -> Option<String> {
+            None
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolRunner for SuccessfulWavToolRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            assert_ffmpeg_bluray_command(&cmd, self.expect_duration);
+            let output_path = PathBuf::from(
+                cmd.args
+                    .last()
+                    .expect("ffmpeg command must end with the output WAV path")
+                    .as_str(),
+            );
+            write_test_pcm_s32le_wav(&output_path, self.wav_sample_rate, self.wav_channels);
+            *self.observed_tmp_path.lock().unwrap() = Some(output_path);
+
+            let command = command_record(&cmd, Some(ProcessExit::Code(0)));
+            Ok(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command,
+            })
+        }
+
+        fn tool_version(&self, _binary: ToolBinary) -> Option<String> {
+            None
+        }
+    }
 
     #[async_trait::async_trait]
     impl ToolRunner for PanicToolRunner {
@@ -813,7 +1174,7 @@ mod tests {
             _cmd: ToolCommand,
             _cancel: &CancellationToken,
         ) -> Result<ToolOutput, ToolRunnerError> {
-            panic!("compressed Blu-ray rejection must not execute external tools")
+            panic!("LPCM Blu-ray realization must not invoke external tools")
         }
 
         fn tool_version(&self, _binary: ToolBinary) -> Option<String> {
@@ -821,23 +1182,121 @@ mod tests {
         }
     }
 
-    fn compressed_bluray_source(audio_coding: BluRayAudioCoding) -> TrackSourceRef {
+    fn assert_ffmpeg_bluray_command(cmd: &ToolCommand, expect_duration: Option<&'static str>) {
+        assert_eq!(cmd.binary, ToolBinary::Ffmpeg);
+        assert_eq!(cmd.timeout, BLURAY_FFMPEG_REALIZE_TIMEOUT);
+        assert_eq!(cmd.secret_args, Vec::<usize>::new());
+        assert!(cmd.args.iter().any(|arg| arg.starts_with("bluray:")));
+        assert_command_arg_value(&cmd.args, "-playlist", "12");
+        assert_command_arg_value(&cmd.args, "-angle", "1");
+        assert_command_arg_value(&cmd.args, "-chapter", "3");
+        assert_command_arg_value(&cmd.args, "-map", "0:a:2");
+        assert_command_arg_value(&cmd.args, "-f", "wav");
+        assert_command_arg_value(&cmd.args, "-c:a", "pcm_s32le");
+        assert!(cmd.args.iter().any(|arg| arg == "-vn"));
+        assert!(cmd.args.iter().any(|arg| arg == "-sn"));
+        assert!(cmd.args.iter().any(|arg| arg == "-dn"));
+
+        match expect_duration {
+            Some(duration) => assert_command_arg_value(&cmd.args, "-t", duration),
+            None => assert!(
+                !cmd.args.iter().any(|arg| arg == "-t"),
+                "last chapter must not pass -t: {:?}",
+                cmd.args
+            ),
+        }
+    }
+
+    fn command_record(cmd: &ToolCommand, exit: Option<ProcessExit>) -> CommandRecord {
+        CommandRecord {
+            description: None,
+            binary: cmd.binary,
+            sanitized_args: cmd.sanitized_args(),
+            cwd: cmd.cwd.clone(),
+            env_keys: cmd.env_keys(),
+            exit,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn write_test_pcm_s32le_wav(path: &Path, sample_rate: u32, channels: u16) {
+        let bits_per_sample = 32u16;
+        let block_align = channels * (bits_per_sample / 8);
+        let byte_rate = sample_rate * u32::from(block_align);
+        let data = vec![0u8; usize::from(block_align)];
+        let riff_size = 36u32 + data.len() as u32;
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        fs::write(path, wav).expect("write mock ffmpeg WAV output");
+    }
+
+    fn successful_wav_runner(
+        expect_duration: Option<&'static str>,
+        wav_sample_rate: u32,
+        wav_channels: u16,
+    ) -> SuccessfulWavToolRunner {
+        SuccessfulWavToolRunner {
+            expect_duration,
+            observed_tmp_path: std::sync::Mutex::new(None),
+            wav_sample_rate,
+            wav_channels,
+        }
+    }
+
+    fn assert_command_arg_value(args: &[String], option: &str, expected_value: &str) {
+        let value = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == option).then_some(pair[1].as_str()))
+            .unwrap_or_else(|| panic!("missing ffmpeg option {option}: {args:?}"));
+        assert_eq!(value, expected_value, "unexpected value for {option}");
+    }
+
+    fn compressed_bluray_source(
+        source: PathBuf,
+        audio_coding: BluRayAudioCoding,
+        chapter_end_pts_90k: Option<u64>,
+    ) -> TrackSourceRef {
         TrackSourceRef::BluRayTrack {
-            source: PathBuf::from("/nonexistent/fixture.iso"),
+            source,
             playlist_number: 12,
             title_index: 0,
-            angle_number: 1,
-            chapter_number: 1,
-            chapter_start_pts_90k: 0,
-            chapter_end_pts_90k: Some(90_000),
+            angle_number: 2,
+            chapter_number: 3,
+            chapter_start_pts_90k: 90_000,
+            chapter_end_pts_90k,
             audio_pid: 0x1100,
-            audio_stream_index: 0,
+            audio_stream_index: 2,
             audio_coding,
             sample_rate: Some(48_000),
             bit_depth: None,
             channels: Some(6),
             channel_layout: Some("5.1".to_string()),
         }
+    }
+
+    fn fixture_bluray_root(temp: &tempfile::TempDir) -> PathBuf {
+        let root = temp.path().join("disc-root");
+        let bdmv = root.join("BDMV");
+        fs::create_dir_all(&bdmv).expect("create BDMV directory");
+        fs::write(bdmv.join("index.bdmv"), []).expect("create index.bdmv sentinel");
+        fs::write(bdmv.join("MovieObject.bdmv"), []).expect("create MovieObject.bdmv sentinel");
+        root
     }
 
     fn synthetic_ts_packet(pid: u16, continuity_counter: u8) -> [u8; TS_PACKET_SIZE] {
@@ -1240,33 +1699,240 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compressed_bluray_audio_returns_targeted_error_before_lpcm_realization() {
+    async fn lpcm_bluray_audio_uses_in_process_path_without_tool_runner() {
         let temp = tempfile::tempdir().expect("temp dir");
         let staging = StagingDir::borrowed(temp.path().join("stage"), "job".to_string());
         let cancel = CancellationToken::new();
-        let src = compressed_bluray_source(BluRayAudioCoding::DtsHdMaster);
+        let src = TrackSourceRef::BluRayTrack {
+            source: fixture_bluray_root(&temp),
+            playlist_number: 12,
+            title_index: 0,
+            angle_number: 2,
+            chapter_number: 3,
+            chapter_start_pts_90k: 90_000,
+            chapter_end_pts_90k: Some(270_000),
+            audio_pid: 0x1100,
+            audio_stream_index: 2,
+            audio_coding: BluRayAudioCoding::Lpcm,
+            sample_rate: None,
+            bit_depth: Some(24),
+            channels: Some(2),
+            channel_layout: Some("stereo".to_string()),
+        };
+
+        let err = realize_bluray_track(&src, &staging, &PanicToolRunner, &cancel, None, None)
+            .await
+            .expect_err("invalid LPCM facts should fail before any external runner call");
+
+        match err {
+            ConvertError::TrackValidation(_) => {}
+            other => panic!("unexpected error type for LPCM validation path: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_bluray_audio_success_validates_publishes_and_returns_wav() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = StagingDir::borrowed(temp.path().join("stage"), "job".to_string());
+        let cancel = CancellationToken::new();
+        let src = compressed_bluray_source(
+            fixture_bluray_root(&temp),
+            BluRayAudioCoding::Ac3,
+            Some(270_000),
+        );
+        let runner = successful_wav_runner(Some("2.000000"), 48_000, 6);
+
+        let wav_path = realize_bluray_track(&src, &staging, &runner, &cancel, None, None)
+            .await
+            .expect("mock ffmpeg success should publish a validated WAV");
+
+        assert!(wav_path.exists(), "published WAV does not exist: {wav_path:?}");
+        assert!(
+            wav_path.starts_with(staging.root.join("bluray-realized")),
+            "published WAV should live under the staging realization directory: {wav_path:?}"
+        );
+        let wav = read_wav_info(&wav_path).expect("published mock WAV should parse");
+        assert_eq!(wav.data_size, 24);
+        let fmt = read_wav_fmt_basics(&wav_path).expect("published mock WAV fmt should parse");
+        assert_eq!(fmt.sample_rate, 48_000);
+        assert_eq!(fmt.channels, 6);
+        assert_eq!(fmt.bits_per_sample, 32);
+
+        let tmp_path = runner
+            .observed_tmp_path
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("successful runner should record temporary output path");
+        assert_ne!(tmp_path, wav_path, "ffmpeg must write to a scoped temporary path");
+        assert!(
+            !tmp_path.exists(),
+            "temporary ffmpeg WAV should be removed after atomic publish: {tmp_path:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_bluray_audio_routes_to_ffmpeg() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = StagingDir::borrowed(temp.path().join("stage"), "job".to_string());
+        let cancel = CancellationToken::new();
+        let src = compressed_bluray_source(
+            fixture_bluray_root(&temp),
+            BluRayAudioCoding::DtsHdMaster,
+            Some(270_000),
+        );
 
         let err = realize_bluray_track(
             &src,
             &staging,
-            &PanicToolRunner,
+            &RejectingToolRunner {
+                expect_duration: Some("2.000000"),
+            },
             &cancel,
             None,
             None,
         )
         .await
-        .expect_err("compressed Blu-ray streams must be rejected before LPCM realization");
+        .expect_err("mock runner rejects after command capture");
 
         match err {
-            ConvertError::Realize(message) => {
+            ConvertError::Tool(ToolRunnerError::Spawn { .. }) => {}
+            other => panic!("unexpected error type: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_bluray_last_chapter_omits_duration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = StagingDir::borrowed(temp.path().join("stage"), "job".to_string());
+        let cancel = CancellationToken::new();
+        let src = compressed_bluray_source(
+            fixture_bluray_root(&temp),
+            BluRayAudioCoding::TrueHd,
+            None,
+        );
+
+        let err = realize_bluray_track(
+            &src,
+            &staging,
+            &RejectingToolRunner {
+                expect_duration: None,
+            },
+            &cancel,
+            None,
+            None,
+        )
+        .await
+        .expect_err("mock runner rejects after command capture");
+
+        match err {
+            ConvertError::Tool(ToolRunnerError::Spawn { .. }) => {}
+            other => panic!("unexpected error type: {other:?}"),
+        }
+    }
+
+
+    #[tokio::test]
+    async fn compressed_bluray_rejects_zero_angle_before_runner() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = StagingDir::borrowed(temp.path().join("stage"), "job".to_string());
+        let cancel = CancellationToken::new();
+        let mut src = compressed_bluray_source(
+            fixture_bluray_root(&temp),
+            BluRayAudioCoding::Ac3,
+            Some(270_000),
+        );
+        let TrackSourceRef::BluRayTrack { angle_number, .. } = &mut src else {
+            unreachable!("test helper should build a BluRayTrack")
+        };
+        *angle_number = 0;
+
+        let err = realize_bluray_track(&src, &staging, &PanicToolRunner, &cancel, None, None)
+            .await
+            .expect_err("invalid angle metadata should fail before invoking ffmpeg");
+
+        match err {
+            ConvertError::TrackValidation(message) => {
                 assert!(
-                    message.contains("Blu-ray compressed audio streams are not yet implemented"),
-                    "unexpected message: {message}"
+                    message.contains("invalid angle number 0"),
+                    "unexpected validation error: {message}"
                 );
-                assert!(message.contains("stream 1"), "unexpected message: {message}");
-                assert!(message.contains("PID 0x1100"), "unexpected message: {message}");
             }
             other => panic!("unexpected error type: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn compressed_bluray_rejects_non_increasing_chapter_bounds_before_runner() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = StagingDir::borrowed(temp.path().join("stage"), "job".to_string());
+        let cancel = CancellationToken::new();
+        let mut src = compressed_bluray_source(
+            fixture_bluray_root(&temp),
+            BluRayAudioCoding::Ac3,
+            Some(90_000),
+        );
+        let TrackSourceRef::BluRayTrack {
+            chapter_start_pts_90k,
+            chapter_end_pts_90k,
+            ..
+        } = &mut src
+        else {
+            unreachable!("test helper should build a BluRayTrack")
+        };
+        *chapter_start_pts_90k = 90_000;
+        *chapter_end_pts_90k = Some(90_000);
+
+        let err = realize_bluray_track(&src, &staging, &PanicToolRunner, &cancel, None, None)
+            .await
+            .expect_err("non-increasing chapter PTS bounds should fail before invoking ffmpeg");
+
+        match err {
+            ConvertError::TrackValidation(message) => {
+                assert!(
+                    message.contains("non-increasing PTS bounds"),
+                    "unexpected validation error: {message}"
+                );
+            }
+            other => panic!("unexpected error type: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_bluray_rejects_decoded_metadata_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = StagingDir::borrowed(temp.path().join("stage"), "job".to_string());
+        let cancel = CancellationToken::new();
+        let src = compressed_bluray_source(
+            fixture_bluray_root(&temp),
+            BluRayAudioCoding::Ac3,
+            Some(270_000),
+        );
+        let runner = successful_wav_runner(Some("2.000000"), 48_000, 2);
+
+        let err = realize_bluray_track(&src, &staging, &runner, &cancel, None, None)
+            .await
+            .expect_err("metadata mismatch should reject the decoded WAV before publish");
+
+        match err {
+            ConvertError::TrackValidation(message) => {
+                assert!(
+                    message.contains("channel-count mismatch"),
+                    "unexpected validation error: {message}"
+                );
+            }
+            other => panic!("unexpected error type: {other:?}"),
+        }
+
+        let tmp_path = runner
+            .observed_tmp_path
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("runner should write a temporary WAV before validation fails");
+        assert!(
+            !tmp_path.exists(),
+            "temporary ffmpeg WAV should be cleaned up after metadata validation failure: {tmp_path:?}"
+        );
     }
 }
