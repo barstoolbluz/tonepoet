@@ -2234,6 +2234,11 @@ mod musicbrainz_completion_dispatch_tests {
             dvdv_track_durations: None,
             dvdv_angle_number: None,
             dvdv_title_angle_count: None,
+            bluray_playlist_number: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream_index: None,
+            bluray_angle_number: None,
+            bluray_chapter_durations: None,
         }
     }
 
@@ -2279,8 +2284,16 @@ mod musicbrainz_completion_dispatch_tests {
             dvdv_track_durations: active.dvdv_track_durations,
             dvdv_angle_number: active.dvdv_angle_number,
             dvdv_title_angle_count: active.dvdv_title_angle_count,
+            bluray_playlist_number: active.bluray_playlist_number,
+            bluray_audio_pid: active.bluray_audio_pid,
+            bluray_audio_stream_index: active.bluray_audio_stream_index,
+            bluray_angle_number: active.bluray_angle_number,
+            bluray_chapter_durations: active.bluray_chapter_durations,
             presentation_tabs: tabs,
             active_tab,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         })
     }
 

@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tonepoet::disc::bluray_backend::{
     BluRayAudioCoding, BluRayAudioStreamKind, BlurayBackend, BlurayBackendCapability,
-    BlurayLpcmBitDepth,
+    BlurayDisplayAngle, BlurayLpcmBitDepth,
 };
 use tonepoet::disc::bluray_backend_libbluray::BlurayBackendLibbluray;
 
@@ -43,7 +43,7 @@ fn smoke_one(path: &Path) {
             title.clip_count
         );
 
-        let chapters = BlurayBackendLibbluray::chapters(&disc, title.key, 0)
+        let chapters = BlurayBackendLibbluray::chapters(&disc, title.key, BlurayDisplayAngle::first())
             .expect("enumerate Blu-ray chapters");
         assert_eq!(chapters.len() as u32, title.chapter_count);
 
@@ -100,7 +100,7 @@ fn assert_title_source_cursor_survives_metadata_queries(
 ) {
     let title = titles[0].key;
     let other_title = titles.get(1).map(|info| info.key).unwrap_or(title);
-    let mut source = BlurayBackendLibbluray::open_title(disc, title, 0, None)
+    let mut source = BlurayBackendLibbluray::open_title(disc, title, BlurayDisplayAngle::first(), None)
         .expect("open independent Blu-ray title source");
 
     let mut warmup = [0u8; 188];
@@ -120,7 +120,7 @@ fn assert_title_source_cursor_survives_metadata_queries(
     let _ = BlurayBackendLibbluray::streams(disc, other_title)
         .expect("metadata stream query must not perturb an open title source");
 
-    let pts = BlurayBackendLibbluray::pts_continuity_segments(&source)
+    let pts = BlurayBackendLibbluray::pts_continuity_segments(&mut source)
         .expect("query PTS continuity capability");
     assert!(
         matches!(pts, BlurayBackendCapability::Unsupported { .. }),
@@ -165,7 +165,7 @@ fn first_event_error_from_fixture(path: &Path, read_limit: usize) -> Option<Stri
     };
 
     for title in titles.iter().take(8) {
-        let mut source = match BlurayBackendLibbluray::open_title(&disc, title.key, 0, None) {
+        let mut source = match BlurayBackendLibbluray::open_title(&disc, title.key, BlurayDisplayAngle::first(), None) {
             Ok(source) => source,
             Err(err) => return Some(err),
         };

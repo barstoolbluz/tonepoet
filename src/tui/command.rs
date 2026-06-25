@@ -10145,7 +10145,6 @@ custom_track_field = "keep-track"
                     angle_number: None,
                     track_count: Some(2),
                     duration_fingerprint: None,
-                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::new(),
             },
@@ -10358,7 +10357,6 @@ title = "Old Angle 2 Song"
                     angle_number: Some(2),
                     track_count: Some(1),
                     duration_fingerprint: None,
-                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::new(),
             },
@@ -10488,7 +10486,6 @@ STALE_TRACK_EXTRA = "keep-a-only"
                     angle_number: None,
                     track_count: None,
                     duration_fingerprint: None,
-                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::from([(
                     "source_vendor_extension".to_string(),
@@ -10636,7 +10633,6 @@ title = "Bonus Song"
                     angle_number: None,
                     track_count: Some(1),
                     duration_fingerprint: None,
-                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::new(),
             },
@@ -10994,7 +10990,8 @@ MUSICBRAINZ_TRACKID = "recording-id"
 
         let mut anonymous = sidecar_with_fingerprint(None);
         anonymous.source.presentation = None;
-        let anonymous_report = find_unique_matching_bluray_metadata_sidecar(&[anonymous], &identity(None), true);
+        let anonymous_sidecars = [anonymous];
+        let anonymous_report = find_unique_matching_bluray_metadata_sidecar(&anonymous_sidecars, &identity(None), true);
         assert!(anonymous_report.selected.is_none());
         assert!(matches!(
             anonymous_report.warnings.as_slice(),
@@ -11008,7 +11005,8 @@ MUSICBRAINZ_TRACKID = "recording-id"
         let mut missing_angle = sidecar_with_fingerprint(None);
         missing_angle.source.presentation.as_mut().unwrap().angle_number = None;
 
-        let report = find_unique_matching_bluray_metadata_sidecar(&[missing_angle], &current, true);
+        let missing_angle_sidecars = [missing_angle];
+        let report = find_unique_matching_bluray_metadata_sidecar(&missing_angle_sidecars, &current, true);
         assert!(report.selected.is_none());
         assert!(matches!(
             report.warnings.as_slice(),
@@ -12516,7 +12514,6 @@ mod dvdv_metadata_editor_sidecar_preload_tests {
                     angle_number: None,
                     track_count: Some(2),
                     duration_fingerprint: None,
-                    extra: BTreeMap::new(),
                 }),
                 extra: BTreeMap::new(),
             },

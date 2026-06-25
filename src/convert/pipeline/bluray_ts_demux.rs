@@ -490,6 +490,7 @@ fn parse_ts_packet(packet: &[u8]) -> Result<ParsedTsPacket<'_>, ConvertError> {
 }
 
 
+#[allow(dead_code)]
 pub(crate) fn find_next_ts_sync_at_cadence(bytes: &[u8]) -> Option<usize> {
     find_next_ts_sync_at_cadence_with_format(bytes, TsPacketFormat::StandardTs)
 }

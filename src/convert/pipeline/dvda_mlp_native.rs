@@ -82,6 +82,7 @@ pub(crate) struct NativeMlpDecodeResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NativeMlpError {
     InvalidPath { path: String },
+    #[allow(dead_code)]
     ProbeFailed(String),
     DecodeFailed(String),
     NonStereoOutput { channels: u32, layout: Option<String> },

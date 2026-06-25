@@ -989,6 +989,7 @@ fn probe_lpcm_headers_for_title(
 struct LpcmProbeReport {
     headers: HashMap<u16, super::bluray_utils::BlurayLpcmPesHeader>,
     scanned_bytes: u64,
+    #[allow(dead_code)]
     missing_pids: Vec<u16>,
     pid_failures: Vec<BlurayLpcmPidProbeFailure>,
     completion: LpcmProbeCompletion,

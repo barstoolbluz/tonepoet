@@ -778,7 +778,7 @@ mod tests {
             angle_number: 1,
             chapter_number: 1,
             chapter_start_pts_90k: 0,
-            chapter_end_pts_90k: 90_000,
+            chapter_end_pts_90k: Some(90_000),
             audio_pid: 0x1100,
             audio_stream_index: 0,
             audio_coding: BluRayAudioCoding::TrueHd,
@@ -821,7 +821,7 @@ mod tests {
         let plan = tonepoet_pipeline::plan_conversion(plan_request).expect("planner builds command plan");
         match plan.action {
             PlanAction::Execute { commands, .. } => {
-                commands.into_iter().map(|cmd| cmd.program).collect()
+                commands.into_iter().map(|cmd| cmd.tool.program().to_string()).collect()
             }
             PlanAction::PassthroughCopy { .. } => {
                 panic!("expected executable command plan, got passthrough copy")

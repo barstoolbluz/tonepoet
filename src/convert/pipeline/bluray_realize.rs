@@ -623,7 +623,7 @@ fn finalize_bluray_lpcm_output(
     tmp_path: &Path,
     tmp: &mut ScopedTempPath,
     wav_path: &Path,
-    mut extractor: BlurayLpcmExtractor,
+    extractor: BlurayLpcmExtractor,
     wav_header_written: bool,
 ) -> Result<(), ConvertError> {
     if !wav_header_written {

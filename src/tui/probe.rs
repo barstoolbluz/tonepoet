@@ -1829,6 +1829,14 @@ mod tests {
             dvdv_source_chapters: None,
             presentation_tabs: vec![],
             active_tab: 0,
+            bluray_playlist_number: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream_index: None,
+            bluray_angle_number: None,
+            bluray_chapter_durations: None,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         };
         assert!(metadata_editor_has_changes(&state));
     }
@@ -1868,6 +1876,14 @@ mod tests {
             dvdv_source_chapters: None,
             presentation_tabs: vec![],
             active_tab: 0,
+            bluray_playlist_number: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream_index: None,
+            bluray_angle_number: None,
+            bluray_chapter_durations: None,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
         };
         // Both entries currently show the MB value → has changes.
         assert!(metadata_editor_has_changes(&state));

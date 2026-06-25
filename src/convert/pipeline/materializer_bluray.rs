@@ -1304,9 +1304,9 @@ mod tests {
         TrackSourceRef,
     };
     use super::{
-        bluray_track_bit_depth, build_prepared_bluray_source, chapter_end_pts_90k,
-        select_bluray_program, select_bluray_program_with_audio_probe, selected_chapter_ordinals,
-        selected_stream_with_materialization_facts,
+        bluray_tool_versions, bluray_track_bit_depth, build_prepared_bluray_source,
+        chapter_end_pts_90k, select_bluray_program, select_bluray_program_with_audio_probe,
+        selected_chapter_ordinals, selected_stream_with_materialization_facts,
         selected_stream_with_materialization_facts_with_audio_probe, validate_chapter_pts,
         validate_explicit_stream_pair, BlurayPresentationRequest,
     };
@@ -1577,7 +1577,7 @@ mod tests {
         chapter_starts: &[u64],
         streams: Vec<BlurayAudioStreamInfo>,
     ) -> FakeTitle {
-        let chapters = chapter_starts
+        let chapters: Vec<BlurayChapterInfo> = chapter_starts
             .iter()
             .enumerate()
             .map(|(index, start)| BlurayChapterInfo {

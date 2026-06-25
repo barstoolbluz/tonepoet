@@ -704,6 +704,7 @@ fn title_set_audio_vobs_disc_absolute_base(
         .checked_add(title_set.header.atstt_vobs)
 }
 
+#[allow(dead_code)]
 fn chapter_first_sector_for_identity_translation(
     chapter: &AudioChapter,
     aobs: &[crate::tui::dvda::AobFileEntry],
@@ -713,6 +714,7 @@ fn chapter_first_sector_for_identity_translation(
     })
 }
 
+#[allow(dead_code)]
 fn chapter_first_sector_for_cross_ats_translation(
     chapter: &AudioChapter,
     source_disc_absolute_base: u32,
@@ -726,6 +728,7 @@ fn chapter_first_sector_for_cross_ats_translation(
     })
 }
 
+#[allow(dead_code)]
 fn chapter_first_sector_for_translation<F>(
     chapter: &AudioChapter,
     aobs: &[crate::tui::dvda::AobFileEntry],

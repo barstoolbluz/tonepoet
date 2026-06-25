@@ -207,6 +207,7 @@ pub struct MlpAccessUnitReassembler<W: Write> {
 }
 
 impl<W: Write> MlpAccessUnitReassembler<W> {
+    #[allow(dead_code)]
     pub fn new(writer: W) -> Self {
         Self::new_with_mode(writer, MlpReassemblyMode::Strict)
     }
@@ -290,6 +291,7 @@ impl<W: Write> MlpAccessUnitReassembler<W> {
         self.stats
     }
 
+    #[allow(dead_code)]
     pub fn into_inner(self) -> W {
         self.writer
     }

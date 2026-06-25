@@ -862,7 +862,7 @@ mod tests {
     use super::*;
     use crate::disc::bluray_backend::BlurayPtsContinuitySegment;
     use super::super::bluray_pts::PTS_CLOCK_HZ;
-    use super::super::bluray_wav_validate::{read_wav_info, validate_bluray_lpcm_wav, write_wav_header};
+    use super::super::bluray_wav_validate::write_wav_header;
 
     fn encode_pts(pts: u64) -> [u8; 5] {
         let pts = pts & ((1u64 << 33) - 1);

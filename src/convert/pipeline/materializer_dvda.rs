@@ -1296,6 +1296,7 @@ fn resolve_cross_ats_aob_resolution(
     }))
 }
 
+#[allow(dead_code)]
 fn title_set_aob_disc_absolute_base(disc: &DvdaDisc, title_set: &TitleSet) -> Option<u32> {
     disc.amg
         .audio_title_table
@@ -1602,6 +1603,7 @@ fn probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
     ))
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn probe_title_chapter_aob_format_with_resolved_aob_path(
     volume: &dyn DvdaVolume,
@@ -2793,6 +2795,7 @@ enum StreamProbeSelectionSource {
 struct SelectedStreamProbe {
     facts: ProbedStreamAudioFacts,
     downmix_source_label: Option<String>,
+    #[allow(dead_code)]
     origin: AobProbeOrigin,
     source: StreamProbeSelectionSource,
 }

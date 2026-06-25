@@ -183,7 +183,7 @@ pub(super) async fn realize_dvda_track(
     };
 
     let source_wav_expectation = extracted.source_wav_expectation(&track);
-    let mut final_wav_expectation =
+    let final_wav_expectation =
         source_wav_expectation.with_downmix_policy(audio_policy.downmix_policy);
 
     let authored_downmix_matrix = resolve_ifo_downmix_matrix_for_track(&track)?;
@@ -2874,6 +2874,7 @@ fn mlp_native_stereo_status(mlp_substream_facts: MlpSubstreamFacts) -> Option<bo
     mlp_substream_facts.num_substreams.map(|value| value > 1)
 }
 
+#[allow(dead_code)]
 fn strict_native_mlp_stereo() -> bool {
     std::env::var(DVDA_STRICT_MLP_NATIVE_STEREO_ENV)
         .or_else(|_| std::env::var(DVDA_REQUIRE_MLP_NATIVE_STEREO_ENV))
@@ -3009,15 +3010,7 @@ async fn decode_mlp_to_wav(
         strategy,
         out_path,
     )?;
-    let mut decode_audit = DvdaDecodeAudit::mlp(
-        strategy,
-        native_stereo_detected,
-        None,
-        None,
-        None,
-    );
-    decode_audit.mlp_num_substreams = mlp_substream_facts.num_substreams;
-    decode_audit.mlp_num_substreams_source = mlp_substream_facts.source.as_str().to_string();
+    let mut decode_audit;
 
     match strategy {
         MlpDecodeStrategy::NativeMlpStereoExtraction => {
@@ -3127,6 +3120,8 @@ async fn decode_mlp_to_wav(
                 Some("ffmpeg subprocess fold-down".to_string()),
                 Some("fold-down path only; not authored stereo".to_string()),
             );
+            decode_audit.mlp_num_substreams = mlp_substream_facts.num_substreams;
+            decode_audit.mlp_num_substreams_source = mlp_substream_facts.source.as_str().to_string();
             decode_audit.ifo_downmix_matrix_index = authored_downmix_matrix.map(|matrix| matrix.index);
             decode_audit.ifo_authored_downmix_matrix_used = authored_downmix_matrix.is_some();
         }
@@ -3149,6 +3144,8 @@ async fn decode_mlp_to_wav(
                 Some("ffmpeg subprocess direct decode".to_string()),
                 None,
             );
+            decode_audit.mlp_num_substreams = mlp_substream_facts.num_substreams;
+            decode_audit.mlp_num_substreams_source = mlp_substream_facts.source.as_str().to_string();
         }
     }
 
