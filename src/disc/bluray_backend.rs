@@ -558,6 +558,62 @@ fn mechanism_summary(name: &str, handled: bool, suffix: Vec<String>) -> String {
     }
 }
 
+impl BlurayProtectionStatus {
+    /// User-facing guidance when a disc cannot be read due to copy protection.
+    #[must_use]
+    pub fn user_guidance(&self) -> Option<String> {
+        match self {
+            Self::Unencrypted
+            | Self::AacsDetectedHandled { .. }
+            | Self::BdPlusDetectedHandled { .. } => None,
+            Self::AacsDetectedNotHandled { details } => {
+                if !details.libaacs_detected {
+                    Some(
+                        "This disc is AACS-protected and libaacs is not available. \
+                         Install libaacs and ensure it is in your library path."
+                            .to_string(),
+                    )
+                } else {
+                    let hint = match details.error_code {
+                        Some(-2) => "AACS key database not found. Place KEYDB.cfg at ~/.config/aacs/KEYDB.cfg \
+                                     (download from https://fvonline-db.bplaced.net/)",
+                        Some(-3) => "No valid processing key found for this disc. \
+                                     Update KEYDB.cfg from https://fvonline-db.bplaced.net/",
+                        Some(-5) => "AACS certificate has been revoked. \
+                                     Update KEYDB.cfg from https://fvonline-db.bplaced.net/",
+                        _ => "AACS decryption failed. Ensure KEYDB.cfg at ~/.config/aacs/KEYDB.cfg \
+                              is up to date (https://fvonline-db.bplaced.net/)",
+                    };
+                    Some(hint.to_string())
+                }
+            }
+            Self::BdPlusDetectedNotHandled { .. } => Some(
+                "This disc uses BD+ protection which is not currently supported.".to_string(),
+            ),
+            Self::AacsAndBdPlusDetected { aacs, bdplus } => {
+                if !aacs.handled || !bdplus.handled {
+                    let mut parts = Vec::new();
+                    if !aacs.handled {
+                        parts.push("AACS");
+                    }
+                    if !bdplus.handled {
+                        parts.push("BD+");
+                    }
+                    Some(format!(
+                        "This disc uses {} protection that could not be handled. \
+                         For AACS: place KEYDB.cfg at ~/.config/aacs/KEYDB.cfg \
+                         (https://fvonline-db.bplaced.net/)",
+                        parts.join(" and ")
+                    ))
+                } else {
+                    None
+                }
+            }
+            Self::Unknown { .. } => None,
+        }
+    }
+}
+
 /// One unsupported or ignored libbluray audio stream entry. These diagnostics
 /// never make stream enumeration fail by themselves; the mapper can still expose
 /// any supported primary streams from the same playlist.

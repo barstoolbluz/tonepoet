@@ -45,6 +45,7 @@
           openssl
           libbluray
           libudfread
+          libaacs
         ];
 
         # opus-tools — fix missing __opus_check_int/_ptr inline helpers
@@ -135,6 +136,8 @@
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           shellHook = ''
+            # libaacs is loaded by libbluray via dlopen(); ensure it's discoverable
+            export LD_LIBRARY_PATH="${pkgs.libaacs}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             echo "tonepoet development environment"
             echo ""
             echo "  cargo build    - Build the project"

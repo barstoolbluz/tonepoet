@@ -48,6 +48,9 @@ where
     let mut suppressed = Vec::new();
     let mut signatures: HashMap<PlaylistSignature, u32> = HashMap::new();
     let protection_status = B::protection_status(disc);
+    if let Some(guidance) = protection_status.user_guidance() {
+        log::warn!("{guidance}");
+    }
 
     for title in titles {
         let playlist_number = title.playlist_number;
