@@ -3532,7 +3532,9 @@ fn metadata_presentation_label_with_stats(tab: &super::app::PresentationTab) -> 
 }
 
 fn metadata_presentation_duration_secs(tab: &super::app::PresentationTab) -> Option<f64> {
-    let durations = if let Some(durations) = tab.dvdv_track_durations.as_ref() {
+    let durations = if let Some(durations) = tab.bluray_chapter_durations.as_ref() {
+        Some(durations)
+    } else if let Some(durations) = tab.dvdv_track_durations.as_ref() {
         Some(durations)
     } else {
         match tab.sacd_area_kind {
@@ -3594,6 +3596,10 @@ fn metadata_presentation_entry_has_saved_tag(
             | "DVDV_TITLE"
             | "DVDV_AUDIO_STREAM"
             | "DVDV_ANGLE"
+            | "BLURAY_PLAYLIST"
+            | "BLURAY_AUDIO_PID"
+            | "BLURAY_AUDIO_STREAM"
+            | "BLURAY_ANGLE"
             | "DISCNUMBER"
             | "TRACKNUMBER"
     ) {
@@ -3602,6 +3608,9 @@ fn metadata_presentation_entry_has_saved_tag(
 
     if matches!(tab.id, crate::disc::model::PresentationId::DvdVideoTitle { .. }) {
         return metadata_dvdv_entry_has_sidecar_tag(tab, entry, key.as_str());
+    }
+    if matches!(tab.id, crate::disc::model::PresentationId::BluRayTitle { .. }) {
+        return metadata_bluray_entry_has_sidecar_tag(tab, entry, key.as_str());
     }
 
     metadata_entry_has_nonempty_value(entry)
@@ -3681,6 +3690,82 @@ fn metadata_dvdv_synthetic_title(
         crate::disc::model::PresentationId::DvdVideoTitle { title_number, .. } => {
             Some(format!("Title {} Chapter {}", title_number, idx + 1))
         }
+        _ => None,
+    }
+}
+
+fn metadata_bluray_entry_has_sidecar_tag(
+    tab: &super::app::PresentationTab,
+    entry: &super::probe::TagEntry,
+    key: &str,
+) -> bool {
+    match key {
+        // Blu-ray editors synthesize TITLE values from playlist/chapter numbers.
+        // Count TITLE as saved metadata only when a value differs from that
+        // generated fallback. This mirrors the DVD-Video sidecar indicator.
+        "TITLE" => metadata_bluray_title_entry_has_saved_value(tab, entry),
+        "CATALOGNUMBER"
+        | "PUBLISHER"
+        | "MUSICBRAINZ_ALBUMID"
+        | "MUSICBRAINZ_ALBUMARTISTID"
+        | "MUSICBRAINZ_RELEASEGROUPID"
+        | "ORIGINALDATE"
+        | "RELEASECOUNTRY"
+        | "ARTIST"
+        | "PERFORMER"
+        | "COMPOSER"
+        | "LYRICIST"
+        | "ARRANGER"
+        | "ISRC"
+        | "MUSICBRAINZ_TRACKID"
+        | "MUSICBRAINZ_RELEASETRACKID"
+        | "MUSICBRAINZ_ARTISTID" => metadata_entry_has_nonempty_value(entry),
+        // ALBUM, ALBUMARTIST, DATE, and GENRE can be mapped-disc fallbacks.
+        // Without provenance in PresentationTab, avoid marking them as saved.
+        "ALBUM" | "ALBUMARTIST" | "DATE" | "YEAR" | "GENRE" => false,
+        // Unknown/custom sidecar fields have no mapped-disc fallback, so any
+        // non-empty value is user-authored or sidecar-authored metadata.
+        _ => metadata_entry_has_nonempty_value(entry),
+    }
+}
+
+fn metadata_bluray_title_entry_has_saved_value(
+    tab: &super::app::PresentationTab,
+    entry: &super::probe::TagEntry,
+) -> bool {
+    if entry.per_file_values.is_empty() {
+        return metadata_bluray_title_value_is_saved(tab, 0, &entry.value);
+    }
+
+    entry
+        .per_file_values
+        .iter()
+        .enumerate()
+        .any(|(idx, value)| metadata_bluray_title_value_is_saved(tab, idx, value))
+}
+
+fn metadata_bluray_title_value_is_saved(
+    tab: &super::app::PresentationTab,
+    idx: usize,
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value == "<multiple values>" {
+        return false;
+    }
+    metadata_bluray_synthetic_title(tab, idx)
+        .map(|synthetic| value != synthetic)
+        .unwrap_or(true)
+}
+
+fn metadata_bluray_synthetic_title(
+    tab: &super::app::PresentationTab,
+    idx: usize,
+) -> Option<String> {
+    match &tab.id {
+        crate::disc::model::PresentationId::BluRayTitle {
+            playlist_number, ..
+        } => Some(format!("Playlist {:05} Chapter {}", playlist_number, idx + 1)),
         _ => None,
     }
 }
@@ -6377,6 +6462,11 @@ mod tests {
             dvdv_track_durations: None,
             dvdv_angle_number: None,
             dvdv_title_angle_count: None,
+            bluray_playlist_number: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream_index: None,
+            bluray_angle_number: None,
+            bluray_chapter_durations: None,
         }
     }
 
@@ -6409,6 +6499,11 @@ mod tests {
             dvdv_track_durations: None,
             dvdv_angle_number: None,
             dvdv_title_angle_count: None,
+            bluray_playlist_number: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream_index: None,
+            bluray_angle_number: None,
+            bluray_chapter_durations: None,
             dvdv_source_chapters: None,
             presentation_tabs: Vec::new(),
             active_tab: 0,
@@ -6573,6 +6668,62 @@ mod tests {
                 audio_stream_index: 0,
             },
             vec![tag("MUSICBRAINZ_ALBUMID", "release-id", vec!["release-id"])],
+            2,
+        );
+
+        assert!(metadata_presentation_has_saved_tags(&tab));
+    }
+
+    #[test]
+    fn bluray_generated_titles_do_not_count_as_saved_tags() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
+                .expect("valid Blu-ray presentation id"),
+            vec![tag(
+                "TITLE",
+                "<multiple values>",
+                vec!["Playlist 00012 Chapter 1", "Playlist 00012 Chapter 2"],
+            )],
+            2,
+        );
+
+        assert!(!metadata_presentation_has_saved_tags(&tab));
+    }
+
+    #[test]
+    fn bluray_custom_title_counts_as_saved_tags() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
+                .expect("valid Blu-ray presentation id"),
+            vec![tag(
+                "TITLE",
+                "<multiple values>",
+                vec!["Opening", "Playlist 00012 Chapter 2"],
+            )],
+            2,
+        );
+
+        assert!(metadata_presentation_has_saved_tags(&tab));
+    }
+
+    #[test]
+    fn bluray_sidecar_only_metadata_counts_as_saved_tags() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
+                .expect("valid Blu-ray presentation id"),
+            vec![tag("MUSICBRAINZ_ALBUMID", "release-id", vec!["release-id"])],
+            2,
+        );
+
+        assert!(metadata_presentation_has_saved_tags(&tab));
+    }
+
+    #[test]
+    fn bluray_custom_sidecar_metadata_counts_as_saved_tags() {
+        let tab = presentation_tab(
+            crate::disc::model::PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
+                .expect("valid Blu-ray presentation id"),
+            vec![tag("VENUE_NOTE", "Royal Albert Hall", vec!["Royal Albert Hall"])],
             2,
         );
 

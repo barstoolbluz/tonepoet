@@ -2826,6 +2826,16 @@ pub struct PresentationTab {
     /// DVD-Video-only: number of authored angles for this title when known.
     /// Values greater than one make angle identity mandatory.
     pub dvdv_title_angle_count: Option<u8>,
+    /// Blu-ray-only: authored playlist number for this presentation.
+    pub bluray_playlist_number: Option<u32>,
+    /// Blu-ray-only: authored audio PID for this presentation.
+    pub bluray_audio_pid: Option<u16>,
+    /// Blu-ray-only: zero-based authored audio stream index.
+    pub bluray_audio_stream_index: Option<u8>,
+    /// Blu-ray-only: one-based display angle selected for this presentation.
+    pub bluray_angle_number: Option<u8>,
+    /// Blu-ray-only: per-chapter durations (seconds) for MusicBrainz TOC synthesis.
+    pub bluray_chapter_durations: Option<Vec<f64>>,
 }
 
 /// State for the metadata editor overlay.
@@ -2910,6 +2920,16 @@ pub struct MetadataEditorState {
     pub dvdv_angle_number: Option<u8>,
     /// DVD-Video-only: authored angle count or equivalent ambiguity signal.
     pub dvdv_title_angle_count: Option<u8>,
+    /// Blu-ray-only: authored playlist number for the active presentation.
+    pub bluray_playlist_number: Option<u32>,
+    /// Blu-ray-only: authored audio PID for the active presentation.
+    pub bluray_audio_pid: Option<u16>,
+    /// Blu-ray-only: zero-based authored audio stream index for the active presentation.
+    pub bluray_audio_stream_index: Option<u8>,
+    /// Blu-ray-only: one-based display angle for the active presentation.
+    pub bluray_angle_number: Option<u8>,
+    /// Blu-ray-only: per-chapter durations (seconds) for the active presentation.
+    pub bluray_chapter_durations: Option<Vec<f64>>,
     /// Disc-backed editor tabs. Empty for plain file editors. Disc editors
     /// keep one entry per selectable presentation, including the single-
     /// presentation case, so rendering can show the same styled control for
@@ -3060,6 +3080,11 @@ impl MetadataEditorState {
         tab.dvdv_track_durations = self.dvdv_track_durations.clone();
         tab.dvdv_angle_number = self.dvdv_angle_number;
         tab.dvdv_title_angle_count = self.dvdv_title_angle_count;
+        tab.bluray_playlist_number = self.bluray_playlist_number;
+        tab.bluray_audio_pid = self.bluray_audio_pid;
+        tab.bluray_audio_stream_index = self.bluray_audio_stream_index;
+        tab.bluray_angle_number = self.bluray_angle_number;
+        tab.bluray_chapter_durations = self.bluray_chapter_durations.clone();
     }
 
     pub fn switch_presentation_tab(&mut self, next: usize) -> bool {
@@ -3081,6 +3106,11 @@ impl MetadataEditorState {
         self.dvdv_track_durations = tab.dvdv_track_durations;
         self.dvdv_angle_number = tab.dvdv_angle_number;
         self.dvdv_title_angle_count = tab.dvdv_title_angle_count;
+        self.bluray_playlist_number = tab.bluray_playlist_number;
+        self.bluray_audio_pid = tab.bluray_audio_pid;
+        self.bluray_audio_stream_index = tab.bluray_audio_stream_index;
+        self.bluray_angle_number = tab.bluray_angle_number;
+        self.bluray_chapter_durations = tab.bluray_chapter_durations;
         self.cursor = self.cursor.min(self.entries.len());
         self.scroll = 0;
         self.last_click = None;
@@ -3132,6 +3162,35 @@ impl MetadataEditorState {
             self.deleted.clear();
             for entry in &mut self.entries {
                 mark_tag_entry_saved(entry);
+            }
+        }
+    }
+
+    pub fn mark_presentation_tabs_saved(&mut self, saved_indices: &[usize]) {
+        self.sync_active_presentation();
+        if self.presentation_tabs.is_empty() {
+            if !saved_indices.is_empty() {
+                self.dirty = false;
+                self.deleted.clear();
+                for entry in &mut self.entries {
+                    mark_tag_entry_saved(entry);
+                }
+            }
+            return;
+        }
+
+        let mut active_saved = false;
+        for &idx in saved_indices {
+            if let Some(tab) = self.presentation_tabs.get_mut(idx) {
+                mark_presentation_tab_saved(tab);
+                active_saved |= idx == self.active_tab;
+            }
+        }
+        if active_saved {
+            if let Some(tab) = self.presentation_tabs.get(self.active_tab).cloned() {
+                self.entries = tab.entries;
+                self.deleted = tab.deleted;
+                self.dirty = tab.dirty;
             }
         }
     }
@@ -3203,6 +3262,18 @@ impl MetadataEditorState {
             self.file_labels = tab.file_labels;
             self.deleted = tab.deleted;
             self.dirty = tab.dirty;
+            self.sacd_area_kind = tab.sacd_area_kind;
+            self.sacd_stereo_durations = tab.sacd_stereo_durations;
+            self.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
+            self.dvdv_source_chapters = tab.dvdv_source_chapters;
+            self.dvdv_track_durations = tab.dvdv_track_durations;
+            self.dvdv_angle_number = tab.dvdv_angle_number;
+            self.dvdv_title_angle_count = tab.dvdv_title_angle_count;
+            self.bluray_playlist_number = tab.bluray_playlist_number;
+            self.bluray_audio_pid = tab.bluray_audio_pid;
+            self.bluray_audio_stream_index = tab.bluray_audio_stream_index;
+            self.bluray_angle_number = tab.bluray_angle_number;
+            self.bluray_chapter_durations = tab.bluray_chapter_durations;
         }
         changed_tabs
     }
@@ -6190,6 +6261,11 @@ mod metadata_presentation_tab_tests {
             dvdv_track_durations: None,
             dvdv_angle_number: None,
             dvdv_title_angle_count: None,
+            bluray_playlist_number: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream_index: None,
+            bluray_angle_number: None,
+            bluray_chapter_durations: None,
         }
     }
 
@@ -6222,6 +6298,11 @@ mod metadata_presentation_tab_tests {
             dvdv_track_durations: active.dvdv_track_durations,
             dvdv_angle_number: active.dvdv_angle_number,
             dvdv_title_angle_count: active.dvdv_title_angle_count,
+            bluray_playlist_number: active.bluray_playlist_number,
+            bluray_audio_pid: active.bluray_audio_pid,
+            bluray_audio_stream_index: active.bluray_audio_stream_index,
+            bluray_angle_number: active.bluray_angle_number,
+            bluray_chapter_durations: active.bluray_chapter_durations,
             presentation_tabs: tabs,
             active_tab,
             presentation_selector_open: false,

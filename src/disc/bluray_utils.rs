@@ -372,6 +372,13 @@ fn log_bluray_sidecar_match_warning(
                 duplicate_id,
             );
         }
+        crate::tui::command::BluRaySidecarMatchWarning::AngleNumberMismatch { sidecar_id } => {
+            log::warn!(
+                "Blu-ray metadata sidecar presentation skipped due to angle number mismatch in {} ({})",
+                sidecar_path.display(),
+                sidecar_id
+            );
+        }
     }
 }
 
