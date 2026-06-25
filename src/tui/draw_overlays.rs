@@ -3123,68 +3123,57 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
 ///   1. SACD case (any `sacd_area_kind`): `" SACD: <iso> [<area>[· read-only]] "`.
 ///      Wins regardless of path count or presentation-tab count so
 ///      single-track SACDs keep the SACD marker.
-///   2. Other disc-backed presentation editors: `" Metadata: <source> [<presentation>] "`.
-///   3. Single non-SACD file: `" Metadata: <name> "`.
-///   4. Multi-file non-SACD edit: `" Metadata: <N> files "`.
+///   2. Other disc-backed presentation editors: `" Metadata Editor  [<presentation>] "`.
+///   3. Single non-SACD file: `" Metadata Editor: <name> "`.
+///   4. Multi-file non-SACD edit: `" Metadata Editor: <N> files "`.
 pub(super) fn editor_title(state: &super::app::MetadataEditorState) -> String {
-    if let Some(area) = state.sacd_area_kind {
-        // SACD editor: paths are the ISO repeated per virtual track;
-        // surface the disc name + which area is being edited.
-        let iso_name = state
-            .paths
-            .first()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let fallback_area_label = match area {
-            crate::tui::sacd::AreaKind::Stereo => "stereo",
-            crate::tui::sacd::AreaKind::MultiChannel => "MCH",
-        };
-        let area_label = state
-            .active_presentation_label()
-            .unwrap_or(fallback_area_label);
-        let ro = if state.read_only { " · read-only" } else { "" };
-        return format!(" SACD: {}  [{}{}] ", iso_name, area_label, ro);
-    }
+    let read_only = if state.read_only { " · read-only" } else { "" };
     if state.shows_presentation_control() {
-        let src_name = state
-            .paths
-            .first()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let label = state.active_presentation_label().unwrap_or("presentation");
-        let ro = if state.read_only { " · read-only" } else { "" };
-        format!(" Metadata: {}  [{}{}] ", src_name, label, ro)
-    } else if state.paths.len() == 1 {
-        let name = state.paths[0]
+        let indicator = if state.presentation_selector_open { "▴" } else { "▾" };
+        let label = state
+            .presentation_tabs
+            .get(state.active_tab)
+            .map(|tab| {
+                let mut label = metadata_presentation_label_with_stats(tab);
+                if metadata_presentation_has_saved_tags(tab) {
+                    label.push_str(" ◆");
+                }
+                label.push_str(metadata_presentation_dirty_suffix(state, state.active_tab, tab));
+                label
+            })
+            .unwrap_or_else(|| "presentation".to_string());
+        let label = truncate_to_chars(&label, 72);
+        return format!(" Metadata Editor{}  [{} {}] ", read_only, indicator, label);
+    }
+
+    if state.active_surface().paths.len() == 1 {
+        let name = state.active_surface().paths[0]
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        format!(" Metadata: {} ", name)
+        format!(" Metadata Editor: {}{} ", name, read_only)
     } else {
-        format!(" Metadata: {} files ", state.paths.len())
+        format!(" Metadata Editor: {} files{} ", state.active_surface().paths.len(), read_only)
     }
 }
 
-fn draw_metadata_presentation_tabs(
+fn draw_content_tabs(
     f: &mut Frame,
     state: &super::app::MetadataEditorState,
     area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
 ) {
-    if state.uses_presentation_dropdown() {
-        draw_metadata_presentation_dropdown_control(f, state, area, button_map);
-        return;
-    }
-
     // 2-line box-drawing tab rendering.
     // Line 1: ┌─ Active ─┐   Inactive
     // Line 2: ┘           └───────────
-    let tab_count = state.presentation_tabs.len().max(1);
-    let max_label_chars = ((area.width as usize).saturating_sub(6 * tab_count) / tab_count)
-        .max(8)
-        .min(32);
+    //
+    // Narrow terminals cannot always show all four labels. Choose a visible
+    // window from the active tab instead of always starting at Metadata, so the
+    // active tab never disappears when the user cycles or clicks through the
+    // tab strip. Ties prefer the later start index: with room for two tabs,
+    // clicking Details shifts the window to Details + ReplayGain, then clicking
+    // ReplayGain shifts it to ReplayGain + Artwork.
+    let slots = content_tab_slots_for_width(state.content_tab, area.width);
 
     let border_style = Style::default().fg(theme::CYAN);
     let active_label_style = Style::default()
@@ -3192,40 +3181,9 @@ fn draw_metadata_presentation_tabs(
         .add_modifier(Modifier::BOLD);
     let inactive_label_style = Style::default().fg(theme::TEXT_DIM);
 
-    // Build per-tab geometry: (label_text, total_width, is_active)
-    struct TabSlot {
-        label: String,
-        width: u16,
-        active: bool,
-    }
-    let mut slots: Vec<TabSlot> = Vec::new();
-    let mut total_width: u16 = 1; // leading space
-    for (idx, tab) in state.presentation_tabs.iter().enumerate() {
-        let label = truncate_to_chars(&metadata_presentation_base_label(tab), max_label_chars);
-        let dirty = metadata_presentation_dirty_suffix(state, idx, tab);
-        let text = format!("{}{}", label, dirty);
-        let active = idx == state.active_tab;
-        // Active: "┌─ label ─┐" = 2 + 1 + label_len + 1 + 2 = label_len + 6
-        // Inactive: " label " = 1 + label_len + 1 = label_len + 2
-        let slot_width = if active {
-            (text.chars().count() + 6) as u16  // ┌─ + space + label + space + ─┐
-        } else {
-            (text.chars().count() + 2) as u16  // space + label + space
-        };
-        if total_width.saturating_add(slot_width) > area.width {
-            break;
-        }
-        slots.push(TabSlot { label: text, width: slot_width, active });
-        total_width = total_width.saturating_add(slot_width);
-        if idx + 1 < state.presentation_tabs.len() {
-            total_width = total_width.saturating_add(1); // separator
-        }
-    }
-
-    // Line 1: tab labels
     let mut line1_spans: Vec<Span> = vec![Span::raw(" ")];
     let mut x = area.x + 1;
-    for (idx, slot) in slots.iter().enumerate() {
+    for (slot_idx, slot) in slots.iter().enumerate() {
         if slot.active {
             line1_spans.push(Span::styled("┌─", border_style));
             line1_spans.push(Span::styled(format!(" {} ", slot.label), active_label_style));
@@ -3234,11 +3192,11 @@ fn draw_metadata_presentation_tabs(
             line1_spans.push(Span::styled(format!(" {} ", slot.label), inactive_label_style));
         }
         button_map.record_button(
-            super::button_map::TuiButton::MetadataEditorTab(idx),
+            super::button_map::TuiButton::MetadataEditorContentTab(slot.index),
             Rect::new(x, area.y, slot.width, 1),
         );
         x = x.saturating_add(slot.width);
-        if idx + 1 < slots.len() {
+        if slot_idx + 1 < slots.len() {
             line1_spans.push(Span::raw(" "));
             x = x.saturating_add(1);
         }
@@ -3248,14 +3206,12 @@ fn draw_metadata_presentation_tabs(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    // Line 2: bottom border with gap under active tab
     if area.height >= 2 {
         let mut line2 = String::new();
-        line2.push(' '); // leading space to match line 1
-        for (idx, slot) in slots.iter().enumerate() {
+        line2.push(' ');
+        for (slot_idx, slot) in slots.iter().enumerate() {
             if slot.active {
                 line2.push('┘');
-                // Interior spaces (slot width minus the 2 corner chars)
                 for _ in 0..slot.width.saturating_sub(2) {
                     line2.push(' ');
                 }
@@ -3265,14 +3221,11 @@ fn draw_metadata_presentation_tabs(
                     line2.push('─');
                 }
             }
-            if idx + 1 < slots.len() {
-                line2.push('─'); // separator becomes part of the line
+            if slot_idx + 1 < slots.len() {
+                line2.push('─');
             }
         }
-        // Fill remaining width with ─
-        let line2_chars = line2.chars().count();
-        let remaining = (area.width as usize).saturating_sub(line2_chars);
-        for _ in 0..remaining {
+        for _ in 0..(area.width as usize).saturating_sub(line2.chars().count()) {
             line2.push('─');
         }
         f.render_widget(
@@ -3282,51 +3235,150 @@ fn draw_metadata_presentation_tabs(
     }
 }
 
-fn draw_metadata_presentation_dropdown_control(
-    f: &mut Frame,
-    state: &super::app::MetadataEditorState,
-    area: Rect,
-    button_map: &mut super::button_map::ButtonRenderMap,
-) {
-    let Some(tab) = state.presentation_tabs.get(state.active_tab) else {
-        return;
-    };
-    let indicator = if state.presentation_selector_open { "▴" } else { "▾" };
-    let mut label = metadata_presentation_label_with_stats(tab);
-    if metadata_presentation_has_saved_tags(tab) {
-        label.push_str(" ◆");
-    }
-    label.push_str(metadata_presentation_dirty_suffix(state, state.active_tab, tab));
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContentTabSlot {
+    label: String,
+    width: u16,
+    active: bool,
+    index: usize,
+    clipped: bool,
+}
 
-    let hint = if state.presentation_selector_open {
-        "  Enter choose · Esc close"
+fn content_tab_slots_for_width(
+    active_tab: super::app::ContentTab,
+    area_width: u16,
+) -> Vec<ContentTabSlot> {
+    let tabs = super::app::ContentTab::ALL;
+    let tab_count = tabs.len();
+    let active_index = active_tab.index();
+    if area_width == 0 || active_index >= tab_count {
+        return Vec::new();
+    }
+
+    let max_label_chars = ((area_width as usize).saturating_sub(6 * tab_count) / tab_count)
+        .max(8)
+        .min(32);
+
+    let full_strip = content_tab_slots_from_start(&tabs, active_tab, 0, area_width, max_label_chars);
+    if full_strip.len() == tab_count && full_strip.iter().any(|slot| slot.active) {
+        return full_strip;
+    }
+
+    // In constrained widths, treat the active tab as the left edge while there
+    // are tabs to its right. This makes tab cycling and visible-tab clicks feel
+    // like horizontal tab-strip scrolling: Metadata+Details -> Details+ReplayGain
+    // -> ReplayGain+Artwork. For the last tab, shift left only as much as helps
+    // show useful context without accepting a clipped active tab when a full one
+    // is possible.
+    if active_index + 1 < tab_count {
+        return content_tab_slots_from_start(&tabs, active_tab, active_index, area_width, max_label_chars);
+    }
+
+    let mut best_slots: Vec<ContentTabSlot> = Vec::new();
+    let mut best_start = active_index;
+    let mut best_active_full = false;
+
+    for start in 0..=active_index {
+        let slots = content_tab_slots_from_start(&tabs, active_tab, start, area_width, max_label_chars);
+        let Some(active_slot) = slots.iter().find(|slot| slot.index == active_index) else {
+            continue;
+        };
+        let active_full = !active_slot.clipped;
+        if (active_full && !best_active_full)
+            || (active_full == best_active_full
+                && (slots.len() > best_slots.len()
+                    || (slots.len() == best_slots.len() && start >= best_start)))
+        {
+            best_start = start;
+            best_active_full = active_full;
+            best_slots = slots;
+        }
+    }
+
+    if best_slots.is_empty() {
+        // Extremely small widths may be unable to fit a complete active capsule.
+        // Still put the active tab first so the clipped text/capsule identifies
+        // the selected surface and the click target is not silently omitted.
+        return vec![content_tab_slot(active_tab, true, area_width.max(1), max_label_chars)];
+    }
+
+    best_slots
+}
+
+fn content_tab_slots_from_start(
+    tabs: &[super::app::ContentTab],
+    active_tab: super::app::ContentTab,
+    start: usize,
+    area_width: u16,
+    max_label_chars: usize,
+) -> Vec<ContentTabSlot> {
+    let mut slots = Vec::new();
+    let mut total_width: u16 = 1;
+
+    for tab in tabs.iter().copied().skip(start) {
+        let active = tab == active_tab;
+        let remaining = area_width.saturating_sub(total_width);
+        if remaining == 0 {
+            break;
+        }
+        let slot = content_tab_slot(tab, active, remaining, max_label_chars);
+        if total_width.saturating_add(slot.width) > area_width {
+            if active && slots.is_empty() {
+                slots.push(slot);
+            }
+            break;
+        }
+        slots.push(slot);
+        total_width = total_width.saturating_add(slots.last().map(|slot| slot.width).unwrap_or(0) + 1);
+    }
+
+    slots
+}
+
+fn content_tab_slot(
+    tab: super::app::ContentTab,
+    active: bool,
+    remaining_width: u16,
+    max_label_chars: usize,
+) -> ContentTabSlot {
+    let chrome_width = if active { 6 } else { 2 };
+    let label_capacity = if remaining_width as usize > chrome_width {
+        (remaining_width as usize - chrome_width).min(max_label_chars)
     } else {
-        "  Space opens selector"
+        1
     };
-    let usable = area.width.saturating_sub(4) as usize;
-    let hint_chars = hint.chars().count();
-    let label_max = usable.saturating_sub(hint_chars + 3).max(8);
-    let label = truncate_to_chars(&label, label_max);
-    let selector_text = format!(" {} {} ", indicator, label);
-    let selector_width = selector_text.chars().count() as u16;
-
-    let mut spans = vec![Span::raw(" ")];
-    spans.push(Span::styled(
-        selector_text,
-        Style::default()
-            .fg(theme::PILL_ACTIVE_FG)
-            .bg(theme::CYAN)
-            .add_modifier(Modifier::BOLD),
-    ));
-    if area.width as usize > selector_width as usize + hint_chars + 1 {
-        spans.push(Span::styled(hint, Style::default().fg(theme::TEXT_DIM)));
+    let label = truncate_tab_label(tab.label(), label_capacity.max(1));
+    let natural_width = (label.chars().count() + chrome_width) as u16;
+    let clipped = natural_width > remaining_width;
+    let width = if clipped {
+        remaining_width.max(1)
+    } else {
+        natural_width
+    };
+    ContentTabSlot {
+        label,
+        width,
+        active,
+        index: tab.index(),
+        clipped,
     }
+}
 
-    button_map.record_button(
-        super::button_map::TuiButton::MetadataPresentationSelectorToggle,
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+fn truncate_tab_label(label: &str, max_chars: usize) -> String {
+    let count = label.chars().count();
+    if count <= max_chars {
+        return label.to_string();
+    }
+    match max_chars {
+        0 => String::new(),
+        1 => label.chars().take(1).collect(),
+        2 => label.chars().take(2).collect(),
+        _ => {
+            let mut out: String = label.chars().take(max_chars.saturating_sub(3)).collect();
+            out.push_str("...");
+            out
+        }
+    }
 }
 
 fn draw_metadata_presentation_dropdown_popup(
@@ -3335,7 +3387,7 @@ fn draw_metadata_presentation_dropdown_popup(
     content_area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
 ) {
-    if !state.uses_presentation_dropdown() || !state.presentation_selector_open {
+    if !state.shows_presentation_control() || !state.presentation_selector_open {
         return;
     }
     if content_area.width < 20 || content_area.height < 3 {
@@ -3571,7 +3623,7 @@ fn metadata_presentation_dirty_suffix(
     tab: &super::app::PresentationTab,
 ) -> &'static str {
     let dirty = if idx == state.active_tab {
-        state.dirty || !state.deleted.is_empty()
+        state.active_surface().dirty || !state.active_surface().deleted.is_empty()
     } else {
         tab.dirty
     };
@@ -3780,15 +3832,23 @@ fn metadata_entry_has_nonempty_value(entry: &super::probe::TagEntry) -> bool {
     value_has_tag || per_file_has_tag
 }
 
-/// Draw the full metadata editor overlay.
-fn draw_metadata_editor(
-    f: &mut Frame,
-    state: &super::app::MetadataEditorState,
-    button_map: &mut super::button_map::ButtonRenderMap,
-) {
-    use super::app::MetadataEditorPhase;
 
-    let area = f.size();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataEditorLayout {
+    pub popup: Rect,
+    pub inner: Rect,
+    pub tab_area: Rect,
+    pub content_area: Rect,
+    pub footer_area: Rect,
+}
+
+/// Compute the metadata editor popup layout once for rendering and input.
+///
+/// Keep this as the single source of truth for the editor's top-level geometry:
+/// border, content-tab strip, content body, and footer. Input handlers use the
+/// same rectangles for scroll bounds and hit testing so row math cannot drift
+/// from what the renderer actually paints.
+pub(crate) fn metadata_editor_layout_for_area(area: Rect) -> MetadataEditorLayout {
     let w = (area.width * 85 / 100)
         .max(50)
         .min(area.width.saturating_sub(2));
@@ -3798,6 +3858,56 @@ fn draw_metadata_editor(
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
+    let inner = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(1),
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    );
+
+    let tab_height = inner.height.min(2);
+    let footer_height = if inner.height.saturating_sub(tab_height) > 0 { 1 } else { 0 };
+    let content_height = inner
+        .height
+        .saturating_sub(tab_height)
+        .saturating_sub(footer_height);
+
+    let tab_area = Rect::new(inner.x, inner.y, inner.width, tab_height);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(tab_height),
+        inner.width,
+        content_height,
+    );
+    let footer_area = Rect::new(
+        inner.x,
+        inner.y
+            .saturating_add(tab_height)
+            .saturating_add(content_height),
+        inner.width,
+        footer_height,
+    );
+
+    MetadataEditorLayout {
+        popup,
+        inner,
+        tab_area,
+        content_area,
+        footer_area,
+    }
+}
+
+/// Draw the full metadata editor overlay.
+fn draw_metadata_editor(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
+    use super::app::{ContentTab, MetadataEditorPhase};
+
+    let layout = metadata_editor_layout_for_area(f.size());
+    let popup = layout.popup;
+    let inner = layout.inner;
 
     f.render_widget(Clear, popup);
 
@@ -3816,48 +3926,35 @@ fn draw_metadata_editor(
                 .fg(border_color)
                 .add_modifier(Modifier::BOLD),
         ));
-    let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    if inner.height < 3 {
+    if state.shows_presentation_control() {
+        let title_width = editor_title(state).chars().count() as u16;
+        button_map.record_button(
+            super::button_map::TuiButton::MetadataPresentationSelectorToggle,
+            Rect::new(
+                popup.x.saturating_add(2),
+                popup.y,
+                title_width.min(popup.width.saturating_sub(4)),
+                1,
+            ),
+        );
+    }
+
+    if inner.height < 4 {
         return;
     }
 
-    let tab_height = if state.shows_presentation_control() && !state.uses_presentation_dropdown() {
-        2
-    } else {
-        1
-    };
-    let chunks = if state.shows_presentation_control() {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(tab_height),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(inner)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(inner)
-    };
+    let tab_area = layout.tab_area;
+    let content_area = layout.content_area;
+    let footer_area = layout.footer_area;
 
-    let (tab_area, content_area, footer_area) = if state.shows_presentation_control() {
-        (Some(chunks[0]), chunks[1], chunks[2])
-    } else {
-        (None, chunks[0], chunks[1])
-    };
-
-    if let Some(tab_area) = tab_area {
-        draw_metadata_presentation_tabs(f, state, tab_area, button_map);
-    }
+    draw_content_tabs(f, state, tab_area, button_map);
 
     let content_h = content_area.height as usize;
     let inner_w = content_area.width as usize;
 
-    // Detail edit mode: show per-file values for one field.
+    // Detail edit mode is part of the editable Metadata tab.
     if state.phase == MetadataEditorPhase::DetailEdit {
         draw_metadata_detail(
             f, state, content_area, footer_area, inner_w, content_h, button_map,
@@ -3866,17 +3963,23 @@ fn draw_metadata_editor(
         return;
     }
 
+    if state.content_tab != ContentTab::Metadata {
+        draw_metadata_read_only_tab(f, state, content_area, footer_area);
+        draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
+        return;
+    }
+
     let key_col_w = 22;
 
     // Build content lines.
-    let total_rows = state.entries.len() + 1; // +1 for "+ Add field..."
+    let total_rows = state.active_surface().entries.len() + 1; // +1 for "+ Add field..."
     let scroll = state.scroll.min(total_rows.saturating_sub(content_h));
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for (i, entry) in state.entries.iter().enumerate() {
+    for (i, entry) in state.active_surface().entries.iter().enumerate() {
         let is_cursor = i == state.cursor;
-        let is_deleted = state.deleted.contains(&i);
+        let is_deleted = state.active_surface().deleted.contains(&i);
         let is_dirty = !is_deleted
             && (entry.value != entry.original
                 || entry
@@ -4216,7 +4319,7 @@ fn draw_metadata_editor(
     }
 
     // "+ Add field..." row
-    let add_row = state.entries.len();
+    let add_row = state.active_surface().entries.len();
     let is_cursor_add = state.cursor == add_row;
     if state.phase == MetadataEditorPhase::AddingKey {
         if let Some(ref input) = state.add_key_input {
@@ -4326,6 +4429,226 @@ fn draw_metadata_editor(
     draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
 }
 
+fn draw_metadata_read_only_tab(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    content_area: Rect,
+    footer_area: Rect,
+) {
+    let lines = metadata_read_only_lines(state);
+    let total = lines.len();
+    let visible = content_area.height as usize;
+    let scroll = state.scroll.min(total.saturating_sub(visible));
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+    f.render_widget(Paragraph::new(visible_lines), content_area);
+
+    let mut footer_spans = vec![
+        footer_pill("Tab next", theme::CYAN),
+        pill_gap(),
+        footer_pill("Shift-Tab prev", theme::CYAN),
+        pill_gap(),
+        footer_pill("j/k scroll", theme::BLUE),
+    ];
+    if state.content_tab == super::app::ContentTab::Details
+        && state.active_surface().technical_details.details_probe_issue_count() > 0
+    {
+        footer_spans.push(pill_gap());
+        footer_spans.push(footer_pill("Ctrl+R retry", theme::AMBER));
+    }
+    footer_spans.push(pill_gap());
+    footer_spans.push(footer_pill("Esc close", theme::PURPLE));
+    let footer = Line::from(footer_spans);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        footer_area,
+    );
+}
+
+pub(crate) fn metadata_read_only_line_count(
+    state: &super::app::MetadataEditorState,
+) -> usize {
+    metadata_read_only_lines(state).len()
+}
+
+fn metadata_read_only_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
+    match state.content_tab {
+        super::app::ContentTab::Details => metadata_details_lines(state),
+        super::app::ContentTab::ReplayGain => metadata_replaygain_lines(state),
+        super::app::ContentTab::Artwork => metadata_artwork_lines(state),
+        super::app::ContentTab::Metadata => Vec::new(),
+    }
+}
+
+
+fn section_line(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("## {}", title),
+        Style::default()
+            .fg(theme::CYAN)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn kv_line(label: &str, value: impl Into<String>) -> Line<'static> {
+    Line::from(format!("  {:<22} {}", format!("{}:", label), value.into()))
+}
+
+fn metadata_details_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
+    render_details_view_model(&super::metadata_view_models::build_details_view_model(state))
+}
+
+fn metadata_replaygain_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
+    render_replaygain_view_model(&super::metadata_view_models::build_replaygain_view_model(state))
+}
+
+fn metadata_artwork_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
+    render_artwork_view_model(&super::metadata_view_models::build_artwork_view_model(state))
+}
+
+fn render_details_view_model(vm: &super::metadata_view_models::DetailsViewModel) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(section_line("Location"));
+    lines.extend(vm.location.iter().map(render_detail_field));
+    if let Some(status) = &vm.probe_status {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", status),
+            Style::default().fg(theme::TEXT_DIM),
+        )));
+    }
+    if !vm.read_issues.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_line("Read issues"));
+        lines.extend(render_issue_rows(&vm.read_issues));
+    }
+    lines.push(Line::from(""));
+    lines.push(section_line("General"));
+    lines.extend(vm.general.iter().map(render_detail_field));
+    lines
+}
+
+fn render_detail_field(row: &super::metadata_view_models::DetailField) -> Line<'static> {
+    kv_line(&row.key, row.value.clone())
+}
+
+fn render_replaygain_view_model(vm: &super::metadata_view_models::ReplayGainViewModel) -> Vec<Line<'static>> {
+    if !vm.has_data {
+        return vec![Line::from(Span::styled(
+            "  No ReplayGain data available",
+            Style::default().fg(theme::TEXT_DIM),
+        ))];
+    }
+
+    let mut lines = Vec::new();
+    lines.push(section_line("Summary"));
+    lines.extend(vm.summary.iter().map(render_detail_field));
+    lines.push(Line::from(""));
+    lines.push(section_line("Details"));
+    lines.push(Line::from(Span::styled(
+        "  | Track                         | Track Gain | Album Gain | Track Peak | Album Peak |",
+        Style::default().fg(theme::TEXT_DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  |-------------------------------|------------|------------|------------|------------|",
+        Style::default().fg(theme::TEXT_DIM),
+    )));
+    for row in &vm.rows {
+        lines.push(Line::from(format!(
+            "  | {:<29} | {:>10} | {:>10} | {:>10} | {:>10} |",
+            truncate_to_chars(&row.title, 29),
+            row.track_gain,
+            row.album_gain,
+            row.track_peak,
+            row.album_peak,
+        )));
+    }
+    lines
+}
+
+fn render_artwork_view_model(vm: &super::metadata_view_models::ArtworkViewModel) -> Vec<Line<'static>> {
+    if vm.disc_not_applicable {
+        let mut lines = vec![Line::from(Span::styled(
+            "  No embedded artwork for disc-backed presentations",
+            Style::default().fg(theme::TEXT_DIM),
+        ))];
+        if !vm.read_issues.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(section_line("Read issues"));
+            lines.extend(render_issue_rows(&vm.read_issues));
+        }
+        return lines;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  | Artwork Type     | Status                         | Details |",
+        Style::default().fg(theme::TEXT_DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  |------------------|--------------------------------|---------|",
+        Style::default().fg(theme::TEXT_DIM),
+    )));
+
+    if !vm.read_issues.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_line("Read issues"));
+        lines.extend(render_issue_rows(&vm.read_issues));
+        lines.push(Line::from(""));
+    }
+
+    for row in &vm.rows {
+        lines.push(artwork_row(&row.kind, &row.status, &row.detail));
+    }
+    lines
+}
+
+fn artwork_row(kind: &str, status: &str, detail: &str) -> Line<'static> {
+    Line::from(format!(
+        "  | {:<16} | {:<30} | {} |",
+        kind,
+        status,
+        detail,
+    ))
+}
+
+fn render_issue_rows(rows: &[super::metadata_view_models::IssueViewRow]) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|row| metadata_issue_line(&row.label, &row.kind, &row.reason))
+        .collect()
+}
+
+fn metadata_issue_line(label: &str, kind: &str, err: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {}: {}: {}", label, kind, err.trim()),
+        Style::default().fg(theme::RED),
+    ))
+}
+
+fn metadata_editor_detail_slot_block_reason(
+    state: &super::app::MetadataEditorState,
+    slot_index: usize,
+    row_count: usize,
+) -> Option<String> {
+    if row_count != state.active_surface().paths.len() {
+        // Per-track sidecar/CUESHEET rows are scoped to tracks rather than
+        // file-backed slots, so file save eligibility does not apply here.
+        return None;
+    }
+    let file = state.active_surface().technical_details.files.get(slot_index)?;
+    match &file.file_facts.read_state {
+        super::app::FileReadState::Readable => {}
+        super::app::FileReadState::Unreadable { reason } => {
+            return Some(format!("unreadable: {}", reason));
+        }
+        super::app::FileReadState::Unsupported { reason } => {
+            return Some(format!("unsupported: {}", reason));
+        }
+    }
+    file.file_facts
+        .write_eligibility
+        .block_reason()
+        .map(|reason| format!("save blocked: {}", reason))
+}
+
 /// Render the per-file detail view within the metadata editor.
 fn draw_metadata_detail(
     f: &mut Frame,
@@ -4337,21 +4660,21 @@ fn draw_metadata_detail(
     button_map: &mut super::button_map::ButtonRenderMap,
 ) {
     let field_idx = state.detail_field_idx;
-    let entry = match state.entries.get(field_idx) {
+    let entry = match state.active_surface().entries.get(field_idx) {
         Some(e) => e,
         None => return,
     };
 
     // Per-track entries (e.g. TITLE on a single-image rip with embedded
-    // CUESHEET) carry more values than `state.file_labels` has labels
+    // CUESHEET) carry more values than `state.active_surface().file_labels` has labels
     // for. Synthesize "Track NN" labels in that case so the detail
     // overlay numbers each row instead of falling through to "?".
-    let synthesize_track_labels = entry.per_file_values.len() != state.file_labels.len();
+    let synthesize_track_labels = entry.per_file_values.len() != state.active_surface().file_labels.len();
     let label_for = |i: usize| -> String {
         if synthesize_track_labels {
             format!("Track {:>02}", i + 1)
         } else {
-            state
+            state.active_surface()
                 .file_labels
                 .get(i)
                 .cloned()
@@ -4368,7 +4691,7 @@ fn draw_metadata_detail(
             .chars()
             .count()
     } else {
-        state
+        state.active_surface()
             .file_labels
             .iter()
             .map(|l| l.chars().count())
@@ -4450,7 +4773,23 @@ fn draw_metadata_detail(
         };
 
         let val_sanitized = val.replace('\n', "↵").replace('\r', "");
-        let val_display = truncate_to_chars(&val_sanitized, detail_val_max);
+        let block_reason = metadata_editor_detail_slot_block_reason(state, i, entry.per_file_values.len());
+        let val_display = if let Some(reason) = block_reason.as_deref() {
+            let suffix = format!("  <{}>", reason);
+            let combined = if val_sanitized.trim().is_empty() {
+                suffix.trim_start().to_string()
+            } else {
+                format!("{}{}", val_sanitized, suffix)
+            };
+            truncate_to_chars(&combined, detail_val_max)
+        } else {
+            truncate_to_chars(&val_sanitized, detail_val_max)
+        };
+        let val_style = if block_reason.is_some() {
+            theme::muted()
+        } else {
+            val_style
+        };
 
         lines.push(Line::from(vec![
             Span::styled(label_display, label_style),
@@ -4468,7 +4807,7 @@ fn draw_metadata_detail(
     let footer = if state.detail_edit.is_some() {
         // Currently editing a per-file value.
         let mut pills = Vec::new();
-        if let Some(entry) = state.entries.get(state.detail_field_idx) {
+        if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
             if super::command::is_cue_importable(&entry.display_key) {
                 pills.push(footer_pill(
                     &format!(":import-cue ({})", entry.display_key),
@@ -4490,7 +4829,7 @@ fn draw_metadata_detail(
         // <multiple values> in the main editor (where the per-row
         // pill is hidden).
         let mut pills = Vec::new();
-        let entry_opt = state.entries.get(state.detail_field_idx);
+        let entry_opt = state.active_surface().entries.get(state.detail_field_idx);
         if let Some(entry) = entry_opt {
             if super::command::is_cue_importable(&entry.display_key) {
                 pills.push(footer_pill(
@@ -6418,7 +6757,7 @@ fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::app::{MetadataEditorPhase, MetadataEditorState, PresentationTab};
+    use super::super::app::{MetadataEditorState, PresentationTab};
     use super::*;
     use crate::tui::probe::TagEntry;
     use lofty::tag::ItemKey;
@@ -6445,75 +6784,41 @@ mod tests {
         entries: Vec<TagEntry>,
         n_paths: usize,
     ) -> PresentationTab {
-        PresentationTab {
+        PresentationTab::new(
             id,
-            label: "Presentation".to_string(),
-            paths: (0..n_paths)
+            "Presentation",
+            (0..n_paths)
                 .map(|idx| PathBuf::from(format!("/disc/track{:02}.flac", idx + 1)))
                 .collect(),
             entries,
-            file_labels: (0..n_paths).map(|idx| format!("Track {:02}", idx + 1)).collect(),
-            deleted: Vec::new(),
-            dirty: false,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        }
+            (0..n_paths).map(|idx| format!("Track {:02}", idx + 1)).collect(),
+            super::super::app::MetadataTechnicalDetails::default(),
+        )
     }
+
 
     /// Minimal MetadataEditorState fixture for title tests. Caller
     /// overrides only the fields they care about.
     fn fixture() -> MetadataEditorState {
-        MetadataEditorState {
-            paths: vec![PathBuf::from("/tmp/track.flac")],
-            entries: vec![],
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: vec![],
-            file_labels: vec!["01".into()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            dvdv_source_chapters: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        }
+        MetadataEditorState::for_files(
+            vec![PathBuf::from("/tmp/track.flac")],
+            vec![],
+            vec!["01".into()],
+            super::super::app::MetadataTechnicalDetails::default(),
+        )
     }
 
 
+
+
+#[test]
+    fn metadata_editor_layout_is_shared_content_body_geometry() {
+        let layout = metadata_editor_layout_for_area(Rect::new(0, 0, 80, 24));
+        assert_eq!(layout.tab_area.y, layout.inner.y);
+        assert_eq!(layout.tab_area.height, 2);
+        assert_eq!(layout.content_area.y, layout.inner.y + 2);
+        assert_eq!(layout.footer_area.y, layout.content_area.y + layout.content_area.height);
+    }
 
     #[test]
     fn active_dirty_suffix_uses_live_editor_state() {
@@ -6525,7 +6830,7 @@ mod tests {
         let mut state = fixture();
         state.presentation_tabs = vec![tab.clone()];
         state.active_tab = 0;
-        state.dirty = true;
+        state.active_surface_mut().dirty = true;
 
         assert_eq!(metadata_presentation_dirty_suffix(&state, 0, &tab), " *");
     }
@@ -6546,7 +6851,7 @@ mod tests {
         let mut state = fixture();
         state.presentation_tabs = vec![active, sibling.clone()];
         state.active_tab = 0;
-        state.dirty = false;
+        state.active_surface_mut().dirty = false;
 
         assert_eq!(metadata_presentation_dirty_suffix(&state, 1, &sibling), " *");
     }
@@ -6591,33 +6896,49 @@ mod tests {
     }
 
     #[test]
-    fn single_presentation_tab_renders_clickable_control() {
-        let tab = presentation_tab(
-            crate::disc::model::PresentationId::DvdAudioGroup(1),
-            vec![tag("TITLE", "one", vec!["one"])],
-            1,
-        );
-        let mut state = fixture();
-        state.presentation_tabs = vec![tab];
-        state.active_tab = 0;
+    fn narrow_content_tabs_shift_forward_from_details() {
+        let slots = content_tab_slots_for_width(super::super::app::ContentTab::Details, 26);
+        assert_eq!(slots.first().map(|slot| slot.index), Some(1));
+        assert!(slots.iter().any(|slot| slot.index == 2));
+        assert!(slots.iter().any(|slot| slot.active && slot.index == 1));
+    }
+
+    #[test]
+    fn narrow_content_tabs_shift_forward_from_replaygain() {
+        let slots = content_tab_slots_for_width(super::super::app::ContentTab::ReplayGain, 26);
+        assert_eq!(slots.first().map(|slot| slot.index), Some(2));
+        assert!(slots.iter().any(|slot| slot.index == 3));
+        assert!(slots.iter().any(|slot| slot.active && slot.index == 2));
+    }
+
+    #[test]
+    fn narrow_content_tabs_keep_late_active_tab_visible() {
+        let slots = content_tab_slots_for_width(super::super::app::ContentTab::Artwork, 26);
+        assert!(slots.iter().any(|slot| slot.active && slot.index == 3));
+        assert_eq!(slots.last().map(|slot| slot.index), Some(3));
+    }
+
+    #[test]
+    fn content_tabs_render_clickable_controls() {
+        let state = fixture();
         let mut button_map = super::super::button_map::ButtonRenderMap::new();
         let backend = ratatui::backend::TestBackend::new(80, 3);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
 
         terminal
             .draw(|f| {
-                draw_metadata_presentation_tabs(
+                draw_content_tabs(
                     f,
                     &state,
-                    Rect::new(0, 0, 80, 1),
+                    Rect::new(0, 0, 80, 2),
                     &mut button_map,
                 );
             })
-            .expect("draw tab row");
+            .expect("draw content tabs");
 
         assert_eq!(
             button_map.find_button_at(2, 0),
-            Some(super::super::button_map::TuiButton::MetadataEditorTab(0))
+            Some(super::super::button_map::TuiButton::MetadataEditorContentTab(0))
         );
     }
 
@@ -6733,29 +7054,35 @@ mod tests {
     #[test]
     fn editor_title_single_file_non_sacd() {
         let mut s = fixture();
-        s.paths = vec![PathBuf::from("/music/song.flac")];
-        assert_eq!(editor_title(&s), " Metadata: song.flac ");
+        s.active_surface_mut().paths = vec![PathBuf::from("/music/song.flac")];
+        assert_eq!(editor_title(&s), " Metadata Editor: song.flac ");
     }
 
     #[test]
     fn editor_title_multi_file_non_sacd() {
         let mut s = fixture();
-        s.paths = vec![
-            PathBuf::from("/m/a.flac"),
-            PathBuf::from("/m/b.flac"),
-            PathBuf::from("/m/c.flac"),
-        ];
-        s.file_labels = vec!["01".into(), "02".into(), "03".into()];
-        assert_eq!(editor_title(&s), " Metadata: 3 files ");
+        {
+            let surface = s.active_surface_mut();
+            surface.paths = vec![
+                PathBuf::from("/m/a.flac"),
+                PathBuf::from("/m/b.flac"),
+                PathBuf::from("/m/c.flac"),
+            ];
+            surface.file_labels = vec!["01".into(), "02".into(), "03".into()];
+        }
+        assert_eq!(editor_title(&s), " Metadata Editor: 3 files ");
     }
 
     #[test]
     fn editor_title_sacd_stereo_multitrack() {
         let mut s = fixture();
         let iso = PathBuf::from("/lib/kind_of_blue.iso");
-        s.paths = vec![iso; 5];
-        s.file_labels = (1..=5).map(|i| format!("{:>02}", i)).collect();
-        s.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        {
+            let surface = s.active_surface_mut();
+            surface.paths = vec![iso; 5];
+            surface.file_labels = (1..=5).map(|i| format!("{:>02}", i)).collect();
+            surface.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        }
         s.read_only = false;
         let t = editor_title(&s);
         assert!(t.contains("SACD"), "{}", t);
@@ -6768,9 +7095,12 @@ mod tests {
     fn editor_title_sacd_mch_read_only() {
         let mut s = fixture();
         let iso = PathBuf::from("/lib/x.iso");
-        s.paths = vec![iso; 4];
-        s.file_labels = (1..=4).map(|i| format!("{:>02}", i)).collect();
-        s.sacd_area_kind = Some(crate::tui::sacd::AreaKind::MultiChannel);
+        {
+            let surface = s.active_surface_mut();
+            surface.paths = vec![iso; 4];
+            surface.file_labels = (1..=4).map(|i| format!("{:>02}", i)).collect();
+            surface.sacd_area_kind = Some(crate::tui::sacd::AreaKind::MultiChannel);
+        }
         s.read_only = true;
         let t = editor_title(&s);
         assert!(t.contains("[MCH · read-only]"), "{}", t);
@@ -6784,9 +7114,12 @@ mod tests {
     fn editor_title_single_track_sacd_shows_area() {
         let mut s = fixture();
         let iso = PathBuf::from("/lib/single_track.iso");
-        s.paths = vec![iso]; // ← length 1 — the bug case
-        s.file_labels = vec!["01".into()];
-        s.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        {
+            let surface = s.active_surface_mut();
+            surface.paths = vec![iso]; // length 1, the regression case
+            surface.file_labels = vec!["01".into()];
+            surface.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        }
         let t = editor_title(&s);
         assert!(
             t.contains("SACD"),

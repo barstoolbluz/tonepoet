@@ -365,7 +365,7 @@ fn build_page_rows(tracks: &[super::app::GnudbReviewTrack]) -> Vec<super::app::G
 /// Populate a metadata editor from the reviewed GNUDB state.
 ///
 /// For single-image rips (paths.len() == 1, multi-track release) with
-/// a CUESHEET anchor in `state.entries`, populates per-track TITLE
+/// a CUESHEET anchor in `state.active_surface().entries`, populates per-track TITLE
 /// and ARTIST from review.pages[0].tracks. The review surface
 /// supports per-track artist (compilation case) which we honor here.
 /// Album-level fields stay at file dimension.
@@ -377,7 +377,7 @@ pub fn populate_editor_from_review(
     state: &mut super::app::MetadataEditorState,
     review: &super::app::GnudbReviewState,
 ) {
-    let n = state.paths.len();
+    let n = state.active_surface().paths.len();
 
     // Single-image detection: one file, one page (no multi-disc), more
     // than one track on that page. Multi-disc + single-image is a
@@ -389,7 +389,7 @@ pub fn populate_editor_from_review(
             .first()
             .map(|p| p.tracks.len() > 1)
             .unwrap_or(false);
-    let has_cuesheet = state
+    let has_cuesheet = state.active_surface()
         .entries
         .iter()
         .any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"));
@@ -428,35 +428,35 @@ pub fn populate_editor_from_review(
     }
 
     let title_idx = find_or_create(
-        &mut state.entries,
+        &mut state.active_surface_mut().entries,
         "TITLE",
         lofty::tag::ItemKey::TrackTitle,
         track_dim,
     );
     let artist_idx = find_or_create(
-        &mut state.entries,
+        &mut state.active_surface_mut().entries,
         "ARTIST",
         lofty::tag::ItemKey::TrackArtist,
         track_dim,
     );
     let album_idx = find_or_create(
-        &mut state.entries,
+        &mut state.active_surface_mut().entries,
         "ALBUM",
         lofty::tag::ItemKey::AlbumTitle,
         n,
     );
     let tn_idx = find_or_create(
-        &mut state.entries,
+        &mut state.active_surface_mut().entries,
         "TRACKNUMBER",
         lofty::tag::ItemKey::TrackNumber,
         n,
     );
-    let year_idx = find_or_create(&mut state.entries, "DATE", lofty::tag::ItemKey::Year, n);
-    let genre_idx = find_or_create(&mut state.entries, "GENRE", lofty::tag::ItemKey::Genre, n);
+    let year_idx = find_or_create(&mut state.active_surface_mut().entries, "DATE", lofty::tag::ItemKey::Year, n);
+    let genre_idx = find_or_create(&mut state.active_surface_mut().entries, "GENRE", lofty::tag::ItemKey::Genre, n);
 
     if per_track_populate {
-        super::probe::ensure_dim_replicate(&mut state.entries[title_idx], track_dim);
-        super::probe::ensure_dim_replicate(&mut state.entries[artist_idx], track_dim);
+        super::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[title_idx], track_dim);
+        super::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[artist_idx], track_dim);
     }
 
     if per_track_populate {
@@ -465,26 +465,26 @@ pub fn populate_editor_from_review(
         // values for both TITLE and ARTIST (compilation-friendly).
         let page = &review.pages[0];
         for (i, track) in page.tracks.iter().enumerate() {
-            state.entries[title_idx].per_file_values[i] = track.title.clone();
-            state.entries[artist_idx].per_file_values[i] = track.artist.clone();
+            state.active_surface_mut().entries[title_idx].per_file_values[i] = track.title.clone();
+            state.active_surface_mut().entries[artist_idx].per_file_values[i] = track.artist.clone();
         }
-        state.entries[album_idx].per_file_values[0] = page.album.clone();
-        state.entries[tn_idx].per_file_values[0] = "1".to_string();
+        state.active_surface_mut().entries[album_idx].per_file_values[0] = page.album.clone();
+        state.active_surface_mut().entries[tn_idx].per_file_values[0] = "1".to_string();
         if !page.year.is_empty() {
-            state.entries[year_idx].per_file_values[0] = page.year.clone();
+            state.active_surface_mut().entries[year_idx].per_file_values[0] = page.year.clone();
         }
         if !page.genre.is_empty() {
-            state.entries[genre_idx].per_file_values[0] = page.genre.clone();
+            state.active_surface_mut().entries[genre_idx].per_file_values[0] = page.genre.clone();
         }
     } else if single_image {
         // Album-level fallback (no CUESHEET anchor available).
         let page = &review.pages[0];
         let title_dim_one =
-            (state.entries[title_idx].per_file_values.len() == 1).then_some(title_idx);
+            (state.active_surface().entries[title_idx].per_file_values.len() == 1).then_some(title_idx);
         let artist_dim_one =
-            (state.entries[artist_idx].per_file_values.len() == 1).then_some(artist_idx);
+            (state.active_surface().entries[artist_idx].per_file_values.len() == 1).then_some(artist_idx);
         if let Some(idx) = title_dim_one {
-            state.entries[idx].per_file_values[0] = page.album.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0] = page.album.clone();
         }
         if let Some(idx) = artist_dim_one {
             // Use the first track's artist as a representative when
@@ -492,16 +492,16 @@ pub fn populate_editor_from_review(
             // (compilation rips); falls back gracefully to whatever
             // tracks[0] has.
             if let Some(track) = page.tracks.first() {
-                state.entries[idx].per_file_values[0] = track.artist.clone();
+                state.active_surface_mut().entries[idx].per_file_values[0] = track.artist.clone();
             }
         }
-        state.entries[album_idx].per_file_values[0] = page.album.clone();
-        state.entries[tn_idx].per_file_values[0] = "1".to_string();
+        state.active_surface_mut().entries[album_idx].per_file_values[0] = page.album.clone();
+        state.active_surface_mut().entries[tn_idx].per_file_values[0] = "1".to_string();
         if !page.year.is_empty() {
-            state.entries[year_idx].per_file_values[0] = page.year.clone();
+            state.active_surface_mut().entries[year_idx].per_file_values[0] = page.year.clone();
         }
         if !page.genre.is_empty() {
-            state.entries[genre_idx].per_file_values[0] = page.genre.clone();
+            state.active_surface_mut().entries[genre_idx].per_file_values[0] = page.genre.clone();
         }
     } else {
         // Per-file populate (multi-disc / multi-file): index by
@@ -512,15 +512,15 @@ pub fn populate_editor_from_review(
                 if i >= n {
                     continue;
                 }
-                state.entries[title_idx].per_file_values[i] = track.title.clone();
-                state.entries[artist_idx].per_file_values[i] = track.artist.clone();
-                state.entries[album_idx].per_file_values[i] = page.album.clone();
-                state.entries[tn_idx].per_file_values[i] = track.track_number.to_string();
+                state.active_surface_mut().entries[title_idx].per_file_values[i] = track.title.clone();
+                state.active_surface_mut().entries[artist_idx].per_file_values[i] = track.artist.clone();
+                state.active_surface_mut().entries[album_idx].per_file_values[i] = page.album.clone();
+                state.active_surface_mut().entries[tn_idx].per_file_values[i] = track.track_number.to_string();
                 if !page.year.is_empty() {
-                    state.entries[year_idx].per_file_values[i] = page.year.clone();
+                    state.active_surface_mut().entries[year_idx].per_file_values[i] = page.year.clone();
                 }
                 if !page.genre.is_empty() {
-                    state.entries[genre_idx].per_file_values[i] = page.genre.clone();
+                    state.active_surface_mut().entries[genre_idx].per_file_values[i] = page.genre.clone();
                 }
             }
         }
@@ -529,7 +529,7 @@ pub fn populate_editor_from_review(
     for idx in [
         title_idx, artist_idx, album_idx, tn_idx, year_idx, genre_idx,
     ] {
-        let e = &mut state.entries[idx];
+        let e = &mut state.active_surface_mut().entries[idx];
         let dim = e.per_file_values.len();
         let all_same = e.per_file_values.windows(2).all(|w| w[0] == w[1]);
         e.is_mixed = !all_same && dim > 1;
@@ -540,7 +540,7 @@ pub fn populate_editor_from_review(
         };
     }
 
-    state.dirty = true;
+    state.active_surface_mut().dirty = true;
 }
 
 /// Group audio file paths by parent directory (disc detection).
@@ -751,7 +751,7 @@ pub fn collect_durations(
 mod gnudb_per_track_tests {
     //! Phase A: gnudb parity with MB's per-track populate flow.
     use super::*;
-    use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+    use crate::tui::app::MetadataEditorState;
     use crate::tui::probe::TagEntry;
 
     fn empty_state(n: usize) -> (MetadataEditorState, tempfile::TempDir) {
@@ -759,44 +759,12 @@ mod gnudb_per_track_tests {
         let paths: Vec<std::path::PathBuf> = (0..n)
             .map(|i| td.path().join(format!("{:02}.flac", i + 1)))
             .collect();
-        let state = MetadataEditorState {
+        let state = MetadataEditorState::for_files(
             paths,
-            entries: Vec::new(),
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            dvdv_source_chapters: None,
-            presentation_tabs: vec![],
-            active_tab: 0,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+            Vec::new(),
+            (0..n).map(|i| format!("{:02}", i + 1)).collect(),
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
         (state, td)
     }
 
@@ -879,7 +847,7 @@ mod gnudb_per_track_tests {
     #[test]
     fn review_per_track_populates_when_single_image_with_cuesheet() {
         let (mut state, _td) = empty_state(1);
-        state.entries.push(cuesheet_entry(
+        state.active_surface_mut().entries.push(cuesheet_entry(
             "FILE \"a.flac\" FLAC\n  TRACK 01 AUDIO\nINDEX 01 00:00:00\n  TRACK 02 AUDIO\nINDEX 01 00:01:00\n  TRACK 03 AUDIO\nINDEX 01 00:02:00\n",
         ));
         // Compilation case: per-track artists differ.
@@ -894,12 +862,12 @@ mod gnudb_per_track_tests {
                     track(3, "T3", "Artist C", 0),
                 ],
             )],
-            state.paths.clone(),
+            state.active_surface().paths.clone(),
         );
         populate_editor_from_review(&mut state, &r);
 
         let lookup = |k: &str| -> Vec<String> {
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(k))
@@ -927,12 +895,12 @@ mod gnudb_per_track_tests {
                 "Rock",
                 vec![track(1, "T1", "Artist A", 0), track(2, "T2", "Artist B", 0)],
             )],
-            state.paths.clone(),
+            state.active_surface().paths.clone(),
         );
         populate_editor_from_review(&mut state, &r);
 
         let lookup = |k: &str| -> Vec<String> {
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(k))
@@ -965,17 +933,17 @@ mod gnudb_per_track_tests {
                     vec![track(1, "D2T1", "Art", 2), track(2, "D2T2", "Art", 3)],
                 ),
             ],
-            state.paths.clone(),
+            state.active_surface().paths.clone(),
         );
         populate_editor_from_review(&mut state, &r);
 
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
             .unwrap();
         assert_eq!(title.per_file_values, vec!["D1T1", "D1T2", "D2T1", "D2T2"]);
-        let album = state
+        let album = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ALBUM")
@@ -992,7 +960,7 @@ mod gnudb_per_track_tests {
         // one file is the user-error case). Falls through to per-file
         // index path. Last disc's last track wins for slot 0.
         let (mut state, _td) = empty_state(1);
-        state.entries.push(cuesheet_entry(
+        state.active_surface_mut().entries.push(cuesheet_entry(
             "FILE \"x\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
         ));
         let r = review(
@@ -1000,11 +968,11 @@ mod gnudb_per_track_tests {
                 page("Disc 1", "", "", vec![track(1, "D1T1", "A", 0)]),
                 page("Disc 2", "", "", vec![track(1, "D2T1", "A", 0)]),
             ],
-            state.paths.clone(),
+            state.active_surface().paths.clone(),
         );
         populate_editor_from_review(&mut state, &r);
 
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")

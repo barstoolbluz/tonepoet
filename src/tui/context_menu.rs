@@ -957,9 +957,9 @@ pub fn execute_context_action(
             // puts the editor back as the active overlay after this returns.
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let cursor = state.cursor;
-                if let Some(entry) = state.entries.get_mut(cursor) {
+                if let Some(entry) = state.active_surface_mut().entries.get_mut(cursor) {
                     super::probe::toggle_mb_revert(entry);
-                    state.dirty = super::probe::metadata_editor_has_changes(&state);
+                    state.recompute_active_dirty();
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
@@ -967,7 +967,7 @@ pub fn execute_context_action(
         ContextAction::MetadataEditValue => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let cursor = state.cursor;
-                if let Some(entry) = state.entries.get(cursor) {
+                if let Some(entry) = state.active_surface().entries.get(cursor) {
                     if !entry.is_binary {
                         state.edit_input =
                             Some(super::text_input::TextInputState::new(entry.value.clone()));
@@ -980,9 +980,9 @@ pub fn execute_context_action(
         ContextAction::MetadataDeleteEntry => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let cursor = state.cursor;
-                if cursor < state.entries.len() && !state.deleted.contains(&cursor) {
-                    state.deleted.push(cursor);
-                    state.dirty = true;
+                if cursor < state.active_surface().entries.len() && !state.active_surface().deleted.contains(&cursor) {
+                    state.active_surface_mut().deleted.push(cursor);
+                    state.active_surface_mut().dirty = true;
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
@@ -990,8 +990,8 @@ pub fn execute_context_action(
         ContextAction::MetadataRestoreEntry => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let cursor = state.cursor;
-                state.deleted.retain(|&i| i != cursor);
-                state.dirty = super::probe::metadata_editor_has_changes(&state);
+                state.active_surface_mut().deleted.retain(|&i| i != cursor);
+                state.recompute_active_dirty();
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
         }
@@ -1009,7 +1009,7 @@ pub fn execute_context_action(
             // preview rows; falls back to a status when not.
             if let Some(state) = app.pending_metadata_editor.take() {
                 let cursor = state.cursor;
-                let entry = match state.entries.get(cursor) {
+                let entry = match state.active_surface().entries.get(cursor) {
                     Some(e) if super::probe::is_synthetic_preview(e) => e,
                     _ => {
                         app.set_status(
@@ -1034,9 +1034,9 @@ pub fn execute_context_action(
         ContextAction::MetadataDetailToggleRevert => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let idx = state.detail_field_idx;
-                if let Some(entry) = state.entries.get_mut(idx) {
+                if let Some(entry) = state.active_surface_mut().entries.get_mut(idx) {
                     super::probe::toggle_mb_revert_field(entry);
-                    state.dirty = super::probe::metadata_editor_has_changes(&state);
+                    state.recompute_active_dirty();
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
@@ -1044,9 +1044,9 @@ pub fn execute_context_action(
         ContextAction::MetadataDetailRestore => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let idx = state.detail_field_idx;
-                if let Some(entry) = state.entries.get_mut(idx) {
+                if let Some(entry) = state.active_surface_mut().entries.get_mut(idx) {
                     super::probe::restore_mb_proposed(entry);
-                    state.dirty = super::probe::metadata_editor_has_changes(&state);
+                    state.recompute_active_dirty();
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
@@ -1681,7 +1681,7 @@ mod tests {
 
     #[test]
     fn metadata_row_context_menu_includes_view_for_synthetic_preview() {
-        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        use crate::tui::app::MetadataEditorState;
         use crate::tui::probe::TagEntry;
 
         let entries = vec![
@@ -1710,44 +1710,12 @@ mod tests {
                 mb_proposed_per_file: None,
             },
         ];
-        let state = MetadataEditorState {
-            paths: vec![std::path::PathBuf::from("/tmp/a.flac")],
+        let state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
             entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels: vec!["01".into()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            dvdv_source_chapters: None,
-            presentation_tabs: vec![],
-            active_tab: 0,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+            vec!["01".into()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
 
         // Row 0 = TITLE: no View entry.
         let menu_title = super::super::keybindings::build_metadata_row_context_menu(&state, 0);

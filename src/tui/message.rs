@@ -156,9 +156,27 @@ pub enum AppMessage {
         results: Vec<(crate::tui::browse::BrowseEntry, i64)>,
     },
     /// Result of a batch metadata write from the metadata editor.
+    ///
+    /// Save completions carry the editor Details/session id plus the
+    /// monotonic save generation captured at dispatch time. The event-loop
+    /// reducer must reject stale sessions/generations before applying results
+    /// or closing an overlay.
     MetadataEditorWriteComplete {
-        /// Per-file results: (path, Ok or Err).
-        results: Vec<(std::path::PathBuf, Result<(), String>)>,
+        session_id: u64,
+        save_generation: u64,
+        results: Vec<crate::tui::app::MetadataEditorWriteResult>,
+    },
+    /// Result of a background Details-tab media probe from the metadata editor.
+    /// Reduced into the active editor model by the event loop; rendering never
+    /// polls worker-owned state. Stale generations are ignored by the reducer.
+    MetadataEditorDetailsProbeComplete {
+        /// Unique Details cache/session id captured when the probe request was
+        /// launched. Prevents stale completions from closed/reopened editors
+        /// with the same generation from mutating the wrong model.
+        session_id: u64,
+        generation: u64,
+        total: usize,
+        results: Vec<crate::tui::app::MetadataDetailsProbeFileResult>,
     },
     /// Result of an async archive listing (`7zz l -slt`).
     ArchiveListingComplete {

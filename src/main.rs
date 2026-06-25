@@ -1613,7 +1613,7 @@ async fn run_tags_mb(
 
     // ── lookup ─────────────────────────────────────────────────────
     let n_tracks = match kind {
-        PathKind::SacdIso(_) | PathKind::DvdVideoSource(_) => state.paths.len(), // disc source replicated × n_tracks
+        PathKind::SacdIso(_) | PathKind::DvdVideoSource(_) => state.active_surface().paths.len(), // disc source replicated × n_tracks
         PathKind::Audio(ref a) => a.len(),
     };
 
@@ -1670,6 +1670,7 @@ async fn run_tags_mb(
 
     if dry_run {
         let count = state
+            .active_surface()
             .entries
             .iter()
             .filter(|e| {
@@ -1685,7 +1686,7 @@ async fn run_tags_mb(
             count
         );
         if verbose {
-            for e in &state.entries {
+            for e in &state.active_surface().entries {
                 let dirty = e.value != e.original
                     || e.per_file_values
                         .iter()
@@ -1754,6 +1755,7 @@ async fn run_tags_mb(
         }
         PathKind::Audio(ref audio_paths) => {
             let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> = state
+                .active_surface()
                 .entries
                 .iter()
                 .map(|e| {
@@ -1764,7 +1766,7 @@ async fn run_tags_mb(
                     )
                 })
                 .collect();
-            let deleted: Vec<usize> = state.deleted.clone();
+            let deleted: Vec<usize> = state.active_surface().deleted.clone();
             let paths_owned = audio_paths.clone();
             let results = match tokio::task::spawn_blocking(move || {
                 probe::apply_audio_tag_changes(&paths_owned, &entries_snap, &deleted)
@@ -1866,44 +1868,12 @@ fn build_audio_state_for_cli(
     probe::sort_paths_and_entries_by_track(&mut paths, &mut entries);
     let n = paths.len();
     let file_labels: Vec<String> = (1..=n).map(|i| format!("{:>02}", i)).collect();
-    Ok(app::MetadataEditorState {
+    Ok(app::MetadataEditorState::for_files(
         paths,
         entries,
-        cursor: 0,
-        scroll: 0,
-        last_click: None,
-        edit_input: None,
-        add_key_input: None,
-        phase: app::MetadataEditorPhase::Editing,
-        dirty: false,
-        deleted: Vec::new(),
         file_labels,
-        detail_field_idx: 0,
-        detail_cursor: 0,
-        detail_scroll: 0,
-        detail_edit: None,
-        mb_back: None,
-        gnudb_back: None,
-        read_only: false,
-        sacd_sidecar_path: None,
-        sacd_area_kind: None,
-        sacd_stereo_durations: None,
-        sacd_multi_channel_durations: None,
-        dvdv_track_durations: None,
-        dvdv_angle_number: None,
-        dvdv_title_angle_count: None,
-        dvdv_source_chapters: None,
-        bluray_playlist_number: None,
-        bluray_audio_pid: None,
-        bluray_audio_stream_index: None,
-        bluray_angle_number: None,
-        bluray_chapter_durations: None,
-        presentation_tabs: Vec::new(),
-        active_tab: 0,
-        presentation_selector_open: false,
-        presentation_selector_cursor: 0,
-        presentation_selector_scroll: 0,
-    })
+        app::MetadataTechnicalDetails::default(),
+    ))
 }
 
 fn build_sacd_state_for_cli(
@@ -1934,44 +1904,15 @@ fn build_dvdv_state_for_cli(
     let sidecar_writable = tonepoet::tui::command::dvdv_metadata_sidecar_target_is_writable(source);
     let sidecar_path = tonepoet::tui::command::dvdv_metadata_sidecar_path_for_source(source).ok();
 
-    Ok(app::MetadataEditorState {
-        paths: std::iter::repeat(source.to_path_buf()).take(n_tracks).collect(),
-        entries: Vec::new(),
-        cursor: 0,
-        scroll: 0,
-        last_click: None,
-        edit_input: None,
-        add_key_input: None,
-        phase: app::MetadataEditorPhase::Editing,
-        dirty: false,
-        deleted: Vec::new(),
-        file_labels: (1..=n_tracks).map(|i| format!("{:>02}", i)).collect(),
-        detail_field_idx: 0,
-        detail_cursor: 0,
-        detail_scroll: 0,
-        detail_edit: None,
-        mb_back: None,
-        gnudb_back: None,
-        read_only: !sidecar_writable,
-        sacd_sidecar_path: sidecar_path,
-        sacd_area_kind: None,
-        sacd_stereo_durations: None,
-        sacd_multi_channel_durations: None,
-        dvdv_track_durations: None,
-        dvdv_angle_number: None,
-        dvdv_title_angle_count: None,
-        dvdv_source_chapters: None,
-        bluray_playlist_number: None,
-        bluray_audio_pid: None,
-        bluray_audio_stream_index: None,
-        bluray_angle_number: None,
-        bluray_chapter_durations: None,
-        presentation_tabs: Vec::new(),
-        active_tab: 0,
-        presentation_selector_open: false,
-        presentation_selector_cursor: 0,
-        presentation_selector_scroll: 0,
-    })
+    let mut state = app::MetadataEditorState::for_files(
+        std::iter::repeat(source.to_path_buf()).take(n_tracks).collect(),
+        Vec::new(),
+        (1..=n_tracks).map(|i| format!("{:>02}", i)).collect(),
+        app::MetadataTechnicalDetails::default(),
+    );
+    state.read_only = !sidecar_writable;
+    state.sacd_sidecar_path = sidecar_path;
+    Ok(state)
 }
 
 /// Run the right MB lookup mode for the CLI args, disambiguate, and
@@ -2061,12 +2002,13 @@ async fn resolve_release(
             }
         }
         PathKind::SacdIso(_) => {
-            let durations = match state.sacd_area_kind {
+            let surface = state.active_surface();
+            let durations = match surface.sacd_area_kind {
                 Some(tonepoet::tui::sacd::AreaKind::Stereo) => {
-                    state.sacd_stereo_durations.as_deref()
+                    surface.sacd_stereo_durations.as_deref()
                 }
                 Some(tonepoet::tui::sacd::AreaKind::MultiChannel) => {
-                    state.sacd_multi_channel_durations.as_deref()
+                    surface.sacd_multi_channel_durations.as_deref()
                 }
                 None => None,
             };

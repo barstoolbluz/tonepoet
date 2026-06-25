@@ -2796,13 +2796,796 @@ pub enum MetadataEditorPhase {
     Saving,
 }
 
-/// One presentation tab inside a disc-backed metadata editor.
+/// Active content pane inside the metadata editor. Presentation selection
+/// remains separate: disc-backed editors keep `presentation_tabs` for data
+/// management, while this enum controls which read/edit surface is visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentTab {
+    Metadata,
+    Details,
+    ReplayGain,
+    Artwork,
+}
+
+impl ContentTab {
+    pub const COUNT: usize = 4;
+
+    pub const ALL: [ContentTab; Self::COUNT] = [
+        ContentTab::Metadata,
+        ContentTab::Details,
+        ContentTab::ReplayGain,
+        ContentTab::Artwork,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ContentTab::Metadata => "Metadata",
+            ContentTab::Details => "Details",
+            ContentTab::ReplayGain => "ReplayGain",
+            ContentTab::Artwork => "Artwork",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            ContentTab::Metadata => 0,
+            ContentTab::Details => 1,
+            ContentTab::ReplayGain => 2,
+            ContentTab::Artwork => 3,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+}
+
+/// Immutable source/file facts captured when the metadata editor opens.
 ///
-/// The active tab is also mirrored into `MetadataEditorState`'s legacy
-/// top-level fields (`paths`, `entries`, `file_labels`, `deleted`, and
-/// `dirty`) so the existing editor code keeps working. Call
-/// `sync_active_presentation` before save/populate operations that must
-/// observe the latest active-tab edits.
+/// Invariants:
+/// - `FileFacts.path` is the canonical key used by editable rows and cached facts.
+/// - `file_facts.len() == paths.len()` for every active file-backed presentation.
+/// - Rendering consumes these facts only; it never performs filesystem, tag, or media probe I/O.
+#[derive(Debug, Clone, Default)]
+pub struct FileFacts {
+    pub path: std::path::PathBuf,
+    pub file_size: Option<u64>,
+    pub modified: Option<std::time::SystemTime>,
+    pub filesystem_error: Option<String>,
+    pub tool: Option<String>,
+    pub read_state: FileReadState,
+    pub write_eligibility: FileWriteEligibility,
+}
+
+/// Result of the initial tag/readability phase for one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileReadState {
+    Readable,
+    Unreadable { reason: String },
+    Unsupported { reason: String },
+}
+
+impl Default for FileReadState {
+    fn default() -> Self {
+        Self::Readable
+    }
+}
+
+/// Whether the current editor session may write this file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileWriteEligibility {
+    Writable,
+    Blocked { reason: String },
+    Unknown { reason: String },
+}
+
+impl Default for FileWriteEligibility {
+    fn default() -> Self {
+        Self::Writable
+    }
+}
+
+impl FileWriteEligibility {
+    pub fn is_writable(&self) -> bool {
+        matches!(self, Self::Writable)
+    }
+
+    pub fn block_reason(&self) -> Option<&str> {
+        match self {
+            Self::Writable => None,
+            Self::Blocked { reason } | Self::Unknown { reason } => Some(reason.as_str()),
+        }
+    }
+}
+
+/// Compact media facts produced by audio probing.
+///
+/// This is separated from source/tag facts because probing can be slow and may
+/// fail independently from tag reads. The Details tab requests it explicitly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaFacts {
+    pub format_name: String,
+    pub codec: String,
+    pub bit_depth: Option<u32>,
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub channel_layout: String,
+    pub duration_secs: f64,
+    pub file_size: u64,
+}
+
+impl From<SourceInfo> for MediaFacts {
+    fn from(info: SourceInfo) -> Self {
+        Self {
+            format_name: info.format_name,
+            codec: info.codec,
+            bit_depth: info.bit_depth,
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+            channel_layout: info.channel_layout,
+            duration_secs: info.duration_secs,
+            file_size: info.file_size,
+        }
+    }
+}
+
+impl From<&SourceInfo> for MediaFacts {
+    fn from(info: &SourceInfo) -> Self {
+        Self {
+            format_name: info.format_name.clone(),
+            codec: info.codec.clone(),
+            bit_depth: info.bit_depth,
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+            channel_layout: info.channel_layout.clone(),
+            duration_secs: info.duration_secs,
+            file_size: info.file_size,
+        }
+    }
+}
+
+impl From<MediaFacts> for SourceInfo {
+    fn from(facts: MediaFacts) -> Self {
+        Self {
+            format_name: facts.format_name,
+            codec: facts.codec,
+            bit_depth: facts.bit_depth,
+            sample_rate: facts.sample_rate,
+            channels: facts.channels,
+            channel_layout: facts.channel_layout,
+            duration_secs: facts.duration_secs,
+            file_size: facts.file_size,
+        }
+    }
+}
+
+/// Explicit lifecycle for one file's media probe.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeState {
+    NotLoaded,
+    Loading { generation: u64 },
+    Ready(MediaFacts),
+    Failed { reason: String, retryable: bool },
+    Cancelled { generation: u64 },
+}
+
+impl Default for ProbeState {
+    fn default() -> Self {
+        Self::NotLoaded
+    }
+}
+
+impl ProbeState {
+    pub fn needs_probe(&self) -> bool {
+        matches!(self, Self::NotLoaded)
+    }
+
+    pub fn failed_reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed { reason, .. } => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Artwork facts from the tag-read phase. Raw bytes are intentionally not kept.
+#[derive(Debug, Clone, Default)]
+pub struct ArtworkFacts {
+    pub applicable: bool,
+    pub entries: Vec<crate::tui::probe::ArtworkInfo>,
+}
+
+/// First-class issue reporting for read-only tabs and save eligibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataIssue {
+    Filesystem { path: std::path::PathBuf, reason: String },
+    TagRead { path: std::path::PathBuf, reason: String },
+    Unsupported { path: std::path::PathBuf, reason: String },
+    Probe { path: std::path::PathBuf, reason: String, retryable: bool },
+    SaveBlocked { path: std::path::PathBuf, reason: String },
+    Write { path: std::path::PathBuf, reason: String },
+}
+
+static METADATA_EDITOR_DETAILS_SESSION_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate a process-unique Details probe session id.
+///
+/// This id is stamped onto each metadata-editor Details cache and echoed by
+/// background probe completion messages. It prevents stale async work from a
+/// closed/reopened editor, or from another presentation surface, from mutating
+/// the wrong editor instance when generations happen to match.
+pub fn next_metadata_editor_details_session_id() -> u64 {
+    METADATA_EDITOR_DETAILS_SESSION_COUNTER.fetch_add(
+        1,
+        std::sync::atomic::Ordering::Relaxed,
+    )
+}
+
+/// One completed audio probe result for a metadata-editor Details load.
+#[derive(Debug, Clone)]
+pub struct MetadataDetailsProbeFileResult {
+    pub index: usize,
+    pub path: std::path::PathBuf,
+    pub result: Result<SourceInfo, String>,
+}
+
+/// Typed outcome for one file in a metadata-editor save request.
+///
+/// The reducer uses this to distinguish successful writes from skipped files
+/// and real write failures. Status text is a summary only; durable per-file
+/// issues are attached to `MetadataFileDetails` for failed/skipped paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataEditorWriteOutcome {
+    Saved,
+    Failed { reason: String },
+    Skipped { reason: String },
+}
+
+/// Path-keyed result from the async metadata-editor save worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataEditorWriteResult {
+    pub path: std::path::PathBuf,
+    pub outcome: MetadataEditorWriteOutcome,
+}
+
+impl MetadataEditorWriteResult {
+    pub fn saved(path: std::path::PathBuf) -> Self {
+        Self { path, outcome: MetadataEditorWriteOutcome::Saved }
+    }
+
+    pub fn failed(path: std::path::PathBuf, reason: impl Into<String>) -> Self {
+        Self { path, outcome: MetadataEditorWriteOutcome::Failed { reason: reason.into() } }
+    }
+
+    pub fn skipped(path: std::path::PathBuf, reason: impl Into<String>) -> Self {
+        Self { path, outcome: MetadataEditorWriteOutcome::Skipped { reason: reason.into() } }
+    }
+
+    pub fn into_legacy_result(self) -> (std::path::PathBuf, Result<(), String>) {
+        match self.outcome {
+            MetadataEditorWriteOutcome::Saved => (self.path, Ok(())),
+            MetadataEditorWriteOutcome::Failed { reason }
+            | MetadataEditorWriteOutcome::Skipped { reason } => (self.path, Err(reason)),
+        }
+    }
+}
+
+/// Structured summary returned by save-result reduction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataEditorWriteSummary {
+    pub saved: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub ignored: usize,
+    /// True when save-result reduction leaves pending model changes behind.
+    ///
+    /// A save can return only successful path-keyed write results while the
+    /// editor still has dirty non-file-aligned state, such as a presentation-
+    /// scoped or CUESHEET row-level delete that cannot be proven from per-file
+    /// write results. In that case the event loop must keep the editor open.
+    pub remaining_dirty: bool,
+    pub saved_paths: Vec<std::path::PathBuf>,
+    pub first_problem: Option<String>,
+}
+
+impl MetadataEditorWriteSummary {
+    pub fn all_saved(&self) -> bool {
+        self.failed == 0 && self.skipped == 0 && self.ignored == 0 && !self.remaining_dirty
+    }
+
+    pub fn status_line(&self) -> String {
+        if self.all_saved() {
+            return format!(
+                "Metadata saved ({} file{})",
+                self.saved,
+                if self.saved == 1 { "" } else { "s" },
+            );
+        }
+
+        let mut parts = vec![format!("{} saved", self.saved)];
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped", self.skipped));
+        }
+        if self.ignored > 0 {
+            parts.push(format!("{} stale/unknown ignored", self.ignored));
+        }
+        if self.remaining_dirty {
+            parts.push("unsaved changes remain".to_string());
+        }
+        match &self.first_problem {
+            Some(problem) if !problem.trim().is_empty() => {
+                format!("Metadata: {} — {}", parts.join(", "), problem)
+            }
+            _ => format!("Metadata: {}", parts.join(", ")),
+        }
+    }
+}
+
+/// Explicit lifecycle for the Details tab's expensive stream-probe data.
+///
+/// Filesystem stats and tag/artwork metadata are available at editor-open time.
+/// Audio stream probing is intentionally separate because it can be slow or
+/// fail on malformed media. Keep that work off the open path, off the render
+/// path, and out of status-message generation.
+#[derive(Debug, Clone)]
+pub enum MetadataDetailsProbeState {
+    Unloaded,
+    Loading {
+        generation: u64,
+        completed: usize,
+        total: usize,
+    },
+    Ready,
+    Partial { issues: Vec<String> },
+    Cancelled { generation: u64 },
+}
+
+impl Default for MetadataDetailsProbeState {
+    fn default() -> Self {
+        Self::Unloaded
+    }
+}
+
+
+/// Cached, display-oriented filesystem/probe data for one selected audio file.
+///
+/// Invariant: this struct has a single source of truth for each fact:
+/// - path/size/mtime/readability/writeability live only in `file_facts`;
+/// - codec/duration/sample-rate probe data lives only in `media_facts`;
+/// - compact embedded artwork metadata lives only in `artwork_facts`;
+/// - user-visible read/probe/save problems live only in `issues`.
+/// Rendering and editing code must not reintroduce mirror fields here.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataFileDetails {
+    /// Stable source facts captured at editor-open time.
+    pub file_facts: FileFacts,
+    /// Lazy media-probe facts. This is the authoritative probe state used by
+    /// Details rendering and AppMessage reduction.
+    pub media_facts: ProbeState,
+    /// Compact artwork metadata from the tag-read phase.
+    pub artwork_facts: ArtworkFacts,
+    /// First-class issues for Details/Artwork/save UI.
+    pub issues: Vec<MetadataIssue>,
+}
+
+impl MetadataFileDetails {
+    pub fn from_open_cache(
+        path: std::path::PathBuf,
+        file_size: Option<u64>,
+        modified: Option<std::time::SystemTime>,
+        filesystem_error: Option<String>,
+        metadata_error: Option<String>,
+        read_state: FileReadState,
+        write_eligibility: FileWriteEligibility,
+        metadata: SourceMetadata,
+    ) -> Self {
+        let mut file_facts = FileFacts {
+            path: path.clone(),
+            file_size,
+            modified,
+            filesystem_error: filesystem_error.clone(),
+            tool: metadata.tool.clone(),
+            read_state,
+            write_eligibility,
+        };
+        if matches!(file_facts.read_state, FileReadState::Unsupported { .. }) {
+            file_facts.write_eligibility = FileWriteEligibility::Blocked {
+                reason: file_facts
+                    .read_state
+                    .block_reason()
+                    .unwrap_or("unsupported file")
+                    .to_string(),
+            };
+        }
+        let artwork_facts = ArtworkFacts {
+            applicable: true,
+            entries: metadata.artwork,
+        };
+        let issues = metadata_issues_from_facts(
+            &file_facts,
+            metadata_error.as_deref(),
+            None,
+        );
+        Self {
+            file_facts,
+            media_facts: ProbeState::NotLoaded,
+            artwork_facts,
+            issues,
+        }
+    }
+
+    /// Constructor name for call sites that are reducing the initial tag-read
+    /// result into durable file facts. It delegates to `from_open_cache` so
+    /// read/write eligibility, artwork facts, and first-class issues are
+    /// initialized consistently.
+    pub fn from_read_result(
+        path: std::path::PathBuf,
+        file_size: Option<u64>,
+        modified: Option<std::time::SystemTime>,
+        filesystem_error: Option<String>,
+        metadata_error: Option<String>,
+        read_state: FileReadState,
+        write_eligibility: FileWriteEligibility,
+        metadata: SourceMetadata,
+    ) -> Self {
+        Self::from_open_cache(
+            path,
+            file_size,
+            modified,
+            filesystem_error,
+            metadata_error,
+            read_state,
+            write_eligibility,
+            metadata,
+        )
+    }
+
+    pub fn set_probe_ready(&mut self, info: SourceInfo) {
+        self.media_facts = ProbeState::Ready(MediaFacts::from(&info));
+        self.issues.retain(|issue| !matches!(issue, MetadataIssue::Probe { .. }));
+    }
+
+    pub fn set_probe_failed(&mut self, reason: String, retryable: bool) {
+        self.media_facts = ProbeState::Failed {
+            reason: reason.clone(),
+            retryable,
+        };
+        self.issues.retain(|issue| !matches!(issue, MetadataIssue::Probe { .. }));
+        self.issues.push(MetadataIssue::Probe {
+            path: self.file_facts.path.clone(),
+            reason,
+            retryable,
+        });
+    }
+}
+
+impl FileReadState {
+    pub fn is_readable(&self) -> bool {
+        matches!(self, Self::Readable)
+    }
+
+    pub fn block_reason(&self) -> Option<&str> {
+        match self {
+            Self::Readable => None,
+            Self::Unreadable { reason } | Self::Unsupported { reason } => Some(reason.as_str()),
+        }
+    }
+}
+
+impl FileFacts {
+    pub fn save_block_reason(&self) -> Option<&str> {
+        self.read_state
+            .block_reason()
+            .or_else(|| self.write_eligibility.block_reason())
+    }
+}
+
+fn metadata_issues_from_facts(
+    file_facts: &FileFacts,
+    metadata_error: Option<&str>,
+    probe_error: Option<&str>,
+) -> Vec<MetadataIssue> {
+    let mut issues = Vec::new();
+    let path = &file_facts.path;
+    if let Some(reason) = file_facts
+        .filesystem_error
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        issues.push(MetadataIssue::Filesystem {
+            path: path.clone(),
+            reason: reason.trim().to_string(),
+        });
+    }
+    match &file_facts.read_state {
+        FileReadState::Readable => {}
+        FileReadState::Unreadable { reason } => issues.push(MetadataIssue::TagRead {
+            path: path.clone(),
+            reason: reason.clone(),
+        }),
+        FileReadState::Unsupported { reason } => issues.push(MetadataIssue::Unsupported {
+            path: path.clone(),
+            reason: reason.clone(),
+        }),
+    }
+    if let Some(reason) = metadata_error.filter(|reason| !reason.trim().is_empty()) {
+        let already_reported_read_state = matches!(
+            file_facts.read_state,
+            FileReadState::Unreadable { .. } | FileReadState::Unsupported { .. }
+        );
+        if !already_reported_read_state {
+            issues.push(MetadataIssue::TagRead {
+                path: path.clone(),
+                reason: reason.trim().to_string(),
+            });
+        }
+    }
+    if let Some(reason) = probe_error.filter(|reason| !reason.trim().is_empty()) {
+        issues.push(MetadataIssue::Probe {
+            path: path.clone(),
+            reason: reason.trim().to_string(),
+            retryable: true,
+        });
+    }
+    if let Some(reason) = file_facts.save_block_reason() {
+        issues.push(MetadataIssue::SaveBlocked {
+            path: path.clone(),
+            reason: reason.to_string(),
+        });
+    }
+    issues
+}
+
+/// Cached technical data for a disc presentation. Disc-backed editors often
+/// synthesize per-track paths from a single ISO/directory, so ordinary file
+/// probes cannot represent the active presentation. Store the presentation
+/// format explicitly instead.
+#[derive(Debug, Clone, Default)]
+pub struct DiscTechnicalDetails {
+    pub presentation_label: String,
+    pub track_count: usize,
+    pub duration_secs: Option<f64>,
+    pub codec: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u32>,
+    pub channel_layout: Option<String>,
+    pub bit_depth: Option<u32>,
+    pub lossless: Option<bool>,
+    pub tool: Option<String>,
+}
+
+/// Cached data used by the metadata editor Details and Artwork tabs.
+#[derive(Debug, Clone)]
+pub struct MetadataTechnicalDetails {
+    /// Unique identity for this Details cache. Background probe completions
+    /// must echo this value and match it before mutating any file facts.
+    pub session_id: u64,
+    pub files: Vec<MetadataFileDetails>,
+    pub disc: Option<DiscTechnicalDetails>,
+    pub details_probe_state: MetadataDetailsProbeState,
+    pub details_probe_generation: u64,
+    /// Monotonic id for async save dispatches on this editor surface.
+    pub save_generation: u64,
+    /// The save generation currently allowed to reduce into this surface.
+    pub active_save_generation: Option<u64>,
+}
+
+impl Default for MetadataTechnicalDetails {
+    fn default() -> Self {
+        Self {
+            session_id: next_metadata_editor_details_session_id(),
+            files: Vec::new(),
+            disc: None,
+            details_probe_state: MetadataDetailsProbeState::Unloaded,
+            details_probe_generation: 0,
+            save_generation: 0,
+            active_save_generation: None,
+        }
+    }
+}
+
+impl MetadataTechnicalDetails {
+    pub fn from_files(files: Vec<MetadataFileDetails>) -> Self {
+        Self {
+            session_id: next_metadata_editor_details_session_id(),
+            files,
+            disc: None,
+            details_probe_state: MetadataDetailsProbeState::Unloaded,
+            details_probe_generation: 0,
+            save_generation: 0,
+            active_save_generation: None,
+        }
+    }
+
+    pub fn from_disc(disc: DiscTechnicalDetails) -> Self {
+        Self {
+            session_id: next_metadata_editor_details_session_id(),
+            files: Vec::new(),
+            disc: Some(disc),
+            details_probe_state: MetadataDetailsProbeState::Ready,
+            details_probe_generation: 0,
+            save_generation: 0,
+            active_save_generation: None,
+        }
+    }
+
+    /// Start an async save for this editor surface and return the identity
+    /// that the completion message must echo before it can mutate state.
+    pub fn begin_write(&mut self) -> (u64, u64) {
+        let generation = self.save_generation.saturating_add(1);
+        self.save_generation = generation;
+        self.active_save_generation = Some(generation);
+        (self.session_id, generation)
+    }
+
+    pub fn cancel_details_probe(&mut self) {
+        let generation = match &self.details_probe_state {
+            MetadataDetailsProbeState::Loading { generation, .. } => Some(*generation),
+            _ => None,
+        };
+        if let Some(generation) = generation {
+            for file in &mut self.files {
+                if matches!(file.media_facts, ProbeState::Loading { generation: g } if g == generation) {
+                    file.media_facts = ProbeState::Cancelled { generation };
+                }
+            }
+            self.details_probe_state = MetadataDetailsProbeState::Cancelled { generation };
+        }
+    }
+
+    /// Clear only failed Details probe results so an explicit user retry can
+    /// recover from transient I/O errors without discarding successfully cached
+    /// stream data. Normal Details entry remains idempotent; this is the
+    /// intentional escape hatch for sticky failures.
+    pub fn retry_failed_details_probes(&mut self) -> usize {
+        self.cancel_details_probe();
+        let mut cleared = 0usize;
+        for file in &mut self.files {
+            let had_failed_probe = matches!(file.media_facts, ProbeState::Failed { .. } | ProbeState::Cancelled { .. });
+            if had_failed_probe {
+                file.media_facts = ProbeState::NotLoaded;
+                file.issues.retain(|issue| !matches!(issue, MetadataIssue::Probe { .. }));
+                cleared = cleared.saturating_add(1);
+            }
+        }
+        if cleared > 0 || matches!(self.details_probe_state, MetadataDetailsProbeState::Cancelled { .. }) {
+            self.details_probe_state = MetadataDetailsProbeState::Unloaded;
+        }
+        cleared
+    }
+
+    pub fn details_probe_issue_count(&self) -> usize {
+        match &self.details_probe_state {
+            MetadataDetailsProbeState::Partial { issues } => issues.len(),
+            _ => self.files.iter().filter(|file| matches!(file.media_facts, ProbeState::Failed { .. })).count(),
+        }
+    }
+
+    /// Reduce a completed background Details probe into ordinary editor state.
+    ///
+    /// Invariant: worker results enter the editor only through this transition
+    /// after an `AppMessage`; rendering and status assembly never poll worker
+    /// state or mutate probe fields. Stale generations are ignored.
+    pub fn apply_details_probe_results(
+        &mut self,
+        session_id: u64,
+        generation: u64,
+        results: Vec<MetadataDetailsProbeFileResult>,
+    ) -> Option<String> {
+        if self.session_id != session_id {
+            return None;
+        }
+        let MetadataDetailsProbeState::Loading { generation: active_generation, .. } = self.details_probe_state else {
+            return None;
+        };
+        if active_generation != generation {
+            return None;
+        }
+
+        let mut loaded = 0usize;
+        let mut issues = Vec::new();
+        for item in results {
+            let Some(file) = self.files.get_mut(item.index) else {
+                let reason = if item.path.as_os_str().is_empty() {
+                    format!("probe result index {} is not part of this editor", item.index)
+                } else {
+                    format!(
+                        "probe result for '{}' used stale index {}",
+                        item.path.display(),
+                        item.index
+                    )
+                };
+                issues.push(reason);
+                continue;
+            };
+            if file.file_facts.path != item.path {
+                issues.push(format!(
+                    "ignored stale probe result for '{}' at index {}; current file is '{}'",
+                    item.path.display(),
+                    item.index,
+                    file.file_facts.path.display()
+                ));
+                continue;
+            }
+            match item.result {
+                Ok(info) => {
+                    file.set_probe_ready(info);
+                    loaded = loaded.saturating_add(1);
+                }
+                Err(reason) => {
+                    issues.push(reason.clone());
+                    file.set_probe_failed(reason, true);
+                }
+            }
+        }
+
+        // A completed worker message must leave no file stuck in this
+        // generation's Loading state. Missing/path-mismatched results become
+        // retryable probe issues rather than invisible indefinite loading.
+        for file in &mut self.files {
+            if matches!(file.media_facts, ProbeState::Loading { generation: g } if g == generation) {
+                let reason = format!(
+                    "probe result missing for '{}' in Details session {} generation {}",
+                    file.file_facts.path.display(),
+                    session_id,
+                    generation
+                );
+                issues.push(reason.clone());
+                file.set_probe_failed(reason, true);
+            }
+        }
+
+        if issues.is_empty() {
+            self.details_probe_state = MetadataDetailsProbeState::Ready;
+            Some(format!(
+                "metadata editor: Details ready ({} file{})",
+                loaded,
+                if loaded == 1 { "" } else { "s" }
+            ))
+        } else {
+            let issue_count = issues.len();
+            self.details_probe_state = MetadataDetailsProbeState::Partial { issues };
+            Some(format!(
+                "metadata editor: Details partially loaded ({} ok, {} issue{})",
+                loaded,
+                issue_count,
+                if issue_count == 1 { "" } else { "s" }
+            ))
+        }
+    }
+
+    pub fn from_disc_presentation(
+        presentation_label: String,
+        track_count: usize,
+        duration_secs: Option<f64>,
+        format: &crate::disc::model::AudioPresentationFormat,
+    ) -> Self {
+        Self::from_disc(DiscTechnicalDetails {
+            presentation_label,
+            track_count,
+            duration_secs: duration_secs.filter(|duration| duration.is_finite() && *duration > 0.0),
+            codec: format.codec.clone(),
+            sample_rate: format.sample_rate,
+            channels: format.channels.map(u32::from),
+            channel_layout: format.channel_layout.clone(),
+            bit_depth: format.bit_depth,
+            lossless: Some(format.lossless),
+            tool: None,
+        })
+    }
+}
+
+/// One presentation surface inside the metadata editor.
+///
+/// Invariant: this struct owns a presentation's editable rows, labels, dirty
+/// state, and read-only facts. For disc-backed editors the active editing
+/// surface is the `PresentationTab` stored directly in
+/// `MetadataEditorModel.presentation_tabs[active_tab]`; no top-level active
+/// clone exists.
 #[derive(Debug, Clone)]
 pub struct PresentationTab {
     pub id: crate::disc::model::PresentationId,
@@ -2812,6 +3595,8 @@ pub struct PresentationTab {
     pub file_labels: Vec<String>,
     pub deleted: Vec<usize>,
     pub dirty: bool,
+    /// Cached Details/Artwork data for this presentation.
+    pub technical_details: MetadataTechnicalDetails,
     pub sacd_area_kind: Option<crate::tui::sacd::AreaKind>,
     pub sacd_stereo_durations: Option<Vec<f64>>,
     pub sacd_multi_channel_durations: Option<Vec<f64>>,
@@ -2838,118 +3623,380 @@ pub struct PresentationTab {
     pub bluray_chapter_durations: Option<Vec<f64>>,
 }
 
-/// State for the metadata editor overlay.
+impl Default for PresentationTab {
+    fn default() -> Self {
+        Self {
+            id: crate::disc::model::PresentationId::DvdAudioGroup(0),
+            label: String::new(),
+            paths: Vec::new(),
+            entries: Vec::new(),
+            file_labels: Vec::new(),
+            deleted: Vec::new(),
+            dirty: false,
+            technical_details: MetadataTechnicalDetails::default(),
+            sacd_area_kind: None,
+            sacd_stereo_durations: None,
+            sacd_multi_channel_durations: None,
+            dvdv_source_chapters: None,
+            dvdv_track_durations: None,
+            dvdv_angle_number: None,
+            dvdv_title_angle_count: None,
+            bluray_playlist_number: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream_index: None,
+            bluray_angle_number: None,
+            bluray_chapter_durations: None,
+        }
+    }
+}
+
+impl PresentationTab {
+    /// Create a file-backed or presentation-backed editor surface with all
+    /// invariant-carrying fields initialized in one place.
+    pub fn new(
+        id: crate::disc::model::PresentationId,
+        label: impl Into<String>,
+        paths: Vec<std::path::PathBuf>,
+        entries: Vec<crate::tui::probe::TagEntry>,
+        file_labels: Vec<String>,
+        technical_details: MetadataTechnicalDetails,
+    ) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            paths,
+            entries,
+            file_labels,
+            technical_details,
+            ..Self::default()
+        }
+    }
+
+    /// Convenience constructor for the ordinary audio-file editor surface.
+    pub fn for_files(
+        paths: Vec<std::path::PathBuf>,
+        entries: Vec<crate::tui::probe::TagEntry>,
+        file_labels: Vec<String>,
+        technical_details: MetadataTechnicalDetails,
+    ) -> Self {
+        Self::new(
+            crate::disc::model::PresentationId::DvdAudioGroup(0),
+            String::new(),
+            paths,
+            entries,
+            file_labels,
+            technical_details,
+        )
+    }
+
+    /// Capture the active surface of an editor state as a presentation tab.
+    /// This keeps disc builders from re-spelling every presentation field and
+    /// preserves the authoritative model invariant as new per-surface facts are
+    /// added.
+    pub fn from_editor_state(
+        id: crate::disc::model::PresentationId,
+        label: impl Into<String>,
+        state: &MetadataEditorState,
+    ) -> Self {
+        let active = state.active_surface();
+        let mut tab = Self::new(
+            id,
+            label,
+            active.paths.clone(),
+            active.entries.clone(),
+            active.file_labels.clone(),
+            active.technical_details.clone(),
+        );
+        tab.deleted = active.deleted.clone();
+        tab.dirty = active.dirty;
+        tab.sacd_area_kind = active.sacd_area_kind;
+        tab.sacd_stereo_durations = active.sacd_stereo_durations.clone();
+        tab.sacd_multi_channel_durations = active.sacd_multi_channel_durations.clone();
+        tab.dvdv_source_chapters = active.dvdv_source_chapters.clone();
+        tab.dvdv_track_durations = active.dvdv_track_durations.clone();
+        tab.dvdv_angle_number = active.dvdv_angle_number;
+        tab.dvdv_title_angle_count = active.dvdv_title_angle_count;
+        tab.bluray_playlist_number = active.bluray_playlist_number;
+        tab.bluray_audio_pid = active.bluray_audio_pid;
+        tab.bluray_audio_stream_index = active.bluray_audio_stream_index;
+        tab.bluray_angle_number = active.bluray_angle_number;
+        tab.bluray_chapter_durations = active.bluray_chapter_durations.clone();
+        tab
+    }
+}
+
+/// Authoritative metadata-editor model.
+///
+/// `MetadataEditorState` is only the application overlay wrapper. This model is
+/// the source of truth for editable metadata, presentation selection, cached
+/// source/media/artwork facts, issue state, and UI interaction state.
+///
+/// Invariants:
+/// - Active editable data is always the active `PresentationTab`: `file_surface`
+///   for plain file editors, or `presentation_tabs[active_tab]` for disc-backed
+///   editors.
+/// - There are no top-level mirrored `paths`/`entries`/`technical_details`
+///   fields outside this model.
+/// - `active_tab < presentation_tabs.len()` whenever `presentation_tabs` is
+///   non-empty; accessors clamp defensively for stale test fixtures.
+/// - Rendering never performs filesystem, tag, media-probe, or save I/O.
+/// - Background worker results enter via explicit reduction methods.
+/// - Read-only tab scroll values are clamped before they are stored.
 #[derive(Debug, Clone)]
-pub struct MetadataEditorState {
-    /// Files being edited.
-    pub paths: Vec<std::path::PathBuf>,
-    /// All tag entries (ordered for display).
-    pub entries: Vec<crate::tui::probe::TagEntry>,
-    /// Cursor position in the entries list.
-    pub cursor: usize,
-    /// Scroll offset for the visible window.
-    pub scroll: usize,
-    /// Last left-click: (row_index, timestamp) for double-click detection.
-    pub last_click: Option<(usize, std::time::Instant)>,
-    /// Text input for inline field editing.
-    pub edit_input: Option<crate::tui::text_input::TextInputState>,
-    /// Text input for adding a new field key.
-    pub add_key_input: Option<crate::tui::text_input::TextInputState>,
-    /// Current phase.
-    pub phase: MetadataEditorPhase,
-    /// Whether any entries have been modified.
-    pub dirty: bool,
-    /// Entries marked for deletion (by index). Tracked separately so
-    /// the user can see them struck through before saving.
-    pub deleted: Vec<usize>,
-    /// Per-file context labels for the detail overlay (e.g., "01 filename").
-    pub file_labels: Vec<String>,
-    /// Which entry index is being detail-edited.
-    pub detail_field_idx: usize,
-    /// Cursor within the detail overlay.
-    pub detail_cursor: usize,
-    /// Scroll offset in the detail overlay.
-    pub detail_scroll: usize,
-    /// Inline edit within the detail overlay.
-    pub detail_edit: Option<crate::tui::text_input::TextInputState>,
-    /// Cached MusicBrainz lookup result + paths so the user can run
-    /// `:mb-back` to pick a different release without re-querying.
-    /// `None` when the editor wasn't reached through MB picker (or
-    /// the lookup had a single match and the picker was skipped).
-    pub mb_back: Option<MbBackCache>,
-    /// Cached GnudbReviewState so the user can run `:gnudb-back`
-    /// to return from the populated editor to the per-track review
-    /// surface without re-querying gnudb. `None` when the editor
-    /// wasn't reached via the gnudb flow.
-    pub gnudb_back: Option<Box<GnudbReviewState>>,
-    /// When true, the editor is opened in display-only mode: edits,
-    /// deletions, additions, and saves are all refused with a status
-    /// message. Set for SACD ISOs without a writable sidecar; once
-    /// C5c discovered a sidecar to write to, this flips to false.
-    pub read_only: bool,
-    /// SACD-only: the sidecar XML path that `:w` will read-modify-
-    /// write into. `None` for normal lofty-backed editors.
-    pub sacd_sidecar_path: Option<std::path::PathBuf>,
-    /// SACD-only: which area's tracks the editor is currently
-    /// surfacing, so the save path knows which sidecar track IDs
-    /// to update (`Stereo` → area 1, `MultiChannel` → area 2).
-    pub sacd_area_kind: Option<crate::tui::sacd::AreaKind>,
-    /// SACD-only: per-track durations (seconds) for the stereo area,
-    /// stashed at editor-open time so `:tags-mb` can synthesize a
-    /// CD-equivalent TOC for MusicBrainz disc-id lookup without
-    /// re-reading the ISO. `None` when the disc has no stereo area
-    /// or its TRL1/TRL2 sectors failed to parse.
-    pub sacd_stereo_durations: Option<Vec<f64>>,
-    /// SACD-only: same as `sacd_stereo_durations` for the
-    /// multi-channel area. `None` when absent or unparseable.
-    /// Both fields are populated regardless of which area the
-    /// editor is currently surfacing — the sibling-area mirror
-    /// (future C-2c) needs both available.
-    pub sacd_multi_channel_durations: Option<Vec<f64>>,
-    /// DVD-Video-only: per-track source chapter numbers for the active VTS/title/stream.
-    /// The sidecar save path uses this to persist source identity without scraping
-    /// user-visible row labels.
-    pub dvdv_source_chapters: Option<Vec<u16>>,
-    /// DVD-Video-only: per-chapter durations (seconds) for the active VTS/title/stream.
-    /// The MusicBrainz populate path uses these to warn when positional track
-    /// assignment differs from MusicBrainz `length_ms` by more than the DVD-Video
-    /// tolerance.
-    pub dvdv_track_durations: Option<Vec<f64>>,
-    /// DVD-Video-only: selected camera angle when angle identity is required.
-    /// Single-angle presentations keep this as `None`.
-    pub dvdv_angle_number: Option<u8>,
-    /// DVD-Video-only: authored angle count or equivalent ambiguity signal.
-    pub dvdv_title_angle_count: Option<u8>,
-    /// Blu-ray-only: authored playlist number for the active presentation.
-    pub bluray_playlist_number: Option<u32>,
-    /// Blu-ray-only: authored audio PID for the active presentation.
-    pub bluray_audio_pid: Option<u16>,
-    /// Blu-ray-only: zero-based authored audio stream index for the active presentation.
-    pub bluray_audio_stream_index: Option<u8>,
-    /// Blu-ray-only: one-based display angle for the active presentation.
-    pub bluray_angle_number: Option<u8>,
-    /// Blu-ray-only: per-chapter durations (seconds) for the active presentation.
-    pub bluray_chapter_durations: Option<Vec<f64>>,
-    /// Disc-backed editor tabs. Empty for plain file editors. Disc editors
-    /// keep one entry per selectable presentation, including the single-
-    /// presentation case, so rendering can show the same styled control for
-    /// the whole <=2-presentation path. The active tab is mirrored into the
-    /// legacy top-level editor fields for rendering and editing.
+pub struct MetadataEditorModel {
+    /// Active file-backed surface when the editor is not presentation-backed.
+    pub file_surface: PresentationTab,
+    /// Presentation-backed surfaces. When non-empty, the active editable surface
+    /// is `presentation_tabs[active_tab]`; no separate active copy exists.
     pub presentation_tabs: Vec<PresentationTab>,
-    /// Active index into `presentation_tabs`. Ignored when the tab vector is
-    /// empty.
     pub active_tab: usize,
-    /// True while the 3+-presentation dropdown is open inside the metadata editor.
+
+    pub cursor: usize,
+    pub scroll: usize,
+    pub content_tab: ContentTab,
+    pub content_tab_scrolls: [usize; ContentTab::COUNT],
+    pub last_click: Option<(usize, std::time::Instant)>,
+    pub edit_input: Option<crate::tui::text_input::TextInputState>,
+    pub add_key_input: Option<crate::tui::text_input::TextInputState>,
+    pub phase: MetadataEditorPhase,
+    pub detail_field_idx: usize,
+    pub detail_cursor: usize,
+    pub detail_scroll: usize,
+    pub detail_edit: Option<crate::tui::text_input::TextInputState>,
+    pub mb_back: Option<MbBackCache>,
+    pub gnudb_back: Option<Box<GnudbReviewState>>,
+    pub read_only: bool,
+    pub sacd_sidecar_path: Option<std::path::PathBuf>,
     pub presentation_selector_open: bool,
-    /// Highlighted dropdown row. It is intentionally separate from `active_tab` so
-    /// Up/Down navigation does not switch presentations until the user confirms.
     pub presentation_selector_cursor: usize,
-    /// First visible dropdown row. Rendering clamps this against current viewport
-    /// height, so stale values from resize or tab-count changes are harmless.
     pub presentation_selector_scroll: usize,
 }
 
+impl Default for MetadataEditorModel {
+    fn default() -> Self {
+        Self {
+            file_surface: PresentationTab::default(),
+            presentation_tabs: Vec::new(),
+            active_tab: 0,
+            cursor: 0,
+            scroll: 0,
+            content_tab: ContentTab::Metadata,
+            content_tab_scrolls: [0; ContentTab::COUNT],
+            last_click: None,
+            edit_input: None,
+            add_key_input: None,
+            phase: MetadataEditorPhase::Editing,
+            detail_field_idx: 0,
+            detail_cursor: 0,
+            detail_scroll: 0,
+            detail_edit: None,
+            mb_back: None,
+            gnudb_back: None,
+            read_only: false,
+            sacd_sidecar_path: None,
+            presentation_selector_open: false,
+            presentation_selector_cursor: 0,
+            presentation_selector_scroll: 0,
+        }
+    }
+}
+
+impl MetadataEditorModel {
+    pub fn single_surface(file_surface: PresentationTab) -> Self {
+        Self {
+            file_surface,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_presentations(presentation_tabs: Vec<PresentationTab>, active_tab: usize) -> Self {
+        let active_tab = active_tab.min(presentation_tabs.len().saturating_sub(1));
+        Self {
+            presentation_tabs,
+            active_tab,
+            presentation_selector_cursor: active_tab,
+            presentation_selector_scroll: active_tab,
+            ..Self::default()
+        }
+    }
+
+    pub fn active_surface(&self) -> &PresentationTab {
+        if self.presentation_tabs.is_empty() {
+            &self.file_surface
+        } else {
+            let idx = self.active_tab.min(self.presentation_tabs.len().saturating_sub(1));
+            &self.presentation_tabs[idx]
+        }
+    }
+
+    pub fn active_surface_mut(&mut self) -> &mut PresentationTab {
+        if self.presentation_tabs.is_empty() {
+            &mut self.file_surface
+        } else {
+            let idx = self.active_tab.min(self.presentation_tabs.len().saturating_sub(1));
+            &mut self.presentation_tabs[idx]
+        }
+    }
+
+    /// Apply a background Details probe completion to the matching editor
+    /// surface, not merely to whatever presentation is currently active.
+    ///
+    /// Invariant: session id, generation, and per-result path identity must all
+    /// match before probe facts are reduced into state. This prevents stale work
+    /// from a closed/reopened editor or another presentation from mutating the
+    /// wrong file facts.
+    pub fn apply_details_probe_results(
+        &mut self,
+        session_id: u64,
+        generation: u64,
+        results: Vec<MetadataDetailsProbeFileResult>,
+    ) -> Option<String> {
+        if self.presentation_tabs.is_empty() {
+            if self.file_surface.technical_details.session_id == session_id {
+                return self
+                    .file_surface
+                    .technical_details
+                    .apply_details_probe_results(session_id, generation, results);
+            }
+            return None;
+        }
+
+        if let Some(idx) = self
+            .presentation_tabs
+            .iter()
+            .position(|tab| tab.technical_details.session_id == session_id)
+        {
+            return self.presentation_tabs[idx]
+                .technical_details
+                .apply_details_probe_results(session_id, generation, results);
+        }
+
+        None
+    }
+}
+
+impl std::ops::Deref for MetadataEditorState {
+    type Target = MetadataEditorModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.model
+    }
+}
+
+impl std::ops::DerefMut for MetadataEditorState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.model
+    }
+}
+
+
+/// State for the metadata editor overlay.
+///
+/// Metadata editor overlay state.
+///
+/// This wrapper connects the authoritative `MetadataEditorModel` to the rest of
+/// the TUI overlay system. Rendering consumes model facts only; it must not
+/// perform filesystem, tag, media-probe, or save I/O.
+///
+/// Invariants:
+/// - `model.file_surface` or `model.presentation_tabs[active_tab]` is the only
+///   active editable source.
+/// - `per_file_values.len() == paths.len()` for every file-backed editable row.
+/// - `active_tab < presentation_tabs.len()` whenever `presentation_tabs` is non-empty.
+/// - rendering never performs filesystem, tag, media-probe, or save I/O.
+/// - read-only tab scroll values are clamped before storage.
+#[derive(Debug, Clone)]
+pub struct MetadataEditorState {
+    /// Authoritative metadata editor model.
+    ///
+    /// All active editable rows, selected presentation state, source facts,
+    /// media/artwork facts, issues, and UI tab/scroll state live in this model.
+    /// `MetadataEditorState` is now only the overlay wrapper used by the
+    /// surrounding application; it no longer owns mirrored
+    /// `paths`/`entries`/`technical_details`/presentation fields. Active-surface
+    /// ownership is intentionally explicit through `active_surface()` and
+    /// `active_surface_mut()`; the remaining state-level `Deref` is compatibility
+    /// for model-level UI fields only.
+    pub model: MetadataEditorModel,
+}
+
+
+fn read_only_max_scroll(total_lines: usize, visible_rows: usize) -> usize {
+    total_lines.saturating_sub(visible_rows.max(1))
+}
+
 impl MetadataEditorState {
+    pub fn from_model(model: MetadataEditorModel) -> Self {
+        Self { model }
+    }
+
+    pub fn for_files(
+        paths: Vec<std::path::PathBuf>,
+        entries: Vec<crate::tui::probe::TagEntry>,
+        file_labels: Vec<String>,
+        technical_details: MetadataTechnicalDetails,
+    ) -> Self {
+        Self::from_model(MetadataEditorModel::single_surface(PresentationTab::for_files(
+            paths,
+            entries,
+            file_labels,
+            technical_details,
+        )))
+    }
+
+    pub fn for_disc_presentations(presentation_tabs: Vec<PresentationTab>, active_tab: usize) -> Self {
+        Self::from_model(MetadataEditorModel::with_presentations(presentation_tabs, active_tab))
+    }
+
+    /// Explicit access to the active editable surface.
+    ///
+    /// Use this instead of relying on `Deref` to make the ownership path clear:
+    /// `MetadataEditorState -> MetadataEditorModel -> active PresentationTab`.
+    pub fn active_surface(&self) -> &PresentationTab {
+        self.model.active_surface()
+    }
+
+    /// Explicit mutable access to the active editable surface.
+    ///
+    /// All edits to rows, file labels, deleted rows, dirty state, and per-surface
+    /// media facts should go through this method or a reducer-style model method.
+    pub fn active_surface_mut(&mut self) -> &mut PresentationTab {
+        self.model.active_surface_mut()
+    }
+
+    /// Recompute dirty state for the active surface from authoritative row data.
+    pub fn recompute_active_dirty(&mut self) -> bool {
+        let dirty = crate::tui::probe::metadata_editor_has_changes(self);
+        self.active_surface_mut().dirty = dirty;
+        dirty
+    }
+
+    /// Explicit access to the authoritative editor model for model-level UI state.
+    pub fn editor_model(&self) -> &MetadataEditorModel {
+        &self.model
+    }
+
+    /// Explicit mutable access to the authoritative editor model.
+    pub fn editor_model_mut(&mut self) -> &mut MetadataEditorModel {
+        &mut self.model
+    }
+
+    /// Replace the file-backed surface with presentation-backed surfaces while
+    /// preserving model-level editor state such as read-only mode and sidecar
+    /// target. Active editable data then resolves through `active_surface()`.
+    pub fn set_presentation_surfaces(
+        &mut self,
+        presentation_tabs: Vec<PresentationTab>,
+        active_tab: usize,
+    ) {
+        let active_tab = active_tab.min(presentation_tabs.len().saturating_sub(1));
+        self.model.presentation_tabs = presentation_tabs;
+        self.model.active_tab = active_tab;
+        self.model.presentation_selector_cursor = active_tab;
+        self.model.presentation_selector_scroll = active_tab;
+        self.model.presentation_selector_open = false;
+    }
+
     pub fn shows_presentation_control(&self) -> bool {
         !self.presentation_tabs.is_empty()
     }
@@ -2958,19 +4005,129 @@ impl MetadataEditorState {
         self.presentation_tabs.len() > 1
     }
 
-    pub fn has_presentation_tabs(&self) -> bool {
-        self.has_multiple_presentations()
+
+    pub fn set_content_tab(&mut self, tab: ContentTab) -> bool {
+        if self.content_tab == tab {
+            return false;
+        }
+        self.save_active_content_tab_scroll();
+        self.content_tab = tab;
+        self.restore_active_content_tab_scroll();
+        self.reset_content_tab_interaction();
+        true
     }
 
-    pub fn uses_presentation_dropdown(&self) -> bool {
-        self.presentation_tabs.len() > 2
+    pub fn set_content_tab_by_index(&mut self, index: usize) -> bool {
+        ContentTab::from_index(index)
+            .map(|tab| self.set_content_tab(tab))
+            .unwrap_or(false)
+    }
+
+    pub fn next_content_tab(&mut self) -> bool {
+        let next = (self.content_tab.index() + 1) % ContentTab::ALL.len();
+        self.set_content_tab(ContentTab::ALL[next])
+    }
+
+    pub fn previous_content_tab(&mut self) -> bool {
+        let index = self.content_tab.index();
+        let next = if index == 0 {
+            ContentTab::ALL.len() - 1
+        } else {
+            index - 1
+        };
+        self.set_content_tab(ContentTab::ALL[next])
+    }
+
+    fn save_active_content_tab_scroll(&mut self) {
+        let idx = self.content_tab.index();
+        self.content_tab_scrolls[idx] = self.scroll;
+    }
+
+    fn restore_active_content_tab_scroll(&mut self) {
+        self.scroll = self.content_tab_scrolls[self.content_tab.index()];
+        if self.content_tab == ContentTab::Metadata {
+            // The active row may have moved while another content tab was shown
+            // (for example after presentation switches or command-populated
+            // edits). Without viewport dimensions here, enforce the safe half of
+            // the invariant: the scroll window must never start after the
+            // selected row. Input handlers call their viewport-aware
+            // `ensure_cursor_visible` after user-driven tab changes.
+            self.cursor = self.cursor.min(self.active_surface().entries.len());
+            if self.scroll > self.cursor {
+                self.scroll = self.cursor;
+            }
+            self.content_tab_scrolls[ContentTab::Metadata.index()] = self.scroll;
+        }
+    }
+
+    fn reset_content_tab_interaction(&mut self) {
+        self.last_click = None;
+        self.edit_input = None;
+        self.add_key_input = None;
+        self.detail_edit = None;
+        self.phase = MetadataEditorPhase::Editing;
+    }
+
+    pub fn scroll_read_only_content_by(
+        &mut self,
+        delta: isize,
+        total_lines: usize,
+        visible_rows: usize,
+    ) -> bool {
+        if self.content_tab == ContentTab::Metadata {
+            return false;
+        }
+
+        let max_scroll = read_only_max_scroll(total_lines, visible_rows);
+        let old = self.scroll;
+        let current = old.min(max_scroll);
+        let step = delta.checked_abs().unwrap_or(isize::MAX) as usize;
+        let next = if delta < 0 {
+            current.saturating_sub(step)
+        } else {
+            current.saturating_add(step).min(max_scroll)
+        };
+        let idx = self.content_tab.index();
+        self.scroll = next;
+        self.content_tab_scrolls[idx] = next;
+        self.scroll != old
+    }
+
+    pub fn set_read_only_content_scroll(
+        &mut self,
+        scroll: usize,
+        total_lines: usize,
+        visible_rows: usize,
+    ) -> bool {
+        if self.content_tab == ContentTab::Metadata {
+            return false;
+        }
+
+        let max_scroll = read_only_max_scroll(total_lines, visible_rows);
+        let next = scroll.min(max_scroll);
+        let changed = self.scroll != next;
+        let idx = self.content_tab.index();
+        self.scroll = next;
+        self.content_tab_scrolls[idx] = next;
+        changed
+    }
+
+    pub fn clamp_read_only_content_scroll(
+        &mut self,
+        total_lines: usize,
+        visible_rows: usize,
+    ) -> bool {
+        if self.content_tab == ContentTab::Metadata {
+            return false;
+        }
+
+        self.set_read_only_content_scroll(self.scroll, total_lines, visible_rows)
     }
 
     pub fn open_presentation_selector(&mut self) -> bool {
-        if !self.uses_presentation_dropdown() {
+        if !self.shows_presentation_control() {
             return false;
         }
-        self.sync_active_presentation();
         self.presentation_selector_open = true;
         self.presentation_selector_cursor = self.active_tab.min(self.presentation_tabs.len() - 1);
         self.presentation_selector_scroll = self.presentation_selector_cursor;
@@ -2988,7 +4145,7 @@ impl MetadataEditorState {
     }
 
     pub fn move_presentation_selector_cursor(&mut self, delta: isize) -> bool {
-        if !self.uses_presentation_dropdown() {
+        if !self.shows_presentation_control() {
             return false;
         }
         let len = self.presentation_tabs.len();
@@ -3007,7 +4164,7 @@ impl MetadataEditorState {
     }
 
     pub fn set_presentation_selector_cursor(&mut self, next: usize) -> bool {
-        if !self.uses_presentation_dropdown() || next >= self.presentation_tabs.len() {
+        if !self.shows_presentation_control() || next >= self.presentation_tabs.len() {
             return false;
         }
         let changed = self.presentation_selector_cursor != next;
@@ -3019,7 +4176,7 @@ impl MetadataEditorState {
     }
 
     pub fn scroll_presentation_selector(&mut self, delta: isize, visible_rows: usize) -> bool {
-        if !self.uses_presentation_dropdown() || visible_rows == 0 {
+        if !self.shows_presentation_control() || visible_rows == 0 {
             return false;
         }
         let len = self.presentation_tabs.len();
@@ -3046,7 +4203,7 @@ impl MetadataEditorState {
     }
 
     pub fn select_presentation_selector_cursor(&mut self) -> bool {
-        if !self.uses_presentation_dropdown() {
+        if !self.shows_presentation_control() {
             return false;
         }
         let next = self.presentation_selector_cursor.min(self.presentation_tabs.len() - 1);
@@ -3061,58 +4218,38 @@ impl MetadataEditorState {
     }
 
     pub fn any_presentation_dirty(&self) -> bool {
-        self.dirty || self.presentation_tabs.iter().any(|tab| tab.dirty)
+        self.active_surface().dirty || self.presentation_tabs.iter().any(|tab| tab.dirty)
     }
 
-    pub fn sync_active_presentation(&mut self) {
-        let Some(tab) = self.presentation_tabs.get_mut(self.active_tab) else {
-            return;
-        };
-        tab.paths = self.paths.clone();
-        tab.entries = self.entries.clone();
-        tab.file_labels = self.file_labels.clone();
-        tab.deleted = self.deleted.clone();
-        tab.dirty = self.dirty;
-        tab.sacd_area_kind = self.sacd_area_kind.clone();
-        tab.sacd_stereo_durations = self.sacd_stereo_durations.clone();
-        tab.sacd_multi_channel_durations = self.sacd_multi_channel_durations.clone();
-        tab.dvdv_source_chapters = self.dvdv_source_chapters.clone();
-        tab.dvdv_track_durations = self.dvdv_track_durations.clone();
-        tab.dvdv_angle_number = self.dvdv_angle_number;
-        tab.dvdv_title_angle_count = self.dvdv_title_angle_count;
-        tab.bluray_playlist_number = self.bluray_playlist_number;
-        tab.bluray_audio_pid = self.bluray_audio_pid;
-        tab.bluray_audio_stream_index = self.bluray_audio_stream_index;
-        tab.bluray_angle_number = self.bluray_angle_number;
-        tab.bluray_chapter_durations = self.bluray_chapter_durations.clone();
+    /// The active presentation is authoritative in-place.
+    ///
+    /// Older versions cloned top-level active fields back into
+    /// `presentation_tabs`. This model stores edits directly in the active
+    /// presentation surface, so there is no reconciliation step.
+    pub fn active_presentation_is_authoritative(&self) -> bool {
+        true
     }
+
+
 
     pub fn switch_presentation_tab(&mut self, next: usize) -> bool {
         if next >= self.presentation_tabs.len() || next == self.active_tab {
             return false;
         }
-        self.sync_active_presentation();
-        let tab = self.presentation_tabs[next].clone();
+
+        // The active editable surface is `presentation_tabs[active_tab]`;
+        // switching presentations changes the index only. No active copy is
+        // cloned out or reconciled back.
         self.active_tab = next;
-        self.paths = tab.paths;
-        self.entries = tab.entries;
-        self.file_labels = tab.file_labels;
-        self.deleted = tab.deleted;
-        self.dirty = tab.dirty;
-        self.sacd_area_kind = tab.sacd_area_kind;
-        self.sacd_stereo_durations = tab.sacd_stereo_durations;
-        self.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
-        self.dvdv_source_chapters = tab.dvdv_source_chapters;
-        self.dvdv_track_durations = tab.dvdv_track_durations;
-        self.dvdv_angle_number = tab.dvdv_angle_number;
-        self.dvdv_title_angle_count = tab.dvdv_title_angle_count;
-        self.bluray_playlist_number = tab.bluray_playlist_number;
-        self.bluray_audio_pid = tab.bluray_audio_pid;
-        self.bluray_audio_stream_index = tab.bluray_audio_stream_index;
-        self.bluray_angle_number = tab.bluray_angle_number;
-        self.bluray_chapter_durations = tab.bluray_chapter_durations;
-        self.cursor = self.cursor.min(self.entries.len());
-        self.scroll = 0;
+        self.cursor = self.cursor.min(self.active_surface().entries.len());
+        self.content_tab_scrolls = [0; ContentTab::COUNT];
+        let ct_idx = self.content_tab.index();
+        self.scroll = if self.content_tab == ContentTab::Metadata {
+            self.cursor
+        } else {
+            0
+        };
+        self.content_tab_scrolls[ct_idx] = self.scroll;
         self.last_click = None;
         self.edit_input = None;
         self.add_key_input = None;
@@ -3128,6 +4265,7 @@ impl MetadataEditorState {
             .min(self.presentation_tabs.len().saturating_sub(1));
         true
     }
+
 
     pub fn next_presentation_tab(&mut self) -> bool {
         if self.presentation_tabs.len() <= 1 {
@@ -3150,82 +4288,45 @@ impl MetadataEditorState {
     }
 
     pub fn mark_active_presentation_saved(&mut self) {
-        self.sync_active_presentation();
-        if let Some(tab) = self.presentation_tabs.get_mut(self.active_tab) {
-            mark_presentation_tab_saved(tab);
-            let tab = tab.clone();
-            self.entries = tab.entries;
-            self.deleted = tab.deleted;
-            self.dirty = false;
-        } else {
-            self.dirty = false;
-            self.deleted.clear();
-            for entry in &mut self.entries {
-                mark_tag_entry_saved(entry);
-            }
-        }
+        mark_presentation_tab_saved(self.model.active_surface_mut());
     }
 
     pub fn mark_presentation_tabs_saved(&mut self, saved_indices: &[usize]) {
-        self.sync_active_presentation();
         if self.presentation_tabs.is_empty() {
             if !saved_indices.is_empty() {
-                self.dirty = false;
-                self.deleted.clear();
-                for entry in &mut self.entries {
-                    mark_tag_entry_saved(entry);
-                }
+                mark_presentation_tab_saved(&mut self.model.file_surface);
             }
             return;
         }
 
-        let mut active_saved = false;
         for &idx in saved_indices {
             if let Some(tab) = self.presentation_tabs.get_mut(idx) {
                 mark_presentation_tab_saved(tab);
-                active_saved |= idx == self.active_tab;
-            }
-        }
-        if active_saved {
-            if let Some(tab) = self.presentation_tabs.get(self.active_tab).cloned() {
-                self.entries = tab.entries;
-                self.deleted = tab.deleted;
-                self.dirty = tab.dirty;
             }
         }
     }
 
     pub fn dirty_presentation_count(&mut self) -> usize {
-        self.sync_active_presentation();
         if self.presentation_tabs.is_empty() {
-            if self.dirty { 1 } else { 0 }
+            if self.active_surface().dirty { 1 } else { 0 }
         } else {
             self.presentation_tabs.iter().filter(|tab| tab.dirty).count()
         }
     }
 
     pub fn active_presentation_is_dirty(&mut self) -> bool {
-        self.sync_active_presentation();
         self.presentation_tabs
             .get(self.active_tab)
             .map(|tab| tab.dirty)
-            .unwrap_or(self.dirty)
+            .unwrap_or_else(|| self.active_surface().dirty)
     }
 
     pub fn mark_all_presentations_saved(&mut self) {
-        self.sync_active_presentation();
-        for tab in &mut self.presentation_tabs {
-            mark_presentation_tab_saved(tab);
-        }
-        if let Some(tab) = self.presentation_tabs.get(self.active_tab).cloned() {
-            self.entries = tab.entries;
-            self.deleted = tab.deleted;
-            self.dirty = false;
+        if self.presentation_tabs.is_empty() {
+            mark_presentation_tab_saved(&mut self.model.file_surface);
         } else {
-            self.dirty = false;
-            self.deleted.clear();
-            for entry in &mut self.entries {
-                mark_tag_entry_saved(entry);
+            for tab in &mut self.presentation_tabs {
+                mark_presentation_tab_saved(tab);
             }
         }
     }
@@ -3234,14 +4335,14 @@ impl MetadataEditorState {
         if self.presentation_tabs.len() <= 1 {
             return 0;
         }
-        self.sync_active_presentation();
         let Some(active) = self.presentation_tabs.get(self.active_tab).cloned() else {
             return 0;
         };
         let track_count = active.paths.len();
+        let active_tab = self.active_tab;
         let mut changed_tabs = 0usize;
         for (idx, tab) in self.presentation_tabs.iter_mut().enumerate() {
-            if idx == self.active_tab || tab.paths.len() != track_count {
+            if idx == active_tab || tab.paths.len() != track_count {
                 continue;
             }
             let copied = copy_musicbrainz_entries_preserving_originals(
@@ -3256,26 +4357,54 @@ impl MetadataEditorState {
             tab.dirty = true;
             changed_tabs += 1;
         }
-        if let Some(tab) = self.presentation_tabs.get(self.active_tab).cloned() {
-            self.entries = tab.entries;
-            self.paths = tab.paths;
-            self.file_labels = tab.file_labels;
-            self.deleted = tab.deleted;
-            self.dirty = tab.dirty;
-            self.sacd_area_kind = tab.sacd_area_kind;
-            self.sacd_stereo_durations = tab.sacd_stereo_durations;
-            self.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
-            self.dvdv_source_chapters = tab.dvdv_source_chapters;
-            self.dvdv_track_durations = tab.dvdv_track_durations;
-            self.dvdv_angle_number = tab.dvdv_angle_number;
-            self.dvdv_title_angle_count = tab.dvdv_title_angle_count;
-            self.bluray_playlist_number = tab.bluray_playlist_number;
-            self.bluray_audio_pid = tab.bluray_audio_pid;
-            self.bluray_audio_stream_index = tab.bluray_audio_stream_index;
-            self.bluray_angle_number = tab.bluray_angle_number;
-            self.bluray_chapter_durations = tab.bluray_chapter_durations;
-        }
         changed_tabs
+    }
+
+    pub fn apply_details_probe_results(
+        &mut self,
+        session_id: u64,
+        generation: u64,
+        results: Vec<MetadataDetailsProbeFileResult>,
+    ) -> Option<String> {
+        self.model
+            .apply_details_probe_results(session_id, generation, results)
+    }
+
+    /// Start an async metadata write for the active surface. The returned
+    /// `(session_id, save_generation)` must be copied into the completion
+    /// message and matched before any result can reduce into this editor.
+    pub fn begin_write(&mut self) -> (u64, u64) {
+        self.model.active_surface_mut().technical_details.begin_write()
+    }
+
+    /// Reduce save results into the matching editor surface.
+    ///
+    /// Invariant: async write completions must match the active editor session
+    /// and save generation before applying; stale sessions/generations cannot
+    /// close or mutate another editor. Save reduction updates model state only
+    /// for files that actually saved.
+    pub fn apply_write_results(
+        &mut self,
+        session_id: u64,
+        save_generation: u64,
+        results: Vec<MetadataEditorWriteResult>,
+    ) -> Option<MetadataEditorWriteSummary> {
+        if self.presentation_tabs.is_empty() {
+            if self.model.file_surface.technical_details.session_id != session_id {
+                return None;
+            }
+            return apply_write_results_to_tab(
+                &mut self.model.file_surface,
+                save_generation,
+                results,
+            );
+        }
+
+        let idx = self
+            .presentation_tabs
+            .iter()
+            .position(|tab| tab.technical_details.session_id == session_id)?;
+        apply_write_results_to_tab(&mut self.presentation_tabs[idx], save_generation, results)
     }
 }
 
@@ -3292,6 +4421,210 @@ fn mark_tag_entry_saved(entry: &mut crate::tui::probe::TagEntry) {
     entry.original = entry.value.clone();
     entry.mb_proposed_value = None;
     entry.mb_proposed_per_file = None;
+}
+
+fn apply_write_results_to_tab(
+    tab: &mut PresentationTab,
+    save_generation: u64,
+    results: Vec<MetadataEditorWriteResult>,
+) -> Option<MetadataEditorWriteSummary> {
+    if tab.technical_details.active_save_generation != Some(save_generation) {
+        return None;
+    }
+    tab.technical_details.active_save_generation = None;
+
+    let path_to_index: std::collections::HashMap<std::path::PathBuf, usize> = tab
+        .paths
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, path)| (path, idx))
+        .collect();
+
+    let mut summary = MetadataEditorWriteSummary::default();
+    let mut saved_slots = std::collections::BTreeSet::new();
+
+    for result in results {
+        let Some(&idx) = path_to_index.get(&result.path) else {
+            summary.ignored = summary.ignored.saturating_add(1);
+            if summary.first_problem.is_none() {
+                summary.first_problem = Some(format!(
+                    "ignored stale save result for '{}'",
+                    result.path.display()
+                ));
+            }
+            continue;
+        };
+
+        match result.outcome {
+            MetadataEditorWriteOutcome::Saved => {
+                summary.saved = summary.saved.saturating_add(1);
+                summary.saved_paths.push(result.path.clone());
+                saved_slots.insert(idx);
+                if let Some(file) = tab.technical_details.files.get_mut(idx) {
+                    file.issues.retain(|issue| !matches!(issue, MetadataIssue::Write { .. }));
+                }
+            }
+            MetadataEditorWriteOutcome::Failed { reason } => {
+                summary.failed = summary.failed.saturating_add(1);
+                if summary.first_problem.is_none() {
+                    summary.first_problem = Some(reason.clone());
+                }
+                attach_write_issue(tab, idx, MetadataIssue::Write {
+                    path: result.path,
+                    reason,
+                });
+            }
+            MetadataEditorWriteOutcome::Skipped { reason } => {
+                summary.skipped = summary.skipped.saturating_add(1);
+                if summary.first_problem.is_none() {
+                    summary.first_problem = Some(reason.clone());
+                }
+                attach_write_issue(tab, idx, MetadataIssue::SaveBlocked {
+                    path: result.path,
+                    reason,
+                });
+            }
+        }
+    }
+
+    reduce_saved_slots(tab, &saved_slots);
+    tab.dirty = presentation_tab_has_changes(tab);
+    summary.remaining_dirty = tab.dirty;
+    Some(summary)
+}
+
+fn attach_write_issue(tab: &mut PresentationTab, idx: usize, issue: MetadataIssue) {
+    let Some(file) = tab.technical_details.files.get_mut(idx) else {
+        return;
+    };
+    match &issue {
+        MetadataIssue::Write { .. } => {
+            file.issues.retain(|existing| !matches!(existing, MetadataIssue::Write { .. }));
+        }
+        MetadataIssue::SaveBlocked { .. } => {
+            file.issues.retain(|existing| !matches!(existing, MetadataIssue::SaveBlocked { .. }));
+        }
+        _ => {}
+    }
+    file.issues.push(issue);
+}
+
+fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections::BTreeSet<usize>) {
+    if saved_slots.is_empty() {
+        return;
+    }
+
+    let path_count = tab.paths.len();
+    let deleted: std::collections::BTreeSet<usize> = tab.deleted.iter().copied().collect();
+    let mut remove_entries = Vec::new();
+    let mut retained_deleted = Vec::new();
+
+    for (entry_idx, entry) in tab.entries.iter_mut().enumerate() {
+        let file_aligned = entry.per_file_values.len() == path_count
+            && entry.per_file_originals.len() == path_count;
+
+        if !file_aligned {
+            if deleted.contains(&entry_idx) {
+                // A row-level delete for a non-file-aligned entry cannot be
+                // safely reduced from path-keyed write results. Examples
+                // include presentation-scoped or single-image/CUESHEET data
+                // where the entry does not map 1:1 onto `paths`. Keep the
+                // delete marker until a dedicated owner proves and clears the
+                // non-file-aligned write. Clearing it here would silently lose
+                // a pending delete after an unrelated file slot saved.
+                retained_deleted.push(entry_idx);
+            } else if path_count == 1 && saved_slots.contains(&0) {
+                // Non-deleted single-file synthetic/display entries have no
+                // per-slot retry state to preserve. Once the sole file saved,
+                // advance their originals with the rest of the surface.
+                mark_tag_entry_saved(entry);
+            }
+            continue;
+        }
+
+        if deleted.contains(&entry_idx) {
+            for idx in 0..path_count {
+                if saved_slots.contains(&idx) {
+                    entry.per_file_values[idx].clear();
+                    entry.per_file_originals[idx].clear();
+                } else {
+                    // Convert the row-level pending delete into a per-file
+                    // empty-value change for the unsaved slot. `write_all_tags`
+                    // treats an empty value as a delete, so the next save will
+                    // retry only the failed/skipped files.
+                    entry.per_file_values[idx].clear();
+                }
+            }
+        } else {
+            for &idx in saved_slots {
+                if idx < path_count {
+                    entry.per_file_originals[idx] = entry.per_file_values[idx].clone();
+                }
+            }
+        }
+
+        recompute_tag_entry_display(entry);
+        if deleted.contains(&entry_idx)
+            && entry.per_file_values.iter().all(|value| value.trim().is_empty())
+            && entry.per_file_originals.iter().all(|value| value.trim().is_empty())
+        {
+            remove_entries.push(entry_idx);
+        }
+    }
+
+    let removed: std::collections::BTreeSet<usize> = remove_entries.iter().copied().collect();
+    tab.deleted = retained_deleted
+        .into_iter()
+        .filter(|idx| !removed.contains(idx))
+        .collect();
+    for idx in remove_entries.into_iter().rev() {
+        if idx < tab.entries.len() {
+            tab.entries.remove(idx);
+        }
+    }
+}
+
+fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
+    if !tab.deleted.is_empty() {
+        return true;
+    }
+
+    let path_count = tab.paths.len();
+    let has_file_details = tab.technical_details.files.len() == path_count;
+    let writable = |idx: usize, tab: &PresentationTab| -> bool {
+        if !has_file_details {
+            return true;
+        }
+        tab.technical_details
+            .files
+            .get(idx)
+            .map(|file| file.file_facts.write_eligibility.is_writable())
+            .unwrap_or(true)
+    };
+
+    tab.entries.iter().any(|entry| {
+        if entry.per_file_values.len() == path_count && entry.per_file_originals.len() == path_count {
+            entry
+                .per_file_values
+                .iter()
+                .zip(entry.per_file_originals.iter())
+                .enumerate()
+                .any(|(idx, (value, original))| writable(idx, tab) && value != original)
+        } else {
+            entry.per_file_values != entry.per_file_originals || entry.value != entry.original
+        }
+    })
+}
+
+fn recompute_tag_entry_display(entry: &mut crate::tui::probe::TagEntry) {
+    let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+    entry.is_mixed = !all_same && entry.per_file_values.len() > 1;
+    entry.value = if entry.is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        entry.per_file_values.first().cloned().unwrap_or_default()
+    };
 }
 
 fn copy_musicbrainz_entries_preserving_originals(
@@ -3781,6 +5114,10 @@ pub enum ConfirmAction {
     /// Copy the active tab's just-populated MusicBrainz values to every
     /// other presentation tab that has the same track count.
     ApplyMbToAllPresentations(Box<MetadataEditorState>),
+    /// Close the metadata editor and discard unsaved changes after an
+    /// explicit confirmation. The editor itself is parked in
+    /// `AppState::pending_metadata_editor` so cancellation restores it.
+    DiscardMetadataEditorChanges,
     RemoveSelected,
     ClearCompleted,
     ClearFinished,
@@ -6244,71 +7581,24 @@ mod metadata_presentation_tab_tests {
     }
 
     fn tab(id: PresentationId, label: &str, entries: Vec<TagEntry>, n_paths: usize) -> PresentationTab {
-        PresentationTab {
+        let paths: Vec<_> = (0..n_paths)
+            .map(|idx| std::path::PathBuf::from(format!("/disc/track{:02}.flac", idx + 1)))
+            .collect();
+        let file_labels: Vec<_> = (0..n_paths)
+            .map(|idx| format!("Track {:02}", idx + 1))
+            .collect();
+        PresentationTab::new(
             id,
-            label: label.to_string(),
-            paths: (0..n_paths)
-                .map(|idx| std::path::PathBuf::from(format!("/disc/track{:02}.flac", idx + 1)))
-                .collect(),
+            label,
+            paths,
             entries,
-            file_labels: (0..n_paths).map(|idx| format!("Track {:02}", idx + 1)).collect(),
-            deleted: Vec::new(),
-            dirty: false,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        }
+            file_labels,
+            MetadataTechnicalDetails::default(),
+        )
     }
 
     fn state_with_tabs(tabs: Vec<PresentationTab>, active_tab: usize) -> MetadataEditorState {
-        let active = tabs[active_tab].clone();
-        MetadataEditorState {
-            paths: active.paths,
-            entries: active.entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: active.dirty,
-            deleted: active.deleted,
-            file_labels: active.file_labels,
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: active.sacd_area_kind,
-            sacd_stereo_durations: active.sacd_stereo_durations,
-            sacd_multi_channel_durations: active.sacd_multi_channel_durations,
-            dvdv_source_chapters: active.dvdv_source_chapters,
-            dvdv_track_durations: active.dvdv_track_durations,
-            dvdv_angle_number: active.dvdv_angle_number,
-            dvdv_title_angle_count: active.dvdv_title_angle_count,
-            bluray_playlist_number: active.bluray_playlist_number,
-            bluray_audio_pid: active.bluray_audio_pid,
-            bluray_audio_stream_index: active.bluray_audio_stream_index,
-            bluray_angle_number: active.bluray_angle_number,
-            bluray_chapter_durations: active.bluray_chapter_durations,
-            presentation_tabs: tabs,
-            active_tab,
-            presentation_selector_open: false,
-            presentation_selector_cursor: active_tab,
-            presentation_selector_scroll: 0,
-        }
+        MetadataEditorState::for_disc_presentations(tabs, active_tab)
     }
 
     #[test]
@@ -6328,17 +7618,65 @@ mod metadata_presentation_tab_tests {
             ),
         ];
         let mut state = state_with_tabs(tabs, 0);
-        state.entries[0].value = "edited mch".to_string();
-        state.entries[0].per_file_values = vec!["edited mch".to_string()];
-        state.dirty = true;
+        state.active_surface_mut().entries[0].value = "edited mch".to_string();
+        state.active_surface_mut().entries[0].per_file_values = vec!["edited mch".to_string()];
+        state.active_surface_mut().dirty = true;
 
         assert!(state.switch_presentation_tab(1));
         assert_eq!(state.presentation_tabs[0].entries[0].value, "edited mch");
         assert!(state.presentation_tabs[0].dirty);
-        assert_eq!(state.entries[0].value, "old stereo");
+        assert_eq!(state.active_surface().entries[0].value, "old stereo");
 
         assert!(state.switch_presentation_tab(0));
-        assert_eq!(state.entries[0].value, "edited mch");
+        assert_eq!(state.active_surface().entries[0].value, "edited mch");
+    }
+
+
+    #[test]
+    fn content_tabs_keep_independent_scroll_offsets() {
+        let entries: Vec<TagEntry> = (0..150)
+            .map(|idx| tag("TITLE", &format!("Track {idx}"), vec!["value"]))
+            .collect();
+        let mut state = state_with_tabs(
+            vec![tab(PresentationId::DvdAudioGroup(1), "Group 1", entries, 1)],
+            0,
+        );
+
+        state.cursor = 100;
+        state.scroll = 92;
+        assert!(state.set_content_tab(ContentTab::Details));
+        assert_eq!(state.scroll, 0, "new read-only tabs should start at top");
+
+        state.scroll = 17;
+        assert!(state.set_content_tab(ContentTab::ReplayGain));
+        assert_eq!(state.scroll, 0, "each read-only tab has its own scroll");
+
+        state.scroll = 5;
+        assert!(state.set_content_tab(ContentTab::Details));
+        assert_eq!(state.scroll, 17, "Details scroll should be restored");
+
+        assert!(state.set_content_tab(ContentTab::Metadata));
+        assert_eq!(state.scroll, 92, "Metadata scroll should not be clobbered by read-only tab scrolling");
+    }
+
+    #[test]
+    fn returning_to_metadata_never_starts_scroll_after_cursor() {
+        let entries: Vec<TagEntry> = (0..20)
+            .map(|idx| tag("TITLE", &format!("Track {idx}"), vec!["value"]))
+            .collect();
+        let mut state = state_with_tabs(
+            vec![tab(PresentationId::DvdAudioGroup(1), "Group 1", entries, 1)],
+            0,
+        );
+
+        state.cursor = 4;
+        state.content_tab = ContentTab::Details;
+        state.scroll = 11;
+        state.content_tab_scrolls[ContentTab::Details.index()] = 11;
+        state.content_tab_scrolls[ContentTab::Metadata.index()] = 99;
+
+        assert!(state.set_content_tab(ContentTab::Metadata));
+        assert_eq!(state.scroll, 4, "selected metadata row must remain reachable after tab switch");
     }
 
     #[test]
@@ -6364,9 +7702,9 @@ mod metadata_presentation_tab_tests {
         dirty_sibling.entries[0].per_file_values = vec!["edited sibling".to_string()];
 
         let mut state = state_with_tabs(vec![dirty_active, dirty_sibling], 0);
-        state.entries[0].value = "edited active".to_string();
-        state.entries[0].per_file_values = vec!["edited active".to_string()];
-        state.dirty = true;
+        state.active_surface_mut().entries[0].value = "edited active".to_string();
+        state.active_surface_mut().entries[0].per_file_values = vec!["edited active".to_string()];
+        state.active_surface_mut().dirty = true;
 
         state.mark_active_presentation_saved();
 
@@ -6447,7 +7785,7 @@ mod metadata_presentation_tab_tests {
 
 
     #[test]
-    fn presentation_selector_uses_dropdown_only_above_two_tabs() {
+    fn presentation_selector_always_uses_dropdown_when_present() {
         let one = vec![tab(
             PresentationId::DvdAudioGroup(1),
             "Group 1",
@@ -6492,19 +7830,14 @@ mod metadata_presentation_tab_tests {
         let one_state = state_with_tabs(one, 0);
         assert!(one_state.shows_presentation_control());
         assert!(!one_state.has_multiple_presentations());
-        assert!(!one_state.has_presentation_tabs());
-        assert!(!one_state.uses_presentation_dropdown());
 
         let two_state = state_with_tabs(two, 0);
         assert!(two_state.shows_presentation_control());
         assert!(two_state.has_multiple_presentations());
-        assert!(two_state.has_presentation_tabs());
-        assert!(!two_state.uses_presentation_dropdown());
 
         let three_state = state_with_tabs(three, 0);
         assert!(three_state.shows_presentation_control());
         assert!(three_state.has_multiple_presentations());
-        assert!(three_state.uses_presentation_dropdown());
     }
 
     #[test]
@@ -6537,12 +7870,12 @@ mod metadata_presentation_tab_tests {
         assert!(state.move_presentation_selector_cursor(2));
         assert_eq!(state.presentation_selector_cursor, 2);
         assert_eq!(state.active_tab, 0);
-        assert_eq!(state.entries[0].value, "one");
+        assert_eq!(state.active_surface().entries[0].value, "one");
 
         assert!(state.select_presentation_selector_cursor());
         assert!(!state.presentation_selector_open);
         assert_eq!(state.active_tab, 2);
-        assert_eq!(state.entries[0].value, "three");
+        assert_eq!(state.active_surface().entries[0].value, "three");
     }
 
     #[test]
@@ -6650,4 +7983,443 @@ mod metadata_presentation_tab_tests {
             vec!["dest 01".to_string(), "dest 02".to_string()]
         );
     }
+    fn probe_file_detail(path: &str) -> MetadataFileDetails {
+        MetadataFileDetails::from_open_cache(
+            std::path::PathBuf::from(path),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            FileWriteEligibility::Writable,
+            SourceMetadata::default(),
+        )
+    }
+
+    fn write_file_detail(path: &str, eligibility: FileWriteEligibility) -> MetadataFileDetails {
+        MetadataFileDetails::from_open_cache(
+            std::path::PathBuf::from(path),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            eligibility,
+            SourceMetadata::default(),
+        )
+    }
+
+    fn write_state() -> MetadataEditorState {
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/one.flac"),
+            std::path::PathBuf::from("/tmp/two.flac"),
+        ];
+        let entries = vec![tag("TITLE", "old", vec!["old one", "old two"])];
+        let details = MetadataTechnicalDetails::from_files(vec![
+            write_file_detail("/tmp/one.flac", FileWriteEligibility::Writable),
+            write_file_detail("/tmp/two.flac", FileWriteEligibility::Writable),
+        ]);
+        MetadataEditorState::for_files(
+            paths,
+            entries,
+            vec!["one".to_string(), "two".to_string()],
+            details,
+        )
+    }
+
+    #[test]
+    fn stale_save_completion_wrong_session_is_ignored() {
+        let mut state = write_state();
+        let (session_id, generation) = state.begin_write();
+        state.active_surface_mut().entries[0].per_file_values[0] = "new one".to_string();
+
+        let ignored = state.apply_write_results(
+            session_id.saturating_add(10_000),
+            generation,
+            vec![MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone())],
+        );
+
+        assert!(ignored.is_none());
+        assert_eq!(state.active_surface().entries[0].per_file_originals[0], "old one");
+        assert_eq!(state.active_surface().technical_details.active_save_generation, Some(generation));
+    }
+
+    #[test]
+    fn stale_save_completion_wrong_generation_is_ignored() {
+        let mut state = write_state();
+        let (session_id, generation) = state.begin_write();
+        state.active_surface_mut().entries[0].per_file_values[0] = "new one".to_string();
+
+        let ignored = state.apply_write_results(
+            session_id,
+            generation.saturating_add(1),
+            vec![MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone())],
+        );
+
+        assert!(ignored.is_none());
+        assert_eq!(state.active_surface().entries[0].per_file_originals[0], "old one");
+        assert_eq!(state.active_surface().technical_details.active_save_generation, Some(generation));
+    }
+
+    #[test]
+    fn partial_save_updates_originals_for_successful_files_only() {
+        let mut state = write_state();
+        state.active_surface_mut().entries[0].per_file_values = vec!["new one".to_string(), "new two".to_string()];
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::failed(state.active_surface().paths[1].clone(), "disk full"),
+                ],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(state.active_surface().entries[0].per_file_originals[0], "new one");
+        assert_eq!(state.active_surface().entries[0].per_file_originals[1], "old two");
+        assert!(state.active_surface().dirty, "failed file remains dirty");
+    }
+
+    #[test]
+    fn failed_and_skipped_writes_become_durable_file_issues() {
+        let mut state = write_state();
+        state.active_surface_mut().entries[0].per_file_values = vec!["new one".to_string(), "new two".to_string()];
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::failed(state.active_surface().paths[0].clone(), "permission denied"),
+                    MetadataEditorWriteResult::skipped(state.active_surface().paths[1].clone(), "read-only"),
+                ],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.skipped, 1);
+        assert!(state.active_surface().technical_details.files[0]
+            .issues
+            .iter()
+            .any(|issue| matches!(issue, MetadataIssue::Write { reason, .. } if reason == "permission denied")));
+        assert!(state.active_surface().technical_details.files[1]
+            .issues
+            .iter()
+            .any(|issue| matches!(issue, MetadataIssue::SaveBlocked { reason, .. } if reason == "read-only")));
+    }
+
+    #[test]
+    fn partial_delete_retries_only_unsaved_slots() {
+        let mut state = write_state();
+        state.active_surface_mut().deleted.push(0);
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::failed(state.active_surface().paths[1].clone(), "locked"),
+                ],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.failed, 1);
+        assert!(state.active_surface().deleted.is_empty(), "row-level delete is reduced to per-slot state");
+        assert_eq!(state.active_surface().entries[0].per_file_values[0], "");
+        assert_eq!(state.active_surface().entries[0].per_file_originals[0], "");
+        assert_eq!(state.active_surface().entries[0].per_file_values[1], "");
+        assert_eq!(state.active_surface().entries[0].per_file_originals[1], "old two");
+    }
+
+
+    #[test]
+    fn partial_save_preserves_non_file_aligned_deleted_rows() {
+        let mut state = write_state();
+        let mut synthetic = tag("CUESHEET", "cue", vec!["cue row one"]);
+        synthetic.per_file_values = vec!["cue row one".to_string(), "cue row two".to_string(), "cue row three".to_string()];
+        synthetic.per_file_originals = synthetic.per_file_values.clone();
+        state.active_surface_mut().entries.push(synthetic);
+        state.active_surface_mut().deleted.push(1);
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone())],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.saved, 1);
+        assert!(summary.remaining_dirty, "summary must report retained dirty model state");
+        assert!(
+            !summary.all_saved(),
+            "a fully successful path-keyed save must not close the editor when non-file-aligned dirty state remains"
+        );
+        assert_eq!(state.active_surface().deleted, vec![1]);
+        assert_eq!(state.active_surface().entries[1].display_key, "CUESHEET");
+        assert!(state.active_surface().dirty, "non-file-aligned delete must remain pending");
+    }
+
+    #[test]
+    fn successful_path_keyed_save_with_retained_dirty_state_is_not_all_saved() {
+        let mut state = write_state();
+        let mut synthetic = tag("CUESHEET", "cue", vec!["cue row one"]);
+        synthetic.per_file_values = vec![
+            "cue row one".to_string(),
+            "cue row two".to_string(),
+            "cue row three".to_string(),
+        ];
+        synthetic.per_file_originals = synthetic.per_file_values.clone();
+        state.active_surface_mut().entries.push(synthetic);
+        state.active_surface_mut().deleted.push(1);
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone())],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.ignored, 0);
+        assert!(summary.remaining_dirty);
+        assert!(!summary.all_saved());
+        assert!(state.active_surface().dirty);
+        assert_eq!(state.active_surface().deleted, vec![1]);
+    }
+
+    #[test]
+    fn constructors_seed_file_surface_invariants() {
+        let paths = vec![std::path::PathBuf::from("/tmp/one.flac")];
+        let state = MetadataEditorState::for_files(
+            paths.clone(),
+            vec![tag("TITLE", "one", vec!["one"])],
+            vec!["one".to_string()],
+            MetadataTechnicalDetails::from_files(vec![write_file_detail(
+                "/tmp/one.flac",
+                FileWriteEligibility::Writable,
+            )]),
+        );
+
+        assert_eq!(state.active_surface().paths, paths);
+        assert_eq!(state.active_surface().entries.len(), 1);
+        assert_eq!(state.active_surface().technical_details.files.len(), 1);
+        assert_eq!(state.content_tab, ContentTab::Metadata);
+    }
+
+    fn probe_source_info() -> SourceInfo {
+        SourceInfo {
+            format_name: "FLAC".to_string(),
+            codec: "FLAC".to_string(),
+            bit_depth: Some(24),
+            sample_rate: 96_000,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 100,
+        }
+    }
+
+    #[test]
+    fn details_probe_completion_ignores_wrong_session_id() {
+        let mut details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/a.flac")]);
+        let session = details.session_id;
+        let generation = 1;
+        details.details_probe_state = MetadataDetailsProbeState::Loading {
+            generation,
+            completed: 0,
+            total: 1,
+        };
+        details.files[0].media_facts = ProbeState::Loading { generation };
+
+        let status = details.apply_details_probe_results(
+            session.saturating_add(1),
+            generation,
+            vec![MetadataDetailsProbeFileResult {
+                index: 0,
+                path: std::path::PathBuf::from("/tmp/a.flac"),
+                result: Ok(probe_source_info()),
+            }],
+        );
+
+        assert!(status.is_none());
+        assert!(matches!(details.files[0].media_facts, ProbeState::Loading { generation: 1 }));
+    }
+
+    #[test]
+    fn details_probe_completion_validates_result_path() {
+        let mut details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/a.flac")]);
+        let session = details.session_id;
+        let generation = 1;
+        details.details_probe_state = MetadataDetailsProbeState::Loading {
+            generation,
+            completed: 0,
+            total: 1,
+        };
+        details.files[0].media_facts = ProbeState::Loading { generation };
+
+        let status = details.apply_details_probe_results(
+            session,
+            generation,
+            vec![MetadataDetailsProbeFileResult {
+                index: 0,
+                path: std::path::PathBuf::from("/tmp/b.flac"),
+                result: Ok(probe_source_info()),
+            }],
+        );
+
+        assert!(status.as_deref().unwrap_or("").contains("partially loaded"));
+        assert!(matches!(details.files[0].media_facts, ProbeState::Failed { .. }));
+    }
+
+    #[test]
+    fn details_probe_completion_applies_to_matching_presentation_session() {
+        let mut tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+        ];
+        tabs[0].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/a.flac")]);
+        tabs[1].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/b.flac")]);
+        let session = tabs[0].technical_details.session_id;
+        let generation = 1;
+        tabs[0].technical_details.details_probe_state = MetadataDetailsProbeState::Loading {
+            generation,
+            completed: 0,
+            total: 1,
+        };
+        tabs[0].technical_details.files[0].media_facts = ProbeState::Loading { generation };
+
+        let mut state = state_with_tabs(tabs, 1);
+        let status = state.apply_details_probe_results(
+            session,
+            generation,
+            vec![MetadataDetailsProbeFileResult {
+                index: 0,
+                path: std::path::PathBuf::from("/tmp/a.flac"),
+                result: Ok(probe_source_info()),
+            }],
+        );
+
+        assert!(status.as_deref().unwrap_or("").contains("Details ready"));
+        assert!(matches!(
+            state.presentation_tabs[0].technical_details.files[0].media_facts,
+            ProbeState::Ready(_)
+        ));
+        assert!(matches!(
+            state.presentation_tabs[1].technical_details.files[0].media_facts,
+            ProbeState::NotLoaded
+        ));
+    }
+
+    #[test]
+    fn read_only_tab_scroll_clamps_at_input_time() {
+        let tabs = vec![tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![tag("TITLE", "one", vec!["one"])],
+            1,
+        )];
+        let mut state = state_with_tabs(tabs, 0);
+        state.content_tab = ContentTab::Details;
+        state.scroll = 10_000;
+        state.content_tab_scrolls[ContentTab::Details.index()] = 10_000;
+
+        assert!(state.clamp_read_only_content_scroll(12, 5));
+        assert_eq!(state.scroll, 7);
+        assert_eq!(state.content_tab_scrolls[ContentTab::Details.index()], 7);
+
+        state.scroll_read_only_content_by(10, 12, 5);
+        assert_eq!(state.scroll, 7);
+        assert_eq!(state.content_tab_scrolls[ContentTab::Details.index()], 7);
+
+        state.scroll_read_only_content_by(-3, 12, 5);
+        assert_eq!(state.scroll, 4);
+        assert_eq!(state.content_tab_scrolls[ContentTab::Details.index()], 4);
+    }
+
+    #[test]
+    fn read_only_tab_scroll_noops_for_metadata_tab() {
+        let tabs = vec![tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![tag("TITLE", "one", vec!["one"])],
+            1,
+        )];
+        let mut state = state_with_tabs(tabs, 0);
+        state.content_tab = ContentTab::Metadata;
+        state.scroll = 3;
+
+        assert!(!state.scroll_read_only_content_by(1, 12, 5));
+        assert_eq!(state.scroll, 3);
+    }
+
+    #[test]
+    fn retry_failed_details_probes_clears_only_failed_files() {
+        let ok_info = crate::tui::probe::SourceInfo {
+            format_name: "flac".to_string(),
+            codec: "FLAC".to_string(),
+            bit_depth: Some(24),
+            sample_rate: 96_000,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 1024,
+        };
+        let mut ok = MetadataFileDetails::default();
+        ok.file_facts.path = std::path::PathBuf::from("/album/ok.flac");
+        ok.media_facts = ProbeState::Ready(MediaFacts::from(&ok_info));
+
+        let mut failed = MetadataFileDetails::default();
+        failed.file_facts.path = std::path::PathBuf::from("/album/transient.flac");
+        failed.media_facts = ProbeState::Failed {
+            reason: "temporary I/O error".to_string(),
+            retryable: true,
+        };
+        failed.issues.push(MetadataIssue::Probe {
+            path: failed.file_facts.path.clone(),
+            reason: "temporary I/O error".to_string(),
+            retryable: true,
+        });
+
+        let mut details = MetadataTechnicalDetails::from_files(vec![ok, failed]);
+        details.details_probe_state = MetadataDetailsProbeState::Partial {
+            issues: vec!["temporary I/O error".to_string()],
+        };
+
+        let cleared = details.retry_failed_details_probes();
+
+        assert_eq!(cleared, 1);
+        assert!(matches!(details.files[0].media_facts, ProbeState::Ready(_)), "successful probe data stays cached");
+        assert!(matches!(details.files[1].media_facts, ProbeState::NotLoaded), "failed probe becomes retryable");
+        assert!(details.files[1].issues.iter().all(|issue| !matches!(issue, MetadataIssue::Probe { .. })));
+        assert!(matches!(details.details_probe_state, MetadataDetailsProbeState::Unloaded));
+    }
+
 }

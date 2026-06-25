@@ -2908,24 +2908,57 @@ pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
 /// Handle key events inside the metadata editor overlay.
 /// Open the "add new field" prompt (sets cursor to the add row,
 /// initializes add_key_input, transitions to AddingKey phase).
-pub(super) fn metadata_editor_open_add(state: &mut super::app::MetadataEditorState) {
-    state.cursor = state.entries.len();
+pub(super) fn metadata_editor_open_add(state: &mut super::app::MetadataEditorState) -> Option<String> {
+    let (writable, blocked) = metadata_editor_file_slot_counts(state);
+    if writable == 0 && blocked > 0 {
+        return Some("metadata editor: cannot add field — no writable files in this editor session".to_string());
+    }
+    state.cursor = state.active_surface().entries.len();
     state.add_key_input = Some(super::text_input::TextInputState::empty());
     state.phase = super::app::MetadataEditorPhase::AddingKey;
     ensure_cursor_visible(state);
+    (blocked > 0).then(|| {
+        format!(
+            "metadata editor: new field will apply to {} writable file{}; {} blocked slot{} will remain unchanged",
+            writable,
+            if writable == 1 { "" } else { "s" },
+            blocked,
+            if blocked == 1 { "" } else { "s" }
+        )
+    })
 }
 
 /// Mark the cursor row for deletion (renders strikethrough until save).
-pub(super) fn metadata_editor_delete_cursor(state: &mut super::app::MetadataEditorState) {
-    if state.cursor < state.entries.len() && !state.deleted.contains(&state.cursor) {
-        state.deleted.push(state.cursor);
-        recalc_dirty(state);
+pub(super) fn metadata_editor_delete_cursor(state: &mut super::app::MetadataEditorState) -> Option<String> {
+    if state.cursor >= state.active_surface().entries.len() || state.active_surface().deleted.contains(&state.cursor) {
+        return None;
+    }
+
+    let (writable, blocked) = metadata_editor_entry_slot_counts(state, state.cursor);
+    if writable == 0 && blocked > 0 {
+        return Some("metadata editor: cannot delete field — no writable file slots for this row".to_string());
+    }
+
+    let cursor = state.cursor;
+    state.active_surface_mut().deleted.push(cursor);
+    recalc_dirty(state);
+    if blocked > 0 {
+        Some(format!(
+            "metadata editor: delete will apply to {} writable file{}; {} blocked slot{} will retain the field",
+            writable,
+            if writable == 1 { "" } else { "s" },
+            blocked,
+            if blocked == 1 { "" } else { "s" }
+        ))
+    } else {
+        None
     }
 }
 
 /// Un-delete the cursor row (removes it from the deleted set).
 pub(super) fn metadata_editor_undelete_cursor(state: &mut super::app::MetadataEditorState) {
-    state.deleted.retain(|&i| i != state.cursor);
+    let cursor = state.cursor;
+    state.active_surface_mut().deleted.retain(|&i| i != cursor);
     recalc_dirty(state);
 }
 
@@ -2933,10 +2966,10 @@ pub(super) fn metadata_editor_undelete_cursor(state: &mut super::app::MetadataEd
 /// on per_file_values.len() > 1 (so per-track entries on single-image
 /// rips qualify even when paths.len() == 1).
 pub(super) fn metadata_editor_open_detail(state: &mut super::app::MetadataEditorState) {
-    if state.cursor < state.entries.len()
-        && state.entries[state.cursor].per_file_values.len() > 1
-        && !state.entries[state.cursor].is_binary
-        && !state.deleted.contains(&state.cursor)
+    if state.cursor < state.active_surface().entries.len()
+        && state.active_surface().entries[state.cursor].per_file_values.len() > 1
+        && !state.active_surface().entries[state.cursor].is_binary
+        && !state.active_surface().deleted.contains(&state.cursor)
     {
         state.detail_field_idx = state.cursor;
         state.detail_cursor = 0;
@@ -2962,21 +2995,20 @@ pub(super) fn metadata_editor_save(
             app.set_status("read-only editor — cannot save (Blu-ray sidecar)");
         } else if metadata_editor_is_dvdv_source(state) {
             app.set_status("read-only editor — cannot save (DVD-Video sidecar)");
-        } else if state.sacd_sidecar_path.is_some() && state.sacd_area_kind.is_none() {
+        } else if state.sacd_sidecar_path.is_some() && state.active_surface().sacd_area_kind.is_none() {
             app.set_status("read-only editor — cannot save (DVD-Audio metabase)");
         } else {
             app.set_status("read-only editor — cannot save (SACD ISO)");
         }
         return;
     }
-    state.sync_active_presentation();
     if !state.any_presentation_dirty() {
         app.set_status("No changes to save");
         return;
     }
     // Disc-image save: route sidecar-backed editors away from the lofty / per-file path.
     if metadata_editor_is_bluray_source(state) {
-        let Some(source_path) = state.paths.first().cloned() else {
+        let Some(source_path) = state.active_surface().paths.first().cloned() else {
             app.set_status("Blu-ray sidecar save failed: editor has no source");
             return;
         };
@@ -3008,7 +3040,7 @@ pub(super) fn metadata_editor_save(
             );
             return;
         }
-        let Some(source_path) = state.paths.first().cloned() else {
+        let Some(source_path) = state.active_surface().paths.first().cloned() else {
             app.set_status("DVD-Video sidecar save failed: editor has no source");
             return;
         };
@@ -3048,7 +3080,7 @@ pub(super) fn metadata_editor_save(
     }
 
     if let Some(sidecar_path) = state.sacd_sidecar_path.clone() {
-        if state.sacd_area_kind.is_none() {
+        if state.active_surface().sacd_area_kind.is_none() {
             match save_dvda_metabase(state, &sidecar_path) {
                 Ok(kind) => {
                     state.mark_all_presentations_saved();
@@ -3084,12 +3116,12 @@ pub(super) fn metadata_editor_save(
                     format!("{} areas", state.presentation_tabs.len())
                 } else {
                     let mirror = outcome.mirror;
-                    let surfaced = match state.sacd_area_kind {
+                    let surfaced = match state.active_surface().sacd_area_kind {
                         Some(super::sacd::AreaKind::Stereo) => "stereo",
                         Some(super::sacd::AreaKind::MultiChannel) => "MCH",
                         None => "?",
                     };
-                    let sibling = match state.sacd_area_kind {
+                    let sibling = match state.active_surface().sacd_area_kind {
                         Some(super::sacd::AreaKind::Stereo) => "MCH",
                         Some(super::sacd::AreaKind::MultiChannel) => "stereo",
                         None => "?",
@@ -3121,9 +3153,29 @@ pub(super) fn metadata_editor_save(
         return;
     }
     state.phase = super::app::MetadataEditorPhase::Saving;
-    let paths = state.paths.clone();
-    let deleted = state.deleted.clone();
-    let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> = state
+    let (session_id, save_generation) = state.begin_write();
+    let paths = state.active_surface().paths.clone();
+    let deleted = state.active_surface().deleted.clone();
+    let save_block_reasons: Vec<Option<String>> = state.active_surface()
+        .technical_details
+        .files
+        .iter()
+        .map(|file| {
+            file.file_facts
+                .write_eligibility
+                .block_reason()
+                .map(str::to_string)
+        })
+        .collect();
+    let blocked_count = save_block_reasons.iter().filter(|reason| reason.is_some()).count();
+    if blocked_count > 0 {
+        app.set_status(format!(
+            "Saving eligible files; {} file{} will be skipped due to read/write eligibility",
+            blocked_count,
+            if blocked_count == 1 { "" } else { "s" }
+        ));
+    }
+    let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> = state.active_surface()
         .entries
         .iter()
         .map(|e| {
@@ -3138,7 +3190,12 @@ pub(super) fn metadata_editor_save(
     let tx = tx.clone();
     tokio::spawn(async move {
         let results = tokio::task::spawn_blocking(move || {
-            crate::tui::probe::apply_audio_tag_changes(&paths, &entries_snap, &deleted)
+            crate::tui::probe::apply_audio_tag_changes_with_save_blocks(
+                &paths,
+                &entries_snap,
+                &deleted,
+                &save_block_reasons,
+            )
         })
         .await
         .unwrap_or_else(|e| {
@@ -3146,13 +3203,17 @@ pub(super) fn metadata_editor_save(
             // are returned, not panicked). If it does happen, surface
             // a single batch-level error rather than losing the
             // request silently.
-            vec![(
+            vec![crate::tui::app::MetadataEditorWriteResult::failed(
                 std::path::PathBuf::new(),
-                Err(format!("save task panic: {}", e)),
+                format!("save task panic: {}", e),
             )]
         });
         let _ = tx
-            .send(AppMessage::MetadataEditorWriteComplete { results })
+            .send(AppMessage::MetadataEditorWriteComplete {
+                session_id,
+                save_generation,
+                results,
+            })
             .await;
     });
 }
@@ -3205,9 +3266,8 @@ fn bluray_sidecar_save_status(
 
 pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
     app: &mut AppState,
-    mut state: Box<super::app::MetadataEditorState>,
+    state: Box<super::app::MetadataEditorState>,
 ) {
-    state.sync_active_presentation();
     if state.has_multiple_presentations() {
         app.pending_metadata_editor = Some(state.clone());
         app.active_overlay = ActiveOverlay::Confirmation {
@@ -3219,15 +3279,37 @@ pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
     }
 }
 
+fn request_metadata_editor_close(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+) {
+    if state.phase == super::app::MetadataEditorPhase::Saving {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state.clone());
+        app.set_status("metadata editor: save in progress — wait for completion before closing".to_string());
+        return;
+    }
+    metadata_editor_cancel_details_probe(state);
+    if state.any_presentation_dirty() {
+        app.pending_metadata_editor = Some(state.clone());
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: "Discard unsaved metadata changes? Y discards them; N/Esc returns to the editor.".to_string(),
+            action: ConfirmAction::DiscardMetadataEditorChanges,
+        };
+        app.set_status("metadata editor: unsaved changes — confirm discard or press Esc/N to return".to_string());
+    } else {
+        app.active_overlay = ActiveOverlay::None;
+    }
+}
+
 fn handle_metadata_editor_key(
     app: &mut AppState,
     key: KeyEvent,
     state: &mut Box<super::app::MetadataEditorState>,
-    _tx: &mpsc::Sender<AppMessage>,
+    tx: &mpsc::Sender<AppMessage>,
 ) {
     use super::app::MetadataEditorPhase;
 
-    let total_rows = state.entries.len() + 1; // +1 for "Add field" row
+    let total_rows = state.active_surface().entries.len() + 1; // +1 for "Add field" row
 
     match state.phase {
         MetadataEditorPhase::Editing => {
@@ -3268,6 +3350,9 @@ fn handle_metadata_editor_key(
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         let changed = state.select_presentation_selector_cursor();
                         if changed {
+                            if state.content_tab == crate::tui::app::ContentTab::Details {
+                                ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+                            }
                             if let Some(label) = state.active_presentation_label() {
                                 app.set_status(format!("metadata editor: {}", label));
                             }
@@ -3279,6 +3364,9 @@ fn handle_metadata_editor_key(
                             state.set_presentation_selector_cursor(idx);
                             let changed = state.select_presentation_selector_cursor();
                             if changed {
+                                if state.content_tab == crate::tui::app::ContentTab::Details {
+                                    ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+                                }
                                 if let Some(label) = state.active_presentation_label() {
                                     app.set_status(format!("metadata editor: {}", label));
                                 }
@@ -3302,39 +3390,91 @@ fn handle_metadata_editor_key(
                     return;
                 }
                 KeyCode::Esc => {
-                    if state.any_presentation_dirty() {
-                        // TODO: confirmation dialog for unsaved changes
-                        // For now, just close.
-                    }
-                    app.active_overlay = ActiveOverlay::None;
+                    request_metadata_editor_close(app, state);
                 }
                 KeyCode::Tab => {
+                    let was_details = state.content_tab == crate::tui::app::ContentTab::Details;
                     let changed = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        state.previous_presentation_tab()
+                        state.previous_content_tab()
                     } else {
-                        state.next_presentation_tab()
+                        state.next_content_tab()
                     };
                     if changed {
-                        if let Some(label) = state.active_presentation_label() {
-                            app.set_status(format!("metadata editor: {}", label));
+                        if state.content_tab == crate::tui::app::ContentTab::Details {
+                            ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+                        } else if was_details {
+                            metadata_editor_cancel_details_probe(state);
+                        }
+                        if state.content_tab == crate::tui::app::ContentTab::Metadata {
+                            ensure_cursor_visible(state);
+                        }
+                        if let Some(status) = metadata_editor_apply_content_tab_progress(state) {
+                            app.set_status(status);
+                        } else {
+                            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+                            app.set_status(metadata_editor_status_for_content_tab(&**state));
                         }
                     }
                 }
                 KeyCode::BackTab => {
-                    if state.previous_presentation_tab() {
-                        if let Some(label) = state.active_presentation_label() {
-                            app.set_status(format!("metadata editor: {}", label));
+                    let was_details = state.content_tab == crate::tui::app::ContentTab::Details;
+                    if state.previous_content_tab() {
+                        if state.content_tab == crate::tui::app::ContentTab::Details {
+                            ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+                        } else if was_details {
+                            metadata_editor_cancel_details_probe(state);
+                        }
+                        if state.content_tab == crate::tui::app::ContentTab::Metadata {
+                            ensure_cursor_visible(state);
+                        }
+                        if let Some(status) = metadata_editor_apply_content_tab_progress(state) {
+                            app.set_status(status);
+                        } else {
+                            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+                            app.set_status(metadata_editor_status_for_content_tab(&**state));
                         }
                     }
                 }
-                KeyCode::Char(' ') if key.modifiers.is_empty() && state.uses_presentation_dropdown() => {
+                KeyCode::Char(' ') if key.modifiers.is_empty() && state.shows_presentation_control() => {
                     state.open_presentation_selector();
                 }
                 KeyCode::Char(c) if key.modifiers.is_empty() && ('1'..='9').contains(&c) => {
                     let idx = (c as u8 - b'1') as usize;
                     if state.switch_presentation_tab(idx) {
+                        if state.content_tab == crate::tui::app::ContentTab::Details {
+                            ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+                        }
                         if let Some(label) = state.active_presentation_label() {
                             app.set_status(format!("metadata editor: {}", label));
+                        }
+                    }
+                }
+                _ if state.content_tab != crate::tui::app::ContentTab::Metadata => {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            scroll_metadata_read_only_tab(state, -1, metadata_editor_read_only_visible_rows());
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            scroll_metadata_read_only_tab(state, 1, metadata_editor_read_only_visible_rows());
+                        }
+                        KeyCode::PageUp => {
+                            scroll_metadata_read_only_tab(state, -5, metadata_editor_read_only_visible_rows());
+                        }
+                        KeyCode::PageDown => {
+                            scroll_metadata_read_only_tab(state, 5, metadata_editor_read_only_visible_rows());
+                        }
+                        KeyCode::Home => {
+                            set_metadata_read_only_scroll(state, 0, metadata_editor_read_only_visible_rows());
+                        }
+                        KeyCode::Char('r')
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && state.content_tab == crate::tui::app::ContentTab::Details =>
+                        {
+                            let status = metadata_editor_retry_details_probe(state, tx);
+                            app.set_status(status);
+                        }
+                        _ => {
+                            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
                         }
                     }
                 }
@@ -3349,9 +3489,9 @@ fn handle_metadata_editor_key(
                     ensure_cursor_visible(state);
                 }
                 KeyCode::Enter => {
-                    if state.cursor < state.entries.len() {
-                        let entry = &state.entries[state.cursor];
-                        if !entry.is_binary && !state.deleted.contains(&state.cursor) {
+                    if state.cursor < state.active_surface().entries.len() {
+                        let entry = &state.active_surface().entries[state.cursor];
+                        if !entry.is_binary && !state.active_surface().deleted.contains(&state.cursor) {
                             // Use the entry's own dimension: per-track entries
                             // (e.g. TITLE on a single-image rip with embedded
                             // CUESHEET) have per_file_values.len() != paths.len().
@@ -3359,28 +3499,52 @@ fn handle_metadata_editor_key(
                                 // Per-track detail view is allowed even in
                                 // read-only mode (the per-track editing inside
                                 // is gated separately in handle_detail_edit).
-                                state.detail_field_idx = state.cursor;
-                                state.detail_cursor = 0;
-                                state.detail_scroll = 0;
-                                state.detail_edit = None;
-                                state.last_click = None;
-                                state.phase = MetadataEditorPhase::DetailEdit;
+                                metadata_editor_begin_detail_edit_for_entry(state, state.cursor, false);
                             } else if state.read_only {
                                 app.set_status("read-only editor (SACD ISO)");
                             } else {
-                                // Single value: inline edit.
-                                state.edit_input = Some(super::text_input::TextInputState::new(
-                                    entry.value.clone(),
-                                ));
-                                state.phase = MetadataEditorPhase::InlineEdit;
+                                let (writable, blocked) = metadata_editor_entry_slot_counts(state, state.cursor);
+                                if writable == 0 && blocked > 0 {
+                                    let reason = metadata_editor_entry_edit_block_reason(state, state.cursor)
+                                        .unwrap_or_else(|| "no writable file slots".to_string());
+                                    app.set_status(format!("metadata editor: cannot edit blocked field — {}", reason));
+                                } else if blocked > 0 {
+                                    app.set_status(format!(
+                                        "metadata editor: editing per-file values; {} writable file{} can change, {} blocked slot{} remain visible and locked",
+                                        writable,
+                                        if writable == 1 { "" } else { "s" },
+                                        blocked,
+                                        if blocked == 1 { "" } else { "s" }
+                                    ));
+                                    metadata_editor_begin_detail_edit_for_entry(state, state.cursor, true);
+                                } else {
+                                    state.edit_input = Some(super::text_input::TextInputState::new(
+                                        entry.value.clone(),
+                                    ));
+                                    state.phase = MetadataEditorPhase::InlineEdit;
+                                }
                             }
                         }
                     } else if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
                     } else {
-                        // "Add field" row — start adding a new key.
-                        state.add_key_input = Some(super::text_input::TextInputState::empty());
-                        state.phase = MetadataEditorPhase::AddingKey;
+                        let (writable, blocked) = metadata_editor_file_slot_counts(state);
+                        if writable == 0 && blocked > 0 {
+                            app.set_status("metadata editor: cannot add field — no writable files in this editor session");
+                        } else {
+                            if blocked > 0 {
+                                app.set_status(format!(
+                                    "metadata editor: new field will apply to {} writable file{}; {} blocked slot{} will remain unchanged",
+                                    writable,
+                                    if writable == 1 { "" } else { "s" },
+                                    blocked,
+                                    if blocked == 1 { "" } else { "s" }
+                                ));
+                            }
+                            // "Add field" row — start adding a new key.
+                            state.add_key_input = Some(super::text_input::TextInputState::empty());
+                            state.phase = MetadataEditorPhase::AddingKey;
+                        }
                     }
                 }
                 // Delete-key convenience: same action as :d. The
@@ -3390,8 +3554,8 @@ fn handle_metadata_editor_key(
                 KeyCode::Delete => {
                     if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
-                    } else {
-                        metadata_editor_delete_cursor(state);
+                    } else if let Some(status) = metadata_editor_delete_cursor(state) {
+                        app.set_status(status);
                     }
                 }
                 _ => {}
@@ -3413,13 +3577,15 @@ fn handle_metadata_editor_key(
                 }
                 KeyCode::Enter => {
                     let new_val = input.text.clone();
-                    if state.cursor < state.entries.len() {
-                        let entry = &mut state.entries[state.cursor];
-                        entry.value = new_val.clone();
-                        for v in &mut entry.per_file_values {
-                            *v = new_val.clone();
+                    if state.cursor < state.active_surface().entries.len() {
+                        let updated = metadata_editor_apply_inline_value_to_writable_slots(
+                            state,
+                            state.cursor,
+                            new_val.clone(),
+                        );
+                        if updated == 0 {
+                            app.set_status("metadata editor: edit ignored — no writable file slots for this field");
                         }
-                        entry.is_mixed = false;
                     }
                     state.edit_input = None;
                     state.phase = MetadataEditorPhase::Editing;
@@ -3430,12 +3596,9 @@ fn handle_metadata_editor_key(
                 KeyCode::Up | KeyCode::Down => {
                     let has_nl = input.text.contains('\n') || input.text.contains('\r');
                     let char_count = input.text.chars().count();
-                    // Compute val_max (must match draw_metadata_editor).
-                    let area = crossterm::terminal::size().unwrap_or((80, 24));
-                    let w = ((area.0 as usize) * 85 / 100)
-                        .max(50)
-                        .min(area.0 as usize - 2);
-                    let inner_w = w.saturating_sub(2);
+                    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
+                    let inner_w = layout.content_area.width as usize;
                     let key_col_w = 22usize;
                     let vm = inner_w.saturating_sub(key_col_w + 1);
 
@@ -3597,8 +3760,15 @@ fn handle_metadata_editor_key(
                 KeyCode::Enter => {
                     let key_name = input.text.trim().to_uppercase();
                     if !key_name.is_empty() {
-                        let n = state.paths.len();
-                        state.entries.push(super::probe::TagEntry {
+                        let (writable, blocked) = metadata_editor_file_slot_counts(state);
+                        if writable == 0 && blocked > 0 {
+                            app.set_status("metadata editor: cannot add field — no writable files in this editor session");
+                            state.add_key_input = None;
+                            state.phase = MetadataEditorPhase::Editing;
+                            return;
+                        }
+                        let n = state.active_surface().paths.len();
+                        state.active_surface_mut().entries.push(super::probe::TagEntry {
                             display_key: key_name.clone(),
                             item_key: lofty::tag::ItemKey::Unknown(key_name),
                             value: String::new(),
@@ -3610,10 +3780,21 @@ fn handle_metadata_editor_key(
                             mb_proposed_value: None,
                             mb_proposed_per_file: None,
                         });
-                        state.cursor = state.entries.len() - 1;
+                        state.cursor = state.active_surface().entries.len() - 1;
                         state.add_key_input = None;
-                        state.edit_input = Some(super::text_input::TextInputState::empty());
-                        state.phase = MetadataEditorPhase::InlineEdit;
+                        if blocked > 0 {
+                            app.set_status(format!(
+                                "metadata editor: added field with per-file editing; {} writable file{} can receive a value, {} blocked slot{} remain locked",
+                                writable,
+                                if writable == 1 { "" } else { "s" },
+                                blocked,
+                                if blocked == 1 { "" } else { "s" }
+                            ));
+                            metadata_editor_begin_detail_edit_for_entry(state, state.cursor, true);
+                        } else {
+                            state.edit_input = Some(super::text_input::TextInputState::empty());
+                            state.phase = MetadataEditorPhase::InlineEdit;
+                        }
                         ensure_cursor_visible(state);
                     } else {
                         state.add_key_input = None;
@@ -3631,11 +3812,11 @@ fn handle_metadata_editor_key(
             // (paths.len() == 1, per_file_values.len() == n_tracks)
             // these diverge.
             let field_idx = state.detail_field_idx;
-            let n_files = state
+            let n_files = state.active_surface()
                 .entries
                 .get(field_idx)
                 .map(|e| e.per_file_values.len())
-                .unwrap_or(state.paths.len());
+                .unwrap_or(state.active_surface().paths.len());
 
             // If an inline edit is active within the detail overlay:
             if let Some(ref mut input) = state.detail_edit {
@@ -3645,20 +3826,14 @@ fn handle_metadata_editor_key(
                     }
                     KeyCode::Enter => {
                         let new_val = input.text.clone();
-                        if field_idx < state.entries.len() && state.detail_cursor < n_files {
-                            state.entries[field_idx].per_file_values[state.detail_cursor] = new_val;
-                            // Recalculate mixed state.
-                            let all_same = state.entries[field_idx]
-                                .per_file_values
-                                .windows(2)
-                                .all(|w| w[0] == w[1]);
-                            state.entries[field_idx].is_mixed = !all_same;
-                            let new_display = if all_same {
-                                state.entries[field_idx].per_file_values[0].clone()
+                        let detail_cursor = state.detail_cursor;
+                        if field_idx < state.active_surface().entries.len() && detail_cursor < n_files {
+                            if let Some(reason) = metadata_editor_slot_edit_block_reason(state, detail_cursor) {
+                                app.set_status(format!("metadata editor: slot is not editable — {}", reason));
                             } else {
-                                "<multiple values>".to_string()
-                            };
-                            state.entries[field_idx].value = new_display;
+                                state.active_surface_mut().entries[field_idx].per_file_values[detail_cursor] = new_val;
+                                metadata_editor_recompute_entry_display(&mut state.active_surface_mut().entries[field_idx]);
+                            }
                         }
                         state.detail_edit = None;
                         recalc_dirty(state);
@@ -3689,9 +3864,11 @@ fn handle_metadata_editor_key(
                 KeyCode::Enter => {
                     if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
-                    } else if field_idx < state.entries.len() && state.detail_cursor < n_files {
+                    } else if let Some(reason) = metadata_editor_slot_edit_block_reason(state, state.detail_cursor) {
+                        app.set_status(format!("metadata editor: slot is not editable — {}", reason));
+                    } else if field_idx < state.active_surface().entries.len() && state.detail_cursor < n_files {
                         let val =
-                            state.entries[field_idx].per_file_values[state.detail_cursor].clone();
+                            state.active_surface().entries[field_idx].per_file_values[state.detail_cursor].clone();
                         state.detail_edit = Some(super::text_input::TextInputState::new(val));
                     }
                 }
@@ -3699,9 +3876,12 @@ fn handle_metadata_editor_key(
             }
         }
         MetadataEditorPhase::Saving => {
-            // Block input while saving, except Esc to force-close.
+            // Save completion is asynchronous and can reduce partial
+            // failures back into this editor. Do not let Esc hide
+            // failed/skipped write issues by closing while the write is
+            // still in flight.
             if key.code == KeyCode::Esc {
-                app.active_overlay = ActiveOverlay::None;
+                request_metadata_editor_close(app, state);
             }
         }
     }
@@ -3715,8 +3895,8 @@ fn handle_metadata_editor_key(
 /// [when dim 1] / DATE / GENRE / CATALOGNUMBER). If anything matches,
 /// parses the on-disk CUESHEET (per_file_originals[0]) as the
 /// structural template, β-mutates album-level fields from
-/// state.entries, builds TrackOverride list from per-track entries,
-/// regenerates the CUE text, and mutates state.entries[cue_idx]'s
+/// state.active_surface().entries, builds TrackOverride list from per-track entries,
+/// regenerates the CUE text, and mutates state.active_surface().entries[cue_idx]'s
 /// value and per_file_values[0] in place. The caller's existing
 /// snapshot+write_all_tags pipeline then sees the CUESHEET diff and
 /// writes it through lofty.
@@ -3731,23 +3911,23 @@ fn handle_metadata_editor_key(
 pub fn regenerate_cuesheet_for_save(
     state: &mut super::app::MetadataEditorState,
 ) -> Result<bool, String> {
-    let n_paths = state.paths.len();
+    let n_paths = state.active_surface().paths.len();
 
     // Helpers indexed-by-display-key.
     let entry_idx = |key: &str| -> Option<usize> {
-        state
+        state.active_surface()
             .entries
             .iter()
             .position(|e| e.display_key.eq_ignore_ascii_case(key))
     };
     let dirty_at = |idx: usize| -> bool {
-        let e = &state.entries[idx];
+        let e = &state.active_surface().entries[idx];
         e.per_file_values != e.per_file_originals
     };
-    let is_per_track = |idx: usize| -> bool { state.entries[idx].per_file_values.len() != n_paths };
+    let is_per_track = |idx: usize| -> bool { state.active_surface().entries[idx].per_file_values.len() != n_paths };
 
     // 1. Detect any per-track dirt or relevant album-level dirt.
-    let per_track_dirty = state
+    let per_track_dirty = state.active_surface()
         .entries
         .iter()
         .enumerate()
@@ -3798,7 +3978,7 @@ pub fn regenerate_cuesheet_for_save(
     // Refuse when the user marked CUESHEET deleted but also has
     // per-track edits — the regen output would land in an entry that
     // the save loop is about to remove. Per-track edits would be lost.
-    if state.deleted.contains(&cue_idx) && per_track_dirty {
+    if state.active_surface().deleted.contains(&cue_idx) && per_track_dirty {
         return Err(
             "save aborted: per-track edits with CUESHEET marked deleted. \
              Undelete the CUESHEET row or revert per-track changes."
@@ -3813,7 +3993,7 @@ pub fn regenerate_cuesheet_for_save(
     // an embedded CUESHEET, values[0] == originals[0] (no inline edit
     // — CUESHEET rows are is_binary), so parsing either yields the
     // same result.
-    let cue_text_template = state.entries[cue_idx]
+    let cue_text_template = state.active_surface().entries[cue_idx]
         .per_file_values
         .first()
         .cloned()
@@ -3847,7 +4027,7 @@ pub fn regenerate_cuesheet_for_save(
         ("ISRC", entry_idx("ISRC")),
     ] {
         if let Some(i) = idx_opt {
-            let dim = state.entries[i].per_file_values.len();
+            let dim = state.active_surface().entries[i].per_file_values.len();
             if dim != n_paths && dim != n_parsed {
                 return Err(format!(
                     "save aborted: {} has {} per-track values but \
@@ -3860,12 +4040,12 @@ pub fn regenerate_cuesheet_for_save(
     }
 
     // 4. β album-level re-derive — mutate parsed CueSheet fields from
-    //    current state.entries (only when the source entry is dim-1
+    //    current state.active_surface().entries (only when the source entry is dim-1
     //    album-level; per-track entries are handled in step 5).
     let derive_album = |key: &str| -> Option<String> {
         entry_idx(key)
             .filter(|&i| !is_per_track(i))
-            .and_then(|i| state.entries[i].per_file_values.first().cloned())
+            .and_then(|i| state.active_surface().entries[i].per_file_values.first().cloned())
             .filter(|s| !s.is_empty())
     };
     if let Some(s) = derive_album("ALBUM") {
@@ -3892,7 +4072,7 @@ pub fn regenerate_cuesheet_for_save(
     let artist_idx_pt = entry_idx("ARTIST").filter(|&i| is_per_track(i));
     let isrc_idx_pt = entry_idx("ISRC").filter(|&i| is_per_track(i));
     let pt_get = |idx: Option<usize>, i: usize| -> Option<String> {
-        idx.and_then(|j| state.entries[j].per_file_values.get(i).cloned())
+        idx.and_then(|j| state.active_surface().entries[j].per_file_values.get(i).cloned())
             .filter(|s| !s.is_empty())
     };
     let overrides: Vec<super::cue_generate::TrackOverride> = (0..parsed.tracks.len())
@@ -3905,7 +4085,7 @@ pub fn regenerate_cuesheet_for_save(
 
     // 5. Regenerate. image_filename / format_tag come from the
     //    single-image audio file at paths[0].
-    let path = state
+    let path = state.active_surface()
         .paths
         .first()
         .ok_or_else(|| "save aborted: editor has no audio path".to_string())?;
@@ -3923,7 +4103,7 @@ pub fn regenerate_cuesheet_for_save(
     //    loop will pick up the diff (vals[0] != origs[0]) and write
     //    through lofty. is_binary stays true so display in the editor
     //    grid keeps showing the read-only summary.
-    let entry = &mut state.entries[cue_idx];
+    let entry = &mut state.active_surface_mut().entries[cue_idx];
     if entry.per_file_values.is_empty() {
         entry.per_file_values.push(new_cue.clone());
     } else {
@@ -4121,11 +4301,11 @@ pub(super) struct FixCapsResult {
 /// expectation: one `:fix-caps` invocation fixes everything; no need
 /// to re-invoke from detail.
 ///
-/// Deleted entries (`state.deleted`) are still skipped — capitalizing
+/// Deleted entries (`state.active_surface().deleted`) are still skipped — capitalizing
 /// a row marked for deletion is wasteful.
 ///
 /// is_mixed is recomputed against the entry's own `per_file_values
-/// .len()` (NOT `state.paths.len()`) — same dim invariant Phase 1c
+/// .len()` (NOT `state.active_surface().paths.len()`) — same dim invariant Phase 1c
 /// fixed in `recompute_and_stamp_mb_proposed`.
 pub(super) fn fix_caps_for_state(
     state: &mut super::app::MetadataEditorState,
@@ -4140,21 +4320,21 @@ pub(super) fn fix_caps_for_state(
 
     let indices: Vec<usize> = match focus {
         Some(i) => vec![i],
-        None => (0..state.entries.len()).collect(),
+        None => (0..state.active_surface().entries.len()).collect(),
     };
 
     for i in indices {
-        if i >= state.entries.len() {
+        if i >= state.active_surface().entries.len() {
             continue;
         }
         // Deleted-skip applies to main-editor invocations only.
         // Detail-overlay invocations honor the user's explicit focus.
-        if focus.is_none() && state.deleted.contains(&i) {
+        if focus.is_none() && state.active_surface().deleted.contains(&i) {
             result.skipped_deleted += 1;
             continue;
         }
 
-        let entry = &mut state.entries[i];
+        let entry = &mut state.active_surface_mut().entries[i];
         let key_upper = entry.display_key.to_ascii_uppercase();
         let cap_fn: fn(&str) -> String = match key_upper.as_str() {
             "TITLE" => capitalize_title,
@@ -4273,10 +4453,10 @@ fn overlay_per_track_values(
 pub(super) fn reload_from_sidecar_cue(
     state: &mut super::app::MetadataEditorState,
 ) -> Result<String, String> {
-    if state.paths.len() != 1 {
+    if state.active_surface().paths.len() != 1 {
         return Err(":tags-cue-sidecar requires a single-image rip (one file)".to_string());
     }
-    let audio = &state.paths[0];
+    let audio = &state.active_surface().paths[0];
     let sidecar = super::cue_parser::find_sidecar_cue(audio)
         .ok_or_else(|| ":tags-cue-sidecar: no .cue file found alongside audio".to_string())?;
     let raw = std::fs::read(&sidecar).map_err(|e| {
@@ -4310,12 +4490,12 @@ pub(super) fn reload_from_sidecar_cue(
     // Update or create the CUESHEET entry's per_file_values[0]
     // (preserving originals so revert restores the prior state).
     use lofty::tag::ItemKey;
-    if let Some(idx) = state
+    if let Some(idx) = state.active_surface()
         .entries
         .iter()
         .position(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
     {
-        let entry = &mut state.entries[idx];
+        let entry = &mut state.active_surface_mut().entries[idx];
         if entry.per_file_values.is_empty() {
             entry.per_file_values.push(text.clone());
         } else {
@@ -4323,7 +4503,7 @@ pub(super) fn reload_from_sidecar_cue(
         }
         entry.value = super::probe::cue_summary_string(&text);
     } else {
-        state.entries.push(super::probe::TagEntry {
+        state.active_surface_mut().entries.push(super::probe::TagEntry {
             display_key: "CUESHEET".to_string(),
             item_key: ItemKey::Unknown("CUESHEET".to_string()),
             value: super::probe::cue_summary_string(&text),
@@ -4353,11 +4533,11 @@ pub(super) fn reload_from_sidecar_cue(
         .iter()
         .map(|t| t.isrc.clone().unwrap_or_default())
         .collect();
-    overlay_per_track_values(&mut state.entries, "TITLE", ItemKey::TrackTitle, titles);
-    overlay_per_track_values(&mut state.entries, "ARTIST", ItemKey::TrackArtist, artists);
-    overlay_per_track_values(&mut state.entries, "ISRC", ItemKey::Isrc, isrcs);
+    overlay_per_track_values(&mut state.active_surface_mut().entries, "TITLE", ItemKey::TrackTitle, titles);
+    overlay_per_track_values(&mut state.active_surface_mut().entries, "ARTIST", ItemKey::TrackArtist, artists);
+    overlay_per_track_values(&mut state.active_surface_mut().entries, "ISRC", ItemKey::Isrc, isrcs);
 
-    state.dirty = super::probe::metadata_editor_has_changes(state);
+    state.active_surface_mut().dirty = super::probe::metadata_editor_has_changes(state);
 
     let n_tracks = parsed.tracks.len();
     let name = sidecar
@@ -4368,6 +4548,426 @@ pub(super) fn reload_from_sidecar_cue(
         ":tags-cue-sidecar: loaded {} tracks from {}",
         n_tracks, name
     ))
+}
+
+
+fn metadata_file_states_for_open(
+    path: &std::path::Path,
+    fs_metadata: Option<&std::fs::Metadata>,
+    filesystem_error: Option<&str>,
+    metadata_issue: Option<&super::probe::MetadataReadIssue>,
+) -> (
+    crate::tui::app::FileReadState,
+    crate::tui::app::FileWriteEligibility,
+) {
+    use crate::tui::app::{FileReadState, FileWriteEligibility};
+    use super::probe::MetadataReadIssueKind;
+
+    if let Some(issue) = metadata_issue {
+        let reason = issue.reason.trim().to_string();
+        let read_state = match issue.kind {
+            MetadataReadIssueKind::UnsupportedFormat => FileReadState::Unsupported {
+                reason: reason.clone(),
+            },
+            MetadataReadIssueKind::FilesystemRead
+            | MetadataReadIssueKind::PermissionDenied
+            | MetadataReadIssueKind::TagRead => FileReadState::Unreadable {
+                reason: reason.clone(),
+            },
+        };
+        return (read_state, FileWriteEligibility::Blocked { reason });
+    }
+
+    if let Some(metadata) = fs_metadata {
+        if metadata.permissions().readonly() {
+            let reason = format!("'{}' is read-only", path.display());
+            return (
+                FileReadState::Readable,
+                FileWriteEligibility::Blocked { reason },
+            );
+        }
+        return (FileReadState::Readable, FileWriteEligibility::Writable);
+    }
+
+    let reason = filesystem_error
+        .filter(|reason| !reason.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("could not verify write eligibility for '{}'", path.display()));
+    (
+        FileReadState::Readable,
+        FileWriteEligibility::Unknown { reason },
+    )
+}
+
+
+fn metadata_technical_details_for_paths(
+    paths: &[std::path::PathBuf],
+    cached_metadata: &[super::probe::SourceMetadata],
+    cached_metadata_errors: &[Option<super::probe::MetadataReadIssue>],
+) -> crate::tui::app::MetadataTechnicalDetails {
+    let files = paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let fs_metadata_result = std::fs::metadata(path);
+            let (file_size, modified, filesystem_error, fs_metadata_for_access) = match fs_metadata_result {
+                Ok(metadata) => (Some(metadata.len()), metadata.modified().ok(), None, Some(metadata)),
+                Err(err) => (None, None, Some(format!("stat '{}': {}", path.display(), err)), None),
+            };
+
+            // Do not probe audio streams while opening the editor. Stream
+            // probing can block on slow disks, network mounts, or malformed
+            // media. The Details tab loads it lazily and caches the result.
+            let (info, probe_error) = (None, None);
+
+            let metadata_cache_missing_issue;
+            let (metadata, metadata_issue) = match cached_metadata.get(idx) {
+                Some(metadata) => (metadata.clone(), cached_metadata_errors.get(idx).and_then(|issue| issue.as_ref())),
+                None => {
+                    metadata_cache_missing_issue = super::probe::MetadataReadIssue {
+                        kind: super::probe::MetadataReadIssueKind::TagRead,
+                        reason: format!(
+                            "metadata cache missing for '{}' after initial tag read",
+                            path.display()
+                        ),
+                    };
+                    (super::probe::SourceMetadata::default(), Some(&metadata_cache_missing_issue))
+                }
+            };
+            let metadata_error = metadata_issue.map(|issue| issue.reason.clone());
+            let (read_state, write_eligibility) = metadata_file_states_for_open(
+                path,
+                fs_metadata_for_access.as_ref(),
+                filesystem_error.as_deref(),
+                metadata_issue,
+            );
+
+            let mut file = crate::tui::app::MetadataFileDetails::from_read_result(
+                path.clone(),
+                file_size,
+                modified,
+                filesystem_error,
+                metadata_error,
+                read_state,
+                write_eligibility,
+                metadata,
+            );
+            // Deliberately leave audio stream probing unloaded here. Details
+            // requests and caches probe facts through an explicit model
+            // transition instead of blocking editor open or status assembly.
+            if let Some(info) = info {
+                file.set_probe_ready(info);
+            }
+            if let Some(reason) = probe_error {
+                file.set_probe_failed(reason, true);
+            }
+            file
+        })
+        .collect();
+    crate::tui::app::MetadataTechnicalDetails::from_files(files)
+}
+
+fn metadata_editor_request_details_probe(
+    state: &mut crate::tui::app::MetadataEditorState,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    use crate::tui::app::MetadataDetailsProbeState;
+
+    if state.active_surface().technical_details.disc.is_some() {
+        state.active_surface_mut().technical_details.details_probe_state = MetadataDetailsProbeState::Ready;
+        return false;
+    }
+
+    if matches!(state.active_surface().technical_details.details_probe_state, MetadataDetailsProbeState::Loading { .. }) {
+        return false;
+    }
+
+    let targets: Vec<(usize, std::path::PathBuf)> = state.active_surface()
+        .technical_details
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| {
+            matches!(file.file_facts.read_state, crate::tui::app::FileReadState::Readable)
+                && file.media_facts.needs_probe()
+        })
+        .map(|(idx, file)| (idx, file.file_facts.path.clone()))
+        .collect();
+
+    if targets.is_empty() {
+        let issues: Vec<String> = state.active_surface()
+            .technical_details
+            .files
+            .iter()
+            .filter_map(|file| file.media_facts.failed_reason().map(str::to_string))
+            .collect();
+        state.active_surface_mut().technical_details.details_probe_state = if issues.is_empty() {
+            MetadataDetailsProbeState::Ready
+        } else {
+            MetadataDetailsProbeState::Partial { issues }
+        };
+        return false;
+    }
+
+    let session_id = state.active_surface().technical_details.session_id;
+    let generation = state.active_surface().technical_details.details_probe_generation.saturating_add(1);
+    state.active_surface_mut().technical_details.details_probe_generation = generation;
+    let total = targets.len();
+    state.active_surface_mut().technical_details.details_probe_state = MetadataDetailsProbeState::Loading {
+        generation,
+        completed: 0,
+        total,
+    };
+    {
+        let files = &mut state.active_surface_mut().technical_details.files;
+        for (idx, _) in &targets {
+            if let Some(file) = files.get_mut(*idx) {
+                file.media_facts = crate::tui::app::ProbeState::Loading { generation };
+            }
+        }
+    }
+
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let results = tokio::task::spawn_blocking(move || {
+            targets
+                .into_iter()
+                .map(|(idx, path)| {
+                    let result = super::probe::probe_audio(&path).map_err(|err| {
+                        format!("probe '{}': {}", path.display(), err)
+                    });
+                    crate::tui::app::MetadataDetailsProbeFileResult {
+                        index: idx,
+                        path,
+                        result,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_else(|err| {
+            vec![crate::tui::app::MetadataDetailsProbeFileResult {
+                index: usize::MAX,
+                path: std::path::PathBuf::new(),
+                result: Err(format!("details probe task panic: {}", err)),
+            }]
+        });
+        let _ = tx
+            .send(AppMessage::MetadataEditorDetailsProbeComplete {
+                session_id,
+                generation,
+                total,
+                results,
+            })
+            .await;
+    });
+
+    true
+}
+
+fn metadata_editor_cancel_details_probe(state: &mut crate::tui::app::MetadataEditorState) {
+    state.active_surface_mut().technical_details.cancel_details_probe();
+}
+
+fn ensure_metadata_content_tab_loaded(
+    state: &mut crate::tui::app::MetadataEditorState,
+    tab: crate::tui::app::ContentTab,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    match tab {
+        crate::tui::app::ContentTab::Details => metadata_editor_request_details_probe(state, tx),
+        crate::tui::app::ContentTab::Metadata
+        | crate::tui::app::ContentTab::ReplayGain
+        | crate::tui::app::ContentTab::Artwork => false,
+    }
+}
+
+fn metadata_editor_retry_details_probe(
+    state: &mut crate::tui::app::MetadataEditorState,
+    tx: &mpsc::Sender<AppMessage>,
+) -> String {
+    if state.active_surface().technical_details.disc.is_some() {
+        state.active_surface_mut().technical_details.details_probe_state = crate::tui::app::MetadataDetailsProbeState::Ready;
+        return "metadata editor: disc details are already available".to_string();
+    }
+
+    let cleared = state.active_surface_mut().technical_details.retry_failed_details_probes();
+    if metadata_editor_request_details_probe(state, tx) {
+        if cleared == 0 {
+            "metadata editor: Details probe started".to_string()
+        } else {
+            format!(
+                "metadata editor: retrying {} failed Details probe{}",
+                cleared,
+                if cleared == 1 { "" } else { "s" }
+            )
+        }
+    } else if cleared == 0 {
+        "metadata editor: no failed Details probes to retry".to_string()
+    } else {
+        format!(
+            "metadata editor: cleared {} failed Details probe{}",
+            cleared,
+            if cleared == 1 { "" } else { "s" }
+        )
+    }
+}
+
+fn metadata_editor_read_only_visible_rows() -> usize {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
+    layout.content_area.height.max(1) as usize
+}
+
+fn metadata_read_only_total_lines(state: &crate::tui::app::MetadataEditorState) -> usize {
+    super::draw_overlays::metadata_read_only_line_count(state)
+}
+
+fn clamp_metadata_read_only_scroll(
+    state: &mut crate::tui::app::MetadataEditorState,
+    visible_rows: usize,
+) -> bool {
+    let total_lines = metadata_read_only_total_lines(state);
+    state.clamp_read_only_content_scroll(total_lines, visible_rows.max(1))
+}
+
+fn scroll_metadata_read_only_tab(
+    state: &mut crate::tui::app::MetadataEditorState,
+    delta: isize,
+    visible_rows: usize,
+) -> bool {
+    let total_lines = metadata_read_only_total_lines(state);
+    state.scroll_read_only_content_by(delta, total_lines, visible_rows.max(1))
+}
+
+fn set_metadata_read_only_scroll(
+    state: &mut crate::tui::app::MetadataEditorState,
+    scroll: usize,
+    visible_rows: usize,
+) -> bool {
+    let total_lines = metadata_read_only_total_lines(state);
+    state.set_read_only_content_scroll(scroll, total_lines, visible_rows.max(1))
+}
+
+fn metadata_editor_apply_content_tab_progress(
+    _state: &mut crate::tui::app::MetadataEditorState,
+) -> Option<String> {
+    None
+}
+
+fn metadata_editor_status_for_content_tab(
+    state: &crate::tui::app::MetadataEditorState,
+) -> String {
+    // Pure status assembly: no filesystem I/O, no media probing, and no model
+    // mutation. Background probe progress is applied by explicit input/message
+    // transitions before this function is called.
+    match &state.active_surface().technical_details.details_probe_state {
+        crate::tui::app::MetadataDetailsProbeState::Loading { completed, total, .. }
+            if state.content_tab == crate::tui::app::ContentTab::Details =>
+        {
+            format!("metadata editor: Details loading ({}/{})", completed.min(total), total)
+        }
+        _ => format!("metadata editor: {}", state.content_tab.label()),
+    }
+}
+
+fn metadata_filesystem_details_for_unique_paths(
+    paths: &[std::path::PathBuf],
+) -> Vec<crate::tui::app::MetadataFileDetails> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .iter()
+        .filter(|path| seen.insert((*path).clone()))
+        .map(|path| {
+            let fs_metadata_result = std::fs::metadata(path);
+            let (file_size, modified, filesystem_error, fs_metadata_for_access) = match fs_metadata_result {
+                Ok(metadata) => (Some(metadata.len()), metadata.modified().ok(), None, Some(metadata)),
+                Err(err) => (None, None, Some(format!("stat '{}': {}", path.display(), err)), None),
+            };
+            let (read_state, write_eligibility) = metadata_file_states_for_open(
+                path,
+                fs_metadata_for_access.as_ref(),
+                filesystem_error.as_deref(),
+                None,
+            );
+            crate::tui::app::MetadataFileDetails::from_read_result(
+                path.clone(),
+                file_size,
+                modified,
+                filesystem_error,
+                None,
+                read_state,
+                write_eligibility,
+                super::probe::SourceMetadata::default(),
+            )
+        })
+        .collect()
+}
+
+fn with_location_file_details(
+    mut details: crate::tui::app::MetadataTechnicalDetails,
+    paths: &[std::path::PathBuf],
+) -> crate::tui::app::MetadataTechnicalDetails {
+    details.files = metadata_filesystem_details_for_unique_paths(paths);
+    details
+}
+
+fn disc_technical_details_from_presentation(
+    label: String,
+    track_count: usize,
+    presentation: &crate::disc::model::DiscPresentation,
+) -> crate::tui::app::MetadataTechnicalDetails {
+    crate::tui::app::MetadataTechnicalDetails::from_disc_presentation(
+        label,
+        track_count,
+        Some(presentation.total_duration_secs),
+        &presentation.format,
+    )
+}
+
+fn minimal_disc_technical_details(
+    label: String,
+    track_count: usize,
+    duration_secs: Option<f64>,
+) -> crate::tui::app::MetadataTechnicalDetails {
+    crate::tui::app::MetadataTechnicalDetails::from_disc(crate::tui::app::DiscTechnicalDetails {
+        presentation_label: label,
+        track_count,
+        duration_secs: duration_secs.filter(|duration| duration.is_finite() && *duration > 0.0),
+        ..Default::default()
+    })
+}
+
+fn sacd_technical_details(
+    label: &'static str,
+    track_count: usize,
+    area: &super::sacd::AreaInfo,
+) -> crate::tui::app::MetadataTechnicalDetails {
+    let channels = area.header.channel_count as u32;
+    let channel_layout = match channels {
+        2 => Some("stereo".to_string()),
+        5 => Some("5.0".to_string()),
+        6 => Some("5.1".to_string()),
+        n if n > 0 => Some(format!("{} ch", n)),
+        _ => None,
+    };
+    let codec = if area.header.frame_format.is_dst_encoded() {
+        Some("DST/DSD".to_string())
+    } else {
+        Some("DSD".to_string())
+    };
+    crate::tui::app::MetadataTechnicalDetails::from_disc(crate::tui::app::DiscTechnicalDetails {
+        presentation_label: label.to_string(),
+        track_count,
+        duration_secs: Some(area.header.total_playtime.total_seconds()),
+        codec,
+        sample_rate: Some(2_822_400),
+        channels: (channels > 0).then_some(channels),
+        channel_layout,
+        bit_depth: Some(1),
+        lossless: Some(true),
+        tool: None,
+    })
 }
 
 pub fn open_metadata_editor(app: &mut AppState) {
@@ -4448,14 +5048,19 @@ pub fn open_metadata_editor(app: &mut AppState) {
         return;
     }
 
-    // Read and merge tags from all files.
-    let mut entries = match super::probe::read_all_tags_merged(&paths) {
-        Ok(e) => e,
+    // Read and merge tags from all files. This also returns compact per-file
+    // SourceMetadata (ReplayGain + artwork) from the same Lofty pass, avoiding
+    // a second immediate tag/artwork read while opening the editor.
+    let merged = match super::probe::read_all_tags_merged_with_metadata(&paths) {
+        Ok(read) => read,
         Err(e) => {
             app.set_status(format!("Failed to read tags: {}", e));
             return;
         }
     };
+    let mut entries = merged.entries;
+    let mut source_metadata = merged.metadata;
+    let mut source_metadata_errors = merged.metadata_errors;
 
     // Phase 2: single-image per-track surfacing.
     // When the editor opens on a single audio file, surface per-track
@@ -4475,7 +5080,14 @@ pub fn open_metadata_editor(app: &mut AppState) {
     // Sort files by (disc, track, filename) for logical display order.
     // Entry-aware sort: paths AND per-file vectors are permuted together
     // so the indexing relationship stays consistent.
-    super::probe::sort_paths_and_entries_by_track(&mut paths, &mut entries);
+    super::probe::sort_paths_entries_metadata_and_errors_by_track(
+        &mut paths,
+        &mut entries,
+        &mut source_metadata,
+        &mut source_metadata_errors,
+    );
+
+    let technical_details = metadata_technical_details_for_paths(&paths, &source_metadata, &source_metadata_errors);
 
     // Auto-populate TITLE and TRACKNUMBER from filenames where missing.
     let mut did_auto_populate = false;
@@ -4530,8 +5142,20 @@ pub fn open_metadata_editor(app: &mut AppState) {
             }
         };
 
-        // Parse filenames and fill empty values.
+        let auto_populate_allowed: Vec<bool> = technical_details
+            .files
+            .iter()
+            .map(|file| file.file_facts.write_eligibility.is_writable())
+            .collect();
+
+        // Parse filenames and fill empty values only for files that are
+        // writable in this editor session. A partial tag-read failure leaves placeholder
+        // slots in per_file_values for alignment, but those slots must not be
+        // auto-populated or later treated as real writable empty tags.
         for i in 0..n {
+            if !auto_populate_allowed.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             let stem = paths[i].file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let (parsed_track, parsed_title) = super::probe::parse_title_from_filename(stem);
 
@@ -4637,44 +5261,14 @@ pub fn open_metadata_editor(app: &mut AppState) {
             .collect()
     };
 
-    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(super::app::MetadataEditorState {
+    let mut state = super::app::MetadataEditorState::for_files(
         paths,
         entries,
-        cursor: 0,
-        scroll: 0,
-        last_click: None,
-        edit_input: None,
-        add_key_input: None,
-        phase: super::app::MetadataEditorPhase::Editing,
-        dirty: did_auto_populate,
-        deleted: Vec::new(),
         file_labels,
-        detail_field_idx: 0,
-        detail_cursor: 0,
-        detail_scroll: 0,
-        detail_edit: None,
-        mb_back: None,
-        gnudb_back: None,
-        read_only: false,
-        sacd_sidecar_path: None,
-        sacd_area_kind: None,
-        sacd_stereo_durations: None,
-        sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        presentation_tabs: Vec::new(),
-        active_tab: 0,
-        presentation_selector_open: false,
-        presentation_selector_cursor: 0,
-        presentation_selector_scroll: 0,
-    }));
+        technical_details,
+    );
+    state.active_surface_mut().dirty = did_auto_populate;
+    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
 }
 
 
@@ -5150,48 +5744,34 @@ pub fn build_dvda_editor_state(
         }
     };
 
-    Ok((
-        super::app::MetadataEditorState {
-            paths,
-            entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: super::app::MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels,
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: !writable,
-            sacd_sidecar_path: target_path,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        },
-        dvda_presentation_label_for_group(disc, disc_contents, group.group_nr),
-        n_tracks,
-    ))
+    let label = dvda_presentation_label_for_group(disc, disc_contents, group.group_nr);
+    let technical_details = with_location_file_details(
+        disc_contents
+            .and_then(|contents| {
+                contents.presentations.iter().find(|presentation| {
+                    matches!(
+                        presentation.id,
+                        crate::disc::model::PresentationId::DvdAudioGroup(n) if n == group.group_nr
+                    )
+                })
+            })
+            .map(|presentation| {
+                disc_technical_details_from_presentation(label.clone(), n_tracks, presentation)
+            })
+            .unwrap_or_else(|| minimal_disc_technical_details(label.clone(), n_tracks, None)),
+        &paths,
+    );
+
+    let mut state = super::app::MetadataEditorState::for_files(
+        paths,
+        entries,
+        file_labels,
+        technical_details,
+    );
+    state.read_only = !writable;
+    state.sacd_sidecar_path = target_path;
+
+    Ok((state, label, n_tracks))
 }
 
 pub fn build_dvda_multitab_editor_state(
@@ -5239,27 +5819,11 @@ pub fn build_dvda_multitab_editor_state(
             metabase,
             Some(spec.group_nr),
         )?;
-        tabs.push(super::app::PresentationTab {
-            id: crate::disc::model::PresentationId::DvdAudioGroup(spec.group_nr),
-            label: spec.label.clone(),
-            paths: state.paths.clone(),
-            entries: state.entries.clone(),
-            file_labels: state.file_labels.clone(),
-            deleted: state.deleted.clone(),
-            dirty: state.dirty,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        });
+        tabs.push(super::app::PresentationTab::from_editor_state(
+            crate::disc::model::PresentationId::DvdAudioGroup(spec.group_nr),
+            spec.label.clone(),
+            &state,
+        ));
         states.push((state, spec.label.clone(), n_tracks, spec.group_nr));
     }
 
@@ -5268,15 +5832,7 @@ pub fn build_dvda_multitab_editor_state(
         .position(|(_, _, _, group_nr)| *group_nr == default_group_nr)
         .unwrap_or(0);
     let (mut state, label, n_tracks, _) = states.remove(active_idx);
-    state.presentation_tabs = tabs;
-    state.active_tab = active_idx;
-    if let Some(tab) = state.presentation_tabs.get(active_idx).cloned() {
-        state.paths = tab.paths;
-        state.entries = tab.entries;
-        state.file_labels = tab.file_labels;
-        state.deleted = tab.deleted;
-        state.dirty = tab.dirty;
-    }
+    state.set_presentation_surfaces(tabs, active_idx);
     Ok((state, label, n_tracks))
 }
 
@@ -5297,7 +5853,7 @@ fn find_single_dvda_source_in_dir(dir: &std::path::Path) -> Option<std::path::Pa
 }
 
 pub(super) fn dvda_group_from_editor_state(state: &super::app::MetadataEditorState) -> Option<u8> {
-    state
+    state.active_surface()
         .entries
         .iter()
         .find(|entry| entry.display_key.eq_ignore_ascii_case("DVDA_GROUP"))
@@ -5316,35 +5872,35 @@ pub(super) fn metadata_editor_is_dvda_source(state: &super::app::MetadataEditorS
         return false;
     }
 
-    let Some(first_path) = state.paths.first() else {
+    let Some(first_path) = state.active_surface().paths.first() else {
         return false;
     };
     if !crate::disc::dvda_utils::is_dvda_source(first_path) {
         return false;
     }
 
-    state.paths.iter().all(|p| p == first_path)
+    state.active_surface().paths.iter().all(|p| p == first_path)
 }
 
 pub(super) fn metadata_editor_is_dvdv_source(state: &super::app::MetadataEditorState) -> bool {
-    let Some(first_path) = state.paths.first() else {
+    let Some(first_path) = state.active_surface().paths.first() else {
         return false;
     };
     if !is_dvdv_source_for_editor(first_path) {
         return false;
     }
-    state.paths.iter().all(|path| path == first_path)
+    state.active_surface().paths.iter().all(|path| path == first_path)
 }
 
 
 pub(super) fn metadata_editor_is_bluray_source(state: &super::app::MetadataEditorState) -> bool {
-    let Some(first_path) = state.paths.first() else {
+    let Some(first_path) = state.active_surface().paths.first() else {
         return false;
     };
     if !is_bluray_source_for_editor(first_path) {
         return false;
     }
-    state.paths.iter().all(|path| path == first_path)
+    state.active_surface().paths.iter().all(|path| path == first_path)
 }
 
 pub(super) fn open_metadata_editor_for_bluray(
@@ -5391,27 +5947,11 @@ pub(super) fn open_metadata_editor_for_bluray(
             Ok(value) => value,
             Err(_) => continue,
         };
-        tabs.push(super::app::PresentationTab {
-            id: presentation.id.clone(),
-            label: label.clone(),
-            paths: state.paths.clone(),
-            entries: state.entries.clone(),
-            file_labels: state.file_labels.clone(),
-            deleted: state.deleted.clone(),
-            dirty: state.dirty,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: state.bluray_playlist_number,
-            bluray_audio_pid: state.bluray_audio_pid,
-            bluray_audio_stream_index: state.bluray_audio_stream_index,
-            bluray_angle_number: state.bluray_angle_number,
-            bluray_chapter_durations: state.bluray_chapter_durations.clone(),
-        });
+        tabs.push(super::app::PresentationTab::from_editor_state(
+            presentation.id.clone(),
+            label.clone(),
+            &state,
+        ));
         states.push((state, label, n_tracks));
     }
 
@@ -5428,27 +5968,7 @@ pub(super) fn open_metadata_editor_for_bluray(
         .unwrap_or(0);
 
     let (mut state, label, n_tracks) = states.remove(active_idx);
-    state.presentation_tabs = tabs;
-    state.active_tab = active_idx;
-    if let Some(tab) = state.presentation_tabs.get(active_idx).cloned() {
-        state.paths = tab.paths;
-        state.entries = tab.entries;
-        state.file_labels = tab.file_labels;
-        state.deleted = tab.deleted;
-        state.dirty = tab.dirty;
-        state.sacd_area_kind = tab.sacd_area_kind;
-        state.sacd_stereo_durations = tab.sacd_stereo_durations;
-        state.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
-        state.dvdv_source_chapters = tab.dvdv_source_chapters;
-        state.dvdv_track_durations = tab.dvdv_track_durations;
-        state.dvdv_angle_number = tab.dvdv_angle_number;
-        state.dvdv_title_angle_count = tab.dvdv_title_angle_count;
-        state.bluray_playlist_number = tab.bluray_playlist_number;
-        state.bluray_audio_pid = tab.bluray_audio_pid;
-        state.bluray_audio_stream_index = tab.bluray_audio_stream_index;
-        state.bluray_angle_number = tab.bluray_angle_number;
-        state.bluray_chapter_durations = tab.bluray_chapter_durations;
-    }
+    state.set_presentation_surfaces(tabs, active_idx);
     let preload_report =
         super::command::preload_bluray_metadata_editor_state_from_sidecars_with_report(
             &mut state,
@@ -5460,10 +5980,10 @@ pub(super) fn open_metadata_editor_for_bluray(
         .get(active_idx)
         .map(|tab| tab.label.clone())
         .unwrap_or(label);
-    let status_tracks = if state.paths.is_empty() {
+    let status_tracks = if state.active_surface().paths.is_empty() {
         n_tracks
     } else {
-        state.paths.len()
+        state.active_surface().paths.len()
     };
     app.active_overlay = super::app::ActiveOverlay::MetadataEditor(Box::new(state));
 
@@ -5658,49 +6178,30 @@ fn build_bluray_editor_state(
         })
         .unwrap_or(false);
     let label = bluray_presentation_label(presentation);
+    let technical_details = with_location_file_details(
+        disc_technical_details_from_presentation(
+            label.clone(),
+            n_tracks,
+            presentation,
+        ),
+        &paths,
+    );
 
-    Ok((
-        super::app::MetadataEditorState {
-            paths,
-            entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: super::app::MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels,
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: !writable,
-            sacd_sidecar_path: target_path,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: Some(playlist_number),
-            bluray_audio_pid: Some(audio_pid),
-            bluray_audio_stream_index: Some(audio_stream_index),
-            bluray_angle_number: Some(display_angle),
-            bluray_chapter_durations,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        },
-        label,
-        n_tracks,
-    ))
+    let mut state = super::app::MetadataEditorState::for_files(
+        paths,
+        entries,
+        file_labels,
+        technical_details,
+    );
+    state.active_surface_mut().bluray_playlist_number = Some(playlist_number);
+    state.active_surface_mut().bluray_audio_pid = Some(audio_pid);
+    state.active_surface_mut().bluray_audio_stream_index = Some(audio_stream_index);
+    state.active_surface_mut().bluray_angle_number = Some(display_angle);
+    state.active_surface_mut().bluray_chapter_durations = bluray_chapter_durations;
+    state.read_only = !writable;
+    state.sacd_sidecar_path = target_path;
+
+    Ok((state, label, n_tracks))
 }
 
 fn bluray_reliable_chapter_durations(
@@ -5839,30 +6340,14 @@ fn open_metadata_editor_for_dvdv_at_track(
         };
         let (dvdv_angle_number, dvdv_title_angle_count) =
             dvdv_presentation_angle_context_for_editor(&contents, presentation_index);
-        state.dvdv_angle_number = dvdv_angle_number;
-        state.dvdv_title_angle_count = dvdv_title_angle_count;
+        state.active_surface_mut().dvdv_angle_number = dvdv_angle_number;
+        state.active_surface_mut().dvdv_title_angle_count = dvdv_title_angle_count;
         let label = dvdv_presentation_label_with_sparse_angle(label, dvdv_angle_number, dvdv_title_angle_count);
-        tabs.push(super::app::PresentationTab {
-            id: presentation.id.clone(),
-            label: label.clone(),
-            paths: state.paths.clone(),
-            entries: state.entries.clone(),
-            file_labels: state.file_labels.clone(),
-            deleted: state.deleted.clone(),
-            dirty: state.dirty,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: state.dvdv_source_chapters.clone(),
-            dvdv_track_durations: state.dvdv_track_durations.clone(),
-            dvdv_angle_number: state.dvdv_angle_number,
-            dvdv_title_angle_count: state.dvdv_title_angle_count,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        });
+        tabs.push(super::app::PresentationTab::from_editor_state(
+            presentation.id.clone(),
+            label.clone(),
+            &state,
+        ));
         states.push((state, label, n_tracks));
     }
 
@@ -5885,27 +6370,7 @@ fn open_metadata_editor_for_dvdv_at_track(
         });
 
     let (mut state, label, n_tracks) = states.remove(active_idx);
-    state.presentation_tabs = tabs;
-    state.active_tab = active_idx;
-    if let Some(tab) = state.presentation_tabs.get(active_idx).cloned() {
-        state.paths = tab.paths;
-        state.entries = tab.entries;
-        state.file_labels = tab.file_labels;
-        state.deleted = tab.deleted;
-        state.dirty = tab.dirty;
-        state.sacd_area_kind = tab.sacd_area_kind;
-        state.sacd_stereo_durations = tab.sacd_stereo_durations;
-        state.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
-        state.dvdv_source_chapters = tab.dvdv_source_chapters;
-        state.dvdv_track_durations = tab.dvdv_track_durations;
-        state.dvdv_angle_number = tab.dvdv_angle_number;
-        state.dvdv_title_angle_count = tab.dvdv_title_angle_count;
-        state.bluray_playlist_number = tab.bluray_playlist_number;
-        state.bluray_audio_pid = tab.bluray_audio_pid;
-        state.bluray_audio_stream_index = tab.bluray_audio_stream_index;
-        state.bluray_angle_number = tab.bluray_angle_number;
-        state.bluray_chapter_durations = tab.bluray_chapter_durations;
-    }
+    state.set_presentation_surfaces(tabs, active_idx);
     if let Some(track) = initial_track {
         if n_tracks > 0 {
             state.detail_cursor = track.min(n_tracks - 1);
@@ -6128,49 +6593,27 @@ pub fn build_dvdv_editor_state(
     let target_path = super::command::dvdv_metadata_sidecar_path_for_source(source_path).ok();
     let writable = super::command::dvdv_metadata_sidecar_target_is_writable(source_path);
     let label = dvdv_presentation_label(presentation, sidecar);
+    let technical_details = with_location_file_details(
+        disc_technical_details_from_presentation(
+            label.clone(),
+            n_tracks,
+            presentation,
+        ),
+        &paths,
+    );
 
-    Ok((
-        super::app::MetadataEditorState {
-            paths,
-            entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: super::app::MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels,
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: !writable,
-            sacd_sidecar_path: target_path,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters,
-            dvdv_track_durations,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        },
-        label,
-        n_tracks,
-    ))
+    let mut state = super::app::MetadataEditorState::for_files(
+        paths,
+        entries,
+        file_labels,
+        technical_details,
+    );
+    state.active_surface_mut().dvdv_source_chapters = dvdv_source_chapters;
+    state.active_surface_mut().dvdv_track_durations = dvdv_track_durations;
+    state.read_only = !writable;
+    state.sacd_sidecar_path = target_path;
+
+    Ok((state, label, n_tracks))
 }
 
 fn push_dvdv_album_entry(
@@ -6438,7 +6881,7 @@ pub fn save_dvda_metabase(
     state: &super::app::MetadataEditorState,
     metabase_path: &std::path::Path,
 ) -> Result<SacdSaveKind, String> {
-    let source_path = state
+    let source_path = state.active_surface()
         .paths
         .first()
         .ok_or_else(|| "editor has no DVD-Audio source path".to_string())?
@@ -6468,11 +6911,11 @@ fn save_dvda_metabase_with_loaded_context<F>(
 where
     F: FnMut(u8) -> Result<Vec<String>, String>,
 {
-    if selected_track_ids.len() != state.paths.len() {
+    if selected_track_ids.len() != state.active_surface().paths.len() {
         return Err(format!(
             "DVD-Audio group has {} track(s) but editor has {}; refusing to map",
             selected_track_ids.len(),
-            state.paths.len(),
+            state.active_surface().paths.len(),
         ));
     }
 
@@ -6501,7 +6944,7 @@ where
     }
 
     ensure_dvda_tracks_present(&mut metabase, seeded, &selected_track_ids);
-    apply_dvda_entries_to_metabase(&mut metabase, &selected_track_ids, &state.entries, &state.deleted)?;
+    apply_dvda_entries_to_metabase(&mut metabase, &selected_track_ids, &state.active_surface().entries, &state.active_surface().deleted)?;
 
     super::dvda_metabase::write_metabase(&metabase, metabase_path)
         .map_err(|e| format!("write: {}", e))?;
@@ -6610,7 +7053,7 @@ pub(super) fn switch_dvda_editor_group(
     }) {
         state.switch_presentation_tab(idx);
         let label = state.active_presentation_label().unwrap_or("DVD-Audio group").to_string();
-        return Ok(format!("{} ({} tracks)", label, state.paths.len()));
+        return Ok(format!("{} ({} tracks)", label, state.active_surface().paths.len()));
     }
 
     let (disc, store_id, metabase_path, metabase, _parse_note) =
@@ -6625,7 +7068,9 @@ pub(super) fn switch_dvda_editor_group(
         metabase.as_ref(),
         Some(group_nr),
     )?;
-    new_state.cursor = state.cursor.min(new_state.entries.len().saturating_sub(1));
+    new_state.cursor = state
+        .cursor
+        .min(new_state.active_surface().entries.len().saturating_sub(1));
     new_state.scroll = 0;
     *state = new_state;
     Ok(format!("{} ({} tracks)", group_label, n_tracks))
@@ -7096,45 +7541,22 @@ pub fn build_sacd_editor_state(
     };
     let sacd_stereo_durations = md.stereo.as_ref().and_then(&area_durations);
     let sacd_multi_channel_durations = md.multi_channel.as_ref().and_then(&area_durations);
+    let technical_details = with_location_file_details(
+        sacd_technical_details(area_label, n_tracks, area),
+        &paths,
+    );
 
-    let state = super::app::MetadataEditorState {
+    let mut state = super::app::MetadataEditorState::for_files(
         paths,
         entries,
-        cursor: 0,
-        scroll: 0,
-        last_click: None,
-        edit_input: None,
-        add_key_input: None,
-        phase: super::app::MetadataEditorPhase::Editing,
-        dirty: false,
-        deleted: Vec::new(),
         file_labels,
-        detail_field_idx: 0,
-        detail_cursor: 0,
-        detail_scroll: 0,
-        detail_edit: None,
-        mb_back: None,
-        gnudb_back: None,
-        read_only: !writable,
-        sacd_sidecar_path: if writable { sidecar_path_opt } else { None },
-        sacd_area_kind: Some(area.header.kind),
-        sacd_stereo_durations,
-        sacd_multi_channel_durations,
-        dvdv_track_durations: None,
-        dvdv_angle_number: None,
-        dvdv_title_angle_count: None,
-        bluray_playlist_number: None,
-        bluray_audio_pid: None,
-        bluray_audio_stream_index: None,
-        bluray_angle_number: None,
-        bluray_chapter_durations: None,
-        dvdv_source_chapters: None,
-        presentation_tabs: Vec::new(),
-        active_tab: 0,
-        presentation_selector_open: false,
-        presentation_selector_cursor: 0,
-        presentation_selector_scroll: 0,
-    };
+        technical_details,
+    );
+    state.active_surface_mut().sacd_area_kind = Some(area.header.kind);
+    state.active_surface_mut().sacd_stereo_durations = sacd_stereo_durations;
+    state.active_surface_mut().sacd_multi_channel_durations = sacd_multi_channel_durations;
+    state.read_only = !writable;
+    state.sacd_sidecar_path = if writable { sidecar_path_opt } else { None };
 
     Ok((state, area_label, n_tracks))
 }
@@ -7179,43 +7601,16 @@ pub fn build_sacd_multitab_editor_state(
                 "Multichannel".to_string(),
             ),
         };
-        tabs.push(super::app::PresentationTab {
+        tabs.push(super::app::PresentationTab::from_editor_state(
             id,
-            label: tab_label,
-            paths: state.paths.clone(),
-            entries: state.entries.clone(),
-            file_labels: state.file_labels.clone(),
-            deleted: state.deleted.clone(),
-            dirty: state.dirty,
-            sacd_area_kind: state.sacd_area_kind.clone(),
-            sacd_stereo_durations: state.sacd_stereo_durations.clone(),
-            sacd_multi_channel_durations: state.sacd_multi_channel_durations.clone(),
-            dvdv_source_chapters: state.dvdv_source_chapters.clone(),
-            dvdv_track_durations: state.dvdv_track_durations.clone(),
-            dvdv_angle_number: state.dvdv_angle_number,
-            dvdv_title_angle_count: state.dvdv_title_angle_count,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        });
+            tab_label,
+            &state,
+        ));
         states.push((state, label, n_tracks));
     }
 
     let (mut state, label, n_tracks) = states.remove(0);
-    state.presentation_tabs = tabs;
-    state.active_tab = 0;
-    if let Some(tab) = state.presentation_tabs.first().cloned() {
-        state.paths = tab.paths;
-        state.entries = tab.entries;
-        state.file_labels = tab.file_labels;
-        state.deleted = tab.deleted;
-        state.dirty = tab.dirty;
-        state.sacd_area_kind = tab.sacd_area_kind;
-        state.sacd_stereo_durations = tab.sacd_stereo_durations;
-        state.sacd_multi_channel_durations = tab.sacd_multi_channel_durations;
-    }
+    state.set_presentation_surfaces(tabs, 0);
     Ok((state, label, n_tracks))
 }
 
@@ -7246,21 +7641,21 @@ pub(super) fn switch_sacd_editor_area(
 
     // Internal guards (defense in depth — callers may already
     // enforce these but we don't rely on it).
-    if state.sacd_area_kind.is_none() {
+    if state.active_surface().sacd_area_kind.is_none() {
         return Err(":area: editor is not on a SACD ISO".to_string());
     }
 
-    if state.has_presentation_tabs() {
+    if state.has_multiple_presentations() {
         let want_kind = match target {
             SacdAreaTarget::Stereo => AreaKind::Stereo,
             SacdAreaTarget::MultiChannel => AreaKind::MultiChannel,
-            SacdAreaTarget::Toggle => match state.sacd_area_kind {
+            SacdAreaTarget::Toggle => match state.active_surface().sacd_area_kind {
                 Some(AreaKind::Stereo) => AreaKind::MultiChannel,
                 Some(AreaKind::MultiChannel) => AreaKind::Stereo,
                 None => return Err(":area toggle: editor has no area kind".to_string()),
             },
         };
-        if Some(want_kind) == state.sacd_area_kind {
+        if Some(want_kind) == state.active_surface().sacd_area_kind {
             let label = match want_kind {
                 AreaKind::Stereo => "stereo",
                 AreaKind::MultiChannel => "multi-channel",
@@ -7289,7 +7684,7 @@ pub(super) fn switch_sacd_editor_area(
         });
     }
 
-    if state.dirty {
+    if state.active_surface().dirty {
         return Err(":area: editor has unsaved edits — save or discard first".to_string());
     }
 
@@ -7301,7 +7696,7 @@ pub(super) fn switch_sacd_editor_area(
     let want_kind = match target {
         SacdAreaTarget::Stereo => AreaKind::Stereo,
         SacdAreaTarget::MultiChannel => AreaKind::MultiChannel,
-        SacdAreaTarget::Toggle => match state.sacd_area_kind {
+        SacdAreaTarget::Toggle => match state.active_surface().sacd_area_kind {
             Some(AreaKind::Stereo) => AreaKind::MultiChannel,
             Some(AreaKind::MultiChannel) => AreaKind::Stereo,
             None => return Err(":area toggle: editor has no area kind".to_string()),
@@ -7320,7 +7715,7 @@ pub(super) fn switch_sacd_editor_area(
         };
         return Err(format!(":area: this disc has no {} area", label));
     }
-    if Some(want_kind) == state.sacd_area_kind {
+    if Some(want_kind) == state.active_surface().sacd_area_kind {
         let label = match want_kind {
             AreaKind::Stereo => "stereo",
             AreaKind::MultiChannel => "multi-channel",
@@ -7367,7 +7762,7 @@ pub(super) fn switch_sacd_editor_area(
     let prev_cursor = state.cursor;
     let prev_scroll = state.scroll;
     *state = new_state;
-    state.cursor = prev_cursor.min(state.entries.len().saturating_sub(1));
+    state.cursor = prev_cursor.min(state.active_surface().entries.len().saturating_sub(1));
     state.scroll = prev_scroll.min(state.cursor);
 
     Ok(area_label)
@@ -7626,7 +8021,7 @@ pub fn save_sacd_sidecar(
         // Mint path: no XML yet. Re-probe the ISO for ScarletBook
         // data, seed an in-memory sidecar, and mint the canonical
         // `<store id>` via MD5 of the master TOC region.
-        let iso_path = state
+        let iso_path = state.active_surface()
             .paths
             .first()
             .ok_or_else(|| "editor has no ISO path for mint".to_string())?
@@ -7639,7 +8034,7 @@ pub fn save_sacd_sidecar(
         (s, SacdSaveKind::Created)
     };
 
-    if state.has_presentation_tabs() {
+    if state.has_multiple_presentations() {
         let mut updated_areas = 0usize;
         for tab in &state.presentation_tabs {
             let area_idx = match &tab.id {
@@ -7685,7 +8080,7 @@ pub fn save_sacd_sidecar(
 
     // Legacy single-area editor path: preserve the pre-existing invisible
     // sibling-area mirror so single-tab callers remain compatible.
-    let area_idx = match state.sacd_area_kind {
+    let area_idx = match state.active_surface().sacd_area_kind {
         Some(super::sacd::AreaKind::Stereo) => 1u8,
         Some(super::sacd::AreaKind::MultiChannel) => 2u8,
         None => return Err("editor has no SACD area kind".into()),
@@ -7697,20 +8092,20 @@ pub fn save_sacd_sidecar(
         .map(|t| t.id)
         .collect();
 
-    if area_track_ids.len() != state.paths.len() {
+    if area_track_ids.len() != state.active_surface().paths.len() {
         return Err(format!(
             "sidecar area {} has {} track(s) but editor has {}; refusing to map",
             area_idx,
             area_track_ids.len(),
-            state.paths.len(),
+            state.active_surface().paths.len(),
         ));
     }
 
     apply_sacd_entries_to_sidecar(
         &mut sidecar,
         &area_track_ids,
-        &state.entries,
-        &state.deleted,
+        &state.active_surface().entries,
+        &state.active_surface().deleted,
     )?;
 
     let sibling_area_idx = match area_idx {
@@ -7736,7 +8131,7 @@ pub fn save_sacd_sidecar(
             mirrored_count: 0,
         }
     } else {
-        let editor_tn_to_idx: std::collections::HashMap<u32, usize> = state
+        let editor_tn_to_idx: std::collections::HashMap<u32, usize> = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key.eq_ignore_ascii_case("TRACKNUMBER"))
@@ -7756,14 +8151,14 @@ pub fn save_sacd_sidecar(
             }
         }
 
-        for (entry_idx, entry) in state.entries.iter().enumerate() {
+        for (entry_idx, entry) in state.active_surface().entries.iter().enumerate() {
             if is_per_area_specific_key(&entry.display_key) {
                 continue;
             }
             let Some(sidecar_key) = editor_key_to_sidecar_key(&entry.display_key) else {
                 continue;
             };
-            let entry_deleted = state.deleted.contains(&entry_idx);
+            let entry_deleted = state.active_surface().deleted.contains(&entry_idx);
             if is_album_level_sidecar_key(sidecar_key) {
                 let new_val = if entry_deleted {
                     String::new()
@@ -8501,7 +8896,7 @@ pub(super) fn build_metadata_row_context_menu(
 ) -> Vec<super::context_menu::ContextMenuEntry> {
     use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
     let mut entries: Vec<ContextMenuEntry> = Vec::new();
-    let is_synthetic = state
+    let is_synthetic = state.active_surface()
         .entries
         .get(row)
         .map(super::probe::is_synthetic_preview)
@@ -8514,7 +8909,7 @@ pub(super) fn build_metadata_row_context_menu(
             enabled: true,
         }));
     }
-    let pill = state
+    let pill = state.active_surface()
         .entries
         .get(row)
         .map(super::probe::mb_pill_state)
@@ -8538,7 +8933,7 @@ pub(super) fn build_metadata_row_context_menu(
         }
         super::probe::MbRevertPill::None => {}
     }
-    let is_binary = state.entries.get(row).map(|e| e.is_binary).unwrap_or(true);
+    let is_binary = state.active_surface().entries.get(row).map(|e| e.is_binary).unwrap_or(true);
     if !is_binary {
         entries.push(ContextMenuEntry::Item(ContextMenuItem {
             label: "Edit value".to_string(),
@@ -8547,7 +8942,7 @@ pub(super) fn build_metadata_row_context_menu(
             enabled: true,
         }));
     }
-    if state.deleted.contains(&row) {
+    if state.active_surface().deleted.contains(&row) {
         entries.push(ContextMenuEntry::Item(ContextMenuItem {
             label: "Restore (cancel deletion)".to_string(),
             action: ContextAction::MetadataRestoreEntry,
@@ -8637,7 +9032,7 @@ fn build_metadata_detail_context_menu(
 ) -> Vec<super::context_menu::ContextMenuEntry> {
     use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
     let mut entries: Vec<ContextMenuEntry> = Vec::new();
-    if let Some(entry) = state.entries.get(state.detail_field_idx) {
+    if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
         if super::probe::entry_has_mb_proposed(entry) {
             let pill = super::probe::mb_pill_state_field(entry);
             let label = match pill {
@@ -10179,28 +10574,26 @@ fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Send
 fn handle_metadata_editor_mouse(
     app: &mut AppState,
     mouse: MouseEvent,
-    _tx: &mpsc::Sender<AppMessage>,
+    tx: &mpsc::Sender<AppMessage>,
 ) {
     use super::app::MetadataEditorPhase;
 
-    // Compute overlay geometry (must match draw_metadata_editor).
-    let area = crossterm::terminal::size().unwrap_or((80, 24));
-    let w = ((area.0 as usize) * 85 / 100)
-        .max(50)
-        .min(area.0 as usize - 2) as u16;
-    let h = ((area.1 as usize) * 85 / 100)
-        .max(14)
-        .min(area.1 as usize - 2) as u16;
-    let popup_x = (area.0.saturating_sub(w)) / 2;
-    let popup_y = (area.1.saturating_sub(h)) / 2;
-    // Inner content area (inside border + footer).
-    let inner_x = popup_x + 1;
-    let inner_y = popup_y + 1;
-    let inner_w = w.saturating_sub(2);
-    let inner_h = h.saturating_sub(2);
-    let content_y = inner_y;
-    let content_h = inner_h.saturating_sub(1) as usize; // -1 for footer row
-    let footer_y = inner_y + inner_h.saturating_sub(1);
+    let (terminal_width, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
+    let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(
+        0,
+        0,
+        terminal_width,
+        terminal_height,
+    ));
+    let popup_x = layout.popup.x;
+    let popup_y = layout.popup.y;
+    let w = layout.popup.width;
+    let h = layout.popup.height;
+    let inner_x = layout.inner.x;
+    let inner_w = layout.inner.width;
+    let content_y = layout.content_area.y;
+    let content_h = layout.content_area.height as usize;
+    let footer_y = layout.footer_area.y;
 
     let mx = mouse.column;
     let my = mouse.row;
@@ -10215,14 +10608,7 @@ fn handle_metadata_editor_mouse(
 
     let overlay = app.active_overlay.clone();
     if let ActiveOverlay::MetadataEditor(mut state) = overlay {
-        let total_rows = state.entries.len() + 1;
-        let mut content_y = content_y;
-        let mut content_h = content_h;
-        if state.shows_presentation_control() {
-            let tab_height: u16 = if !state.uses_presentation_dropdown() { 2 } else { 1 };
-            content_y = content_y.saturating_add(tab_height);
-            content_h = content_h.saturating_sub(tab_height as usize);
-        }
+        let total_rows = state.active_surface().entries.len() + 1;
         let in_content = mx >= inner_x
             && mx < inner_x + inner_w
             && my >= content_y
@@ -10245,6 +10631,9 @@ fn handle_metadata_editor_mouse(
                         state.set_presentation_selector_cursor(idx);
                         let changed = state.select_presentation_selector_cursor();
                         if changed {
+                            if state.content_tab == crate::tui::app::ContentTab::Details {
+                                ensure_metadata_content_tab_loaded(&mut state, crate::tui::app::ContentTab::Details, tx);
+                            }
                             if let Some(label) = state.active_presentation_label() {
                                 app.set_status(format!("metadata editor: {}", label));
                             }
@@ -10253,8 +10642,32 @@ fn handle_metadata_editor_mouse(
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     return;
                 }
+                Some(super::button_map::TuiButton::MetadataEditorContentTab(idx)) => {
+                    let was_details = state.content_tab == crate::tui::app::ContentTab::Details;
+                    if state.set_content_tab_by_index(idx) {
+                        if state.content_tab == crate::tui::app::ContentTab::Details {
+                            ensure_metadata_content_tab_loaded(&mut state, crate::tui::app::ContentTab::Details, tx);
+                        } else if was_details {
+                            metadata_editor_cancel_details_probe(&mut state);
+                        }
+                        if state.content_tab == crate::tui::app::ContentTab::Metadata {
+                            ensure_cursor_visible(&mut state);
+                        }
+                        if let Some(status) = metadata_editor_apply_content_tab_progress(&mut state) {
+                                app.set_status(status);
+                            } else {
+                                clamp_metadata_read_only_scroll(&mut state, metadata_editor_read_only_visible_rows());
+                                app.set_status(metadata_editor_status_for_content_tab(state.as_ref()));
+                            }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
                 Some(super::button_map::TuiButton::MetadataEditorTab(idx)) => {
                     if state.switch_presentation_tab(idx) {
+                        if state.content_tab == crate::tui::app::ContentTab::Details {
+                            ensure_metadata_content_tab_loaded(&mut state, crate::tui::app::ContentTab::Details, tx);
+                        }
                         if let Some(label) = state.active_presentation_label() {
                             app.set_status(format!("metadata editor: {}", label));
                         }
@@ -10294,7 +10707,21 @@ fn handle_metadata_editor_mouse(
         }
 
         match mouse.kind {
-            // Scroll wheel: navigate entries. Blocked during inline edit.
+            // Scroll wheel: read-only tabs scroll their text surface; Metadata scrolls entries.
+            MouseEventKind::ScrollUp
+                if state.phase == MetadataEditorPhase::Editing
+                    && state.content_tab != crate::tui::app::ContentTab::Metadata =>
+            {
+                scroll_metadata_read_only_tab(&mut state, -1, content_h);
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+            MouseEventKind::ScrollDown
+                if state.phase == MetadataEditorPhase::Editing
+                    && state.content_tab != crate::tui::app::ContentTab::Metadata =>
+            {
+                scroll_metadata_read_only_tab(&mut state, 1, content_h);
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
             MouseEventKind::ScrollUp if state.phase == MetadataEditorPhase::Editing => {
                 state.cursor = state.cursor.saturating_sub(1);
                 ensure_cursor_visible(&mut state);
@@ -10315,11 +10742,11 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
             MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::DetailEdit => {
-                let n = state
+                let n = state.active_surface()
                     .entries
                     .get(state.detail_field_idx)
                     .map(|e| e.per_file_values.len())
-                    .unwrap_or(state.paths.len());
+                    .unwrap_or(state.active_surface().paths.len());
                 if state.detail_cursor + 1 < n {
                     state.detail_cursor += 1;
                 }
@@ -10365,10 +10792,12 @@ fn handle_metadata_editor_mouse(
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         }
                     }
-                    MetadataEditorPhase::Editing if in_content => {
+                    MetadataEditorPhase::Editing
+                        if in_content && state.content_tab == crate::tui::app::ContentTab::Metadata =>
+                    {
                         // Compute the clicked row (entry index).
                         let row = (my - content_y) as usize + state.scroll;
-                        if row < state.entries.len() {
+                        if row < state.active_surface().entries.len() {
                             state.cursor = row;
                             let entries = build_metadata_row_context_menu(&state, row);
                             app.pending_metadata_editor = Some(state);
@@ -10395,24 +10824,27 @@ fn handle_metadata_editor_mouse(
                         }
                     }
                     _ => {
-                        // Right-click outside content area in Editing
-                        // mode → close as before.
-                        app.active_overlay = ActiveOverlay::None;
+                        // Right-click outside content area uses the
+                        // same close gate as Esc/footer/outside-click so
+                        // dirty edits cannot be discarded silently.
+                        request_metadata_editor_close(app, &mut state);
                     }
                 }
             }
 
             // Left click in content: move cursor, double-click to edit.
-            MouseEventKind::Down(MouseButton::Left) if in_content => {
+            MouseEventKind::Down(MouseButton::Left)
+                if in_content && state.content_tab == crate::tui::app::ContentTab::Metadata =>
+            {
                 // Check first whether the click landed on a per-row
                 // revert/use-MB pill. The pill rect is registered by
                 // draw_metadata_editor; if hit, toggle and return.
                 if state.phase == MetadataEditorPhase::Editing {
                     match app.button_map.find_button_at(mx, my) {
                         Some(super::button_map::TuiButton::MetadataEntryRevert(idx)) => {
-                            if state.entries.get(idx).is_some() {
-                                super::probe::toggle_mb_revert(&mut state.entries[idx]);
-                                state.dirty = super::probe::metadata_editor_has_changes(&state);
+                            if state.active_surface().entries.get(idx).is_some() {
+                                super::probe::toggle_mb_revert(&mut state.active_surface_mut().entries[idx]);
+                                state.recompute_active_dirty();
                                 state.cursor = idx;
                                 ensure_cursor_visible(&mut state);
                                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
@@ -10423,7 +10855,7 @@ fn handle_metadata_editor_mouse(
                             // Open a read-only CuePreview seeded with
                             // the row's value. Park the editor so Esc
                             // / Close pill restores it.
-                            if let Some(entry) = state.entries.get(idx) {
+                            if let Some(entry) = state.active_surface().entries.get(idx) {
                                 let content = entry.value.clone();
                                 let summary = format!(
                                     "{} (read-only · {})",
@@ -10452,29 +10884,23 @@ fn handle_metadata_editor_mouse(
                     if detail_row >= header_offset {
                         let file_idx = detail_row - header_offset;
                         let field_idx = state.detail_field_idx;
-                        let n_files = state
+                        let n_files = state.active_surface()
                             .entries
                             .get(field_idx)
                             .map(|e| e.per_file_values.len())
-                            .unwrap_or(state.paths.len());
+                            .unwrap_or(state.active_surface().paths.len());
 
                         // Confirm inline edit if active.
                         if let Some(ref input) = state.detail_edit {
                             let new_val = input.text.clone();
-                            if field_idx < state.entries.len() && state.detail_cursor < n_files {
-                                state.entries[field_idx].per_file_values[state.detail_cursor] =
-                                    new_val;
-                                let all_same = state.entries[field_idx]
-                                    .per_file_values
-                                    .windows(2)
-                                    .all(|w| w[0] == w[1]);
-                                state.entries[field_idx].is_mixed = !all_same;
-                                let new_display = if all_same {
-                                    state.entries[field_idx].per_file_values[0].clone()
+                            let detail_cursor = state.detail_cursor;
+                            if field_idx < state.active_surface().entries.len() && detail_cursor < n_files {
+                                if let Some(reason) = metadata_editor_slot_edit_block_reason(&state, detail_cursor) {
+                                    app.set_status(format!("metadata editor: slot is not editable — {}", reason));
                                 } else {
-                                    "<multiple values>".to_string()
-                                };
-                                state.entries[field_idx].value = new_display;
+                                    state.active_surface_mut().entries[field_idx].per_file_values[detail_cursor] = new_val;
+                                    metadata_editor_recompute_entry_display(&mut state.active_surface_mut().entries[field_idx]);
+                                }
                             }
                             state.detail_edit = None;
                             recalc_dirty(&mut state);
@@ -10490,14 +10916,20 @@ fn handle_metadata_editor_mouse(
                                 })
                                 .unwrap_or(false);
 
-                            if is_double && field_idx < state.entries.len() && !state.read_only {
-                                // Open inline edit for this file's value.
-                                let val =
-                                    state.entries[field_idx].per_file_values[file_idx].clone();
-                                state.detail_edit =
-                                    Some(super::text_input::TextInputState::new(val));
-                                state.detail_cursor = file_idx;
-                                state.last_click = None;
+                            if is_double && field_idx < state.active_surface().entries.len() && !state.read_only {
+                                if let Some(reason) = metadata_editor_slot_edit_block_reason(&state, file_idx) {
+                                    app.set_status(format!("metadata editor: slot is not editable — {}", reason));
+                                    state.detail_cursor = file_idx;
+                                    state.last_click = None;
+                                } else {
+                                    // Open inline edit for this file's value.
+                                    let val =
+                                        state.active_surface().entries[field_idx].per_file_values[file_idx].clone();
+                                    state.detail_edit =
+                                        Some(super::text_input::TextInputState::new(val));
+                                    state.detail_cursor = file_idx;
+                                    state.last_click = None;
+                                }
                             } else if is_double && state.read_only {
                                 app.set_status("read-only editor (SACD ISO)");
                                 state.detail_cursor = file_idx;
@@ -10657,8 +11089,9 @@ fn handle_metadata_editor_mouse(
                     // Click is outside the drop-down — commit the edit.
                     if let Some(ref input) = state.edit_input {
                         let new_val = input.text.clone();
-                        if state.cursor < state.entries.len() {
-                            let entry = &mut state.entries[state.cursor];
+                        let cursor = state.cursor;
+                        if cursor < state.active_surface().entries.len() {
+                            let entry = &mut state.active_surface_mut().entries[cursor];
                             entry.value = new_val.clone();
                             for v in &mut entry.per_file_values {
                                 *v = new_val.clone();
@@ -10684,38 +11117,46 @@ fn handle_metadata_editor_mouse(
                     })
                     .unwrap_or(false);
 
-                if is_double && row < state.entries.len() {
+                if is_double && row < state.active_surface().entries.len() {
                     // Double-click: open detail for mixed fields, inline edit otherwise.
                     state.cursor = row;
-                    let entry = &state.entries[row];
-                    if !entry.is_binary && !state.deleted.contains(&row) {
+                    let entry = &state.active_surface().entries[row];
+                    if !entry.is_binary && !state.active_surface().deleted.contains(&row) {
                         // Mirrors the keyboard-Enter gate: use the entry's
                         // own dimension so per-track CUESHEET rows on a
                         // single-image rip can open detail.
                         if entry.is_mixed && entry.per_file_values.len() > 1 {
-                            state.detail_field_idx = row;
-                            state.detail_cursor = 0;
-                            state.detail_scroll = 0;
-                            state.detail_edit = None;
-                            state.last_click = None;
-                            state.phase = MetadataEditorPhase::DetailEdit;
+                            metadata_editor_begin_detail_edit_for_entry(&mut state, row, false);
                         } else if state.read_only {
                             app.set_status("read-only editor (SACD ISO)");
                         } else {
-                            state.edit_input =
-                                Some(super::text_input::TextInputState::new(entry.value.clone()));
-                            state.phase = MetadataEditorPhase::InlineEdit;
+                            let (writable, blocked) = metadata_editor_entry_slot_counts(&state, row);
+                            if writable == 0 && blocked > 0 {
+                                let reason = metadata_editor_entry_edit_block_reason(&state, row)
+                                    .unwrap_or_else(|| "no writable file slots".to_string());
+                                app.set_status(format!("metadata editor: cannot edit blocked field — {}", reason));
+                            } else if blocked > 0 {
+                                app.set_status(format!(
+                                    "metadata editor: editing per-file values; {} writable file{} can change, {} blocked slot{} remain visible and locked",
+                                    writable,
+                                    if writable == 1 { "" } else { "s" },
+                                    blocked,
+                                    if blocked == 1 { "" } else { "s" }
+                                ));
+                                metadata_editor_begin_detail_edit_for_entry(&mut state, row, true);
+                            } else {
+                                state.edit_input =
+                                    Some(super::text_input::TextInputState::new(entry.value.clone()));
+                                state.phase = MetadataEditorPhase::InlineEdit;
+                            }
                         }
                     }
                     state.last_click = None;
-                } else if is_double && row == state.entries.len() {
+                } else if is_double && row == state.active_surface().entries.len() {
                     if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
-                    } else {
-                        // Double-click on "+ Add field..."
-                        state.cursor = state.entries.len();
-                        state.add_key_input = Some(super::text_input::TextInputState::empty());
-                        state.phase = MetadataEditorPhase::AddingKey;
+                    } else if let Some(status) = metadata_editor_open_add(&mut state) {
+                        app.set_status(status);
                     }
                     state.last_click = None;
                 } else {
@@ -10764,12 +11205,12 @@ fn handle_metadata_editor_mouse(
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                             let cmd = super::command::parse_command(&action[1..]);
-                            super::command::execute_command(app, cmd, _tx);
+                            super::command::execute_command(app, cmd, tx);
                             return;
                         }
                         match action {
                             "esc" => {
-                                app.active_overlay = ActiveOverlay::None;
+                                request_metadata_editor_close(app, &mut state);
                                 return;
                             }
                             _ => {}
@@ -10781,18 +11222,20 @@ fn handle_metadata_editor_mouse(
                     if state.detail_edit.is_none() {
                         match app.button_map.find_button_at(mx, my) {
                             Some(super::button_map::TuiButton::MetadataDetailRevert) => {
-                                if let Some(entry) = state.entries.get_mut(state.detail_field_idx) {
+                                let field_idx = state.detail_field_idx;
+                                if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
                                     super::probe::toggle_mb_revert_field(entry);
                                 }
-                                state.dirty = super::probe::metadata_editor_has_changes(&state);
+                                state.recompute_active_dirty();
                                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                 return;
                             }
                             Some(super::button_map::TuiButton::MetadataDetailRestore) => {
-                                if let Some(entry) = state.entries.get_mut(state.detail_field_idx) {
+                                let field_idx = state.detail_field_idx;
+                                if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
                                     super::probe::restore_mb_proposed(entry);
                                 }
-                                state.dirty = super::probe::metadata_editor_has_changes(&state);
+                                state.recompute_active_dirty();
                                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                 return;
                             }
@@ -10805,7 +11248,7 @@ fn handle_metadata_editor_mouse(
                     // browsing mode (not while inline-editing a value).
                     let cue_label: String;
                     let mut pills: Vec<(&str, &str)> = Vec::new();
-                    if let Some(entry) = state.entries.get(state.detail_field_idx) {
+                    if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
                         if super::command::is_cue_importable(&entry.display_key) {
                             cue_label = format!(":import-cue ({})", entry.display_key);
                             pills.push((&cue_label, ":import-cue"));
@@ -10817,7 +11260,7 @@ fn handle_metadata_editor_mouse(
                             ("Esc cancel", "esc"),
                         ]);
                     } else {
-                        if let Some(entry) = state.entries.get(state.detail_field_idx) {
+                        if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
                             if is_fix_caps_applicable(&entry.display_key) {
                                 pills.push((":fix-caps", ":fix-caps"));
                             }
@@ -10834,7 +11277,7 @@ fn handle_metadata_editor_mouse(
                     // handled via button_map (above), not via this
                     // hit-test.
                     let extra_width = if state.detail_edit.is_none() {
-                        if let Some(entry) = state.entries.get(state.detail_field_idx) {
+                        if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
                             if super::probe::entry_has_mb_proposed(entry) {
                                 let pill_state = super::probe::mb_pill_state_field(entry);
                                 let revert_chunk = match pill_state {
@@ -10860,7 +11303,7 @@ fn handle_metadata_editor_mouse(
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                             let cmd = super::command::parse_command(&action[1..]);
-                            super::command::execute_command(app, cmd, _tx);
+                            super::command::execute_command(app, cmd, tx);
                             return;
                         }
                         let fake_key = match action {
@@ -10871,7 +11314,7 @@ fn handle_metadata_editor_mouse(
                                 return;
                             }
                         };
-                        handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                        handle_metadata_editor_key(app, fake_key, &mut state, tx);
                         if !matches!(app.active_overlay, ActiveOverlay::None) {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         }
@@ -10886,7 +11329,7 @@ fn handle_metadata_editor_mouse(
                         match action {
                             "enter" => {
                                 let fake_key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                                handle_metadata_editor_key(app, fake_key, &mut state, tx);
                                 if !matches!(app.active_overlay, ActiveOverlay::None) {
                                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                 }
@@ -10894,7 +11337,7 @@ fn handle_metadata_editor_mouse(
                             }
                             "esc" => {
                                 let fake_key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-                                handle_metadata_editor_key(app, fake_key, &mut state, _tx);
+                                handle_metadata_editor_key(app, fake_key, &mut state, tx);
                                 if !matches!(app.active_overlay, ActiveOverlay::None) {
                                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                 }
@@ -10907,9 +11350,11 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
 
-            // Left click outside the popup: close the overlay.
+            // Left click outside the popup uses the same close gate
+            // as Esc/footer close so dirty edits cannot be discarded
+            // silently.
             MouseEventKind::Down(MouseButton::Left) if !in_popup => {
-                app.active_overlay = ActiveOverlay::None;
+                request_metadata_editor_close(app, &mut state);
             }
 
             // Left click inside popup but outside content/footer: ignore.
@@ -11005,15 +11450,170 @@ fn ensure_detail_visible(state: &mut super::app::MetadataEditorState) {
     }
 }
 
+fn metadata_editor_file_slot_counts(state: &super::app::MetadataEditorState) -> (usize, usize) {
+    let total = state.active_surface().paths.len();
+    let writable = (0..total)
+        .filter(|&idx| metadata_editor_slot_is_writable(state, idx))
+        .count();
+    (writable, total.saturating_sub(writable))
+}
+
+fn metadata_editor_first_writable_slot(
+    state: &super::app::MetadataEditorState,
+    limit: usize,
+) -> Option<usize> {
+    (0..limit).find(|&idx| metadata_editor_slot_is_writable(state, idx))
+}
+
+fn metadata_editor_begin_detail_edit_for_entry(
+    state: &mut super::app::MetadataEditorState,
+    entry_idx: usize,
+    edit_first_writable_slot: bool,
+) {
+    state.detail_field_idx = entry_idx;
+    state.detail_cursor = 0;
+    state.detail_scroll = 0;
+    state.detail_edit = None;
+    state.last_click = None;
+    if edit_first_writable_slot {
+        let n = state.active_surface()
+            .entries
+            .get(entry_idx)
+            .map(|entry| entry.per_file_values.len())
+            .unwrap_or(0);
+        if let Some(slot) = metadata_editor_first_writable_slot(state, n) {
+            state.detail_cursor = slot;
+            if let Some(value) = state.active_surface()
+                .entries
+                .get(entry_idx)
+                .and_then(|entry| entry.per_file_values.get(slot))
+                .cloned()
+            {
+                state.detail_edit = Some(super::text_input::TextInputState::new(value));
+            }
+        }
+    }
+    state.phase = super::app::MetadataEditorPhase::DetailEdit;
+}
+
+fn metadata_editor_entry_slot_counts(
+    state: &super::app::MetadataEditorState,
+    entry_idx: usize,
+) -> (usize, usize) {
+    let Some(entry) = state.active_surface().entries.get(entry_idx) else {
+        return (0, 0);
+    };
+    if entry.per_file_values.len() != state.active_surface().paths.len() {
+        return (entry.per_file_values.len(), 0);
+    }
+    let writable = (0..entry.per_file_values.len())
+        .filter(|&idx| metadata_editor_slot_is_writable(state, idx))
+        .count();
+    (writable, entry.per_file_values.len().saturating_sub(writable))
+}
+
+fn metadata_editor_apply_inline_value_to_writable_slots(
+    state: &mut super::app::MetadataEditorState,
+    entry_idx: usize,
+    new_value: String,
+) -> usize {
+    let Some(entry) = state.active_surface().entries.get(entry_idx) else {
+        return 0;
+    };
+    let dim = entry.per_file_values.len();
+    let file_dim = dim == state.active_surface().paths.len();
+    let writable_slots: Vec<bool> = if file_dim {
+        (0..dim)
+            .map(|idx| metadata_editor_slot_is_writable(state, idx))
+            .collect()
+    } else {
+        vec![true; dim]
+    };
+
+    let Some(entry) = state.active_surface_mut().entries.get_mut(entry_idx) else {
+        return 0;
+    };
+    let mut updated = 0usize;
+    for (idx, slot) in entry.per_file_values.iter_mut().enumerate() {
+        if writable_slots.get(idx).copied().unwrap_or(true) {
+            *slot = new_value.clone();
+            updated = updated.saturating_add(1);
+        }
+    }
+    metadata_editor_recompute_entry_display(entry);
+    updated
+}
+
+fn metadata_editor_recompute_entry_display(entry: &mut super::probe::TagEntry) {
+    let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
+    entry.is_mixed = !all_same && entry.per_file_values.len() > 1;
+    entry.value = if entry.is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        entry.per_file_values.first().cloned().unwrap_or_default()
+    };
+}
+
+fn metadata_editor_slot_edit_block_reason(
+    state: &super::app::MetadataEditorState,
+    slot_index: usize,
+) -> Option<String> {
+    let file = state.active_surface().technical_details.files.get(slot_index)?;
+    match &file.file_facts.read_state {
+        crate::tui::app::FileReadState::Readable => {}
+        crate::tui::app::FileReadState::Unreadable { reason } => {
+            return Some(format!("unreadable: {}", reason));
+        }
+        crate::tui::app::FileReadState::Unsupported { reason } => {
+            return Some(format!("unsupported: {}", reason));
+        }
+    }
+    file.file_facts
+        .write_eligibility
+        .block_reason()
+        .map(|reason| format!("save blocked: {}", reason))
+}
+
+fn metadata_editor_entry_edit_block_reason(
+    state: &super::app::MetadataEditorState,
+    entry_idx: usize,
+) -> Option<String> {
+    let entry = state.active_surface().entries.get(entry_idx)?;
+    if entry.per_file_values.len() != state.active_surface().paths.len() {
+        return None;
+    }
+    (0..entry.per_file_values.len()).find_map(|idx| metadata_editor_slot_edit_block_reason(state, idx))
+}
+
+fn metadata_editor_slot_is_writable(
+    state: &super::app::MetadataEditorState,
+    slot_index: usize,
+) -> bool {
+    metadata_editor_slot_edit_block_reason(state, slot_index).is_none()
+}
+
 /// Recalculate the dirty flag by checking per-file values for changes.
 fn recalc_dirty(state: &mut super::app::MetadataEditorState) {
-    state.dirty = !state.deleted.is_empty()
-        || state.entries.iter().any(|e| {
-            e.per_file_values
-                .iter()
-                .zip(e.per_file_originals.iter())
-                .any(|(v, o)| v != o)
+    let path_count = state.active_surface().paths.len();
+    let writable_slots: Vec<bool> = (0..path_count)
+        .map(|idx| metadata_editor_slot_is_writable(state, idx))
+        .collect();
+    let dirty = !state.active_surface().deleted.is_empty()
+        || state.active_surface().entries.iter().any(|e| {
+            if e.per_file_values.len() == path_count {
+                e.per_file_values
+                    .iter()
+                    .zip(e.per_file_originals.iter())
+                    .enumerate()
+                    .any(|(idx, (v, o))| writable_slots.get(idx).copied().unwrap_or(true) && v != o)
+            } else {
+                e.per_file_values
+                    .iter()
+                    .zip(e.per_file_originals.iter())
+                    .any(|(v, o)| v != o)
+            }
         });
+    state.active_surface_mut().dirty = dirty;
 }
 
 /// Cascade direction for one level relative to its parent. Each level
@@ -12048,19 +12648,29 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
     }
 
     let mut paths = vec![path];
-    let mut entries = match super::probe::read_all_tags_merged(&paths) {
-        Ok(e) => e,
+    let merged = match super::probe::read_all_tags_merged_with_metadata(&paths) {
+        Ok(read) => read,
         Err(e) => {
             app.set_status(format!("Failed to read tags: {}", e));
             return;
         }
     };
+    let mut entries = merged.entries;
+    let mut source_metadata = merged.metadata;
+    let mut source_metadata_errors = merged.metadata_errors;
 
     if paths.len() == 1 {
         inject_sidecar_cuesheet_if_present(&mut entries, &paths[0]);
         apply_embedded_cuesheet_per_track(&mut entries);
     }
-    super::probe::sort_paths_and_entries_by_track(&mut paths, &mut entries);
+    super::probe::sort_paths_entries_metadata_and_errors_by_track(
+        &mut paths,
+        &mut entries,
+        &mut source_metadata,
+        &mut source_metadata_errors,
+    );
+
+    let technical_details = metadata_technical_details_for_paths(&paths, &source_metadata, &source_metadata_errors);
 
     let file_labels: Vec<String> = paths
         .iter()
@@ -12072,44 +12682,12 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         })
         .collect();
 
-    let mut state = super::app::MetadataEditorState {
+    let mut state = super::app::MetadataEditorState::for_files(
         paths,
         entries,
-        cursor: 0,
-        scroll: 0,
-        last_click: None,
-        edit_input: None,
-        add_key_input: None,
-        phase: super::app::MetadataEditorPhase::Editing,
-        dirty: false,
-        deleted: Vec::new(),
         file_labels,
-        detail_field_idx: 0,
-        detail_cursor: 0,
-        detail_scroll: 0,
-        detail_edit: None,
-        mb_back: None,
-        gnudb_back: None,
-        read_only: false,
-        sacd_sidecar_path: None,
-        sacd_area_kind: None,
-        sacd_stereo_durations: None,
-        sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        presentation_tabs: Vec::new(),
-        active_tab: 0,
-        presentation_selector_open: false,
-        presentation_selector_cursor: 0,
-        presentation_selector_scroll: 0,
-    };
+        technical_details,
+    );
     if let Some(track_index) = initial_track {
         focus_metadata_editor_on_track(&mut state, track_index);
     }
@@ -12120,23 +12698,23 @@ fn focus_metadata_editor_on_track(
     state: &mut super::app::MetadataEditorState,
     track_index: usize,
 ) {
-    if state.entries.is_empty() {
+    if state.active_surface().entries.is_empty() {
         return;
     }
 
     let preferred_keys = ["TITLE", "ARTIST", "PERFORMER", "TRACKNUMBER", "ISRC"];
     let preferred = preferred_keys.iter().find_map(|key| {
-        state.entries.iter().position(|entry| {
+        state.active_surface().entries.iter().position(|entry| {
             entry.display_key.eq_ignore_ascii_case(key)
                 && !entry.is_binary
                 && entry.per_file_values.len() > track_index
         })
     });
-    let fallback = state.entries.iter().position(|entry| {
+    let fallback = state.active_surface().entries.iter().position(|entry| {
         !entry.is_binary && entry.per_file_values.len() > track_index
     });
     let Some(field_idx) = preferred.or(fallback) else {
-        state.cursor = state.cursor.min(state.entries.len().saturating_sub(1));
+        state.cursor = state.cursor.min(state.active_surface().entries.len().saturating_sub(1));
         ensure_cursor_visible(state);
         return;
     };
@@ -12144,7 +12722,7 @@ fn focus_metadata_editor_on_track(
     state.cursor = field_idx;
     ensure_cursor_visible(state);
 
-    let values_len = state.entries[field_idx].per_file_values.len();
+    let values_len = state.active_surface().entries[field_idx].per_file_values.len();
     if values_len > 1 {
         state.detail_field_idx = field_idx;
         state.detail_cursor = track_index.min(values_len - 1);
@@ -12964,8 +13542,14 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
         }
     }
 
-    if matches!(action, Some(ConfirmAction::ApplyMbToAllPresentations(_))) {
-        app.set_status(":tags-mb: kept MusicBrainz values on active presentation".to_string());
+    match action {
+        Some(ConfirmAction::ApplyMbToAllPresentations(_)) => {
+            app.set_status(":tags-mb: kept MusicBrainz values on active presentation".to_string());
+        }
+        Some(ConfirmAction::DiscardMetadataEditorChanges) => {
+            app.set_status("metadata editor: discard cancelled".to_string());
+        }
+        _ => {}
     }
 }
 
@@ -13002,6 +13586,11 @@ fn execute_confirm_action(
                 ":tags-mb: applied MusicBrainz values to {} matching presentation(s)",
                 copied,
             ));
+        }
+        ConfirmAction::DiscardMetadataEditorChanges => {
+            app.pending_metadata_editor = None;
+            app.active_overlay = ActiveOverlay::None;
+            app.set_status("metadata editor: discarded unsaved changes".to_string());
         }
         ConfirmAction::RemoveSelected => {
             let removed = app.manager.remove_selected();
@@ -14253,9 +14842,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::MetadataEntryRevert(idx) => {
                 if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
-                    if state.entries.get(idx).is_some() {
-                        super::probe::toggle_mb_revert(&mut state.entries[idx]);
-                        state.dirty = super::probe::metadata_editor_has_changes(state);
+                    if state.active_surface().entries.get(idx).is_some() {
+                        super::probe::toggle_mb_revert(&mut state.active_surface_mut().entries[idx]);
+                        state.active_surface_mut().dirty = super::probe::metadata_editor_has_changes(state);
                     }
                 }
             }
@@ -14335,6 +14924,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserConvert
             | TuiButton::DiscBrowserClose
             | TuiButton::MetadataEditorTab(_)
+            | TuiButton::MetadataEditorContentTab(_)
             | TuiButton::MetadataPresentationSelectorToggle
             | TuiButton::MetadataPresentationSelectorRow(_) => {
                 // Handled in dedicated mouse/overlay handlers; no-op here.
@@ -14580,20 +15170,20 @@ mod phase4_tests {
             .collect();
 
         assert_eq!(states.len(), 2);
-        assert_eq!(states[0].0.bluray_playlist_number, Some(12));
-        assert_eq!(states[0].0.bluray_audio_pid, Some(0x1100));
-        assert_eq!(states[0].0.bluray_audio_stream_index, Some(0));
-        assert_eq!(states[0].0.bluray_chapter_durations, Some(vec![90.0, 91.0]));
-        assert_eq!(states[1].0.bluray_audio_pid, Some(0x1101));
-        assert_eq!(states[1].0.bluray_audio_stream_index, Some(1));
-        assert_eq!(states[1].0.bluray_chapter_durations, Some(vec![92.0, 93.0]));
+        assert_eq!(states[0].0.active_surface().bluray_playlist_number, Some(12));
+        assert_eq!(states[0].0.active_surface().bluray_audio_pid, Some(0x1100));
+        assert_eq!(states[0].0.active_surface().bluray_audio_stream_index, Some(0));
+        assert_eq!(states[0].0.active_surface().bluray_chapter_durations, Some(vec![90.0, 91.0]));
+        assert_eq!(states[1].0.active_surface().bluray_audio_pid, Some(0x1101));
+        assert_eq!(states[1].0.active_surface().bluray_audio_stream_index, Some(1));
+        assert_eq!(states[1].0.active_surface().bluray_chapter_durations, Some(vec![92.0, 93.0]));
         assert_eq!(states[0].1, "Mapped Stream 1 (DTS-HD MA 48kHz/24-bit Stereo)");
         assert_eq!(states[1].1, "Mapped Stream 2 (DTS-HD MA 48kHz/24-bit Stereo)");
         assert!(states.iter().all(|(state, _, n_tracks)| {
             *n_tracks == 2
-                && state.paths == vec![source.clone(), source.clone()]
-                && state.entries.iter().any(|entry| entry.display_key == "TITLE")
-                && !state.entries.iter().any(|entry| entry.display_key == "MOOD")
+                && state.active_surface().paths == vec![source.clone(), source.clone()]
+                && state.active_surface().entries.iter().any(|entry| entry.display_key == "TITLE")
+                && !state.active_surface().entries.iter().any(|entry| entry.display_key == "MOOD")
         }));
     }
 
@@ -14623,114 +15213,330 @@ mod phase4_tests {
 
     /// Build a minimal MetadataEditorState with paths.len() == 1.
     fn single_image_state(entries: Vec<TagEntry>) -> MetadataEditorState {
-        MetadataEditorState {
-            paths: vec![std::path::PathBuf::from("/tmp/album.flac")],
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/album.flac")],
             entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: true,
-            deleted: vec![],
-            file_labels: vec!["01".to_string()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        }
+            vec!["01".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().dirty = true;
+        state
     }
+
 
     fn dvda_multitab_state(tabs: Vec<super::super::app::PresentationTab>) -> MetadataEditorState {
-        let first = tabs.first().expect("at least one tab").clone();
-        MetadataEditorState {
-            paths: first.paths.clone(),
-            entries: first.entries.clone(),
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: first.dirty,
-            deleted: first.deleted.clone(),
-            file_labels: first.file_labels.clone(),
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_tabs: tabs,
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
+        MetadataEditorState::for_disc_presentations(tabs, 0)
+    }
+
+
+    #[test]
+    fn metadata_editor_esc_with_dirty_state_prompts_before_closing() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
+        ])));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { action, message } => {
+                assert!(matches!(action, ConfirmAction::DiscardMetadataEditorChanges));
+                assert!(message.contains("Discard unsaved metadata changes"));
+            }
+            other => panic!("expected discard confirmation, got {:?}", other),
+        }
+        assert!(app.pending_metadata_editor.is_some());
+    }
+
+    #[test]
+    fn metadata_editor_discard_cancel_restores_dirty_editor() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
+        ])));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert!(app.pending_metadata_editor.is_none());
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(restored) => {
+                assert!(restored.any_presentation_dirty());
+                assert_eq!(restored.active_surface().entries[0].per_file_values[0], "New");
+            }
+            other => panic!("expected restored metadata editor, got {:?}", other),
         }
     }
 
+    #[test]
+    fn metadata_editor_discard_confirm_closes_dirty_editor() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
+        ])));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(app.pending_metadata_editor.is_none());
+    }
+
+    #[test]
+    fn metadata_editor_esc_with_clean_state_closes_without_confirmation() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let mut state = single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["Same"],
+            &["Same"],
+        )]);
+        state.active_surface_mut().dirty = false;
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(app.pending_metadata_editor.is_none());
+    }
+
+
+    fn metadata_editor_test_layout() -> crate::tui::draw_overlays::MetadataEditorLayout {
+        let (terminal_width, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
+        crate::tui::draw_overlays::metadata_editor_layout_for_area(Rect::new(
+            0,
+            0,
+            terminal_width,
+            terminal_height,
+        ))
+    }
+
+    fn footer_close_mouse_event() -> MouseEvent {
+        let layout = metadata_editor_test_layout();
+        let pills: Vec<(&str, &str)> = vec![
+            (":tags-mb", ":tags-mb"),
+            (":fix-caps", ":fix-caps"),
+            (":d delete", ":d"),
+            (":u undo", ":u"),
+            (":a add", ":a"),
+            (":w save", ":w"),
+            ("Esc close", "esc"),
+        ];
+        let x = (layout.inner.x..layout.inner.x + layout.inner.width)
+            .find(|x| footer_pill_hit(&pills, *x, layout.inner.x, layout.inner.width) == Some("esc"))
+            .expect("footer close pill should be hittable");
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: layout.footer_area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn outside_popup_left_click() -> MouseEvent {
+        let layout = metadata_editor_test_layout();
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: layout.popup.x.saturating_add(layout.popup.width),
+            row: layout.popup.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn right_click_inside_popup_outside_content() -> MouseEvent {
+        let layout = metadata_editor_test_layout();
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: layout.popup.x,
+            row: layout.popup.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn assert_discard_confirmation(app: &AppState) {
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { action, message } => {
+                assert!(matches!(action, ConfirmAction::DiscardMetadataEditorChanges));
+                assert!(message.contains("Discard unsaved metadata changes"));
+            }
+            other => panic!("expected discard confirmation, got {:?}", other),
+        }
+        assert!(app.pending_metadata_editor.is_some());
+    }
+
+    #[test]
+    fn metadata_editor_footer_close_with_dirty_state_prompts_before_closing() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
+        ])));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_mouse(&mut app, footer_close_mouse_event(), &tx);
+
+        assert_discard_confirmation(&app);
+    }
+
+    #[test]
+    fn metadata_editor_left_click_outside_dirty_popup_prompts_before_closing() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
+        ])));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_mouse(&mut app, outside_popup_left_click(), &tx);
+
+        assert_discard_confirmation(&app);
+    }
+
+    #[test]
+    fn metadata_editor_right_click_outside_content_dirty_popup_prompts_before_closing() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
+        ])));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_mouse(&mut app, right_click_inside_popup_outside_content(), &tx);
+
+        assert_discard_confirmation(&app);
+    }
+
+    #[test]
+    fn metadata_editor_esc_while_saving_keeps_editor_open() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let mut state = single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["New"],
+            &["Old"],
+        )]);
+        state.phase = MetadataEditorPhase::Saving;
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert_eq!(state.phase, MetadataEditorPhase::Saving);
+            }
+            other => panic!("expected metadata editor to remain open, got {:?}", other),
+        }
+        assert!(app.pending_metadata_editor.is_none());
+    }
+
+    fn clean_active_dirty_sibling_state() -> MetadataEditorState {
+        let mut tabs = selector_test_tabs();
+        tabs[0].dirty = false;
+        tabs[1].dirty = true;
+        MetadataEditorState::for_disc_presentations(tabs, 0)
+    }
+
+    #[test]
+    fn mb_back_checks_dirty_sibling_presentations() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let mut state = clean_active_dirty_sibling_state();
+        state.mb_back = Some(crate::tui::app::MbBackCache {
+            releases: Vec::new(),
+            paths: vec![std::path::PathBuf::from("/tmp/album.flac")],
+            selected: 0,
+        });
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        crate::tui::command::execute_command(&mut app, crate::tui::command::Command::MbBack, &tx);
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { action, message } => {
+                assert!(matches!(action, ConfirmAction::MbBack(_)));
+                assert!(message.contains("Discard editor changes"));
+            }
+            other => panic!("expected MB back confirmation, got {:?}", other),
+        }
+        assert!(app.pending_metadata_editor.is_some());
+    }
+
+    #[test]
+    fn gnudb_back_checks_dirty_sibling_presentations() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let mut state = clean_active_dirty_sibling_state();
+        state.gnudb_back = Some(Box::new(crate::tui::app::GnudbReviewState {
+            pages: Vec::new(),
+            active_page: 0,
+            cursor: 0,
+            scroll: 0,
+            edit_input: None,
+            last_click: None,
+            paths: vec![std::path::PathBuf::from("/tmp/album.flac")],
+            origin_matches: None,
+            source: crate::tui::app::ReviewSource::Gnudb,
+        }));
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        crate::tui::command::execute_command(&mut app, crate::tui::command::Command::GnudbBack, &tx);
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { action, message } => {
+                assert!(matches!(action, ConfirmAction::GnudbBack(_)));
+                assert!(message.contains("Discard editor changes"));
+            }
+            other => panic!("expected gnudb back confirmation, got {:?}", other),
+        }
+        assert!(app.pending_metadata_editor.is_some());
+    }
+
+
     fn dvda_save_tab(group_nr: u8, entries: Vec<TagEntry>) -> super::super::app::PresentationTab {
-        super::super::app::PresentationTab {
-            id: crate::disc::model::PresentationId::DvdAudioGroup(group_nr),
-            label: format!("Group {}", group_nr),
-            paths: vec![
+        let mut tab = super::super::app::PresentationTab::new(
+            crate::disc::model::PresentationId::DvdAudioGroup(group_nr),
+            format!("Group {}", group_nr),
+            vec![
                 std::path::PathBuf::from(format!("/tmp/group-{}.aob", group_nr)),
                 std::path::PathBuf::from(format!("/tmp/group-{}.aob", group_nr)),
             ],
             entries,
-            file_labels: vec!["01".to_string(), "02".to_string()],
-            deleted: Vec::new(),
-            dirty: true,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        }
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        tab.dirty = true;
+        tab
     }
+
 
     fn dvda_metabase_track(
         id: &str,
@@ -14821,7 +15627,7 @@ mod phase4_tests {
             ActiveOverlay::MetadataEditor(state) => {
                 assert_eq!(state.active_tab, 2);
                 assert!(!state.presentation_selector_open);
-                assert_eq!(state.entries[0].per_file_values[0], "Group 3 One");
+                assert_eq!(state.active_surface().entries[0].per_file_values[0], "Group 3 One");
             }
             other => panic!("expected metadata editor, got {:?}", other),
         }
@@ -14923,7 +15729,7 @@ mod phase4_tests {
         match &app.active_overlay {
             ActiveOverlay::MetadataEditor(restored) => {
                 assert_eq!(restored.presentation_tabs.len(), 2);
-                assert_eq!(restored.entries[0].per_file_values[0], "Populated One");
+                assert_eq!(restored.active_surface().entries[0].per_file_values[0], "Populated One");
             }
             other => panic!("expected restored metadata editor, got {:?}", other),
         }
@@ -15297,12 +16103,12 @@ mod phase4_tests {
         ]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
         assert!(result, "per-track edit → regen ran");
-        let cue_idx = state
+        let cue_idx = state.active_surface()
             .entries
             .iter()
             .position(|e| e.display_key == "CUESHEET")
             .unwrap();
-        let new_cue = &state.entries[cue_idx].per_file_values[0];
+        let new_cue = &state.active_surface().entries[cue_idx].per_file_values[0];
         assert!(
             new_cue.contains("TITLE \"EDITED\""),
             "regenerated CUE must include the edited title"
@@ -15330,12 +16136,12 @@ mod phase4_tests {
         ]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
         assert!(result, "album-level dirt with CUESHEET → regen ran");
-        let cue_idx = state
+        let cue_idx = state.active_surface()
             .entries
             .iter()
             .position(|e| e.display_key == "CUESHEET")
             .unwrap();
-        let new_cue = &state.entries[cue_idx].per_file_values[0];
+        let new_cue = &state.active_surface().entries[cue_idx].per_file_values[0];
         assert!(
             new_cue.contains("TITLE \"New Album\""),
             "β re-derive must update CUE album title"
@@ -15417,7 +16223,7 @@ mod phase4_tests {
                 &["Track 1", "Track 2", "Track 3"],
             ),
         ]);
-        state.deleted.push(0); // CUESHEET marked deleted
+        state.active_surface_mut().deleted.push(0); // CUESHEET marked deleted
         let result = regenerate_cuesheet_for_save(&mut state);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("CUESHEET marked deleted"));
@@ -15487,7 +16293,7 @@ mod phase4_tests {
         ]);
         let result = regenerate_cuesheet_for_save(&mut state).expect("ok");
         assert!(result);
-        let new_cue = &state
+        let new_cue = &state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "CUESHEET")
@@ -15648,45 +16454,14 @@ mod phase4_tests {
         dir: &std::path::Path,
         existing_entries: Vec<TagEntry>,
     ) -> MetadataEditorState {
-        MetadataEditorState {
-            paths: vec![dir.join("album.flac")],
-            entries: existing_entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: vec![],
-            file_labels: vec!["01".to_string()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        }
+        MetadataEditorState::for_files(
+            vec![dir.join("album.flac")],
+            existing_entries,
+            vec!["01".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        )
     }
+
 
     #[test]
     fn reload_sidecar_overlays_per_track_values_preserving_originals() {
@@ -15706,7 +16481,7 @@ mod phase4_tests {
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_ok(), "reload should succeed: {:?}", result);
 
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -15721,7 +16496,7 @@ mod phase4_tests {
             vec!["Old1", "Old2", "Old3"],
             "originals preserved (revert restores prior state)"
         );
-        assert!(state.dirty, "values diverged from originals → dirty=true");
+        assert!(state.active_surface().dirty, "values diverged from originals → dirty=true");
     }
 
     #[test]
@@ -15732,7 +16507,7 @@ mod phase4_tests {
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_ok());
 
-        let cue = state
+        let cue = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "CUESHEET")
@@ -15765,7 +16540,7 @@ mod phase4_tests {
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_ok());
 
-        let cue = state
+        let cue = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "CUESHEET")
@@ -15798,7 +16573,7 @@ mod phase4_tests {
             )],
         );
         reload_from_sidecar_cue(&mut state).expect("ok");
-        let isrc = state
+        let isrc = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ISRC")
@@ -15830,7 +16605,7 @@ mod phase4_tests {
             )],
         );
         reload_from_sidecar_cue(&mut state).expect("ok");
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -15875,44 +16650,12 @@ mod phase4_tests {
     fn reload_sidecar_refuses_multi_file() {
         let td = tempfile::tempdir().expect("tempdir");
         write_sidecar_at(td.path(), SIDECAR_3_TRACK_SINGLE_IMAGE);
-        let mut state = MetadataEditorState {
-            paths: vec![td.path().join("a.flac"), td.path().join("b.flac")],
-            entries: vec![],
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: vec![],
-            file_labels: vec!["01".into(), "02".into()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+        let mut state = MetadataEditorState::for_files(
+            vec![td.path().join("a.flac"), td.path().join("b.flac")],
+            vec![],
+            vec!["01".into(), "02".into()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("single-image"));
@@ -15946,17 +16689,17 @@ mod phase4_tests {
                 &["speak to me", "breathe", "on the run"],
             ),
         ]);
-        let title_idx = state
+        let title_idx = state.active_surface()
             .entries
             .iter()
             .position(|e| e.display_key == "TITLE")
             .unwrap();
-        state.entries[title_idx].is_mixed = true;
-        state.entries[title_idx].value = "<multiple values>".to_string();
+        state.active_surface_mut().entries[title_idx].is_mixed = true;
+        state.active_surface_mut().entries[title_idx].value = "<multiple values>".to_string();
 
         let result = fix_caps_for_state(&mut state, None);
 
-        let album = state
+        let album = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ALBUM")
@@ -15964,7 +16707,7 @@ mod phase4_tests {
         assert_eq!(album.per_file_values, vec!["The Dark Side of the Moon"]);
 
         // TITLE per_file_values capitalized (visible in detail overlay).
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -15996,9 +16739,9 @@ mod phase4_tests {
             entry("TITLE", ItemKey::TrackTitle, &["money"], &["money"]),
         ]);
         // Mark ALBUM (idx 0) deleted.
-        state.deleted.push(0);
+        state.active_surface_mut().deleted.push(0);
         let result = fix_caps_for_state(&mut state, None);
-        let album = state
+        let album = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ALBUM")
@@ -16010,7 +16753,7 @@ mod phase4_tests {
         );
         assert_eq!(result.skipped_deleted, 1);
         // TITLE still got capitalized.
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -16029,18 +16772,18 @@ mod phase4_tests {
                 &["speak to me", "breathe", "on the run"],
             ),
         ]);
-        let title_idx = state
+        let title_idx = state.active_surface()
             .entries
             .iter()
             .position(|e| e.display_key == "TITLE")
             .unwrap();
-        state.entries[title_idx].is_mixed = true;
+        state.active_surface_mut().entries[title_idx].is_mixed = true;
 
         // Detail overlay focused on TITLE.
         let result = fix_caps_for_state(&mut state, Some(title_idx));
 
         // TITLE's per-track values capitalized.
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -16050,7 +16793,7 @@ mod phase4_tests {
             vec!["Speak to Me", "Breathe", "On the Run"]
         );
         // ALBUM untouched.
-        let album = state
+        let album = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ALBUM")
@@ -16078,7 +16821,7 @@ mod phase4_tests {
             &["foo", "foo", "foo"],
         )]);
         let _ = fix_caps_for_state(&mut state, None);
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -16262,10 +17005,10 @@ mod phase4_tests {
             state.sacd_sidecar_path.as_deref(),
             Some(std::path::Path::new("/tmp/test.xml")),
         );
-        assert_eq!(state.paths.len(), 2);
-        assert!(state.paths.iter().all(|p| p == &path));
+        assert_eq!(state.active_surface().paths.len(), 2);
+        assert!(state.active_surface().paths.iter().all(|p| p == &path));
 
-        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        let by_key = |k: &str| state.active_surface().entries.iter().find(|e| e.display_key == k);
         assert_eq!(
             by_key("ALBUM").map(|e| e.value.as_str()),
             Some("Kind of Blue")
@@ -16302,7 +17045,7 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/synthetic.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
 
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -16310,7 +17053,7 @@ mod phase4_tests {
         assert_eq!(title.per_file_values, vec!["Track A", "Track B", "Track C"]);
         assert!(title.is_mixed);
 
-        let artist = state
+        let artist = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ARTIST")
@@ -16321,7 +17064,7 @@ mod phase4_tests {
         );
         assert!(artist.is_mixed);
 
-        let isrc = state
+        let isrc = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ISRC")
@@ -16346,8 +17089,8 @@ mod phase4_tests {
         );
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
-        assert!(state.entries.iter().all(|e| e.display_key != "ARTIST"));
-        assert!(state.entries.iter().all(|e| e.display_key != "ISRC"));
+        assert!(state.active_surface().entries.iter().all(|e| e.display_key != "ARTIST"));
+        assert!(state.active_surface().entries.iter().all(|e| e.display_key != "ISRC"));
     }
 
     #[test]
@@ -16363,7 +17106,7 @@ mod phase4_tests {
         );
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
-        let tn = state
+        let tn = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TRACKNUMBER")
@@ -16432,7 +17175,7 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
 
-        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        let by_key = |k: &str| state.active_surface().entries.iter().find(|e| e.display_key == k);
         assert_eq!(
             by_key("ALBUM").map(|e| e.value.as_str()),
             Some("Sidecar Album")
@@ -16465,7 +17208,7 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
 
-        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        let by_key = |k: &str| state.active_surface().entries.iter().find(|e| e.display_key == k);
         // ALBUM from sidecar
         assert_eq!(
             by_key("ALBUM").map(|e| e.value.as_str()),
@@ -16496,7 +17239,7 @@ mod phase4_tests {
         let sidecar = parse_sidecar_for_test(xml);
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
-        let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
+        let pub_entry = state.active_surface().entries.iter().find(|e| e.display_key == "PUBLISHER");
         assert_eq!(
             pub_entry.map(|e| e.value.as_str()),
             Some("Sony Music Japan International Inc.")
@@ -16513,7 +17256,7 @@ mod phase4_tests {
         let sidecar = parse_sidecar_for_test(xml);
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
-        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        let by_key = |k: &str| state.active_surface().entries.iter().find(|e| e.display_key == k);
         assert_eq!(
             by_key("ALBUMARTIST").map(|e| e.value.as_str()),
             Some("Composite Artist")
@@ -16547,7 +17290,7 @@ mod phase4_tests {
         let sidecar = parse_sidecar_for_test(xml);
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
-        let album = state
+        let album = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ALBUM")
@@ -16570,7 +17313,7 @@ mod phase4_tests {
         });
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
-        let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
+        let pub_entry = state.active_surface().entries.iter().find(|e| e.display_key == "PUBLISHER");
         assert_eq!(
             pub_entry.map(|e| e.value.as_str()),
             Some("ScarletBook Publisher")
@@ -16594,7 +17337,7 @@ mod phase4_tests {
         let sidecar = parse_sidecar_for_test(xml);
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
-        let pub_entry = state.entries.iter().find(|e| e.display_key == "PUBLISHER");
+        let pub_entry = state.active_surface().entries.iter().find(|e| e.display_key == "PUBLISHER");
         assert_eq!(
             pub_entry.map(|e| e.value.as_str()),
             Some("Sidecar Publisher")
@@ -16634,7 +17377,7 @@ mod phase4_tests {
         // Force writability so the save path is reachable in tests.
         state.read_only = false;
         state.sacd_sidecar_path = Some(xml_path.clone());
-        state.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        state.active_surface_mut().sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
 
         mutate(&mut state);
 
@@ -16664,7 +17407,7 @@ mod phase4_tests {
         let sidecar = parse_sidecar_for_test(xml);
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
-        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        let by_key = |k: &str| state.active_surface().entries.iter().find(|e| e.display_key == k);
         assert_eq!(
             by_key("MUSICBRAINZ_TRACKID").map(|e| e.per_file_values.clone()),
             Some(vec!["rec-1".to_string(), "rec-2".to_string()]),
@@ -16701,7 +17444,7 @@ mod phase4_tests {
         let sidecar = parse_sidecar_for_test(xml);
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
-        let by_key = |k: &str| state.entries.iter().find(|e| e.display_key == k);
+        let by_key = |k: &str| state.active_surface().entries.iter().find(|e| e.display_key == k);
         assert_eq!(
             by_key("MUSICBRAINZ_ALBUMID").map(|e| e.value.as_str()),
             Some("alb-1")
@@ -16748,7 +17491,7 @@ mod phase4_tests {
             "RELEASECOUNTRY",
         ] {
             assert!(
-                state.entries.iter().all(|e| e.display_key != k),
+                state.active_surface().entries.iter().all(|e| e.display_key != k),
                 "{} should not surface when sidecar carries no value",
                 k,
             );
@@ -16767,7 +17510,7 @@ mod phase4_tests {
         let (_td, reparsed) = round_trip_save(xml, |state| {
             // Update the album-level MB id (simulating an `:mb-back`
             // re-pick) and per-track MB recording ids.
-            for entry in state.entries.iter_mut() {
+            for entry in state.active_surface_mut().entries.iter_mut() {
                 match entry.display_key.as_str() {
                     "MUSICBRAINZ_ALBUMID" => {
                         entry.per_file_values = vec!["alb-new".into(); 3];
@@ -16856,7 +17599,7 @@ mod phase4_tests {
         let (_td, reparsed) = round_trip_save(xml, |state| {
             // Change the ARTIST values to "New". ARTIST is per-track
             // in the editor (built via push_per_track), so update each.
-            for entry in state.entries.iter_mut() {
+            for entry in state.active_surface_mut().entries.iter_mut() {
                 if entry.display_key == "ARTIST" {
                     entry.per_file_values = vec!["New".into(); 3];
                     entry.value = "New".into();
@@ -16895,7 +17638,7 @@ mod phase4_tests {
 <track id="3"><meta name="TITLE" value="T3"/><meta name="ALBUM" value="Old Album"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/></track>
 </store></root>"#;
         let (_td, reparsed) = round_trip_save(xml, |state| {
-            for entry in state.entries.iter_mut() {
+            for entry in state.active_surface_mut().entries.iter_mut() {
                 if entry.display_key == "ALBUM" {
                     entry.per_file_values = vec!["New Album".into(); 3];
                     entry.value = "New Album".into();
@@ -16917,7 +17660,7 @@ mod phase4_tests {
 <track id="3"><meta name="TITLE" value="C"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/></track>
 </store></root>"#;
         let (_td, reparsed) = round_trip_save(xml, |state| {
-            for entry in state.entries.iter_mut() {
+            for entry in state.active_surface_mut().entries.iter_mut() {
                 if entry.display_key == "TITLE" {
                     entry.per_file_values = vec!["Alpha".into(), "Beta".into(), "Gamma".into()];
                     entry.value = "<multiple values>".into();
@@ -16955,9 +17698,9 @@ mod phase4_tests {
         let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, Some(&sidecar)).unwrap();
         state.read_only = false;
         state.sacd_sidecar_path = Some(xml_path.clone());
-        state.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        state.active_surface_mut().sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
 
-        for entry in state.entries.iter_mut() {
+        for entry in state.active_surface_mut().entries.iter_mut() {
             if entry.display_key == "ARTIST" {
                 entry.per_file_values = vec!["".into()];
                 entry.value = "".into();
@@ -17002,7 +17745,7 @@ mod phase4_tests {
         std::fs::write(&iso_path, b"\0").unwrap();
         let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, Some(&sidecar)).unwrap();
         state.sacd_sidecar_path = Some(xml_path.clone());
-        state.sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
+        state.active_surface_mut().sacd_area_kind = Some(crate::tui::sacd::AreaKind::Stereo);
         state.read_only = false;
 
         let res = save_sacd_sidecar(&state, &xml_path);
@@ -17054,7 +17797,7 @@ mod phase4_tests {
         // The fixture mirrors the synthetic md, so the editor lands
         // on the stereo area by default. Verify before switching.
         assert_eq!(
-            state.sacd_area_kind,
+            state.active_surface().sacd_area_kind,
             Some(crate::tui::sacd::AreaKind::Stereo)
         );
 
@@ -17159,7 +17902,7 @@ mod phase4_tests {
         let (state, res) = switch_helper(super::super::command::SacdAreaTarget::MultiChannel);
         assert_eq!(res.unwrap(), "MCH");
         assert_eq!(
-            state.sacd_area_kind,
+            state.active_surface().sacd_area_kind,
             Some(crate::tui::sacd::AreaKind::MultiChannel)
         );
     }
@@ -17170,7 +17913,7 @@ mod phase4_tests {
         // Starting on stereo → toggle → MCH.
         assert_eq!(res.unwrap(), "MCH");
         assert_eq!(
-            state.sacd_area_kind,
+            state.active_surface().sacd_area_kind,
             Some(crate::tui::sacd::AreaKind::MultiChannel)
         );
     }
@@ -17199,7 +17942,7 @@ mod phase4_tests {
             build_sacd_editor_state(&iso_path, &parsed_md, None).expect("build");
 
         state.cursor = 1; // not row 0 — so a bug that resets to 0 is caught
-        let entry_count_before = state.entries.len();
+        let entry_count_before = state.active_surface().entries.len();
         assert!(
             entry_count_before >= 2,
             "fixture should produce at least 2 editor entries (TRACKNUMBER + TITLE)",
@@ -17215,7 +17958,7 @@ mod phase4_tests {
         // Both areas in the fixture have matching shape (same
         // track count, both with TITLE sectors), so no clamp.
         assert_eq!(
-            state.entries.len(),
+            state.active_surface().entries.len(),
             entry_count_before,
             "fixture should preserve entry count across areas",
         );
@@ -17296,10 +18039,10 @@ mod phase4_tests {
         .expect("switch");
 
         assert!(
-            state.cursor < state.entries.len(),
+            state.cursor < state.active_surface().entries.len(),
             "cursor must be clamped into new entry count: cursor={}, entries={}",
             state.cursor,
-            state.entries.len(),
+            state.active_surface().entries.len(),
         );
     }
 
@@ -17313,7 +18056,7 @@ mod phase4_tests {
         let iso_path = td.path().join("hybrid.iso");
         write_hybrid_iso_fixture(&iso_path, &md);
         let (mut state, _, _) = build_sacd_editor_state(&iso_path, &md, None).expect("build");
-        state.dirty = true; // simulate unsaved edits
+        state.active_surface_mut().dirty = true; // simulate unsaved edits
         let res = switch_sacd_editor_area(
             &mut state,
             &iso_path,
@@ -17323,7 +18066,7 @@ mod phase4_tests {
         assert!(res.unwrap_err().contains("unsaved edits"));
         // State unchanged.
         assert_eq!(
-            state.sacd_area_kind,
+            state.active_surface().sacd_area_kind,
             Some(crate::tui::sacd::AreaKind::Stereo)
         );
     }
@@ -17408,7 +18151,7 @@ mod phase4_tests {
         let path = std::path::PathBuf::from("/tmp/x.iso");
         let (state, label, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         assert_eq!(label, "MCH");
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -17505,7 +18248,7 @@ mod phase4_tests {
             build_sacd_editor_state(&iso_path, md, Some(&sidecar)).expect("build");
         state.read_only = false;
         state.sacd_sidecar_path = Some(xml_path.clone());
-        state.sacd_area_kind = Some(area);
+        state.active_surface_mut().sacd_area_kind = Some(area);
         mutate(&mut state);
         let outcome = super::save_sacd_sidecar(&state, &xml_path).expect("save");
         let reparsed = parse_sidecar(&xml_path).expect("re-parse");
@@ -17600,7 +18343,7 @@ mod phase4_tests {
             &md,
             crate::tui::sacd::AreaKind::Stereo,
             |state| {
-                let album = state
+                let album = state.active_surface_mut()
                     .entries
                     .iter_mut()
                     .find(|e| e.display_key == "ALBUM")
@@ -17632,7 +18375,7 @@ mod phase4_tests {
             &md,
             crate::tui::sacd::AreaKind::Stereo,
             |state| {
-                let title = state
+                let title = state.active_surface_mut()
                     .entries
                     .iter_mut()
                     .find(|e| e.display_key == "TITLE")
@@ -17690,7 +18433,7 @@ mod phase4_tests {
             synth_hybrid_sacd_metadata(Some("Old"), &["St-1", "St-2", "St-3"], &["MC-1", "MC-2"]);
         let (_td, reparsed, outcome) =
             round_trip_hybrid_save(xml, &md, crate::tui::sacd::AreaKind::Stereo, |state| {
-                let album = state
+                let album = state.active_surface_mut()
                     .entries
                     .iter_mut()
                     .find(|e| e.display_key == "ALBUM")

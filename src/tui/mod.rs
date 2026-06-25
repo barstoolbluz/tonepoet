@@ -41,6 +41,7 @@ pub mod help;
 pub mod keybindings;
 pub mod keychain;
 pub mod message;
+pub mod metadata_view_models;
 pub mod musicbrainz;
 pub mod pill;
 pub mod preemphasis;

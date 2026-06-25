@@ -910,14 +910,14 @@ pub fn populate_editor_mb_supplemental(
 ) {
     use lofty::tag::ItemKey;
 
-    let n = state.paths.len();
+    let n = state.active_surface().paths.len();
     // Single-image rip: one file representing a multi-track release.
     let single_image = n == 1 && release.tracks.len() > 1;
     // Per-track populate eligibility: same guards used to gate the
     // populate-time CUESHEET embed pre-Phase-5. When false on a
     // single_image rip we fall back to album-only writes for the
     // legacy MB-only IDs that have no per-track home.
-    let per_track_populate = single_image && is_per_track_eligible(&state.paths, release, false);
+    let per_track_populate = single_image && is_per_track_eligible(&state.active_surface().paths, release, false);
 
     fn find_or_create(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
@@ -991,7 +991,7 @@ pub fn populate_editor_mb_supplemental(
     };
     let isrc_idx = if any_isrc {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "ISRC",
             ItemKey::Isrc,
             isrc_dim,
@@ -1006,12 +1006,12 @@ pub fn populate_editor_mb_supplemental(
     // pre-populate state.
     if per_track_populate {
         if let Some(idx) = isrc_idx {
-            crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], isrc_dim);
+            crate::tui::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[idx], isrc_dim);
         }
     }
     let recording_idx = if any_recording {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_TRACKID",
             ItemKey::MusicBrainzRecordingId,
             n,
@@ -1021,7 +1021,7 @@ pub fn populate_editor_mb_supplemental(
     };
     let track_idx = if any_track {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_RELEASETRACKID",
             ItemKey::MusicBrainzTrackId,
             n,
@@ -1031,7 +1031,7 @@ pub fn populate_editor_mb_supplemental(
     };
     let artist_idx = if any_track_artist {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_ARTISTID",
             ItemKey::MusicBrainzArtistId,
             n,
@@ -1049,7 +1049,7 @@ pub fn populate_editor_mb_supplemental(
         .map(|s| s.to_string());
     let catalog_idx = if catalog_value.is_some() {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "CATALOGNUMBER",
             ItemKey::CatalogNumber,
             n,
@@ -1059,7 +1059,7 @@ pub fn populate_editor_mb_supplemental(
     };
     let album_id_idx = if !release.release_id.is_empty() {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_ALBUMID",
             ItemKey::MusicBrainzReleaseId,
             n,
@@ -1069,7 +1069,7 @@ pub fn populate_editor_mb_supplemental(
     };
     let album_artist_id_idx = if release.artist_id.as_deref().is_some_and(|s| !s.is_empty()) {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_ALBUMARTISTID",
             ItemKey::MusicBrainzReleaseArtistId,
             n,
@@ -1083,7 +1083,7 @@ pub fn populate_editor_mb_supplemental(
         .is_some_and(|s| !s.is_empty())
     {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_RELEASEGROUPID",
             ItemKey::MusicBrainzReleaseGroupId,
             n,
@@ -1097,7 +1097,7 @@ pub fn populate_editor_mb_supplemental(
         .is_some_and(|s| !s.is_empty())
     {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "ORIGINALDATE",
             ItemKey::OriginalReleaseDate,
             n,
@@ -1107,7 +1107,7 @@ pub fn populate_editor_mb_supplemental(
     };
     let country_idx = if release.country.as_deref().is_some_and(|s| !s.is_empty()) {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "RELEASECOUNTRY",
             ItemKey::Unknown("RELEASECOUNTRY".to_string()),
             n,
@@ -1124,11 +1124,11 @@ pub fn populate_editor_mb_supplemental(
         if let Some(idx) = isrc_idx {
             for mt in release.tracks.iter() {
                 let i = (mt.position as usize).saturating_sub(1);
-                if i >= state.entries[idx].per_file_values.len() {
+                if i >= state.active_surface().entries[idx].per_file_values.len() {
                     continue;
                 }
                 if let Some(s) = mt.isrc.as_deref().filter(|s| !s.is_empty()) {
-                    state.entries[idx].per_file_values[i] = s.to_string();
+                    state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
                 }
             }
         }
@@ -1140,38 +1140,38 @@ pub fn populate_editor_mb_supplemental(
                 if let (Some(idx), Some(s)) =
                     (isrc_idx, mt.isrc.as_deref().filter(|s| !s.is_empty()))
                 {
-                    state.entries[idx].per_file_values[i] = s.to_string();
+                    state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
                 }
             }
             if let (Some(idx), Some(s)) = (
                 recording_idx,
                 mt.recording_id.as_deref().filter(|s| !s.is_empty()),
             ) {
-                state.entries[idx].per_file_values[i] = s.to_string();
+                state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
             }
             if let (Some(idx), Some(s)) =
                 (track_idx, mt.track_id.as_deref().filter(|s| !s.is_empty()))
             {
-                state.entries[idx].per_file_values[i] = s.to_string();
+                state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
             }
             if let (Some(idx), Some(s)) = (
                 artist_idx,
                 mt.artist_id.as_deref().filter(|s| !s.is_empty()),
             ) {
-                state.entries[idx].per_file_values[i] = s.to_string();
+                state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
             }
         }
         if let (Some(idx), Some(s)) = (catalog_idx, catalog_value.as_deref()) {
-            state.entries[idx].per_file_values[i] = s.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
         }
         if let Some(idx) = album_id_idx {
-            state.entries[idx].per_file_values[i] = release.release_id.clone();
+            state.active_surface_mut().entries[idx].per_file_values[i] = release.release_id.clone();
         }
         if let (Some(idx), Some(s)) = (
             album_artist_id_idx,
             release.artist_id.as_deref().filter(|s| !s.is_empty()),
         ) {
-            state.entries[idx].per_file_values[i] = s.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
         }
         if let (Some(idx), Some(s)) = (
             release_group_idx,
@@ -1180,19 +1180,19 @@ pub fn populate_editor_mb_supplemental(
                 .as_deref()
                 .filter(|s| !s.is_empty()),
         ) {
-            state.entries[idx].per_file_values[i] = s.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
         }
         if let (Some(idx), Some(s)) = (
             original_date_idx,
             release.original_date.as_deref().filter(|s| !s.is_empty()),
         ) {
-            state.entries[idx].per_file_values[i] = s.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
         }
         if let (Some(idx), Some(s)) = (
             country_idx,
             release.country.as_deref().filter(|s| !s.is_empty()),
         ) {
-            state.entries[idx].per_file_values[i] = s.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
         }
     }
 
@@ -1211,11 +1211,11 @@ pub fn populate_editor_mb_supplemental(
     .iter()
     .filter_map(|x| *x)
     {
-        recompute_and_stamp_mb_proposed(&mut state.entries[idx], n);
+        recompute_and_stamp_mb_proposed(&mut state.active_surface_mut().entries[idx], n);
     }
 
-    crate::tui::probe::sort_entries_standard_first(&mut state.entries);
-    state.dirty = true;
+    crate::tui::probe::sort_entries_standard_first(&mut state.active_surface_mut().entries);
+    state.active_surface_mut().dirty = true;
 }
 
 /// Recompute `value` / `is_mixed` for an entry after a populate touched
@@ -1264,7 +1264,7 @@ pub fn track_count_mismatch_message(
     state: &crate::tui::app::MetadataEditorState,
     release: &MbRelease,
 ) -> Option<String> {
-    let n_files = state.paths.len();
+    let n_files = state.active_surface().paths.len();
     let n_mb = release.tracks.len();
     if n_files == 1 && n_mb > 1 {
         return None;
@@ -1303,10 +1303,10 @@ pub fn apply_dvdv_duration_warnings(
     state: &mut crate::tui::app::MetadataEditorState,
     release: &MbRelease,
 ) -> Option<String> {
-    let Some(durations) = state.dvdv_track_durations.as_deref() else {
+    let Some(durations) = state.active_surface().dvdv_track_durations.as_deref() else {
         return None;
     };
-    if durations.is_empty() || state.paths.len() != durations.len() {
+    if durations.is_empty() || state.active_surface().paths.len() != durations.len() {
         return None;
     }
 
@@ -1374,7 +1374,7 @@ fn upsert_dvdv_duration_warning_entry(
     state: &mut crate::tui::app::MetadataEditorState,
     mismatches: &[DvdvTrackDurationMismatch],
 ) {
-    let n = state.paths.len();
+    let n = state.active_surface().paths.len();
     if n == 0 {
         return;
     }
@@ -1396,12 +1396,12 @@ fn upsert_dvdv_duration_warning_entry(
     .unwrap_or_default();
     let all_same = per_file_values.windows(2).all(|window| window[0] == window[1]);
 
-    if let Some(idx) = state
+    if let Some(idx) = state.active_surface()
         .entries
         .iter()
         .position(|entry| entry.display_key.eq_ignore_ascii_case(DVDV_DURATION_WARNING_KEY))
     {
-        let entry = &mut state.entries[idx];
+        let entry = &mut state.active_surface_mut().entries[idx];
         entry.value = summary.clone();
         entry.original.clear();
         entry.is_binary = false;
@@ -1411,7 +1411,7 @@ fn upsert_dvdv_duration_warning_entry(
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
     } else if !mismatches.is_empty() {
-        state.entries.push(crate::tui::probe::TagEntry {
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
             display_key: DVDV_DURATION_WARNING_KEY.to_string(),
             item_key: lofty::tag::ItemKey::Unknown(DVDV_DURATION_WARNING_KEY.to_string()),
             value: summary,
@@ -1538,7 +1538,7 @@ pub fn populate_editor_from_mb(
 
     populate_editor_mb_supplemental(state, release);
 
-    let n = state.paths.len();
+    let n = state.active_surface().paths.len();
 
     fn find_or_create(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
@@ -1572,7 +1572,7 @@ pub fn populate_editor_from_mb(
     // is_per_track_eligible — multi-disc / sidecar .cue / unverifiable
     // identity all fall back to album-level).
     let single_image = n == 1 && release.tracks.len() > 1;
-    let per_track_populate = single_image && is_per_track_eligible(&state.paths, release, true);
+    let per_track_populate = single_image && is_per_track_eligible(&state.active_surface().paths, release, true);
     let track_dim = if per_track_populate {
         release.tracks.len()
     } else {
@@ -1586,7 +1586,7 @@ pub fn populate_editor_from_mb(
 
     let title_idx = if any_title {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "TITLE",
             ItemKey::TrackTitle,
             track_dim,
@@ -1596,7 +1596,7 @@ pub fn populate_editor_from_mb(
     };
     let artist_idx = if any_artist {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "ARTIST",
             ItemKey::TrackArtist,
             track_dim,
@@ -1606,7 +1606,7 @@ pub fn populate_editor_from_mb(
     };
     let album_idx = if !release.title.is_empty() {
         Some(find_or_create(
-            &mut state.entries,
+            &mut state.active_surface_mut().entries,
             "ALBUM",
             ItemKey::AlbumTitle,
             n,
@@ -1616,9 +1616,9 @@ pub fn populate_editor_from_mb(
     };
     // TRACKNUMBER is always 1-based-by-file-position, computed locally —
     // doesn't depend on MB content. Always create.
-    let tn_idx = find_or_create(&mut state.entries, "TRACKNUMBER", ItemKey::TrackNumber, n);
+    let tn_idx = find_or_create(&mut state.active_surface_mut().entries, "TRACKNUMBER", ItemKey::TrackNumber, n);
     let date_idx = if release.year.as_deref().is_some_and(|s| !s.is_empty()) {
-        Some(find_or_create(&mut state.entries, "DATE", ItemKey::Year, n))
+        Some(find_or_create(&mut state.active_surface_mut().entries, "DATE", ItemKey::Year, n))
     } else {
         None
     };
@@ -1634,10 +1634,10 @@ pub fn populate_editor_from_mb(
     // favor.
     if per_track_populate {
         if let Some(idx) = title_idx {
-            crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], track_dim);
+            crate::tui::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[idx], track_dim);
         }
         if let Some(idx) = artist_idx {
-            crate::tui::probe::ensure_dim_replicate(&mut state.entries[idx], track_dim);
+            crate::tui::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[idx], track_dim);
         }
     }
 
@@ -1650,21 +1650,21 @@ pub fn populate_editor_from_mb(
             let mt = release.tracks.iter().find(|m| m.position == track_pos);
             if let Some(mt) = mt {
                 if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
-                    state.entries[idx].per_file_values[i] = mt.title.clone();
+                    state.active_surface_mut().entries[idx].per_file_values[i] = mt.title.clone();
                 }
                 if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
-                    state.entries[idx].per_file_values[i] = mt.artist.clone();
+                    state.active_surface_mut().entries[idx].per_file_values[i] = mt.artist.clone();
                 }
             }
         }
         if let Some(idx) = album_idx {
-            state.entries[idx].per_file_values[0] = release.title.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0] = release.title.clone();
         }
-        state.entries[tn_idx].per_file_values[0] = "1".to_string();
+        state.active_surface_mut().entries[tn_idx].per_file_values[0] = "1".to_string();
         if let (Some(idx), Some(year)) =
             (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
         {
-            state.entries[idx].per_file_values[0] = year.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[0] = year.to_string();
         }
     } else if single_image {
         // Single-image rip with a guard failure (multi-disc release,
@@ -1675,22 +1675,22 @@ pub fn populate_editor_from_mb(
         // sidecar — Phase 2 still parses the embedded one on open).
         // Writing the album title to slot [0] of a per-track TITLE
         // entry would contaminate track 0 with the album name.
-        let title_dim_one = title_idx.filter(|&i| state.entries[i].per_file_values.len() == 1);
-        let artist_dim_one = artist_idx.filter(|&i| state.entries[i].per_file_values.len() == 1);
+        let title_dim_one = title_idx.filter(|&i| state.active_surface().entries[i].per_file_values.len() == 1);
+        let artist_dim_one = artist_idx.filter(|&i| state.active_surface().entries[i].per_file_values.len() == 1);
         if let Some(idx) = title_dim_one {
-            state.entries[idx].per_file_values[0] = release.title.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0] = release.title.clone();
         }
         if let (Some(idx), false) = (artist_dim_one, release.artist.is_empty()) {
-            state.entries[idx].per_file_values[0] = release.artist.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0] = release.artist.clone();
         }
         if let Some(idx) = album_idx {
-            state.entries[idx].per_file_values[0] = release.title.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0] = release.title.clone();
         }
-        state.entries[tn_idx].per_file_values[0] = "1".to_string();
+        state.active_surface_mut().entries[tn_idx].per_file_values[0] = "1".to_string();
         if let (Some(idx), Some(year)) =
             (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
         {
-            state.entries[idx].per_file_values[0] = year.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[0] = year.to_string();
         }
     } else {
         // Per-file populate: tag-per-file with track position == file
@@ -1699,20 +1699,20 @@ pub fn populate_editor_from_mb(
             let mt = release.tracks.iter().find(|m| m.position as usize == i + 1);
             if let Some(mt) = mt {
                 if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
-                    state.entries[idx].per_file_values[i] = mt.title.clone();
+                    state.active_surface_mut().entries[idx].per_file_values[i] = mt.title.clone();
                 }
                 if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
-                    state.entries[idx].per_file_values[i] = mt.artist.clone();
+                    state.active_surface_mut().entries[idx].per_file_values[i] = mt.artist.clone();
                 }
             }
             if let Some(idx) = album_idx {
-                state.entries[idx].per_file_values[i] = release.title.clone();
+                state.active_surface_mut().entries[idx].per_file_values[i] = release.title.clone();
             }
-            state.entries[tn_idx].per_file_values[i] = (i + 1).to_string();
+            state.active_surface_mut().entries[tn_idx].per_file_values[i] = (i + 1).to_string();
             if let (Some(idx), Some(year)) =
                 (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
             {
-                state.entries[idx].per_file_values[i] = year.to_string();
+                state.active_surface_mut().entries[idx].per_file_values[i] = year.to_string();
             }
         }
     }
@@ -1721,7 +1721,7 @@ pub fn populate_editor_from_mb(
         .iter()
         .filter_map(|x| *x)
     {
-        recompute_and_stamp_mb_proposed(&mut state.entries[idx], n);
+        recompute_and_stamp_mb_proposed(&mut state.active_surface_mut().entries[idx], n);
     }
 
     // Per-track-eligible single-image rip without an existing CUESHEET
@@ -1734,12 +1734,12 @@ pub fn populate_editor_from_mb(
     // Guard checks (multi-disc / sidecar / identity) live in
     // is_per_track_eligible, not duplicated here.
     if per_track_populate {
-        let has_cuesheet = state
+        let has_cuesheet = state.active_surface()
             .entries
             .iter()
             .any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"));
         if !has_cuesheet {
-            if let Some(filename) = state
+            if let Some(filename) = state.active_surface()
                 .paths
                 .first()
                 .and_then(|p| p.file_name())
@@ -1751,23 +1751,23 @@ pub fn populate_editor_from_mb(
                     .unwrap_or("flac");
                 if let Ok(cue) = super::cue_generate::cue_from_mb_release(release, filename, ext) {
                     let cue_idx = find_or_create(
-                        &mut state.entries,
+                        &mut state.active_surface_mut().entries,
                         "CUESHEET",
                         ItemKey::Unknown("CUESHEET".to_string()),
                         n,
                     );
-                    state.entries[cue_idx].per_file_values[0] = cue.clone();
+                    state.active_surface_mut().entries[cue_idx].per_file_values[0] = cue.clone();
                     // is_binary keeps inline edit blocked; the value
                     // would be 1-2KB of multi-line content otherwise.
-                    state.entries[cue_idx].is_binary = true;
-                    recompute_and_stamp_mb_proposed(&mut state.entries[cue_idx], n);
+                    state.active_surface_mut().entries[cue_idx].is_binary = true;
+                    recompute_and_stamp_mb_proposed(&mut state.active_surface_mut().entries[cue_idx], n);
                 }
             }
         }
     }
 
-    crate::tui::probe::sort_entries_standard_first(&mut state.entries);
-    state.dirty = true;
+    crate::tui::probe::sort_entries_standard_first(&mut state.active_surface_mut().entries);
+    state.active_surface_mut().dirty = true;
 }
 
 /// Tolerance (ms) for the file-duration vs MB-track-sum check used by
@@ -2462,49 +2462,17 @@ mod tests {
     }
 
     fn empty_editor_state(n: usize) -> (crate::tui::app::MetadataEditorState, tempfile::TempDir) {
-        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        use crate::tui::app::MetadataEditorState;
         let td = tempfile::tempdir().expect("tempdir");
         let paths: Vec<std::path::PathBuf> = (0..n)
             .map(|i| td.path().join(format!("{:02}.flac", i + 1)))
             .collect();
-        let state = MetadataEditorState {
+        let state = MetadataEditorState::for_files(
             paths,
-            entries: Vec::new(),
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels: (0..n).map(|i| format!("{:02}", i + 1)).collect(),
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            presentation_tabs: vec![],
-            active_tab: 0,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+            Vec::new(),
+            (0..n).map(|i| format!("{:02}", i + 1)).collect(),
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
         (state, td)
     }
 
@@ -2530,7 +2498,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         let pos = |key: &str| -> Option<usize> {
-            state.entries.iter().position(|e| e.display_key == key)
+            state.active_surface().entries.iter().position(|e| e.display_key == key)
         };
 
         // STANDARD_KEY_ORDER positions enforced.
@@ -2558,7 +2526,7 @@ mod tests {
         populate_editor_mb_supplemental(&mut state, &release);
 
         // ALBUMID gets created because release_id is non-empty.
-        assert!(state
+        assert!(state.active_surface()
             .entries
             .iter()
             .any(|e| e.display_key == "MUSICBRAINZ_ALBUMID"));
@@ -2575,7 +2543,7 @@ mod tests {
             "CATALOGNUMBER",
         ] {
             assert!(
-                state
+                state.active_surface()
                     .entries
                     .iter()
                     .find(|e| e.display_key == absent)
@@ -2600,7 +2568,7 @@ mod tests {
         release.year = Some("1971".into());
         populate_editor_from_mb(&mut state, &release);
 
-        let title_entry = state
+        let title_entry = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
@@ -2633,7 +2601,7 @@ mod tests {
         populate_editor_mb_supplemental(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
@@ -2651,17 +2619,17 @@ mod tests {
         assert_eq!(lookup("ORIGINALDATE"), vec!["1969", "1969"]);
         assert_eq!(lookup("RELEASECOUNTRY"), vec!["US", "US"]);
         // Helper does NOT write Title/Album/Artist/Date.
-        assert!(state
+        assert!(state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "TITLE")
             .is_none());
-        assert!(state
+        assert!(state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "ALBUM")
             .is_none());
-        assert!(state
+        assert!(state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "DATE")
@@ -2685,7 +2653,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
@@ -2700,7 +2668,7 @@ mod tests {
         assert_eq!(lookup("ISRC"), vec!["USRC17607839", ""]);
         // Catalog prefers label catalog over barcode.
         assert_eq!(lookup("CATALOGNUMBER"), vec!["UICY-94626", "UICY-94626"]);
-        assert!(state.dirty);
+        assert!(state.active_surface().dirty);
     }
 
     #[test]
@@ -2745,7 +2713,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
@@ -2773,17 +2741,17 @@ mod tests {
             vec!["USRC17607839", "", ""],
             "ISRC must be per-track on per-track-eligible single-image (Phase 1b)"
         );
-        assert!(state
+        assert!(state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "MUSICBRAINZ_TRACKID")
             .is_none());
-        assert!(state
+        assert!(state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "MUSICBRAINZ_RELEASETRACKID")
             .is_none());
-        assert!(state
+        assert!(state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "MUSICBRAINZ_ARTISTID")
@@ -2888,7 +2856,7 @@ mod tests {
     #[test]
     fn apply_dvdv_duration_warnings_adds_editor_row() {
         let (mut state, _td) = empty_editor_state(2);
-        state.dvdv_track_durations = Some(vec![240.0, 201.0]);
+        state.active_surface_mut().dvdv_track_durations = Some(vec![240.0, 201.0]);
         let mut release = rel(
             "rid",
             vec![
@@ -2901,7 +2869,7 @@ mod tests {
 
         let msg = apply_dvdv_duration_warnings(&mut state, &release).expect("warning");
         assert!(msg.contains("DVD-Video duration warning"));
-        let entry = state
+        let entry = state.active_surface()
             .entries
             .iter()
             .find(|entry| entry.display_key == DVDV_DURATION_WARNING_KEY)
@@ -2915,45 +2883,13 @@ mod tests {
         // paths.len() == 1 with N>1 MB tracks is the legitimate
         // single-image rip case (titles ride in the CUESHEET tag).
         // Helper returns None.
-        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
-        let state = MetadataEditorState {
-            paths: vec![std::path::PathBuf::from("/tmp/x.flac")],
-            entries: Vec::new(),
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels: vec!["01".into()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            presentation_tabs: vec![],
-            active_tab: 0,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+        use crate::tui::app::MetadataEditorState;
+        let state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/x.flac")],
+            Vec::new(),
+            vec!["01".into()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
         let release = rel(
             "rid",
             vec![
@@ -2969,94 +2905,30 @@ mod tests {
     fn track_count_mismatch_message_single_image_single_track_no_warning() {
         // paths.len() == 1, n_mb == 1: genuine 1:1 match, not a
         // mismatch and not a single-image case. No warning.
-        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
-        let state = MetadataEditorState {
-            paths: vec![std::path::PathBuf::from("/tmp/x.flac")],
-            entries: Vec::new(),
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels: vec!["01".into()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            presentation_tabs: vec![],
-            active_tab: 0,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+        use crate::tui::app::MetadataEditorState;
+        let state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/x.flac")],
+            Vec::new(),
+            vec!["01".into()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
         let release = rel("rid", vec![trk(1, "T", "A", None)]);
         assert!(track_count_mismatch_message(&state, &release).is_none());
     }
 
     #[test]
     fn track_count_mismatch_message_multi_file_mismatch_warns() {
-        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
-        let state = MetadataEditorState {
-            paths: vec![
+        use crate::tui::app::MetadataEditorState;
+        let state = MetadataEditorState::for_files(
+            vec![
                 std::path::PathBuf::from("/tmp/01.flac"),
                 std::path::PathBuf::from("/tmp/02.flac"),
                 std::path::PathBuf::from("/tmp/03.flac"),
             ],
-            entries: Vec::new(),
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels: vec!["01".into(), "02".into(), "03".into()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            presentation_tabs: vec![],
-            active_tab: 0,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+            Vec::new(),
+            vec!["01".into(), "02".into(), "03".into()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
         let release = rel(
             "rid",
             vec![
@@ -3152,7 +3024,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
@@ -3169,7 +3041,7 @@ mod tests {
         // ISRC must NOT be created (no per-track CUESHEET home, and
         // album-level ISRC is meaningless).
         assert!(
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key == "ISRC")
@@ -3177,7 +3049,7 @@ mod tests {
             "non-eligible single-image: ISRC must not be created"
         );
         // No CUESHEET embed either (per_track_populate gates that too).
-        assert!(state
+        assert!(state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == "CUESHEET")
@@ -3215,7 +3087,7 @@ mod tests {
         release.artist = "Album Artist".into();
         populate_editor_from_mb(&mut state, &release);
 
-        let cue_entry = state
+        let cue_entry = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
@@ -3245,7 +3117,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
@@ -3255,11 +3127,11 @@ mod tests {
     }
 
     /// Copy `tests/fixtures/silence.flac` into the test's tempdir at
-    /// the path `state.paths[0]` points to. The fixture is 100ms.
+    /// the path `state.active_surface().paths[0]` points to. The fixture is 100ms.
     fn install_silence_at(state: &crate::tui::app::MetadataEditorState) {
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/silence.flac");
-        let dst = &state.paths[0];
+        let dst = &state.active_surface().paths[0];
         std::fs::copy(&fixture, dst).expect("install silence.flac fixture");
     }
 
@@ -3287,7 +3159,7 @@ mod tests {
         release.title = "Whole Album".into();
         populate_editor_from_mb(&mut state, &release);
         assert!(
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
@@ -3314,7 +3186,7 @@ mod tests {
         let (mut state, _td) = empty_editor_state(1);
         install_silence_at(&state);
         // Write MUSICBRAINZ_ALBUMID = "matching-rid" into the file.
-        let path = &state.paths[0];
+        let path = &state.active_surface().paths[0];
         {
             let mut tagged = lofty::read_from_path(path).expect("read fixture copy");
             if tagged.primary_tag().is_none() {
@@ -3350,7 +3222,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .any(|e| e.display_key.eq_ignore_ascii_case("CUESHEET")),
@@ -3372,7 +3244,7 @@ mod tests {
 
         let (mut state, _td) = empty_editor_state(1);
         install_silence_at(&state);
-        let path = &state.paths[0];
+        let path = &state.active_surface().paths[0];
         {
             let mut tagged = lofty::read_from_path(path).expect("read fixture");
             if tagged.primary_tag().is_none() {
@@ -3400,14 +3272,14 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
                 .is_none(),
             "no track lengths → no CUESHEET even with identity match",
         );
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key.eq_ignore_ascii_case("TITLE"))
@@ -3443,7 +3315,7 @@ mod tests {
         release.title = "Whole Album".into();
         populate_editor_from_mb(&mut state, &release);
         assert!(
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
@@ -3477,7 +3349,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
@@ -3488,7 +3360,7 @@ mod tests {
 
     #[test]
     fn populate_editor_from_mb_single_image_preserves_existing_cuesheet() {
-        // Phase 5 guard: when state.entries already contains a CUESHEET
+        // Phase 5 guard: when state.active_surface().entries already contains a CUESHEET
         // (whether parsed from an embedded tag at open or injected from
         // a sidecar by Phase 2's editor-open flow), populate must NOT
         // rebuild it from MB. Phase 4 will mutate the existing entry
@@ -3504,7 +3376,7 @@ mod tests {
                             FILE \"x.flac\" FLAC\n\
                             TRACK 01 AUDIO\nTITLE \"Pre T1\"\nINDEX 01 00:00:00\n\
                             TRACK 02 AUDIO\nTITLE \"Pre T2\"\nINDEX 01 00:00:50\n";
-        state.entries.push(crate::tui::probe::TagEntry {
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
             display_key: "CUESHEET".to_string(),
             item_key: lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
             value: "<cue summary>".to_string(),
@@ -3536,7 +3408,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         // CUESHEET preserved verbatim — populate did NOT rebuild it.
-        let cue = state
+        let cue = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
@@ -3546,7 +3418,7 @@ mod tests {
             "existing CUESHEET preserved by populate (not regenerated from MB)"
         );
         // Per-track populate from MB still ran on TITLE.
-        let title = state
+        let title = state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key.eq_ignore_ascii_case("TITLE"))
@@ -3582,7 +3454,7 @@ mod tests {
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
-            state
+            state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))

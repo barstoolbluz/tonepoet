@@ -841,31 +841,61 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.browse.selected_index = 0;
             app.browse.scroll_offset = 0;
         }
-        AppMessage::MetadataEditorWriteComplete { results } => {
-            let total = results.len();
-            let failed: Vec<_> = results.iter().filter(|(_, r)| r.is_err()).collect();
-            if failed.is_empty() {
-                app.set_status(format!(
-                    "Metadata saved ({} file{})",
-                    total,
-                    if total == 1 { "" } else { "s" },
-                ));
-            } else {
-                let first_err = failed[0].1.as_ref().unwrap_err();
-                app.set_status(format!(
-                    "Metadata: {} saved, {} failed — {}",
-                    total - failed.len(),
-                    failed.len(),
-                    first_err,
-                ));
+        AppMessage::MetadataEditorDetailsProbeComplete { session_id, generation, total, results } => {
+            let mut reduced = false;
+            if let ActiveOverlay::MetadataEditor(mut state) = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+                if let Some(status) = state.apply_details_probe_results(session_id, generation, results) {
+                    app.set_status(status);
+                } else {
+                    app.set_status(format!(
+                        "metadata editor: ignored stale Details probe result for session {session_id} ({total} file{})",
+                        if total == 1 { "" } else { "s" }
+                    ));
+                }
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                reduced = true;
             }
-            // Invalidate caches for all written files.
-            for (path, _) in &results {
-                app.browse.probe_cache.remove(path);
-                let _ = app.db.invalidate_probe(&path.display().to_string());
+            if !reduced {
+                app.set_status("metadata editor: Details probe finished after editor closed");
             }
-            app.active_overlay = ActiveOverlay::None;
-            app.browse.probe_current_with_db(tx, Some(&app.db));
+        }
+        AppMessage::MetadataEditorWriteComplete {
+            session_id,
+            save_generation,
+            results,
+        } => {
+            let mut reduced = false;
+            if let ActiveOverlay::MetadataEditor(mut state) =
+                std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+            {
+                if let Some(summary) =
+                    state.apply_write_results(session_id, save_generation, results)
+                {
+                    let close_editor = summary.all_saved();
+                    for path in &summary.saved_paths {
+                        app.browse.probe_cache.remove(path);
+                        let _ = app.db.invalidate_probe(&path.display().to_string());
+                    }
+                    app.set_status(summary.status_line());
+                    if close_editor {
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                    } else {
+                        state.phase = super::app::MetadataEditorPhase::Editing;
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    }
+                } else {
+                    app.set_status(format!(
+                        "metadata editor: ignored stale save result for session {session_id} generation {save_generation}"
+                    ));
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                }
+                reduced = true;
+            }
+            if !reduced {
+                app.set_status(
+                    "metadata editor: save finished after editor closed; stale result ignored",
+                );
+            }
         }
         AppMessage::GnudbQueryComplete { result, paths } => {
             match result {
@@ -1408,11 +1438,16 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 use super::app::MetadataEditorPhase;
                 if state.phase == MetadataEditorPhase::DetailEdit {
                     let field_idx = state.detail_field_idx;
-                    if field_idx < state.entries.len() {
+                    if field_idx < state.active_surface().entries.len() {
                         let sanitized = text.replace("\r\n", "\n").replace('\r', "\n");
                         let lines: Vec<&str> = sanitized.split('\n').collect();
-                        let n_files = state.paths.len();
-                        let entry = &mut state.entries[field_idx];
+                        let n_files = state.active_surface().paths.len();
+
+                        // Cancel any active inline edit before taking the
+                        // mutable entry borrow (avoids double-borrow of state).
+                        state.detail_edit = None;
+
+                        let entry = &mut state.active_surface_mut().entries[field_idx];
                         let is_album = entry.display_key.eq_ignore_ascii_case("ALBUM");
 
                         if is_album {
@@ -1432,9 +1467,6 @@ fn handle_paste(app: &mut AppState, text: &str) {
                             }
                         }
 
-                        // Cancel any active inline edit.
-                        state.detail_edit = None;
-
                         // Update merged display value + mixed state.
                         let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
                         entry.is_mixed = !all_same && n_files > 1;
@@ -1444,7 +1476,7 @@ fn handle_paste(app: &mut AppState, text: &str) {
                             entry.per_file_values.first().cloned().unwrap_or_default()
                         };
 
-                        state.dirty = true;
+                        state.active_surface_mut().dirty = true;
                         let applied = lines.len().min(n_files);
                         app.set_status(format!(
                             "Pasted {} value{}",
@@ -1993,7 +2025,7 @@ pub(super) fn open_editor_with_mb_release(
         }
     };
 
-    if state.paths != paths {
+    if state.active_surface().paths != paths {
         app.set_status(":tags-mb: selection changed since lookup; rerun".to_string());
         app.active_overlay = ActiveOverlay::MetadataEditor(state);
         return;
@@ -2001,7 +2033,7 @@ pub(super) fn open_editor_with_mb_release(
     // Compute the skip reason BEFORE populate so we can surface
     // it on the status line — populate itself runs the same
     // checks internally for the gate but only logs to env_logger.
-    let skip_reason = super::musicbrainz::per_track_skip_reason(&state.paths, release);
+    let skip_reason = super::musicbrainz::per_track_skip_reason(&state.active_surface().paths, release);
     // Phase C item 3: surface track-count divergence as a non-fatal
     // warning. MB releases sometimes carry bonus/hidden tracks not
     // present on the SACD area being tagged, or the reverse —
@@ -2014,13 +2046,11 @@ pub(super) fn open_editor_with_mb_release(
     // multi-presentation editors this preserves per-tab state and lets the
     // apply-to-all confirmation copy only the MB-populated values from the
     // active presentation into matching sibling presentations.
-    state.sync_active_presentation();
     super::musicbrainz::populate_editor_from_mb(&mut state, release);
     let dvdv_duration_warning =
         super::musicbrainz::apply_dvdv_duration_warnings(&mut state, release);
     state.phase = super::app::MetadataEditorPhase::Editing;
-    state.dirty = true;
-    state.sync_active_presentation();
+    state.active_surface_mut().dirty = true;
 
     let label = if release.title.is_empty() {
         "(untitled)"
@@ -2048,9 +2078,9 @@ pub(super) fn open_editor_with_mb_release(
         });
     }
 
-    let has_presentation_tabs = state.has_presentation_tabs();
+    let has_matching_presentations = state.has_multiple_presentations();
     super::keybindings::reopen_metadata_editor_after_musicbrainz_population(app, state);
-    if has_presentation_tabs {
+    if has_matching_presentations {
         msg.push_str(" [apply to matching presentations?]");
     }
     app.set_status(msg);
@@ -2180,7 +2210,7 @@ mod musicbrainz_completion_dispatch_tests {
     use super::*;
     use crate::config::TonepoetConfig;
     use crate::disc::model::PresentationId;
-    use crate::tui::app::{ConfirmAction, MetadataEditorPhase, MetadataEditorState, PresentationTab};
+    use crate::tui::app::{ConfirmAction, MetadataEditorState, PresentationTab};
     use crate::tui::probe::TagEntry;
     use lofty::tag::ItemKey;
 
@@ -2216,31 +2246,19 @@ mod musicbrainz_completion_dispatch_tests {
             PresentationId::DvdAudioGroup(group) => group.to_string(),
             _ => String::new(),
         };
-        PresentationTab {
+        PresentationTab::new(
             id,
-            label: label.to_string(),
-            paths: tab_paths,
-            entries: vec![
+            label,
+            tab_paths,
+            vec![
                 tag("TITLE", label, n_paths),
                 tag("DVDA_GROUP", &group_value, n_paths),
             ],
-            file_labels: (0..n_paths).map(|idx| format!("Track {:02}", idx + 1)).collect(),
-            deleted: Vec::new(),
-            dirty: false,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        }
+            (0..n_paths).map(|idx| format!("Track {:02}", idx + 1)).collect(),
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        )
     }
+
 
     fn editor_with_tabs(active_tab: usize, n_paths: usize) -> Box<MetadataEditorState> {
         let active_paths = paths(n_paths);
@@ -2256,46 +2274,9 @@ mod musicbrainz_completion_dispatch_tests {
                 paths(n_paths),
             ),
         ];
-        let active = tabs[active_tab].clone();
-        Box::new(MetadataEditorState {
-            paths: active.paths,
-            entries: active.entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: active.dirty,
-            deleted: active.deleted,
-            file_labels: active.file_labels,
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: active.sacd_area_kind,
-            sacd_stereo_durations: active.sacd_stereo_durations,
-            sacd_multi_channel_durations: active.sacd_multi_channel_durations,
-            dvdv_source_chapters: active.dvdv_source_chapters,
-            dvdv_track_durations: active.dvdv_track_durations,
-            dvdv_angle_number: active.dvdv_angle_number,
-            dvdv_title_angle_count: active.dvdv_title_angle_count,
-            bluray_playlist_number: active.bluray_playlist_number,
-            bluray_audio_pid: active.bluray_audio_pid,
-            bluray_audio_stream_index: active.bluray_audio_stream_index,
-            bluray_angle_number: active.bluray_angle_number,
-            bluray_chapter_durations: active.bluray_chapter_durations,
-            presentation_tabs: tabs,
-            active_tab,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        })
+        Box::new(MetadataEditorState::for_disc_presentations(tabs, active_tab))
     }
+
 
     fn release(id: &str, title: &str) -> crate::tui::musicbrainz::MbRelease {
         crate::tui::musicbrainz::MbRelease {
@@ -2371,7 +2352,7 @@ mod musicbrainz_completion_dispatch_tests {
         let mut app = AppState::new(TonepoetConfig::default());
         let tx = tx();
         let editor = editor_with_tabs(0, 2);
-        let editor_paths = editor.paths.clone();
+        let editor_paths = editor.active_surface().paths.clone();
         app.active_overlay = ActiveOverlay::MetadataEditor(editor);
 
         handle_message(
@@ -2418,7 +2399,7 @@ mod musicbrainz_completion_dispatch_tests {
         let mut app = AppState::new(TonepoetConfig::default());
         let tx = tx();
         let editor = editor_with_tabs(0, 2);
-        let editor_paths = editor.paths.clone();
+        let editor_paths = editor.active_surface().paths.clone();
         app.active_overlay = ActiveOverlay::MetadataEditor(editor);
 
         handle_message(
@@ -2450,7 +2431,7 @@ mod musicbrainz_completion_dispatch_tests {
         let mut app = AppState::new(TonepoetConfig::default());
         let tx = tx();
         let editor = editor_with_tabs(0, 2);
-        let editor_paths = editor.paths.clone();
+        let editor_paths = editor.active_surface().paths.clone();
         app.active_overlay = ActiveOverlay::MetadataEditor(editor);
 
         handle_message(
@@ -2475,7 +2456,7 @@ mod musicbrainz_completion_dispatch_tests {
     fn picked_mb_select_release_uses_parked_editor_and_caches_picker_back_state() {
         let mut app = AppState::new(TonepoetConfig::default());
         let editor = editor_with_tabs(0, 2);
-        let editor_paths = editor.paths.clone();
+        let editor_paths = editor.active_surface().paths.clone();
         app.pending_metadata_editor = Some(editor);
         app.active_overlay = ActiveOverlay::MbSelect(Box::new(crate::tui::app::MbSelectState::new(
             vec![release("", "Candidate A"), release("", "Candidate B")],

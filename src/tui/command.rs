@@ -981,7 +981,7 @@ fn parse_tags_mb_args(args: &str) -> Command {
 /// unless `f` (or something it called) set a different overlay.
 fn with_editor_state<F>(app: &mut AppState, mut f: F)
 where
-    F: FnMut(&mut super::app::MetadataEditorState),
+    F: FnMut(&mut super::app::MetadataEditorState) -> Option<String>,
 {
     let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
         parked
@@ -999,7 +999,10 @@ where
         app.set_status("metadata-editor command requires the editor to be active");
         return;
     };
-    f(&mut state);
+    let status = f(&mut state);
+    if let Some(status) = status {
+        app.set_status(status);
+    }
     if matches!(app.active_overlay, super::app::ActiveOverlay::None) {
         app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
     }
@@ -2146,7 +2149,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             } else {
                 state.cursor
             };
-            if let Some(entry) = state.entries.get_mut(target_idx) {
+            if let Some(entry) = state.active_surface_mut().entries.get_mut(target_idx) {
                 if in_detail {
                     let pill_before = super::probe::mb_pill_state_field(entry);
                     if matches!(pill_before, super::probe::MbRevertPill::None) {
@@ -2157,7 +2160,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         super::probe::toggle_mb_revert_field(entry);
                         let after = super::probe::mb_pill_state_field(entry);
                         let display_key = entry.display_key.clone();
-                        state.dirty = super::probe::metadata_editor_has_changes(&state);
+                        state.recompute_active_dirty();
                         let label = match after {
                             super::probe::MbRevertPill::Revert => "applied MB values",
                             super::probe::MbRevertPill::UseMb => "reverted to file values",
@@ -2173,7 +2176,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         super::probe::toggle_mb_revert(entry);
                         let after = super::probe::mb_pill_state(entry);
                         let display_key = entry.display_key.clone();
-                        state.dirty = super::probe::metadata_editor_has_changes(&state);
+                        state.recompute_active_dirty();
                         let label = match after {
                             super::probe::MbRevertPill::Revert => "applied MB value",
                             super::probe::MbRevertPill::UseMb => "reverted to file value",
@@ -2199,13 +2202,13 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             } else {
                 state.cursor
             };
-            if let Some(entry) = state.entries.get_mut(target_idx) {
+            if let Some(entry) = state.active_surface_mut().entries.get_mut(target_idx) {
                 if !super::probe::entry_has_mb_proposed(entry) {
                     app.set_status(":restore: field was not populated from MusicBrainz");
                 } else {
                     super::probe::restore_mb_proposed(entry);
                     let display_key = entry.display_key.clone();
-                    state.dirty = super::probe::metadata_editor_has_changes(&state);
+                    state.recompute_active_dirty();
                     app.set_status(format!(":restore: {} (snapped to MB values)", display_key));
                 }
             }
@@ -2223,12 +2226,14 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
         }
         Command::MetaUndelete => {
             with_editor_state(app, |state| {
-                super::keybindings::metadata_editor_undelete_cursor(state)
+                super::keybindings::metadata_editor_undelete_cursor(state);
+                None
             });
         }
         Command::MetaDetail => {
             with_editor_state(app, |state| {
-                super::keybindings::metadata_editor_open_detail(state)
+                super::keybindings::metadata_editor_open_detail(state);
+                None
             });
         }
         Command::MbBack => {
@@ -2259,7 +2264,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                 return;
             };
-            if state.dirty {
+            if state.any_presentation_dirty() {
                 // Park the editor on pending so the user can cancel
                 // and come back. ConfirmAction::MbBack carries the
                 // cached release list for the post-confirm transition.
@@ -2303,7 +2308,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                 return;
             };
-            if state.dirty {
+            if state.any_presentation_dirty() {
                 app.pending_metadata_editor = Some(state);
                 app.active_overlay = super::app::ActiveOverlay::Confirmation {
                     action: super::app::ConfirmAction::GnudbBack(review),
@@ -2334,12 +2339,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 return;
             };
             // SACD only.
-            let Some(_) = state.sacd_area_kind else {
+            let Some(_) = state.active_surface().sacd_area_kind else {
                 app.set_status(":area: editor is not on a SACD ISO");
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                 return;
             };
-            let iso_path = match state.paths.first().cloned() {
+            let iso_path = match state.active_surface().paths.first().cloned() {
                 Some(p) => p,
                 None => {
                     app.set_status(":area: no source path on editor state");
@@ -2347,7 +2352,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     return;
                 }
             };
-            if state.dirty {
+            if state.active_surface().dirty {
                 app.set_status(
                     ":area: editor has unsaved edits — save (:w) or discard (:q!) first",
                 );
@@ -2378,7 +2383,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(":dvda-group only works in the metadata editor");
                 return;
             };
-            let source_path = match state.paths.first().cloned() {
+            let source_path = match state.active_surface().paths.first().cloned() {
                 Some(p) if crate::disc::dvda_utils::is_dvda_source(&p) => p,
                 _ => {
                     app.set_status(":dvda-group: editor is not on a DVD-Audio source");
@@ -2386,7 +2391,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     return;
                 }
             };
-            if state.dirty {
+            if state.active_surface().dirty {
                 app.set_status(
                     ":dvda-group: editor has unsaved edits — save (:w) or discard (:q!) first",
                 );
@@ -2416,7 +2421,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 return;
             };
             let cursor = state.cursor;
-            let entry = match state.entries.get(cursor) {
+            let entry = match state.active_surface().entries.get(cursor) {
                 Some(e) => e,
                 None => {
                     app.set_status(":cue-view: no entry at cursor");
@@ -3264,7 +3269,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 };
                 let result = super::keybindings::fix_caps_for_state(state, focus);
                 if result.changed_values > 0 {
-                    state.dirty = true;
+                    state.active_surface_mut().dirty = true;
                 }
                 let mut msg = format!(
                     "Capitalization applied ({} values changed",
@@ -4769,7 +4774,7 @@ pub struct SacdMbSeed {
 /// results — so any single non-empty term is enough.
 pub(super) fn seed_sacd_mb_query(state: &super::app::MetadataEditorState) -> Option<SacdMbSeed> {
     let entry_value = |k: &str| -> Option<String> {
-        state
+        state.active_surface()
             .entries
             .iter()
             .find(|e| e.display_key == k)
@@ -5426,14 +5431,17 @@ pub fn preload_dvdv_metadata_editor_state_from_sidecar_with_presentation_id(
         let Some(sidecar) = dvdv_matching_sidecar_for_editor(&sidecars, identity, &shape) else {
             return Ok(false);
         };
+        let path_count = state.active_surface().paths.len();
+        let source_chapters = state.active_surface().dvdv_source_chapters.clone();
+        let surface = state.active_surface_mut();
         dvdv_apply_sidecar_to_editor_fields(
-            &mut state.entries,
-            state.paths.len(),
-            state.dvdv_source_chapters.as_deref(),
+            &mut surface.entries,
+            path_count,
+            source_chapters.as_deref(),
             sidecar,
         );
-        state.deleted.clear();
-        state.dirty = false;
+        surface.deleted.clear();
+        surface.dirty = false;
         return Ok(true);
     }
 
@@ -5457,23 +5465,23 @@ pub fn preload_dvdv_metadata_editor_state_from_sidecar_with_presentation_id(
 
     if applied_any {
         if let Some(active) = state.presentation_tabs.get(state.active_tab).cloned() {
-            state.paths = active.paths;
-            state.entries = active.entries;
-            state.file_labels = active.file_labels;
-            state.deleted = active.deleted;
-            state.dirty = active.dirty;
-            state.sacd_area_kind = active.sacd_area_kind;
-            state.sacd_stereo_durations = active.sacd_stereo_durations;
-            state.sacd_multi_channel_durations = active.sacd_multi_channel_durations;
-            state.dvdv_source_chapters = active.dvdv_source_chapters;
-            state.dvdv_track_durations = active.dvdv_track_durations;
-            state.dvdv_angle_number = active.dvdv_angle_number;
-            state.dvdv_title_angle_count = active.dvdv_title_angle_count;
-            state.bluray_playlist_number = active.bluray_playlist_number;
-            state.bluray_audio_pid = active.bluray_audio_pid;
-            state.bluray_audio_stream_index = active.bluray_audio_stream_index;
-            state.bluray_angle_number = active.bluray_angle_number;
-            state.bluray_chapter_durations = active.bluray_chapter_durations;
+            state.active_surface_mut().paths = active.paths;
+            state.active_surface_mut().entries = active.entries;
+            state.active_surface_mut().file_labels = active.file_labels;
+            state.active_surface_mut().deleted = active.deleted;
+            state.active_surface_mut().dirty = active.dirty;
+            state.active_surface_mut().sacd_area_kind = active.sacd_area_kind;
+            state.active_surface_mut().sacd_stereo_durations = active.sacd_stereo_durations;
+            state.active_surface_mut().sacd_multi_channel_durations = active.sacd_multi_channel_durations;
+            state.active_surface_mut().dvdv_source_chapters = active.dvdv_source_chapters;
+            state.active_surface_mut().dvdv_track_durations = active.dvdv_track_durations;
+            state.active_surface_mut().dvdv_angle_number = active.dvdv_angle_number;
+            state.active_surface_mut().dvdv_title_angle_count = active.dvdv_title_angle_count;
+            state.active_surface_mut().bluray_playlist_number = active.bluray_playlist_number;
+            state.active_surface_mut().bluray_audio_pid = active.bluray_audio_pid;
+            state.active_surface_mut().bluray_audio_stream_index = active.bluray_audio_stream_index;
+            state.active_surface_mut().bluray_angle_number = active.bluray_angle_number;
+            state.active_surface_mut().bluray_chapter_durations = active.bluray_chapter_durations;
         }
     }
     Ok(applied_any)
@@ -5528,13 +5536,13 @@ struct DvdvEditorPresentationShape {
 fn dvdv_editor_presentation_shape_from_state(
     state: &super::app::MetadataEditorState,
 ) -> DvdvEditorPresentationShape {
-    let angle_number = match (state.dvdv_title_angle_count, state.dvdv_angle_number) {
+    let angle_number = match (state.active_surface().dvdv_title_angle_count, state.active_surface().dvdv_angle_number) {
         (Some(count), Some(angle)) if count > 1 => Some(angle),
         _ => None,
     };
     DvdvEditorPresentationShape {
-        track_count: state.paths.len(),
-        duration_fingerprint: state
+        track_count: state.active_surface().paths.len(),
+        duration_fingerprint: state.active_surface()
             .dvdv_track_durations
             .as_deref()
             .filter(|durations| !durations.is_empty())
@@ -6221,13 +6229,12 @@ pub fn save_bluray_metadata_sidecar_dirty_presentations_from_state(
     source: &Path,
     state: &super::app::MetadataEditorState,
 ) -> Result<BluRaySidecarSaveAllOutcome, String> {
-    let mut state_snapshot = state.clone();
-    state_snapshot.sync_active_presentation();
+    let state_snapshot = state.clone();
     let state = &state_snapshot;
 
     let default_path = bluray_metadata_sidecar_path_for_source(source);
     if state.presentation_tabs.is_empty() {
-        if !state.dirty {
+        if !state.active_surface().dirty {
             return Ok(BluRaySidecarSaveAllOutcome {
                 path: default_path,
                 saved_tab_indices: Vec::new(),
@@ -6351,29 +6358,31 @@ fn bluray_metadata_editor_state_for_tab(
     state: &super::app::MetadataEditorState,
     tab: &super::app::PresentationTab,
 ) -> super::app::MetadataEditorState {
-    let mut tab_state = state.clone();
-    tab_state.paths = tab.paths.clone();
-    tab_state.entries = tab.entries.clone();
-    tab_state.file_labels = tab.file_labels.clone();
-    tab_state.deleted = tab.deleted.clone();
-    tab_state.dirty = tab.dirty;
-    tab_state.sacd_area_kind = tab.sacd_area_kind;
-    tab_state.sacd_stereo_durations = tab.sacd_stereo_durations.clone();
-    tab_state.sacd_multi_channel_durations = tab.sacd_multi_channel_durations.clone();
-    tab_state.dvdv_source_chapters = tab.dvdv_source_chapters.clone();
-    tab_state.dvdv_track_durations = tab.dvdv_track_durations.clone();
-    tab_state.dvdv_angle_number = tab.dvdv_angle_number;
-    tab_state.dvdv_title_angle_count = tab.dvdv_title_angle_count;
-    tab_state.bluray_playlist_number = tab.bluray_playlist_number;
-    tab_state.bluray_audio_pid = tab.bluray_audio_pid;
-    tab_state.bluray_audio_stream_index = tab.bluray_audio_stream_index;
-    tab_state.bluray_angle_number = tab.bluray_angle_number;
-    tab_state.bluray_chapter_durations = tab.bluray_chapter_durations.clone();
-    tab_state.presentation_tabs = Vec::new();
-    tab_state.active_tab = 0;
-    tab_state.presentation_selector_open = false;
-    tab_state.presentation_selector_cursor = 0;
-    tab_state.presentation_selector_scroll = 0;
+    let mut tab_state = super::app::MetadataEditorState::for_files(
+        tab.paths.clone(),
+        tab.entries.clone(),
+        tab.file_labels.clone(),
+        tab.technical_details.clone(),
+    );
+    {
+        let surface = tab_state.active_surface_mut();
+        surface.deleted = tab.deleted.clone();
+        surface.dirty = tab.dirty;
+        surface.sacd_area_kind = tab.sacd_area_kind;
+        surface.sacd_stereo_durations = tab.sacd_stereo_durations.clone();
+        surface.sacd_multi_channel_durations = tab.sacd_multi_channel_durations.clone();
+        surface.dvdv_source_chapters = tab.dvdv_source_chapters.clone();
+        surface.dvdv_track_durations = tab.dvdv_track_durations.clone();
+        surface.dvdv_angle_number = tab.dvdv_angle_number;
+        surface.dvdv_title_angle_count = tab.dvdv_title_angle_count;
+        surface.bluray_playlist_number = tab.bluray_playlist_number;
+        surface.bluray_audio_pid = tab.bluray_audio_pid;
+        surface.bluray_audio_stream_index = tab.bluray_audio_stream_index;
+        surface.bluray_angle_number = tab.bluray_angle_number;
+        surface.bluray_chapter_durations = tab.bluray_chapter_durations.clone();
+    }
+    tab_state.read_only = state.read_only;
+    tab_state.sacd_sidecar_path = state.sacd_sidecar_path.clone();
     tab_state
 }
 
@@ -6417,7 +6426,7 @@ fn bluray_metadata_sidecar_from_state_preserving(
     state: &super::app::MetadataEditorState,
     existing: Option<&BluRayMetadataSidecar>,
 ) -> Result<BluRayMetadataSidecar, String> {
-    let n_tracks = state.paths.len();
+    let n_tracks = state.active_surface().paths.len();
     if n_tracks == 0 {
         return Err("Blu-ray metadata editor has no tracks".to_string());
     }
@@ -6450,7 +6459,7 @@ fn bluray_metadata_sidecar_from_state_preserving(
                 .get(&number)
                 .copied()
                 .or_else(|| existing_tracks_by_number.get(&number).copied());
-            let label = state.file_labels.get(idx).cloned().unwrap_or_else(|| {
+            let label = state.active_surface().file_labels.get(idx).cloned().unwrap_or_else(|| {
                 existing_track
                     .map(|track| track.label.clone())
                     .unwrap_or_else(|| format!("{:02}", number))
@@ -6465,11 +6474,11 @@ fn bluray_metadata_sidecar_from_state_preserving(
         })
         .collect();
 
-    for (entry_idx, entry) in state.entries.iter().enumerate() {
+    for (entry_idx, entry) in state.active_surface().entries.iter().enumerate() {
         let Some(sidecar_key) = bluray_editor_key_to_sidecar_key(&entry.display_key) else {
             continue;
         };
-        let entry_deleted = state.deleted.contains(&entry_idx);
+        let entry_deleted = state.active_surface().deleted.contains(&entry_idx);
         let is_album_level_key = bluray_is_album_level_sidecar_key(&sidecar_key);
         if !is_album_level_key {
             album.remove(sidecar_key.as_str());
@@ -6609,10 +6618,12 @@ pub fn preload_bluray_metadata_editor_state_from_sidecars_with_report(
         let Some(sidecar) = selected else {
             return preload_report;
         };
-        bluray_apply_sidecar_to_editor_fields(&mut state.entries, state.paths.len(), sidecar);
-        bluray_apply_sidecar_track_labels(&mut state.file_labels, sidecar);
-        state.deleted.clear();
-        state.dirty = false;
+        let track_count = state.active_surface().paths.len();
+        let surface = state.active_surface_mut();
+        bluray_apply_sidecar_to_editor_fields(&mut surface.entries, track_count, sidecar);
+        bluray_apply_sidecar_track_labels(&mut surface.file_labels, sidecar);
+        surface.deleted.clear();
+        surface.dirty = false;
         preload_report.applied_presentations = 1;
         return preload_report;
     }
@@ -6647,23 +6658,23 @@ pub fn preload_bluray_metadata_editor_state_from_sidecars_with_report(
 
 fn bluray_sync_active_tab_to_editor_state(state: &mut super::app::MetadataEditorState) {
     if let Some(active) = state.presentation_tabs.get(state.active_tab).cloned() {
-        state.paths = active.paths;
-        state.entries = active.entries;
-        state.file_labels = active.file_labels;
-        state.deleted = active.deleted;
-        state.dirty = active.dirty;
-        state.sacd_area_kind = active.sacd_area_kind;
-        state.sacd_stereo_durations = active.sacd_stereo_durations;
-        state.sacd_multi_channel_durations = active.sacd_multi_channel_durations;
-        state.dvdv_source_chapters = active.dvdv_source_chapters;
-        state.dvdv_track_durations = active.dvdv_track_durations;
-        state.dvdv_angle_number = active.dvdv_angle_number;
-        state.dvdv_title_angle_count = active.dvdv_title_angle_count;
-        state.bluray_playlist_number = active.bluray_playlist_number;
-        state.bluray_audio_pid = active.bluray_audio_pid;
-        state.bluray_audio_stream_index = active.bluray_audio_stream_index;
-        state.bluray_angle_number = active.bluray_angle_number;
-        state.bluray_chapter_durations = active.bluray_chapter_durations;
+        state.active_surface_mut().paths = active.paths;
+        state.active_surface_mut().entries = active.entries;
+        state.active_surface_mut().file_labels = active.file_labels;
+        state.active_surface_mut().deleted = active.deleted;
+        state.active_surface_mut().dirty = active.dirty;
+        state.active_surface_mut().sacd_area_kind = active.sacd_area_kind;
+        state.active_surface_mut().sacd_stereo_durations = active.sacd_stereo_durations;
+        state.active_surface_mut().sacd_multi_channel_durations = active.sacd_multi_channel_durations;
+        state.active_surface_mut().dvdv_source_chapters = active.dvdv_source_chapters;
+        state.active_surface_mut().dvdv_track_durations = active.dvdv_track_durations;
+        state.active_surface_mut().dvdv_angle_number = active.dvdv_angle_number;
+        state.active_surface_mut().dvdv_title_angle_count = active.dvdv_title_angle_count;
+        state.active_surface_mut().bluray_playlist_number = active.bluray_playlist_number;
+        state.active_surface_mut().bluray_audio_pid = active.bluray_audio_pid;
+        state.active_surface_mut().bluray_audio_stream_index = active.bluray_audio_stream_index;
+        state.active_surface_mut().bluray_angle_number = active.bluray_angle_number;
+        state.active_surface_mut().bluray_chapter_durations = active.bluray_chapter_durations;
     }
 }
 
@@ -6801,12 +6812,12 @@ fn bluray_presentation_identity_from_state(
             return Some(identity);
         }
     }
-    let playlist_number = state.bluray_playlist_number?;
-    let audio_pid = state.bluray_audio_pid?;
-    let audio_stream_index = state.bluray_audio_stream_index?;
-    let angle_number = state.bluray_angle_number;
-    let track_count = Some(u32::try_from(state.paths.len()).ok()?);
-    let duration_fingerprint = state
+    let playlist_number = state.active_surface().bluray_playlist_number?;
+    let audio_pid = state.active_surface().bluray_audio_pid?;
+    let audio_stream_index = state.active_surface().bluray_audio_stream_index?;
+    let angle_number = state.active_surface().bluray_angle_number;
+    let track_count = Some(u32::try_from(state.active_surface().paths.len()).ok()?);
+    let duration_fingerprint = state.active_surface()
         .bluray_chapter_durations
         .as_deref()
         .and_then(bluray_reliable_chapter_duration_fingerprint_from_secs);
@@ -8025,7 +8036,7 @@ fn dvdv_metadata_sidecar_from_state_preserving(
     state: &super::app::MetadataEditorState,
     existing: Option<&DvdVideoMetadataSidecar>,
 ) -> Result<DvdVideoMetadataSidecar, String> {
-    let n_tracks = state.paths.len();
+    let n_tracks = state.active_surface().paths.len();
     if n_tracks == 0 { return Err("DVD-Video metadata editor has no tracks".to_string()); }
     let presentation = dvdv_presentation_identity_from_state(state);
     let existing = existing.filter(|sidecar| dvdv_existing_sidecar_can_merge(sidecar, presentation.as_ref()));
@@ -8036,7 +8047,7 @@ fn dvdv_metadata_sidecar_from_state_preserving(
     let mut tracks: Vec<DvdVideoMetadataTrack> = (0..n_tracks).map(|idx| {
         let number = idx + 1;
         let existing_track = existing_tracks_by_number.get(&number).copied();
-        let label = state.file_labels.get(idx).cloned().unwrap_or_else(|| {
+        let label = state.active_surface().file_labels.get(idx).cloned().unwrap_or_else(|| {
             existing_track.map(|track| track.label.clone()).unwrap_or_else(|| format!("{:02}", number))
         });
         let (source_title, source_chapter) = dvdv_track_source_from_state(state, idx, presentation.as_ref(), existing_track, &label);
@@ -8046,21 +8057,21 @@ fn dvdv_metadata_sidecar_from_state_preserving(
             extra: existing_track.map(|track| track.extra.clone()).unwrap_or_default(),
         }
     }).collect();
-    for (entry_idx, entry) in state.entries.iter().enumerate() {
+    for (entry_idx, entry) in state.active_surface().entries.iter().enumerate() {
         let Some(sidecar_key) = dvdv_editor_key_to_sidecar_key(&entry.display_key) else { continue; };
         if dvdv_is_album_level_sidecar_key(sidecar_key) {
-            if entry.is_mixed && !state.deleted.contains(&entry_idx) {
+            if entry.is_mixed && !state.active_surface().deleted.contains(&entry_idx) {
                 return Err(format!("album-level field {} has mixed values; cannot save DVD-Video sidecar", entry.display_key));
             }
             album.remove(sidecar_key);
-            if !state.deleted.contains(&entry_idx) {
+            if !state.active_surface().deleted.contains(&entry_idx) {
                 let value = entry.value.trim();
                 if !value.is_empty() { album.insert(sidecar_key.to_string(), value.to_string()); }
             }
         } else {
             for (idx, track) in tracks.iter_mut().enumerate() {
                 track.tags.remove(sidecar_key);
-                if state.deleted.contains(&entry_idx) { continue; }
+                if state.active_surface().deleted.contains(&entry_idx) { continue; }
                 let value = entry.per_file_values.get(idx).map(|value| value.trim()).unwrap_or_default();
                 if !value.is_empty() { track.tags.insert(sidecar_key.to_string(), value.to_string()); }
             }
@@ -8087,7 +8098,7 @@ fn dvdv_track_source_from_state(
 ) -> (Option<u8>, Option<u16>) {
     if let (Some(presentation), Some(chapter)) = (
         presentation,
-        state.dvdv_source_chapters.as_ref().and_then(|chapters| chapters.get(idx)).copied(),
+        state.active_surface().dvdv_source_chapters.as_ref().and_then(|chapters| chapters.get(idx)).copied(),
     ) {
         return (Some(presentation.title_number), Some(chapter));
     }
@@ -8165,9 +8176,9 @@ fn dvdv_sparse_angle_identity_compatible(stored: Option<u8>, current: Option<u8>
 fn dvdv_presentation_identity_from_state(state: &super::app::MetadataEditorState) -> Option<DvdVideoPresentationIdentity> {
     let presentation_id = state.presentation_tabs.get(state.active_tab).map(|tab| &tab.id)?;
     let (vts_number, title_number, audio_stream_index) = presentation_id.dvd_video_parts()?;
-    let track_count = Some(state.paths.len());
-    let duration_fingerprint = state.dvdv_track_durations.as_deref().filter(|durations| !durations.is_empty()).map(dvdv_track_duration_fingerprint_from_secs);
-    let angle_number = match (state.dvdv_title_angle_count, state.dvdv_angle_number) {
+    let track_count = Some(state.active_surface().paths.len());
+    let duration_fingerprint = state.active_surface().dvdv_track_durations.as_deref().filter(|durations| !durations.is_empty()).map(dvdv_track_duration_fingerprint_from_secs);
+    let angle_number = match (state.active_surface().dvdv_title_angle_count, state.active_surface().dvdv_angle_number) {
         (Some(count), Some(angle)) if count > 1 => Some(angle),
         _ => None,
     };
@@ -8527,7 +8538,7 @@ pub(super) fn spawn_tags_mb_toc_lookup(
 
 /// Dispatch `:tags-mb` when a metadata editor is open. Handles both
 /// SACD ISOs (TOC from per-area durations) and regular file editors
-/// (TOC from accuraterip helpers on `state.paths`). Returns
+/// (TOC from accuraterip helpers on `state.active_surface().paths`). Returns
 /// `Some(true)` when the dispatch fired (caller short-circuits) or
 /// `None` when no editor is in scope (caller falls through to the
 /// Browse path).
@@ -8551,7 +8562,7 @@ fn try_dispatch_in_editor_tags_mb(
 ) -> Option<bool> {
     use super::app::ActiveOverlay;
 
-    let mut state_owned: Box<super::app::MetadataEditorState> =
+    let state_owned: Box<super::app::MetadataEditorState> =
         if let Some(parked) = app.pending_metadata_editor.take() {
             parked
         } else if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
@@ -8565,14 +8576,12 @@ fn try_dispatch_in_editor_tags_mb(
             return None;
         };
 
-    state_owned.sync_active_presentation();
-
     // Direct-args path: skip TOC, fire a text search using the
     // user-supplied seed. Editor goes into `active_overlay` so the
     // result handler can populate it in place (same parking-slot
     // invariant as the TOC path).
     if let Some(seed) = direct_seed {
-        let paths = state_owned.paths.clone();
+        let paths = state_owned.active_surface().paths.clone();
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
         let ctx = super::message::TagsMbContext {
             paths,
@@ -8596,11 +8605,12 @@ fn try_dispatch_in_editor_tags_mb(
     // the audio files via the same accuraterip helpers the Browse
     // path uses, and disable the fallback (file-level TOCs are
     // sample-exact; fallback rarely helps).
-    let (sectors, fallback_seed) = if let Some(area_kind) = state_owned.sacd_area_kind {
-        let durations = match area_kind {
-            super::sacd::AreaKind::Stereo => state_owned.sacd_stereo_durations.as_deref(),
-            super::sacd::AreaKind::MultiChannel => {
-                state_owned.sacd_multi_channel_durations.as_deref()
+    let (sectors, fallback_seed) = if let Some(area_kind) = state_owned.active_surface().sacd_area_kind {
+        let durations = {
+            let surface = state_owned.active_surface();
+            match area_kind {
+                super::sacd::AreaKind::Stereo => surface.sacd_stereo_durations.clone(),
+                super::sacd::AreaKind::MultiChannel => surface.sacd_multi_channel_durations.clone(),
             }
         };
         let Some(durations) = durations.filter(|d| !d.is_empty()) else {
@@ -8612,12 +8622,17 @@ fn try_dispatch_in_editor_tags_mb(
             );
             return Some(true);
         };
-        let sectors = sacd_durations_to_sectors(durations);
+        let sectors = sacd_durations_to_sectors(&durations);
         let seed = seed_sacd_mb_query(&state_owned);
         (sectors, seed)
     } else if super::keybindings::metadata_editor_is_dvda_source(&state_owned) {
-        let first_path = state_owned.paths[0].clone();
-        if !state_owned.paths.iter().all(|p| p == &first_path) {
+        let paths = state_owned.active_surface().paths.clone();
+        let Some(first_path) = paths.first().cloned() else {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(":tags-mb: DVD-Audio editor has no source".to_string());
+            return Some(true);
+        };
+        if !paths.iter().all(|p| p == &first_path) {
             app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
             app.set_status(":tags-mb: DVD-Audio editor paths do not share one source".to_string());
             return Some(true);
@@ -8634,23 +8649,24 @@ fn try_dispatch_in_editor_tags_mb(
         let seed = seed_sacd_mb_query(&state_owned);
         (sectors, seed)
     } else if super::keybindings::metadata_editor_is_bluray_source(&state_owned) {
-        if state_owned.paths.is_empty() {
+        let paths = state_owned.active_surface().paths.clone();
+        let Some(first_path) = paths.first().cloned() else {
             app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
             app.set_status(":tags-mb: Blu-ray editor has no source".to_string());
             return Some(true);
-        }
-        let first_path = state_owned.paths[0].clone();
-        if !state_owned.paths.iter().all(|p| p == &first_path) {
+        };
+        if !paths.iter().all(|p| p == &first_path) {
             app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
             app.set_status(":tags-mb: Blu-ray editor paths do not share one source".to_string());
             return Some(true);
         }
         let seed = seed_sacd_mb_query(&state_owned);
-        let sectors = match state_owned.bluray_chapter_durations.as_deref() {
+        let chapter_durations = state_owned.active_surface().bluray_chapter_durations.clone();
+        let sectors = match chapter_durations.as_deref() {
             Some(durations) => match bluray_editor_durations_to_cd_sectors(durations) {
                 Ok(sectors) => sectors,
                 Err(err) => {
-                    let paths = state_owned.paths.clone();
+                    let ctx_paths = paths.clone();
                     app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
                     if let Some(seed) = seed {
                         app.set_status(format!(
@@ -8658,7 +8674,7 @@ fn try_dispatch_in_editor_tags_mb(
                             err
                         ));
                         let ctx = super::message::TagsMbContext {
-                            paths,
+                            paths: ctx_paths,
                             editor_park: true,
                             fallback_seed: None,
                         };
@@ -8679,14 +8695,14 @@ fn try_dispatch_in_editor_tags_mb(
                 }
             },
             None => {
-                let paths = state_owned.paths.clone();
+                let ctx_paths = paths.clone();
                 app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
                 if let Some(seed) = seed {
                     app.set_status(
                         ":tags-mb: Blu-ray synthetic TOC skipped: no chapter durations are available; running MusicBrainz text search from editor tags".to_string(),
                     );
                     let ctx = super::message::TagsMbContext {
-                        paths,
+                        paths: ctx_paths,
                         editor_park: true,
                         fallback_seed: None,
                     };
@@ -8707,27 +8723,28 @@ fn try_dispatch_in_editor_tags_mb(
         };
         (sectors, seed)
     } else if super::keybindings::metadata_editor_is_dvdv_source(&state_owned) {
-        if state_owned.paths.is_empty() {
+        let paths = state_owned.active_surface().paths.clone();
+        let Some(first_path) = paths.first().cloned() else {
             app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
             app.set_status(":tags-mb: DVD-Video editor has no source".to_string());
             return Some(true);
-        }
-        let first_path = state_owned.paths[0].clone();
-        if !state_owned.paths.iter().all(|p| p == &first_path) {
+        };
+        if !paths.iter().all(|p| p == &first_path) {
             app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
             app.set_status(":tags-mb: DVD-Video editor paths do not share one source".to_string());
             return Some(true);
         }
         let seed = seed_sacd_mb_query(&state_owned);
-        let sectors = match state_owned.dvdv_track_durations.as_deref() {
+        let track_durations = state_owned.active_surface().dvdv_track_durations.clone();
+        let sectors = match track_durations.as_deref() {
             Some(durations) => match dvdv_editor_durations_to_cd_sectors(durations) {
                 Ok(sectors) => sectors,
                 Err(err) => {
-                    let paths = state_owned.paths.clone();
+                    let ctx_paths = paths.clone();
                     app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
                     if let Some(seed) = seed {
                         let ctx = super::message::TagsMbContext {
-                            paths,
+                            paths: ctx_paths,
                             editor_park: true,
                             fallback_seed: None,
                         };
@@ -8758,22 +8775,23 @@ fn try_dispatch_in_editor_tags_mb(
         };
         (sectors, seed)
     } else {
-        // File editor: state.paths is the audio file set. Use the
+        // File editor: state.active_surface().paths is the audio file set. Use the
         // same TOC derivation the Browse path uses — first try
         // AccurateRip-style offsets in the parent dir, fall back to
         // per-file sample counts.
-        if state_owned.paths.is_empty() {
+        let paths = state_owned.active_surface().paths.clone();
+        let Some(first_path) = paths.first().cloned() else {
             app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
             app.set_status(":tags-mb: editor has no paths".to_string());
             return Some(true);
-        }
-        let dir = state_owned.paths[0]
+        };
+        let dir = first_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_path_buf();
         let sectors = match super::accuraterip::find_toc_offsets(&dir) {
             Some(s) => s,
-            None => match super::accuraterip::collect_sample_counts(&state_owned.paths) {
+            None => match super::accuraterip::collect_sample_counts(&paths) {
                 Ok((sample_counts, sample_rate)) => {
                     let samples_per_frame = (sample_rate / 75) as u64;
                     let mut sectors = Vec::with_capacity(sample_counts.len() + 1);
@@ -8800,7 +8818,7 @@ fn try_dispatch_in_editor_tags_mb(
         app.set_status(":tags-mb: TOC too short".to_string());
         return Some(true);
     };
-    let paths = state_owned.paths.clone();
+    let paths = state_owned.active_surface().paths.clone();
 
     // Editor MUST go back into active_overlay (not pending) before
     // the spawn — see the parking-slot invariant in this function's
@@ -9173,7 +9191,7 @@ fn build_cue_diff(
     // ARTIST and PERFORMER both map to CUE performer.
     let filter_upper = field_filter.map(|f| f.to_ascii_uppercase());
 
-    for (i, path) in state.paths.iter().enumerate() {
+    for (i, path) in state.active_surface().paths.iter().enumerate() {
         let stem = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -9218,7 +9236,7 @@ fn build_cue_diff(
                 }
             }
 
-            let old_value = state
+            let old_value = state.active_surface()
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(field))
@@ -9245,11 +9263,11 @@ pub fn apply_cue_changes(
     state: &mut super::app::MetadataEditorState,
     changes: &[super::app::CueImportChange],
 ) {
-    let n = state.paths.len();
+    let n = state.active_surface().paths.len();
 
     for change in changes {
         // Find or create the entry for this field.
-        let idx = match state
+        let idx = match state.active_surface()
             .entries
             .iter()
             .position(|e| e.display_key.eq_ignore_ascii_case(&change.field))
@@ -9263,7 +9281,7 @@ pub fn apply_cue_changes(
                     "TRACKNUMBER" => lofty::tag::ItemKey::TrackNumber,
                     _ => lofty::tag::ItemKey::Unknown(change.field.to_ascii_uppercase()),
                 };
-                state.entries.push(super::probe::TagEntry {
+                state.active_surface_mut().entries.push(super::probe::TagEntry {
                     display_key: change.field.to_ascii_uppercase(),
                     item_key,
                     value: String::new(),
@@ -9275,17 +9293,17 @@ pub fn apply_cue_changes(
                     mb_proposed_value: None,
                     mb_proposed_per_file: None,
                 });
-                state.entries.len() - 1
+                state.active_surface().entries.len() - 1
             }
         };
 
         if change.file_index < n {
-            state.entries[idx].per_file_values[change.file_index] = change.new_value.clone();
+            state.active_surface_mut().entries[idx].per_file_values[change.file_index] = change.new_value.clone();
         }
     }
 
     // Update merged display values and mixed state.
-    for entry in &mut state.entries {
+    for entry in &mut state.active_surface_mut().entries {
         let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
         entry.is_mixed = !all_same && n > 1;
         entry.value = if entry.is_mixed {
@@ -9295,7 +9313,7 @@ pub fn apply_cue_changes(
         };
     }
 
-    state.dirty = true;
+    state.active_surface_mut().dirty = true;
 }
 
 #[cfg(test)]
@@ -9569,7 +9587,7 @@ mod completion_tests {
 #[cfg(test)]
 mod dvdv_sidecar_idempotency_tests {
     use super::*;
-    use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+    use crate::tui::app::MetadataEditorState;
     use crate::tui::probe::TagEntry;
     use lofty::tag::ItemKey;
 
@@ -9589,45 +9607,14 @@ mod dvdv_sidecar_idempotency_tests {
     }
 
     fn state(entries: Vec<TagEntry>) -> MetadataEditorState {
-        MetadataEditorState {
-            paths: vec![PathBuf::from("/tmp/track1.wav"), PathBuf::from("/tmp/track2.wav")],
+        MetadataEditorState::for_files(
+            vec![PathBuf::from("/tmp/track1.wav"), PathBuf::from("/tmp/track2.wav")],
             entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels: vec!["01".to_string(), "02".to_string()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        }
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        )
     }
+
 
     #[test]
     fn dvdv_sidecar_struct_roundtrip_preserves_presentation_and_extensions() {
@@ -9880,36 +9867,22 @@ custom_track_field = "keep-track"
     #[test]
     fn dvdv_sidecar_save_uses_state_source_chapters_before_display_label() {
         let mut state = state(vec![entry("TITLE", "", vec!["Song One", "Song Two"])]);
-        state.file_labels = vec![
+        state.active_surface_mut().file_labels = vec![
             "01 Title 7 Chapter 1".to_string(),
             "02 Title 7 Chapter 2".to_string(),
         ];
-        state.dvdv_source_chapters = Some(vec![1, 2]);
-        state.presentation_tabs = vec![crate::tui::app::PresentationTab {
-            id: crate::disc::model::PresentationId::DvdVideoTitle {
+        state.active_surface_mut().dvdv_source_chapters = Some(vec![1, 2]);
+        let mut tab = crate::tui::app::PresentationTab::from_editor_state(
+            crate::disc::model::PresentationId::DvdVideoTitle {
                 vts_number: 3,
                 title_number: 7,
                 audio_stream_index: 1,
             },
-            label: "Title 7".to_string(),
-            paths: state.paths.clone(),
-            entries: state.entries.clone(),
-            file_labels: state.file_labels.clone(),
-            deleted: Vec::new(),
-            dirty: true,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: state.dvdv_source_chapters.clone(),
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        }];
+            "Title 7",
+            &state,
+        );
+        tab.dirty = true;
+        state.set_presentation_surfaces(vec![tab], 0);
 
         let sidecar = dvdv_metadata_sidecar_from_state_preserving(
             Path::new("/tmp/concert.iso"),
@@ -9996,26 +9969,26 @@ custom_track_field = "keep-track"
             entry("TITLE", "", vec!["", ""]),
         ]);
         state.presentation_tabs = Vec::new();
-        state.dvdv_track_durations = Some(durations);
-        state.dvdv_source_chapters = Some(vec![1, 2]);
+        state.active_surface_mut().dvdv_track_durations = Some(durations);
+        state.active_surface_mut().dvdv_source_chapters = Some(vec![1, 2]);
 
         assert!(preload_dvdv_metadata_editor_state_from_sidecar(&source, &mut state)
             .expect("preload sidecar"));
 
-        let album = state.entries.iter().find(|entry| entry.display_key == "ALBUM").unwrap();
+        let album = state.active_surface().entries.iter().find(|entry| entry.display_key == "ALBUM").unwrap();
         assert_eq!(album.value, "Concert Film");
         assert_eq!(album.per_file_values, vec!["Concert Film".to_string(), "Concert Film".to_string()]);
-        let mood = state.entries.iter().find(|entry| entry.display_key == "MOOD").unwrap();
+        let mood = state.active_surface().entries.iter().find(|entry| entry.display_key == "MOOD").unwrap();
         assert_eq!(mood.value, "Electric");
         assert_eq!(mood.per_file_values, vec!["Electric".to_string(), "Electric".to_string()]);
-        let work = state.entries.iter().find(|entry| entry.display_key == "WORK").unwrap();
+        let work = state.active_surface().entries.iter().find(|entry| entry.display_key == "WORK").unwrap();
         assert_eq!(work.value, "Concert Film");
         assert_eq!(work.per_file_values, vec!["Concert Film".to_string(), "Concert Film".to_string()]);
-        let title = state.entries.iter().find(|entry| entry.display_key == "TITLE").unwrap();
+        let title = state.active_surface().entries.iter().find(|entry| entry.display_key == "TITLE").unwrap();
         assert_eq!(title.value, "<multiple values>");
         assert_eq!(title.per_file_values, vec!["Opening".to_string(), "Finale".to_string()]);
-        assert!(!state.dirty);
-        assert!(state.deleted.is_empty());
+        assert!(!state.active_surface().dirty);
+        assert!(state.active_surface().deleted.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10177,7 +10150,7 @@ custom_track_field = "keep-track"
             entry("TITLE", "", vec!["", ""]),
         ]);
         state.presentation_tabs = Vec::new();
-        state.dvdv_source_chapters = Some(vec![1, 2]);
+        state.active_surface_mut().dvdv_source_chapters = Some(vec![1, 2]);
 
         assert!(preload_dvdv_metadata_editor_state_from_sidecar_with_presentation_id(
             &source,
@@ -10190,9 +10163,9 @@ custom_track_field = "keep-track"
         )
         .expect("preload sidecar"));
 
-        let album = state.entries.iter().find(|entry| entry.display_key == "ALBUM").unwrap();
+        let album = state.active_surface().entries.iter().find(|entry| entry.display_key == "ALBUM").unwrap();
         assert_eq!(album.value, "Selected Presentation");
-        let title = state.entries.iter().find(|entry| entry.display_key == "TITLE").unwrap();
+        let title = state.active_surface().entries.iter().find(|entry| entry.display_key == "TITLE").unwrap();
         assert_eq!(title.per_file_values, vec!["First".to_string(), "Second".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -10201,32 +10174,18 @@ custom_track_field = "keep-track"
     #[test]
     fn dvdv_sparse_angle_identity_writes_minimal_single_angle_toml() {
         let mut state = state(vec![entry("ALBUM", "Single Angle", vec!["Single Angle", "Single Angle"])]);
-        state.presentation_tabs = vec![crate::tui::app::PresentationTab {
-            id: crate::disc::model::PresentationId::DvdVideoTitle {
+        state.active_surface_mut().dvdv_title_angle_count = Some(1);
+        let mut tab = crate::tui::app::PresentationTab::from_editor_state(
+            crate::disc::model::PresentationId::DvdVideoTitle {
                 vts_number: 1,
                 title_number: 1,
                 audio_stream_index: 0,
             },
-            label: "Title 1".to_string(),
-            paths: state.paths.clone(),
-            entries: state.entries.clone(),
-            file_labels: state.file_labels.clone(),
-            deleted: Vec::new(),
-            dirty: true,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: state.dvdv_source_chapters.clone(),
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: Some(1),
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        }];
-        state.dvdv_title_angle_count = Some(1);
+            "Title 1",
+            &state,
+        );
+        tab.dirty = true;
+        state.set_presentation_surfaces(vec![tab], 0);
 
         let sidecar = dvdv_metadata_sidecar_from_state_preserving(
             Path::new("/tmp/concert.iso"),
@@ -10245,33 +10204,19 @@ custom_track_field = "keep-track"
     #[test]
     fn dvdv_sparse_angle_identity_writes_multi_angle_toml() {
         let mut state = state(vec![entry("ALBUM", "Angle 2", vec!["Angle 2", "Angle 2"])]);
-        state.presentation_tabs = vec![crate::tui::app::PresentationTab {
-            id: crate::disc::model::PresentationId::DvdVideoTitle {
+        state.active_surface_mut().dvdv_angle_number = Some(2);
+        state.active_surface_mut().dvdv_title_angle_count = Some(2);
+        let mut tab = crate::tui::app::PresentationTab::from_editor_state(
+            crate::disc::model::PresentationId::DvdVideoTitle {
                 vts_number: 1,
                 title_number: 1,
                 audio_stream_index: 0,
             },
-            label: "Title 1 Angle 2".to_string(),
-            paths: state.paths.clone(),
-            entries: state.entries.clone(),
-            file_labels: state.file_labels.clone(),
-            deleted: Vec::new(),
-            dirty: true,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: state.dvdv_source_chapters.clone(),
-            dvdv_track_durations: None,
-            dvdv_angle_number: Some(2),
-            dvdv_title_angle_count: Some(2),
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-        }];
-        state.dvdv_angle_number = Some(2);
-        state.dvdv_title_angle_count = Some(2);
+            "Title 1 Angle 2",
+            &state,
+        );
+        tab.dirty = true;
+        state.set_presentation_surfaces(vec![tab], 0);
 
         let sidecar = dvdv_metadata_sidecar_from_state_preserving(
             Path::new("/tmp/concert.iso"),
@@ -10668,7 +10613,7 @@ title = "Bonus Song"
 #[cfg(test)]
 mod bluray_sidecar_tests {
     use super::*;
-    use crate::tui::app::{MetadataEditorPhase, MetadataEditorState, PresentationTab};
+    use crate::tui::app::{MetadataEditorState, PresentationTab};
     use crate::tui::probe::TagEntry;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10817,53 +10762,34 @@ ARTIST = "Soloist"
                 vec![title_one.as_str(), title_two.as_str()],
             ),
         ];
-        PresentationTab {
-            id: crate::disc::model::PresentationId::try_blu_ray_title(
+        let mut tab = PresentationTab::new(
+            crate::disc::model::PresentationId::try_blu_ray_title(
                 playlist_number,
                 0x1100 + u16::from(audio_stream_index),
                 audio_stream_index,
                 1,
             )
             .expect("valid Blu-ray presentation id"),
-            label: format!("Playlist {playlist_number}"),
+            format!("Playlist {playlist_number}"),
             paths,
             entries,
-            file_labels: vec!["Chapter 1".to_string(), "Chapter 2".to_string()],
-            deleted: Vec::new(),
-            dirty,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: Some(playlist_number),
-            bluray_audio_pid: Some(0x1100 + u16::from(audio_stream_index)),
-            bluray_audio_stream_index: Some(audio_stream_index),
-            bluray_angle_number: Some(1),
-            bluray_chapter_durations: Some(vec![90.0, 91.0]),
-        }
+            vec!["Chapter 1".to_string(), "Chapter 2".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        tab.dirty = dirty;
+        tab.bluray_playlist_number = Some(playlist_number);
+        tab.bluray_audio_pid = Some(0x1100 + u16::from(audio_stream_index));
+        tab.bluray_audio_stream_index = Some(audio_stream_index);
+        tab.bluray_angle_number = Some(1);
+        tab.bluray_chapter_durations = Some(vec![90.0, 91.0]);
+        tab
     }
 
+
     fn bluray_state_with_tabs(tabs: Vec<PresentationTab>) -> MetadataEditorState {
-        let mut state = bluray_editor_state_for_custom_fields(Vec::new());
-        state.presentation_tabs = tabs;
-        state.active_tab = 0;
-        if let Some(tab) = state.presentation_tabs.first().cloned() {
-            state.paths = tab.paths;
-            state.entries = tab.entries;
-            state.file_labels = tab.file_labels;
-            state.deleted = tab.deleted;
-            state.dirty = tab.dirty;
-            state.bluray_playlist_number = tab.bluray_playlist_number;
-            state.bluray_audio_pid = tab.bluray_audio_pid;
-            state.bluray_audio_stream_index = tab.bluray_audio_stream_index;
-            state.bluray_angle_number = tab.bluray_angle_number;
-            state.bluray_chapter_durations = tab.bluray_chapter_durations;
-        }
-        state
+        MetadataEditorState::for_disc_presentations(tabs, 0)
     }
+
 
     #[test]
     fn bluray_toml_parser_reads_identity_tags_and_extension_fields() {
@@ -11017,7 +10943,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
     #[test]
     fn bluray_preload_report_surfaces_degraded_and_skipped_matches() {
         let mut state = bluray_editor_state_for_custom_fields(Vec::new());
-        state.bluray_chapter_durations = None;
+        state.active_surface_mut().bluray_chapter_durations = None;
         let mut stale_but_stable = sidecar_with_fingerprint(Some("fp-from-earlier-map"));
         stale_but_stable.album.insert("ALBUM".to_string(), "Recovered".to_string());
         let mut missing_angle = sidecar_with_fingerprint(None);
@@ -11030,7 +10956,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
         );
 
         assert_eq!(report.applied_presentations, 1);
-        assert_eq!(entry_value(&state.entries, "ALBUM"), Some("Recovered"));
+        assert_eq!(entry_value(&state.active_surface().entries, "ALBUM"), Some("Recovered"));
         assert!(report
             .warnings
             .iter()
@@ -11068,48 +10994,23 @@ MUSICBRAINZ_TRACKID = "recording-id"
     }
 
     fn bluray_editor_state_for_custom_fields(entries: Vec<TagEntry>) -> MetadataEditorState {
-        MetadataEditorState {
-            paths: vec![
+        let mut state = MetadataEditorState::for_files(
+            vec![
                 PathBuf::from("/fixtures/Concert.iso"),
                 PathBuf::from("/fixtures/Concert.iso"),
             ],
             entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: true,
-            deleted: Vec::new(),
-            file_labels: vec!["Chapter 1".to_string(), "Chapter 2".to_string()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: Some(12),
-            bluray_audio_pid: Some(0x1100),
-            bluray_audio_stream_index: Some(0),
-            bluray_angle_number: Some(1),
-            bluray_chapter_durations: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        }
+            vec!["Chapter 1".to_string(), "Chapter 2".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().dirty = true;
+        state.active_surface_mut().bluray_playlist_number = Some(12);
+        state.active_surface_mut().bluray_audio_pid = Some(0x1100);
+        state.active_surface_mut().bluray_audio_stream_index = Some(0);
+        state.active_surface_mut().bluray_angle_number = Some(1);
+        state
     }
+
 
     fn sidecar_with_custom_fields() -> BluRayMetadataSidecar {
         let mut sidecar = sidecar_with_fingerprint(Some("fp-a"));
@@ -11165,9 +11066,9 @@ MUSICBRAINZ_TRACKID = "recording-id"
         assert_eq!(entry_value(&state.presentation_tabs[1].entries, "ALBUM"), Some("Saved Stream 2"));
         assert_eq!(entry_value(&state.presentation_tabs[0].entries, "MOOD"), Some("Saved Stream 1 Mood"));
         assert_eq!(entry_value(&state.presentation_tabs[1].entries, "MOOD"), Some("Saved Stream 2 Mood"));
-        assert_eq!(state.file_labels, vec!["Saved Stream 2 Chapter 1", "Saved Stream 2 Chapter 2"]);
-        assert_eq!(entry_value(&state.entries, "ALBUM"), Some("Saved Stream 2"));
-        assert!(!state.dirty);
+        assert_eq!(state.active_surface().file_labels, vec!["Saved Stream 2 Chapter 1", "Saved Stream 2 Chapter 2"]);
+        assert_eq!(entry_value(&state.active_surface().entries, "ALBUM"), Some("Saved Stream 2"));
+        assert!(!state.active_surface().dirty);
         assert!(state.presentation_tabs.iter().all(|tab| !tab.dirty));
     }
 
@@ -11183,16 +11084,16 @@ MUSICBRAINZ_TRACKID = "recording-id"
             false,
         )]);
         let active = state.presentation_tabs.remove(0);
-        state.paths = active.paths;
-        state.entries = active.entries;
-        state.file_labels = active.file_labels;
-        state.deleted = active.deleted;
-        state.dirty = true;
-        state.bluray_playlist_number = active.bluray_playlist_number;
-        state.bluray_audio_pid = active.bluray_audio_pid;
-        state.bluray_audio_stream_index = active.bluray_audio_stream_index;
-        state.bluray_angle_number = active.bluray_angle_number;
-        state.bluray_chapter_durations = active.bluray_chapter_durations;
+        state.active_surface_mut().paths = active.paths;
+        state.active_surface_mut().entries = active.entries;
+        state.active_surface_mut().file_labels = active.file_labels;
+        state.active_surface_mut().deleted = active.deleted;
+        state.active_surface_mut().dirty = true;
+        state.active_surface_mut().bluray_playlist_number = active.bluray_playlist_number;
+        state.active_surface_mut().bluray_audio_pid = active.bluray_audio_pid;
+        state.active_surface_mut().bluray_audio_stream_index = active.bluray_audio_stream_index;
+        state.active_surface_mut().bluray_angle_number = active.bluray_angle_number;
+        state.active_surface_mut().bluray_chapter_durations = active.bluray_chapter_durations;
 
         let sidecars = vec![sidecar_for_stream(0, "Saved Active")];
         assert!(preload_bluray_metadata_editor_state_from_sidecars(
@@ -11201,10 +11102,10 @@ MUSICBRAINZ_TRACKID = "recording-id"
         ));
 
         assert!(state.presentation_tabs.is_empty());
-        assert_eq!(entry_value(&state.entries, "ALBUM"), Some("Saved Active"));
-        assert_eq!(entry_value(&state.entries, "MOOD"), Some("Saved Active Mood"));
-        assert_eq!(state.file_labels, vec!["Saved Active Chapter 1", "Saved Active Chapter 2"]);
-        assert!(!state.dirty);
+        assert_eq!(entry_value(&state.active_surface().entries, "ALBUM"), Some("Saved Active"));
+        assert_eq!(entry_value(&state.active_surface().entries, "MOOD"), Some("Saved Active Mood"));
+        assert_eq!(state.active_surface().file_labels, vec!["Saved Active Chapter 1", "Saved Active Chapter 2"]);
+        assert!(!state.active_surface().dirty);
     }
 
     #[test]
@@ -11220,17 +11121,16 @@ MUSICBRAINZ_TRACKID = "recording-id"
             "Saved Track",
             true,
         )]);
-        state.entries.push(bluray_tag_entry(
+        state.active_surface_mut().entries.push(bluray_tag_entry(
             "MOOD",
             "After Hours",
             vec!["After Hours", "After Hours"],
         ));
-        state.entries.push(bluray_tag_entry(
+        state.active_surface_mut().entries.push(bluray_tag_entry(
             "TAKE_NOTE",
             "<multiple values>",
             vec!["First Take", "Second Take"],
         ));
-        state.sync_active_presentation();
 
         let outcome = save_bluray_metadata_sidecar_dirty_presentations_from_state(source, &state)
             .expect("save dirty Blu-ray state");
@@ -11247,15 +11147,17 @@ MUSICBRAINZ_TRACKID = "recording-id"
         assert!(preload_bluray_metadata_editor_state_from_sidecar(source, &mut reopened)
             .expect("preload saved sidecar"));
 
-        assert_eq!(entry_value(&reopened.entries, "ALBUM"), Some("Saved Concert"));
-        assert_eq!(entry_value(&reopened.entries, "MOOD"), Some("After Hours"));
+        assert_eq!(entry_value(&reopened.active_surface().entries, "ALBUM"), Some("Saved Concert"));
+        assert_eq!(entry_value(&reopened.active_surface().entries, "MOOD"), Some("After Hours"));
         let take_note = reopened
+            .active_surface()
             .entries
             .iter()
             .find(|entry| entry.display_key == "TAKE_NOTE")
             .expect("custom track field should reload");
         assert_eq!(take_note.per_file_values, vec!["First Take", "Second Take"]);
         let title = reopened
+            .active_surface()
             .entries
             .iter()
             .find(|entry| entry.display_key == "TITLE")
@@ -11355,9 +11257,9 @@ MUSICBRAINZ_TRACKID = "recording-id"
             "Only Title",
             vec!["Only Title"],
         )]);
-        state.paths.truncate(1);
-        state.file_labels.truncate(1);
-        state.bluray_chapter_durations = Some(vec![180.0]);
+        state.active_surface_mut().paths.truncate(1);
+        state.active_surface_mut().file_labels.truncate(1);
+        state.active_surface_mut().bluray_chapter_durations = Some(vec![180.0]);
 
         let saved = bluray_metadata_sidecar_from_state_preserving(
             Path::new("/fixtures/Concert.iso"),
@@ -11543,7 +11445,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
             bluray_tag_entry("TAKE_NOTE", "<multiple values>", vec!["", "Kept Two"]),
         ];
         let mut state = bluray_editor_state_for_custom_fields(entries);
-        state.deleted.push(0);
+        state.active_surface_mut().deleted.push(0);
 
         let saved = bluray_metadata_sidecar_from_state_preserving(
             Path::new("/fixtures/Concert.iso"),
@@ -11633,7 +11535,7 @@ CUT_NOTE = "Old Cut Two"
             }
         }
         let mut state = bluray_editor_state_for_custom_fields(entries);
-        state.bluray_chapter_durations = None;
+        state.active_surface_mut().bluray_chapter_durations = None;
         let saved = bluray_metadata_sidecar_from_state_preserving(
             Path::new("/fixtures/Concert.iso"),
             &state,
@@ -11980,7 +11882,7 @@ ALBUM = "Sibling"
 #[cfg(test)]
 mod sacd_seed_tests {
     use super::*;
-    use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+    use crate::tui::app::MetadataEditorState;
     use crate::tui::probe::TagEntry;
 
     fn editor_with(entries: Vec<(&str, &str, bool)>) -> MetadataEditorState {
@@ -12003,45 +11905,14 @@ mod sacd_seed_tests {
                 mb_proposed_per_file: None,
             })
             .collect();
-        MetadataEditorState {
-            paths: vec![std::path::PathBuf::from("/tmp/x.iso")],
+        MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/x.iso")],
             entries,
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: Vec::new(),
-            file_labels: vec!["01".to_string()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_source_chapters: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_tabs: Vec::new(),
-            active_tab: 0,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        }
+            vec!["01".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        )
     }
+
 
     #[test]
     fn seed_returns_none_when_all_fields_empty() {

@@ -1911,6 +1911,8 @@ impl CachedProbeRow {
                 preemphasis_metadata: None, // Not cached; re-detected on probe.
                 hdcd_detail: None,          // Populated from analysis cache if available.
                 isrc: None, // Not cached; re-read on full probe (only used by :cue).
+                tool: None, // Not cached; re-read on full probe.
+                artwork: Vec::new(), // Not cached; re-read on full probe.
             },
         })
     }

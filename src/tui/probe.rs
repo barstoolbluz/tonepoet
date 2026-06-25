@@ -16,6 +16,31 @@ pub struct SourceInfo {
     pub file_size: u64,
 }
 
+/// Embedded artwork metadata read from tags. The editor deliberately keeps
+/// only compact metadata here instead of storing raw image bytes; this avoids
+/// retaining large artwork payloads in TUI state while preserving the typed
+/// picture kind reported by Lofty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtworkInfo {
+    pub picture_type: lofty::picture::PictureType,
+    pub mime_type: String,
+    pub data_size: usize,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+impl Default for ArtworkInfo {
+    fn default() -> Self {
+        Self {
+            picture_type: lofty::picture::PictureType::Other,
+            mime_type: String::new(),
+            data_size: 0,
+            width: None,
+            height: None,
+        }
+    }
+}
+
 /// Metadata tags from the source file
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
@@ -24,6 +49,11 @@ pub struct SourceMetadata {
     pub album: Option<String>,
     pub genre: Option<String>,
     pub year: Option<String>,
+
+    /// Encoder/tool/vendor string from source tags or format metadata when available.
+    /// Keep this in the cached metadata model so Details does not need to infer
+    /// Tool from already-rendered editor rows.
+    pub tool: Option<String>,
 
     /// Track number from the tag (e.g. 3 for the third track).
     /// Used by the bulk rename wizard for `%N%` / `%NN%` placeholders.
@@ -58,6 +88,66 @@ pub struct SourceMetadata {
     /// CD ISRC code, when present in the file's tags (typically populated by
     /// EAC reading subchannel data during the rip). Used by CUE generation.
     pub isrc: Option<String>,
+
+    /// Embedded artwork blocks, without retaining the raw image bytes.
+    pub artwork: Vec<ArtworkInfo>,
+}
+
+
+fn picture_dimensions(data: &[u8]) -> (Option<u32>, Option<u32>) {
+    parse_png_dimensions(data)
+        .or_else(|| parse_jpeg_dimensions(data))
+        .unwrap_or((None, None))
+}
+
+fn parse_png_dimensions(data: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
+    if data.len() < 24 || &data[..8] != b"\x89PNG\r\n\x1a\n" || &data[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+    let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+    Some((Some(width), Some(height)))
+}
+
+fn parse_jpeg_dimensions(data: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
+    if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 9 < data.len() {
+        while i < data.len() && data[i] != 0xff {
+            i += 1;
+        }
+        while i < data.len() && data[i] == 0xff {
+            i += 1;
+        }
+        if i >= data.len() {
+            return None;
+        }
+        let marker = data[i];
+        i += 1;
+        if marker == 0xd9 || marker == 0xda {
+            return None;
+        }
+        if i + 2 > data.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+        if len < 2 || i + len > data.len() {
+            return None;
+        }
+        let is_sof = matches!(
+            marker,
+            0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf
+        );
+        if is_sof && len >= 7 {
+            let height = u16::from_be_bytes([data[i + 3], data[i + 4]]) as u32;
+            let width = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+            return Some((Some(width), Some(height)));
+        }
+        i += len;
+    }
+    None
 }
 
 /// Convert an R128 Q7.8 fixed-point integer (stored as a string) into a
@@ -470,12 +560,11 @@ fn probe_sacd(path: &Path) -> Result<SourceInfo, String> {
 /// Read metadata tags from an audio file using lofty
 pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
     use lofty::file::TaggedFileExt;
-    use lofty::tag::{Accessor, ItemKey};
 
     // SACD ISOs aren't tagged files in lofty's sense — pull the
     // album-level fields out of the ScarletBook Master TOC + SACDText
     // sector instead. Per-track text (titles per track) lives on the
-    // editor's per-track populate path (C5+), not the source-level
+    // editor's per-track populate path (C5), not the source-level
     // SourceMetadata.
     if super::sacd::is_sacd_iso(path) {
         return read_metadata_sacd(path);
@@ -484,84 +573,7 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
     let tagged_file = lofty::read_from_path(path)
         .map_err(|e| format!("Failed to read tags from '{}': {}", path.display(), e))?;
 
-    // Try each tag in the file, take the first one that has data
-    let tags = tagged_file.tags();
-
-    // R128 ItemKeys (Vorbis comment style; not a dedicated lofty variant).
-    let r128_track_key = ItemKey::Unknown("R128_TRACK_GAIN".to_string());
-    let r128_album_key = ItemKey::Unknown("R128_ALBUM_GAIN".to_string());
-
-    let mut meta = SourceMetadata::default();
-    for tag in tags {
-        if meta.title.is_none() {
-            meta.title = tag.title().map(|s| s.to_string());
-        }
-        if meta.artist.is_none() {
-            meta.artist = tag.artist().map(|s| s.to_string());
-        }
-        if meta.album.is_none() {
-            meta.album = tag.album().map(|s| s.to_string());
-        }
-        if meta.genre.is_none() {
-            meta.genre = tag.genre().map(|s| s.to_string());
-        }
-        if meta.year.is_none() {
-            meta.year = tag.year().map(|y| y.to_string());
-        }
-        if meta.track_number.is_none() {
-            meta.track_number = tag.track();
-        }
-        if meta.isrc.is_none() {
-            meta.isrc = tag.get_string(&ItemKey::Isrc).map(|s| s.to_string());
-        }
-        if meta.catalog_number.is_none() {
-            // CATALOGNUMBER is a Vorbis comment convention; also used in
-            // some ID3v2 TXXX frames. Try the standard ItemKey first,
-            // then fall back to a freeform lookup.
-            meta.catalog_number = tag
-                .get_string(&ItemKey::CatalogNumber)
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    tag.get_string(&ItemKey::Unknown("CATALOGNUMBER".to_string()))
-                        .map(|s| s.to_string())
-                });
-        }
-
-        // ReplayGain (raw strings, format-preserving)
-        if meta.rg_track_gain.is_none() {
-            meta.rg_track_gain = tag
-                .get_string(&ItemKey::ReplayGainTrackGain)
-                .map(|s| s.to_string());
-        }
-        if meta.rg_track_peak.is_none() {
-            meta.rg_track_peak = tag
-                .get_string(&ItemKey::ReplayGainTrackPeak)
-                .map(|s| s.to_string());
-        }
-        if meta.rg_album_gain.is_none() {
-            meta.rg_album_gain = tag
-                .get_string(&ItemKey::ReplayGainAlbumGain)
-                .map(|s| s.to_string());
-        }
-        if meta.rg_album_peak.is_none() {
-            meta.rg_album_peak = tag
-                .get_string(&ItemKey::ReplayGainAlbumPeak)
-                .map(|s| s.to_string());
-        }
-
-        // R128 (Q7.8 fixed-point integer converted to dB on read)
-        if meta.r128_track_gain.is_none() {
-            meta.r128_track_gain = tag.get_string(&r128_track_key).and_then(r128_raw_to_db);
-        }
-        if meta.r128_album_gain.is_none() {
-            meta.r128_album_gain = tag.get_string(&r128_album_key).and_then(r128_raw_to_db);
-        }
-    }
-
-    // Quick pre-emphasis metadata check (tags + CUE/log + catalog).
-    meta.preemphasis_metadata = preemphasis_metadata_check(path);
-
-    Ok(meta)
+    Ok(source_metadata_from_tags(path, tagged_file.tags(), true))
 }
 
 /// Synthesize source-level metadata for a SACD ISO from the Master
@@ -613,6 +625,11 @@ fn read_metadata_sacd(path: &Path) -> Result<SourceMetadata, String> {
         .or_else(|| md.master_text.as_ref().and_then(|t| t.album_artist.clone()));
     meta.year =
         from_sidecar("DATE").or_else(|| md.master_toc.disc_date.map(|d| d.year.to_string()));
+    meta.tool = from_sidecar("ENCODER")
+        .or_else(|| from_sidecar("ENCODED_BY"))
+        .or_else(|| from_sidecar("ENCODED BY"))
+        .or_else(|| from_sidecar("VENDOR"))
+        .or_else(|| from_sidecar("SOFTWARE"));
     meta.catalog_number = from_sidecar("CATALOGNUMBER")
         .or_else(|| from_sidecar("DISCOGS_CATALOG"))
         .or_else(|| {
@@ -857,11 +874,27 @@ pub fn ensure_dim_replicate(entry: &mut TagEntry, target_dim: usize) {
 }
 
 pub fn metadata_editor_has_changes(state: &super::app::MetadataEditorState) -> bool {
-    !state.deleted.is_empty()
-        || state
-            .entries
-            .iter()
-            .any(|e| e.value != e.original || e.per_file_values != e.per_file_originals)
+    let writable_indices: Vec<usize> = state.active_surface()
+        .technical_details
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, file)| file.file_facts.write_eligibility.is_writable().then_some(idx))
+        .collect();
+    let has_file_access_model = state.active_surface().technical_details.files.len() == state.active_surface().paths.len();
+
+    let deletion_is_dirty = !state.active_surface().deleted.is_empty()
+        && (!has_file_access_model || !writable_indices.is_empty());
+
+    deletion_is_dirty
+        || state.active_surface().entries.iter().any(|e| {
+            if has_file_access_model && e.per_file_values.len() == state.active_surface().paths.len() {
+                return writable_indices.iter().any(|&idx| {
+                    e.per_file_values.get(idx) != e.per_file_originals.get(idx)
+                });
+            }
+            e.value != e.original || e.per_file_values != e.per_file_originals
+        })
 }
 
 /// State of the per-row revert toggle pill in the metadata editor.
@@ -1124,35 +1157,57 @@ pub fn parse_title_from_filename(stem: &str) -> (Option<u32>, Option<String>) {
 }
 
 /// Sort paths by (disc, track, filename) for logical display order.
-/// Reads disc/track tags from each file via lofty (lightweight read),
-/// falls back to directory/filename patterns.
-/// Entry-aware variant of `sort_paths_by_track`. Sorts `paths` by
-/// (disc, track, filename) AND permutes each entry's `per_file_values`
-/// + `per_file_originals` in lockstep so the per-file vectors stay
-/// aligned with the new path order.
+/// Reads disc/track tags from already-merged editor entries, falling back to
+/// directory/filename patterns. Entry-aware variant of `sort_paths_by_track`.
 ///
-/// Pulls disc/track from already-merged `entries` (the canonical
-/// source after `read_all_tags_merged`); falls back to path-name
-/// extraction when an entry is empty or missing. Treats empty
-/// strings as "no tag" — divergence from `sort_paths_by_track`'s
-/// `parse_track_disc_tag("")=0` behavior, but matches what
-/// `open_metadata_editor` has always done.
-///
-/// Used by:
-/// - TUI's `open_metadata_editor` after `read_all_tags_merged`.
-/// - CLI `tonepoet tags-mb` audio-file path before populate.
-///
-/// Caller's responsibility: don't mix this with `sort_paths_by_track`
-/// in the same flow — they may produce slightly different orderings
-/// on edge cases (present-but-empty tags), and the latter doesn't
-/// touch the entry vectors.
+/// Sorts `paths` by (disc, track, filename) AND permutes each entry's
+/// `per_file_values` + `per_file_originals` in lockstep so the per-file
+/// vectors stay aligned with the new path order.
 pub fn sort_paths_and_entries_by_track(
     paths: &mut Vec<std::path::PathBuf>,
     entries: &mut Vec<TagEntry>,
 ) {
+    let perm = sort_permutation_for_paths_and_entries(paths, entries);
+    apply_paths_entries_permutation(paths, entries, &perm);
+}
+
+/// Sort paths, editor entries, and cached source metadata together.
+///
+/// Use this when the caller has already read compact `SourceMetadata` from
+/// the same tag pass as `entries`; otherwise artwork/ReplayGain caches would
+/// remain in pre-sort order while the UI rows use the sorted path order.
+pub fn sort_paths_entries_and_metadata_by_track(
+    paths: &mut Vec<std::path::PathBuf>,
+    entries: &mut Vec<TagEntry>,
+    metadata: &mut Vec<SourceMetadata>,
+) {
+    let perm = sort_permutation_for_paths_and_entries(paths, entries);
+    apply_paths_entries_permutation(paths, entries, &perm);
+    apply_same_len_permutation(metadata, &perm);
+}
+
+/// Sort paths, editor entries, cached source metadata, and per-file read
+/// errors together. Use this for metadata-editor open paths so partial
+/// tag-read failures remain attached to the same file after track sorting.
+pub fn sort_paths_entries_metadata_and_errors_by_track(
+    paths: &mut Vec<std::path::PathBuf>,
+    entries: &mut Vec<TagEntry>,
+    metadata: &mut Vec<SourceMetadata>,
+    metadata_errors: &mut Vec<Option<MetadataReadIssue>>,
+) {
+    let perm = sort_permutation_for_paths_and_entries(paths, entries);
+    apply_paths_entries_permutation(paths, entries, &perm);
+    apply_same_len_permutation(metadata, &perm);
+    apply_same_len_permutation(metadata_errors, &perm);
+}
+
+fn sort_permutation_for_paths_and_entries(
+    paths: &[std::path::PathBuf],
+    entries: &[TagEntry],
+) -> Vec<usize> {
     let n = paths.len();
     if n <= 1 {
-        return;
+        return (0..n).collect();
     }
 
     let disc_entry = entries
@@ -1188,12 +1243,24 @@ pub fn sort_paths_and_entries_by_track(
 
     let mut perm: Vec<usize> = (0..n).collect();
     perm.sort_by(|&a, &b| sort_keys[a].cmp(&sort_keys[b]));
+    perm
+}
+
+fn apply_paths_entries_permutation(
+    paths: &mut Vec<std::path::PathBuf>,
+    entries: &mut Vec<TagEntry>,
+    perm: &[usize],
+) {
+    let n = paths.len();
+    if perm.len() != n || n <= 1 {
+        return;
+    }
 
     let sorted_paths: Vec<_> = perm.iter().map(|&i| paths[i].clone()).collect();
     *paths = sorted_paths;
 
     for entry in entries.iter_mut() {
-        if entry.per_file_values.len() == n {
+        if entry.per_file_values.len() == n && entry.per_file_originals.len() == n {
             let sv: Vec<_> = perm
                 .iter()
                 .map(|&i| entry.per_file_values[i].clone())
@@ -1209,6 +1276,14 @@ pub fn sort_paths_and_entries_by_track(
         // CUESHEET) are indexed by MB-track position, not file position,
         // so the path permutation doesn't apply.
     }
+}
+
+fn apply_same_len_permutation<T: Clone>(items: &mut Vec<T>, perm: &[usize]) {
+    if items.len() != perm.len() || items.len() <= 1 {
+        return;
+    }
+    let sorted: Vec<T> = perm.iter().map(|&i| items[i].clone()).collect();
+    *items = sorted;
 }
 
 pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
@@ -1367,18 +1442,200 @@ fn item_key_display(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) ->
     format!("{:?}", key)
 }
 
-/// Read all tags from an audio file's primary tag.
-/// Returns entries sorted: standard fields first, then alphabetical.
-pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
+fn normalize_metadata_tool_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect()
+}
+
+fn is_metadata_tool_key(key: &str) -> bool {
+    matches!(
+        normalize_metadata_tool_key(key).as_str(),
+        "ENCODER"
+            | "ENCODEDBY"
+            | "ENCODINGTOOL"
+            | "ENCODERSETTINGS"
+            | "VENDOR"
+            | "TOOL"
+            | "SOFTWARE"
+            | "WRITINGAPPLICATION"
+            | "ITUNESENCODER"
+    )
+}
+
+fn non_empty_tool_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn source_metadata_tool_from_tag(tag: &lofty::tag::Tag) -> Option<String> {
+    use lofty::tag::{ItemKey, ItemValue};
+
+    // Try common textual keys first. These cover Vorbis comments, MP4 freeform
+    // tags, ID3 TXXX-style mappings, and similar format-specific fields without
+    // depending on every Lofty `ItemKey` variant name.
+    for key in [
+        "ENCODER",
+        "ENCODED_BY",
+        "ENCODED BY",
+        "ENCODING_TOOL",
+        "ENCODERSETTINGS",
+        "VENDOR",
+        "TOOL",
+        "SOFTWARE",
+        "WRITING_APPLICATION",
+        "ITUNESENCODER",
+    ] {
+        if let Some(value) = tag.get_string(&ItemKey::Unknown(key.to_string())).and_then(non_empty_tool_value) {
+            return Some(value);
+        }
+    }
+
+    // Then inspect all items using the format-specific display key. This keeps
+    // the value in `SourceMetadata` even when the editable row later gets
+    // renamed, hidden, or merged with another tag representation.
+    for item in tag.items() {
+        let display_key = item_key_display(item.key(), tag.tag_type());
+        if !is_metadata_tool_key(&display_key) {
+            continue;
+        }
+        match item.value() {
+            ItemValue::Text(value) | ItemValue::Locator(value) => {
+                if let Some(value) = non_empty_tool_value(value) {
+                    return Some(value);
+                }
+            }
+            ItemValue::Binary(_) => {}
+        }
+    }
+
+    None
+}
+
+fn source_metadata_from_tags(
+    path: &Path,
+    tags: &[lofty::tag::Tag],
+    include_external_preemphasis_checks: bool,
+) -> SourceMetadata {
+    use lofty::tag::{Accessor, ItemKey};
+
+    // R128 ItemKeys (Vorbis comment style; not a dedicated lofty variant).
+    let r128_track_key = ItemKey::Unknown("R128_TRACK_GAIN".to_string());
+    let r128_album_key = ItemKey::Unknown("R128_ALBUM_GAIN".to_string());
+
+    let mut meta = SourceMetadata::default();
+    for tag in tags {
+        if meta.title.is_none() {
+            meta.title = tag.title().map(|s| s.to_string());
+        }
+        if meta.artist.is_none() {
+            meta.artist = tag.artist().map(|s| s.to_string());
+        }
+        if meta.album.is_none() {
+            meta.album = tag.album().map(|s| s.to_string());
+        }
+        if meta.genre.is_none() {
+            meta.genre = tag.genre().map(|s| s.to_string());
+        }
+        if meta.year.is_none() {
+            meta.year = tag.year().map(|y| y.to_string());
+        }
+        if meta.track_number.is_none() {
+            meta.track_number = tag.track();
+        }
+        if meta.isrc.is_none() {
+            meta.isrc = tag.get_string(&ItemKey::Isrc).map(|s| s.to_string());
+        }
+        if meta.catalog_number.is_none() {
+            meta.catalog_number = tag
+                .get_string(&ItemKey::CatalogNumber)
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    tag.get_string(&ItemKey::Unknown("CATALOGNUMBER".to_string()))
+                        .map(|s| s.to_string())
+                });
+        }
+        if meta.tool.is_none() {
+            meta.tool = source_metadata_tool_from_tag(tag);
+        }
+
+        if meta.rg_track_gain.is_none() {
+            meta.rg_track_gain = tag
+                .get_string(&ItemKey::ReplayGainTrackGain)
+                .map(|s| s.to_string());
+        }
+        if meta.rg_track_peak.is_none() {
+            meta.rg_track_peak = tag
+                .get_string(&ItemKey::ReplayGainTrackPeak)
+                .map(|s| s.to_string());
+        }
+        if meta.rg_album_gain.is_none() {
+            meta.rg_album_gain = tag
+                .get_string(&ItemKey::ReplayGainAlbumGain)
+                .map(|s| s.to_string());
+        }
+        if meta.rg_album_peak.is_none() {
+            meta.rg_album_peak = tag
+                .get_string(&ItemKey::ReplayGainAlbumPeak)
+                .map(|s| s.to_string());
+        }
+
+        if meta.r128_track_gain.is_none() {
+            meta.r128_track_gain = tag.get_string(&r128_track_key).and_then(r128_raw_to_db);
+        }
+        if meta.r128_album_gain.is_none() {
+            meta.r128_album_gain = tag.get_string(&r128_album_key).and_then(r128_raw_to_db);
+        }
+
+        for picture in tag.pictures() {
+            let data = picture.data();
+            let (width, height) = picture_dimensions(data);
+            meta.artwork.push(ArtworkInfo {
+                picture_type: picture.pic_type(),
+                mime_type: picture
+                    .mime_type()
+                    .map(|mime| mime.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                data_size: data.len(),
+                width,
+                height,
+            });
+        }
+    }
+
+    meta.artwork.sort_by(|a, b| {
+        a.picture_type
+            .as_u8()
+            .cmp(&b.picture_type.as_u8())
+            .then_with(|| a.mime_type.cmp(&b.mime_type))
+            .then_with(|| a.data_size.cmp(&b.data_size))
+            .then_with(|| a.width.cmp(&b.width))
+            .then_with(|| a.height.cmp(&b.height))
+    });
+
+    // Optional pre-emphasis metadata check (tags + CUE/log + catalog).
+    // The metadata-editor open path disables this because it would otherwise
+    // perform additional immediate file/tag I/O after the already-open Lofty
+    // pass. Dedicated browse/metadata reads keep the historical behavior.
+    if include_external_preemphasis_checks {
+        meta.preemphasis_metadata = preemphasis_metadata_check(path);
+    }
+
+    meta
+}
+
+fn read_all_tags_from_tagged_file(tagged: &lofty::file::TaggedFile) -> Vec<TagEntry> {
     use lofty::file::TaggedFileExt;
     use lofty::tag::ItemValue;
 
-    let tagged = lofty::read_from_path(path)
-        .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
-
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
         Some(t) => t,
-        None => return Ok(Vec::new()), // tagless file — editor opens empty
+        None => return Vec::new(), // tagless file — editor opens empty
     };
 
     let tag_type = tag.tag_type();
@@ -1406,9 +1663,6 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
         });
     }
 
-    // Force-binary on synthetic-preview rows (CUESHEET) so inline edit
-    // is blocked everywhere — those values can be 1-2KB of multi-line
-    // content and a synthetic summary is shown in the editor instead.
     for e in &mut entries {
         if is_synthetic_preview(e) {
             e.is_binary = true;
@@ -1416,8 +1670,74 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
     }
 
     sort_entries_standard_first(&mut entries);
+    entries
+}
 
-    Ok(entries)
+/// Read all tags from an audio file's primary tag.
+/// Returns entries sorted: standard fields first, then alphabetical.
+pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
+    let tagged = lofty::read_from_path(path)
+        .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+    Ok(read_all_tags_from_tagged_file(&tagged))
+}
+
+/// Tags plus compact source metadata read from the same Lofty pass.
+///
+/// `metadata[i]` is aligned with the input `paths[i]` until the caller
+/// applies any later path permutation. The TUI metadata editor uses this to
+/// avoid immediately re-reading tags/artwork after `read_all_tags_merged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataReadIssueKind {
+    /// The file could not be opened or read from the filesystem.
+    FilesystemRead,
+    /// The filesystem denied access to the file.
+    PermissionDenied,
+    /// Lofty could not identify or support the container/tag format.
+    UnsupportedFormat,
+    /// Lofty recognized the file class but failed while decoding tag data.
+    TagRead,
+}
+
+/// Typed per-file metadata read issue produced at the tag I/O boundary.
+///
+/// Classification happens after attempting the real Lofty read and inspecting
+/// `LoftyError::kind()`. We deliberately do not reject files by extension: an
+/// uncommon extension may still contain a supported container, while a familiar
+/// extension may contain corrupt or unsupported data. UI/model code formats
+/// this value; it does not infer unsupported state from error strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataReadIssue {
+    pub kind: MetadataReadIssueKind,
+    pub reason: String,
+}
+
+impl MetadataReadIssue {
+    fn from_lofty_read_error(path: &std::path::Path, err: lofty::error::LoftyError) -> Self {
+        use lofty::error::ErrorKind;
+        let kind = match err.kind() {
+            ErrorKind::UnknownFormat | ErrorKind::UnsupportedTag => {
+                MetadataReadIssueKind::UnsupportedFormat
+            }
+            ErrorKind::Io(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
+                MetadataReadIssueKind::PermissionDenied
+            }
+            ErrorKind::Io(_) => MetadataReadIssueKind::FilesystemRead,
+            _ => MetadataReadIssueKind::TagRead,
+        };
+        Self {
+            kind,
+            reason: format!("failed to read '{}': {}", path.display(), err),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MergedTagsAndMetadata {
+    pub entries: Vec<TagEntry>,
+    pub metadata: Vec<SourceMetadata>,
+    /// One entry per input path. A populated slot means that file failed tag
+    /// reading, but other files may still have produced editable entries.
+    pub metadata_errors: Vec<Option<MetadataReadIssue>>,
 }
 
 /// Read and merge tags from multiple audio files.
@@ -1437,20 +1757,18 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
         return read_all_tags(&paths[0]);
     }
 
-    // Read all files, collecting per-key values.
-    // Key: ItemKey → Vec of (file_index, value_string) for ordering.
-    // Also track the first tag_type for display name resolution.
+    // Read all files, collecting per-key values. This legacy API deliberately
+    // does not extract artwork/source metadata; callers that need those should
+    // use `read_all_tags_merged_with_metadata` so the extra work is explicit.
     let mut first_tag_type: Option<TagType> = None;
     let n = paths.len();
 
-    // For each ItemKey, store: display_key, is_binary, per_file_value[file_idx]
     struct KeyData {
         display_key: String,
         is_binary: bool,
-        values: Vec<String>, // one per file, "" if absent
+        values: Vec<String>,
     }
 
-    // Use Vec<(ItemKey, KeyData)> to preserve insertion order (first-seen).
     let mut key_order: Vec<lofty::tag::ItemKey> = Vec::new();
     let mut key_map: HashMap<lofty::tag::ItemKey, KeyData> = HashMap::new();
 
@@ -1460,13 +1778,170 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
 
         let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
             Some(t) => t,
-            None => continue, // file has no tags — all values stay ""
+            None => continue,
         };
 
         if first_tag_type.is_none() {
             first_tag_type = Some(tag.tag_type());
         }
         let tag_type = first_tag_type.unwrap();
+
+        let mut file_values: HashMap<lofty::tag::ItemKey, (String, bool)> = HashMap::new();
+        for item in tag.items() {
+            let key = item.key().clone();
+            let (val, is_bin) = match item.value() {
+                ItemValue::Text(t) => (t.clone(), false),
+                ItemValue::Locator(l) => (l.clone(), false),
+                ItemValue::Binary(b) => (format!("<binary, {} bytes>", b.len()), true),
+            };
+            let entry = file_values
+                .entry(key.clone())
+                .or_insert_with(|| (String::new(), is_bin));
+            if entry.0.is_empty() {
+                entry.0 = val;
+            } else {
+                entry.0 = format!("{}; {}", entry.0, val);
+            }
+            if !key_map.contains_key(&key) {
+                let display = item_key_display(&key, tag_type);
+                key_order.push(key.clone());
+                key_map.insert(
+                    key,
+                    KeyData {
+                        display_key: display,
+                        is_binary: is_bin,
+                        values: vec![String::new(); n],
+                    },
+                );
+            }
+        }
+
+        for (key, (val, is_bin)) in &file_values {
+            if let Some(data) = key_map.get_mut(key) {
+                data.values[file_idx] = val.clone();
+                if *is_bin {
+                    data.is_binary = true;
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<TagEntry> = Vec::new();
+    for key in &key_order {
+        let data = &key_map[key];
+        let all_same = data.values.windows(2).all(|w| w[0] == w[1]);
+        let is_mixed = !all_same;
+        let display_value = if is_mixed {
+            "<multiple values>".to_string()
+        } else {
+            data.values[0].clone()
+        };
+
+        entries.push(TagEntry {
+            display_key: data.display_key.clone(),
+            item_key: key.clone(),
+            value: display_value.clone(),
+            original: display_value,
+            is_binary: data.is_binary,
+            is_mixed,
+            per_file_values: data.values.clone(),
+            per_file_originals: data.values.clone(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    }
+
+    for e in &mut entries {
+        if is_synthetic_preview(e) {
+            e.is_binary = true;
+        }
+    }
+
+    sort_entries_standard_first(&mut entries);
+    Ok(entries)
+}
+
+/// Read merged editor entries and per-file `SourceMetadata` in one Lofty pass.
+///
+/// This is the preferred path for opening the metadata editor: entries,
+/// ReplayGain fields, and compact artwork metadata all come from the same
+/// tag read, so Details/Artwork can be cached without duplicate tag I/O.
+pub fn read_all_tags_merged_with_metadata(
+    paths: &[std::path::PathBuf],
+) -> Result<MergedTagsAndMetadata, String> {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::{ItemValue, TagType};
+    use std::collections::HashMap;
+
+    let n = paths.len();
+    if paths.is_empty() {
+        return Ok(MergedTagsAndMetadata {
+            entries: Vec::new(),
+            metadata: Vec::new(),
+            metadata_errors: Vec::new(),
+        });
+    }
+
+    if paths.len() == 1 {
+        let path = &paths[0];
+        let tagged = match lofty::read_from_path(path) {
+            Ok(tagged) => tagged,
+            Err(err) => {
+                return Ok(MergedTagsAndMetadata {
+                    entries: Vec::new(),
+                    metadata: vec![SourceMetadata::default()],
+                    metadata_errors: vec![Some(MetadataReadIssue::from_lofty_read_error(path, err))],
+                });
+            }
+        };
+        let entries = read_all_tags_from_tagged_file(&tagged);
+        let metadata = source_metadata_from_tags(path, tagged.tags(), false);
+        return Ok(MergedTagsAndMetadata {
+            entries,
+            metadata: vec![metadata],
+            metadata_errors: vec![None],
+        });
+    }
+
+    // Read all files, collecting per-key values and per-file source metadata.
+    // Unlike the legacy all-or-nothing merge, this editor-open path is
+    // partial-success: a corrupt, inaccessible, or unsupported file records a
+    // per-file error and leaves its value slots empty, while the rest of the
+    // selection remains editable.
+    let mut first_tag_type: Option<TagType> = None;
+    let mut metadata = vec![SourceMetadata::default(); n];
+    let mut metadata_errors = vec![None; n];
+
+    // For each ItemKey, store: display_key, is_binary, per_file_value[file_idx]
+    struct KeyData {
+        display_key: String,
+        is_binary: bool,
+        values: Vec<String>, // one per file, "" if absent or unreadable
+    }
+
+    // Use Vec<(ItemKey, KeyData)> to preserve insertion order (first-seen).
+    let mut key_order: Vec<lofty::tag::ItemKey> = Vec::new();
+    let mut key_map: HashMap<lofty::tag::ItemKey, KeyData> = HashMap::new();
+
+    for (file_idx, path) in paths.iter().enumerate() {
+        let tagged = match lofty::read_from_path(path) {
+            Ok(tagged) => tagged,
+            Err(err) => {
+                metadata_errors[file_idx] = Some(MetadataReadIssue::from_lofty_read_error(path, err));
+                continue;
+            }
+        };
+        metadata[file_idx] = source_metadata_from_tags(path, tagged.tags(), false);
+
+        let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+            Some(t) => t,
+            None => continue, // file has no tags — all values stay ""
+        };
+
+        if first_tag_type.is_none() {
+            first_tag_type = Some(tag.tag_type());
+        }
+        let tag_type = first_tag_type.unwrap_or_else(|| tag.tag_type());
 
         // Collect values per key. Join duplicates within this file with "; ".
         let mut file_values: HashMap<lofty::tag::ItemKey, (String, bool)> = HashMap::new();
@@ -1548,7 +2023,11 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
     // Sort with standard key priority.
     sort_entries_standard_first(&mut entries);
 
-    Ok(entries)
+    Ok(MergedTagsAndMetadata {
+        entries,
+        metadata,
+        metadata_errors,
+    })
 }
 
 /// Apply a metadata-editor snapshot to a set of audio files, writing
@@ -1567,12 +2046,29 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
 /// (where `vals.len() != paths.len()`) are skipped — they round-trip
 /// through the CUESHEET tag via `regenerate_cuesheet_for_save`, not
 /// through individual file writes. `deleted` is the editor's
-/// `state.deleted` (indices of entries the user removed).
+/// `state.active_surface().deleted` (indices of entries the user removed).
 pub fn apply_audio_tag_changes(
     paths: &[std::path::PathBuf],
     entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
     deleted: &[usize],
 ) -> Vec<(std::path::PathBuf, Result<(), String>)> {
+    apply_audio_tag_changes_with_save_blocks(paths, entries_snap, deleted, &[])
+        .into_iter()
+        .map(crate::tui::app::MetadataEditorWriteResult::into_legacy_result)
+        .collect()
+}
+
+/// Apply audio tag changes while respecting per-file save blocks captured by
+/// the metadata editor at open time. A file that failed the initial Lofty read,
+/// is read-only, or whose write eligibility could not be verified must not be
+/// treated as an ordinary writable empty-tag file. If such a file has pending
+/// changes, return an explicit skipped result instead of attempting a write.
+pub fn apply_audio_tag_changes_with_save_blocks(
+    paths: &[std::path::PathBuf],
+    entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
+    deleted: &[usize],
+    save_block_reasons: &[Option<String>],
+) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
     let mut results = Vec::new();
     for (file_idx, path) in paths.iter().enumerate() {
         let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
@@ -1591,9 +2087,25 @@ pub fn apply_audio_tag_changes(
                 }
             }
         }
-        if !changes.is_empty() {
-            let r = write_all_tags(path, &changes);
-            results.push((path.clone(), r));
+        if changes.is_empty() {
+            continue;
+        }
+
+        if let Some(reason) = save_block_reasons
+            .get(file_idx)
+            .and_then(|reason| reason.as_ref())
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            results.push(crate::tui::app::MetadataEditorWriteResult::skipped(
+                path.clone(),
+                format!("file is not writable in this editor session: {}", reason.trim()),
+            ));
+            continue;
+        }
+
+        match write_all_tags(path, &changes) {
+            Ok(()) => results.push(crate::tui::app::MetadataEditorWriteResult::saved(path.clone())),
+            Err(reason) => results.push(crate::tui::app::MetadataEditorWriteResult::failed(path.clone(), reason)),
         }
     }
     results
@@ -1669,6 +2181,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merged_with_metadata_records_single_file_read_error_without_failing() {
+        let path = std::env::temp_dir().join(format!(
+            "tonepoet-missing-{}-{}.flac",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let merged = read_all_tags_merged_with_metadata(&[path.clone()])
+            .expect("partial metadata merge should not fail for one unreadable file");
+
+        assert!(merged.entries.is_empty());
+        assert_eq!(merged.metadata.len(), 1);
+        assert_eq!(merged.metadata_errors.len(), 1);
+        let error = merged.metadata_errors[0]
+            .as_ref()
+            .expect("missing file should record a per-file metadata error");
+        assert!(matches!(
+            error.kind,
+            MetadataReadIssueKind::FilesystemRead
+                | MetadataReadIssueKind::PermissionDenied
+                | MetadataReadIssueKind::TagRead
+        ));
+        assert!(error.reason.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn merged_with_metadata_does_not_reject_by_extension_before_lofty_read() {
+        let path = std::env::temp_dir().join(format!(
+            "tonepoet-unknown-container-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"not an audio container").expect("write fixture");
+
+        let merged = read_all_tags_merged_with_metadata(&[path.clone()])
+            .expect("metadata merge should return a partial result");
+
+        let issue = merged.metadata_errors[0]
+            .as_ref()
+            .expect("Lofty read failure should produce a typed issue");
+        assert!(matches!(
+            issue.kind,
+            MetadataReadIssueKind::UnsupportedFormat | MetadataReadIssueKind::TagRead
+        ));
+        assert!(issue.reason.contains(&path.display().to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn r128_raw_to_db_positive() {
         assert_eq!(r128_raw_to_db("1664").as_deref(), Some("+6.50 dB"));
     }
@@ -1699,6 +2266,43 @@ mod tests {
     #[test]
     fn r128_raw_to_db_whitespace_trimmed() {
         assert_eq!(r128_raw_to_db("  -1664  ").as_deref(), Some("-6.50 dB"));
+    }
+
+    #[test]
+    fn sort_paths_entries_and_metadata_keeps_cached_metadata_aligned() {
+        let mut paths = vec![
+            std::path::PathBuf::from("02 - Second.flac"),
+            std::path::PathBuf::from("01 - First.flac"),
+        ];
+        let mut entries = vec![TagEntry {
+            display_key: "TRACKNUMBER".to_string(),
+            item_key: lofty::tag::ItemKey::TrackNumber,
+            value: "<multiple values>".to_string(),
+            original: "<multiple values>".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            per_file_values: vec!["2".to_string(), "1".to_string()],
+            per_file_originals: vec!["2".to_string(), "1".to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }];
+        let mut metadata = vec![
+            SourceMetadata {
+                title: Some("Second".to_string()),
+                ..Default::default()
+            },
+            SourceMetadata {
+                title: Some("First".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        sort_paths_entries_and_metadata_by_track(&mut paths, &mut entries, &mut metadata);
+
+        assert_eq!(paths[0].file_name().and_then(|s| s.to_str()), Some("01 - First.flac"));
+        assert_eq!(entries[0].per_file_values, vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(metadata[0].title.as_deref(), Some("First"));
+        assert_eq!(metadata[1].title.as_deref(), Some("Second"));
     }
 
     fn entry_with_mb_proposed(original: &str, proposed: &str, per_file_count: usize) -> TagEntry {
@@ -1787,11 +2391,11 @@ mod tests {
 
     #[test]
     fn metadata_editor_has_changes_true_with_pending_deletion() {
-        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
+        use crate::tui::app::MetadataEditorState;
         // No value changes, but one entry marked for deletion → dirty.
-        let state = MetadataEditorState {
-            paths: vec![std::path::PathBuf::from("/tmp/01.flac")],
-            entries: vec![TagEntry {
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/01.flac")],
+            vec![TagEntry {
                 display_key: "TITLE".into(),
                 item_key: lofty::tag::ItemKey::TrackTitle,
                 value: "x".into(),
@@ -1803,94 +2407,32 @@ mod tests {
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             }],
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: false,
-            deleted: vec![0],
-            file_labels: vec!["01".into()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            dvdv_source_chapters: None,
-            presentation_tabs: vec![],
-            active_tab: 0,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+            vec!["01".into()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().deleted = vec![0];
         assert!(metadata_editor_has_changes(&state));
     }
 
     #[test]
     fn metadata_editor_has_changes_false_after_full_revert() {
-        use crate::tui::app::{MetadataEditorPhase, MetadataEditorState};
-        let mut state = MetadataEditorState {
-            paths: vec![std::path::PathBuf::from("/tmp/01.flac")],
-            entries: vec![
+        use crate::tui::app::MetadataEditorState;
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/01.flac")],
+            vec![
                 entry_with_mb_proposed("File", "MB", 1),
                 entry_with_mb_proposed("File2", "MB2", 1),
             ],
-            cursor: 0,
-            scroll: 0,
-            last_click: None,
-            edit_input: None,
-            add_key_input: None,
-            phase: MetadataEditorPhase::Editing,
-            dirty: true,
-            deleted: Vec::new(),
-            file_labels: vec!["01".into()],
-            detail_field_idx: 0,
-            detail_cursor: 0,
-            detail_scroll: 0,
-            detail_edit: None,
-            mb_back: None,
-            gnudb_back: None,
-            read_only: false,
-            sacd_sidecar_path: None,
-            sacd_area_kind: None,
-            sacd_stereo_durations: None,
-            sacd_multi_channel_durations: None,
-            dvdv_track_durations: None,
-            dvdv_angle_number: None,
-            dvdv_title_angle_count: None,
-            dvdv_source_chapters: None,
-            presentation_tabs: vec![],
-            active_tab: 0,
-            bluray_playlist_number: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream_index: None,
-            bluray_angle_number: None,
-            bluray_chapter_durations: None,
-            presentation_selector_open: false,
-            presentation_selector_cursor: 0,
-            presentation_selector_scroll: 0,
-        };
+            vec!["01".into()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().dirty = true;
         // Both entries currently show the MB value → has changes.
         assert!(metadata_editor_has_changes(&state));
 
         // Revert both.
-        toggle_mb_revert(&mut state.entries[0]);
-        toggle_mb_revert(&mut state.entries[1]);
+        toggle_mb_revert(&mut state.active_surface_mut().entries[0]);
+        toggle_mb_revert(&mut state.active_surface_mut().entries[1]);
         assert!(!metadata_editor_has_changes(&state));
     }
 
