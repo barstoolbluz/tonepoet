@@ -2,13 +2,13 @@
 
 A standalone CLI + TUI audio conversion and metadata management toolkit for music collectors who're fastidious as fuck about every. bloody. detail. of their libraries.
 
-But tonepoet is absolutely usable by normies, too: it exposes an intuitive, mouse- and keyboard-driven UX for working with audio file metadata, as well as sensible, opinionated defaults for converting audio files. Extract and demux audio from SACD, DVD-Audio, and DVD-Video ISOs. Convert from DSD to PCM, PCM to PCM, PCM to DSD, etc., inheriting sensible, high-performance defaults ... or specifying your own.
+But tonepoet is absolutely usable by normies, too: it exposes an intuitive, mouse- and keyboard-driven UX for working with audio file metadata, as well as sensible, opinionated defaults for converting audio files. Extract and demux audio from SACD, DVD-Audio, DVD-Video, and Blu-ray discs. Convert from DSD to PCM, PCM to PCM, PCM to DSD, etc., inheriting sensible, high-performance defaults ... or specifying your own.
 
 > **Status:** tonepoet is unfinished and under active development, with multiple commits landing daily. Features described below are at varying stages of completeness. Expect a few rough edges, occasional breaking changes, and documentation / help gaps.
 
 ## What it does
 
-tonepoet is a music library workstation in your terminal: browse and manage your collection, verify disc rips, analyze audio quality, tag from MusicBrainz, and convert between any format — all through a keyboard-and-mouse-driven TUI or batch CLI. It handles single files, multi-track archives, CUE+image decomposition, SACD ISO extraction, DVD-Audio ISO extraction, and DVD-Video ISO audio extraction.
+tonepoet is a music library workstation in your terminal: browse and manage your collection, verify disc rips, analyze audio quality, tag from MusicBrainz, and convert between any format — all through a keyboard-and-mouse-driven TUI or batch CLI. It handles single files, multi-track archives, CUE+image decomposition, SACD ISO extraction, DVD-Audio ISO extraction, DVD-Video ISO audio extraction, and Blu-ray audio extraction.
 
 ### Browsing and file management
 
@@ -21,10 +21,10 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 
 ### Metadata and tagging
 
-- **MusicBrainz** — disc-TOC-based release lookup (CD, SACD, DVD-Audio, DVD-Video via synthetic TOC), interactive release picker, per-track title/artist/ISRC population
+- **MusicBrainz** — disc-TOC-based release lookup (CD, SACD, DVD-Audio, DVD-Video, Blu-ray via synthetic TOC), interactive release picker, per-track title/artist/ISRC population
 - **GNUDB** — freedb/gnudb disc ID lookup with multi-disc support
 - **Per-track metadata editor** — inline tag editing with MusicBrainz integration, CUE preview, revert/restore, multi-presentation tabs and dropdown selector for disc sources
-- **Disc metadata sidecars** — persistent metadata sidecars for SACD ISOs (XML), DVD-Audio (foo_input_dvda-compatible XML), and DVD-Video (TOML with multi-presentation support)
+- **Disc metadata sidecars** — persistent metadata sidecars for SACD ISOs (XML), DVD-Audio (foo_input_dvda-compatible XML), DVD-Video (TOML with multi-presentation support), and Blu-ray (TOML with multi-presentation support)
 - **CUE sheet parsing** — legacy encoding support (CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1252), embedded CUESHEET preferred over sidecar
 - **CUESHEET embedding** — regenerate and embed CUESHEET tags on metadata save
 - **Typed metadata effects** — pipeline tracks source-tag transfer, artwork preservation, and authoritative metadata application independently to prevent silent metadata loss
@@ -48,7 +48,7 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 
 **Output:** FLAC, Opus, AAC (libfdk_aac), MP3, ALAC, WAV, WavPack, DSF, DFF, W64, RF64, AIFF, LPCM, WebM, MKV
 
-**Input (decode-only):** All output formats plus ISO (SACD, DVD-Audio, DVD-Video), CUE+image, 7z/zip/rar archives, SHN, APE, DTS, AC3
+**Input (decode-only):** All output formats plus ISO (SACD, DVD-Audio, DVD-Video, Blu-ray), Blu-ray BDMV directories, CUE+image, 7z/zip/rar archives, SHN, APE, DTS, AC3
 
 **Resamplers:**
 
@@ -68,6 +68,10 @@ Native DVD-Audio ISO and directory extraction via the built-in dvda-demuxer crat
 ### DVD-Video support
 
 DVD-Video ISO and directory audio extraction with per-chapter track splitting. LPCM extraction via in-process demuxer with IFO audio attribute override from packet sub-headers (corrects unreliable IFO sample rate and bit depth). Disc browser with stream picker showing all VTS/title/audio-stream combinations. Multi-presentation TOML metadata sidecars with MusicBrainz integration via synthetic CD TOC lookup and text search fallback. Metadata editor with dropdown presentation selector for discs with many programs, smart default selection preferring LPCM with existing sidecar metadata.
+
+### Blu-ray support
+
+Blu-ray ISO and BDMV directory audio extraction with per-chapter track splitting. LPCM streams are extracted in-process via libbluray with M2TS 192-byte packet demuxing, PES reassembly, big-endian to little-endian byte swap, and multi-clip PTS continuity mapping. Compressed codecs (TrueHD, DTS-HD MA, DTS-HD HR, DTS, AC-3, E-AC-3) are decoded via ffmpeg's `bluray://` protocol. Bit depth is probed from the actual stream via ffprobe at browse time, not hardcoded. Disc browser with stream picker showing all playlists, audio streams, and angles. Multi-presentation TOML metadata sidecars with MusicBrainz integration via synthetic CD TOC from chapter durations. AACS decryption via libaacs when KEYDB.cfg is available at `~/.config/aacs/KEYDB.cfg`.
 
 ## Building
 
@@ -151,6 +155,8 @@ All provided by the nix flake:
 | wavpack, wvtag | WavPack encoding, metadata |
 | loudgain | ReplayGain analysis |
 | AtomicParsley | AAC/M4A metadata |
+| libbluray | Blu-ray disc reading + AACS integration |
+| libaacs | Blu-ray AACS decryption (requires user-provided KEYDB.cfg) |
 | 7z (p7zip) | Archive extraction |
 
 ## License
