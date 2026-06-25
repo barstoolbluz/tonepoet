@@ -2170,6 +2170,7 @@ mod tests {
         .await;
 
         let mut encoded = Vec::new();
+        #[allow(unused_assignments)]
         let mut postprocessed = false;
         loop {
             let result = run.results.recv().await.expect("worker result");
@@ -2241,7 +2242,7 @@ mod chunk_2_1_3_worker_recovery_tests {
     };
     use crate::convert::pipeline::tool::{ToolBinary, ToolCommand, ToolRunner};
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn track_id(index: usize) -> TrackId {

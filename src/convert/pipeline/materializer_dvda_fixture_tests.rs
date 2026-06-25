@@ -6,7 +6,6 @@
 
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::convert::pipeline::tool::StubToolRunner;
@@ -327,6 +326,7 @@ fn json_u64_at<'a>(value: &'a serde_json::Value, key: &str, context: &str) -> u6
         .unwrap_or_else(|| panic!("golden DVD-Audio probe {context} lacks numeric {key}"))
 }
 
+#[allow(dead_code)]
 fn json_bool_at(value: &serde_json::Value, key: &str, context: &str) -> bool {
     value
         .get(key)
@@ -334,6 +334,7 @@ fn json_bool_at(value: &serde_json::Value, key: &str, context: &str) -> bool {
         .unwrap_or_else(|| panic!("golden DVD-Audio probe {context} lacks boolean {key}"))
 }
 
+#[allow(dead_code)]
 fn json_array_at<'a>(value: &'a serde_json::Value, key: &str, context: &str) -> &'a Vec<serde_json::Value> {
     value
         .get(key)
@@ -341,6 +342,7 @@ fn json_array_at<'a>(value: &'a serde_json::Value, key: &str, context: &str) -> 
         .unwrap_or_else(|| panic!("golden DVD-Audio probe {context} lacks array {key}"))
 }
 
+#[allow(dead_code)]
 fn json_object_at<'a>(value: &'a serde_json::Value, key: &str, context: &str) -> &'a serde_json::Map<String, serde_json::Value> {
     value
         .get(key)

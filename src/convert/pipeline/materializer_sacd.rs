@@ -539,22 +539,27 @@ pub(crate) mod test_support {
     use super::*;
     use std::path::PathBuf;
 
+    #[allow(dead_code)]
     pub(crate) fn default_area_for_test(area: Option<SacdArea>) -> SacdArea {
         requested_sacd_area(area)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn sacd_expected_samples_for_test() -> Option<u64> {
         None
     }
 
+    #[allow(dead_code)]
     pub(crate) fn detection_positive_for_test(detection: DetectionResult) -> bool {
         is_sacd_detection_positive(detection)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn explicit_sacd_for_test(req: &PipelineRequest) -> bool {
         explicit_sacd_requested(req)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn encrypted_mapping_for_test(
         err: SacdError,
         explicit_sacd_request: bool,
@@ -562,6 +567,7 @@ pub(crate) mod test_support {
         sacd_error_to_materialize(err, explicit_sacd_request)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn selection_ordinals_for_test(
         track_count: u32,
         selection: TrackSelection,

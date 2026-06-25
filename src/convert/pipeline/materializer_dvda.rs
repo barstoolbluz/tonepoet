@@ -3966,14 +3966,17 @@ fn dvda_error_to_materialize(err: DvdaError) -> MaterializeError {
 pub(crate) mod test_support {
     use super::*;
 
+    #[allow(dead_code)]
     pub(crate) fn contains_magic_for_test(bytes: &[u8]) -> bool {
         contains_subslice(bytes, DVDA_AMG_MAGIC)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn default_group_for_test(disc: &DvdaDisc) -> Result<u8, MaterializeError> {
         select_group(disc, None).map(|group| group.group_nr)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn selected_ordinals_for_test(
         tracks: Vec<PreparedTrack>,
         selection: &TrackSelection,
@@ -6073,11 +6076,11 @@ mod tests {
                 expected_bit_depth,
                 expected_channel_assignment_code,
                 expected_group1_sample_rate,
-                expected_group2_sample_rate,
+                expected_group2_sample_rate: _,
                 expected_group1_bit_depth,
-                expected_group2_bit_depth,
+                expected_group2_bit_depth: _,
                 expected_group1_channel_count,
-                expected_group2_channel_count,
+                expected_group2_channel_count: _,
                 samg_ordinal,
                 ..
             } => {
@@ -6468,11 +6471,11 @@ mod tests {
                 expected_bit_depth,
                 expected_channel_assignment_code,
                 expected_group1_sample_rate,
-                expected_group2_sample_rate,
+                expected_group2_sample_rate: _,
                 expected_group1_bit_depth,
-                expected_group2_bit_depth,
+                expected_group2_bit_depth: _,
                 expected_group1_channel_count,
-                expected_group2_channel_count,
+                expected_group2_channel_count: _,
                 sector_ranges,
                 aob_files,
                 ..

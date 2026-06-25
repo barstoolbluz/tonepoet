@@ -75,7 +75,6 @@ pub use dvda_mlp::{probe_mlp_major_sync, MlpMajorSyncInfo};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;

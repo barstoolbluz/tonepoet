@@ -8,6 +8,7 @@ use tonepoet::tui::preemphasis::{corpus, frame_select, models, stft};
 
 /// Per-track multi-summary record.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct TrackMultiSummary {
     quiet_median_alpha: f64,
     quiet_p75_alpha: f64,
@@ -187,6 +188,7 @@ fn collect_files(dir: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// Aggregate album-level stats from track summaries.
+#[allow(dead_code)]
 struct AlbumStats {
     n_tracks: usize,
     median_quiet_median: f64,
@@ -395,7 +397,7 @@ async fn threeway_summary_ablation() {
     // Detection rates at simple thresholds.
     println!("\n=== DETECTION RATES (album median > 0 AND frac_positive >= 60%) ===\n");
 
-    for (stat_name, med_ext, frac_ext) in [
+    for (stat_name, med_ext, _frac_ext) in [
         (
             "quiet_median",
             (|a: &AlbumStats| a.median_quiet_median) as fn(&AlbumStats) -> f64,

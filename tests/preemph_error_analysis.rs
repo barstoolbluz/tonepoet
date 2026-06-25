@@ -5,11 +5,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tonepoet::tui::preemphasis::{
-    corpus, frame_select, models, scoring, stft, PreemphasisConfidence,
+    corpus, frame_select, models, scoring, stft,
 };
 
 /// Per-track diagnostic record (richer than TrackSummary).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct TrackDiag {
     path: PathBuf,
     alpha: f64,

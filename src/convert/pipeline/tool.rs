@@ -856,6 +856,7 @@ pub(crate) mod blocking_test_runner {
             }
         }
 
+        #[allow(dead_code)]
         pub(crate) fn push(&self, behavior: ToolBehavior) {
             self.behaviors.lock().unwrap().push_back(behavior);
         }

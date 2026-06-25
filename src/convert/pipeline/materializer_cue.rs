@@ -2481,6 +2481,7 @@ fn same_existing_path(left: &Path, right: &Path) -> bool {
 pub(crate) mod test_support {
     use super::*;
 
+    #[allow(dead_code)]
     pub(crate) fn parse_probe_for_test(json: &str) -> Result<(u32, u64, bool), MaterializeError> {
         let probe = parse_audio_probe_json(json)?;
         Ok((probe.sample_rate, probe.total_samples, probe.exact_samples))
@@ -2683,7 +2684,7 @@ mod materializer_cue_tests {
                 } else {
                     b"RIFF-staged-cue-segment".as_slice()
                 };
-                std::fs::write(Path::new(destination), bytes);
+                let _ = std::fs::write(Path::new(destination), bytes);
                 String::new()
             } else if cmd.args.windows(2).any(|pair| pair[0] == "-select_streams" && pair[1] == "v") {
                 r#"{"streams":[]}"#.to_string()
@@ -2934,7 +2935,7 @@ TRACK XX AUDIO
                     .lock()
                     .expect("observed lock") = observed;
                 let destination = cmd.args.last().expect("ffmpeg command has destination");
-                std::fs::write(Path::new(destination), b"RIFF-staged-cue-segment");
+                let _ = std::fs::write(Path::new(destination), b"RIFF-staged-cue-segment");
                 String::new()
             } else {
                 let probed_path = PathBuf::from(cmd.args.last().expect("ffprobe command has path"));
@@ -3479,8 +3480,8 @@ TRACK XX AUDIO
     async fn track_selection_filters_before_staging_segments() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cue_path = temp.path().join("album.cue");
-        std::fs::write(&cue_path, cue_sheet_3_track().as_bytes());
-        std::fs::write(&temp.path().join("album.flac"), b"fake-audio-data");
+        let _ = std::fs::write(&cue_path, cue_sheet_3_track().as_bytes());
+        let _ = std::fs::write(&temp.path().join("album.flac"), b"fake-audio-data");
 
         let mut req = test_request(&cue_path);
         req.source.track_selection = TrackSelection::Set(std::collections::BTreeSet::from([2]));
@@ -3675,8 +3676,8 @@ FILE "03 - Wonderin.wav" WAVE
         let temp = tempfile::tempdir().expect("temp dir");
         let flac = temp.path().join("album.flac");
         let wav = temp.path().join("album.wav");
-        std::fs::write(&flac, b"fake flac");
-        std::fs::write(&wav, b"fake wav");
+        let _ = std::fs::write(&flac, b"fake flac");
+        let _ = std::fs::write(&wav, b"fake wav");
 
         let err = resolve_audio_reference(Some(temp.path()), "album.ape", None)
             .expect_err("ambiguous stem-only reference should fail");
@@ -3692,7 +3693,7 @@ FILE "03 - Wonderin.wav" WAVE
         let disc = temp.path().join("disc");
         std::fs::create_dir(&disc).expect("create disc dir");
         let image = disc.join("image.flac");
-        std::fs::write(&image, b"fake flac");
+        let _ = std::fs::write(&image, b"fake flac");
 
         let resolved = resolve_audio_reference(Some(temp.path()), "disc/image.wav", None)
             .expect("extension mismatch should resolve inside referenced subdirectory");
@@ -3705,7 +3706,7 @@ FILE "03 - Wonderin.wav" WAVE
         let cue_path = temp.path().join("album.cue");
         let track1 = temp.path().join("track1.flac");
         let track2 = temp.path().join("track2.flac");
-        std::fs::write(
+        let _ = std::fs::write(
             &cue_path,
             br#"FILE "track1.flac" WAVE
   TRACK 01 AUDIO
@@ -3715,8 +3716,8 @@ FILE "track2.flac" WAVE
     INDEX 01 00:00:00
 "#,
         );
-        std::fs::write(&track1, b"fake-audio-data");
-        std::fs::write(&track2, b"fake-audio-data");
+        let _ = std::fs::write(&track1, b"fake-audio-data");
+        let _ = std::fs::write(&track2, b"fake-audio-data");
 
         let discovered = find_valid_sidecar_cue_for_image(&track2)
             .expect("sidecar search succeeds")
@@ -3729,8 +3730,8 @@ FILE "track2.flac" WAVE
         let temp = tempfile::tempdir().expect("temp dir");
         let image = temp.path().join("album.flac");
         let cue_path = temp.path().join("album.cue");
-        std::fs::write(&image, b"fake-audio-data");
-        std::fs::write(
+        let _ = std::fs::write(&image, b"fake-audio-data");
+        let _ = std::fs::write(
             &cue_path,
             br#"FILE "album.flac" WAVE
   TRACK 01 AUDIO
@@ -3751,9 +3752,9 @@ FILE "track2.flac" WAVE
         let image = temp.path().join("album.flac");
         let other = temp.path().join("other.flac");
         let cue_path = temp.path().join("album.cue");
-        std::fs::write(&image, b"fake-audio-data");
-        std::fs::write(&other, b"fake-audio-data");
-        std::fs::write(
+        let _ = std::fs::write(&image, b"fake-audio-data");
+        let _ = std::fs::write(&other, b"fake-audio-data");
+        let _ = std::fs::write(
             &cue_path,
             br#"FILE "other.flac" WAVE
   TRACK 01 AUDIO
@@ -3773,8 +3774,8 @@ FILE "track2.flac" WAVE
         let temp = tempfile::tempdir().expect("temp dir");
         let image = temp.path().join("album.flac");
         let cue_path = temp.path().join("album.cue");
-        std::fs::write(&image, b"fake-audio-data");
-        std::fs::write(
+        let _ = std::fs::write(&image, b"fake-audio-data");
+        let _ = std::fs::write(
             &cue_path,
             br#"FILE "album.flac" WAVE
   TRACK 01 AUDIO
@@ -4219,8 +4220,8 @@ FILE "track2.flac" WAVE
         let temp = tempfile::tempdir().expect("temp dir");
         let image = temp.path().join("album.flac");
         let cue_path = temp.path().join("album.cue");
-        std::fs::write(&image, b"not-a-real-flac-with-no-readable-tags");
-        std::fs::write(
+        let _ = std::fs::write(&image, b"not-a-real-flac-with-no-readable-tags");
+        let _ = std::fs::write(
             &cue_path,
             br#"FILE "album.flac" WAVE
   TRACK 01 AUDIO
@@ -4251,14 +4252,14 @@ FILE "track2.flac" WAVE
         let embedded_cue = temp.path().join("embedded-malformed.cue");
         let sidecar_cue = temp.path().join("album.cue");
 
-        std::fs::write(
+        let _ = std::fs::write(
             &embedded_cue,
             br#"FILE "album.flac" WAVE
   TRACK 01 AUDIO
     TITLE "Malformed embedded CUE with no index"
 "#,
         );
-        std::fs::write(
+        let _ = std::fs::write(
             &sidecar_cue,
             br#"FILE "album.flac" WAVE
   TRACK 01 AUDIO
@@ -4377,8 +4378,8 @@ FILE "lofty-image.flac" WAVE
         let temp = tempfile::tempdir().expect("temp dir");
         let cue_path = temp.path().join("album.cue");
         let audio_path = temp.path().join("album.flac");
-        std::fs::write(&cue_path, cue_sheet_single_track().as_bytes());
-        std::fs::write(&audio_path, b"fake-audio-data");
+        let _ = std::fs::write(&cue_path, cue_sheet_single_track().as_bytes());
+        let _ = std::fs::write(&audio_path, b"fake-audio-data");
 
         let runner = StubToolRunner::new();
         runner.push_failure("ffprobe: error reading input");

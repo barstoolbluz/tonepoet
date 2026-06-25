@@ -148,7 +148,7 @@ async fn debug_fold_assignment() {
             continue;
         }
         match scoring::grouped_cv_train_with_calibration_report(&samples, k, 0.01) {
-            Ok((classifier, report)) => {
+            Ok((_classifier, report)) => {
                 println!(
                     "\n{}-fold CV: OK — accuracy={:.1}%, FPR={:.1}%, threshold={:.4}",
                     k,

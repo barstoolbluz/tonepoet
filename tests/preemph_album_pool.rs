@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tonepoet::tui::preemphasis::{
-    corpus, frame_select, models, scoring, stft, PreemphasisConfidence,
+    corpus, frame_select, models, scoring, stft,
 };
 
 /// Full per-track computation: features + multi-alpha + shape features.
+#[allow(dead_code)]
 struct TrackResult {
     features: scoring::TrackFeatures,
     multi_alpha: models::TrackMultiAlpha,

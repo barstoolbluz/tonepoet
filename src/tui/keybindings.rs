@@ -17262,7 +17262,7 @@ mod phase4_tests {
         f.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
         f.write_all(&mtoc).unwrap();
 
-        let mut build_area = |magic: &[u8; 8], channels: u8, n_tracks: u8| {
+        let build_area = |magic: &[u8; 8], channels: u8, n_tracks: u8| {
             let mut a = vec![0u8; SECTOR_SIZE as usize];
             a[0..8].copy_from_slice(magic);
             a[0x08] = 1;

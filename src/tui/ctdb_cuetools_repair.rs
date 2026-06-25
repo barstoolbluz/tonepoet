@@ -475,7 +475,6 @@ pub async fn repair_disc_via_rs(
 #[cfg(test)]
 mod cuetools_repair_translation_fixtures {
     use super::*;
-    use base64::Engine as _;
 
     fn repair_fixture_audio() -> Vec<i16> {
         let stride = crate::ctdb_rs::STRIDE;

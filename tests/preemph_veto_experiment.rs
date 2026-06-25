@@ -15,6 +15,7 @@ use tonepoet::tui::preemphasis::{corpus, frame_select, models, scoring, stft};
 
 // ── Track-level data ───────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct TrackData {
     deemph_delta: f64,
     alpha: f64,
@@ -96,6 +97,7 @@ impl AlbumData {
         self.tracks.iter().filter(|t| t.alpha > 0.0).count() as f64 / n
     }
 
+    #[allow(dead_code)]
     fn alpha_iqr(&self) -> f64 {
         let mut v: Vec<f64> = self.tracks.iter().map(|t| t.alpha).collect();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -261,6 +263,7 @@ fn tune_threshold(scores: &[(f64, bool)], target_fpr: f64) -> f64 {
 
 // ── Evaluation ─────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct FoldResult {
     // Per album: (name, is_pe, score_a, score_b, flagged_b, vetoed, score_stack)
     albums: Vec<AlbumResult>,
@@ -399,7 +402,7 @@ async fn veto_experiment() {
             .iter()
             .map(|a| (detector_a_score(a), a.is_pe))
             .collect();
-        let a_thresh = tune_threshold(&a_train_scores, target_fpr);
+        let _a_thresh = tune_threshold(&a_train_scores, target_fpr);
 
         // Train detector B on train.
         let (b_weights, b_bias) = detector_b_train(&train);
@@ -455,7 +458,7 @@ async fn veto_experiment() {
                 (score_lr(&[sa, s_b], &sw, sb_stack), a.is_pe)
             })
             .collect();
-        let stack_thresh = tune_threshold(&stack_train_scores, target_fpr);
+        let _stack_thresh = tune_threshold(&stack_train_scores, target_fpr);
 
         // Score test albums.
         for a in &test {

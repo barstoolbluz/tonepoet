@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tonepoet::tui::preemphasis::{corpus, frame_select, models, scoring, stft};
 
+#[allow(dead_code)]
 struct TrackData {
     deemph_delta: f64,
     alpha: f64, // quiet median

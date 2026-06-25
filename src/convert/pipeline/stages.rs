@@ -1780,6 +1780,7 @@ fn looks_encrypted_sacd(message: &str) -> bool {
 pub(crate) mod sacd_stage_test_support {
     use super::*;
 
+    #[allow(dead_code)]
     pub(crate) fn output_name_for_test(
         path: &Path,
         area: SacdArea,
@@ -1795,6 +1796,7 @@ pub(crate) mod sacd_stage_test_support {
         sacd_track_output_name(path, area, track_index, &entry, "dsf")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn playtime_frames_for_test(minutes: u8, seconds: u8, frames: u8) -> u32 {
         playtime_to_frame_count(PlayTime {
             minutes,
@@ -1803,6 +1805,7 @@ pub(crate) mod sacd_stage_test_support {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn dsf_ready_for_test(
         path: &Path,
         channel_count: u32,
@@ -1819,6 +1822,7 @@ pub(crate) mod sacd_stage_test_support {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn dsf_sample_count_for_test(minutes: u8, seconds: u8, frames: u8) -> u64 {
         sacd_dsf_sample_count(PlayTime {
             minutes,

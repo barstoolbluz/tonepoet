@@ -83,7 +83,7 @@ async fn empirical_template_test() {
 
     let s_theory = models::pe_curve();
     let mask = models::usable_band_mask(44100);
-    let n_usable = mask.iter().filter(|&&m| m).count();
+    let _n_usable = mask.iter().filter(|&&m| m).count();
 
     // s_emp vs s_theory in usable bands.
     let emp_usable: Vec<f64> = s_emp

@@ -136,8 +136,6 @@ pub fn extract_year_from_flac_files(files: &[impl AsRef<Path>]) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
 
     #[test]
     fn test_metadata_creation() {

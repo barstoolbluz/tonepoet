@@ -1151,6 +1151,7 @@ enum QueueWorkOutput {
     #[cfg(test)]
     SyntheticEncoded {
         job_id: String,
+        #[allow(dead_code)]
         track_index: usize,
     },
 }
@@ -2395,6 +2396,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     async fn expect_processor_scheduler_event(
         events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::convert::pipeline::SchedulerTestEvent>,
         expected: crate::convert::pipeline::SchedulerTestEvent,

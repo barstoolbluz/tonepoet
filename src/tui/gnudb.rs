@@ -815,6 +815,7 @@ mod gnudb_per_track_tests {
         }
     }
 
+    #[allow(dead_code)]
     fn entry(album: &str, year: &str, genre: &str, tracks: Vec<&str>) -> GnudbEntry {
         GnudbEntry {
             disc_id: "deadbeef".to_string(),

@@ -7309,13 +7309,13 @@ mod tests {
             expected_sample_rate,
             expected_channel_count,
             expected_bit_depth,
-            expected_channel_assignment_code,
-            expected_group1_sample_rate,
-            expected_group2_sample_rate,
-            expected_group1_bit_depth,
-            expected_group2_bit_depth,
-            expected_group1_channel_count,
-            expected_group2_channel_count,
+            expected_channel_assignment_code: _,
+            expected_group1_sample_rate: _,
+            expected_group2_sample_rate: _,
+            expected_group1_bit_depth: _,
+            expected_group2_bit_depth: _,
+            expected_group1_channel_count: _,
+            expected_group2_channel_count: _,
             ..
         } = &track.source_ref
         else {
