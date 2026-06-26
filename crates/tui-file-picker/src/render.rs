@@ -580,14 +580,9 @@ fn nearest_char_boundary(text: &str, mut cursor: usize) -> usize {
     cursor
 }
 
-fn menu_line(label: &str, width: usize, style: ratatui::style::Style, hot_style: ratatui::style::Style) -> Line<'static> {
+fn menu_line(label: &str, width: usize, style: ratatui::style::Style, _hot_style: ratatui::style::Style) -> Line<'static> {
     let padded = fit_text_left(label, width);
-    let mut chars = padded.chars();
-    let Some(first) = chars.next() else {
-        return Line::from(Span::styled(String::new(), style));
-    };
-    let rest: String = chars.collect();
-    Line::from(vec![Span::styled(first.to_string(), hot_style), Span::styled(rest, style)])
+    Line::from(Span::styled(padded, style))
 }
 
 fn format_size(bytes: u64) -> String {

@@ -7537,8 +7537,8 @@ mod tests {
             selected: true,
         };
 
-        assert_eq!(artwork_row_action(&missing), "[ + ]");
-        assert_eq!(artwork_row_action(&present), "[replace] [remove]");
+        assert!(!artwork_row_has_embedded(&missing));
+        assert!(artwork_row_has_embedded(&present));
     }
 
     #[test]
