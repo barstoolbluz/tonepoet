@@ -336,22 +336,32 @@ fn metadata_editor_apply_artwork_metadata(
 
 fn reduce_file_picker_complete(
     app: &mut AppState,
-    target: super::app::FilePickerTarget,
+    session_id: u64,
+    purpose: super::app::FilePickerPurpose,
     path: Option<std::path::PathBuf>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    match target.clone() {
-        super::app::FilePickerTarget::MetadataArtwork { picture_type } => {
+    match purpose.clone() {
+        super::app::FilePickerPurpose::SelectArtwork { picture_type } => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             match overlay {
                 ActiveOverlay::MetadataEditor(mut state) => {
                     let matches_open_picker = state
                         .file_picker
                         .as_ref()
-                        .map(|picker| picker.target == target)
+                        .map(|picker| picker.session_id == session_id && picker.purpose == purpose)
                         .unwrap_or(false);
-                    state.file_picker = None;
-                    state.pending_artwork_type = None;
+                    if matches_open_picker {
+                        if let Some(current_dir) = state
+                            .file_picker
+                            .as_ref()
+                            .map(|picker| picker.current_dir().to_path_buf())
+                        {
+                            app.last_artwork_picker_dir = Some(current_dir);
+                        }
+                        state.file_picker = None;
+                        state.pending_artwork_type = None;
+                    }
 
                     if !matches_open_picker {
                         app.set_status("file picker: ignored stale metadata-artwork completion");
@@ -375,31 +385,59 @@ fn reduce_file_picker_complete(
                 }
             }
         }
-        super::app::FilePickerTarget::Generic { id } => {
-            close_matching_file_picker(app, &target);
+        super::app::FilePickerPurpose::Generic { id } => {
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status(format!("file picker purpose '{id}': ignored stale completion"));
+                return;
+            }
             match path {
                 Some(path) => app.set_status(format!(
-                    "file picker target '{id}' selected {}",
+                    "file picker purpose '{id}' selected {}",
                     path.display()
                 )),
-                None => app.set_status(format!("file picker target '{id}' cancelled")),
+                None => app.set_status(format!("file picker purpose '{id}' cancelled")),
+            }
+        }
+        super::app::FilePickerPurpose::SelectFile | super::app::FilePickerPurpose::SelectDirectory => {
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status("file picker: ignored stale completion");
+                return;
+            }
+            match path {
+                Some(path) => app.set_status(format!("file picker selected {}", path.display())),
+                None => app.set_status("file picker cancelled"),
             }
         }
     }
 }
 
-fn close_matching_file_picker(app: &mut AppState, target: &super::app::FilePickerTarget) {
+fn close_matching_file_picker(
+    app: &mut AppState,
+    session_id: u64,
+    purpose: &super::app::FilePickerPurpose,
+) -> bool {
     let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    let mut matched = false;
     match overlay {
         ActiveOverlay::MetadataEditor(mut state) => {
-            if state
+            let matches_open_picker = state
                 .file_picker
                 .as_ref()
-                .map(|picker| &picker.target == target)
-                .unwrap_or(false)
-            {
+                .map(|picker| picker.session_id == session_id && &picker.purpose == purpose)
+                .unwrap_or(false);
+            if matches_open_picker {
+                if matches!(purpose, super::app::FilePickerPurpose::SelectArtwork { .. }) {
+                    if let Some(current_dir) = state
+                        .file_picker
+                        .as_ref()
+                        .map(|picker| picker.current_dir().to_path_buf())
+                    {
+                        app.last_artwork_picker_dir = Some(current_dir);
+                    }
+                }
                 state.file_picker = None;
                 state.pending_artwork_type = None;
+                matched = true;
             }
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
         }
@@ -407,6 +445,7 @@ fn close_matching_file_picker(app: &mut AppState, target: &super::app::FilePicke
             app.active_overlay = other;
         }
     }
+    matched
 }
 
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
@@ -1083,8 +1122,8 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.browse.selected_index = 0;
             app.browse.scroll_offset = 0;
         }
-        AppMessage::FilePickerComplete { target, path } => {
-            reduce_file_picker_complete(app, target, path, tx);
+        AppMessage::FilePickerComplete { session_id, purpose, path } => {
+            reduce_file_picker_complete(app, session_id, purpose, path, tx);
         }
         AppMessage::MetadataEditorDetailsProbeComplete { session_id, generation, total, results } => {
             let mut reduced = false;
@@ -2926,5 +2965,161 @@ mod musicbrainz_completion_dispatch_tests {
         assert_eq!(mb_back.selected, 1);
         assert_eq!(mb_back.releases.len(), 2);
         assert_eq!(state.presentation_tabs.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod artwork_file_picker_completion_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{ContentTab, FilePickerPurpose, MetadataEditorState, MetadataFilePickerState, MetadataTechnicalDetails};
+    use crate::tui::metadata_editor_actions::test_probe;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn channel() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(8);
+        tx
+    }
+
+    fn editor_for_audio_path(path: PathBuf) -> Box<MetadataEditorState> {
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "track.flac".to_string());
+        let mut state = Box::new(MetadataEditorState::for_files(
+            vec![path],
+            Vec::new(),
+            vec![label],
+            MetadataTechnicalDetails::default(),
+        ));
+        state.content_tab = ContentTab::Artwork;
+        state
+    }
+
+    fn editor_with_picker(dir: &Path, picture_type: lofty::picture::PictureType) -> (Box<MetadataEditorState>, PathBuf) {
+        let audio_path = dir.join("track.flac");
+        fs::write(&audio_path, b"audio").expect("audio fixture");
+        let mut state = editor_for_audio_path(audio_path.clone());
+        let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+            start_dir: dir.to_path_buf(),
+            filter: tui_file_picker::FilePickerFilter::Images,
+            selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
+            operation_policy: tui_file_picker::FileOperationPolicy {
+                allow_new_file: false,
+                allow_new_folder: false,
+                allow_cut: false,
+                allow_copy: false,
+                allow_paste: false,
+                allow_delete: false,
+                symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
+                cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
+                delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+            },
+            ..tui_file_picker::FilePickerConfig::default()
+        });
+        state.file_picker = Some(MetadataFilePickerState::new(
+            FilePickerPurpose::SelectArtwork { picture_type: picture_type.clone() },
+            picker,
+        ));
+        (state, audio_path)
+    }
+
+    #[test]
+    fn cancel_completion_closes_picker_preserves_artwork_tab_and_persists_last_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let picture_type = lofty::picture::PictureType::CoverBack;
+        let (state, _audio_path) = editor_with_picker(temp.path(), picture_type.clone());
+        let session_id = state.file_picker.as_ref().expect("picker").session_id;
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+
+        handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id,
+                purpose: FilePickerPurpose::SelectArtwork { picture_type: picture_type.clone() },
+                path: None,
+            },
+            &channel(),
+        );
+
+        assert_eq!(app.last_artwork_picker_dir.as_deref(), Some(temp.path()));
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert!(state.file_picker.is_none());
+                assert_eq!(state.content_tab, ContentTab::Artwork);
+            }
+            other => panic!("expected metadata editor after cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selected_completion_reaches_artwork_dispatch_with_path_type_and_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image_path = temp.path().join("cover.png");
+        fs::write(&image_path, b"png").expect("image fixture");
+        let picture_type = lofty::picture::PictureType::CoverBack;
+        let (state, audio_path) = editor_with_picker(temp.path(), picture_type.clone());
+        let session_id = state.file_picker.as_ref().expect("picker").session_id;
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        test_probe::clear_artwork_dispatches();
+
+        handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id,
+                purpose: FilePickerPurpose::SelectArtwork { picture_type: picture_type.clone() },
+                path: Some(image_path.clone()),
+            },
+            &channel(),
+        );
+
+        assert_eq!(app.last_artwork_picker_dir.as_deref(), Some(temp.path()));
+        let dispatch = test_probe::last_artwork_dispatch().expect("artwork dispatch");
+        assert_eq!(dispatch.image_path, image_path);
+        assert_eq!(dispatch.picture_type, picture_type);
+        assert_eq!(dispatch.target_paths, vec![audio_path]);
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert!(state.file_picker.is_none());
+                assert_eq!(state.content_tab, ContentTab::Artwork);
+            }
+            other => panic!("expected metadata editor after selection, got {other:?}"),
+        }
+    }
+    #[test]
+    fn stale_artwork_completion_for_same_purpose_does_not_close_newer_picker_or_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stale_image = temp.path().join("stale.png");
+        fs::write(&stale_image, b"png").expect("image fixture");
+        let picture_type = lofty::picture::PictureType::CoverBack;
+        let (state, _audio_path) = editor_with_picker(temp.path(), picture_type.clone());
+        let active_session_id = state.file_picker.as_ref().expect("picker").session_id;
+        let stale_session_id = active_session_id.saturating_add(10_000);
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        test_probe::clear_artwork_dispatches();
+
+        handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id: stale_session_id,
+                purpose: FilePickerPurpose::SelectArtwork { picture_type },
+                path: Some(stale_image),
+            },
+            &channel(),
+        );
+
+        assert!(test_probe::last_artwork_dispatch().is_none());
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                let picker = state.file_picker.as_ref().expect("newer picker remains open");
+                assert_eq!(picker.session_id, active_session_id);
+                assert_eq!(state.content_tab, ContentTab::Artwork);
+            }
+            other => panic!("expected metadata editor after stale completion, got {other:?}"),
+        }
     }
 }

@@ -177,18 +177,6 @@ pub enum TuiButton {
     /// MetadataEditor Artwork tab remove button for an existing artwork type.
     MetadataArtworkRemove(usize),
 
-    /// Reusable file-picker toolbar button.
-    FilePickerToolbar(crate::tui::app::FilePickerToolbarAction),
-    /// Reusable file-picker list row. Argument is the visible entry index.
-    FilePickerRow(usize),
-    /// Reusable file-picker editable address bar.
-    FilePickerAddress,
-    /// Reusable file-picker bookmark shortcut row.
-    FilePickerBookmark(usize),
-    /// Reusable file-picker recent-location shortcut row.
-    FilePickerRecent(usize),
-    /// Reusable file-picker footer button.
-    FilePickerFooter(crate::tui::app::FilePickerFooterAction),
 
     /// MbSelect overlay: clickable row (0-based index into `releases`).
     MbSelectRow(usize),
@@ -282,12 +270,6 @@ impl TuiButton {
             | Self::MetadataArtworkAdd(_)
             | Self::MetadataArtworkReplace(_)
             | Self::MetadataArtworkRemove(_)
-            | Self::FilePickerToolbar(_)
-            | Self::FilePickerRow(_)
-            | Self::FilePickerAddress
-            | Self::FilePickerBookmark(_)
-            | Self::FilePickerRecent(_)
-            | Self::FilePickerFooter(_)
             | Self::MbSelectRow(_)
             | Self::MbSelectAccept
             | Self::MbSelectCancel

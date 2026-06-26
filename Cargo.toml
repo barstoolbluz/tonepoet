@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard", "crates/sacd-rs", "crates/dvda-demuxer", "crates/dvdvideo", "tonepoet-pipeline"]
+members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard", "crates/sacd-rs", "crates/dvda-demuxer", "crates/dvdvideo", "crates/tui-file-picker", "tonepoet-pipeline"]
 resolver = "2"
 
 [package]
@@ -19,6 +19,7 @@ sacd-rs = { path = "crates/sacd-rs" }
 dvda-demuxer = { path = "crates/dvda-demuxer" }
 dvdvideo = { path = "crates/dvdvideo", default-features = false }
 tonepoet-wizard = { path = "crates/tonepoet-wizard" }
+tui-file-picker = { path = "crates/tui-file-picker" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"

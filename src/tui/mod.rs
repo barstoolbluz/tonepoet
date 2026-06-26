@@ -36,7 +36,6 @@ pub mod draw_source;
 pub mod draw_status;
 pub mod event_loop;
 pub mod external_editor;
-pub mod file_picker;
 pub mod gnudb;
 pub mod help;
 pub mod keybindings;

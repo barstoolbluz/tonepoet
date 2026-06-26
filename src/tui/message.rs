@@ -194,10 +194,11 @@ pub enum AppMessage {
         result: Result<Vec<crate::tui::probe::SourceMetadata>, String>,
     },
     /// Generic reusable file-picker completion. All picker owners send this
-    /// message so target dispatch is centralized in the event loop instead of
+    /// message so purpose dispatch is centralized in the event loop instead of
     /// being coupled to a specific overlay such as the metadata editor.
     FilePickerComplete {
-        target: crate::tui::app::FilePickerTarget,
+        session_id: u64,
+        purpose: crate::tui::app::FilePickerPurpose,
         path: Option<std::path::PathBuf>,
     },
     /// Result of add/replace/remove artwork launched from the Artwork tab.

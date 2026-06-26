@@ -3471,7 +3471,7 @@ fn handle_metadata_artwork_key(
             } else if state.artwork_write.is_some() {
                 app.set_status("metadata editor: artwork write already running");
             } else {
-                metadata_editor_open_artwork_picker(state);
+                metadata_editor_open_artwork_picker(app, state);
                 app.set_status("metadata editor: choose artwork image");
             }
         }
@@ -3493,18 +3493,55 @@ fn metadata_editor_current_artwork_type(
         .map(|row| row.picture_type)
 }
 
-fn metadata_editor_open_artwork_picker(state: &mut Box<super::app::MetadataEditorState>) {
+fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super::app::MetadataEditorState>) {
     let picture_type = metadata_editor_current_artwork_type(state)
         .unwrap_or(lofty::picture::PictureType::CoverFront);
-    let dir = state
-        .active_surface()
-        .paths
-        .first()
-        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+    let dir = app
+        .last_artwork_picker_dir
+        .clone()
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            state
+                .active_surface()
+                .paths
+                .first()
+                .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        })
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     state.pending_artwork_type = None;
-    state.file_picker = Some(crate::tui::app::FilePickerState::for_artwork(dir, picture_type));
+    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+        start_dir: dir,
+        filter: tui_file_picker::FilePickerFilter::Images,
+        title: "Select artwork image".to_string(),
+        theme: file_picker_theme_from_tonepoet_theme(),
+        selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
+        operation_policy: artwork_file_picker_policy(),
+        ..tui_file_picker::FilePickerConfig::default()
+    });
+    state.file_picker = Some(crate::tui::app::MetadataFilePickerState::new(
+        crate::tui::app::FilePickerPurpose::SelectArtwork { picture_type },
+        picker,
+    ));
+}
+
+
+fn artwork_file_picker_policy() -> tui_file_picker::FileOperationPolicy {
+    tui_file_picker::FileOperationPolicy {
+        allow_new_file: false,
+        allow_new_folder: false,
+        allow_cut: false,
+        allow_copy: false,
+        allow_paste: false,
+        allow_delete: false,
+        symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
+        cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
+        delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+    }
+}
+
+fn file_picker_theme_from_tonepoet_theme() -> tui_file_picker::FilePickerTheme {
+    tui_file_picker::FilePickerTheme::default()
 }
 
 fn handle_metadata_file_picker_key(
@@ -3513,16 +3550,35 @@ fn handle_metadata_file_picker_key(
     state: &mut Box<super::app::MetadataEditorState>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    let visible_rows = metadata_file_picker_visible_rows();
-    let outcome = state
-        .file_picker
-        .as_mut()
-        .and_then(|picker| super::file_picker::handle_key(picker, key, visible_rows));
+    let Some(session) = state.file_picker.as_mut() else {
+        return;
+    };
+    let session_id = session.session_id;
+    let purpose = session.purpose.clone();
+    let action = session.picker.handle_key(key);
+    if let Err(err) = send_file_picker_completion(tx, session_id, purpose, action) {
+        app.set_status(format!("file picker: failed to queue completion: {err}"));
+    }
+}
 
-    if let Some(outcome) = outcome {
-        if let Err(err) = super::file_picker::send_completion(tx, outcome) {
-            app.set_status(format!("file picker: failed to queue completion: {err}"));
-        }
+fn send_file_picker_completion(
+    tx: &mpsc::Sender<AppMessage>,
+    session_id: u64,
+    purpose: super::app::FilePickerPurpose,
+    action: tui_file_picker::FilePickerAction,
+) -> Result<(), mpsc::error::TrySendError<AppMessage>> {
+    match action {
+        tui_file_picker::FilePickerAction::None => Ok(()),
+        tui_file_picker::FilePickerAction::Selected(path) => tx.try_send(AppMessage::FilePickerComplete {
+            session_id,
+            purpose,
+            path: Some(path),
+        }),
+        tui_file_picker::FilePickerAction::Cancelled => tx.try_send(AppMessage::FilePickerComplete {
+            session_id,
+            purpose,
+            path: None,
+        }),
     }
 }
 
@@ -3578,16 +3634,16 @@ fn handle_metadata_file_picker_mouse(
     mouse: MouseEvent,
     state: &mut Box<super::app::MetadataEditorState>,
     tx: &mpsc::Sender<AppMessage>,
+    area: Rect,
 ) {
-    let visible_rows = metadata_file_picker_visible_rows();
-    let outcome = state.file_picker.as_mut().and_then(|picker| {
-        super::file_picker::handle_mouse(picker, mouse, visible_rows, &app.button_map)
-    });
-
-    if let Some(outcome) = outcome {
-        if let Err(err) = super::file_picker::send_completion(tx, outcome) {
-            app.set_status(format!("file picker: failed to queue completion: {err}"));
-        }
+    let Some(session) = state.file_picker.as_mut() else {
+        return;
+    };
+    let session_id = session.session_id;
+    let purpose = session.purpose.clone();
+    let action = session.picker.handle_mouse(mouse, area);
+    if let Err(err) = send_file_picker_completion(tx, session_id, purpose, action) {
+        app.set_status(format!("file picker: failed to queue completion: {err}"));
     }
 }
 
@@ -5398,12 +5454,6 @@ fn metadata_editor_read_only_visible_rows() -> usize {
     let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
     let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
     layout.content_area.height.max(1) as usize
-}
-
-fn metadata_file_picker_visible_rows() -> usize {
-    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
-    super::draw_overlays::file_picker_visible_rows_for_parent(layout.popup).max(1)
 }
 
 fn metadata_read_only_total_lines(state: &crate::tui::app::MetadataEditorState) -> usize {
@@ -11204,7 +11254,8 @@ fn handle_metadata_editor_mouse(
         let total_rows = state.active_surface().entries.len() + 1;
 
         if state.file_picker.is_some() {
-            handle_metadata_file_picker_mouse(app, mouse, &mut state, tx);
+            let file_picker_area = super::draw_overlays::file_picker_overlay_area(layout.popup);
+            handle_metadata_file_picker_mouse(app, mouse, &mut state, tx, file_picker_area);
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
             return;
         }
@@ -11323,7 +11374,7 @@ fn handle_metadata_editor_mouse(
                         } else if state.artwork_write.is_some() {
                             app.set_status("metadata editor: artwork write already running");
                         } else {
-                            metadata_editor_open_artwork_picker(&mut state);
+                            metadata_editor_open_artwork_picker(app, &mut state);
                             app.set_status("metadata editor: choose artwork image");
                         }
                     }
@@ -11899,7 +11950,7 @@ fn handle_metadata_editor_mouse(
                                     } else if state.artwork_write.is_some() {
                                         app.set_status("metadata editor: artwork write already running");
                                     } else {
-                                        metadata_editor_open_artwork_picker(&mut state);
+                                        metadata_editor_open_artwork_picker(app, &mut state);
                                         app.set_status("metadata editor: choose artwork image");
                                     }
                                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
@@ -15698,12 +15749,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataArtworkAdd(_)
             | TuiButton::MetadataArtworkReplace(_)
             | TuiButton::MetadataArtworkRemove(_)
-            | TuiButton::FilePickerToolbar(_)
-            | TuiButton::FilePickerRow(_)
-            | TuiButton::FilePickerAddress
-            | TuiButton::FilePickerBookmark(_)
-            | TuiButton::FilePickerRecent(_)
-            | TuiButton::FilePickerFooter(_) => {
+            => {
                 // Handled in dedicated mouse/overlay handlers; no-op here.
             }
         }
@@ -19274,4 +19320,158 @@ mod phase4_tests {
         assert_eq!(args, vec!["-k".to_string(), "-s".to_string(), "i".to_string(), "/music/01.flac".to_string()]);
     }
 
+}
+
+#[cfg(test)]
+mod artwork_file_picker_handoff_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{ContentTab, MetadataEditorState, MetadataTechnicalDetails};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn channel() -> (mpsc::Sender<AppMessage>, mpsc::Receiver<AppMessage>) {
+        mpsc::channel(8)
+    }
+
+    fn editor_for_audio_path(path: PathBuf) -> Box<MetadataEditorState> {
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "track.flac".to_string());
+        let mut state = Box::new(MetadataEditorState::for_files(
+            vec![path],
+            Vec::new(),
+            vec![label],
+            MetadataTechnicalDetails::default(),
+        ));
+        state.content_tab = ContentTab::Artwork;
+        state
+    }
+
+    fn make_editor_fixture(dir: &Path) -> Box<MetadataEditorState> {
+        let audio_path = dir.join("track.flac");
+        fs::write(&audio_path, b"audio").expect("audio fixture");
+        editor_for_audio_path(audio_path)
+    }
+
+    #[test]
+    fn source_tree_has_no_app_local_file_picker_and_uses_crate() {
+        assert!(
+            !Path::new("src/tui/file_picker.rs").exists(),
+            "old in-app picker module must stay deleted"
+        );
+        let keybindings = fs::read_to_string("src/tui/keybindings.rs").expect("keybindings source");
+        assert!(keybindings.contains("tui_file_picker::FilePickerState::new"));
+        assert!(!keybindings.contains(&format!("{}{}", "super::", "file_picker::")));
+        assert!(!keybindings.contains(&format!("{}{}", "FilePickerState::", "for_artwork")));
+    }
+
+    #[test]
+    fn artwork_plus_opens_crate_picker_with_images_and_explicit_non_mutating_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("cover.png"), b"png").expect("image fixture");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.last_artwork_picker_dir = Some(temp.path().to_path_buf());
+        let (tx, _rx) = channel();
+        let mut state = make_editor_fixture(temp.path());
+
+        handle_metadata_artwork_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+
+        let session = state.file_picker.as_ref().expect("artwork picker opened");
+        assert_eq!(session.picker.filter(), tui_file_picker::FilePickerFilter::Images);
+        assert_eq!(
+            session.picker.selection_mode(),
+            tui_file_picker::FilePickerSelectionMode::Files
+        );
+        assert_eq!(session.picker.current_dir(), temp.path());
+        let policy = session.picker.file_operation_policy();
+        assert!(!policy.allow_new_file);
+        assert!(!policy.allow_new_folder);
+        assert!(!policy.allow_cut);
+        assert!(!policy.allow_copy);
+        assert!(!policy.allow_paste);
+        assert!(!policy.allow_delete);
+    }
+
+    #[test]
+    fn selecting_artwork_file_sends_completion_with_path_and_picture_type() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("cover.png");
+        fs::write(&image, b"png").expect("image fixture");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.last_artwork_picker_dir = Some(temp.path().to_path_buf());
+        let (tx, mut rx) = channel();
+        let mut state = make_editor_fixture(temp.path());
+
+        handle_metadata_artwork_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        let session = state.file_picker.as_mut().expect("artwork picker opened");
+        let session_id = session.session_id;
+        assert!(session.picker.select_path_in_entries(&image));
+
+        handle_metadata_file_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+
+        match rx.try_recv().expect("file picker completion") {
+            AppMessage::FilePickerComplete { session_id: completion_session_id, purpose, path } => {
+                assert_eq!(completion_session_id, session_id);
+                assert_eq!(path, Some(image));
+                assert_eq!(
+                    purpose,
+                    FilePickerPurpose::SelectArtwork {
+                        picture_type: lofty::picture::PictureType::CoverFront,
+                    }
+                );
+            }
+            other => panic!("expected FilePickerComplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escape_from_artwork_picker_sends_cancel_completion_without_leaving_artwork_tab() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.last_artwork_picker_dir = Some(temp.path().to_path_buf());
+        let (tx, mut rx) = channel();
+        let mut state = make_editor_fixture(temp.path());
+
+        handle_metadata_artwork_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        let session_id = state.file_picker.as_ref().expect("artwork picker opened").session_id;
+        handle_metadata_file_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+
+        match rx.try_recv().expect("file picker cancel completion") {
+            AppMessage::FilePickerComplete { session_id: completion_session_id, purpose, path } => {
+                assert_eq!(completion_session_id, session_id);
+                assert!(path.is_none());
+                assert!(matches!(purpose, FilePickerPurpose::SelectArtwork { .. }));
+            }
+            other => panic!("expected FilePickerComplete, got {other:?}"),
+        }
+        assert_eq!(state.content_tab, ContentTab::Artwork);
+    }
 }

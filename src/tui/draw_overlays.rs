@@ -59,7 +59,13 @@ fn truncate_to_chars(s: &str, max: usize) -> String {
 
 /// Draw any active overlay on top of the main content
 pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
-    // Clone overlay data to avoid borrow issues
+    if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
+        draw_metadata_editor(f, state, &mut app.button_map);
+        return;
+    }
+
+    // Clone overlay data to avoid borrow issues for overlays whose rendering does
+    // not need to refresh crate-owned hit-test state.
     let overlay = app.active_overlay.clone();
     match overlay {
         ActiveOverlay::None => {}
@@ -110,9 +116,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::Help { screen, scroll } => {
             super::help::draw_help(f, screen, scroll);
         }
-        ActiveOverlay::MetadataEditor(ref state) => {
-            draw_metadata_editor(f, state, &mut app.button_map);
-        }
+        ActiveOverlay::MetadataEditor(_) => {}
         ActiveOverlay::CuePreview(ref state) => {
             draw_cue_preview(f, state, &mut app.button_map);
         }
@@ -3911,7 +3915,7 @@ pub(crate) fn metadata_editor_layout_for_area(area: Rect) -> MetadataEditorLayou
 /// Draw the full metadata editor overlay.
 fn draw_metadata_editor(
     f: &mut Frame,
-    state: &super::app::MetadataEditorState,
+    state: &mut super::app::MetadataEditorState,
     button_map: &mut super::button_map::ButtonRenderMap,
 ) {
     use super::app::{ContentTab, MetadataEditorPhase};
@@ -3976,7 +3980,7 @@ fn draw_metadata_editor(
 
     if state.content_tab != ContentTab::Metadata {
         draw_metadata_read_only_tab(f, state, content_area, footer_area, button_map);
-        if let Some(picker) = state.file_picker.as_ref() {
+        if let Some(picker) = state.file_picker.as_mut() {
             draw_file_picker_overlay(f, picker, popup, button_map);
         }
         draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
@@ -4440,25 +4444,13 @@ fn draw_metadata_editor(
         Paragraph::new(footer).alignment(Alignment::Center),
         footer_area,
     );
-    if let Some(picker) = state.file_picker.as_ref() {
+    if let Some(picker) = state.file_picker.as_mut() {
         draw_file_picker_overlay(f, picker, popup, button_map);
     }
     draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FilePickerOverlayGeometry {
-    pub toolbar_primary: Rect,
-    pub toolbar_secondary: Rect,
-    pub address_area: Rect,
-    pub info_area: Rect,
-    pub header_area: Rect,
-    pub list_area: Rect,
-    pub status_area: Rect,
-    pub footer_area: Rect,
-}
-
-pub(crate) fn file_picker_overlay_geometry(parent: Rect) -> Option<FilePickerOverlayGeometry> {
+pub(crate) fn file_picker_overlay_area(parent: Rect) -> Rect {
     let width = parent
         .width
         .saturating_mul(90)
@@ -4471,457 +4463,28 @@ pub(crate) fn file_picker_overlay_geometry(parent: Rect) -> Option<FilePickerOve
         .saturating_div(100)
         .max(16)
         .min(parent.height.saturating_sub(2));
-    let area = Rect::new(
+    Rect::new(
         parent.x + parent.width.saturating_sub(width) / 2,
         parent.y + parent.height.saturating_sub(height) / 2,
         width,
         height,
-    );
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    if inner.height < 9 {
-        return None;
-    }
-    let footer_area = Rect::new(
-        inner.x,
-        inner.y.saturating_add(inner.height.saturating_sub(1)),
-        inner.width,
-        1,
-    );
-    let status_area = Rect::new(inner.x, footer_area.y.saturating_sub(1), inner.width, 1);
-    Some(FilePickerOverlayGeometry {
-        toolbar_primary: Rect::new(inner.x, inner.y, inner.width, 1),
-        toolbar_secondary: Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
-        address_area: Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
-        info_area: Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 1),
-        header_area: Rect::new(inner.x, inner.y.saturating_add(4), inner.width, 1),
-        list_area: Rect::new(
-            inner.x,
-            inner.y.saturating_add(5),
-            inner.width,
-            inner.height.saturating_sub(7),
-        ),
-        status_area,
-        footer_area,
-    })
-}
-
-pub(crate) fn file_picker_visible_rows_for_parent(parent: Rect) -> usize {
-    file_picker_overlay_geometry(parent)
-        .map(|geometry| geometry.list_area.height.max(1) as usize)
-        .unwrap_or(1)
+    )
 }
 
 fn draw_file_picker_overlay(
     f: &mut Frame,
-    picker: &super::app::FilePickerState,
+    session: &mut super::app::MetadataFilePickerState,
     parent: Rect,
-    button_map: &mut super::button_map::ButtonRenderMap,
+    _button_map: &mut super::button_map::ButtonRenderMap,
 ) {
-    use super::app::{
-        FilePickerFocus, FilePickerFooterAction, FilePickerSortKey, FilePickerToolbarAction,
-    };
-
-    let width = parent
-        .width
-        .saturating_mul(90)
-        .saturating_div(100)
-        .max(56)
-        .min(parent.width.saturating_sub(4));
-    let height = parent
-        .height
-        .saturating_mul(86)
-        .saturating_div(100)
-        .max(16)
-        .min(parent.height.saturating_sub(2));
-    let area = Rect::new(
-        parent.x + parent.width.saturating_sub(width) / 2,
-        parent.y + parent.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::CYAN))
-        .title(Span::styled(
-            picker.title.clone(),
-            Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(block, area);
-
-    let Some(geometry) = file_picker_overlay_geometry(parent) else {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "File picker needs more space",
-                Style::default().fg(theme::RED),
-            ))),
-            area,
-        );
-        return;
-    };
-
-    let primary_toolbar = [
-        ("Back", FilePickerToolbarAction::Back, theme::BLUE),
-        ("Up", FilePickerToolbarAction::Up, theme::BLUE),
-        ("Home", FilePickerToolbarAction::Home, theme::BLUE),
-        ("Refresh", FilePickerToolbarAction::Refresh, theme::AMBER),
-        ("New", FilePickerToolbarAction::NewFolder, theme::GREEN),
-        ("Search", FilePickerToolbarAction::Search, theme::PURPLE),
-        (
-            if picker.show_hidden { "Hide dotfiles" } else { "Show dotfiles" },
-            FilePickerToolbarAction::ToggleHidden,
-            theme::PURPLE,
-        ),
-    ];
-    render_file_picker_toolbar_row(
-        f,
-        button_map,
-        geometry.toolbar_primary,
-        &primary_toolbar,
-    );
-
-    let sort_name = if picker.sort_key == FilePickerSortKey::Name { "Sort:Name*" } else { "Sort:Name" };
-    let sort_modified = if picker.sort_key == FilePickerSortKey::Modified { "Sort:Date*" } else { "Sort:Date" };
-    let sort_size = if picker.sort_key == FilePickerSortKey::Size { "Sort:Size*" } else { "Sort:Size" };
-    let secondary_toolbar = [
-        (sort_name, FilePickerToolbarAction::SortName, theme::CYAN),
-        (sort_modified, FilePickerToolbarAction::SortModified, theme::CYAN),
-        (sort_size, FilePickerToolbarAction::SortSize, theme::CYAN),
-        ("Open parent", FilePickerToolbarAction::RevealParent, theme::BLUE),
-        ("Rename", FilePickerToolbarAction::Rename, theme::AMBER),
-        ("Delete...", FilePickerToolbarAction::Delete, theme::RED),
-        ("Copy", FilePickerToolbarAction::Copy, theme::GREEN),
-        ("Move", FilePickerToolbarAction::Move, theme::GREEN),
-        ("Paste", FilePickerToolbarAction::Paste, theme::GREEN),
-    ];
-    render_file_picker_toolbar_row(
-        f,
-        button_map,
-        geometry.toolbar_secondary,
-        &secondary_toolbar,
-    );
-
-    let (address_label, input_text, input_cursor) = match picker.focus {
-        FilePickerFocus::Address => ("Path*:", &picker.address_input, picker.address_cursor),
-        FilePickerFocus::Search => ("Find*:", &picker.search_input, picker.search_cursor),
-        FilePickerFocus::NewFolderName => ("New* :", &picker.new_folder_input, picker.new_folder_cursor),
-        FilePickerFocus::Rename => ("Name*:", &picker.rename_input, picker.rename_cursor),
-        FilePickerFocus::DeleteConfirm => ("Delete:", &picker.address_input, picker.address_cursor),
-        FilePickerFocus::List => ("Path :", &picker.address_input, picker.address_cursor),
-    };
-    let input_width = geometry
-        .address_area
-        .width
-        .saturating_sub(address_label.chars().count() as u16)
-        .saturating_sub(3) as usize;
-    let active_input = !matches!(picker.focus, FilePickerFocus::List | FilePickerFocus::DeleteConfirm);
-    let visible_input = visible_text_with_caret(input_text, input_cursor, input_width, active_input);
-    let address_style = if active_input {
-        Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::TEXT_BRIGHT)
-    };
-    let address_line = Line::from(vec![
-        Span::styled(format!("{} ", address_label), Style::default().fg(theme::TEXT_DIM)),
-        Span::styled(visible_input, address_style),
-    ]);
-    f.render_widget(Paragraph::new(address_line), geometry.address_area);
-    button_map.record_button(TuiButton::FilePickerAddress, geometry.address_area);
-
-    let selected_name = picker
-        .selected
-        .as_ref()
-        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| match picker.selection_mode {
-            super::app::FilePickerSelectionMode::Directories => picker
-                .current_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| picker.current_dir.display().to_string()),
-            _ => "none".to_string(),
-        });
-    let clipboard = picker
-        .clipboard
-        .as_ref()
-        .and_then(|clip| clip.path.file_name().map(|name| name.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "empty".to_string());
-    let info_line = format!(
-        "Filter: {}  Sort: {}{}  Selected: {}  Clipboard: {}  Search: {}",
-        picker.filter.label(),
-        picker.sort_key.label(),
-        if picker.sort_reverse { " desc" } else { " asc" },
-        selected_name,
-        clipboard,
-        if picker.search_input.is_empty() { "-" } else { picker.search_input.as_str() },
-    );
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_to_chars(&info_line, geometry.info_area.width as usize),
-            Style::default().fg(theme::TEXT_DIM),
-        ))),
-        geometry.info_area,
-    );
-
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "  Type   Name                                      Size        Modified",
-            Style::default().fg(theme::TEXT_DIM),
-        ))),
-        geometry.header_area,
-    );
-
-    let visible_rows = geometry.list_area.height as usize;
-    let mut rows: Vec<Line> = Vec::new();
-    if let Some(error) = &picker.error {
-        rows.push(Line::from(Span::styled(
-            format!("  {}", error),
-            Style::default().fg(theme::RED),
-        )));
-    }
-    for (idx, entry) in picker
-        .entries
-        .iter()
-        .enumerate()
-        .skip(picker.scroll)
-        .take(visible_rows.saturating_sub(rows.len()))
-    {
-        let display_row = rows.len() as u16;
-        let cursor = if idx == picker.cursor { ">" } else { " " };
-        let icon = file_picker_entry_icon(entry);
-        let size = entry.size.map(format_file_size).unwrap_or_else(|| "-".to_string());
-        let modified = entry
-            .modified
-            .map(format_file_picker_modified)
-            .unwrap_or_else(|| "-".to_string());
-        let fixed_cols = 2 + 7 + 12 + 14;
-        let name_width = geometry.list_area.width.saturating_sub(fixed_cols) as usize;
-        let line = format!(
-            " {} {:<6} {:<name_width$} {:>10}  {:>10}",
-            cursor,
-            icon,
-            truncate_to_chars(&entry.name, name_width),
-            size,
-            modified,
-            name_width = name_width,
-        );
-        let style = if idx == picker.cursor {
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
-        } else if entry.is_dir {
-            Style::default().fg(theme::CYAN)
-        } else {
-            Style::default().fg(theme::TEXT_BRIGHT)
-        };
-        rows.push(Line::from(Span::styled(line, style)));
-        button_map.record_button(
-            TuiButton::FilePickerRow(idx),
-            Rect::new(geometry.list_area.x, geometry.list_area.y + display_row, geometry.list_area.width, 1),
-        );
-    }
-    if rows.is_empty() {
-        rows.push(Line::from(Span::styled(
-            "  No matching entries",
-            Style::default().fg(theme::TEXT_DIM),
-        )));
-    }
-    f.render_widget(Paragraph::new(rows), geometry.list_area);
-
-    let mut status_text = match picker.focus {
-        FilePickerFocus::Address => "Enter go to path | Esc return to list",
-        FilePickerFocus::Search => "Enter apply search | Esc return to list | empty search clears filter",
-        FilePickerFocus::NewFolderName => "Enter create folder | Esc cancel new folder",
-        FilePickerFocus::Rename => "Enter rename | Esc cancel rename",
-        FilePickerFocus::DeleteConfirm => "PERMANENT DELETE: Enter/Y confirms | Esc/N/Cancel keeps the file",
-        FilePickerFocus::List => "Enter/Open navigates folders; Apply/OK selects | / search | Ctrl+L address | Ctrl+N new folder",
-    }
-    .to_string();
-    if !picker.bookmarks.is_empty() || !picker.recent_locations.is_empty() {
-        status_text.push_str(" | ");
-        let mut spans = Vec::new();
-        spans.push("Bookmarks:".to_string());
-        for (idx, path) in picker.bookmarks.iter().take(3).enumerate() {
-            let label = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-            spans.push(format!("B{}={}", idx + 1, label));
-            let start = spans.join(" ").chars().count().saturating_sub(label.chars().count() + 3) as u16;
-            if start < geometry.status_area.width {
-                button_map.record_button(
-                    TuiButton::FilePickerBookmark(idx),
-                    Rect::new(geometry.status_area.x.saturating_add(start), geometry.status_area.y, (label.chars().count() + 3) as u16, 1),
-                );
-            }
-        }
-        if !picker.recent_locations.is_empty() {
-            spans.push("Recent:".to_string());
-            for (idx, path) in picker.recent_locations.iter().take(3).enumerate() {
-                let label = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-                spans.push(format!("R{}={}", idx + 1, label));
-                let start = spans.join(" ").chars().count().saturating_sub(label.chars().count() + 3) as u16;
-                if start < geometry.status_area.width {
-                    button_map.record_button(
-                        TuiButton::FilePickerRecent(idx),
-                        Rect::new(geometry.status_area.x.saturating_add(start), geometry.status_area.y, (label.chars().count() + 3) as u16, 1),
-                    );
-                }
-            }
-        }
-        status_text.push_str(&spans.join(" "));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_to_chars(&status_text, geometry.status_area.width as usize),
-            Style::default().fg(theme::TEXT_DIM),
-        ))),
-        geometry.status_area,
-    );
-
-    let footer_buttons = if matches!(picker.focus, FilePickerFocus::DeleteConfirm) {
-        vec![FilePickerFooterAction::DeletePermanently, FilePickerFooterAction::Cancel]
-    } else {
-        let mut buttons = vec![picker.primary_action];
-        if let Some(action) = picker.secondary_action {
-            if !buttons.contains(&action) {
-                buttons.push(action);
-            }
-        }
-        if !buttons.contains(&FilePickerFooterAction::Cancel) {
-            buttons.push(FilePickerFooterAction::Cancel);
-        }
-        buttons
-    };
-    let total_w: usize = footer_buttons
-        .iter()
-        .map(|action| action.label().chars().count() + 2)
-        .sum::<usize>()
-        + footer_buttons.len().saturating_sub(1);
-    let mut footer_x = geometry.footer_area.x + (geometry.footer_area.width.saturating_sub(total_w as u16)) / 2;
-    let mut footer_spans: Vec<Span> = Vec::new();
-    for (idx, action) in footer_buttons.iter().enumerate() {
-        if idx > 0 {
-            footer_spans.push(pill_gap());
-            footer_x = footer_x.saturating_add(1);
-        }
-        let color = match action {
-            FilePickerFooterAction::Cancel => theme::PURPLE,
-            FilePickerFooterAction::DeletePermanently => theme::RED,
-            FilePickerFooterAction::Apply | FilePickerFooterAction::Ok => theme::GREEN,
-            FilePickerFooterAction::Open => theme::CYAN,
-        };
-        let label = action.label();
-        footer_spans.push(footer_pill(label, color));
-        let w = label.chars().count().saturating_add(2) as u16;
-        button_map.record_button(
-            TuiButton::FilePickerFooter(*action),
-            Rect::new(footer_x, geometry.footer_area.y, w, 1),
-        );
-        footer_x = footer_x.saturating_add(w);
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(footer_spans)).alignment(Alignment::Center),
-        geometry.footer_area,
-    );
-}
-
-fn render_file_picker_toolbar_row(
-    f: &mut Frame,
-    button_map: &mut super::button_map::ButtonRenderMap,
-    area: Rect,
-    actions: &[(&str, super::app::FilePickerToolbarAction, Color)],
-) {
-    let mut spans: Vec<Span> = Vec::new();
-    let mut x = area.x;
-    for (idx, (label, action, color)) in actions.iter().enumerate() {
-        if idx > 0 {
-            spans.push(pill_gap());
-            x = x.saturating_add(1);
-        }
-        let w = label.chars().count().saturating_add(2) as u16;
-        if x.saturating_add(w) > area.x.saturating_add(area.width) {
-            break;
-        }
-        spans.push(footer_pill(label, *color));
-        button_map.record_button(
-            TuiButton::FilePickerToolbar(*action),
-            Rect::new(x, area.y, w, 1),
-        );
-        x = x.saturating_add(w);
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn file_picker_entry_icon(entry: &super::app::FilePickerEntry) -> &'static str {
-    if entry.is_dir {
-        return "[DIR]";
-    }
-    match entry
-        .path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("jpg" | "jpeg") => "[JPG]",
-        Some("png") => "[PNG]",
-        Some("gif") => "[GIF]",
-        Some("bmp") => "[BMP]",
-        Some("webp") => "[WEBP]",
-        Some("flac" | "wav" | "aiff" | "aif" | "wv") => "[AUD]",
-        Some("mp3" | "m4a" | "aac" | "ogg" | "opus") => "[AUD]",
-        Some("cue") => "[CUE]",
-        Some("txt" | "md" | "json" | "xml") => "[TXT]",
-        _ => "[FILE]",
-    }
-}
-
-fn format_file_picker_modified(time: std::time::SystemTime) -> String {
-    match std::time::SystemTime::now().duration_since(time) {
-        Ok(age) if age.as_secs() < 60 => "just now".to_string(),
-        Ok(age) if age.as_secs() < 3600 => format!("{}m ago", age.as_secs() / 60),
-        Ok(age) if age.as_secs() < 86_400 => format!("{}h ago", age.as_secs() / 3600),
-        Ok(age) if age.as_secs() < 31_536_000 => format!("{}d ago", age.as_secs() / 86_400),
-        Ok(age) => format!("{}y ago", age.as_secs() / 31_536_000),
-        Err(_) => "future".to_string(),
-    }
-}
-
-fn visible_text_with_caret(text: &str, cursor: usize, width: usize, active: bool) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if !active {
-        return visible_text_around_cursor(text, cursor.min(text.len()), width);
-    }
-    let mut cursor = cursor.min(text.len());
-    while cursor > 0 && !text.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    let mut marked = String::with_capacity(text.len() + 3);
-    marked.push_str(&text[..cursor]);
-    marked.push('▌');
-    marked.push_str(&text[cursor..]);
-    visible_text_around_cursor(&marked, cursor + '▌'.len_utf8(), width)
-}
-
-fn visible_text_around_cursor(text: &str, cursor: usize, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let cursor_chars = text[..cursor.min(text.len())].chars().count();
-    let start = cursor_chars.saturating_sub(width.saturating_sub(1));
-    text.chars().skip(start).take(width).collect()
-}
-
-fn format_file_size(bytes: u64) -> String {
-    if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
+    // The reusable picker owns hit testing through `handle_mouse()`. Tonepoet
+    // intentionally does not mirror these regions into ButtonRenderMap; the
+    // underscore argument documents that this modal's mouse contract is
+    // crate-authoritative.
+    let area = file_picker_overlay_area(parent);
+    let free_space = fs2::available_space(session.picker.current_dir()).ok();
+    session.picker.set_free_space_bytes(free_space);
+    session.picker.render(f, area);
 }
 
 fn draw_metadata_read_only_tab(
@@ -4933,6 +4496,8 @@ fn draw_metadata_read_only_tab(
 ) {
     if state.content_tab == super::app::ContentTab::ReplayGain {
         draw_metadata_replaygain_tab(f, state, content_area);
+    } else if state.content_tab == super::app::ContentTab::Artwork {
+        draw_metadata_artwork_tab(f, state, content_area, button_map);
     } else {
         let lines = metadata_read_only_lines(state);
         let total = lines.len();
@@ -4940,9 +4505,6 @@ fn draw_metadata_read_only_tab(
         let scroll = state.scroll.min(total.saturating_sub(visible));
         let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
         f.render_widget(Paragraph::new(visible_lines), content_area);
-        if state.content_tab == super::app::ContentTab::Artwork {
-            record_artwork_button_hits(state, content_area, scroll, visible, button_map);
-        }
     }
 
     draw_metadata_read_only_footer(state, footer_area, button_map, f);
@@ -5043,16 +4605,28 @@ fn record_centered_footer_pills(
 pub(crate) fn metadata_read_only_line_count(
     state: &super::app::MetadataEditorState,
 ) -> usize {
-    metadata_read_only_lines(state).len()
+    match state.content_tab {
+        super::app::ContentTab::Artwork => metadata_artwork_table_line_count(state),
+        _ => metadata_read_only_lines(state).len(),
+    }
 }
 
 fn metadata_read_only_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
     match state.content_tab {
         super::app::ContentTab::Details => metadata_details_lines(state),
         super::app::ContentTab::ReplayGain => metadata_replaygain_lines(state),
-        super::app::ContentTab::Artwork => metadata_artwork_lines(state),
+        super::app::ContentTab::Artwork => metadata_artwork_non_table_lines(state),
         super::app::ContentTab::Metadata => Vec::new(),
     }
+}
+
+fn metadata_artwork_table_line_count(state: &super::app::MetadataEditorState) -> usize {
+    let vm = super::metadata_view_models::build_artwork_view_model(state);
+    if vm.disc_not_applicable {
+        return metadata_artwork_non_table_lines(state).len();
+    }
+    let issue_rows = if vm.read_issues.is_empty() { 0 } else { 2 + vm.read_issues.len() + 1 };
+    issue_rows + 1 + vm.rows.len()
 }
 
 
@@ -5077,8 +4651,23 @@ fn metadata_replaygain_lines(state: &super::app::MetadataEditorState) -> Vec<Lin
     replaygain_summary_lines(&super::metadata_view_models::build_replaygain_view_model(state))
 }
 
-fn metadata_artwork_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
-    render_artwork_view_model(&super::metadata_view_models::build_artwork_view_model(state))
+fn metadata_artwork_non_table_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
+    let vm = super::metadata_view_models::build_artwork_view_model(state);
+    let mut lines = Vec::new();
+    if vm.disc_not_applicable {
+        lines.push(Line::from(Span::styled(
+            "  No embedded artwork for disc-backed presentations",
+            Style::default().fg(theme::TEXT_DIM),
+        )));
+    }
+    if !vm.read_issues.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(section_line("Read issues"));
+        lines.extend(render_issue_rows(&vm.read_issues));
+    }
+    lines
 }
 
 fn render_details_view_model(vm: &super::metadata_view_models::DetailsViewModel) -> Vec<Line<'static>> {
@@ -5232,6 +4821,132 @@ fn draw_metadata_replaygain_tab(
     f.render_stateful_widget(table, table_area, &mut table_state);
 }
 
+fn draw_metadata_artwork_tab(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    content_area: Rect,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
+    let vm = super::metadata_view_models::build_artwork_view_model(state);
+    if vm.disc_not_applicable {
+        let lines = metadata_artwork_non_table_lines(state);
+        let total = lines.len();
+        let visible = content_area.height as usize;
+        let scroll = state.scroll.min(total.saturating_sub(visible));
+        let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+        f.render_widget(Paragraph::new(visible_lines), content_area);
+        return;
+    }
+
+    let mut top_lines = Vec::new();
+    if !vm.read_issues.is_empty() {
+        top_lines.push(section_line("Read issues"));
+        top_lines.extend(render_issue_rows(&vm.read_issues));
+        top_lines.push(Line::from(""));
+    }
+    top_lines.push(Line::from(Span::styled(
+        "  Click Add/Replace/Remove • Enter/+ add or replace • Delete/d remove",
+        Style::default().fg(theme::TEXT_DIM),
+    )));
+
+    let top_height = (top_lines.len() as u16).min(content_area.height);
+    if top_height > 0 {
+        let top_area = Rect::new(content_area.x, content_area.y, content_area.width, top_height);
+        f.render_widget(Paragraph::new(top_lines), top_area);
+    }
+
+    let table_height = content_area.height.saturating_sub(top_height);
+    if table_height == 0 {
+        return;
+    }
+    let table_area = Rect::new(
+        content_area.x,
+        content_area.y.saturating_add(top_height),
+        content_area.width,
+        table_height,
+    );
+    let body_capacity = table_area.height.saturating_sub(1) as usize;
+    let selected = (!vm.rows.is_empty()).then(|| state.artwork_cursor.min(vm.rows.len().saturating_sub(1)));
+    let (row_offset, visible_rows) = replaygain_table_window(
+        vm.rows.len(),
+        selected.unwrap_or(0),
+        body_capacity,
+    );
+
+    let header = Row::new(vec!["Artwork Type", "Status", "Details", "Action"])
+        .style(Style::default().fg(theme::TEXT_DIM))
+        .bottom_margin(0);
+    let rows: Vec<Row<'static>> = vm
+        .rows
+        .iter()
+        .skip(row_offset)
+        .take(visible_rows)
+        .map(|row| {
+            Row::new(vec![
+                Cell::from(row.kind.clone()),
+                Cell::from(row.status.clone()),
+                Cell::from(row.detail.clone()),
+                Cell::from(artwork_row_action(row)),
+            ])
+            .style(Style::default().fg(if row.selected { theme::AMBER } else { theme::TEXT_BRIGHT }))
+        })
+        .collect();
+    let widths = [
+        Constraint::Percentage(22),
+        Constraint::Percentage(34),
+        Constraint::Percentage(25),
+        Constraint::Percentage(19),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .highlight_style(Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ")
+        .block(Block::default());
+    let mut table_state = TableState::default();
+    if let Some(selected) = selected {
+        if visible_rows > 0 {
+            table_state.select(Some(selected.saturating_sub(row_offset)));
+        }
+    }
+    f.render_stateful_widget(table, table_area, &mut table_state);
+
+    record_artwork_table_button_hits(&vm.rows, table_area, row_offset, visible_rows, button_map);
+}
+
+fn record_artwork_table_button_hits(
+    rows: &[super::metadata_view_models::ArtworkCoverageRow],
+    table_area: Rect,
+    row_offset: usize,
+    visible_rows: usize,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
+    let action_x = table_area.x.saturating_add(table_area.width.saturating_mul(81).saturating_div(100));
+    let action_w = table_area.x.saturating_add(table_area.width).saturating_sub(action_x);
+    for (visible_idx, row) in rows.iter().skip(row_offset).take(visible_rows).enumerate() {
+        let y = table_area.y.saturating_add(1).saturating_add(visible_idx as u16);
+        button_map.record_button(
+            super::button_map::TuiButton::MetadataArtworkRow(row.index),
+            Rect::new(table_area.x, y, table_area.width, 1),
+        );
+        if artwork_row_has_embedded(row) {
+            let replace_w = action_w.saturating_div(2).max(1);
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataArtworkReplace(row.index),
+                Rect::new(action_x, y, replace_w, 1),
+            );
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataArtworkRemove(row.index),
+                Rect::new(action_x.saturating_add(replace_w), y, action_w.saturating_sub(replace_w), 1),
+            );
+        } else {
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataArtworkAdd(row.index),
+                Rect::new(action_x, y, action_w, 1),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod replaygain_table_window_tests {
     use super::replaygain_table_window;
@@ -5252,69 +4967,6 @@ mod replaygain_table_window_tests {
     }
 }
 
-fn render_artwork_view_model(vm: &super::metadata_view_models::ArtworkViewModel) -> Vec<Line<'static>> {
-    if vm.disc_not_applicable {
-        let mut lines = vec![Line::from(Span::styled(
-            "  No embedded artwork for disc-backed presentations",
-            Style::default().fg(theme::TEXT_DIM),
-        ))];
-        if !vm.read_issues.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(section_line("Read issues"));
-            lines.extend(render_issue_rows(&vm.read_issues));
-        }
-        return lines;
-    }
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "  | Artwork Type     | Status                         | Details              | Action             |",
-        Style::default().fg(theme::TEXT_DIM),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  |------------------|--------------------------------|----------------------|--------------------|",
-        Style::default().fg(theme::TEXT_DIM),
-    )));
-
-    if !vm.read_issues.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(section_line("Read issues"));
-        lines.extend(render_issue_rows(&vm.read_issues));
-        lines.push(Line::from(""));
-    }
-
-    lines.push(Line::from(Span::styled(
-        "  Click [ + ], [replace], or [remove] • Enter/+ add or replace • Delete/d remove",
-        Style::default().fg(theme::TEXT_DIM),
-    )));
-    for row in &vm.rows {
-        lines.push(artwork_row(row));
-    }
-    lines
-}
-
-fn artwork_row(row: &super::metadata_view_models::ArtworkCoverageRow) -> Line<'static> {
-    let style = if row.selected {
-        Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::TEXT_BRIGHT)
-    };
-    Line::from(Span::styled(artwork_row_text(row), style))
-}
-
-fn artwork_row_text(row: &super::metadata_view_models::ArtworkCoverageRow) -> String {
-    let cursor = if row.selected { ">" } else { " " };
-    let action = artwork_row_action(row);
-    format!(
-        " {}| {:<16} | {:<30} | {:<20} | {:<18} |",
-        cursor,
-        truncate_to_chars(&row.kind, 16),
-        truncate_to_chars(&row.status, 30),
-        truncate_to_chars(&row.detail, 20),
-        action,
-    )
-}
-
 fn artwork_row_action(row: &super::metadata_view_models::ArtworkCoverageRow) -> &'static str {
     if artwork_row_has_embedded(row) {
         "[replace] [remove]"
@@ -5325,85 +4977,6 @@ fn artwork_row_action(row: &super::metadata_view_models::ArtworkCoverageRow) -> 
 
 fn artwork_row_has_embedded(row: &super::metadata_view_models::ArtworkCoverageRow) -> bool {
     row.status.trim() != "«not present»" && !row.status.trim().is_empty()
-}
-
-fn record_artwork_button_hits(
-    state: &super::app::MetadataEditorState,
-    content_area: Rect,
-    scroll: usize,
-    visible: usize,
-    button_map: &mut super::button_map::ButtonRenderMap,
-) {
-    let vm = super::metadata_view_models::build_artwork_view_model(state);
-    if vm.disc_not_applicable {
-        return;
-    }
-
-    let issue_block_rows = if vm.read_issues.is_empty() {
-        0
-    } else {
-        1 + 1 + vm.read_issues.len() + 1
-    };
-    let row_start = 2 + issue_block_rows + 1;
-    let visible_end = scroll.saturating_add(visible);
-
-    for row in &vm.rows {
-        let line_idx = row_start.saturating_add(row.index);
-        if line_idx < scroll || line_idx >= visible_end {
-            continue;
-        }
-        let y = content_area.y.saturating_add((line_idx - scroll) as u16);
-        button_map.record_button(
-            super::button_map::TuiButton::MetadataArtworkRow(row.index),
-            Rect::new(content_area.x, y, content_area.width, 1),
-        );
-
-        let line = artwork_row_text(row);
-        if artwork_row_has_embedded(row) {
-            record_artwork_action_button(
-                button_map,
-                &line,
-                "[replace]",
-                super::button_map::TuiButton::MetadataArtworkReplace(row.index),
-                content_area.x,
-                y,
-            );
-            record_artwork_action_button(
-                button_map,
-                &line,
-                "[remove]",
-                super::button_map::TuiButton::MetadataArtworkRemove(row.index),
-                content_area.x,
-                y,
-            );
-        } else {
-            record_artwork_action_button(
-                button_map,
-                &line,
-                "[ + ]",
-                super::button_map::TuiButton::MetadataArtworkAdd(row.index),
-                content_area.x,
-                y,
-            );
-        }
-    }
-}
-
-fn record_artwork_action_button(
-    button_map: &mut super::button_map::ButtonRenderMap,
-    line: &str,
-    needle: &str,
-    button: super::button_map::TuiButton,
-    x: u16,
-    y: u16,
-) {
-    if let Some(byte_idx) = line.find(needle) {
-        let col = line[..byte_idx].chars().count() as u16;
-        button_map.record_button(
-            button,
-            Rect::new(x.saturating_add(col), y, needle.chars().count() as u16, 1),
-        );
-    }
 }
 
 fn render_issue_rows(rows: &[super::metadata_view_models::IssueViewRow]) -> Vec<Line<'static>> {
@@ -7938,7 +7511,7 @@ mod tests {
     }
 
     #[test]
-    fn artwork_rows_render_explicit_mouse_actions() {
+    fn artwork_rows_expose_explicit_table_actions() {
         let missing = super::super::metadata_view_models::ArtworkCoverageRow {
             index: 0,
             kind: "Front Cover".to_string(),
@@ -7956,13 +7529,12 @@ mod tests {
             selected: true,
         };
 
-        assert!(artwork_row_text(&missing).contains("[ + ]"));
-        assert!(artwork_row_text(&present).contains("[replace]"));
-        assert!(artwork_row_text(&present).contains("[remove]"));
+        assert_eq!(artwork_row_action(&missing), "[ + ]");
+        assert_eq!(artwork_row_action(&present), "[replace] [remove]");
     }
 
     #[test]
-    fn artwork_action_hitboxes_are_registered_as_buttons() {
+    fn artwork_table_action_hitboxes_are_registered_as_buttons() {
         let row = super::super::metadata_view_models::ArtworkCoverageRow {
             index: 2,
             kind: "Front Cover".to_string(),
@@ -7971,62 +7543,70 @@ mod tests {
             picture_type: lofty::picture::PictureType::CoverFront,
             selected: false,
         };
-        let line = artwork_row_text(&row);
         let mut map = super::super::button_map::ButtonRenderMap::new();
-        record_artwork_action_button(
-            &mut map,
-            &line,
-            "[replace]",
-            super::super::button_map::TuiButton::MetadataArtworkReplace(row.index),
-            10,
-            4,
-        );
-        record_artwork_action_button(
-            &mut map,
-            &line,
-            "[remove]",
-            super::super::button_map::TuiButton::MetadataArtworkRemove(row.index),
-            10,
-            4,
-        );
+        let table_area = Rect::new(10, 4, 80, 5);
+        record_artwork_table_button_hits(&[row], table_area, 0, 1, &mut map);
+        let action_x = table_area.x.saturating_add(table_area.width.saturating_mul(81).saturating_div(100));
+        let action_w = table_area.x.saturating_add(table_area.width).saturating_sub(action_x);
+        let replace_w = action_w.saturating_div(2).max(1);
 
-        let replace_x = 10 + line[..line.find("[replace]").unwrap()].chars().count() as u16;
-        let remove_x = 10 + line[..line.find("[remove]").unwrap()].chars().count() as u16;
         assert_eq!(
-            map.find_button_at(replace_x, 4),
+            map.find_button_at(action_x, 5),
             Some(super::super::button_map::TuiButton::MetadataArtworkReplace(2))
         );
         assert_eq!(
-            map.find_button_at(remove_x, 4),
+            map.find_button_at(action_x.saturating_add(replace_w), 5),
             Some(super::super::button_map::TuiButton::MetadataArtworkRemove(2))
         );
     }
 
 
     #[test]
-    fn file_picker_visible_rows_match_overlay_geometry() {
-        let parent = Rect::new(0, 0, 120, 40);
-        let geometry = file_picker_overlay_geometry(parent).expect("geometry");
-        assert_eq!(
-            file_picker_visible_rows_for_parent(parent),
-            geometry.list_area.height.max(1) as usize
-        );
-    }
-
-    #[test]
     fn later_action_buttons_take_priority_over_full_row_hitboxes() {
         use super::super::button_map::{ButtonRenderMap, TuiButton};
         let mut map = ButtonRenderMap::new();
         let rect = Rect::new(10, 10, 20, 1);
-        map.record_button(TuiButton::FilePickerRow(7), rect);
-        map.record_button(
-            TuiButton::FilePickerFooter(super::super::app::FilePickerFooterAction::Apply),
-            rect,
-        );
+        map.record_button(TuiButton::MetadataArtworkRow(7), rect);
+        map.record_button(TuiButton::MetadataArtworkReplace(7), rect);
         assert_eq!(
             map.find_button_at(12, 10),
-            Some(TuiButton::FilePickerFooter(super::super::app::FilePickerFooterAction::Apply))
+            Some(TuiButton::MetadataArtworkReplace(7))
         );
     }
 
+}
+
+#[cfg(test)]
+mod file_picker_overlay_contract_tests {
+    use super::*;
+    use crate::tui::app::{FilePickerPurpose, MetadataFilePickerState};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn tonepoet_supplies_free_space_before_rendering_crate_picker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..tui_file_picker::FilePickerConfig::default()
+        });
+        let mut session = MetadataFilePickerState::new(
+            FilePickerPurpose::Generic { id: "test".to_string() },
+            picker,
+        );
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut button_map = crate::tui::button_map::ButtonRenderMap::new();
+
+        terminal
+            .draw(|frame| {
+                draw_file_picker_overlay(frame, &mut session, Rect::new(0, 0, 100, 30), &mut button_map);
+            })
+            .expect("draw");
+
+        assert!(
+            session.picker.free_space_bytes().is_some(),
+            "tonepoet must pass host-computed free-space status into the std-only picker crate"
+        );
+    }
 }
