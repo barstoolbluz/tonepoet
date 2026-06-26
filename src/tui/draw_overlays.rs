@@ -4886,7 +4886,7 @@ fn draw_metadata_artwork_tab(
                 Cell::from(row.kind.clone()),
                 Cell::from(row.status.clone()),
                 Cell::from(row.detail.clone()),
-                Cell::from(artwork_row_action(row)),
+                artwork_action_cell(row),
             ])
             .style(Style::default().fg(if row.selected { theme::AMBER } else { theme::TEXT_BRIGHT }))
         })
@@ -4967,11 +4967,19 @@ mod replaygain_table_window_tests {
     }
 }
 
-fn artwork_row_action(row: &super::metadata_view_models::ArtworkCoverageRow) -> &'static str {
+fn artwork_action_cell(row: &super::metadata_view_models::ArtworkCoverageRow) -> Cell<'static> {
+    let btn = Style::default().fg(theme::BG).bg(theme::CYAN);
+    let gap = Span::raw(" ");
     if artwork_row_has_embedded(row) {
-        "[replace] [remove]"
+        Cell::from(Line::from(vec![
+            Span::styled(" Replace ", btn),
+            gap,
+            Span::styled(" Remove ", Style::default().fg(theme::BG).bg(theme::AMBER)),
+        ]))
     } else {
-        "[ + ]"
+        Cell::from(Line::from(vec![
+            Span::styled(" + Add ", btn),
+        ]))
     }
 }
 
