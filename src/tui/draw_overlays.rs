@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 
@@ -4931,50 +4931,113 @@ fn draw_metadata_read_only_tab(
     footer_area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
 ) {
-    let lines = metadata_read_only_lines(state);
-    let total = lines.len();
-    let visible = content_area.height as usize;
-    let scroll = state.scroll.min(total.saturating_sub(visible));
-    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
-    f.render_widget(Paragraph::new(visible_lines), content_area);
-    if state.content_tab == super::app::ContentTab::Artwork {
-        record_artwork_button_hits(state, content_area, scroll, visible, button_map);
+    if state.content_tab == super::app::ContentTab::ReplayGain {
+        draw_metadata_replaygain_tab(f, state, content_area);
+    } else {
+        let lines = metadata_read_only_lines(state);
+        let total = lines.len();
+        let visible = content_area.height as usize;
+        let scroll = state.scroll.min(total.saturating_sub(visible));
+        let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+        f.render_widget(Paragraph::new(visible_lines), content_area);
+        if state.content_tab == super::app::ContentTab::Artwork {
+            record_artwork_button_hits(state, content_area, scroll, visible, button_map);
+        }
     }
 
-    let mut footer_spans = vec![
-        footer_pill("Tab next", theme::CYAN),
-        pill_gap(),
-        footer_pill("Shift-Tab prev", theme::CYAN),
-        pill_gap(),
-        footer_pill("j/k move", theme::BLUE),
-    ];
-    if state.content_tab == super::app::ContentTab::ReplayGain {
-        footer_spans.push(pill_gap());
-        footer_spans.push(footer_pill("Space select", theme::BLUE));
-        footer_spans.push(pill_gap());
-        footer_spans.push(footer_pill("s scan", theme::GREEN));
-        footer_spans.push(pill_gap());
-        footer_spans.push(footer_pill("a album", theme::GREEN));
+    draw_metadata_read_only_footer(state, footer_area, button_map, f);
+}
+
+fn draw_metadata_read_only_footer(
+    state: &super::app::MetadataEditorState,
+    footer_area: Rect,
+    button_map: &mut super::button_map::ButtonRenderMap,
+    f: &mut Frame,
+) {
+    let mut pills: Vec<(&str, Color, Option<super::button_map::TuiButton>)> = Vec::new();
+    match state.content_tab {
+        super::app::ContentTab::ReplayGain => {
+            pills.push((
+                "s scan",
+                theme::GREEN,
+                Some(super::button_map::TuiButton::MetadataReplayGainScanTrack),
+            ));
+            pills.push((
+                "a album",
+                theme::GREEN,
+                Some(super::button_map::TuiButton::MetadataReplayGainScanAlbum),
+            ));
+        }
+        super::app::ContentTab::Artwork => {
+            pills.push((
+                "+ artwork",
+                theme::GREEN,
+                Some(super::button_map::TuiButton::MetadataArtworkAdd(state.artwork_cursor)),
+            ));
+            pills.push((
+                "Del remove",
+                theme::RED,
+                Some(super::button_map::TuiButton::MetadataArtworkRemove(state.artwork_cursor)),
+            ));
+        }
+        super::app::ContentTab::Details => {
+            if state.details_analysis.is_some() {
+                pills.push(("Analyzing...", theme::AMBER, None));
+            } else if super::metadata_view_models::details_analyze_applicable(state) {
+                pills.push((
+                    "a analyze",
+                    theme::GREEN,
+                    Some(super::button_map::TuiButton::MetadataDetailsAnalyze),
+                ));
+            }
+            if state.active_surface().technical_details.details_probe_issue_count() > 0 {
+                pills.push(("Ctrl+R retry", theme::AMBER, None));
+            }
+        }
+        super::app::ContentTab::Metadata => {}
     }
-    if state.content_tab == super::app::ContentTab::Artwork {
-        footer_spans.push(pill_gap());
-        footer_spans.push(footer_pill("+ artwork", theme::GREEN));
-        footer_spans.push(pill_gap());
-        footer_spans.push(footer_pill("Del remove", theme::RED));
+    pills.push(("Esc close", theme::PURPLE, None));
+
+    let mut spans = Vec::new();
+    for (idx, (label, bg, _)) in pills.iter().enumerate() {
+        if idx > 0 {
+            spans.push(pill_gap());
+        }
+        spans.push(footer_pill(label, *bg));
     }
-    if state.content_tab == super::app::ContentTab::Details
-        && state.active_surface().technical_details.details_probe_issue_count() > 0
-    {
-        footer_spans.push(pill_gap());
-        footer_spans.push(footer_pill("Ctrl+R retry", theme::AMBER));
-    }
-    footer_spans.push(pill_gap());
-    footer_spans.push(footer_pill("Esc close", theme::PURPLE));
-    let footer = Line::from(footer_spans);
+
+    record_centered_footer_pills(&pills, footer_area, button_map);
+
     f.render_widget(
-        Paragraph::new(footer).alignment(Alignment::Center),
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
         footer_area,
     );
+}
+
+fn record_centered_footer_pills(
+    pills: &[(&str, Color, Option<super::button_map::TuiButton>)],
+    footer_area: Rect,
+    button_map: &mut super::button_map::ButtonRenderMap,
+) {
+    let pills_width: u16 = pills
+        .iter()
+        .map(|(label, _, _)| label.chars().count() as u16 + 2)
+        .sum();
+    let gaps = pills.len().saturating_sub(1) as u16;
+    let total_width = pills_width.saturating_add(gaps);
+    let mut x = footer_area
+        .x
+        .saturating_add(footer_area.width.saturating_sub(total_width) / 2);
+    for (idx, (label, _, button)) in pills.iter().enumerate() {
+        if idx > 0 {
+            x = x.saturating_add(1);
+        }
+        let width = label.chars().count() as u16 + 2;
+        if let Some(button) = button {
+            button_map.record_button(*button, Rect::new(x, footer_area.y, width, 1));
+        }
+        x = x.saturating_add(width);
+    }
 }
 
 pub(crate) fn metadata_read_only_line_count(
@@ -4995,7 +5058,7 @@ fn metadata_read_only_lines(state: &super::app::MetadataEditorState) -> Vec<Line
 
 fn section_line(title: &str) -> Line<'static> {
     Line::from(Span::styled(
-        format!("## {}", title),
+        title.to_string(),
         Style::default()
             .fg(theme::CYAN)
             .add_modifier(Modifier::BOLD),
@@ -5011,7 +5074,7 @@ fn metadata_details_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'
 }
 
 fn metadata_replaygain_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
-    render_replaygain_view_model(&super::metadata_view_models::build_replaygain_view_model(state))
+    replaygain_summary_lines(&super::metadata_view_models::build_replaygain_view_model(state))
 }
 
 fn metadata_artwork_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
@@ -5026,6 +5089,12 @@ fn render_details_view_model(vm: &super::metadata_view_models::DetailsViewModel)
         lines.push(Line::from(Span::styled(
             format!("  {}", status),
             Style::default().fg(theme::TEXT_DIM),
+        )));
+    }
+    if let Some(status) = &vm.analysis_status {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", status),
+            Style::default().fg(theme::AMBER),
         )));
     }
     if !vm.read_issues.is_empty() {
@@ -5043,67 +5112,144 @@ fn render_detail_field(row: &super::metadata_view_models::DetailField) -> Line<'
     kv_line(&row.key, row.value.clone())
 }
 
-fn render_replaygain_view_model(vm: &super::metadata_view_models::ReplayGainViewModel) -> Vec<Line<'static>> {
+fn replaygain_summary_lines(vm: &super::metadata_view_models::ReplayGainViewModel) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(section_line("Summary"));
-    if !vm.has_data {
-        lines.push(Line::from(Span::styled(
-            "  No ReplayGain tags found yet",
-            Style::default().fg(theme::TEXT_DIM),
-        )));
-    } else {
-        lines.extend(vm.summary.iter().map(render_detail_field));
-    }
-    lines.push(kv_line(
-        "Selection",
-        format!(
-            "{} of {} track{} selected",
-            vm.selected_count,
-            vm.total_count,
-            if vm.total_count == 1 { "" } else { "s" }
-        ),
-    ));
+    lines.extend(vm.summary.iter().map(render_detail_field));
     if let Some(status) = &vm.scan_status {
         lines.push(Line::from(Span::styled(
             format!("  {}", status),
             Style::default().fg(theme::AMBER),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        "  Space/Enter toggle • s scan selected • a scan album • * select all",
-        Style::default().fg(theme::TEXT_DIM),
-    )));
     lines.push(Line::from(""));
     lines.push(section_line("Tracks"));
-    lines.push(Line::from(Span::styled(
-        "  |   | Track                         | Track Gain | Album Gain | Track Peak | Album Peak |",
-        Style::default().fg(theme::TEXT_DIM),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  |---|-------------------------------|------------|------------|------------|------------|",
-        Style::default().fg(theme::TEXT_DIM),
-    )));
-    for row in &vm.rows {
-        let mark = if row.selected { "x" } else { " " };
-        let cursor = if row.cursor { ">" } else { " " };
-        let line = format!(
-            "  |{}{}| {:<29} | {:>10} | {:>10} | {:>10} | {:>10} |",
-            cursor,
-            mark,
-            truncate_to_chars(&row.title, 29),
-            row.track_gain,
-            row.album_gain,
-            row.track_peak,
-            row.album_peak,
-        );
-        let style = if row.cursor {
-            Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::TEXT_BRIGHT)
-        };
-        lines.push(Line::from(Span::styled(line, style)));
-    }
     lines
+}
+
+fn replaygain_table_body_capacity(table_height: u16) -> usize {
+    // Header + bottom_margin(1) consumes two terminal rows before data rows.
+    table_height.saturating_sub(2) as usize
+}
+
+fn replaygain_table_window(
+    row_count: usize,
+    cursor: usize,
+    body_capacity: usize,
+) -> (usize, usize) {
+    if row_count == 0 || body_capacity == 0 {
+        return (0, 0);
+    }
+    let visible_rows = body_capacity.min(row_count);
+    let clamped_cursor = cursor.min(row_count - 1);
+    let max_offset = row_count.saturating_sub(visible_rows);
+    let offset = clamped_cursor
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(max_offset);
+    (offset, visible_rows)
+}
+
+fn draw_metadata_replaygain_tab(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    content_area: Rect,
+) {
+    let vm = super::metadata_view_models::build_replaygain_view_model(state);
+    let summary_lines = replaygain_summary_lines(&vm);
+    let summary_height = (summary_lines.len() as u16).min(content_area.height);
+    if summary_height > 0 {
+        let summary_area = Rect::new(
+            content_area.x,
+            content_area.y,
+            content_area.width,
+            summary_height,
+        );
+        f.render_widget(Paragraph::new(summary_lines), summary_area);
+    }
+
+    let table_height = content_area.height.saturating_sub(summary_height);
+    if table_height == 0 {
+        return;
+    }
+    let table_area = Rect::new(
+        content_area.x,
+        content_area.y.saturating_add(summary_height),
+        content_area.width,
+        table_height,
+    );
+
+    let body_capacity = replaygain_table_body_capacity(table_area.height);
+    let selected = (!vm.rows.is_empty()).then(|| {
+        state
+            .replaygain_cursor
+            .min(vm.rows.len().saturating_sub(1))
+    });
+    let (row_offset, visible_rows) = replaygain_table_window(
+        vm.rows.len(),
+        selected.unwrap_or(0),
+        body_capacity,
+    );
+
+    let header = Row::new(vec!["Track", "Track Gain", "Album Gain", "Track Peak", "Album Peak"])
+        .style(Style::default().fg(theme::TEXT_DIM))
+        .bottom_margin(1);
+    let rows: Vec<Row<'static>> = vm
+        .rows
+        .iter()
+        .skip(row_offset)
+        .take(visible_rows)
+        .map(|row| {
+            Row::new(vec![
+                Cell::from(row.title.clone()),
+                Cell::from(row.track_gain.clone()).style(Style::default().fg(theme::TEXT_BRIGHT)),
+                Cell::from(row.album_gain.clone()).style(Style::default().fg(theme::TEXT_BRIGHT)),
+                Cell::from(row.track_peak.clone()).style(Style::default().fg(theme::TEXT_BRIGHT)),
+                Cell::from(row.album_peak.clone()).style(Style::default().fg(theme::TEXT_BRIGHT)),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Percentage(35),
+        Constraint::Percentage(16),
+        Constraint::Percentage(16),
+        Constraint::Percentage(16),
+        Constraint::Percentage(17),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .highlight_style(Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ")
+        .block(Block::default());
+    // Scrolling is deterministic: rows are windowed before rendering. The
+    // render-local TableState is now used only for highlighting the selected
+    // row inside that window, so it cannot lose or reset scroll offset.
+    let mut table_state = TableState::default();
+    if let Some(selected) = selected {
+        if visible_rows > 0 {
+            table_state.select(Some(selected.saturating_sub(row_offset)));
+        }
+    }
+    f.render_stateful_widget(table, table_area, &mut table_state);
+}
+
+#[cfg(test)]
+mod replaygain_table_window_tests {
+    use super::replaygain_table_window;
+
+    #[test]
+    fn keeps_cursor_visible_without_render_local_scroll_memory() {
+        assert_eq!(replaygain_table_window(20, 0, 5), (0, 5));
+        assert_eq!(replaygain_table_window(20, 4, 5), (0, 5));
+        assert_eq!(replaygain_table_window(20, 5, 5), (1, 5));
+        assert_eq!(replaygain_table_window(20, 19, 5), (15, 5));
+    }
+
+    #[test]
+    fn handles_short_or_zero_height_tables() {
+        assert_eq!(replaygain_table_window(3, 2, 10), (0, 3));
+        assert_eq!(replaygain_table_window(3, 2, 0), (0, 0));
+        assert_eq!(replaygain_table_window(0, 0, 5), (0, 0));
+    }
 }
 
 fn render_artwork_view_model(vm: &super::metadata_view_models::ArtworkViewModel) -> Vec<Line<'static>> {

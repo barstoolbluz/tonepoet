@@ -178,6 +178,13 @@ pub enum AppMessage {
         total: usize,
         results: Vec<crate::tui::app::MetadataDetailsProbeFileResult>,
     },
+    /// Result of a narrow Details-tab HDCD + metadata/CUE/catalog PRE scan.
+    MetadataEditorDetailsAnalysisComplete {
+        session_id: u64,
+        generation: u64,
+        total: usize,
+        results: Vec<crate::tui::app::MetadataDetailsAnalysisFileResult>,
+    },
     /// Result of a ReplayGain scan launched from the metadata editor.
     MetadataEditorReplayGainComplete {
         session_id: u64,

@@ -2045,13 +2045,22 @@ impl BrowseState {
                             info.metadata.preemphasis_metadata =
                                 super::probe::preemphasis_metadata_check_pub(&path);
                             // HDCD info from analysis cache (if previously analyzed).
+                            let path_key = path.display().to_string();
                             if let Some(analysis) = db.get_cached_analysis(
-                                &path.display().to_string(),
+                                &path_key,
                                 mtime_unix,
                                 entry.size,
                             ) {
                                 if analysis.hdcd_detected == Some(true) {
                                     info.metadata.hdcd_detail = analysis.hdcd_detail;
+                                }
+                            } else if let Some(facts) = db.get_cached_metadata_analysis_facts(
+                                &path_key,
+                                mtime_unix,
+                                entry.size,
+                            ) {
+                                if facts.hdcd_detected == Some(true) {
+                                    info.metadata.hdcd_detail = facts.hdcd_detail;
                                 }
                             }
                             self.probe_cache

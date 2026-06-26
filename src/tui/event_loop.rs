@@ -550,13 +550,22 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                                 .modified()
                                 .map(crate::db::systemtime_to_unix)
                                 .unwrap_or(0);
+                            let path_key = path.display().to_string();
                             if let Some(analysis) = app.db.get_cached_analysis(
-                                &path.display().to_string(),
+                                &path_key,
                                 mtime,
                                 meta.len(),
                             ) {
                                 if analysis.hdcd_detected == Some(true) {
                                     info.metadata.hdcd_detail = analysis.hdcd_detail;
+                                }
+                            } else if let Some(facts) = app.db.get_cached_metadata_analysis_facts(
+                                &path_key,
+                                mtime,
+                                meta.len(),
+                            ) {
+                                if facts.hdcd_detected == Some(true) {
+                                    info.metadata.hdcd_detail = facts.hdcd_detail;
                                 }
                             }
                         }
@@ -1093,6 +1102,121 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             }
             if !reduced {
                 app.set_status("metadata editor: Details probe finished after editor closed");
+            }
+        }
+        AppMessage::MetadataEditorDetailsAnalysisComplete { session_id, generation, total, results } => {
+            let mut reduced = false;
+            if let ActiveOverlay::MetadataEditor(mut state) = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+                if !state.complete_details_analysis(session_id, generation) {
+                    app.set_status(format!(
+                        "metadata editor: ignored stale Details analysis result for session {session_id} generation {generation}"
+                    ));
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    reduced = true;
+                } else {
+                    let mut applied = 0usize;
+                    let mut issue_count = 0usize;
+                    let mut ignored = 0usize;
+                    let mut store_errors = 0usize;
+
+                    if let Some(surface) = state.surface_mut_for_session(session_id) {
+                        for item in results {
+                            issue_count = issue_count.saturating_add(item.issues.len());
+                            let mut facts_to_store = None;
+                            if let Some(file) = surface.technical_details.files.get_mut(item.index) {
+                                if file.file_facts.path == item.path
+                                    && file.file_facts.modified == item.modified
+                                    && file.file_facts.file_size == item.file_size
+                                {
+                                    if item.facts.has_any_result() {
+                                        file.merge_analysis_facts(&item.facts);
+                                        applied = applied.saturating_add(1);
+                                        // Store the already-merged file facts, not the worker's
+                                        // partial detector output. This keeps cache writes
+                                        // idempotent when one detector succeeds and another was
+                                        // not attempted or failed non-fatally.
+                                        facts_to_store = Some(file.analysis_facts.clone());
+                                    }
+                                } else {
+                                    ignored = ignored.saturating_add(1);
+                                }
+                            } else {
+                                ignored = ignored.saturating_add(1);
+                            }
+
+                            if let Some(facts_to_store) = facts_to_store {
+                                if let (Some(modified), Some(size)) = (item.modified.clone(), item.file_size) {
+                                    let mtime = crate::db::systemtime_to_unix(modified);
+                                    if let Err(err) = app.db.store_metadata_analysis_facts(
+                                        &item.path.display().to_string(),
+                                        mtime,
+                                        size,
+                                        &facts_to_store,
+                                    ) {
+                                        store_errors = store_errors.saturating_add(1);
+                                        log::error!("analysis facts cache store failed: {}", err);
+                                    }
+                                }
+
+                                if item.facts.hdcd_detected == Some(true) {
+                                    let updated_probe = app
+                                        .browse
+                                        .probe_cache
+                                        .get(&item.path)
+                                        .and_then(|entry| entry.as_ref())
+                                        .map(|cached| {
+                                            let mut info = (**cached).clone();
+                                            info.metadata.hdcd_detail = item.facts.hdcd_detail.clone();
+                                            info
+                                        });
+                                    if let Some(info) = updated_probe {
+                                        app.browse.probe_cache.insert(
+                                            item.path.clone(),
+                                            Some(std::sync::Arc::new(info)),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        ignored = ignored.saturating_add(total);
+                    }
+
+                    let mut parts = vec![format!(
+                        "{} file{} updated",
+                        applied,
+                        if applied == 1 { "" } else { "s" }
+                    )];
+                    if issue_count > 0 {
+                        parts.push(format!(
+                            "{} issue{}",
+                            issue_count,
+                            if issue_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if ignored > 0 {
+                        parts.push(format!(
+                            "{} stale/unknown ignored",
+                            ignored
+                        ));
+                    }
+                    if store_errors > 0 {
+                        parts.push(format!(
+                            "{} cache write error{}",
+                            store_errors,
+                            if store_errors == 1 { "" } else { "s" }
+                        ));
+                    }
+                    app.set_status(format!(
+                        "metadata editor: Details analysis complete ({})",
+                        parts.join(", ")
+                    ));
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    reduced = true;
+                }
+            }
+            if !reduced {
+                app.set_status("metadata editor: Details analysis finished after editor closed");
             }
         }
         AppMessage::MetadataEditorReplayGainComplete { session_id, generation, mode, paths, result } => {

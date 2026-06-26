@@ -1150,6 +1150,8 @@ impl Database {
                         }
                         Some(2) => Some(crate::tui::preemphasis::PreemphasisConfidence::Detected),
                         Some(1) => Some(crate::tui::preemphasis::PreemphasisConfidence::Possible),
+                        Some(0) => Some(crate::tui::preemphasis::PreemphasisConfidence::NotDetected),
+                        Some(-1) => Some(crate::tui::preemphasis::PreemphasisConfidence::Indeterminate),
                         _ => None,
                     };
                     let hdcd_int: Option<i32> = row.get(15)?;
@@ -1178,6 +1180,165 @@ impl Database {
             .ok()
     }
 
+    /// Look up only the HDCD / Phase-2-safe pre-emphasis facts from the
+    /// analysis cache. Unlike `get_cached_analysis`, this intentionally accepts
+    /// rows that contain only narrow Details-tab facts and no DR/peak/RMS data.
+    pub fn get_cached_metadata_analysis_facts(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: u64,
+    ) -> Option<crate::tui::app::MetadataAnalysisFacts> {
+        self.conn
+            .query_row(
+                "SELECT preemphasis, preemphasis_detail, hdcd_detected, hdcd_detail
+                 FROM analysis_cache
+                 WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3
+                   AND algo_version = ?4",
+                params![file_path, mtime, size as i64, Self::ANALYSIS_ALGO_VERSION],
+                |row| {
+                    let preemph_int: Option<i32> = row.get(0)?;
+                    let preemphasis = match preemph_int {
+                        Some(3) => {
+                            Some(crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate)
+                        }
+                        Some(2) => Some(crate::tui::preemphasis::PreemphasisConfidence::Detected),
+                        Some(1) => Some(crate::tui::preemphasis::PreemphasisConfidence::Possible),
+                        Some(0) => Some(crate::tui::preemphasis::PreemphasisConfidence::NotDetected),
+                        Some(-1) => Some(crate::tui::preemphasis::PreemphasisConfidence::Indeterminate),
+                        _ => None,
+                    };
+                    let hdcd_int: Option<i32> = row.get(2)?;
+                    let facts = crate::tui::app::MetadataAnalysisFacts {
+                        preemphasis,
+                        preemphasis_detail: row.get(1)?,
+                        hdcd_detected: hdcd_int.map(|value| value != 0),
+                        hdcd_detail: row.get(3)?,
+                    };
+                    if facts.has_any_result() {
+                        Ok(Some(facts))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Store only HDCD / Phase-2-safe pre-emphasis facts. Existing full analysis
+    /// metrics are preserved when the file identity is unchanged, but are
+    /// cleared if the same path now points at different bytes. This prevents
+    /// the narrow Details analyzer from poisoning the full DR/peak/RMS cache.
+    pub fn store_metadata_analysis_facts(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: u64,
+        facts: &crate::tui::app::MetadataAnalysisFacts,
+    ) -> Result<(), String> {
+        if !facts.has_any_result() {
+            return Ok(());
+        }
+
+        let preemphasis = facts.preemphasis.as_ref().map(|p| match p {
+            crate::tui::preemphasis::PreemphasisConfidence::Detected => 2i32,
+            crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate => 3i32,
+            crate::tui::preemphasis::PreemphasisConfidence::Possible => 1i32,
+            crate::tui::preemphasis::PreemphasisConfidence::NotDetected => 0i32,
+            crate::tui::preemphasis::PreemphasisConfidence::Indeterminate => -1i32,
+        });
+        let hdcd_detected = facts.hdcd_detected.map(|value| if value { 1i32 } else { 0i32 });
+
+        self.conn.execute(
+            "INSERT INTO analysis_cache (
+                file_path, file_mtime, file_size, algo_version,
+                preemphasis, preemphasis_detail, hdcd_detected, hdcd_detail, analyzed_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            ON CONFLICT(file_path) DO UPDATE SET
+                dr_value = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                  AND analysis_cache.file_size = excluded.file_size
+                                THEN analysis_cache.dr_value ELSE NULL END,
+                peak_db = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                 AND analysis_cache.file_size = excluded.file_size
+                               THEN analysis_cache.peak_db ELSE NULL END,
+                rms_db = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                AND analysis_cache.file_size = excluded.file_size
+                              THEN analysis_cache.rms_db ELSE NULL END,
+                clipping_count = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                        AND analysis_cache.file_size = excluded.file_size
+                                      THEN analysis_cache.clipping_count ELSE NULL END,
+                dc_bias = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                 AND analysis_cache.file_size = excluded.file_size
+                               THEN analysis_cache.dc_bias ELSE NULL END,
+                actual_bit_depth = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                          AND analysis_cache.file_size = excluded.file_size
+                                        THEN analysis_cache.actual_bit_depth ELSE NULL END,
+                declared_bit_depth = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                            AND analysis_cache.file_size = excluded.file_size
+                                          THEN analysis_cache.declared_bit_depth ELSE NULL END,
+                sample_rate = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                     AND analysis_cache.file_size = excluded.file_size
+                                   THEN analysis_cache.sample_rate ELSE NULL END,
+                channels = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                  AND analysis_cache.file_size = excluded.file_size
+                                THEN analysis_cache.channels ELSE NULL END,
+                duration_secs = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                       AND analysis_cache.file_size = excluded.file_size
+                                     THEN analysis_cache.duration_secs ELSE NULL END,
+                lufs = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                              AND analysis_cache.file_size = excluded.file_size
+                            THEN analysis_cache.lufs ELSE NULL END,
+                true_peak_dbtp = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                        AND analysis_cache.file_size = excluded.file_size
+                                      THEN analysis_cache.true_peak_dbtp ELSE NULL END,
+                file_mtime = excluded.file_mtime,
+                file_size = excluded.file_size,
+                algo_version = excluded.algo_version,
+                preemphasis = CASE
+                    WHEN analysis_cache.file_mtime = excluded.file_mtime
+                     AND analysis_cache.file_size = excluded.file_size
+                     AND excluded.preemphasis IS NULL
+                    THEN analysis_cache.preemphasis
+                    ELSE excluded.preemphasis
+                END,
+                preemphasis_detail = CASE
+                    WHEN analysis_cache.file_mtime = excluded.file_mtime
+                     AND analysis_cache.file_size = excluded.file_size
+                     AND excluded.preemphasis IS NULL
+                    THEN analysis_cache.preemphasis_detail
+                    ELSE excluded.preemphasis_detail
+                END,
+                hdcd_detected = CASE
+                    WHEN analysis_cache.file_mtime = excluded.file_mtime
+                     AND analysis_cache.file_size = excluded.file_size
+                     AND excluded.hdcd_detected IS NULL
+                    THEN analysis_cache.hdcd_detected
+                    ELSE excluded.hdcd_detected
+                END,
+                hdcd_detail = CASE
+                    WHEN analysis_cache.file_mtime = excluded.file_mtime
+                     AND analysis_cache.file_size = excluded.file_size
+                     AND excluded.hdcd_detected IS NULL
+                    THEN analysis_cache.hdcd_detail
+                    ELSE excluded.hdcd_detail
+                END,
+                analyzed_at = excluded.analyzed_at",
+            params![
+                file_path,
+                mtime,
+                size as i64,
+                Self::ANALYSIS_ALGO_VERSION,
+                preemphasis,
+                facts.preemphasis_detail.as_deref(),
+                hdcd_detected,
+                facts.hdcd_detail.as_deref(),
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        ).map_err(|e| format!("analysis facts cache store: {}", e))?;
+        Ok(())
+    }
+
     /// Store an analysis result in the cache.
     pub fn store_analysis(
         &self,
@@ -1199,17 +1360,17 @@ impl Database {
                 r.dr_value, r.peak_db, r.rms_db, r.clipping_count as i64, r.dc_bias,
                 r.actual_bit_depth, r.declared_bit_depth, r.sample_rate, r.channels,
                 r.duration_secs, r.lufs, r.true_peak_dbtp,
-                r.preemphasis.as_ref().and_then(|p| match p {
-                    crate::tui::preemphasis::PreemphasisConfidence::Detected => Some(2i32),
-                    crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate => Some(3i32),
-                    crate::tui::preemphasis::PreemphasisConfidence::Possible => Some(1i32),
-                    crate::tui::preemphasis::PreemphasisConfidence::NotDetected => None,
-                    crate::tui::preemphasis::PreemphasisConfidence::Indeterminate => None,
+                r.preemphasis.as_ref().map(|p| match p {
+                    crate::tui::preemphasis::PreemphasisConfidence::Detected => 2i32,
+                    crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate => 3i32,
+                    crate::tui::preemphasis::PreemphasisConfidence::Possible => 1i32,
+                    crate::tui::preemphasis::PreemphasisConfidence::NotDetected => 0i32,
+                    crate::tui::preemphasis::PreemphasisConfidence::Indeterminate => -1i32,
                 }),
                 r.preemphasis_corr,
-                r.preemphasis_detail,
+                r.preemphasis_detail.as_deref(),
                 r.hdcd_detected.map(|b| if b { 1i32 } else { 0 }),
-                r.hdcd_detail,
+                r.hdcd_detail.as_deref(),
                 chrono::Utc::now().to_rfc3339(),
             ],
         ).map_err(|e| format!("analysis cache store: {}", e))?;
@@ -2401,6 +2562,61 @@ mod tests {
         db.invalidate_probe("/music/song.flac").unwrap();
         let cached = db.get_cached_probe("/music/song.flac", 1000, 5000000);
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn metadata_analysis_facts_store_preserves_unattempted_detectors_for_same_file() {
+        use crate::tui::app::MetadataAnalysisFacts;
+        use crate::tui::preemphasis::PreemphasisConfidence;
+
+        let db = Database::open_memory().unwrap();
+        let path = "/music/song.flac";
+        let complete = MetadataAnalysisFacts {
+            hdcd_detected: Some(true),
+            hdcd_detail: Some("HDCD detected".into()),
+            preemphasis: Some(PreemphasisConfidence::Detected),
+            preemphasis_detail: Some("CUE FLAGS PRE".into()),
+        };
+        db.store_metadata_analysis_facts(path, 1000, 5000000, &complete)
+            .unwrap();
+
+        let pre_only = MetadataAnalysisFacts {
+            hdcd_detected: None,
+            hdcd_detail: None,
+            preemphasis: Some(PreemphasisConfidence::NotDetected),
+            preemphasis_detail: Some("no PRE tag, CUE flag, or catalog match".into()),
+        };
+        db.store_metadata_analysis_facts(path, 1000, 5000000, &pre_only)
+            .unwrap();
+
+        let cached = db
+            .get_cached_metadata_analysis_facts(path, 1000, 5000000)
+            .expect("same-identity partial analysis remains cached");
+        assert_eq!(cached.hdcd_detected, Some(true));
+        assert_eq!(cached.hdcd_detail.as_deref(), Some("HDCD detected"));
+        assert_eq!(
+            cached.preemphasis,
+            Some(PreemphasisConfidence::NotDetected),
+            "incoming PRE result should still update the PRE columns",
+        );
+        assert_eq!(
+            cached.preemphasis_detail.as_deref(),
+            Some("no PRE tag, CUE flag, or catalog match"),
+        );
+
+        db.store_metadata_analysis_facts(path, 1001, 5000000, &pre_only)
+            .unwrap();
+        let changed_identity = db
+            .get_cached_metadata_analysis_facts(path, 1001, 5000000)
+            .expect("new-identity partial analysis remains cached");
+        assert_eq!(
+            changed_identity.hdcd_detected, None,
+            "a different file identity must not inherit HDCD facts from old bytes",
+        );
+        assert_eq!(
+            changed_identity.preemphasis,
+            Some(PreemphasisConfidence::NotDetected),
+        );
     }
 
     #[test]

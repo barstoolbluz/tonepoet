@@ -2844,7 +2844,7 @@ impl ContentTab {
 /// ReplayGain scan mode launched from the metadata editor's ReplayGain tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataReplayGainScanMode {
-    /// Recalculate per-track ReplayGain tags for the selected files only.
+    /// Recalculate per-track ReplayGain tags for all active files.
     Track,
     /// Recalculate album + track ReplayGain tags for the whole active album.
     Album,
@@ -2867,6 +2867,33 @@ pub struct MetadataReplayGainScanState {
     pub generation: u64,
     pub mode: MetadataReplayGainScanMode,
     pub file_count: usize,
+}
+
+/// In-flight Details-tab HDCD/PRE analysis identity for the metadata editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataDetailsAnalysisState {
+    /// Details/session id of the presentation surface that launched the scan.
+    pub session_id: u64,
+    pub generation: u64,
+    pub file_count: usize,
+}
+
+/// Result for one file from the Details-tab HDCD/PRE analyzer.
+#[derive(Debug, Clone)]
+pub struct MetadataDetailsAnalysisFileResult {
+    /// Index captured at dispatch time. Reducers must verify path identity too.
+    pub index: usize,
+    pub path: std::path::PathBuf,
+    /// File metadata captured at dispatch time. Used to reject stale results and
+    /// to key partial analysis-cache updates without re-statting in reducers.
+    pub modified: Option<std::time::SystemTime>,
+    pub file_size: Option<u64>,
+    /// Only HDCD and metadata/CUE/catalog PRE facts are populated. This is
+    /// intentionally not a full DR/peak/RMS analysis result.
+    pub facts: MetadataAnalysisFacts,
+    /// Non-fatal per-file analyzer issues. PRE can still succeed when HDCD
+    /// fails, and vice versa.
+    pub issues: Vec<String>,
 }
 
 /// Artwork write/remove mode launched from the metadata editor Artwork tab.
@@ -4177,6 +4204,12 @@ pub struct MetadataAnalysisFacts {
     pub preemphasis_detail: Option<String>,
 }
 
+impl MetadataAnalysisFacts {
+    pub fn has_any_result(&self) -> bool {
+        self.hdcd_detected.is_some() || self.preemphasis.is_some()
+    }
+}
+
 /// Cached, display-oriented filesystem/probe data for one selected audio file.
 ///
 /// Invariant: this struct has a single source of truth for each fact:
@@ -4340,6 +4373,20 @@ impl MetadataFileDetails {
         } else {
             Some(safe.detail)
         };
+    }
+
+    /// Merge the narrow Details-tab analyzer facts without touching unrelated
+    /// DR/peak/RMS/loudness state. `None` means the analyzer did not attempt or
+    /// could not complete that specific detector, so existing facts are kept.
+    pub fn merge_analysis_facts(&mut self, facts: &MetadataAnalysisFacts) {
+        if facts.hdcd_detected.is_some() {
+            self.analysis_facts.hdcd_detected = facts.hdcd_detected;
+            self.analysis_facts.hdcd_detail = facts.hdcd_detail.clone();
+        }
+        if facts.preemphasis.is_some() {
+            self.analysis_facts.preemphasis = facts.preemphasis;
+            self.analysis_facts.preemphasis_detail = facts.preemphasis_detail.clone();
+        }
     }
 }
 
@@ -4846,9 +4893,10 @@ pub struct MetadataEditorModel {
     pub mb_back: Option<MbBackCache>,
     pub gnudb_back: Option<Box<GnudbReviewState>>,
     pub replaygain_cursor: usize,
-    pub replaygain_selected: std::collections::BTreeSet<usize>,
     pub replaygain_scan_generation: u64,
     pub replaygain_scan: Option<MetadataReplayGainScanState>,
+    pub details_analysis_generation: u64,
+    pub details_analysis: Option<MetadataDetailsAnalysisState>,
     pub artwork_cursor: usize,
     pub artwork_write_generation: u64,
     pub artwork_write: Option<MetadataArtworkWriteState>,
@@ -4882,9 +4930,10 @@ impl Default for MetadataEditorModel {
             mb_back: None,
             gnudb_back: None,
             replaygain_cursor: 0,
-            replaygain_selected: std::collections::BTreeSet::new(),
             replaygain_scan_generation: 0,
             replaygain_scan: None,
+            details_analysis_generation: 0,
+            details_analysis: None,
             artwork_cursor: 0,
             artwork_write_generation: 0,
             artwork_write: None,
@@ -5119,6 +5168,32 @@ impl MetadataEditorState {
         }
     }
 
+    pub fn begin_details_analysis(&mut self, file_count: usize) -> (u64, u64) {
+        let session_id = self.active_surface().technical_details.session_id;
+        let generation = self.details_analysis_generation.saturating_add(1);
+        self.details_analysis_generation = generation;
+        self.details_analysis = Some(MetadataDetailsAnalysisState {
+            session_id,
+            generation,
+            file_count,
+        });
+        (session_id, generation)
+    }
+
+    pub fn complete_details_analysis(&mut self, session_id: u64, generation: u64) -> bool {
+        if self
+            .details_analysis
+            .as_ref()
+            .map(|scan| scan.session_id == session_id && scan.generation == generation)
+            .unwrap_or(false)
+        {
+            self.details_analysis = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn begin_artwork_write(
         &mut self,
         mode: MetadataArtworkWriteMode,
@@ -5166,7 +5241,7 @@ impl MetadataEditorState {
     }
 
     pub fn move_replaygain_cursor(&mut self, delta: isize) -> bool {
-        let len = self.active_surface().paths.len();
+        let len = crate::tui::metadata_view_models::replaygain_action_row_count(self);
         if len == 0 {
             self.replaygain_cursor = 0;
             return false;
@@ -5180,37 +5255,6 @@ impl MetadataEditorState {
         };
         self.replaygain_cursor = next;
         old != next
-    }
-
-    pub fn toggle_replaygain_cursor_selection(&mut self) -> bool {
-        let len = self.active_surface().paths.len();
-        let cursor = self.replaygain_cursor;
-        if cursor >= len {
-            return false;
-        }
-        if !self.replaygain_selected.insert(cursor) {
-            self.replaygain_selected.remove(&cursor);
-        }
-        true
-    }
-
-    pub fn set_replaygain_all_selected(&mut self, selected: bool) -> bool {
-        let len = self.active_surface().paths.len();
-        let before = self.replaygain_selected.clone();
-        if selected {
-            self.replaygain_selected = (0..len).collect();
-        } else {
-            self.replaygain_selected.clear();
-        }
-        self.replaygain_selected != before
-    }
-
-    pub fn replaygain_selected_paths(&self) -> Vec<std::path::PathBuf> {
-        let surface = self.active_surface();
-        self.replaygain_selected
-            .iter()
-            .filter_map(|idx| surface.paths.get(*idx).cloned())
-            .collect()
     }
 
     pub fn move_artwork_cursor(&mut self, delta: isize) -> bool {

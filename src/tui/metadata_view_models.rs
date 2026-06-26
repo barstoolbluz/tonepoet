@@ -18,6 +18,7 @@ use super::probe::{ArtworkInfo, SourceInfo};
 pub struct DetailsViewModel {
     pub location: Vec<DetailField>,
     pub probe_status: Option<String>,
+    pub analysis_status: Option<String>,
     pub read_issues: Vec<IssueViewRow>,
     pub general: Vec<DetailField>,
 }
@@ -33,16 +34,12 @@ pub struct ReplayGainViewModel {
     pub has_data: bool,
     pub summary: Vec<DetailField>,
     pub rows: Vec<ReplayGainRow>,
-    pub selected_count: usize,
-    pub total_count: usize,
     pub scan_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReplayGainRow {
     pub index: usize,
-    pub selected: bool,
-    pub cursor: bool,
     pub title: String,
     pub track_gain: String,
     pub album_gain: String,
@@ -211,15 +208,52 @@ pub fn build_details_view_model(state: &MetadataEditorState) -> DetailsViewModel
         general.push(detail_field("Embedded cue sheet", embedded_cuesheet_status(state)));
     }
 
-    general.push(detail_field("HDCD", metadata_hdcd_status(state)));
-    general.push(detail_field("Pre-emphasis", metadata_preemphasis_status(state)));
+    if metadata_hdcd_is_applicable_to_active_surface(state) {
+        general.push(detail_field("HDCD", metadata_hdcd_status(state)));
+    }
+    if metadata_preemphasis_is_applicable_to_active_surface(state) {
+        general.push(detail_field("Pre-emphasis", metadata_preemphasis_status(state)));
+    }
 
     DetailsViewModel {
         location,
         probe_status: metadata_details_probe_status_text(state),
+        analysis_status: metadata_details_analysis_status_text(state),
         read_issues: metadata_file_issue_rows_for_files(state, display_files, true, true),
         general,
     }
+}
+
+pub fn replaygain_action_row_count(state: &MetadataEditorState) -> usize {
+    let track_gain = metadata_entry_values(state, &["REPLAYGAIN_TRACK_GAIN", "R128_TRACK_GAIN"]);
+    let album_gain_values = metadata_entry_values(state, &["REPLAYGAIN_ALBUM_GAIN", "R128_ALBUM_GAIN"]);
+    let track_peak = metadata_entry_values(state, &["REPLAYGAIN_TRACK_PEAK"]);
+    let album_peak = metadata_entry_values(state, &["REPLAYGAIN_ALBUM_PEAK"]);
+    let titles = metadata_track_titles(state);
+    replaygain_row_count_from_parts(
+        state,
+        titles.len(),
+        track_gain.len(),
+        album_gain_values.len(),
+        track_peak.len(),
+        album_peak.len(),
+    )
+}
+
+fn replaygain_row_count_from_parts(
+    state: &MetadataEditorState,
+    title_count: usize,
+    track_gain_count: usize,
+    album_gain_count: usize,
+    track_peak_count: usize,
+    album_peak_count: usize,
+) -> usize {
+    title_count
+        .max(track_gain_count)
+        .max(album_gain_count)
+        .max(track_peak_count)
+        .max(album_peak_count)
+        .max(state.active_surface().paths.len())
 }
 
 pub fn build_replaygain_view_model(state: &MetadataEditorState) -> ReplayGainViewModel {
@@ -245,42 +279,53 @@ pub fn build_replaygain_view_model(state: &MetadataEditorState) -> ReplayGainVie
         .iter()
         .filter_map(|value| parse_db_value(value))
         .collect();
-    let summary = if has_data {
-        vec![
-            detail_field("Track Gain", summarize_values(&track_gain)),
-            detail_field("Album Gain", summarize_values(&album_gain_values)),
-            detail_field("Total Peak", summarize_peak(&track_peak, &album_peak)),
-            detail_field(
-                "Lowest gain (loudest)",
-                gains
-                    .iter()
-                    .copied()
-                    .reduce(f64::min)
-                    .map(|gain| format!("{:+.2} dB", gain))
-                    .unwrap_or_else(|| "—".to_string()),
-            ),
-            detail_field(
-                "Highest gain (quietest)",
-                gains
-                    .iter()
-                    .copied()
-                    .reduce(f64::max)
-                    .map(|gain| format!("{:+.2} dB", gain))
-                    .unwrap_or_else(|| "—".to_string()),
-            ),
-        ]
-    } else {
-        vec![detail_field("Status", "No ReplayGain tags found yet")]
-    };
+    let summary = vec![
+        detail_field(
+            "Track Gain",
+            if has_metadata_values(&track_gain) {
+                summarize_values(&track_gain)
+            } else {
+                "«not scanned»".to_string()
+            },
+        ),
+        detail_field(
+            "Album Gain",
+            if has_metadata_values(&album_gain_values) {
+                summarize_values(&album_gain_values)
+            } else {
+                "«not scanned»".to_string()
+            },
+        ),
+        detail_field("Total Peak", summarize_peak(&track_peak, &album_peak)),
+        detail_field(
+            "Loudest track",
+            gains
+                .iter()
+                .copied()
+                .reduce(f64::min)
+                .map(|gain| format!("{:+.2} dB", gain))
+                .unwrap_or_else(|| "—".to_string()),
+        ),
+        detail_field(
+            "Quietest track",
+            gains
+                .iter()
+                .copied()
+                .reduce(f64::max)
+                .map(|gain| format!("{:+.2} dB", gain))
+                .unwrap_or_else(|| "—".to_string()),
+        ),
+    ];
 
     let titles = metadata_track_titles(state);
-    let row_count = titles
-        .len()
-        .max(track_gain.len())
-        .max(album_gain_values.len())
-        .max(track_peak.len())
-        .max(album_peak.len())
-        .max(state.active_surface().paths.len());
+    let row_count = replaygain_row_count_from_parts(
+        state,
+        titles.len(),
+        track_gain.len(),
+        album_gain_values.len(),
+        track_peak.len(),
+        album_peak.len(),
+    );
     let mut rows = Vec::new();
     for idx in 0..row_count {
         let title = titles
@@ -291,8 +336,6 @@ pub fn build_replaygain_view_model(state: &MetadataEditorState) -> ReplayGainVie
             .unwrap_or_else(|| format!("Track {}", idx + 1));
         rows.push(ReplayGainRow {
             index: idx,
-            selected: state.replaygain_selected.contains(&idx),
-            cursor: state.replaygain_cursor == idx,
             title,
             track_gain: replaygain_cell(&track_gain, idx),
             album_gain: replaygain_cell(&album_gain_values, idx),
@@ -305,8 +348,6 @@ pub fn build_replaygain_view_model(state: &MetadataEditorState) -> ReplayGainVie
         has_data,
         summary,
         rows,
-        selected_count: state.replaygain_selected.len(),
-        total_count: state.active_surface().paths.len(),
         scan_status,
     }
 }
@@ -367,6 +408,63 @@ pub fn build_artwork_view_model(state: &MetadataEditorState) -> ArtworkViewModel
 }
 
 
+pub fn details_analyze_applicable(state: &MetadataEditorState) -> bool {
+    if state.active_surface().technical_details.disc.is_some() {
+        return false;
+    }
+    metadata_details_files_for_display(state).iter().any(|file| {
+        file.file_facts.read_state.is_readable()
+            && (hdcd_applicability_for_file(file) == HdcdApplicability::Applicable
+                || preemphasis_applicable_for_file(file))
+    })
+}
+
+fn metadata_hdcd_is_applicable_to_active_surface(state: &MetadataEditorState) -> bool {
+    if state.active_surface().technical_details.disc.is_some() {
+        return false;
+    }
+    metadata_details_files_for_display(state)
+        .iter()
+        .any(|file| hdcd_applicability_for_file(file) == HdcdApplicability::Applicable)
+}
+
+fn metadata_preemphasis_is_applicable_to_active_surface(state: &MetadataEditorState) -> bool {
+    if state.active_surface().technical_details.disc.is_some() {
+        return false;
+    }
+    metadata_details_files_for_display(state)
+        .iter()
+        .any(preemphasis_applicable_for_file)
+}
+
+fn preemphasis_applicable_for_file(file: &MetadataFileDetails) -> bool {
+    let path = &file.file_facts.path;
+    if path_is_disc_structure(path) || path_has_extension(path, &["dsf", "dff"]) {
+        return false;
+    }
+    if path_has_extension(
+        path,
+        &["mp3", "aac", "ogg", "opus", "wma", "ac3", "dts"],
+    ) {
+        return false;
+    }
+    if let ProbeState::Ready(facts) = &file.media_facts {
+        let combined = format!("{} {}", facts.format_name, facts.codec).to_ascii_lowercase();
+        if combined.contains("dsd")
+            || combined.contains("mp3")
+            || combined.contains("aac")
+            || combined.contains("opus")
+            || combined.contains("vorbis")
+            || combined.contains("ac-3")
+            || combined.contains("e-ac-3")
+            || combined.contains("dts")
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn metadata_hdcd_status(state: &MetadataEditorState) -> String {
     if state.active_surface().technical_details.disc.is_some() {
         return "N/A".to_string();
@@ -381,7 +479,6 @@ fn metadata_hdcd_status(state: &MetadataEditorState) -> String {
 fn hdcd_status_for_file(file: &MetadataFileDetails) -> String {
     match hdcd_applicability_for_file(file) {
         HdcdApplicability::NotApplicable => "N/A".to_string(),
-        HdcdApplicability::Checking => "«checking applicability»".to_string(),
         HdcdApplicability::Applicable => match file.analysis_facts.hdcd_detected {
             Some(true) => file
                 .analysis_facts
@@ -410,7 +507,6 @@ fn normalize_hdcd_detail(detail: &str) -> String {
 enum HdcdApplicability {
     Applicable,
     NotApplicable,
-    Checking,
 }
 
 #[cfg(test)]
@@ -426,7 +522,7 @@ fn hdcd_applicability_for_file(file: &MetadataFileDetails) -> HdcdApplicability 
     if path_has_extension(
         path,
         &[
-            "mp3", "aac", "m4a", "mp4", "ogg", "opus", "wma", "alac", "ac3", "dts",
+            "mp3", "aac", "ogg", "opus", "wma", "ac3", "dts",
         ],
     ) {
         return HdcdApplicability::NotApplicable;
@@ -434,16 +530,11 @@ fn hdcd_applicability_for_file(file: &MetadataFileDetails) -> HdcdApplicability 
 
     let candidate_container = path_has_extension(path, &["flac", "wav", "aiff", "aif", "wv"]);
     let ProbeState::Ready(facts) = &file.media_facts else {
-        // HDCD applicability is ultimately decided from authoritative stream
-        // facts, especially bit depth. While a lazy Details probe is still
-        // loading, keep plausible PCM containers in an explicit pending state
-        // instead of either surfacing stale cache data for 24-bit files or
-        // prematurely rendering a valid 16-bit CD rip as N/A.
-        return if candidate_container {
-            HdcdApplicability::Checking
-        } else {
-            HdcdApplicability::NotApplicable
-        };
+        // HDCD must not be exposed from path plausibility alone. A 24-bit file
+        // can carry stale cached HDCD facts from an earlier identity, so the
+        // Details row and Details analyzer are hidden until the authoritative
+        // stream probe has confirmed 16-bit PCM/lossless applicability.
+        return HdcdApplicability::NotApplicable;
     };
 
     if facts.bit_depth != Some(16) {
@@ -452,7 +543,7 @@ fn hdcd_applicability_for_file(file: &MetadataFileDetails) -> HdcdApplicability 
     let combined = format!("{} {}", facts.format_name, facts.codec).to_ascii_lowercase();
     if combined.contains("dsd")
         || combined.contains("mp3")
-        || combined.contains("aac")
+        || (combined.contains("aac") && !combined.contains("alac"))
         || combined.contains("opus")
         || combined.contains("vorbis")
     {
@@ -549,6 +640,16 @@ fn non_empty_detail(value: Option<&str>) -> Option<&str> {
 
 fn metadata_details_files_for_display(state: &MetadataEditorState) -> &[MetadataFileDetails] {
     &state.active_surface().technical_details.files
+}
+
+fn metadata_details_analysis_status_text(state: &MetadataEditorState) -> Option<String> {
+    state.details_analysis.as_ref().map(|scan| {
+        format!(
+            "Analyzing HDCD/PRE for {} file{}...",
+            scan.file_count,
+            if scan.file_count == 1 { "" } else { "s" }
+        )
+    })
 }
 
 fn metadata_details_probe_status_text(state: &MetadataEditorState) -> Option<String> {
@@ -1495,12 +1596,186 @@ fn artwork_type_label_from_id3_code(code: u8) -> String {
 mod tests {
     use super::*;
 
+    fn details_state_for_file(file: MetadataFileDetails) -> MetadataEditorState {
+        let path = file.file_facts.path.clone();
+        MetadataEditorState::for_files(
+            vec![path],
+            Vec::new(),
+            Vec::new(),
+            super::super::app::MetadataTechnicalDetails::from_files(vec![file]),
+        )
+    }
+
+    fn file_with_probe(
+        path: &str,
+        format_name: &str,
+        codec: &str,
+        bit_depth: Option<u32>,
+    ) -> MetadataFileDetails {
+        let mut file = MetadataFileDetails::from_open_cache(
+            PathBuf::from(path),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            FileWriteEligibility::Writable,
+            super::super::probe::SourceMetadata::default(),
+        );
+        file.set_probe_ready(SourceInfo {
+            format_name: format_name.to_string(),
+            codec: codec.to_string(),
+            sample_rate: 44_100,
+            bit_depth,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 100,
+        });
+        file
+    }
+
     #[test]
     fn replaygain_cell_preserves_missing_positions() {
         let values = vec!["+1.0 dB".to_string(), String::new(), "-2.0 dB".to_string()];
         assert_eq!(replaygain_cell(&values, 0), "+1.0 dB");
         assert_eq!(replaygain_cell(&values, 1), "—");
         assert_eq!(replaygain_cell(&values, 2), "-2.0 dB");
+    }
+
+    #[test]
+    fn details_view_hides_hdcd_and_preemphasis_when_source_is_lossy() {
+        let file = file_with_probe("/tmp/lossy.mp3", "mp3", "mp3", None);
+        let state = details_state_for_file(file);
+        let vm = build_details_view_model(&state);
+
+        assert!(!vm.general.iter().any(|row| row.key == "HDCD"));
+        assert!(!vm.general.iter().any(|row| row.key == "Pre-emphasis"));
+    }
+
+    #[test]
+    fn details_view_shows_cached_hdcd_for_applicable_sixteen_bit_pcm() {
+        let mut file = file_with_probe("/tmp/cd_rip.flac", "flac", "flac", Some(16));
+        file.analysis_facts.hdcd_detected = Some(false);
+        let state = details_state_for_file(file);
+        let vm = build_details_view_model(&state);
+
+        assert_eq!(
+            vm.general
+                .iter()
+                .find(|row| row.key == "HDCD")
+                .map(|row| row.value.as_str()),
+            Some("Not detected")
+        );
+    }
+
+    #[test]
+    fn details_analyze_is_available_for_pcm_details_targets() {
+        let file = file_with_probe("/tmp/cd_rip.flac", "flac", "flac", Some(16));
+        let state = details_state_for_file(file);
+
+        assert!(details_analyze_applicable(&state));
+    }
+
+    #[test]
+    fn details_analyze_is_hidden_for_lossy_details_targets() {
+        let file = file_with_probe("/tmp/lossy.mp3", "mp3", "mp3", None);
+        let state = details_state_for_file(file);
+
+        assert!(!details_analyze_applicable(&state));
+    }
+
+    #[test]
+    fn replaygain_view_model_has_unconditional_summary_and_no_selection_state() {
+        let file = file_with_probe("/tmp/01.flac", "flac", "flac", Some(16));
+        let state = details_state_for_file(file);
+        let vm = build_replaygain_view_model(&state);
+
+        let keys: Vec<&str> = vm.summary.iter().map(|row| row.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "Track Gain",
+                "Album Gain",
+                "Total Peak",
+                "Loudest track",
+                "Quietest track"
+            ]
+        );
+        assert_eq!(vm.summary[0].value, "«not scanned»");
+        assert_eq!(vm.summary[1].value, "«not scanned»");
+        assert_eq!(vm.rows.len(), 1);
+    }
+
+    #[test]
+    fn replaygain_row_count_includes_tag_vectors_not_only_paths() {
+        let file = file_with_probe("/tmp/01.flac", "flac", "flac", Some(16));
+        let mut state = details_state_for_file(file);
+        let surface = state.active_surface_mut();
+        surface.entries.push(super::super::probe::TagEntry {
+            display_key: "REPLAYGAIN_TRACK_GAIN".to_string(),
+            item_key: lofty::tag::ItemKey::ReplayGainTrackGain,
+            value: "-1.0 dB".to_string(),
+            original: "-1.0 dB".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            per_file_values: vec![
+                "-1.0 dB".to_string(),
+                "-2.0 dB".to_string(),
+                "-3.0 dB".to_string(),
+            ],
+            per_file_originals: vec![
+                "-1.0 dB".to_string(),
+                "-2.0 dB".to_string(),
+                "-3.0 dB".to_string(),
+            ],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+
+        assert_eq!(state.active_surface().paths.len(), 1);
+        assert_eq!(replaygain_action_row_count(&state), 3);
+        assert_eq!(build_replaygain_view_model(&state).rows.len(), 3);
+    }
+
+    #[test]
+    fn hdcd_row_is_hidden_until_probe_confirms_sixteen_bit_pcm() {
+        let mut file = MetadataFileDetails::from_open_cache(
+            PathBuf::from("/tmp/unprobed.flac"),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            FileWriteEligibility::Writable,
+            super::super::probe::SourceMetadata::default(),
+        );
+        file.analysis_facts.hdcd_detected = Some(false);
+        let mut state = details_state_for_file(file);
+
+        let vm = build_details_view_model(&state);
+        assert!(!vm.general.iter().any(|row| row.key == "HDCD"));
+        assert!(details_analyze_applicable(&state)); // PRE metadata scan is still valid for this source.
+
+        state.active_surface_mut().technical_details.files[0].set_probe_ready(SourceInfo {
+            format_name: "flac".to_string(),
+            codec: "flac".to_string(),
+            sample_rate: 44_100,
+            bit_depth: Some(16),
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 100,
+        });
+
+        let vm = build_details_view_model(&state);
+        assert_eq!(
+            vm.general
+                .iter()
+                .find(|row| row.key == "HDCD")
+                .map(|row| row.value.as_str()),
+            Some("Not detected")
+        );
     }
 
     #[test]
@@ -1563,7 +1838,7 @@ mod tests {
 
 
     #[test]
-    fn hdcd_status_is_pending_until_authoritative_bit_depth_arrives() {
+    fn hdcd_status_is_hidden_until_authoritative_bit_depth_arrives() {
         let mut file = MetadataFileDetails::from_open_cache(
             PathBuf::from("/tmp/twenty_four_bit.flac"),
             Some(100),
@@ -1576,12 +1851,12 @@ mod tests {
         );
         file.analysis_facts.hdcd_detected = Some(false);
 
-        assert_eq!(hdcd_applicability_for_file(&file), HdcdApplicability::Checking);
-        assert_eq!(hdcd_status_for_file(&file), "«checking applicability»");
+        assert_eq!(hdcd_applicability_for_file(&file), HdcdApplicability::NotApplicable);
+        assert_eq!(hdcd_status_for_file(&file), "N/A");
 
         file.media_facts = ProbeState::Loading { generation: 9 };
-        assert_eq!(hdcd_applicability_for_file(&file), HdcdApplicability::Checking);
-        assert_eq!(hdcd_status_for_file(&file), "«checking applicability»");
+        assert_eq!(hdcd_applicability_for_file(&file), HdcdApplicability::NotApplicable);
+        assert_eq!(hdcd_status_for_file(&file), "N/A");
 
         file.set_probe_ready(SourceInfo {
             format_name: "flac".to_string(),

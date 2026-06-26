@@ -161,6 +161,12 @@ pub enum TuiButton {
     /// MetadataEditor detail-overlay restore pill (per-file values
     /// snap back to the as-retrieved MB proposal).
     MetadataDetailRestore,
+    /// MetadataEditor Details tab: analyze HDCD + non-spectral PRE facts.
+    MetadataDetailsAnalyze,
+    /// MetadataEditor ReplayGain tab: scan all active tracks.
+    MetadataReplayGainScanTrack,
+    /// MetadataEditor ReplayGain tab: scan album + tracks.
+    MetadataReplayGainScanAlbum,
     /// MetadataEditor Artwork tab row hit target. Argument is the
     /// 0-based artwork coverage row index.
     MetadataArtworkRow(usize),
@@ -269,6 +275,9 @@ impl TuiButton {
             | Self::MetadataEntryView(_)
             | Self::MetadataDetailRevert
             | Self::MetadataDetailRestore
+            | Self::MetadataDetailsAnalyze
+            | Self::MetadataReplayGainScanTrack
+            | Self::MetadataReplayGainScanAlbum
             | Self::MetadataArtworkRow(_)
             | Self::MetadataArtworkAdd(_)
             | Self::MetadataArtworkReplace(_)
