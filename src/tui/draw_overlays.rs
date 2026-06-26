@@ -4806,19 +4806,8 @@ fn draw_metadata_replaygain_tab(
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .highlight_style(Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▸ ")
         .block(Block::default());
-    // Scrolling is deterministic: rows are windowed before rendering. The
-    // render-local TableState is now used only for highlighting the selected
-    // row inside that window, so it cannot lose or reset scroll offset.
-    let mut table_state = TableState::default();
-    if let Some(selected) = selected {
-        if visible_rows > 0 {
-            table_state.select(Some(selected.saturating_sub(row_offset)));
-        }
-    }
-    f.render_stateful_widget(table, table_area, &mut table_state);
+    f.render_widget(table, table_area);
 }
 
 fn draw_metadata_artwork_tab(
