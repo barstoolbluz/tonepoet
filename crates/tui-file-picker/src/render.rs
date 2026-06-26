@@ -292,7 +292,13 @@ impl FilePickerState {
             } else {
                 self.theme.menu
             };
-            let hot_style = if disabled { self.theme.menu_disabled } else { self.theme.destructive };
+            let hot_style = if disabled {
+                self.theme.menu_disabled
+            } else if selected {
+                self.theme.menu_selected
+            } else {
+                self.theme.accelerator
+            };
             lines.push(menu_line(label, inner.width as usize, style, hot_style));
             let hit_action = match action {
                 Some(action) => FilePickerHitAction::Menu(*action),
@@ -327,7 +333,13 @@ impl FilePickerState {
                 } else {
                     self.theme.menu
                 };
-                let hot_style = if disabled { self.theme.menu_disabled } else { self.theme.destructive };
+                let hot_style = if disabled {
+                    self.theme.menu_disabled
+                } else if selected {
+                    self.theme.menu_selected
+                } else {
+                    self.theme.accelerator
+                };
                 lines.push(menu_line(label, inner.width as usize, style, hot_style));
                 if !disabled {
                     hits.push(HitRegion {

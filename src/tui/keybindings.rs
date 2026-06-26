@@ -3548,6 +3548,7 @@ fn file_picker_theme_from_tonepoet_theme() -> tui_file_picker::FilePickerTheme {
         menu: Style::default().fg(super::theme::TEXT_BRIGHT).bg(super::theme::SURFACE),
         menu_selected: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
         menu_disabled: Style::default().fg(super::theme::TEXT_MUTED).bg(super::theme::SURFACE),
+        accelerator: Style::default().fg(super::theme::AMBER).add_modifier(Modifier::UNDERLINED),
         destructive: Style::default().fg(super::theme::RED).add_modifier(Modifier::BOLD),
         error: Style::default().fg(super::theme::RED),
     }

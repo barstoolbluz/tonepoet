@@ -18,6 +18,7 @@ pub struct FilePickerTheme {
     pub menu: Style,
     pub menu_selected: Style,
     pub menu_disabled: Style,
+    pub accelerator: Style,
     pub destructive: Style,
     pub error: Style,
 }
@@ -40,6 +41,7 @@ impl Default for FilePickerTheme {
             menu: Style::default().fg(Color::Black).bg(Color::Gray),
             menu_selected: Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
             menu_disabled: Style::default().fg(Color::DarkGray).bg(Color::Gray),
+            accelerator: Style::default().fg(Color::Yellow).add_modifier(Modifier::UNDERLINED),
             destructive: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             error: Style::default().fg(Color::Red),
         }
