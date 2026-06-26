@@ -141,6 +141,27 @@ pub struct HitRegion {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolbarButtonGeometry {
+    pub action: ToolbarAction,
+    pub rect: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteConfirmButton {
+    Delete,
+    Cancel,
+}
+
+impl DeleteConfirmButton {
+    pub(crate) fn toggle(self) -> Self {
+        match self {
+            Self::Delete => Self::Cancel,
+            Self::Cancel => Self::Delete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilePickerCreateKind {
     File,
     Folder,
@@ -289,6 +310,28 @@ impl FilePickerError {
             ),
         }
     }
+
+    pub(crate) fn status_message(&self) -> String {
+        match self {
+            Self::Io { op, message, .. } if op.starts_with("delete") => {
+                format!("Delete failed: {message}")
+            }
+            Self::Io { op, message, .. } => {
+                format!("{} failed: {message}", sentence_case_operation(op))
+            }
+            other => other.message(),
+        }
+    }
+}
+
+fn sentence_case_operation(op: &str) -> String {
+    let mut chars = op.chars();
+    let Some(first) = chars.next() else {
+        return "Operation".to_string();
+    };
+    let mut out = first.to_uppercase().collect::<String>();
+    out.push_str(chars.as_str());
+    out
 }
 
 impl fmt::Display for FilePickerError {
@@ -369,9 +412,11 @@ pub struct FilePickerState {
     pub(crate) sort_reverse: bool,
     pub(crate) clipboard: Option<FilePickerClipboard>,
     pub(crate) pending_delete: Option<PathBuf>,
+    pub(crate) delete_confirm_button: DeleteConfirmButton,
     pub(crate) properties_open: bool,
     pub(crate) last_error: Option<FilePickerError>,
     pub(crate) hit_regions: Vec<HitRegion>,
+    pub(crate) toolbar_button_geometry: Vec<ToolbarButtonGeometry>,
     pub(crate) last_layout: Option<FilePickerLayoutMetrics>,
     pub(crate) last_click: Option<LastClick>,
     pub(crate) double_click_window: Duration,
@@ -416,9 +461,11 @@ impl FilePickerState {
             sort_reverse: false,
             clipboard: None,
             pending_delete: None,
+            delete_confirm_button: DeleteConfirmButton::Cancel,
             properties_open: false,
             last_error: None,
             hit_regions: Vec::new(),
+            toolbar_button_geometry: Vec::new(),
             last_layout: None,
             last_click: None,
             double_click_window: Duration::from_millis(500),
@@ -524,6 +571,10 @@ impl FilePickerState {
         self.last_error.as_ref().map(FilePickerError::message)
     }
 
+    pub(crate) fn status_error_message(&self) -> Option<String> {
+        self.last_error.as_ref().map(FilePickerError::status_message)
+    }
+
     pub fn hit_regions(&self) -> &[HitRegion] {
         &self.hit_regions
     }
@@ -571,12 +622,46 @@ impl FilePickerState {
 
     pub(crate) fn clear_hit_regions(&mut self) {
         self.hit_regions.clear();
+        self.toolbar_button_geometry.clear();
     }
 
     pub(crate) fn record_hit_region(&mut self, rect: Rect, action: FilePickerHitAction) {
         if rect.width > 0 && rect.height > 0 {
             self.hit_regions.push(HitRegion { rect, action });
         }
+    }
+
+    pub(crate) fn record_hit_region_clipped(
+        &mut self,
+        rect: Rect,
+        clip: Rect,
+        action: FilePickerHitAction,
+    ) -> Option<Rect> {
+        let clipped = intersect_rect(rect, clip)?;
+        self.hit_regions.push(HitRegion { rect: clipped, action });
+        Some(clipped)
+    }
+
+    pub(crate) fn record_toolbar_button_geometry(&mut self, action: ToolbarAction, rect: Rect) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        if let Some(existing) = self
+            .toolbar_button_geometry
+            .iter_mut()
+            .find(|geometry| geometry.action == action)
+        {
+            existing.rect = rect;
+        } else {
+            self.toolbar_button_geometry.push(ToolbarButtonGeometry { action, rect });
+        }
+    }
+
+    pub(crate) fn toolbar_button_rect(&self, action: ToolbarAction) -> Option<Rect> {
+        self.toolbar_button_geometry
+            .iter()
+            .find(|geometry| geometry.action == action)
+            .map(|geometry| geometry.rect)
     }
 
     pub(crate) fn set_error(&mut self, error: FilePickerError) {
@@ -677,6 +762,7 @@ impl FilePickerState {
         self.submenu_open = false;
         self.properties_open = false;
         self.pending_delete = None;
+        self.delete_confirm_button = DeleteConfirmButton::Cancel;
         self.pending_create = None;
         self.focus = FilePickerFocus::Files;
         self.previous_focus = FilePickerFocus::Files;
@@ -1194,11 +1280,8 @@ impl FilePickerState {
                 self.pending_delete = Some(entry.path.clone());
                 self.previous_focus = self.focus;
                 self.focus = FilePickerFocus::DeleteConfirm;
-                self.set_error(FilePickerError::Io {
-                    op: "delete confirmation required",
-                    path: entry.path,
-                    message: "Enter/Y confirms; Esc/N cancels".to_string(),
-                });
+                self.delete_confirm_button = DeleteConfirmButton::Cancel;
+                self.clear_error();
                 true
             }
             None => {
@@ -1210,6 +1293,7 @@ impl FilePickerState {
 
     pub fn cancel_delete(&mut self) {
         self.pending_delete = None;
+        self.delete_confirm_button = DeleteConfirmButton::Cancel;
         self.focus = FilePickerFocus::Files;
         self.clear_error();
     }
@@ -1234,6 +1318,7 @@ impl FilePickerState {
             self.selected = None;
         }
         self.pending_delete = None;
+        self.delete_confirm_button = DeleteConfirmButton::Cancel;
         self.focus = FilePickerFocus::Files;
         self.refresh();
         Ok(())
@@ -1268,6 +1353,18 @@ impl FilePickerState {
                     && self.clipboard.as_ref().map(|clipboard| clipboard.path.exists()).unwrap_or(false)
             }
         }
+    }
+}
+
+pub(crate) fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
+    let bottom = a.y.saturating_add(a.height).min(b.y.saturating_add(b.height));
+    if right > left && bottom > top {
+        Some(Rect::new(left, top, right - left, bottom - top))
+    } else {
+        None
     }
 }
 
@@ -1520,6 +1617,20 @@ pub(crate) fn root_path() -> PathBuf {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn delete_io_errors_have_status_bar_copy_without_full_path() {
+        let path = PathBuf::from("/tmp/example/front 2.jpg");
+        let error = FilePickerError::Io {
+            op: "delete file",
+            path: path.clone(),
+            message: "permission denied".to_string(),
+        };
+
+        assert_eq!(error.status_message(), "Delete failed: permission denied");
+        assert!(error.message().contains(&path.display().to_string()));
+    }
+
     #[test]
     fn navigation_maintains_back_forward_history() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1602,6 +1713,30 @@ mod tests {
         assert_eq!(picker.commit_address(), FilePickerAction::Selected(file.clone()));
         assert!(same_path(picker.current_dir(), temp.path()));
         assert_eq!(picker.selected_path(), Some(file.as_path()));
+    }
+
+
+    #[test]
+    fn request_delete_current_opens_confirmation_without_setting_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("cover.png");
+        fs::write(&file, b"png").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        let index = picker.entries().iter().position(|entry| entry.path == file).expect("file visible");
+        picker.set_file_cursor(index, 4);
+        picker.set_error(FilePickerError::NoSelection);
+
+        assert!(picker.request_delete_current());
+
+        assert_eq!(picker.focus(), FilePickerFocus::DeleteConfirm);
+        assert_eq!(picker.pending_delete.as_deref(), Some(file.as_path()));
+        assert_eq!(picker.delete_confirm_button, DeleteConfirmButton::Cancel);
+        assert!(picker.last_error().is_none(), "confirmation is expected UI state, not an error");
+        assert!(file.exists(), "requesting confirmation must not delete immediately");
     }
 
     #[test]

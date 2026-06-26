@@ -1,6 +1,6 @@
 use crate::state::{
-    FilePickerCreateKind, FilePickerFocus, FilePickerHitAction, FilePickerMenuAction, FilePickerState,
-    HitRegion, ToolbarAction,
+    intersect_rect, DeleteConfirmButton, FilePickerCreateKind, FilePickerFocus, FilePickerHitAction,
+    FilePickerMenuAction, FilePickerState, HitRegion, ToolbarAction,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -65,37 +65,50 @@ impl FilePickerState {
     fn render_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let mut spans = Vec::new();
         let mut x = area.x;
+        let toolbar_right = area.x.saturating_add(area.width);
         let buttons = [
-            ("‹ Back", ToolbarAction::Back, self.history_back.is_empty()),
-            ("› Forward", ToolbarAction::Forward, self.history_forward.is_empty()),
-            ("↑ Up", ToolbarAction::Up, self.current_dir.parent().is_none()),
-            ("│", ToolbarAction::Up, true),
+            ("‹ Back", Some(ToolbarAction::Back), self.history_back.is_empty()),
+            ("› Forward", Some(ToolbarAction::Forward), self.history_forward.is_empty()),
+            ("↑ Up", Some(ToolbarAction::Up), self.current_dir.parent().is_none()),
+            ("│", None, true),
             (
                 if self.menu_open { "File Operations ▴" } else { "File Operations ▾" },
-                ToolbarAction::FileOperations,
+                Some(ToolbarAction::FileOperations),
                 false,
             ),
-            ("Properties", ToolbarAction::Properties, self.current_selection().is_none()),
+            ("Properties", Some(ToolbarAction::Properties), self.current_selection().is_none()),
         ];
         for (idx, (label, action, disabled)) in buttons.iter().enumerate() {
             if idx > 0 {
                 spans.push(Span::raw("  "));
                 x = x.saturating_add(2);
             }
-            let width = label.chars().count() as u16;
+
+            if action.is_none() {
+                let width = label.chars().count() as u16;
+                spans.push(Span::styled((*label).to_string(), self.theme.border_dim));
+                x = x.saturating_add(width);
+                continue;
+            }
+
+            let width = button_width(label);
             let style = if *disabled {
-                self.theme.text_dim
-            } else if *action == ToolbarAction::FileOperations && self.menu_open {
-                self.theme.toolbar_active
+                self.theme.button_disabled
+            } else if *action == Some(ToolbarAction::FileOperations) && self.menu_open {
+                self.theme.button_focused
             } else {
-                self.theme.toolbar
+                self.theme.button
             };
-            spans.push(Span::styled((*label).to_string(), style));
-            if !*disabled && *label != "│" {
-                self.record_hit_region(Rect::new(x, area.y, width, 1), FilePickerHitAction::Toolbar(*action));
+            spans.push(button_span(label, style));
+            let raw_rect = Rect::new(x, area.y, width, 1);
+            if let Some(visible_rect) = intersect_rect(raw_rect, area) {
+                self.record_toolbar_button_geometry((*action).unwrap(), visible_rect);
+                if !*disabled {
+                    self.record_hit_region(visible_rect, FilePickerHitAction::Toolbar((*action).unwrap()));
+                }
             }
             x = x.saturating_add(width);
-            if x >= area.x.saturating_add(area.width) {
+            if x >= toolbar_right {
                 break;
             }
         }
@@ -103,7 +116,8 @@ impl FilePickerState {
     }
 
     fn render_address(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let go_width = 6u16;
+        let go_label = "Go";
+        let go_width = button_width(go_label);
         let label = "Address:";
         let input_x = area.x.saturating_add(label.chars().count() as u16 + 2);
         let input_width = area
@@ -121,14 +135,22 @@ impl FilePickerState {
             Span::raw("  "),
             Span::styled(input, self.theme.text),
             Span::raw(" "),
-            Span::styled("[ Go ]", self.theme.toolbar),
+            button_span(go_label, self.theme.button),
         ]);
         frame.render_widget(Paragraph::new(line), area);
-        self.record_hit_region(Rect::new(input_x, area.y, input_width, 1), FilePickerHitAction::Address);
-        self.record_hit_region(
-            Rect::new(area.x.saturating_add(area.width.saturating_sub(go_width)), area.y, go_width, 1),
-            FilePickerHitAction::Toolbar(ToolbarAction::Go),
+        let _ = self.record_hit_region_clipped(
+            Rect::new(input_x, area.y, input_width, 1),
+            area,
+            FilePickerHitAction::Address,
         );
+        let go_rect = Rect::new(area.x.saturating_add(area.width.saturating_sub(go_width)), area.y, go_width, 1);
+        if let Some(visible_rect) = self.record_hit_region_clipped(
+            go_rect,
+            area,
+            FilePickerHitAction::Toolbar(ToolbarAction::Go),
+        ) {
+            self.record_toolbar_button_geometry(ToolbarAction::Go, visible_rect);
+        }
     }
 
     fn render_split_pane(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -248,12 +270,12 @@ impl FilePickerState {
     fn render_status(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let count = self.entries.len();
         let total = format_size(self.visible_total_size());
-        let error = self.error_message();
-        let left = format!(" {count} items");
+        let error = self.status_error_message();
+        let left = format!("{count} {}", pluralize(count, "item", "items"));
         let center = error.unwrap_or_else(|| format!("{total} visible"));
         let right = match self.free_space_bytes {
-            Some(bytes) => format!("{} free ", format_size(bytes)),
-            None => "free space unavailable ".to_string(),
+            Some(bytes) => format!("{} free", format_size(bytes)),
+            None => "free space unavailable".to_string(),
         };
         let width = area.width as usize;
         let line = distribute_status(&left, &center, &right, width);
@@ -262,11 +284,18 @@ impl FilePickerState {
     }
 
     fn render_file_operations_menu(&mut self, frame: &mut Frame<'_>, toolbar_area: Rect) {
-        let menu_x = toolbar_area
+        let menu_width = 15;
+        let menu_height = 7;
+        let toolbar_right = toolbar_area.x.saturating_add(toolbar_area.width);
+        let fallback_anchor = Rect::new(toolbar_area.x, toolbar_area.y, 1, 1);
+        let anchor = self
+            .toolbar_button_rect(ToolbarAction::FileOperations)
+            .unwrap_or(fallback_anchor);
+        let menu_x = anchor
             .x
-            .saturating_add(28)
-            .min(toolbar_area.x.saturating_add(toolbar_area.width.saturating_sub(16)));
-        let menu_area = Rect::new(menu_x, toolbar_area.y.saturating_add(1), 15, 7);
+            .min(toolbar_right.saturating_sub(menu_width))
+            .max(toolbar_area.x);
+        let menu_area = Rect::new(menu_x, toolbar_area.y.saturating_add(1), menu_width, menu_height);
         frame.render_widget(Clear, menu_area);
         let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
         let inner = block.inner(menu_area);
@@ -315,7 +344,17 @@ impl FilePickerState {
         frame.render_widget(Paragraph::new(lines), inner);
 
         if self.submenu_open {
-            let submenu_area = Rect::new(menu_area.x.saturating_add(menu_area.width), menu_area.y.saturating_add(1), 10, 4);
+            let submenu_width = 10;
+            let submenu_height = 4;
+            let bounds = self.last_rendered_area().unwrap_or(toolbar_area);
+            let bounds_right = bounds.x.saturating_add(bounds.width);
+            let submenu_right_x = menu_area.x.saturating_add(menu_area.width);
+            let submenu_x = if submenu_right_x.saturating_add(submenu_width) <= bounds_right {
+                submenu_right_x
+            } else {
+                menu_area.x.saturating_sub(submenu_width).max(bounds.x)
+            };
+            let submenu_area = Rect::new(submenu_x, menu_area.y.saturating_add(1), submenu_width, submenu_height);
             frame.render_widget(Clear, submenu_area);
             let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
             let inner = block.inner(submenu_area);
@@ -383,26 +422,66 @@ impl FilePickerState {
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(self.theme.destructive)
-            .title("Confirm delete");
+            .border_style(self.theme.border)
+            .title(" Confirm ");
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        let target = self
-            .pending_delete
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "no pending delete".to_string());
-        let lines = vec![
-            Line::from(Span::styled("This permanently deletes the selected path under the configured delete policy.", self.theme.destructive)),
-            Line::from(""),
-            Line::from(target),
-            Line::from(""),
-            Line::from("[ Delete ]    [ Cancel ]"),
-        ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+        let target = self.pending_delete.as_deref();
+        let file_name = target
+            .and_then(|path| path.file_name())
+            .map(|name| clean_display_text(&name.to_string_lossy()))
+            .unwrap_or_else(|| "selected item".to_string());
+        let path_text = target
+            .map(|path| clean_display_text(&path.display().to_string()))
+            .unwrap_or_else(|| "No pending delete".to_string());
+        let message = format!("Delete \"{file_name}\"?");
+        let text_width = inner.width.saturating_sub(4) as usize;
+        let path_width = text_width.saturating_sub(2);
+        let message_line = indent_text(&message, 2, text_width);
+        let path_line = format!("  {}", fit_text_right(&path_text, path_width));
+
+        let delete_label = "Delete";
+        let cancel_label = "Cancel";
+        let delete_width = button_width(delete_label);
+        let cancel_width = button_width(cancel_label);
+        let gap = 4u16;
+        let total_width = delete_width.saturating_add(gap).saturating_add(cancel_width);
+        let button_x = inner.x.saturating_add(inner.width.saturating_sub(total_width) / 2);
         let button_y = inner.y.saturating_add(inner.height.saturating_sub(1));
-        self.record_hit_region(Rect::new(inner.x, button_y, 10, 1), FilePickerHitAction::DeleteConfirm);
-        self.record_hit_region(Rect::new(inner.x.saturating_add(14), button_y, 10, 1), FilePickerHitAction::DeleteCancel);
+        let text_area = Rect::new(inner.x, inner.y, inner.width, button_y.saturating_sub(inner.y));
+        let mut lines = Vec::new();
+        if text_area.height >= 4 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(message_line, self.theme.text)));
+        if text_area.height >= 3 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(path_line, self.theme.text_dim)));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
+
+        let delete_style = if self.delete_confirm_button == DeleteConfirmButton::Delete {
+            self.theme.button_focused
+        } else {
+            self.theme.button
+        };
+        let cancel_style = if self.delete_confirm_button == DeleteConfirmButton::Cancel {
+            self.theme.button_focused
+        } else {
+            self.theme.button
+        };
+        let line = Line::from(vec![
+            button_span(delete_label, delete_style),
+            Span::raw(" ".repeat(gap as usize)),
+            button_span(cancel_label, cancel_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, total_width, 1));
+        self.record_hit_region(Rect::new(button_x, button_y, delete_width, 1), FilePickerHitAction::DeleteConfirm);
+        self.record_hit_region(
+            Rect::new(button_x.saturating_add(delete_width).saturating_add(gap), button_y, cancel_width, 1),
+            FilePickerHitAction::DeleteCancel,
+        );
     }
 
     fn render_create_name_popup(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -460,6 +539,29 @@ fn fit_text_right(text: &str, width: usize) -> String {
     }
     let suffix: String = text.chars().rev().take(width - 1).collect::<String>().chars().rev().collect();
     format!("…{suffix}")
+}
+
+fn button_width(label: &str) -> u16 {
+    label.chars().count().saturating_add(2) as u16
+}
+
+fn button_span(label: &str, style: ratatui::style::Style) -> Span<'static> {
+    Span::styled(format!(" {label} "), style)
+}
+
+fn clean_display_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+}
+
+fn indent_text(text: &str, indent: usize, width: usize) -> String {
+    let available = width.saturating_sub(indent);
+    format!("{}{}", " ".repeat(indent), fit_text_left(text, available))
+}
+
+fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
 }
 
 fn text_with_caret(text: &str, cursor: usize, width: usize) -> String {
@@ -530,14 +632,27 @@ fn distribute_status(left: &str, center: &str, right: &str, width: usize) -> Str
     if width == 0 {
         return String::new();
     }
-    let left = fit_text_left(left, left.chars().count());
-    let right_len = right.chars().count();
-    let left_len = left.chars().count();
-    if left_len + right_len >= width {
-        return fit_text_left(&format!("{left} {right}"), width);
+
+    let leading = [left.trim(), center.trim()]
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("  |  ");
+    let right = right.trim();
+    if right.is_empty() {
+        return fit_text_left(&leading, width);
     }
-    let center_width = width.saturating_sub(left_len).saturating_sub(right_len);
-    format!("{left}{}{}", fit_text_left(center, center_width), right)
+
+    let leading_len = leading.chars().count();
+    let right_len = right.chars().count();
+    let minimum_gap = 3;
+    if leading_len + minimum_gap + right_len > width {
+        return fit_text_left(&format!("{leading}  |  {right}"), width);
+    }
+
+    let gap = width - leading_len - right_len;
+    let spacer = " ".repeat(gap);
+    format!("{leading}{spacer}{right}")
 }
 
 fn same_display_path(a: &std::path::Path, b: &std::path::Path) -> bool {
@@ -554,6 +669,8 @@ mod tests {
     use super::*;
     use crate::{FilePickerConfig, FilePickerFilter};
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::Terminal;
     use std::fs;
 
@@ -577,6 +694,195 @@ mod tests {
     }
 
     #[test]
+    fn toolbar_hit_regions_are_clipped_to_the_visible_toolbar_area() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("cover.png"), b"png").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(54, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let area = Rect::new(0, 0, 48, 12);
+        terminal.draw(|frame| picker.render(frame, area)).expect("draw");
+
+        let toolbar_area = Rect::new(1, 1, 46, 1);
+        for hit in picker.hit_regions().iter() {
+            match hit.action {
+                FilePickerHitAction::Toolbar(ToolbarAction::Go) => {}
+                FilePickerHitAction::Toolbar(_) => {
+                    assert!(rect_contains_rect(toolbar_area, hit.rect), "toolbar hit not clipped: {:?}", hit);
+                }
+                _ => {}
+            }
+        }
+
+        let file_ops = picker
+            .toolbar_button_rect(ToolbarAction::FileOperations)
+            .expect("visible file operations geometry");
+        assert!(
+            rect_contains_rect(toolbar_area, file_ops),
+            "toolbar geometry not clipped: {:?}",
+            file_ops
+        );
+    }
+
+    #[test]
+    fn file_operations_menu_anchors_to_the_recorded_button_geometry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("cover.png"), b"png").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        picker.menu_open = true;
+        picker.focus = FilePickerFocus::Menu;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 96, 24)))
+            .expect("draw");
+
+        let file_ops = picker
+            .toolbar_button_rect(ToolbarAction::FileOperations)
+            .expect("file operations button geometry");
+        let menu_new = picker
+            .hit_regions()
+            .iter()
+            .find(|hit| matches!(hit.action, FilePickerHitAction::MenuNew))
+            .expect("menu item hit region");
+
+        assert_eq!(menu_new.rect.x, file_ops.x.saturating_add(1));
+        assert_eq!(menu_new.rect.y, file_ops.y.saturating_add(2));
+    }
+
+    #[test]
+    fn toolbar_buttons_apply_buffer_cell_background_styles() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("cover.png"), b"png").expect("file");
+        let mut theme = crate::FilePickerTheme::default();
+        theme.button = Style::default().fg(Color::White).bg(Color::Blue);
+        theme.button_focused = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        theme.button_disabled = Style::default().fg(Color::DarkGray).bg(Color::Red);
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            theme,
+            ..FilePickerConfig::default()
+        });
+        picker.menu_open = true;
+        picker.focus = FilePickerFocus::Menu;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 96, 24)))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+
+        let back = picker.toolbar_button_rect(ToolbarAction::Back).expect("back geometry");
+        let up = picker.toolbar_button_rect(ToolbarAction::Up).expect("up geometry");
+        let file_ops = picker
+            .toolbar_button_rect(ToolbarAction::FileOperations)
+            .expect("file operations geometry");
+
+        assert_eq!(buffer.get(back.x, back.y).bg, Color::Red);
+        assert_eq!(buffer.get(up.x, up.y).bg, Color::Blue);
+        assert_eq!(buffer.get(file_ops.x, file_ops.y).bg, Color::Green);
+        assert!(buffer.get(file_ops.x, file_ops.y).modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn delete_confirmation_buttons_apply_normal_and_focused_styles() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("front 2.jpg");
+        fs::write(&file, b"jpg").expect("file");
+        let mut theme = crate::FilePickerTheme::default();
+        theme.button = Style::default().fg(Color::White).bg(Color::Blue);
+        theme.button_focused = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            theme,
+            ..FilePickerConfig::default()
+        });
+        let index = picker.entries().iter().position(|entry| entry.path == file).expect("file visible");
+        picker.set_file_cursor(index, 4);
+        assert!(picker.request_delete_current());
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 96, 24)))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let delete = find_text(buffer, " Delete ", 100, 30).expect("delete button text");
+        let cancel = find_text(buffer, " Cancel ", 100, 30).expect("cancel button text");
+
+        assert_eq!(buffer.get(delete.0, delete.1).bg, Color::Blue);
+        assert_eq!(buffer.get(cancel.0, cancel.1).bg, Color::Green);
+        assert!(buffer.get(cancel.0, cancel.1).modifier.contains(Modifier::BOLD));
+    }
+
+
+    #[test]
+    fn status_bar_uses_separators_between_segments() {
+        let line = distribute_status("3 items", "12.0 KB visible", "3401.7 GB free", 80);
+        assert!(line.contains("3 items  |  12.0 KB visible"));
+        assert!(line.contains("3401.7 GB free"));
+        assert!(!line.contains("items12"));
+    }
+
+    #[test]
+    fn delete_confirmation_renders_clean_copy_without_status_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("front 2.jpg");
+        fs::write(&file, b"jpg").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        let index = picker.entries().iter().position(|entry| entry.path == file).expect("file visible");
+        picker.set_file_cursor(index, 4);
+        assert!(picker.request_delete_current());
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 96, 24)))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Confirm"));
+        assert!(rendered.contains("Delete \"front 2.jpg\"?"));
+        assert!(rendered.contains("Delete"));
+        assert!(rendered.contains("Cancel"));
+        assert!(!rendered.contains("configured delete policy"));
+        assert!(!rendered.contains("failed for"));
+        assert!(picker.last_error().is_none());
+        assert!(picker
+            .hit_regions()
+            .iter()
+            .any(|hit| matches!(hit.action, FilePickerHitAction::DeleteConfirm)));
+        assert!(picker
+            .hit_regions()
+            .iter()
+            .any(|hit| matches!(hit.action, FilePickerHitAction::DeleteCancel)));
+    }
+
+    #[test]
     fn status_bar_reports_free_space_when_host_provides_it() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut picker = FilePickerState::new(FilePickerConfig {
@@ -592,5 +898,32 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("142.0 GB free"));
+    }
+
+    fn rect_contains_rect(outer: Rect, inner: Rect) -> bool {
+        inner.x >= outer.x
+            && inner.y >= outer.y
+            && inner.x.saturating_add(inner.width) <= outer.x.saturating_add(outer.width)
+            && inner.y.saturating_add(inner.height) <= outer.y.saturating_add(outer.height)
+    }
+
+    fn find_text(buffer: &Buffer, text: &str, width: u16, height: u16) -> Option<(u16, u16)> {
+        let symbols = text.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+        let text_width = u16::try_from(symbols.len()).ok()?;
+        if text_width == 0 || text_width > width {
+            return None;
+        }
+        for y in 0..height {
+            for x in 0..=width.saturating_sub(text_width) {
+                if symbols
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, symbol)| buffer.get(x.saturating_add(offset as u16), y).symbol() == symbol.as_str())
+                {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
     }
 }

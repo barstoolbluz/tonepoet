@@ -1,6 +1,6 @@
 use crate::state::{
-    FilePickerAction, FilePickerCreateKind, FilePickerError, FilePickerFocus, FilePickerHitAction,
-    FilePickerMenuAction, FilePickerState, LastClick, ToolbarAction,
+    DeleteConfirmButton, FilePickerAction, FilePickerCreateKind, FilePickerError, FilePickerFocus,
+    FilePickerHitAction, FilePickerMenuAction, FilePickerState, LastClick, ToolbarAction,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -283,7 +283,22 @@ impl FilePickerState {
     fn handle_delete_confirm_key(&mut self, key: KeyEvent) -> FilePickerAction {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => self.cancel_delete(),
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Tab => {
+                self.delete_confirm_button = self.delete_confirm_button.toggle();
+            }
+            KeyCode::Left => {
+                self.delete_confirm_button = DeleteConfirmButton::Delete;
+            }
+            KeyCode::Right => {
+                self.delete_confirm_button = DeleteConfirmButton::Cancel;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match self.delete_confirm_button {
+                DeleteConfirmButton::Delete => {
+                    self.confirm_delete();
+                }
+                DeleteConfirmButton::Cancel => self.cancel_delete(),
+            },
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.confirm_delete();
             }
             _ => {}
@@ -358,10 +373,12 @@ impl FilePickerState {
                 FilePickerAction::None
             }
             FilePickerHitAction::DeleteConfirm => {
+                self.delete_confirm_button = DeleteConfirmButton::Delete;
                 self.confirm_delete();
                 FilePickerAction::None
             }
             FilePickerHitAction::DeleteCancel => {
+                self.delete_confirm_button = DeleteConfirmButton::Cancel;
                 self.cancel_delete();
                 FilePickerAction::None
             }
@@ -655,6 +672,53 @@ mod tests {
         picker.set_file_cursor(index, 4);
         let _ = picker.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(picker.last_error(), Some(FilePickerError::OperationDisabled("copy"))));
+    }
+
+
+    #[test]
+    fn delete_confirmation_enter_activates_focused_button() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("cover.png");
+        fs::write(&file, b"png").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        let index = picker.entries().iter().position(|entry| entry.path == file).expect("file visible");
+        picker.set_file_cursor(index, 4);
+
+        assert!(picker.request_delete_current());
+        assert_eq!(picker.delete_confirm_button, DeleteConfirmButton::Cancel);
+        assert_eq!(picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), FilePickerAction::None);
+        assert!(file.exists(), "Enter on the default Cancel focus must not delete");
+        assert_eq!(picker.focus(), FilePickerFocus::Files);
+
+        assert!(picker.request_delete_current());
+        assert_eq!(picker.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)), FilePickerAction::None);
+        assert_eq!(picker.delete_confirm_button, DeleteConfirmButton::Delete);
+        assert_eq!(picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), FilePickerAction::None);
+        assert!(!file.exists(), "Enter on Delete focus must delete");
+    }
+
+    #[test]
+    fn delete_confirmation_arrows_select_buttons() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("cover.png");
+        fs::write(&file, b"png").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        let index = picker.entries().iter().position(|entry| entry.path == file).expect("file visible");
+        picker.set_file_cursor(index, 4);
+
+        assert!(picker.request_delete_current());
+        assert_eq!(picker.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), FilePickerAction::None);
+        assert_eq!(picker.delete_confirm_button, DeleteConfirmButton::Delete);
+        assert_eq!(picker.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)), FilePickerAction::None);
+        assert_eq!(picker.delete_confirm_button, DeleteConfirmButton::Cancel);
     }
 
     #[test]

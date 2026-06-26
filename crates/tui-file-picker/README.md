@@ -47,15 +47,16 @@ picker.set_free_space_bytes(Some(142 * 1024 * 1024 * 1024));
 - Back/forward/up navigation is deterministic and idempotent.
 - Directory listings are refreshed explicitly and sorted folder-first.
 - Direct path entry supports `~` expansion and relative paths.
+- The toolbar, address action, and confirmation actions render as themed button pills rather than label-like text.
 - Filtered pickers still show directories so users can navigate to matching descendants.
 - Mouse hit regions are crate-owned and available to host applications via `hit_regions()`.
 - Mouse handling is tied to the last render pass; a non-default input area must match the last rendered area.
 - File rows support double-click activation by interpreting two consecutive clicks on the same row within the double-click window as open/select.
-- The status bar reports item count, total visible size, and host-provided free space or an explicit unavailable marker.
+- The status bar reports item count, total visible size, and host-provided free space or an explicit unavailable marker; expected modal states do not masquerade as errors.
 - New File/New Folder prompts for a name before creating anything.
 - File-operation behavior is controlled through `FileOperationPolicy`, including operation allow/deny switches, symlink-copy, cross-device cut, and delete behavior.
 - Copy operations stage into the destination directory and clean up partial staged copies on failure.
 - Symlinks are rejected by default. Following targets is opt-in.
-- Delete is two-step and defaults to files plus empty directories only; recursive deletion is opt-in.
+- Delete is two-step and defaults to files plus empty directories only; recursive deletion is opt-in. The confirmation dialog defaults keyboard focus to Cancel, supports Tab/Left/Right focus movement, and keeps Delete/Cancel mouse-clickable.
 
 The layout follows the mock file-manager overlay: toolbar, address bar, folder-tree pane, file-list table, status bar, File Operations dropdown with a New submenu, and a properties popup.
