@@ -3531,7 +3531,26 @@ fn artwork_file_picker_policy() -> tui_file_picker::FileOperationPolicy {
 }
 
 fn file_picker_theme_from_tonepoet_theme() -> tui_file_picker::FilePickerTheme {
-    tui_file_picker::FilePickerTheme::default()
+    use ratatui::style::{Modifier, Style};
+    tui_file_picker::FilePickerTheme {
+        border: Style::default().fg(super::theme::CYAN),
+        border_dim: Style::default().fg(super::theme::BORDER_DIM),
+        title: Style::default().fg(super::theme::CYAN).add_modifier(Modifier::BOLD),
+        toolbar: Style::default().fg(super::theme::TEXT_BRIGHT),
+        toolbar_active: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
+        label: Style::default().fg(super::theme::TEXT_DIM),
+        text: Style::default().fg(super::theme::TEXT),
+        text_dim: Style::default().fg(super::theme::TEXT_MUTED),
+        folder: Style::default().fg(super::theme::AMBER),
+        selected: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
+        header: Style::default().fg(super::theme::TEXT_DIM).add_modifier(Modifier::BOLD),
+        status: Style::default().fg(super::theme::TEXT).bg(super::theme::SURFACE),
+        menu: Style::default().fg(super::theme::TEXT_BRIGHT).bg(super::theme::SURFACE),
+        menu_selected: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
+        menu_disabled: Style::default().fg(super::theme::TEXT_MUTED).bg(super::theme::SURFACE),
+        destructive: Style::default().fg(super::theme::RED).add_modifier(Modifier::BOLD),
+        error: Style::default().fg(super::theme::RED),
+    }
 }
 
 fn handle_metadata_file_picker_key(
