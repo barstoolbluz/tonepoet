@@ -178,6 +178,29 @@ pub enum AppMessage {
         total: usize,
         results: Vec<crate::tui::app::MetadataDetailsProbeFileResult>,
     },
+    /// Result of a ReplayGain scan launched from the metadata editor.
+    MetadataEditorReplayGainComplete {
+        session_id: u64,
+        generation: u64,
+        mode: crate::tui::app::MetadataReplayGainScanMode,
+        paths: Vec<std::path::PathBuf>,
+        result: Result<Vec<crate::tui::probe::SourceMetadata>, String>,
+    },
+    /// Generic reusable file-picker completion. All picker owners send this
+    /// message so target dispatch is centralized in the event loop instead of
+    /// being coupled to a specific overlay such as the metadata editor.
+    FilePickerComplete {
+        target: crate::tui::app::FilePickerTarget,
+        path: Option<std::path::PathBuf>,
+    },
+    /// Result of add/replace/remove artwork launched from the Artwork tab.
+    MetadataEditorArtworkWriteComplete {
+        session_id: u64,
+        generation: u64,
+        mode: crate::tui::app::MetadataArtworkWriteMode,
+        paths: Vec<std::path::PathBuf>,
+        result: Result<Vec<crate::tui::probe::SourceMetadata>, String>,
+    },
     /// Result of an async archive listing (`7zz l -slt`).
     ArchiveListingComplete {
         archive_path: std::path::PathBuf,

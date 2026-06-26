@@ -1512,6 +1512,20 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
         ));
     }
 
+    // Crash recovery: artwork batch writes keep a sidecar manifest while an
+    // all-file mutation is uncommitted. Roll any interrupted batch back before
+    // the TUI can display stale artwork state.
+    let artwork_recovered = tonepoet::tui::probe::recover_stale_artwork_batches();
+    if !artwork_recovered.is_empty() {
+        for msg in &artwork_recovered {
+            log::warn!("Artwork recovery: {}", msg);
+        }
+        app.set_status(&format!(
+            "Recovered {} interrupted artwork batch(es)",
+            artwork_recovered.len()
+        ));
+    }
+
     // Phase 6f: if the user launched with file args (`tonepoet tui foo.flac
     // bar.flac`), seed the Convert screen with those files and land on
     // Convert instead of the configured default screen. Invalid paths

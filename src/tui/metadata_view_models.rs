@@ -5,7 +5,7 @@
 //! facts from editor state directly.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::app::{
@@ -33,10 +33,16 @@ pub struct ReplayGainViewModel {
     pub has_data: bool,
     pub summary: Vec<DetailField>,
     pub rows: Vec<ReplayGainRow>,
+    pub selected_count: usize,
+    pub total_count: usize,
+    pub scan_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReplayGainRow {
+    pub index: usize,
+    pub selected: bool,
+    pub cursor: bool,
     pub title: String,
     pub track_gain: String,
     pub album_gain: String,
@@ -53,9 +59,12 @@ pub struct ArtworkViewModel {
 
 #[derive(Debug, Clone)]
 pub struct ArtworkCoverageRow {
+    pub index: usize,
     pub kind: String,
     pub status: String,
     pub detail: String,
+    pub picture_type: lofty::picture::PictureType,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +211,9 @@ pub fn build_details_view_model(state: &MetadataEditorState) -> DetailsViewModel
         general.push(detail_field("Embedded cue sheet", embedded_cuesheet_status(state)));
     }
 
+    general.push(detail_field("HDCD", metadata_hdcd_status(state)));
+    general.push(detail_field("Pre-emphasis", metadata_preemphasis_status(state)));
+
     DetailsViewModel {
         location,
         probe_status: metadata_details_probe_status_text(state),
@@ -220,41 +232,46 @@ pub fn build_replaygain_view_model(state: &MetadataEditorState) -> ReplayGainVie
         || has_metadata_values(&album_gain_values)
         || has_metadata_values(&track_peak)
         || has_metadata_values(&album_peak);
-    if !has_data {
-        return ReplayGainViewModel {
-            has_data: false,
-            summary: Vec::new(),
-            rows: Vec::new(),
-        };
-    }
+    let scan_status = state.replaygain_scan.as_ref().map(|scan| {
+        format!(
+            "Scanning {} ReplayGain for {} file{}...",
+            scan.mode.label(),
+            scan.file_count,
+            if scan.file_count == 1 { "" } else { "s" }
+        )
+    });
 
     let gains: Vec<f64> = track_gain
         .iter()
         .filter_map(|value| parse_db_value(value))
         .collect();
-    let summary = vec![
-        detail_field("Track Gain", summarize_values(&track_gain)),
-        detail_field("Album Gain", summarize_values(&album_gain_values)),
-        detail_field("Total Peak", summarize_peak(&track_peak, &album_peak)),
-        detail_field(
-            "Lowest gain (loudest)",
-            gains
-                .iter()
-                .copied()
-                .reduce(f64::min)
-                .map(|gain| format!("{:+.2} dB", gain))
-                .unwrap_or_else(|| "—".to_string()),
-        ),
-        detail_field(
-            "Highest gain (quietest)",
-            gains
-                .iter()
-                .copied()
-                .reduce(f64::max)
-                .map(|gain| format!("{:+.2} dB", gain))
-                .unwrap_or_else(|| "—".to_string()),
-        ),
-    ];
+    let summary = if has_data {
+        vec![
+            detail_field("Track Gain", summarize_values(&track_gain)),
+            detail_field("Album Gain", summarize_values(&album_gain_values)),
+            detail_field("Total Peak", summarize_peak(&track_peak, &album_peak)),
+            detail_field(
+                "Lowest gain (loudest)",
+                gains
+                    .iter()
+                    .copied()
+                    .reduce(f64::min)
+                    .map(|gain| format!("{:+.2} dB", gain))
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+            detail_field(
+                "Highest gain (quietest)",
+                gains
+                    .iter()
+                    .copied()
+                    .reduce(f64::max)
+                    .map(|gain| format!("{:+.2} dB", gain))
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+        ]
+    } else {
+        vec![detail_field("Status", "No ReplayGain tags found yet")]
+    };
 
     let titles = metadata_track_titles(state);
     let row_count = titles
@@ -273,6 +290,9 @@ pub fn build_replaygain_view_model(state: &MetadataEditorState) -> ReplayGainVie
             .or_else(|| state.active_surface().file_labels.get(idx).cloned())
             .unwrap_or_else(|| format!("Track {}", idx + 1));
         rows.push(ReplayGainRow {
+            index: idx,
+            selected: state.replaygain_selected.contains(&idx),
+            cursor: state.replaygain_cursor == idx,
             title,
             track_gain: replaygain_cell(&track_gain, idx),
             album_gain: replaygain_cell(&album_gain_values, idx),
@@ -285,6 +305,9 @@ pub fn build_replaygain_view_model(state: &MetadataEditorState) -> ReplayGainVie
         has_data,
         summary,
         rows,
+        selected_count: state.replaygain_selected.len(),
+        total_count: state.active_surface().paths.len(),
+        scan_status,
     }
 }
 
@@ -317,18 +340,23 @@ pub fn build_artwork_view_model(state: &MetadataEditorState) -> ArtworkViewModel
 
     let mut rows = Vec::new();
     for bucket in ["Front Cover", "Back Cover", "Artist", "Disc", "Icon"] {
+        let index = rows.len();
         if let Some(aggregate) = aggregates.remove(bucket) {
-            rows.push(artwork_aggregate_view_row(&aggregate, file_count));
+            rows.push(artwork_aggregate_view_row(&aggregate, file_count, index, state.artwork_cursor));
         } else {
             rows.push(ArtworkCoverageRow {
+                index,
                 kind: bucket.to_string(),
                 status: "«not present»".to_string(),
                 detail: String::new(),
+                picture_type: artwork_bucket_picture_type(bucket),
+                selected: state.artwork_cursor == index,
             });
         }
     }
     for aggregate in aggregates.values() {
-        rows.push(artwork_aggregate_view_row(aggregate, file_count));
+        let index = rows.len();
+        rows.push(artwork_aggregate_view_row(aggregate, file_count, index, state.artwork_cursor));
     }
 
     ArtworkViewModel {
@@ -336,6 +364,187 @@ pub fn build_artwork_view_model(state: &MetadataEditorState) -> ArtworkViewModel
         read_issues: metadata_file_issue_rows(state, false, true),
         rows,
     }
+}
+
+
+fn metadata_hdcd_status(state: &MetadataEditorState) -> String {
+    if state.active_surface().technical_details.disc.is_some() {
+        return "N/A".to_string();
+    }
+    let values: Vec<String> = metadata_details_files_for_display(state)
+        .iter()
+        .map(hdcd_status_for_file)
+        .collect();
+    same_or_multiple(values)
+}
+
+fn hdcd_status_for_file(file: &MetadataFileDetails) -> String {
+    match hdcd_applicability_for_file(file) {
+        HdcdApplicability::NotApplicable => "N/A".to_string(),
+        HdcdApplicability::Checking => "«checking applicability»".to_string(),
+        HdcdApplicability::Applicable => match file.analysis_facts.hdcd_detected {
+            Some(true) => file
+                .analysis_facts
+                .hdcd_detail
+                .as_ref()
+                .map(|detail| normalize_hdcd_detail(detail))
+                .unwrap_or_else(|| "Detected".to_string()),
+            Some(false) => "Not detected".to_string(),
+            None => "«not scanned»".to_string(),
+        },
+    }
+}
+
+fn normalize_hdcd_detail(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        "Detected".to_string()
+    } else if detail.to_ascii_lowercase().starts_with("hdcd") {
+        detail.to_string()
+    } else {
+        format!("Detected ({detail})")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HdcdApplicability {
+    Applicable,
+    NotApplicable,
+    Checking,
+}
+
+#[cfg(test)]
+fn hdcd_applicable_for_file(file: &MetadataFileDetails) -> bool {
+    hdcd_applicability_for_file(file) == HdcdApplicability::Applicable
+}
+
+fn hdcd_applicability_for_file(file: &MetadataFileDetails) -> HdcdApplicability {
+    let path = &file.file_facts.path;
+    if path_is_disc_structure(path) || path_has_extension(path, &["dsf", "dff"]) {
+        return HdcdApplicability::NotApplicable;
+    }
+    if path_has_extension(
+        path,
+        &[
+            "mp3", "aac", "m4a", "mp4", "ogg", "opus", "wma", "alac", "ac3", "dts",
+        ],
+    ) {
+        return HdcdApplicability::NotApplicable;
+    }
+
+    let candidate_container = path_has_extension(path, &["flac", "wav", "aiff", "aif", "wv"]);
+    let ProbeState::Ready(facts) = &file.media_facts else {
+        // HDCD applicability is ultimately decided from authoritative stream
+        // facts, especially bit depth. While a lazy Details probe is still
+        // loading, keep plausible PCM containers in an explicit pending state
+        // instead of either surfacing stale cache data for 24-bit files or
+        // prematurely rendering a valid 16-bit CD rip as N/A.
+        return if candidate_container {
+            HdcdApplicability::Checking
+        } else {
+            HdcdApplicability::NotApplicable
+        };
+    };
+
+    if facts.bit_depth != Some(16) {
+        return HdcdApplicability::NotApplicable;
+    }
+    let combined = format!("{} {}", facts.format_name, facts.codec).to_ascii_lowercase();
+    if combined.contains("dsd")
+        || combined.contains("mp3")
+        || combined.contains("aac")
+        || combined.contains("opus")
+        || combined.contains("vorbis")
+    {
+        return HdcdApplicability::NotApplicable;
+    }
+    if candidate_container
+        || combined.contains("pcm")
+        || combined.contains("flac")
+        || combined.contains("wav")
+        || combined.contains("aiff")
+        || combined.contains("wavpack")
+    {
+        HdcdApplicability::Applicable
+    } else {
+        HdcdApplicability::NotApplicable
+    }
+}
+
+fn path_is_disc_structure(path: &Path) -> bool {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    text.ends_with(".iso")
+        || text.contains("/bdmv")
+        || text.contains("\\bdmv")
+        || text.contains("/audio_ts")
+        || text.contains("\\audio_ts")
+        || text.contains("/video_ts")
+        || text.contains("\\video_ts")
+}
+
+fn path_has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| extensions.iter().any(|candidate| candidate.eq_ignore_ascii_case(ext)))
+        .unwrap_or(false)
+}
+
+fn metadata_preemphasis_status(state: &MetadataEditorState) -> String {
+    if state.active_surface().technical_details.disc.is_some() {
+        return "N/A".to_string();
+    }
+    let values: Vec<String> = metadata_details_files_for_display(state)
+        .iter()
+        .map(preemphasis_status_for_file)
+        .collect();
+    same_or_multiple(values)
+}
+
+fn preemphasis_status_for_file(file: &MetadataFileDetails) -> String {
+    use crate::tui::preemphasis::PreemphasisConfidence;
+    let detail = non_empty_detail(file.analysis_facts.preemphasis_detail.as_deref());
+    match file.analysis_facts.preemphasis {
+        Some(PreemphasisConfidence::Detected) if preemphasis_detail_is_pre_flag(detail) => {
+            "Detected (PRE flag)".to_string()
+        }
+        Some(PreemphasisConfidence::StrongCandidate) if preemphasis_detail_is_catalog(detail) => {
+            preemphasis_catalog_status(detail)
+        }
+        Some(PreemphasisConfidence::Possible) if preemphasis_detail_is_catalog(detail) => {
+            preemphasis_catalog_status(detail)
+        }
+        Some(PreemphasisConfidence::NotDetected) => "Not detected".to_string(),
+        Some(PreemphasisConfidence::Detected)
+        | Some(PreemphasisConfidence::StrongCandidate)
+        | Some(PreemphasisConfidence::Possible)
+        | Some(PreemphasisConfidence::Indeterminate) => "Not detected".to_string(),
+        None => "«not scanned»".to_string(),
+    }
+}
+
+fn preemphasis_detail_is_pre_flag(detail: Option<&str>) -> bool {
+    detail
+        .map(crate::tui::preemphasis::metadata_editor_detail_is_pre_flag)
+        .unwrap_or(false)
+}
+
+fn preemphasis_detail_is_catalog(detail: Option<&str>) -> bool {
+    detail
+        .map(crate::tui::preemphasis::metadata_editor_detail_is_catalog)
+        .unwrap_or(false)
+}
+
+fn preemphasis_catalog_status(detail: Option<&str>) -> String {
+    let detail = detail.unwrap_or("catalog match").trim();
+    if detail.is_empty() {
+        "Candidate (catalog match)".to_string()
+    } else {
+        format!("Candidate ({detail})")
+    }
+}
+
+fn non_empty_detail(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn metadata_details_files_for_display(state: &MetadataEditorState) -> &[MetadataFileDetails] {
@@ -1148,8 +1357,14 @@ impl ArtworkAggregate {
     }
 }
 
-fn artwork_aggregate_view_row(aggregate: &ArtworkAggregate, file_count: usize) -> ArtworkCoverageRow {
+fn artwork_aggregate_view_row(
+    aggregate: &ArtworkAggregate,
+    file_count: usize,
+    index: usize,
+    cursor: usize,
+) -> ArtworkCoverageRow {
     ArtworkCoverageRow {
+        index,
         kind: aggregate.label.clone(),
         status: artwork_presence_status(
             aggregate.present_files.len(),
@@ -1157,6 +1372,23 @@ fn artwork_aggregate_view_row(aggregate: &ArtworkAggregate, file_count: usize) -
             aggregate.entry_count,
         ),
         detail: artwork_detail_summary(&aggregate.details),
+        picture_type: artwork_bucket_picture_type(&aggregate.label),
+        selected: cursor == index,
+    }
+}
+
+pub fn artwork_action_row_count(state: &MetadataEditorState) -> usize {
+    build_artwork_view_model(state).rows.len()
+}
+
+fn artwork_bucket_picture_type(bucket: &str) -> lofty::picture::PictureType {
+    match bucket {
+        "Front Cover" => lofty::picture::PictureType::CoverFront,
+        "Back Cover" => lofty::picture::PictureType::CoverBack,
+        "Artist" => lofty::picture::PictureType::Artist,
+        "Disc" => lofty::picture::PictureType::Media,
+        "Icon" => lofty::picture::PictureType::Icon,
+        _ => lofty::picture::PictureType::Other,
     }
 }
 
@@ -1329,11 +1561,211 @@ mod tests {
         assert_eq!(artwork_known_bucket_from_id3_code(0), None);
     }
 
+
+    #[test]
+    fn hdcd_status_is_pending_until_authoritative_bit_depth_arrives() {
+        let mut file = MetadataFileDetails::from_open_cache(
+            PathBuf::from("/tmp/twenty_four_bit.flac"),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            FileWriteEligibility::Writable,
+            super::super::probe::SourceMetadata::default(),
+        );
+        file.analysis_facts.hdcd_detected = Some(false);
+
+        assert_eq!(hdcd_applicability_for_file(&file), HdcdApplicability::Checking);
+        assert_eq!(hdcd_status_for_file(&file), "«checking applicability»");
+
+        file.media_facts = ProbeState::Loading { generation: 9 };
+        assert_eq!(hdcd_applicability_for_file(&file), HdcdApplicability::Checking);
+        assert_eq!(hdcd_status_for_file(&file), "«checking applicability»");
+
+        file.set_probe_ready(SourceInfo {
+            format_name: "flac".to_string(),
+            codec: "flac".to_string(),
+            sample_rate: 96_000,
+            bit_depth: Some(24),
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 100,
+        });
+
+        assert!(!hdcd_applicable_for_file(&file));
+        assert_eq!(hdcd_status_for_file(&file), "N/A");
+    }
+
+    #[test]
+    fn hdcd_status_uses_cache_only_for_confirmed_sixteen_bit_pcm() {
+        let mut file = MetadataFileDetails::from_open_cache(
+            PathBuf::from("/tmp/cd_rip.flac"),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            FileWriteEligibility::Writable,
+            super::super::probe::SourceMetadata::default(),
+        );
+        file.analysis_facts.hdcd_detected = Some(false);
+        file.set_probe_ready(SourceInfo {
+            format_name: "flac".to_string(),
+            codec: "flac".to_string(),
+            sample_rate: 44_100,
+            bit_depth: Some(16),
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 100,
+        });
+
+        assert!(hdcd_applicable_for_file(&file));
+        assert_eq!(hdcd_status_for_file(&file), "Not detected");
+    }
     #[test]
     fn artwork_type_label_has_numbered_fallback() {
         assert_eq!(artwork_type_label_from_id3_code(16), "Movie Screen Capture");
         assert_eq!(artwork_type_label_from_id3_code(17), "Bright Colored Fish");
         assert_eq!(artwork_type_label_from_id3_code(221), "Picture type 221");
+    }
+
+
+    #[test]
+    fn preemphasis_status_uses_pre_flag_and_catalog_only() {
+        let mut detected = MetadataFileDetails::from_open_cache(
+            PathBuf::from("/tmp/detected.flac"),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            FileWriteEligibility::Writable,
+            super::super::probe::SourceMetadata::default(),
+        );
+        detected.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::Detected);
+        detected.analysis_facts.preemphasis_detail = Some("PRE flag".to_string());
+
+        let mut catalog = detected.clone();
+        catalog.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate);
+        catalog.analysis_facts.preemphasis_detail = Some("catalog match: 35DP-4".to_string());
+
+        let mut spectral_possible = detected.clone();
+        spectral_possible.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::Possible);
+        spectral_possible.analysis_facts.preemphasis_detail =
+            Some("spectral analysis suggests pre-emphasis boost may be present".to_string());
+
+        let mut comment_tag = detected.clone();
+        comment_tag.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::Detected);
+        comment_tag.analysis_facts.preemphasis_detail = Some("comment tag".to_string());
+
+        let mut log_file = detected.clone();
+        log_file.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::Detected);
+        log_file.analysis_facts.preemphasis_detail = Some("log file".to_string());
+
+        let mut explicit_tag = detected.clone();
+        explicit_tag.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::Detected);
+        explicit_tag.analysis_facts.preemphasis_detail = Some("tag".to_string());
+
+        assert_eq!(preemphasis_status_for_file(&detected), "Detected (PRE flag)");
+        assert_eq!(
+            preemphasis_status_for_file(&catalog),
+            "Candidate (catalog match: 35DP-4)"
+        );
+        assert_eq!(preemphasis_status_for_file(&spectral_possible), "Not detected");
+        assert_eq!(preemphasis_status_for_file(&comment_tag), "Not detected");
+        assert_eq!(preemphasis_status_for_file(&log_file), "Not detected");
+        assert_eq!(preemphasis_status_for_file(&explicit_tag), "Detected (PRE flag)");
+    }
+
+    #[test]
+    fn preemphasis_status_has_not_scanned_and_mixed_values() {
+        let mut not_scanned = MetadataFileDetails::from_open_cache(
+            PathBuf::from("/tmp/unscanned.flac"),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            FileWriteEligibility::Writable,
+            super::super::probe::SourceMetadata::default(),
+        );
+        assert_eq!(preemphasis_status_for_file(&not_scanned), "«not scanned»");
+
+        not_scanned.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::NotDetected);
+        assert_eq!(preemphasis_status_for_file(&not_scanned), "Not detected");
+    }
+
+    #[test]
+    fn hdcd_status_is_na_for_lossy_dsd_and_disc_sources_even_with_cache() {
+        let cases = [
+            (
+                "/tmp/lossy.mp3",
+                SourceInfo {
+                    format_name: "mp3".to_string(),
+                    codec: "mp3".to_string(),
+                    sample_rate: 44_100,
+                    bit_depth: None,
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: 100,
+                },
+            ),
+            (
+                "/tmp/dsd.dsf",
+                SourceInfo {
+                    format_name: "dsf".to_string(),
+                    codec: "dsd".to_string(),
+                    sample_rate: 2_822_400,
+                    bit_depth: Some(1),
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: 100,
+                },
+            ),
+            (
+                "/tmp/disc.iso",
+                SourceInfo {
+                    format_name: "wav".to_string(),
+                    codec: "pcm_s16le".to_string(),
+                    sample_rate: 44_100,
+                    bit_depth: Some(16),
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: 100,
+                },
+            ),
+        ];
+
+        for (path, info) in cases {
+            let mut file = MetadataFileDetails::from_open_cache(
+                PathBuf::from(path),
+                Some(100),
+                None,
+                None,
+                None,
+                FileReadState::Readable,
+                FileWriteEligibility::Writable,
+                super::super::probe::SourceMetadata::default(),
+            );
+            file.analysis_facts.hdcd_detected = Some(false);
+            file.set_probe_ready(info);
+
+            assert!(!hdcd_applicable_for_file(&file), "{} should not be HDCD-applicable", path);
+            assert_eq!(hdcd_status_for_file(&file), "N/A", "{} should render N/A", path);
+        }
     }
 
 }

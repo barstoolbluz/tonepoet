@@ -40,12 +40,35 @@ impl PreemphasisEvidence {
 /// Check audio file tags for pre-emphasis indicators via lofty.
 /// Returns the evidence type if found.
 pub fn check_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
+    if let Some(evidence) = check_pre_flag_tag_evidence(audio_path) {
+        return Some(evidence);
+    }
+
     use lofty::file::TaggedFileExt;
     use lofty::tag::ItemKey;
 
     let tagged = lofty::read_from_path(audio_path).ok()?;
     for tag in tagged.tags() {
-        // Check for explicit PRE_EMPHASIS or PRE-EMPHASIS tags.
+        // Historical broader detector: check COMMENT tag for a positive
+        // pre-emphasis statement. The Phase 2 metadata editor does not call
+        // this function; it calls check_pre_flag_tag_evidence instead.
+        if let Some(comment) = tag.get_string(&ItemKey::Comment) {
+            if comment_has_positive_preemphasis(comment) {
+                return Some(PreemphasisEvidence::CommentTag);
+            }
+        }
+    }
+    None
+}
+
+/// Check only explicit metadata PRE flag fields, excluding COMMENT heuristics.
+/// This is the tag-tier function used by the Phase 2 metadata editor path.
+pub fn check_pre_flag_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::ItemKey;
+
+    let tagged = lofty::read_from_path(audio_path).ok()?;
+    for tag in tagged.tags() {
         let pe_keys = [
             ItemKey::Unknown("PRE_EMPHASIS".to_string()),
             ItemKey::Unknown("PRE-EMPHASIS".to_string()),
@@ -66,14 +89,27 @@ pub fn check_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
                 }
             }
         }
+    }
+    None
+}
 
-        // Check COMMENT tag for a positive pre-emphasis statement.
-        if let Some(comment) = tag.get_string(&ItemKey::Comment) {
-            if comment_has_positive_preemphasis(comment) {
-                return Some(PreemphasisEvidence::CommentTag);
-            }
+/// Check associated CUE files for explicit FLAGS PRE evidence.
+///
+/// This deliberately excludes EAC/XLD log heuristics so Phase 2 metadata-editor
+/// behavior is driven only by PRE flags and catalog matching.
+pub fn check_cue_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
+    let dir = audio_path.parent()?;
+
+    if directory_has_cue_preemphasis_for_audio(dir, audio_path) {
+        return Some(PreemphasisEvidence::CueFile);
+    }
+
+    if let Some(parent) = dir.parent() {
+        if directory_has_cue_preemphasis_for_audio(parent, audio_path) {
+            return Some(PreemphasisEvidence::CueFile);
         }
     }
+
     None
 }
 

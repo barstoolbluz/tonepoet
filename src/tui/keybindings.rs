@@ -3301,6 +3301,320 @@ fn request_metadata_editor_close(
     }
 }
 
+
+fn handle_metadata_replaygain_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.move_replaygain_cursor(-1);
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.move_replaygain_cursor(1);
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+        KeyCode::Home => {
+            state.replaygain_cursor = 0;
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+        KeyCode::End => {
+            state.replaygain_cursor = state.active_surface().paths.len().saturating_sub(1);
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            if state.toggle_replaygain_cursor_selection() {
+                app.set_status(format!(
+                    "metadata editor: {} ReplayGain track{} selected",
+                    state.replaygain_selected.len(),
+                    if state.replaygain_selected.len() == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        KeyCode::Char('*') => {
+            let all_selected = state.replaygain_selected.len() == state.active_surface().paths.len();
+            state.set_replaygain_all_selected(!all_selected);
+            app.set_status(format!(
+                "metadata editor: {} ReplayGain track{} selected",
+                state.replaygain_selected.len(),
+                if state.replaygain_selected.len() == 1 { "" } else { "s" }
+            ));
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            metadata_editor_start_replaygain_scan(
+                app,
+                state,
+                crate::tui::app::MetadataReplayGainScanMode::Track,
+                tx,
+            );
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            metadata_editor_start_replaygain_scan(
+                app,
+                state,
+                crate::tui::app::MetadataReplayGainScanMode::Album,
+                tx,
+            );
+        }
+        _ => {
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+    }
+}
+
+fn metadata_editor_start_replaygain_scan(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    mode: crate::tui::app::MetadataReplayGainScanMode,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if state.read_only {
+        app.set_status("metadata editor: read-only source; ReplayGain tags cannot be written");
+        return;
+    }
+    if state.replaygain_scan.is_some() {
+        app.set_status("metadata editor: ReplayGain scan already running");
+        return;
+    }
+    let paths = match mode {
+        crate::tui::app::MetadataReplayGainScanMode::Track => {
+            let selected = state.replaygain_selected_paths();
+            if selected.is_empty() {
+                state
+                    .active_surface()
+                    .paths
+                    .get(state.replaygain_cursor)
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            } else {
+                selected
+            }
+        }
+        crate::tui::app::MetadataReplayGainScanMode::Album => state.active_surface().paths.clone(),
+    };
+    if paths.is_empty() {
+        app.set_status("metadata editor: no files available for ReplayGain scan");
+        return;
+    }
+    let (session_id, generation) = state.begin_replaygain_scan(mode, paths.len());
+    let tx = tx.clone();
+    let worker_paths = paths.clone();
+    let tool_paths = app.manager.config.tool_paths.clone();
+    tokio::spawn(async move {
+        let cmd = metadata_replaygain_tool_command(mode, &worker_paths);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
+        let result = match crate::convert::pipeline::tool::ToolRunner::run(&runner, cmd, &cancel).await {
+            Ok(_) => tokio::task::spawn_blocking({
+                let worker_paths = worker_paths.clone();
+                move || super::probe::read_all_tags_merged_with_metadata(&worker_paths).map(|read| read.metadata)
+            })
+            .await
+            .unwrap_or_else(|err| Err(format!("ReplayGain tag re-read task failed: {err}"))),
+            Err(err) => Err(format!("loudgain failed: {err}")),
+        };
+        let _ = tx
+            .send(AppMessage::MetadataEditorReplayGainComplete {
+                session_id,
+                generation,
+                mode,
+                paths: worker_paths,
+                result,
+            })
+            .await;
+    });
+    app.set_status(format!(
+        "metadata editor: scanning {} ReplayGain for {} file{}",
+        mode.label(),
+        paths.len(),
+        if paths.len() == 1 { "" } else { "s" }
+    ));
+}
+
+
+fn metadata_replaygain_tool_args(
+    mode: crate::tui::app::MetadataReplayGainScanMode,
+    paths: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if mode == crate::tui::app::MetadataReplayGainScanMode::Album {
+        args.push("-a".to_string());
+    }
+    args.push("-k".to_string());
+    args.push("-s".to_string());
+    args.push("i".to_string());
+    args.extend(paths.iter().map(|path| path.to_string_lossy().to_string()));
+    args
+}
+
+fn metadata_replaygain_tool_command(
+    mode: crate::tui::app::MetadataReplayGainScanMode,
+    paths: &[std::path::PathBuf],
+) -> crate::convert::pipeline::tool::ToolCommand {
+    crate::convert::pipeline::tool::ToolCommand {
+        binary: crate::convert::pipeline::tool::ToolBinary::Loudgain,
+        args: metadata_replaygain_tool_args(mode, paths),
+        secret_args: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
+        timeout: std::time::Duration::from_secs(600),
+    }
+}
+
+fn handle_metadata_artwork_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.move_artwork_cursor(-1);
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.move_artwork_cursor(1);
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+        KeyCode::Home => {
+            state.artwork_cursor = 0;
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+        KeyCode::End => {
+            state.artwork_cursor = crate::tui::metadata_view_models::artwork_action_row_count(state)
+                .saturating_sub(1);
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+        KeyCode::Enter | KeyCode::Char('+') => {
+            if state.read_only {
+                app.set_status("metadata editor: read-only source; artwork cannot be written");
+            } else if state.artwork_write.is_some() {
+                app.set_status("metadata editor: artwork write already running");
+            } else {
+                metadata_editor_open_artwork_picker(state);
+                app.set_status("metadata editor: choose artwork image");
+            }
+        }
+        KeyCode::Delete | KeyCode::Char('d') | KeyCode::Char('D') => {
+            metadata_editor_dispatch_artwork_remove(app, state, tx);
+        }
+        _ => {
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+        }
+    }
+}
+
+fn metadata_editor_current_artwork_type(
+    state: &super::app::MetadataEditorState,
+) -> Option<lofty::picture::PictureType> {
+    crate::tui::metadata_view_models::build_artwork_view_model(state)
+        .rows
+        .get(state.artwork_cursor)
+        .map(|row| row.picture_type)
+}
+
+fn metadata_editor_open_artwork_picker(state: &mut Box<super::app::MetadataEditorState>) {
+    let picture_type = metadata_editor_current_artwork_type(state)
+        .unwrap_or(lofty::picture::PictureType::CoverFront);
+    let dir = state
+        .active_surface()
+        .paths
+        .first()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    state.pending_artwork_type = None;
+    state.file_picker = Some(crate::tui::app::FilePickerState::for_artwork(dir, picture_type));
+}
+
+fn handle_metadata_file_picker_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let visible_rows = metadata_file_picker_visible_rows();
+    let outcome = state
+        .file_picker
+        .as_mut()
+        .and_then(|picker| super::file_picker::handle_key(picker, key, visible_rows));
+
+    if let Some(outcome) = outcome {
+        if let Err(err) = super::file_picker::send_completion(tx, outcome) {
+            app.set_status(format!("file picker: failed to queue completion: {err}"));
+        }
+    }
+}
+
+fn metadata_editor_dispatch_artwork_remove(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if state.read_only {
+        app.set_status("metadata editor: read-only source; artwork cannot be removed");
+        return;
+    }
+    let Some(picture_type) = metadata_editor_current_artwork_type(state) else {
+        app.set_status("metadata editor: no artwork row selected");
+        return;
+    };
+    if state.artwork_write.is_some() {
+        app.set_status("metadata editor: artwork write already running");
+        return;
+    }
+    let paths = state.active_surface().paths.clone();
+    if paths.is_empty() {
+        app.set_status("metadata editor: no files available for artwork removal");
+        return;
+    }
+    let (session_id, generation) = state.begin_artwork_write(
+        crate::tui::app::MetadataArtworkWriteMode::Remove,
+        paths.len(),
+    );
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result_paths = paths.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            super::probe::remove_artwork_from_files(&paths, picture_type)
+        })
+        .await
+        .unwrap_or_else(|err| Err(format!("artwork removal task failed: {err}")));
+        let _ = tx
+            .send(AppMessage::MetadataEditorArtworkWriteComplete {
+                session_id,
+                generation,
+                mode: crate::tui::app::MetadataArtworkWriteMode::Remove,
+                paths: result_paths,
+                result,
+            })
+            .await;
+    });
+    app.set_status("metadata editor: removing artwork...");
+}
+
+fn handle_metadata_file_picker_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let visible_rows = metadata_file_picker_visible_rows();
+    let outcome = state.file_picker.as_mut().and_then(|picker| {
+        super::file_picker::handle_mouse(picker, mouse, visible_rows, &app.button_map)
+    });
+
+    if let Some(outcome) = outcome {
+        if let Err(err) = super::file_picker::send_completion(tx, outcome) {
+            app.set_status(format!("file picker: failed to queue completion: {err}"));
+        }
+    }
+}
+
 fn handle_metadata_editor_key(
     app: &mut AppState,
     key: KeyEvent,
@@ -3313,6 +3627,11 @@ fn handle_metadata_editor_key(
 
     match state.phase {
         MetadataEditorPhase::Editing => {
+            if state.file_picker.is_some() {
+                handle_metadata_file_picker_key(app, key, state, tx);
+                return;
+            }
+
             if state.presentation_selector_open {
                 match key.code {
                     KeyCode::Esc => {
@@ -3450,32 +3769,38 @@ fn handle_metadata_editor_key(
                     }
                 }
                 _ if state.content_tab != crate::tui::app::ContentTab::Metadata => {
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            scroll_metadata_read_only_tab(state, -1, metadata_editor_read_only_visible_rows());
+                    match state.content_tab {
+                        crate::tui::app::ContentTab::ReplayGain => {
+                            handle_metadata_replaygain_key(app, key, state, tx);
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            scroll_metadata_read_only_tab(state, 1, metadata_editor_read_only_visible_rows());
+                        crate::tui::app::ContentTab::Artwork => {
+                            handle_metadata_artwork_key(app, key, state, tx);
                         }
-                        KeyCode::PageUp => {
-                            scroll_metadata_read_only_tab(state, -5, metadata_editor_read_only_visible_rows());
-                        }
-                        KeyCode::PageDown => {
-                            scroll_metadata_read_only_tab(state, 5, metadata_editor_read_only_visible_rows());
-                        }
-                        KeyCode::Home => {
-                            set_metadata_read_only_scroll(state, 0, metadata_editor_read_only_visible_rows());
-                        }
-                        KeyCode::Char('r')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && state.content_tab == crate::tui::app::ContentTab::Details =>
-                        {
-                            let status = metadata_editor_retry_details_probe(state, tx);
-                            app.set_status(status);
-                        }
-                        _ => {
-                            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
-                        }
+                        crate::tui::app::ContentTab::Details => match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                scroll_metadata_read_only_tab(state, -1, metadata_editor_read_only_visible_rows());
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                scroll_metadata_read_only_tab(state, 1, metadata_editor_read_only_visible_rows());
+                            }
+                            KeyCode::PageUp => {
+                                scroll_metadata_read_only_tab(state, -5, metadata_editor_read_only_visible_rows());
+                            }
+                            KeyCode::PageDown => {
+                                scroll_metadata_read_only_tab(state, 5, metadata_editor_read_only_visible_rows());
+                            }
+                            KeyCode::Home => {
+                                set_metadata_read_only_scroll(state, 0, metadata_editor_read_only_visible_rows());
+                            }
+                            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let status = metadata_editor_retry_details_probe(state, tx);
+                                app.set_status(status);
+                            }
+                            _ => {
+                                clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+                            }
+                        },
+                        crate::tui::app::ContentTab::Metadata => {}
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -4600,10 +4925,12 @@ fn metadata_file_states_for_open(
 }
 
 
-fn metadata_technical_details_for_paths(
+fn metadata_technical_details_for_paths_with_analysis(
     paths: &[std::path::PathBuf],
     cached_metadata: &[super::probe::SourceMetadata],
     cached_metadata_errors: &[Option<super::probe::MetadataReadIssue>],
+    db: Option<&crate::db::Database>,
+    preemph_results: &[crate::tui::preemphasis::PreemphasisResult],
 ) -> crate::tui::app::MetadataTechnicalDetails {
     let files = paths
         .iter()
@@ -4642,6 +4969,7 @@ fn metadata_technical_details_for_paths(
                 metadata_issue,
             );
 
+            let metadata_preemphasis = metadata.preemphasis_metadata.clone();
             let mut file = crate::tui::app::MetadataFileDetails::from_read_result(
                 path.clone(),
                 file_size,
@@ -4652,6 +4980,18 @@ fn metadata_technical_details_for_paths(
                 write_eligibility,
                 metadata,
             );
+            if let (Some(db), Some(modified), Some(size)) = (db, modified, file_size) {
+                let mtime = crate::db::systemtime_to_unix(modified);
+                if let Some(analysis) = db.get_cached_analysis(&path.display().to_string(), mtime, size) {
+                    file.set_analysis_result(&analysis);
+                }
+            }
+            if let Some(label) = metadata_preemphasis.as_deref() {
+                file.set_preemphasis_metadata_label(label);
+            }
+            if let Some(result) = preemph_results.iter().find(|result| result.path == *path) {
+                file.set_preemphasis_result(result);
+            }
             // Deliberately leave audio stream probing unloaded here. Details
             // requests and caches probe facts through an explicit model
             // transition instead of blocking editor open or status assembly.
@@ -4817,6 +5157,12 @@ fn metadata_editor_read_only_visible_rows() -> usize {
     let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
     let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
     layout.content_area.height.max(1) as usize
+}
+
+fn metadata_file_picker_visible_rows() -> usize {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
+    super::draw_overlays::file_picker_visible_rows_for_parent(layout.popup).max(1)
 }
 
 fn metadata_read_only_total_lines(state: &crate::tui::app::MetadataEditorState) -> usize {
@@ -5087,7 +5433,13 @@ pub fn open_metadata_editor(app: &mut AppState) {
         &mut source_metadata_errors,
     );
 
-    let technical_details = metadata_technical_details_for_paths(&paths, &source_metadata, &source_metadata_errors);
+    let technical_details = metadata_technical_details_for_paths_with_analysis(
+        &paths,
+        &source_metadata,
+        &source_metadata_errors,
+        Some(&app.db),
+        &app.preemph_results,
+    );
 
     // Auto-populate TITLE and TRACKNUMBER from filenames where missing.
     let mut did_auto_populate = false;
@@ -10609,6 +10961,13 @@ fn handle_metadata_editor_mouse(
     let overlay = app.active_overlay.clone();
     if let ActiveOverlay::MetadataEditor(mut state) = overlay {
         let total_rows = state.active_surface().entries.len() + 1;
+
+        if state.file_picker.is_some() {
+            handle_metadata_file_picker_mouse(app, mouse, &mut state, tx);
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            return;
+        }
+
         let in_content = mx >= inner_x
             && mx < inner_x + inner_w
             && my >= content_y
@@ -10671,6 +11030,38 @@ fn handle_metadata_editor_mouse(
                         if let Some(label) = state.active_presentation_label() {
                             app.set_status(format!("metadata editor: {}", label));
                         }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataArtworkRow(idx)) => {
+                    if state.content_tab == crate::tui::app::ContentTab::Artwork {
+                        state.artwork_cursor = idx;
+                        clamp_metadata_read_only_scroll(&mut state, metadata_editor_read_only_visible_rows());
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataArtworkAdd(idx))
+                | Some(super::button_map::TuiButton::MetadataArtworkReplace(idx)) => {
+                    if state.content_tab == crate::tui::app::ContentTab::Artwork {
+                        state.artwork_cursor = idx;
+                        if state.read_only {
+                            app.set_status("metadata editor: read-only source; artwork cannot be written");
+                        } else if state.artwork_write.is_some() {
+                            app.set_status("metadata editor: artwork write already running");
+                        } else {
+                            metadata_editor_open_artwork_picker(&mut state);
+                            app.set_status("metadata editor: choose artwork image");
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataArtworkRemove(idx)) => {
+                    if state.content_tab == crate::tui::app::ContentTab::Artwork {
+                        state.artwork_cursor = idx;
+                        metadata_editor_dispatch_artwork_remove(app, &mut state, tx);
                     }
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     return;
@@ -12670,7 +13061,13 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         &mut source_metadata_errors,
     );
 
-    let technical_details = metadata_technical_details_for_paths(&paths, &source_metadata, &source_metadata_errors);
+    let technical_details = metadata_technical_details_for_paths_with_analysis(
+        &paths,
+        &source_metadata,
+        &source_metadata_errors,
+        Some(&app.db),
+        &app.preemph_results,
+    );
 
     let file_labels: Vec<String> = paths
         .iter()
@@ -14926,7 +15323,17 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataEditorTab(_)
             | TuiButton::MetadataEditorContentTab(_)
             | TuiButton::MetadataPresentationSelectorToggle
-            | TuiButton::MetadataPresentationSelectorRow(_) => {
+            | TuiButton::MetadataPresentationSelectorRow(_)
+            | TuiButton::MetadataArtworkRow(_)
+            | TuiButton::MetadataArtworkAdd(_)
+            | TuiButton::MetadataArtworkReplace(_)
+            | TuiButton::MetadataArtworkRemove(_)
+            | TuiButton::FilePickerToolbar(_)
+            | TuiButton::FilePickerRow(_)
+            | TuiButton::FilePickerAddress
+            | TuiButton::FilePickerBookmark(_)
+            | TuiButton::FilePickerRecent(_)
+            | TuiButton::FilePickerFooter(_) => {
                 // Handled in dedicated mouse/overlay handlers; no-op here.
             }
         }
@@ -18465,4 +18872,36 @@ mod phase4_tests {
         // level. But the test only edited ALBUM, so this trace is
         // bound to the album-level path.).
     }
+
+    #[test]
+    fn replaygain_scan_builds_loudgain_tool_command() {
+        let paths = vec![
+            std::path::PathBuf::from("/music/01.flac"),
+            std::path::PathBuf::from("/music/02.flac"),
+        ];
+        let cmd = metadata_replaygain_tool_command(
+            crate::tui::app::MetadataReplayGainScanMode::Album,
+            &paths,
+        );
+
+        assert_eq!(cmd.binary, crate::convert::pipeline::tool::ToolBinary::Loudgain);
+        assert_eq!(cmd.args[0], "-a");
+        assert_eq!(&cmd.args[1..4], &["-k".to_string(), "-s".to_string(), "i".to_string()]);
+        assert_eq!(cmd.args[4], "/music/01.flac");
+        assert_eq!(cmd.args[5], "/music/02.flac");
+        assert!(cmd.secret_args.is_empty());
+        assert_eq!(cmd.timeout, std::time::Duration::from_secs(600));
+    }
+
+    #[test]
+    fn replaygain_track_scan_omits_album_flag() {
+        let paths = vec![std::path::PathBuf::from("/music/01.flac")];
+        let args = metadata_replaygain_tool_args(
+            crate::tui::app::MetadataReplayGainScanMode::Track,
+            &paths,
+        );
+
+        assert_eq!(args, vec!["-k".to_string(), "-s".to_string(), "i".to_string(), "/music/01.flac".to_string()]);
+    }
+
 }

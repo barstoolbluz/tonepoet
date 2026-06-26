@@ -1610,26 +1610,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                         Ok(Ok(mut result)) => {
                                             result.path = display_path;
 
-                                            let pe_evidence = super::preemphasis::metadata::check_tag_evidence(&original_path)
-                                                .or_else(|| super::preemphasis::metadata::check_file_evidence(&original_path));
-                                            let catalog_match =
-                                                super::preemphasis::catalog::check_catalog_evidence(
-                                                    &original_path,
-                                                );
-
-                                            if let Some(ev) = pe_evidence {
-                                                result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
-                                                result.preemphasis_detail = Some(format!(
-                                                    "{} indicates source disc used pre-emphasis; verify de-emphasis was not applied during ripping",
-                                                    ev.label()
-                                                ));
-                                            } else if let Some(cm) = catalog_match {
-                                                result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
-                                                result.preemphasis_detail = Some(format!(
-                                                    "{}; verify de-emphasis was not applied during ripping",
-                                                    cm.detail
-                                                ));
-                                            }
+                                            let pe_result = super::preemphasis::detect_preemphasis_metadata_catalog(
+                                                original_path.clone(),
+                                            );
+                                            result.preemphasis = Some(pe_result.confidence);
+                                            result.preemphasis_detail = if pe_result.detail.is_empty() {
+                                                None
+                                            } else {
+                                                Some(pe_result.detail)
+                                            };
 
                                             if result.declared_bit_depth == Some(16)
                                                 || (result.declared_bit_depth.is_none()
@@ -1722,22 +1711,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                                     result.lufs = Some(lufs);
                                                     result.true_peak_dbtp = Some(tp);
                                                 }
-                                                let pe_evidence = super::preemphasis::metadata::check_tag_evidence(&original_path)
-                                                    .or_else(|| super::preemphasis::metadata::check_file_evidence(&original_path));
-                                                let catalog_match = super::preemphasis::catalog::check_catalog_evidence(&original_path);
-                                                if let Some(ev) = pe_evidence {
-                                                    result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
-                                                    result.preemphasis_detail = Some(format!(
-                                                        "{} indicates source disc used pre-emphasis; verify de-emphasis was not applied during ripping",
-                                                        ev.label()
-                                                    ));
-                                                } else if let Some(cm) = catalog_match {
-                                                    result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
-                                                    result.preemphasis_detail = Some(format!(
-                                                        "{}; verify de-emphasis was not applied during ripping",
-                                                        cm.detail
-                                                    ));
-                                                }
+                                                let pe_result = super::preemphasis::detect_preemphasis_metadata_catalog(
+                                                    original_path.clone(),
+                                                );
+                                                result.preemphasis = Some(pe_result.confidence);
+                                                result.preemphasis_detail = if pe_result.detail.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(pe_result.detail)
+                                                };
                                                 if result.declared_bit_depth == Some(16)
                                                     || (result.declared_bit_depth.is_none()
                                                         && result.actual_bit_depth <= 16)
@@ -1840,33 +1822,16 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                         result.true_peak_dbtp = Some(tp);
                                     }
 
-                                    // Fast pre-emphasis detection (metadata + catalog only, no spectral).
-                                    let pe_path = result.path.clone();
-                                    let pe_evidence =
-                                        super::preemphasis::metadata::check_tag_evidence(&pe_path)
-                                            .or_else(|| {
-                                                super::preemphasis::metadata::check_file_evidence(
-                                                    &pe_path,
-                                                )
-                                            });
-                                    let catalog_match =
-                                        super::preemphasis::catalog::check_catalog_evidence(
-                                            &pe_path,
-                                        );
-
-                                    if let Some(ev) = pe_evidence {
-                                        result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
-                                        result.preemphasis_detail = Some(format!(
-                                            "{} indicates source disc used pre-emphasis; verify de-emphasis was not applied during ripping",
-                                            ev.label()
-                                        ));
-                                    } else if let Some(cm) = catalog_match {
-                                        result.preemphasis = Some(super::preemphasis::PreemphasisConfidence::StrongCandidate);
-                                        result.preemphasis_detail = Some(format!(
-                                            "{}; verify de-emphasis was not applied during ripping",
-                                            cm.detail
-                                        ));
-                                    }
+                                    // Fast Phase 2-safe pre-emphasis detection (metadata/CUE PRE flag + catalog only; no spectral analysis).
+                                    let pe_result = super::preemphasis::detect_preemphasis_metadata_catalog(
+                                        result.path.clone(),
+                                    );
+                                    result.preemphasis = Some(pe_result.confidence);
+                                    result.preemphasis_detail = if pe_result.detail.is_empty() {
+                                        None
+                                    } else {
+                                        Some(pe_result.detail)
+                                    };
 
                                     // HDCD detection (only meaningful for 16-bit sources).
                                     if result.declared_bit_depth == Some(16)
@@ -3007,7 +2972,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 for path in paths {
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let result = super::preemphasis::detect_preemphasis(path).await;
+                        let result = super::preemphasis::detect_preemphasis_metadata_catalog_async(path).await;
                         let _ = tx.send(AppMessage::PreemphasisComplete { result }).await;
                     });
                 }

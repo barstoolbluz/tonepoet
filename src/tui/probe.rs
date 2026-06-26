@@ -658,19 +658,19 @@ pub fn preemphasis_metadata_check_pub(path: &Path) -> Option<String> {
     preemphasis_metadata_check(path)
 }
 
-/// Lightweight pre-emphasis check using metadata evidence only (no
-/// spectral analysis). Checks tags, CUE/log files in the same directory,
-/// and catalog number against the known PE disc database.
+/// Lightweight Phase 2 pre-emphasis check using PRE flags and catalog evidence
+/// only. It never runs spectral analysis and deliberately excludes log-file
+/// heuristics.
 fn preemphasis_metadata_check(path: &Path) -> Option<String> {
     use super::preemphasis::catalog::check_catalog_evidence;
-    use super::preemphasis::metadata::{check_file_evidence, check_tag_evidence};
+    use super::preemphasis::metadata::{check_cue_evidence, check_pre_flag_tag_evidence};
 
     // Tags (fastest).
-    if let Some(ev) = check_tag_evidence(path) {
+    if let Some(ev) = check_pre_flag_tag_evidence(path) {
         return Some(ev.label().to_string());
     }
-    // CUE and log files in the same directory.
-    if let Some(ev) = check_file_evidence(path) {
+    // CUE FLAGS PRE sidecars.
+    if let Some(ev) = check_cue_evidence(path) {
         return Some(ev.label().to_string());
     }
     // Catalog number matching.
@@ -2176,6 +2176,323 @@ pub fn write_all_tags(
     result
 }
 
+/// Embed or replace one artwork picture type in each path and return fresh compact metadata.
+pub fn write_artwork_to_files(
+    paths: &[std::path::PathBuf],
+    image_path: &std::path::Path,
+    picture_type: lofty::picture::PictureType,
+) -> Result<Vec<SourceMetadata>, String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::picture::Picture;
+
+    let image_bytes = std::fs::read(image_path)
+        .map_err(|e| format!("read artwork '{}': {}", image_path.display(), e))?;
+    let mime_type = image_mime_type(image_path, &image_bytes)?;
+
+    transactional_artwork_batch(paths, |path| {
+        let mut tagged = lofty::read_from_path(path)
+            .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+        if tagged.primary_tag().is_none() {
+            let tt = tagged.primary_tag_type();
+            tagged.insert_tag(lofty::tag::Tag::new(tt));
+        }
+        let tag = tagged
+            .primary_tag_mut()
+            .ok_or_else(|| format!("no writable tag for '{}'", path.display()))?;
+        tag.remove_picture_type(picture_type);
+        tag.push_picture(Picture::new_unchecked(
+            picture_type,
+            Some(mime_type.clone()),
+            None,
+            image_bytes.clone(),
+        ));
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .map_err(|e| format!("failed to save '{}': {}", path.display(), e))?;
+        Ok(())
+    })?;
+
+    Ok(read_all_tags_merged_with_metadata(paths)?.metadata)
+}
+
+/// Remove one artwork picture type from each path and return fresh compact metadata.
+pub fn remove_artwork_from_files(
+    paths: &[std::path::PathBuf],
+    picture_type: lofty::picture::PictureType,
+) -> Result<Vec<SourceMetadata>, String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+
+    transactional_artwork_batch(paths, |path| {
+        let mut tagged = lofty::read_from_path(path)
+            .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+        let Some(tag) = tagged.primary_tag_mut() else {
+            return Ok(());
+        };
+        tag.remove_picture_type(picture_type);
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .map_err(|e| format!("failed to save '{}': {}", path.display(), e))?;
+        Ok(())
+    })?;
+
+    Ok(read_all_tags_merged_with_metadata(paths)?.metadata)
+}
+
+/// Apply artwork mutations transactionally across a batch of paths.
+///
+/// The operation is intentionally all-or-nothing for multi-file selections:
+/// first every unique target is backed up, then every mutation is applied, and
+/// backups are removed only after the whole batch succeeds. If any mutation
+/// fails, every target with a backup is restored in reverse order so callers do
+/// not observe a misleading "failed" result with a partially changed selection.
+fn transactional_artwork_batch<F>(
+    paths: &[std::path::PathBuf],
+    mut apply: F,
+) -> Result<(), String>
+where
+    F: FnMut(&std::path::Path) -> Result<(), String>,
+{
+    let unique_paths = unique_artwork_paths(paths);
+    if unique_paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::with_capacity(unique_paths.len());
+
+    for path in &unique_paths {
+        let backup = crate::db::Database::backup_path_for(path);
+        std::fs::copy(path, &backup).map_err(|e| {
+            cleanup_artwork_backups(&backups);
+            format!("backup failed for '{}': {}", path.display(), e)
+        })?;
+        backups.push((path.clone(), backup));
+    }
+
+    let manifest = write_artwork_recovery_manifest(&backups).map_err(|err| {
+        let rollback = rollback_artwork_backups(&backups);
+        if rollback.is_empty() {
+            err
+        } else {
+            format!("{err}; rollback issues: {}", rollback.join("; "))
+        }
+    })?;
+
+    for path in &unique_paths {
+        if let Err(err) = apply(path) {
+            let rollback = rollback_artwork_backups(&backups);
+            let _ = std::fs::remove_file(&manifest);
+            if rollback.is_empty() {
+                return Err(err);
+            }
+            return Err(format!("{}; rollback issues: {}", err, rollback.join("; ")));
+        }
+    }
+
+    // Commit point: once the manifest is gone, startup recovery will not roll
+    // the batch back. If we cannot remove the manifest, roll back while the
+    // backups are still present so a successful mutation never leaves an
+    // ambiguous crash-recovery record behind.
+    if let Err(err) = std::fs::remove_file(&manifest) {
+        let rollback = rollback_artwork_backups(&backups);
+        if rollback.is_empty() {
+            return Err(format!("artwork batch commit failed (rolled back): {err}"));
+        }
+        return Err(format!(
+            "artwork batch commit failed ({err}); rollback issues: {}",
+            rollback.join("; ")
+        ));
+    }
+    cleanup_artwork_backups(&backups);
+    Ok(())
+}
+
+fn unique_artwork_paths(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut unique = Vec::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            unique.push(path.clone());
+        }
+    }
+    unique
+}
+
+
+const ARTWORK_RECOVERY_MANIFEST_PREFIX: &str = "tonepoet-artwork-batch-";
+const ARTWORK_RECOVERY_MANIFEST_SUFFIX: &str = ".manifest";
+
+/// Recover artwork batch writes that were interrupted after backups were made
+/// and before the commit marker was removed. This mirrors the metadata-write
+/// journal recovery path: an uncommitted batch rolls back on the next startup.
+pub fn recover_stale_artwork_batches() -> Vec<String> {
+    let mut messages = Vec::new();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return messages;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(ARTWORK_RECOVERY_MANIFEST_PREFIX)
+            || !name.ends_with(ARTWORK_RECOVERY_MANIFEST_SUFFIX)
+        {
+            continue;
+        }
+        match recover_artwork_batch_manifest(&path) {
+            Ok(restored) if restored > 0 => messages.push(format!(
+                "Recovered artwork batch: restored {restored} file(s) from {}",
+                path.display()
+            )),
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(err) => messages.push(format!(
+                "ARTWORK RECOVERY FAILED for {}: {err}",
+                path.display()
+            )),
+        }
+    }
+    messages
+}
+
+fn artwork_recovery_manifest_path() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "{ARTWORK_RECOVERY_MANIFEST_PREFIX}{}-{nanos}{ARTWORK_RECOVERY_MANIFEST_SUFFIX}",
+        std::process::id()
+    ))
+}
+
+fn write_artwork_recovery_manifest(
+    backups: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Result<std::path::PathBuf, String> {
+    let manifest = artwork_recovery_manifest_path();
+    let tmp = manifest.with_extension("manifest.tmp");
+    let mut body = String::new();
+    for (path, backup) in backups {
+        body.push_str(&path.display().to_string());
+        body.push('\t');
+        body.push_str(&backup.display().to_string());
+        body.push('\n');
+    }
+    std::fs::write(&tmp, body)
+        .map_err(|err| format!("artwork recovery manifest write failed: {err}"))?;
+    std::fs::rename(&tmp, &manifest)
+        .map_err(|err| format!("artwork recovery manifest commit failed: {err}"))?;
+    Ok(manifest)
+}
+
+fn recover_artwork_batch_manifest(manifest: &std::path::Path) -> Result<usize, String> {
+    let text = std::fs::read_to_string(manifest)
+        .map_err(|err| format!("read manifest: {err}"))?;
+    let mut restored = 0usize;
+    let mut issues = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((original, backup)) = line.split_once('\t') else {
+            issues.push(format!("malformed manifest line: {line}"));
+            continue;
+        };
+        let original = std::path::PathBuf::from(original);
+        let backup = std::path::PathBuf::from(backup);
+        if !backup.exists() {
+            issues.push(format!("missing backup: {}", backup.display()));
+            continue;
+        }
+        match std::fs::copy(&backup, &original) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&backup);
+                restored += 1;
+            }
+            Err(err) => issues.push(format!(
+                "restore '{}' from '{}' failed: {err}",
+                original.display(),
+                backup.display()
+            )),
+        }
+    }
+    if issues.is_empty() {
+        let _ = std::fs::remove_file(manifest);
+        Ok(restored)
+    } else {
+        Err(issues.join("; "))
+    }
+}
+
+fn rollback_artwork_backups(
+    backups: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    for (path, backup) in backups.iter().rev() {
+        if backup.exists() {
+            match std::fs::copy(backup, path) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(backup);
+                }
+                Err(e) => {
+                    issues.push(format!(
+                        "restore '{}' from '{}' failed: {}",
+                        path.display(),
+                        backup.display(),
+                        e
+                    ));
+                }
+            }
+        } else {
+            issues.push(format!(
+                "restore '{}' failed: backup '{}' missing",
+                path.display(),
+                backup.display()
+            ));
+        }
+    }
+    issues
+}
+
+fn cleanup_artwork_backups(backups: &[(std::path::PathBuf, std::path::PathBuf)]) {
+    for (_, backup) in backups {
+        let _ = std::fs::remove_file(backup);
+    }
+}
+
+fn image_mime_type(
+    path: &std::path::Path,
+    data: &[u8],
+) -> Result<lofty::picture::MimeType, String> {
+    use lofty::picture::MimeType;
+    if data.starts_with(b"\xff\xd8\xff") {
+        return Ok(MimeType::Jpeg);
+    }
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok(MimeType::Png);
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        return Ok(MimeType::Gif);
+    }
+    if data.starts_with(b"BM") {
+        return Ok(MimeType::Bmp);
+    }
+    if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        return Ok(MimeType::Unknown("image/webp".to_string()));
+    }
+    match path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()) {
+        Some(ext) if ext == "jpg" || ext == "jpeg" => Ok(MimeType::Jpeg),
+        Some(ext) if ext == "png" => Ok(MimeType::Png),
+        Some(ext) if ext == "gif" => Ok(MimeType::Gif),
+        Some(ext) if ext == "bmp" => Ok(MimeType::Bmp),
+        Some(ext) if ext == "webp" => Ok(MimeType::Unknown("image/webp".to_string())),
+        _ => Err(format!(
+            "unsupported artwork image type for '{}' (supported: JPEG, PNG, GIF, BMP, WebP)",
+            path.display()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2821,4 +3138,60 @@ mod tests {
         assert_eq!(info.channels, 6);
         assert_eq!(info.channel_layout, "5.1");
     }
+
+    #[test]
+    fn transactional_artwork_batch_rolls_back_prior_success_on_later_failure() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let one = td.path().join("one.flac");
+        let two = td.path().join("two.flac");
+        std::fs::write(&one, b"original one").expect("write one");
+        std::fs::write(&two, b"original two").expect("write two");
+
+        let paths = vec![one.clone(), two.clone()];
+        let result = transactional_artwork_batch(&paths, |path| {
+            if path == one.as_path() {
+                std::fs::write(path, b"mutated one").map_err(|err| err.to_string())?;
+                Ok(())
+            } else {
+                Err("simulated second-file failure".to_string())
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&one).expect("read one"), b"original one");
+        assert_eq!(std::fs::read(&two).expect("read two"), b"original two");
+        assert!(!crate::db::Database::backup_path_for(&one).exists());
+        assert!(!crate::db::Database::backup_path_for(&two).exists());
+    }
+
+
+    #[test]
+    fn artwork_recovery_manifest_restores_interrupted_batch() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let one = td.path().join("one.flac");
+        let two = td.path().join("two.flac");
+        std::fs::write(&one, b"original one").expect("write one");
+        std::fs::write(&two, b"original two").expect("write two");
+        let backup_one = crate::db::Database::backup_path_for(&one);
+        let backup_two = crate::db::Database::backup_path_for(&two);
+        std::fs::copy(&one, &backup_one).expect("backup one");
+        std::fs::copy(&two, &backup_two).expect("backup two");
+        std::fs::write(&one, b"mutated one").expect("mutate one");
+        std::fs::write(&two, b"mutated two").expect("mutate two");
+
+        let manifest = write_artwork_recovery_manifest(&[
+            (one.clone(), backup_one.clone()),
+            (two.clone(), backup_two.clone()),
+        ])
+        .expect("manifest");
+
+        let restored = recover_artwork_batch_manifest(&manifest).expect("recover");
+        assert_eq!(restored, 2);
+        assert_eq!(std::fs::read(&one).expect("read one"), b"original one");
+        assert_eq!(std::fs::read(&two).expect("read two"), b"original two");
+        assert!(!manifest.exists());
+        assert!(!backup_one.exists());
+        assert!(!backup_two.exists());
+    }
+
 }

@@ -2840,6 +2840,1020 @@ impl ContentTab {
     }
 }
 
+
+/// ReplayGain scan mode launched from the metadata editor's ReplayGain tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataReplayGainScanMode {
+    /// Recalculate per-track ReplayGain tags for the selected files only.
+    Track,
+    /// Recalculate album + track ReplayGain tags for the whole active album.
+    Album,
+}
+
+impl MetadataReplayGainScanMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Track => "track",
+            Self::Album => "album + track",
+        }
+    }
+}
+
+/// In-flight ReplayGain scan identity for the metadata editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataReplayGainScanState {
+    /// Details/session id of the presentation surface that launched the scan.
+    pub session_id: u64,
+    pub generation: u64,
+    pub mode: MetadataReplayGainScanMode,
+    pub file_count: usize,
+}
+
+/// Artwork write/remove mode launched from the metadata editor Artwork tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataArtworkWriteMode {
+    Write,
+    Remove,
+}
+
+impl MetadataArtworkWriteMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Write => "artwork write",
+            Self::Remove => "artwork removal",
+        }
+    }
+}
+
+/// In-flight artwork write/remove identity for the metadata editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataArtworkWriteState {
+    /// Details/session id of the presentation surface that launched the write.
+    pub session_id: u64,
+    pub generation: u64,
+    pub mode: MetadataArtworkWriteMode,
+    pub file_count: usize,
+}
+
+/// Reusable modal file picker filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePickerFilter {
+    Images,
+    Audio,
+    All,
+    Custom(Vec<String>),
+}
+
+impl FilePickerFilter {
+    pub fn accepts_path(&self, path: &std::path::Path, is_dir: bool) -> bool {
+        if is_dir {
+            return true;
+        }
+        match self {
+            Self::All => true,
+            Self::Images => path_extension_matches(
+                path,
+                &["jpg", "jpeg", "png", "gif", "bmp", "webp"],
+            ),
+            Self::Audio => path_extension_matches(
+                path,
+                &[
+                    "flac", "wav", "aiff", "aif", "wv", "mp3", "m4a", "aac", "ogg",
+                    "opus",
+                ],
+            ),
+            Self::Custom(exts) => path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| exts.iter().any(|candidate| candidate.eq_ignore_ascii_case(ext)))
+                .unwrap_or(false),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Images => "Images (*.jpg, *.jpeg, *.png, *.gif, *.bmp, *.webp)".to_string(),
+            Self::Audio => "Audio files".to_string(),
+            Self::All => "All files".to_string(),
+            Self::Custom(exts) if exts.is_empty() => "Custom filter (no extensions)".to_string(),
+            Self::Custom(exts) => format!("Custom (*.{})", exts.join(", *.")),
+        }
+    }
+}
+
+fn path_extension_matches(path: &std::path::Path, exts: &[&str]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| exts.iter().any(|candidate| candidate.eq_ignore_ascii_case(ext)))
+        .unwrap_or(false)
+}
+
+/// What a reusable file picker is selecting for.
+///
+/// New TUI callers should add a target here and handle `FilePickerOutcome` in
+/// their owning overlay/module. The picker itself only emits a target + path;
+/// it never performs caller-specific side effects such as artwork writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePickerTarget {
+    MetadataArtwork {
+        picture_type: lofty::picture::PictureType,
+    },
+    Generic {
+        id: String,
+    },
+}
+
+/// Selection mode for reusable file-picker clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerSelectionMode {
+    Files,
+    Directories,
+    FilesOrDirectories,
+}
+
+impl FilePickerSelectionMode {
+    fn accepts_entry(self, is_dir: bool) -> bool {
+        match self {
+            Self::Files => !is_dir,
+            Self::Directories => is_dir,
+            Self::FilesOrDirectories => true,
+        }
+    }
+}
+
+/// Toolbar actions shown in the picker chrome and surfaced through the button map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerToolbarAction {
+    Back,
+    Up,
+    Home,
+    Refresh,
+    NewFolder,
+    Search,
+    ToggleHidden,
+    SortName,
+    SortModified,
+    SortSize,
+    RevealParent,
+    Rename,
+    Delete,
+    Copy,
+    Move,
+    Paste,
+}
+
+/// Footer actions shown in the picker chrome and surfaced through the button map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerFooterAction {
+    Open,
+    Apply,
+    Ok,
+    /// Explicit confirmation action for permanent picker deletes.
+    DeletePermanently,
+    Cancel,
+}
+
+impl FilePickerFooterAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Apply => "Apply",
+            Self::Ok => "OK",
+            Self::DeletePermanently => "Delete permanently",
+            Self::Cancel => "Cancel",
+        }
+    }
+}
+
+/// Focused interactive region inside the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerFocus {
+    List,
+    Address,
+    Search,
+    NewFolderName,
+    Rename,
+    /// Confirmation surface for destructive permanent deletes.
+    DeleteConfirm,
+}
+
+/// Sort modes for the reusable file picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerSortKey {
+    Name,
+    Kind,
+    Size,
+    Modified,
+}
+
+impl FilePickerSortKey {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Kind => "Kind",
+            Self::Size => "Size",
+            Self::Modified => "Modified",
+        }
+    }
+}
+
+/// Local clipboard mode for picker copy/move operations. This is deliberately
+/// picker-local rather than a process-wide clipboard so a reusable picker can be
+/// embedded safely without surprising other TUI surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerClipboardMode {
+    Copy,
+    Move,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePickerClipboard {
+    pub mode: FilePickerClipboardMode,
+    pub path: std::path::PathBuf,
+}
+
+/// Result emitted by a file-picker interaction. This is intentionally generic:
+/// clients decide what a selected path means for their workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePickerOutcome {
+    Selected {
+        target: FilePickerTarget,
+        path: std::path::PathBuf,
+    },
+    Cancelled {
+        target: FilePickerTarget,
+    },
+}
+
+/// A single entry in the reusable file picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePickerEntry {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+/// Reusable modal file picker state.
+///
+/// The state is intentionally not artwork-specific. It models a desktop-style
+/// file browser in TUI form: toolbar buttons, editable address bar, directory
+/// history, optional folder creation, selectable rows, and context-dependent
+/// footer actions. Callers consume `FilePickerOutcome` and perform their own
+/// side effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePickerState {
+    pub current_dir: std::path::PathBuf,
+    pub entries: Vec<FilePickerEntry>,
+    pub cursor: usize,
+    pub scroll: usize,
+    pub filter: FilePickerFilter,
+    pub selection_mode: FilePickerSelectionMode,
+    pub target: FilePickerTarget,
+    pub selected: Option<std::path::PathBuf>,
+    pub title: String,
+    pub history: Vec<std::path::PathBuf>,
+    pub focus: FilePickerFocus,
+    pub address_input: String,
+    pub address_cursor: usize,
+    pub search_input: String,
+    pub search_cursor: usize,
+    pub new_folder_input: String,
+    pub new_folder_cursor: usize,
+    pub rename_input: String,
+    pub rename_cursor: usize,
+    pub operation_target: Option<std::path::PathBuf>,
+    /// Path awaiting explicit delete confirmation. Delete is permanent; the
+    /// picker never removes files directly from a single keypress or toolbar click.
+    pub pending_delete: Option<std::path::PathBuf>,
+    pub pending_delete_is_dir: bool,
+    pub sort_key: FilePickerSortKey,
+    pub sort_reverse: bool,
+    pub show_hidden: bool,
+    pub recent_locations: Vec<std::path::PathBuf>,
+    pub bookmarks: Vec<std::path::PathBuf>,
+    pub clipboard: Option<FilePickerClipboard>,
+    pub primary_action: FilePickerFooterAction,
+    pub secondary_action: Option<FilePickerFooterAction>,
+    pub allow_new_folder: bool,
+    pub error: Option<String>,
+}
+
+impl FilePickerState {
+    pub fn new(
+        current_dir: std::path::PathBuf,
+        filter: FilePickerFilter,
+        title: impl Into<String>,
+        target: FilePickerTarget,
+    ) -> Self {
+        let mut state = Self {
+            current_dir: current_dir.clone(),
+            entries: Vec::new(),
+            cursor: 0,
+            scroll: 0,
+            filter,
+            selection_mode: FilePickerSelectionMode::Files,
+            target,
+            selected: None,
+            title: title.into(),
+            history: Vec::new(),
+            focus: FilePickerFocus::List,
+            address_input: String::new(),
+            address_cursor: 0,
+            search_input: String::new(),
+            search_cursor: 0,
+            new_folder_input: String::new(),
+            new_folder_cursor: 0,
+            rename_input: String::new(),
+            rename_cursor: 0,
+            operation_target: None,
+            pending_delete: None,
+            pending_delete_is_dir: false,
+            sort_key: FilePickerSortKey::Name,
+            sort_reverse: false,
+            show_hidden: false,
+            recent_locations: Vec::new(),
+            bookmarks: default_file_picker_bookmarks(&current_dir),
+            clipboard: None,
+            primary_action: FilePickerFooterAction::Open,
+            secondary_action: Some(FilePickerFooterAction::Ok),
+            allow_new_folder: true,
+            error: None,
+        };
+        state.sync_address_from_current_dir();
+        state.refresh();
+        state
+    }
+
+    pub fn for_artwork(
+        current_dir: std::path::PathBuf,
+        picture_type: lofty::picture::PictureType,
+    ) -> Self {
+        let mut state = Self::new(
+            current_dir,
+            FilePickerFilter::Images,
+            "Select artwork image",
+            FilePickerTarget::MetadataArtwork { picture_type },
+        );
+        state.primary_action = FilePickerFooterAction::Apply;
+        state.secondary_action = Some(FilePickerFooterAction::Open);
+        state.selection_mode = FilePickerSelectionMode::Files;
+        state
+    }
+
+    pub fn sync_address_from_current_dir(&mut self) {
+        self.address_input = self.current_dir.display().to_string();
+        self.address_cursor = self.address_input.len();
+    }
+
+    pub fn refresh(&mut self) {
+        self.entries.clear();
+        self.error = None;
+        match std::fs::read_dir(&self.current_dir) {
+            Ok(read_dir) => {
+                let mut entries = Vec::new();
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    let metadata = entry.metadata().ok();
+                    let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or_else(|| path.is_dir());
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    if !self.show_hidden && name.starts_with('.') {
+                        continue;
+                    }
+                    if !self.filter.accepts_path(&path, is_dir) {
+                        continue;
+                    }
+                    if !self.search_input.is_empty()
+                        && !name
+                            .to_ascii_lowercase()
+                            .contains(&self.search_input.to_ascii_lowercase())
+                    {
+                        continue;
+                    }
+                    entries.push(FilePickerEntry {
+                        name,
+                        path,
+                        is_dir,
+                        size: metadata.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
+                        modified: metadata.and_then(|m| m.modified().ok()),
+                    });
+                }
+                let sort_key = self.sort_key;
+                let reverse = self.sort_reverse;
+                entries.sort_by(|a, b| {
+                    let ordering = b
+                        .is_dir
+                        .cmp(&a.is_dir)
+                        .then_with(|| match sort_key {
+                            FilePickerSortKey::Name => a
+                                .name
+                                .to_ascii_lowercase()
+                                .cmp(&b.name.to_ascii_lowercase()),
+                            FilePickerSortKey::Kind => file_picker_kind_label(a)
+                                .cmp(&file_picker_kind_label(b))
+                                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())),
+                            FilePickerSortKey::Size => a
+                                .size
+                                .unwrap_or(0)
+                                .cmp(&b.size.unwrap_or(0))
+                                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())),
+                            FilePickerSortKey::Modified => a
+                                .modified
+                                .cmp(&b.modified)
+                                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())),
+                        });
+                    if reverse && !a.is_dir && !b.is_dir {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    }
+                });
+                self.entries = entries;
+                self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+                self.scroll = self.scroll.min(self.cursor);
+                self.sync_address_from_current_dir();
+            }
+            Err(err) => {
+                self.error = Some(format!("{}: {}", self.current_dir.display(), err));
+                self.cursor = 0;
+                self.scroll = 0;
+                self.sync_address_from_current_dir();
+            }
+        }
+    }
+
+    pub fn move_cursor(&mut self, delta: isize, visible_rows: usize) {
+        if self.entries.is_empty() {
+            self.cursor = 0;
+            self.scroll = 0;
+            return;
+        }
+        let step = delta.checked_abs().unwrap_or(isize::MAX) as usize;
+        self.cursor = if delta < 0 {
+            self.cursor.saturating_sub(step)
+        } else {
+            self.cursor.saturating_add(step).min(self.entries.len() - 1)
+        };
+        self.selected = self.entries.get(self.cursor).map(|entry| entry.path.clone());
+        self.ensure_cursor_visible(visible_rows);
+    }
+
+    pub fn set_cursor(&mut self, index: usize, visible_rows: usize) {
+        if self.entries.is_empty() {
+            self.cursor = 0;
+            self.scroll = 0;
+            self.selected = None;
+            return;
+        }
+        self.cursor = index.min(self.entries.len() - 1);
+        self.selected = self.entries.get(self.cursor).map(|entry| entry.path.clone());
+        self.ensure_cursor_visible(visible_rows);
+    }
+
+    pub fn ensure_cursor_visible(&mut self, visible_rows: usize) {
+        let visible_rows = visible_rows.max(1);
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll.saturating_add(visible_rows) {
+            self.scroll = self.cursor.saturating_add(1).saturating_sub(visible_rows);
+        }
+        self.scroll = self.scroll.min(self.entries.len().saturating_sub(visible_rows));
+    }
+
+    fn remember_location(&mut self, path: std::path::PathBuf) {
+        if self.recent_locations.first() == Some(&path) {
+            return;
+        }
+        self.recent_locations.retain(|prior| prior != &path);
+        self.recent_locations.insert(0, path);
+        self.recent_locations.truncate(6);
+    }
+
+    pub fn navigate_to_dir(&mut self, dir: std::path::PathBuf) -> bool {
+        if !dir.is_dir() {
+            self.error = Some(format!("Not a directory: {}", dir.display()));
+            return false;
+        }
+        self.history.push(self.current_dir.clone());
+        self.remember_location(self.current_dir.clone());
+        self.current_dir = dir;
+        self.pending_delete = None;
+        self.pending_delete_is_dir = false;
+        self.cursor = 0;
+        self.scroll = 0;
+        self.selected = None;
+        self.focus = FilePickerFocus::List;
+        self.refresh();
+        true
+    }
+
+    pub fn go_parent(&mut self) -> bool {
+        let Some(parent) = self.current_dir.parent().map(|p| p.to_path_buf()) else {
+            return false;
+        };
+        self.navigate_to_dir(parent)
+    }
+
+    pub fn go_back(&mut self) -> bool {
+        let Some(prior) = self.history.pop() else {
+            return false;
+        };
+        self.remember_location(self.current_dir.clone());
+        self.current_dir = prior;
+        self.pending_delete = None;
+        self.pending_delete_is_dir = false;
+        self.cursor = 0;
+        self.scroll = 0;
+        self.selected = None;
+        self.refresh();
+        true
+    }
+
+    pub fn go_home(&mut self) -> bool {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            self.error = Some("HOME is not set".to_string());
+            return false;
+        };
+        self.navigate_to_dir(home)
+    }
+
+    pub fn reveal_selected_parent(&mut self) -> bool {
+        let Some(path) = self.selected.clone().or_else(|| self.entries.get(self.cursor).map(|e| e.path.clone())) else {
+            self.error = Some("No item selected".to_string());
+            return false;
+        };
+        let target = if path.is_dir() { path } else { path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.current_dir.clone()) };
+        self.navigate_to_dir(target)
+    }
+
+    pub fn open_or_select_current(&mut self) -> Option<std::path::PathBuf> {
+        let entry = self.entries.get(self.cursor).cloned()?;
+        self.selected = Some(entry.path.clone());
+        if entry.is_dir {
+            self.navigate_to_dir(entry.path);
+            None
+        } else if self.selection_mode.accepts_entry(entry.is_dir) {
+            Some(entry.path)
+        } else {
+            self.error = Some("This picker cannot select that item type".to_string());
+            None
+        }
+    }
+
+    pub fn accept_current_selection(&mut self) -> Option<std::path::PathBuf> {
+        if self.selection_mode == FilePickerSelectionMode::Directories {
+            if let Some(path) = self.selected.clone().filter(|path| path.is_dir()) {
+                return Some(path);
+            }
+            return Some(self.current_dir.clone());
+        }
+        if let Some(path) = self.selected.clone() {
+            let is_dir = path.is_dir();
+            if self.selection_mode.accepts_entry(is_dir) {
+                return Some(path);
+            }
+        }
+        self.entries.get(self.cursor).cloned().and_then(|entry| {
+            if self.selection_mode.accepts_entry(entry.is_dir) {
+                self.selected = Some(entry.path.clone());
+                Some(entry.path)
+            } else {
+                self.error = Some("Select a file before applying".to_string());
+                None
+            }
+        })
+    }
+
+    pub fn outcome_for_path(&self, path: std::path::PathBuf) -> FilePickerOutcome {
+        FilePickerOutcome::Selected {
+            target: self.target.clone(),
+            path,
+        }
+    }
+
+    pub fn cancel_outcome(&self) -> FilePickerOutcome {
+        FilePickerOutcome::Cancelled {
+            target: self.target.clone(),
+        }
+    }
+
+    pub fn begin_address_edit(&mut self) {
+        self.focus = FilePickerFocus::Address;
+        self.sync_address_from_current_dir();
+    }
+
+    pub fn begin_search(&mut self) {
+        self.focus = FilePickerFocus::Search;
+        self.search_cursor = self.search_input.len();
+    }
+
+    pub fn begin_rename_current(&mut self) {
+        let Some(entry) = self.entries.get(self.cursor).cloned() else {
+            self.error = Some("No item selected".to_string());
+            return;
+        };
+        self.operation_target = Some(entry.path);
+        self.rename_input = entry.name;
+        self.rename_cursor = self.rename_input.len();
+        self.focus = FilePickerFocus::Rename;
+        self.error = None;
+    }
+
+    pub fn begin_new_folder(&mut self) {
+        if !self.allow_new_folder {
+            self.error = Some("Folder creation is disabled for this picker".to_string());
+            return;
+        }
+        self.focus = FilePickerFocus::NewFolderName;
+        self.new_folder_input.clear();
+        self.new_folder_cursor = 0;
+        self.error = None;
+    }
+
+    pub fn commit_address(&mut self) -> bool {
+        let expanded = expand_user_path(&self.address_input);
+        let candidate = if expanded.is_absolute() {
+            expanded
+        } else {
+            self.current_dir.join(expanded)
+        };
+        if candidate.is_dir() {
+            self.navigate_to_dir(candidate)
+        } else if candidate.is_file() && self.filter.accepts_path(&candidate, false) {
+            if let Some(parent) = candidate.parent().map(|p| p.to_path_buf()) {
+                self.navigate_to_dir(parent);
+                self.refresh();
+                if let Some(pos) = self.entries.iter().position(|entry| entry.path == candidate) {
+                    self.set_cursor(pos, 1);
+                }
+            }
+            self.selected = Some(candidate);
+            self.focus = FilePickerFocus::List;
+            true
+        } else {
+            self.error = Some(format!("Path not found or filtered out: {}", candidate.display()));
+            false
+        }
+    }
+
+    pub fn create_folder_from_input(&mut self) -> bool {
+        let name = self.new_folder_input.trim();
+        if name.is_empty() {
+            self.error = Some("Enter a folder name".to_string());
+            return false;
+        }
+        if name.contains(std::path::MAIN_SEPARATOR) {
+            self.error = Some("Folder name must not contain path separators".to_string());
+            return false;
+        }
+        let path = self.current_dir.join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                self.focus = FilePickerFocus::List;
+                self.navigate_to_dir(path)
+            }
+            Err(err) => {
+                self.error = Some(format!("Could not create folder: {err}"));
+                false
+            }
+        }
+    }
+
+    pub fn commit_rename(&mut self) -> bool {
+        let Some(old_path) = self.operation_target.clone() else {
+            self.error = Some("No rename target".to_string());
+            return false;
+        };
+        let new_name = self.rename_input.trim();
+        if new_name.is_empty() {
+            self.error = Some("Enter a new name".to_string());
+            return false;
+        }
+        if new_name.contains(std::path::MAIN_SEPARATOR) {
+            self.error = Some("Name must not contain path separators".to_string());
+            return false;
+        }
+        let Some(parent) = old_path.parent().map(|p| p.to_path_buf()) else {
+            self.error = Some("Cannot rename root path".to_string());
+            return false;
+        };
+        let new_path = parent.join(new_name);
+        if new_path.exists() && new_path != old_path {
+            self.error = Some(format!("Destination already exists: {}", new_path.display()));
+            return false;
+        }
+        match std::fs::rename(&old_path, &new_path) {
+            Ok(()) => {
+                self.focus = FilePickerFocus::List;
+                self.operation_target = None;
+                self.selected = Some(new_path.clone());
+                self.refresh();
+                if let Some(pos) = self.entries.iter().position(|entry| entry.path == new_path) {
+                    self.set_cursor(pos, 1);
+                }
+                true
+            }
+            Err(err) => {
+                self.error = Some(format!("Could not rename: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Begin a guarded permanent delete. This method deliberately does not
+    /// remove anything; callers must subsequently call `confirm_pending_delete`
+    /// after the user explicitly confirms the destructive operation.
+    pub fn delete_current(&mut self) -> bool {
+        let Some(entry) = self.entries.get(self.cursor).cloned() else {
+            self.error = Some("No item selected".to_string());
+            return false;
+        };
+        self.pending_delete = Some(entry.path.clone());
+        self.pending_delete_is_dir = entry.is_dir;
+        self.focus = FilePickerFocus::DeleteConfirm;
+        self.error = Some(format!(
+            "Permanent delete requested for '{}'. Press Enter/Y or click 'Delete permanently'; Esc/Cancel keeps it.",
+            entry.name
+        ));
+        true
+    }
+
+    pub fn cancel_pending_delete(&mut self) {
+        self.pending_delete = None;
+        self.pending_delete_is_dir = false;
+        if self.focus == FilePickerFocus::DeleteConfirm {
+            self.focus = FilePickerFocus::List;
+        }
+        self.error = None;
+    }
+
+    /// Permanently delete the path selected by `delete_current` after explicit
+    /// user confirmation. The UI labels this as permanent because this project
+    /// does not depend on a cross-platform trash/recycle-bin crate.
+    pub fn confirm_pending_delete(&mut self) -> bool {
+        let Some(path) = self.pending_delete.clone() else {
+            self.error = Some("No delete is pending".to_string());
+            self.focus = FilePickerFocus::List;
+            return false;
+        };
+        let display_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let result = if self.pending_delete_is_dir {
+            std::fs::remove_dir(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => {
+                if self.selected.as_ref() == Some(&path) {
+                    self.selected = None;
+                }
+                self.pending_delete = None;
+                self.pending_delete_is_dir = false;
+                self.focus = FilePickerFocus::List;
+                self.refresh();
+                true
+            }
+            Err(err) => {
+                self.error = Some(format!("Could not permanently delete '{}': {err}", display_name));
+                self.pending_delete = None;
+                self.pending_delete_is_dir = false;
+                self.focus = FilePickerFocus::List;
+                false
+            }
+        }
+    }
+
+    pub fn copy_current(&mut self) -> bool {
+        let Some(entry) = self.entries.get(self.cursor).cloned() else {
+            self.error = Some("No item selected".to_string());
+            return false;
+        };
+        self.clipboard = Some(FilePickerClipboard { mode: FilePickerClipboardMode::Copy, path: entry.path });
+        self.error = None;
+        true
+    }
+
+    pub fn move_current(&mut self) -> bool {
+        let Some(entry) = self.entries.get(self.cursor).cloned() else {
+            self.error = Some("No item selected".to_string());
+            return false;
+        };
+        self.clipboard = Some(FilePickerClipboard { mode: FilePickerClipboardMode::Move, path: entry.path });
+        self.error = None;
+        true
+    }
+
+    pub fn paste_clipboard(&mut self) -> bool {
+        let Some(clipboard) = self.clipboard.clone() else {
+            self.error = Some("Nothing to paste".to_string());
+            return false;
+        };
+        let Some(name) = clipboard.path.file_name() else {
+            self.error = Some("Clipboard path has no file name".to_string());
+            return false;
+        };
+        let destination = unique_destination_path(&self.current_dir.join(name));
+        let result = match clipboard.mode {
+            FilePickerClipboardMode::Copy => copy_file_picker_path(&clipboard.path, &destination),
+            FilePickerClipboardMode::Move => std::fs::rename(&clipboard.path, &destination).map_err(|err| err.to_string()),
+        };
+        match result {
+            Ok(()) => {
+                if clipboard.mode == FilePickerClipboardMode::Move {
+                    self.clipboard = None;
+                }
+                self.selected = Some(destination.clone());
+                self.refresh();
+                if let Some(pos) = self.entries.iter().position(|entry| entry.path == destination) {
+                    self.set_cursor(pos, 1);
+                }
+                true
+            }
+            Err(err) => {
+                self.error = Some(format!("Paste failed: {err}"));
+                false
+            }
+        }
+    }
+
+    pub fn set_sort(&mut self, sort_key: FilePickerSortKey) {
+        if self.sort_key == sort_key {
+            self.sort_reverse = !self.sort_reverse;
+        } else {
+            self.sort_key = sort_key;
+            self.sort_reverse = false;
+        }
+        self.refresh();
+    }
+
+    pub fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.refresh();
+    }
+
+    pub fn handle_text_edit_key(text: &mut String, cursor: &mut usize, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        match key.code {
+            KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                text.insert(*cursor, c);
+                *cursor += c.len_utf8();
+                true
+            }
+            KeyCode::Backspace => {
+                if *cursor > 0 {
+                    let mut prev = *cursor - 1;
+                    while prev > 0 && !text.is_char_boundary(prev) {
+                        prev -= 1;
+                    }
+                    text.drain(prev..*cursor);
+                    *cursor = prev;
+                }
+                true
+            }
+            KeyCode::Delete => {
+                if *cursor < text.len() {
+                    let mut next = *cursor + 1;
+                    while next < text.len() && !text.is_char_boundary(next) {
+                        next += 1;
+                    }
+                    text.drain(*cursor..next);
+                }
+                true
+            }
+            KeyCode::Left => {
+                if *cursor > 0 {
+                    let mut prev = *cursor - 1;
+                    while prev > 0 && !text.is_char_boundary(prev) {
+                        prev -= 1;
+                    }
+                    *cursor = prev;
+                }
+                true
+            }
+            KeyCode::Right => {
+                if *cursor < text.len() {
+                    let mut next = *cursor + 1;
+                    while next < text.len() && !text.is_char_boundary(next) {
+                        next += 1;
+                    }
+                    *cursor = next;
+                }
+                true
+            }
+            KeyCode::Home => {
+                *cursor = 0;
+                true
+            }
+            KeyCode::End => {
+                *cursor = text.len();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+fn expand_user_path(input: &str) -> std::path::PathBuf {
+    if input == "~" {
+        return std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(input));
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(input)
+}
+
+fn default_file_picker_bookmarks(current_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut bookmarks = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        bookmarks.push(home);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if !bookmarks.iter().any(|path| path == &cwd) {
+            bookmarks.push(cwd);
+        }
+    }
+    if !bookmarks.iter().any(|path| path.as_path() == current_dir) {
+        bookmarks.push(current_dir.to_path_buf());
+    }
+    bookmarks.truncate(5);
+    bookmarks
+}
+
+fn file_picker_kind_label(entry: &FilePickerEntry) -> &'static str {
+    if entry.is_dir {
+        return "dir";
+    }
+    match entry
+        .path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp") => "image",
+        Some("flac" | "wav" | "aiff" | "aif" | "wv" | "mp3" | "m4a" | "aac" | "ogg" | "opus") => "audio",
+        Some("cue" | "txt" | "md" | "json" | "xml") => "text",
+        _ => "file",
+    }
+}
+
+fn unique_destination_path(path: &std::path::Path) -> std::path::PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("copy");
+    let ext = path.extension().and_then(|s| s.to_str());
+    for idx in 1..10_000 {
+        let name = match ext {
+            Some(ext) => format!("{stem} copy {idx}.{ext}"),
+            None => format!("{stem} copy {idx}"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{stem} copy"))
+}
+
+fn copy_file_picker_path(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(src).map_err(|err| err.to_string())?;
+    if metadata.is_dir() {
+        copy_file_picker_dir(src, dst)
+    } else {
+        std::fs::copy(src, dst)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+}
+
+fn copy_file_picker_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir(dst).map_err(|err| err.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        copy_file_picker_path(&from, &to)?;
+    }
+    Ok(())
+}
+
 /// Immutable source/file facts captured when the metadata editor opens.
 ///
 /// Invariants:
@@ -3151,6 +4165,18 @@ impl Default for MetadataDetailsProbeState {
 }
 
 
+
+/// Cached analysis/detection facts surfaced in the Details tab.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataAnalysisFacts {
+    /// None means HDCD has not been scanned or is not applicable.
+    pub hdcd_detected: Option<bool>,
+    pub hdcd_detail: Option<String>,
+    /// None means pre-emphasis has not been scanned.
+    pub preemphasis: Option<crate::tui::preemphasis::PreemphasisConfidence>,
+    pub preemphasis_detail: Option<String>,
+}
+
 /// Cached, display-oriented filesystem/probe data for one selected audio file.
 ///
 /// Invariant: this struct has a single source of truth for each fact:
@@ -3168,6 +4194,8 @@ pub struct MetadataFileDetails {
     pub media_facts: ProbeState,
     /// Compact artwork metadata from the tag-read phase.
     pub artwork_facts: ArtworkFacts,
+    /// Cached HDCD / pre-emphasis analysis facts.
+    pub analysis_facts: MetadataAnalysisFacts,
     /// First-class issues for Details/Artwork/save UI.
     pub issues: Vec<MetadataIssue>,
 }
@@ -3214,6 +4242,7 @@ impl MetadataFileDetails {
             file_facts,
             media_facts: ProbeState::NotLoaded,
             artwork_facts,
+            analysis_facts: MetadataAnalysisFacts::default(),
             issues,
         }
     }
@@ -3260,6 +4289,57 @@ impl MetadataFileDetails {
             reason,
             retryable,
         });
+    }
+
+    pub fn set_analysis_result(&mut self, result: &crate::tui::analyze::AnalysisResult) {
+        self.analysis_facts.hdcd_detected = result.hdcd_detected;
+        self.analysis_facts.hdcd_detail = result.hdcd_detail.clone();
+        if let Some(confidence) = result.preemphasis {
+            let raw = crate::tui::preemphasis::PreemphasisResult {
+                path: result.path.clone(),
+                confidence,
+                cue_confirmed: false,
+                llr_m2_vs_m0: f64::NAN,
+                llr_m2_vs_m1: f64::NAN,
+                fitted_alpha: f64::NAN,
+                frames_scored: 0,
+                deemph_distance_delta: 0.0,
+                gates_fired: vec![],
+                detail: result.preemphasis_detail.clone().unwrap_or_default(),
+                spectral_rms_error: 0.0,
+                crest_improvement: 0.0,
+            };
+            let safe = crate::tui::preemphasis::metadata_editor_safe_result(&raw);
+            self.analysis_facts.preemphasis = Some(safe.confidence);
+            self.analysis_facts.preemphasis_detail = if safe.detail.is_empty() {
+                None
+            } else {
+                Some(safe.detail)
+            };
+        }
+    }
+
+    pub fn set_preemphasis_result(&mut self, result: &crate::tui::preemphasis::PreemphasisResult) {
+        let safe = crate::tui::preemphasis::metadata_editor_safe_result(result);
+        self.analysis_facts.preemphasis = Some(safe.confidence);
+        self.analysis_facts.preemphasis_detail = if safe.detail.is_empty() {
+            None
+        } else {
+            Some(safe.detail)
+        };
+    }
+
+    pub fn set_preemphasis_metadata_label(&mut self, label: &str) {
+        let safe = crate::tui::preemphasis::result_from_metadata_label(
+            self.file_facts.path.clone(),
+            label,
+        );
+        self.analysis_facts.preemphasis = Some(safe.confidence);
+        self.analysis_facts.preemphasis_detail = if safe.detail.is_empty() {
+            None
+        } else {
+            Some(safe.detail)
+        };
     }
 }
 
@@ -3765,6 +4845,15 @@ pub struct MetadataEditorModel {
     pub detail_edit: Option<crate::tui::text_input::TextInputState>,
     pub mb_back: Option<MbBackCache>,
     pub gnudb_back: Option<Box<GnudbReviewState>>,
+    pub replaygain_cursor: usize,
+    pub replaygain_selected: std::collections::BTreeSet<usize>,
+    pub replaygain_scan_generation: u64,
+    pub replaygain_scan: Option<MetadataReplayGainScanState>,
+    pub artwork_cursor: usize,
+    pub artwork_write_generation: u64,
+    pub artwork_write: Option<MetadataArtworkWriteState>,
+    pub file_picker: Option<FilePickerState>,
+    pub pending_artwork_type: Option<lofty::picture::PictureType>,
     pub read_only: bool,
     pub sacd_sidecar_path: Option<std::path::PathBuf>,
     pub presentation_selector_open: bool,
@@ -3792,6 +4881,15 @@ impl Default for MetadataEditorModel {
             detail_edit: None,
             mb_back: None,
             gnudb_back: None,
+            replaygain_cursor: 0,
+            replaygain_selected: std::collections::BTreeSet::new(),
+            replaygain_scan_generation: 0,
+            replaygain_scan: None,
+            artwork_cursor: 0,
+            artwork_write_generation: 0,
+            artwork_write: None,
+            file_picker: None,
+            pending_artwork_type: None,
             read_only: false,
             sacd_sidecar_path: None,
             presentation_selector_open: false,
@@ -3964,6 +5062,174 @@ impl MetadataEditorState {
         self.model.active_surface_mut()
     }
 
+
+    pub fn apply_analysis_result(&mut self, result: &crate::tui::analyze::AnalysisResult) -> bool {
+        let mut changed = false;
+        for file in &mut self.active_surface_mut().technical_details.files {
+            if file.file_facts.path == result.path {
+                file.set_analysis_result(result);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn apply_preemphasis_result(
+        &mut self,
+        result: &crate::tui::preemphasis::PreemphasisResult,
+    ) -> bool {
+        let mut changed = false;
+        for file in &mut self.active_surface_mut().technical_details.files {
+            if file.file_facts.path == result.path {
+                file.set_preemphasis_result(result);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn begin_replaygain_scan(
+        &mut self,
+        mode: MetadataReplayGainScanMode,
+        file_count: usize,
+    ) -> (u64, u64) {
+        let session_id = self.active_surface().technical_details.session_id;
+        let generation = self.replaygain_scan_generation.saturating_add(1);
+        self.replaygain_scan_generation = generation;
+        self.replaygain_scan = Some(MetadataReplayGainScanState {
+            session_id,
+            generation,
+            mode,
+            file_count,
+        });
+        (session_id, generation)
+    }
+
+    pub fn complete_replaygain_scan(&mut self, session_id: u64, generation: u64) -> bool {
+        if self
+            .replaygain_scan
+            .as_ref()
+            .map(|scan| scan.session_id == session_id && scan.generation == generation)
+            .unwrap_or(false)
+        {
+            self.replaygain_scan = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn begin_artwork_write(
+        &mut self,
+        mode: MetadataArtworkWriteMode,
+        file_count: usize,
+    ) -> (u64, u64) {
+        let session_id = self.active_surface().technical_details.session_id;
+        let generation = self.artwork_write_generation.saturating_add(1);
+        self.artwork_write_generation = generation;
+        self.artwork_write = Some(MetadataArtworkWriteState {
+            session_id,
+            generation,
+            mode,
+            file_count,
+        });
+        (session_id, generation)
+    }
+
+    pub fn complete_artwork_write(&mut self, session_id: u64, generation: u64) -> bool {
+        if self
+            .artwork_write
+            .as_ref()
+            .map(|write| write.session_id == session_id && write.generation == generation)
+            .unwrap_or(false)
+        {
+            self.artwork_write = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn surface_mut_for_session(&mut self, session_id: u64) -> Option<&mut PresentationTab> {
+        if self.model.presentation_tabs.is_empty() {
+            if self.model.file_surface.technical_details.session_id == session_id {
+                Some(&mut self.model.file_surface)
+            } else {
+                None
+            }
+        } else {
+            self.model
+                .presentation_tabs
+                .iter_mut()
+                .find(|tab| tab.technical_details.session_id == session_id)
+        }
+    }
+
+    pub fn move_replaygain_cursor(&mut self, delta: isize) -> bool {
+        let len = self.active_surface().paths.len();
+        if len == 0 {
+            self.replaygain_cursor = 0;
+            return false;
+        }
+        let old = self.replaygain_cursor.min(len - 1);
+        let step = delta.checked_abs().unwrap_or(isize::MAX) as usize;
+        let next = if delta < 0 {
+            old.saturating_sub(step)
+        } else {
+            old.saturating_add(step).min(len - 1)
+        };
+        self.replaygain_cursor = next;
+        old != next
+    }
+
+    pub fn toggle_replaygain_cursor_selection(&mut self) -> bool {
+        let len = self.active_surface().paths.len();
+        let cursor = self.replaygain_cursor;
+        if cursor >= len {
+            return false;
+        }
+        if !self.replaygain_selected.insert(cursor) {
+            self.replaygain_selected.remove(&cursor);
+        }
+        true
+    }
+
+    pub fn set_replaygain_all_selected(&mut self, selected: bool) -> bool {
+        let len = self.active_surface().paths.len();
+        let before = self.replaygain_selected.clone();
+        if selected {
+            self.replaygain_selected = (0..len).collect();
+        } else {
+            self.replaygain_selected.clear();
+        }
+        self.replaygain_selected != before
+    }
+
+    pub fn replaygain_selected_paths(&self) -> Vec<std::path::PathBuf> {
+        let surface = self.active_surface();
+        self.replaygain_selected
+            .iter()
+            .filter_map(|idx| surface.paths.get(*idx).cloned())
+            .collect()
+    }
+
+    pub fn move_artwork_cursor(&mut self, delta: isize) -> bool {
+        let len = crate::tui::metadata_view_models::artwork_action_row_count(self);
+        if len == 0 {
+            self.artwork_cursor = 0;
+            return false;
+        }
+        let old = self.artwork_cursor.min(len - 1);
+        let step = delta.checked_abs().unwrap_or(isize::MAX) as usize;
+        let next = if delta < 0 {
+            old.saturating_sub(step)
+        } else {
+            old.saturating_add(step).min(len - 1)
+        };
+        self.artwork_cursor = next;
+        old != next
+    }
+
     /// Recompute dirty state for the active surface from authoritative row data.
     pub fn recompute_active_dirty(&mut self) -> bool {
         let dirty = crate::tui::probe::metadata_editor_has_changes(self);
@@ -4065,6 +5331,8 @@ impl MetadataEditorState {
         self.edit_input = None;
         self.add_key_input = None;
         self.detail_edit = None;
+        self.file_picker = None;
+        self.pending_artwork_type = None;
         self.phase = MetadataEditorPhase::Editing;
     }
 
@@ -8287,6 +9555,204 @@ mod metadata_presentation_tab_tests {
 
         assert!(status.as_deref().unwrap_or("").contains("partially loaded"));
         assert!(matches!(details.files[0].media_facts, ProbeState::Failed { .. }));
+    }
+
+    #[test]
+    fn replaygain_completion_requires_matching_surface_session() {
+        let mut tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+        ];
+        tabs[0].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/a.flac")]);
+        tabs[1].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/b.flac")]);
+        let mut state = state_with_tabs(tabs, 0);
+        let (session_id, generation) = state.begin_replaygain_scan(MetadataReplayGainScanMode::Track, 1);
+
+        assert!(!state.complete_replaygain_scan(session_id.saturating_add(1), generation));
+        assert!(state.replaygain_scan.is_some());
+        assert!(state.complete_replaygain_scan(session_id, generation));
+        assert!(state.replaygain_scan.is_none());
+    }
+
+    #[test]
+    fn artwork_completion_requires_matching_surface_session() {
+        let mut tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+        ];
+        tabs[0].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/a.flac")]);
+        tabs[1].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/b.flac")]);
+        let mut state = state_with_tabs(tabs, 0);
+        let (session_id, generation) = state.begin_artwork_write(MetadataArtworkWriteMode::Write, 1);
+
+        assert!(!state.complete_artwork_write(session_id, generation.saturating_add(1)));
+        assert!(state.artwork_write.is_some());
+        assert!(state.complete_artwork_write(session_id, generation));
+        assert!(state.artwork_write.is_none());
+    }
+
+    #[test]
+    fn replaygain_completion_can_target_non_active_presentation() {
+        let mut tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+        ];
+        tabs[0].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/a.flac")]);
+        tabs[1].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/b.flac")]);
+        let mut state = state_with_tabs(tabs, 0);
+        let (session_id, generation) = state.begin_replaygain_scan(MetadataReplayGainScanMode::Album, 1);
+
+        state.active_tab = 1;
+
+        assert!(state.complete_replaygain_scan(session_id, generation));
+        let surface = state
+            .surface_mut_for_session(session_id)
+            .expect("originating surface should still be addressable after tab switch");
+        surface.entries[0].value = "updated origin".to_string();
+
+        assert_eq!(state.presentation_tabs[0].entries[0].value, "updated origin");
+        assert_eq!(state.presentation_tabs[1].entries[0].value, "two");
+        assert_eq!(state.active_tab, 1);
+    }
+
+    #[test]
+    fn file_picker_generic_target_round_trips_without_artwork_coupling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let selected = temp.path().join("selection.txt");
+        std::fs::write(&selected, "ok").expect("write fixture");
+        let mut picker = FilePickerState::new(
+            temp.path().to_path_buf(),
+            FilePickerFilter::All,
+            "Pick anything",
+            FilePickerTarget::Generic {
+                id: "test-client".to_string(),
+            },
+        );
+        picker.refresh();
+        let index = picker
+            .entries
+            .iter()
+            .position(|entry| entry.path == selected)
+            .expect("fixture should be visible");
+        picker.set_cursor(index, 10);
+        let path = picker.accept_current_selection().expect("file selection");
+
+        assert_eq!(path, selected);
+        assert_eq!(
+            picker.outcome_for_path(path),
+            FilePickerOutcome::Selected {
+                target: FilePickerTarget::Generic {
+                    id: "test-client".to_string(),
+                },
+                path: selected,
+            }
+        );
+    }
+
+    #[test]
+    fn file_picker_directory_mode_enter_navigates_ok_selects_current_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child");
+        std::fs::create_dir(&child).expect("mkdir fixture");
+        let mut picker = FilePickerState::new(
+            temp.path().to_path_buf(),
+            FilePickerFilter::All,
+            "Pick folder",
+            FilePickerTarget::Generic { id: "folder-client".to_string() },
+        );
+        picker.selection_mode = FilePickerSelectionMode::Directories;
+        picker.refresh();
+        let index = picker.entries.iter().position(|entry| entry.path == child).expect("child visible");
+        picker.set_cursor(index, 10);
+
+        assert!(picker.open_or_select_current().is_none(), "Enter should navigate into directories");
+        assert_eq!(picker.current_dir, child);
+        assert_eq!(picker.accept_current_selection().expect("directory selection"), picker.current_dir);
+    }
+
+    #[test]
+    fn file_picker_search_hidden_and_sort_are_generic_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("zeta.txt"), "z").expect("write zeta");
+        std::fs::write(temp.path().join("alpha.txt"), "a").expect("write alpha");
+        std::fs::write(temp.path().join(".hidden.txt"), "h").expect("write hidden");
+        let mut picker = FilePickerState::new(
+            temp.path().to_path_buf(),
+            FilePickerFilter::All,
+            "Pick anything",
+            FilePickerTarget::Generic { id: "generic-client".to_string() },
+        );
+
+        assert!(picker.entries.iter().all(|entry| !entry.name.starts_with('.')));
+        picker.toggle_hidden();
+        assert!(picker.entries.iter().any(|entry| entry.name == ".hidden.txt"));
+        picker.search_input = "alpha".to_string();
+        picker.refresh();
+        assert_eq!(picker.entries.iter().filter(|entry| !entry.is_dir).count(), 1);
+        assert_eq!(picker.entries.iter().find(|entry| !entry.is_dir).map(|entry| entry.name.as_str()), Some("alpha.txt"));
+        picker.search_input.clear();
+        picker.set_sort(FilePickerSortKey::Size);
+        assert_eq!(picker.sort_key, FilePickerSortKey::Size);
+    }
+
+    #[test]
+    fn surface_mut_for_session_finds_non_active_presentation() {
+        let mut tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![tag("TITLE", "one", vec!["one"])],
+                1,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "two", vec!["two"])],
+                1,
+            ),
+        ];
+        tabs[0].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/a.flac")]);
+        tabs[1].technical_details = MetadataTechnicalDetails::from_files(vec![probe_file_detail("/tmp/b.flac")]);
+        let session = tabs[0].technical_details.session_id;
+        let mut state = state_with_tabs(tabs, 1);
+
+        let surface = state
+            .surface_mut_for_session(session)
+            .expect("non-active session should still be addressable");
+        surface.entries[0].value = "updated non-active".to_string();
+
+        assert_eq!(state.presentation_tabs[0].entries[0].value, "updated non-active");
+        assert_eq!(state.active_tab, 1);
     }
 
     #[test]

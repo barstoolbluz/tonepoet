@@ -189,6 +189,226 @@ fn check_pending_browse_rename(app: &mut AppState) {
 }
 
 /// Handle async messages from background tasks
+
+fn metadata_editor_apply_replaygain_metadata(
+    surface: &mut super::app::PresentationTab,
+    paths: &[std::path::PathBuf],
+    metadata: &[super::probe::SourceMetadata],
+) {
+    use lofty::tag::ItemKey;
+
+    let fields: [(&str, ItemKey, fn(&super::probe::SourceMetadata) -> Option<String>); 4] = [
+        (
+            "REPLAYGAIN_TRACK_GAIN",
+            ItemKey::ReplayGainTrackGain,
+            |m| m.rg_track_gain.clone(),
+        ),
+        (
+            "REPLAYGAIN_TRACK_PEAK",
+            ItemKey::ReplayGainTrackPeak,
+            |m| m.rg_track_peak.clone(),
+        ),
+        (
+            "REPLAYGAIN_ALBUM_GAIN",
+            ItemKey::ReplayGainAlbumGain,
+            |m| m.rg_album_gain.clone(),
+        ),
+        (
+            "REPLAYGAIN_ALBUM_PEAK",
+            ItemKey::ReplayGainAlbumPeak,
+            |m| m.rg_album_peak.clone(),
+        ),
+    ];
+
+    for (label, key, getter) in fields {
+        let values = metadata_editor_ordered_values_for_paths(surface, paths, metadata, label, getter);
+        metadata_editor_upsert_per_file_entry(surface, label, key, values);
+    }
+}
+
+fn metadata_editor_ordered_values_for_paths(
+    surface: &super::app::PresentationTab,
+    paths: &[std::path::PathBuf],
+    metadata: &[super::probe::SourceMetadata],
+    label: &str,
+    getter: fn(&super::probe::SourceMetadata) -> Option<String>,
+) -> Vec<String> {
+    let mut by_path = std::collections::HashMap::new();
+    for (path, meta) in paths.iter().zip(metadata.iter()) {
+        by_path.insert(path.clone(), getter(meta).unwrap_or_default());
+    }
+    surface
+        .paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            by_path
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| metadata_editor_existing_entry_value(surface, idx, label).unwrap_or_default())
+        })
+        .collect()
+}
+
+fn metadata_editor_existing_entry_value(
+    surface: &super::app::PresentationTab,
+    idx: usize,
+    label: &str,
+) -> Option<String> {
+    surface
+        .entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case(label))
+        .and_then(|entry| {
+            entry
+                .per_file_values
+                .get(idx)
+                .cloned()
+                .or_else(|| (!entry.value.trim().is_empty()).then(|| entry.value.clone()))
+        })
+}
+
+fn metadata_editor_upsert_per_file_entry(
+    surface: &mut super::app::PresentationTab,
+    label: &str,
+    item_key: lofty::tag::ItemKey,
+    values: Vec<String>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let has_value = values.iter().any(|value| !value.trim().is_empty());
+    let Some(idx) = surface
+        .entries
+        .iter()
+        .position(|entry| entry.display_key.eq_ignore_ascii_case(label))
+        .or_else(|| has_value.then(|| surface.entries.len()))
+    else {
+        return;
+    };
+
+    let is_mixed = values.windows(2).any(|w| w[0] != w[1]);
+    let value = if is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        values.first().cloned().unwrap_or_default()
+    };
+    if idx == surface.entries.len() {
+        surface.entries.push(super::probe::TagEntry {
+            display_key: label.to_string(),
+            item_key,
+            value: value.clone(),
+            original: value,
+            is_binary: false,
+            is_mixed,
+            per_file_values: values.clone(),
+            per_file_originals: values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    } else if let Some(entry) = surface.entries.get_mut(idx) {
+        entry.value = value.clone();
+        entry.original = value;
+        entry.is_binary = false;
+        entry.is_mixed = is_mixed;
+        entry.per_file_values = values.clone();
+        entry.per_file_originals = values;
+        entry.mb_proposed_value = None;
+        entry.mb_proposed_per_file = None;
+    }
+}
+
+fn metadata_editor_apply_artwork_metadata(
+    surface: &mut super::app::PresentationTab,
+    paths: &[std::path::PathBuf],
+    metadata: &[super::probe::SourceMetadata],
+) {
+    let mut by_path = std::collections::HashMap::new();
+    for (path, meta) in paths.iter().zip(metadata.iter()) {
+        by_path.insert(path.clone(), meta.artwork.clone());
+    }
+    for file in &mut surface.technical_details.files {
+        if let Some(artwork) = by_path.get(&file.file_facts.path) {
+            file.artwork_facts.entries = artwork.clone();
+        }
+    }
+}
+
+fn reduce_file_picker_complete(
+    app: &mut AppState,
+    target: super::app::FilePickerTarget,
+    path: Option<std::path::PathBuf>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match target.clone() {
+        super::app::FilePickerTarget::MetadataArtwork { picture_type } => {
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            match overlay {
+                ActiveOverlay::MetadataEditor(mut state) => {
+                    let matches_open_picker = state
+                        .file_picker
+                        .as_ref()
+                        .map(|picker| picker.target == target)
+                        .unwrap_or(false);
+                    state.file_picker = None;
+                    state.pending_artwork_type = None;
+
+                    if !matches_open_picker {
+                        app.set_status("file picker: ignored stale metadata-artwork completion");
+                    } else if let Some(path) = path {
+                        super::metadata_editor_actions::dispatch_artwork_write(
+                            app,
+                            &mut state,
+                            path,
+                            picture_type,
+                            tx,
+                        );
+                    } else {
+                        app.set_status("metadata editor: file picker cancelled");
+                    }
+
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                }
+                other => {
+                    app.active_overlay = other;
+                    app.set_status("file picker: ignored metadata-artwork completion without an active editor");
+                }
+            }
+        }
+        super::app::FilePickerTarget::Generic { id } => {
+            close_matching_file_picker(app, &target);
+            match path {
+                Some(path) => app.set_status(format!(
+                    "file picker target '{id}' selected {}",
+                    path.display()
+                )),
+                None => app.set_status(format!("file picker target '{id}' cancelled")),
+            }
+        }
+    }
+}
+
+fn close_matching_file_picker(app: &mut AppState, target: &super::app::FilePickerTarget) {
+    let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    match overlay {
+        ActiveOverlay::MetadataEditor(mut state) => {
+            if state
+                .file_picker
+                .as_ref()
+                .map(|picker| &picker.target == target)
+                .unwrap_or(false)
+            {
+                state.file_picker = None;
+                state.pending_artwork_type = None;
+            }
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        other => {
+            app.active_overlay = other;
+        }
+    }
+}
+
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::ClearTrackProgress {
@@ -546,6 +766,12 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         }
                     }
 
+                    if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
+                        state.apply_analysis_result(&result);
+                    }
+                    if let Some(state) = app.pending_metadata_editor.as_mut() {
+                        state.apply_analysis_result(&result);
+                    }
                     app.analysis_results.push(*result);
                     if app.analysis_pending == 0 {
                         // Sort results by disc/track for logical display order.
@@ -593,7 +819,14 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             }
         }
         AppMessage::PreemphasisComplete { result } => {
+            let result = crate::tui::preemphasis::metadata_editor_safe_result(&result);
             app.preemph_pending = app.preemph_pending.saturating_sub(1);
+            if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
+                state.apply_preemphasis_result(&result);
+            }
+            if let Some(state) = app.pending_metadata_editor.as_mut() {
+                state.apply_preemphasis_result(&result);
+            }
             app.preemph_results.push(result);
             if app.preemph_pending == 0 {
                 // Sort by path for consistent display.
@@ -605,18 +838,18 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Detected
                     })
                     .count();
-                let possible = app
+                let candidates = app
                     .preemph_results
                     .iter()
                     .filter(|r| {
-                        r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Possible
+                        r.confidence == crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate
                     })
                     .count();
                 let total = app.preemph_results.len();
-                if detected > 0 || possible > 0 {
+                if detected > 0 || candidates > 0 {
                     app.set_status(format!(
-                        "Pre-emphasis: {} detected, {} possible out of {} file(s)",
-                        detected, possible, total,
+                        "Pre-emphasis: {} PRE flag, {} catalog candidate out of {} file(s)",
+                        detected, candidates, total,
                     ));
                 } else {
                     app.set_status(format!("Pre-emphasis: not detected in {} file(s)", total,));
@@ -841,6 +1074,9 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.browse.selected_index = 0;
             app.browse.scroll_offset = 0;
         }
+        AppMessage::FilePickerComplete { target, path } => {
+            reduce_file_picker_complete(app, target, path, tx);
+        }
         AppMessage::MetadataEditorDetailsProbeComplete { session_id, generation, total, results } => {
             let mut reduced = false;
             if let ActiveOverlay::MetadataEditor(mut state) = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
@@ -857,6 +1093,94 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             }
             if !reduced {
                 app.set_status("metadata editor: Details probe finished after editor closed");
+            }
+        }
+        AppMessage::MetadataEditorReplayGainComplete { session_id, generation, mode, paths, result } => {
+            let mut reduced = false;
+            if let ActiveOverlay::MetadataEditor(mut state) = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+                if !state.complete_replaygain_scan(session_id, generation) {
+                    app.set_status(format!(
+                        "metadata editor: ignored stale ReplayGain scan result for session {session_id} generation {generation}"
+                    ));
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    reduced = true;
+                } else {
+                    match result {
+                        Ok(metadata) => {
+                            if let Some(surface) = state.surface_mut_for_session(session_id) {
+                                metadata_editor_apply_replaygain_metadata(surface, &paths, &metadata);
+                                for path in &paths {
+                                    app.browse.probe_cache.remove(path);
+                                    let _ = app.db.invalidate_probe(&path.display().to_string());
+                                }
+                                app.set_status(format!(
+                                    "metadata editor: ReplayGain {} scan wrote {} file{}",
+                                    mode.label(),
+                                    paths.len(),
+                                    if paths.len() == 1 { "" } else { "s" }
+                                ));
+                            } else {
+                                app.set_status(format!(
+                                    "metadata editor: ignored ReplayGain result for missing session {session_id}"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            app.set_status(format!("metadata editor: ReplayGain scan failed: {err}"));
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    reduced = true;
+                }
+            }
+            if !reduced {
+                app.set_status("metadata editor: ReplayGain scan finished after editor closed");
+            }
+        }
+        AppMessage::MetadataEditorArtworkWriteComplete { session_id, generation, mode, paths, result } => {
+            let mut reduced = false;
+            if let ActiveOverlay::MetadataEditor(mut state) = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+                if !state.complete_artwork_write(session_id, generation) {
+                    app.set_status(format!(
+                        "metadata editor: ignored stale {} result for session {session_id} generation {generation}",
+                        mode.label()
+                    ));
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    reduced = true;
+                } else {
+                    match result {
+                        Ok(metadata) => {
+                            if let Some(surface) = state.surface_mut_for_session(session_id) {
+                                metadata_editor_apply_artwork_metadata(surface, &paths, &metadata);
+                                for path in &paths {
+                                    app.browse.probe_cache.remove(path);
+                                    let _ = app.db.invalidate_probe(&path.display().to_string());
+                                }
+                                app.set_status(format!(
+                                    "metadata editor: {} updated {} file{}",
+                                    mode.label(),
+                                    paths.len(),
+                                    if paths.len() == 1 { "" } else { "s" }
+                                ));
+                            } else {
+                                app.set_status(format!(
+                                    "metadata editor: ignored {} result for missing session {session_id}",
+                                    mode.label()
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            app.set_status(format!("metadata editor: {} failed: {err}", mode.label()));
+                        }
+                    }
+                    state.file_picker = None;
+                    state.pending_artwork_type = None;
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    reduced = true;
+                }
+            }
+            if !reduced {
+                app.set_status("metadata editor: artwork update finished after editor closed");
             }
         }
         AppMessage::MetadataEditorWriteComplete {
