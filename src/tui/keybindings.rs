@@ -3527,17 +3527,7 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
 
 
 fn artwork_file_picker_policy() -> tui_file_picker::FileOperationPolicy {
-    tui_file_picker::FileOperationPolicy {
-        allow_new_file: false,
-        allow_new_folder: false,
-        allow_cut: false,
-        allow_copy: false,
-        allow_paste: false,
-        allow_delete: false,
-        symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
-        cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
-        delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
-    }
+    tui_file_picker::FileOperationPolicy::default()
 }
 
 fn file_picker_theme_from_tonepoet_theme() -> tui_file_picker::FilePickerTheme {
@@ -19392,12 +19382,12 @@ mod artwork_file_picker_handoff_tests {
         );
         assert_eq!(session.picker.current_dir(), temp.path());
         let policy = session.picker.file_operation_policy();
-        assert!(!policy.allow_new_file);
-        assert!(!policy.allow_new_folder);
-        assert!(!policy.allow_cut);
-        assert!(!policy.allow_copy);
-        assert!(!policy.allow_paste);
-        assert!(!policy.allow_delete);
+        assert!(policy.allow_new_file);
+        assert!(policy.allow_new_folder);
+        assert!(policy.allow_cut);
+        assert!(policy.allow_copy);
+        assert!(policy.allow_paste);
+        assert!(policy.allow_delete);
     }
 
     #[test]
