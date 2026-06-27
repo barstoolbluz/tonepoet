@@ -410,6 +410,10 @@ pub(crate) struct ImagePreviewCache {
     pub desired_protocol_generation: usize,
     /// Host generation for which `protocol` was actually prepared.
     pub encoded_protocol_generation: usize,
+    /// Kitty-only graphics retransmit generation for which `protocol` was prepared.
+    /// This is intentionally separate from protocol/cell-metric generation so
+    /// mouse-damage recovery does not masquerade as a terminal resize.
+    pub encoded_retransmit_generation: usize,
     /// Monotonic request generation for async preview loads.
     pub generation: usize,
     /// Generation of the decoded image currently waiting for protocol encoding.
@@ -429,6 +433,7 @@ impl Default for ImagePreviewCache {
             encoded_preview_area: None,
             desired_protocol_generation: 0,
             encoded_protocol_generation: 0,
+            encoded_retransmit_generation: 0,
             generation: 0,
             decoded_generation: None,
             decoded_image: None,
@@ -448,6 +453,7 @@ impl fmt::Debug for ImagePreviewCache {
             .field("encoded_preview_area", &self.encoded_preview_area)
             .field("desired_protocol_generation", &self.desired_protocol_generation)
             .field("encoded_protocol_generation", &self.encoded_protocol_generation)
+            .field("encoded_retransmit_generation", &self.encoded_retransmit_generation)
             .field("generation", &self.generation)
             .field("decoded_generation", &self.decoded_generation)
             .field("has_decoded_image", &self.decoded_image.is_some())
@@ -467,6 +473,7 @@ impl Clone for ImagePreviewCache {
         cloned.encoded_preview_area = self.encoded_preview_area;
         cloned.desired_protocol_generation = self.desired_protocol_generation;
         cloned.encoded_protocol_generation = self.encoded_protocol_generation;
+        cloned.encoded_retransmit_generation = self.encoded_retransmit_generation;
         cloned.generation = self.generation;
         cloned.decoded_generation = self.decoded_generation;
         cloned.error = self.error.clone();
@@ -701,6 +708,7 @@ impl FilePickerState {
             encoded_preview_area: None,
             desired_protocol_generation: 0,
             encoded_protocol_generation: 0,
+            encoded_retransmit_generation: 0,
             generation,
             decoded_generation: None,
             decoded_image: None,
@@ -755,6 +763,7 @@ impl FilePickerState {
                     self.image_preview_cache.protocol = None;
                     self.image_preview_cache.encoded_preview_area = None;
                     self.image_preview_cache.encoded_protocol_generation = 0;
+                    self.image_preview_cache.encoded_retransmit_generation = 0;
                     match result.result {
                         Ok(image) => {
                             self.image_preview_cache.decoded_generation = Some(result.generation);
@@ -780,13 +789,40 @@ impl FilePickerState {
 
 
     /// Build or rebuild terminal protocol state for a decoded image preview.
-    /// This is intentionally called by the host update loop after drawing has
-    /// recorded pane geometry, not from the render path itself.
+    ///
+    /// This compatibility wrapper rebuilds only when the decoded image, render
+    /// area, or host terminal/cell-metric generation changes. Hosts that need
+    /// Kitty/Ghostty mouse-damage recovery should call
+    /// `prepare_image_preview_protocol_with_retransmit_generation` instead.
     #[cfg(feature = "image-preview")]
     pub fn prepare_image_preview_protocol(
         &mut self,
         picker: &mut ratatui_image::picker::Picker,
         protocol_generation: usize,
+    ) -> bool {
+        self.prepare_image_preview_protocol_with_retransmit_generation(
+            picker,
+            protocol_generation,
+            0,
+        )
+    }
+
+    /// Build or rebuild terminal protocol state for a decoded image preview.
+    ///
+    /// `protocol_generation` is for terminal resize/cell-metric changes.
+    /// `retransmit_generation` is a separate, Kitty-only damage-recovery
+    /// generation that lets Ghostty/Kitty hosts rate-limit full protocol
+    /// re-creation/retransmission after mouse movement without treating that
+    /// recovery as a resize. Non-Kitty protocols deliberately ignore it.
+    ///
+    /// This method is intentionally called by the host update loop after render
+    /// has recorded pane geometry, not from the render path itself.
+    #[cfg(feature = "image-preview")]
+    pub fn prepare_image_preview_protocol_with_retransmit_generation(
+        &mut self,
+        picker: &mut ratatui_image::picker::Picker,
+        protocol_generation: usize,
+        retransmit_generation: usize,
     ) -> bool {
         let had_receiver = self.image_preview_cache.receiver.is_some();
         self.poll_image_preview_load();
@@ -802,9 +838,17 @@ impl FilePickerState {
             return decode_completed;
         }
         let desired_protocol_generation = protocol_generation;
+        let desired_retransmit_generation = if picker.protocol_type
+            == ratatui_image::picker::ProtocolType::Kitty
+        {
+            retransmit_generation
+        } else {
+            0
+        };
         self.image_preview_cache.desired_protocol_generation = desired_protocol_generation;
         if self.image_preview_cache.protocol.is_some()
             && self.image_preview_cache.encoded_protocol_generation == desired_protocol_generation
+            && self.image_preview_cache.encoded_retransmit_generation == desired_retransmit_generation
             && self.image_preview_cache.encoded_preview_area == Some(preview_area)
         {
             return decode_completed;
@@ -812,6 +856,7 @@ impl FilePickerState {
 
         self.image_preview_cache.protocol = Some(picker.new_resize_protocol(decoded.clone()));
         self.image_preview_cache.encoded_protocol_generation = desired_protocol_generation;
+        self.image_preview_cache.encoded_retransmit_generation = desired_retransmit_generation;
         self.image_preview_cache.encoded_preview_area = Some(preview_area);
         self.image_preview_cache.error = None;
         true

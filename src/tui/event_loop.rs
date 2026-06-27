@@ -38,7 +38,16 @@ pub async fn run_app(
             app.bookmarks.close_overlay();
         }
 
-        // 2. Render
+        // 2. Advance image-preview protocol state, then render.
+        //
+        // The pre-draw prepare is important for Ghostty/Kitty mouse-damage
+        // recovery: mouse events are handled after the previous draw, so the
+        // desired preview geometry from that frame is already known. Rebuilding
+        // the Kitty protocol from cached decoded pixels before the next draw
+        // lets that draw retransmit immediately instead of showing one stale or
+        // missing frame. The post-draw prepare remains for first-time geometry
+        // discovery and resize/layout changes recorded during this draw.
+        app.prepare_image_preview_protocols();
         if app.force_redraw {
             terminal.clear()?;
             app.force_redraw = false;

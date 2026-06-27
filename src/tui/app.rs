@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::config::TonepoetConfig;
 use crate::convert::formats::AudioFormat;
@@ -3156,6 +3157,9 @@ pub struct ArtworkPreviewCache {
     pub desired_protocol_generation: usize,
     /// App generation for which `image_protocol` was actually prepared.
     pub encoded_protocol_generation: usize,
+    /// Kitty-only graphics retransmit generation for which `image_protocol`
+    /// was prepared. Separate from resize/cell-metric generation.
+    pub encoded_retransmit_generation: usize,
     pub generation: usize,
     pub decoded_generation: Option<usize>,
     pub decoded_image: Option<image::DynamicImage>,
@@ -3173,6 +3177,7 @@ impl fmt::Debug for ArtworkPreviewCache {
             .field("encoded_preview_area", &self.encoded_preview_area)
             .field("desired_protocol_generation", &self.desired_protocol_generation)
             .field("encoded_protocol_generation", &self.encoded_protocol_generation)
+            .field("encoded_retransmit_generation", &self.encoded_retransmit_generation)
             .field("generation", &self.generation)
             .field("decoded_generation", &self.decoded_generation)
             .field("has_decoded_image", &self.decoded_image.is_some())
@@ -3192,6 +3197,7 @@ impl Clone for ArtworkPreviewCache {
             encoded_preview_area: self.encoded_preview_area,
             desired_protocol_generation: self.desired_protocol_generation,
             encoded_protocol_generation: self.encoded_protocol_generation,
+            encoded_retransmit_generation: self.encoded_retransmit_generation,
             generation: self.generation,
             decoded_generation: self.decoded_generation,
             decoded_image: None,
@@ -4482,6 +4488,7 @@ impl MetadataEditorState {
             encoded_preview_area: ratatui::layout::Rect::default(),
             desired_protocol_generation: 0,
             encoded_protocol_generation: 0,
+            encoded_retransmit_generation: 0,
             generation,
             decoded_generation: None,
             decoded_image: None,
@@ -4518,6 +4525,7 @@ impl MetadataEditorState {
                     cache.image_protocol = None;
                     cache.encoded_preview_area = ratatui::layout::Rect::default();
                     cache.encoded_protocol_generation = 0;
+                    cache.encoded_retransmit_generation = 0;
                     match result.result {
                         Ok(image) => {
                             cache.decoded_generation = Some(result.generation);
@@ -4546,6 +4554,7 @@ impl MetadataEditorState {
         &mut self,
         image_picker: &mut ratatui_image::picker::Picker,
         protocol_generation: usize,
+        retransmit_generation: usize,
     ) -> bool {
         let had_receiver = self
             .artwork_preview_cache
@@ -4570,9 +4579,17 @@ impl MetadataEditorState {
         if desired_area.width == 0 || desired_area.height == 0 {
             return decode_completed;
         }
+        let desired_retransmit_generation = if image_picker.protocol_type
+            == ratatui_image::picker::ProtocolType::Kitty
+        {
+            retransmit_generation
+        } else {
+            0
+        };
         cache.desired_protocol_generation = protocol_generation;
         if cache.image_protocol.is_some()
             && cache.encoded_protocol_generation == protocol_generation
+            && cache.encoded_retransmit_generation == desired_retransmit_generation
             && cache.encoded_preview_area == desired_area
         {
             return decode_completed;
@@ -4580,6 +4597,7 @@ impl MetadataEditorState {
 
         cache.image_protocol = Some(image_picker.new_resize_protocol(decoded.clone()));
         cache.encoded_protocol_generation = protocol_generation;
+        cache.encoded_retransmit_generation = desired_retransmit_generation;
         cache.encoded_preview_area = desired_area;
         cache.error = None;
         true
@@ -6003,6 +6021,14 @@ pub struct AppState {
     /// Monotonic generation used to force terminal image command re-emission
     /// after mouse movement or other terminal-side graphics damage.
     pub image_repaint_generation: usize,
+    /// Kitty-only retransmit generation used when Ghostty/Kitty mouse damage
+    /// requires protocol re-creation/retransmission. This is intentionally
+    /// separate from `image_picker_generation`, which tracks real terminal
+    /// size/cell-metric changes.
+    pub image_kitty_retransmit_generation: usize,
+    /// Last time a Kitty/Ghostty retransmit was requested. Used to rate-limit
+    /// protocol rebuilds during high-frequency mouse motion.
+    pub last_image_kitty_retransmit_at: Option<Instant>,
 
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
@@ -6014,6 +6040,8 @@ fn new_terminal_image_picker() -> ratatui_image::picker::Picker {
     picker.guess_protocol();
     picker
 }
+
+const KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
 impl AppState {
     pub fn new(config: TonepoetConfig) -> Self {
@@ -6117,6 +6145,8 @@ impl AppState {
             image_picker: new_terminal_image_picker(),
             image_picker_generation: 0,
             image_repaint_generation: 0,
+            image_kitty_retransmit_generation: 0,
+            last_image_kitty_retransmit_at: None,
             hover_target: None,
             analysis_results: Vec::new(),
             analysis_pending: 0,
@@ -6141,6 +6171,7 @@ impl AppState {
     pub fn refresh_image_picker_after_resize(&mut self) {
         self.image_picker = new_terminal_image_picker();
         self.image_picker_generation = self.image_picker_generation.saturating_add(1);
+        self.last_image_kitty_retransmit_at = None;
 
         if let ActiveOverlay::MetadataEditor(state) = &mut self.active_overlay {
             state.invalidate_artwork_preview_cache();
@@ -6158,10 +6189,35 @@ impl AppState {
         self.force_redraw = true;
     }
 
-    /// Advance the repaint generation used to re-emit already prepared terminal
-    /// graphics commands without rebuilding cached image protocol state.
+    /// Advance image-preview repaint/retransmit generations after terminal-side
+    /// graphics damage, such as mouse movement over Ghostty's Kitty graphics
+    /// layer.
+    ///
+    /// The repaint generation remains as a cheap ratatui-buffer nudge for
+    /// non-Kitty protocol cells. Kitty/Ghostty additionally gets a separate,
+    /// rate-limited retransmit generation so cached decoded pixels can be
+    /// re-wrapped in a fresh StatefulProtocol without conflating mouse damage
+    /// with terminal resize/cell-metric changes.
     pub fn request_image_preview_repaint(&mut self) {
         self.image_repaint_generation = self.image_repaint_generation.saturating_add(1);
+        self.request_kitty_image_preview_retransmit();
+    }
+
+    fn request_kitty_image_preview_retransmit(&mut self) {
+        if self.image_picker.protocol_type != ratatui_image::picker::ProtocolType::Kitty {
+            return;
+        }
+
+        let now = Instant::now();
+        let should_retransmit = self
+            .last_image_kitty_retransmit_at
+            .map(|last| now.duration_since(last) >= KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL)
+            .unwrap_or(true);
+        if should_retransmit {
+            self.image_kitty_retransmit_generation =
+                self.image_kitty_retransmit_generation.saturating_add(1);
+            self.last_image_kitty_retransmit_at = Some(now);
+        }
     }
 
 
@@ -6171,16 +6227,27 @@ impl AppState {
     /// non-blocking decode workers and, once decoded pixels and geometry are
     /// both available, builds terminal protocol state from the startup-owned
     /// image picker so the next frame can render without synchronous disk/tag/
-    /// image decode or protocol creation work.
+    /// image decode or protocol creation work. For Kitty/Ghostty, a separate
+    /// rate-limited retransmit generation can also rebuild protocol state from
+    /// cached decoded pixels after mouse-driven graphics-layer damage.
     pub fn prepare_image_preview_protocols(&mut self) {
         let protocol_generation = self.image_picker_generation;
+        let retransmit_generation = self.image_kitty_retransmit_generation;
         let mut changed = false;
         if let ActiveOverlay::MetadataEditor(state) = &mut self.active_overlay {
-            changed |= state.prepare_artwork_preview_protocol(&mut self.image_picker, protocol_generation);
+            changed |= state.prepare_artwork_preview_protocol(
+                &mut self.image_picker,
+                protocol_generation,
+                retransmit_generation,
+            );
             if let Some(file_picker) = state.file_picker.as_mut() {
                 changed |= file_picker
                     .picker
-                    .prepare_image_preview_protocol(&mut self.image_picker, protocol_generation);
+                    .prepare_image_preview_protocol_with_retransmit_generation(
+                        &mut self.image_picker,
+                        protocol_generation,
+                        retransmit_generation,
+                    );
             }
         }
         // No force_redraw — the next normal render cycle picks up the new
@@ -9354,6 +9421,7 @@ mod metadata_presentation_tab_tests {
             encoded_preview_area: ratatui::layout::Rect::new(1, 2, 20, 10),
             desired_protocol_generation: 7,
             encoded_protocol_generation: 7,
+            encoded_retransmit_generation: 3,
             generation: 42,
             decoded_generation: Some(42),
             decoded_image: None,
@@ -9370,6 +9438,7 @@ mod metadata_presentation_tab_tests {
         assert_eq!(cloned.encoded_preview_area, cache.encoded_preview_area);
         assert_eq!(cloned.desired_protocol_generation, 7);
         assert_eq!(cloned.encoded_protocol_generation, 7);
+        assert_eq!(cloned.encoded_retransmit_generation, 3);
         assert_eq!(cloned.generation, 42);
         assert_eq!(cloned.decoded_generation, Some(42));
         assert!(cloned.decoded_image.is_none());
@@ -9390,6 +9459,7 @@ mod metadata_presentation_tab_tests {
             encoded_preview_area: ratatui::layout::Rect::new(1, 1, 16, 8),
             desired_protocol_generation: 1,
             encoded_protocol_generation: 1,
+            encoded_retransmit_generation: 1,
             generation: before,
             decoded_generation: None,
             decoded_image: None,

@@ -4985,6 +4985,12 @@ fn draw_metadata_artwork_tab(
     record_artwork_table_button_hits(&vm.rows, table_area, row_offset, visible_rows, button_map);
 }
 
+/// Draw the artwork image preview pane.
+///
+/// **Known limitation:** On terminals using the Kitty graphics protocol
+/// (Ghostty, Kitty, WezTerm), mouse movement can cause the image to
+/// disappear. Keyboard-only navigation works correctly. See the
+/// corresponding note on `tui-file-picker::render_preview_pane` for details.
 fn draw_artwork_preview_pane(
     f: &mut Frame,
     state: &mut super::app::MetadataEditorState,
@@ -4993,7 +4999,7 @@ fn draw_artwork_preview_pane(
     area: Rect,
     _image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
-    image_repaint_generation: usize,
+    _image_repaint_generation: usize,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -5041,7 +5047,6 @@ fn draw_artwork_preview_pane(
         if let Some(protocol) = cache.image_protocol.as_mut() {
             let image = ratatui_image::StatefulImage::new(None);
             f.render_stateful_widget(image, inner, protocol);
-            force_terminal_image_repaint(f, inner, image_repaint_generation);
         }
     } else {
         let message = if cache.receiver.is_some() {
@@ -5055,43 +5060,6 @@ fn draw_artwork_preview_pane(
     }
 }
 
-
-fn force_terminal_image_repaint(f: &mut Frame<'_>, area: Rect, repaint_generation: usize) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-
-    // ratatui-image writes graphics protocols into buffer cells as terminal
-    // escape-string symbols. If the symbol bytes are unchanged, ratatui's diff
-    // can skip re-emitting that command even when mouse motion has damaged the
-    // terminal-side graphics layer. Dirty the command cell through ratatui-owned
-    // style metadata rather than by appending raw escape sequences to the
-    // symbol; the style tracker remains authoritative and cached protocol state
-    // is not rebuilt per frame.
-    let repaint_color = repaint_generation_color(repaint_generation);
-    let right = area.x.saturating_add(area.width);
-    let bottom = area.y.saturating_add(area.height);
-    let buffer = f.buffer_mut();
-    for y in area.y..bottom {
-        for x in area.x..right {
-            let cell = buffer.get_mut(x, y);
-            if cell.symbol().contains('\u{1b}') {
-                cell.fg = repaint_color;
-                return;
-            }
-        }
-    }
-}
-
-fn repaint_generation_color(repaint_generation: usize) -> Color {
-    let key = repaint_generation as u64;
-    let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17) ^ key;
-    Color::Rgb(
-        (mixed & 0xff) as u8,
-        ((mixed >> 8) & 0xff) as u8,
-        ((mixed >> 16) & 0xff) as u8,
-    )
-}
 
 fn artwork_preview_source_path(
     state: &super::app::MetadataEditorState,
