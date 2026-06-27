@@ -20,7 +20,7 @@ impl FilePickerFilter {
             Self::All => true,
             Self::Images => extension_matches(
                 path,
-                &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff"],
+                SUPPORTED_PREVIEW_IMAGE_EXTENSIONS,
             ),
             Self::Audio => extension_matches(
                 path,
@@ -59,6 +59,12 @@ impl Default for FilePickerFilter {
     }
 }
 
+pub(crate) const SUPPORTED_PREVIEW_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp"];
+
+pub(crate) fn is_supported_preview_image_extension(path: &Path) -> bool {
+    extension_matches(path, SUPPORTED_PREVIEW_IMAGE_EXTENSIONS)
+}
+
 fn extension_matches(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -77,5 +83,7 @@ mod tests {
         assert!(filter.accepts_path(Path::new("cover.JPG"), false));
         assert!(filter.accepts_path(Path::new("folder"), true));
         assert!(!filter.accepts_path(Path::new("notes.txt"), false));
+        assert!(!filter.accepts_path(Path::new("scan.tiff"), false));
+        assert!(!filter.accepts_path(Path::new("scan.tif"), false));
     }
 }

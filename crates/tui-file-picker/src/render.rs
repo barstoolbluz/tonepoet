@@ -8,12 +8,74 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Table
 use ratatui::Frame;
 use std::time::{Duration, SystemTime};
 
+
+#[cfg(feature = "image-preview")]
+struct ImageRenderContext<'a> {
+    picker: Option<&'a mut ratatui_image::picker::Picker>,
+    protocol_generation: usize,
+}
+
+#[cfg(feature = "image-preview")]
+impl<'a> ImageRenderContext<'a> {
+    fn none() -> Self {
+        Self { picker: None, protocol_generation: 0 }
+    }
+
+    fn with_picker(
+        picker: &'a mut ratatui_image::picker::Picker,
+        protocol_generation: usize,
+    ) -> Self {
+        Self { picker: Some(picker), protocol_generation }
+    }
+}
+
+#[cfg(not(feature = "image-preview"))]
+struct ImageRenderContext<'a> {
+    _phantom: std::marker::PhantomData<&'a mut ()>,
+}
+
+#[cfg(not(feature = "image-preview"))]
+impl<'a> ImageRenderContext<'a> {
+    fn none() -> Self {
+        Self { _phantom: std::marker::PhantomData }
+    }
+}
+
 impl FilePickerState {
     /// Render the picker into `area` and refresh internal hit-test regions.
     ///
     /// Hosts that dispatch mouse events should either pass this same `area` to
     /// `handle_mouse` or pass `Rect::default()` to use this last-rendered area.
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.render_with_image_context(frame, area, ImageRenderContext::none());
+    }
+
+    /// Render with a host-owned terminal image picker.
+    ///
+    /// The picker should be detected once by the host at startup. Increment
+    /// `protocol_generation` whenever terminal resize/cell-size changes require
+    /// cached StatefulProtocol values to be re-encoded.
+    #[cfg(feature = "image-preview")]
+    pub fn render_with_image_picker(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        image_picker: &mut ratatui_image::picker::Picker,
+        protocol_generation: usize,
+    ) {
+        self.render_with_image_context(
+            frame,
+            area,
+            ImageRenderContext::with_picker(image_picker, protocol_generation),
+        );
+    }
+
+    fn render_with_image_context(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        mut image_ctx: ImageRenderContext<'_>,
+    ) {
         self.clear_hit_regions();
         self.set_last_area(area);
         if area.width < 48 || area.height < 10 {
@@ -45,7 +107,7 @@ impl FilePickerState {
 
         self.render_toolbar(frame, rows[0]);
         self.render_address(frame, rows[1]);
-        self.render_split_pane(frame, rows[2]);
+        self.render_split_pane(frame, rows[2], &mut image_ctx);
         self.render_status(frame, rows[3]);
 
         if self.menu_open {
@@ -153,13 +215,122 @@ impl FilePickerState {
         }
     }
 
-    fn render_split_pane(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
-            .split(area);
-        self.render_tree(frame, panes[0]);
-        self.render_file_table(frame, panes[1]);
+    fn render_split_pane(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        image_ctx: &mut ImageRenderContext<'_>,
+    ) {
+        if self.preview_pane_enabled(area) {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(24),
+                    Constraint::Percentage(52),
+                    Constraint::Percentage(24),
+                ])
+                .split(area);
+            self.render_tree(frame, panes[0]);
+            self.render_file_table(frame, panes[1]);
+            self.render_preview_pane(frame, panes[2], image_ctx);
+        } else {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
+                .split(area);
+            self.render_tree(frame, panes[0]);
+            self.render_file_table(frame, panes[1]);
+        }
+    }
+
+    #[cfg(feature = "image-preview")]
+    fn preview_pane_enabled(&self, area: Rect) -> bool {
+        self.show_preview && area.width >= 76 && area.height >= 6
+    }
+
+    #[cfg(not(feature = "image-preview"))]
+    fn preview_pane_enabled(&self, _area: Rect) -> bool {
+        false
+    }
+
+    #[cfg(feature = "image-preview")]
+    fn render_preview_pane(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        image_ctx: &mut ImageRenderContext<'_>,
+    ) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border_dim)
+            .title("Preview");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(entry) = self.current_selection().cloned() else {
+            render_preview_message(frame, inner, "No selection", self.theme.text_dim);
+            return;
+        };
+
+        if entry.is_dir {
+            render_preview_message(frame, inner, "Folder", self.theme.text_dim);
+            return;
+        }
+        if !is_previewable_image_path(&entry.path) {
+            render_preview_message(frame, inner, "No image preview", self.theme.text_dim);
+            return;
+        }
+
+        if self.image_preview_cache.path.as_ref() != Some(&entry.path) {
+            self.request_image_preview_load(entry.path.clone());
+        }
+
+        let area_changed = self.image_preview_cache.preview_area != Some(inner);
+        let protocol_changed = self.image_preview_cache.protocol_generation != image_ctx.protocol_generation;
+        if area_changed || protocol_changed {
+            self.image_preview_cache.preview_area = Some(inner);
+            self.image_preview_cache.protocol_generation = image_ctx.protocol_generation;
+            self.image_preview_cache.protocol = None;
+        }
+
+        if image_ctx.picker.is_none() {
+            self.image_preview_cache.error = Some(
+                "Preview unavailable: host did not provide terminal image picker".to_string(),
+            );
+        }
+
+        if let Some(protocol) = self.image_preview_cache.protocol.as_mut() {
+            let image = ratatui_image::StatefulImage::new(None);
+            frame.render_stateful_widget(image, inner, protocol);
+        } else {
+            let message = if self.image_preview_cache.receiver.is_some() {
+                "Loading preview…"
+            } else if self.image_preview_cache.decoded_image.is_some() {
+                "Preparing preview…"
+            } else {
+                self.image_preview_cache
+                    .error
+                    .as_deref()
+                    .unwrap_or("Preview unavailable")
+            };
+            render_preview_message(frame, inner, message, self.theme.text_dim);
+        }
+    }
+
+    #[cfg(not(feature = "image-preview"))]
+    fn render_preview_pane(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        _image_ctx: &mut ImageRenderContext<'_>,
+    ) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border_dim)
+            .title("Preview");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        render_preview_message(frame, inner, "Preview feature disabled", self.theme.text_dim);
     }
 
     fn render_tree(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -648,6 +819,22 @@ fn distribute_status(left: &str, center: &str, right: &str, width: usize) -> Str
     let gap = width - leading_len - right_len;
     let spacer = " ".repeat(gap);
     format!("{leading}{spacer}{right}")
+}
+
+fn render_preview_message(frame: &mut Frame<'_>, area: Rect, message: &str, style: ratatui::style::Style) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let line = fit_text_left(message, area.width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(line, style))).alignment(ratatui::layout::Alignment::Center),
+        area,
+    );
+}
+
+#[cfg(feature = "image-preview")]
+fn is_previewable_image_path(path: &std::path::Path) -> bool {
+    crate::filter::is_supported_preview_image_extension(path)
 }
 
 fn same_display_path(a: &std::path::Path, b: &std::path::Path) -> bool {

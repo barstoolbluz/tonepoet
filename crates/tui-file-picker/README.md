@@ -28,7 +28,7 @@ let mut picker = FilePickerState::new(FilePickerConfig {
 // non-std disk-space dependencies.
 picker.set_free_space_bytes(Some(142 * 1024 * 1024 * 1024));
 
-// In the draw loop:
+// In the draw loop, without terminal image previews:
 // picker.render(frame, area);
 
 // In the input loop:
@@ -38,6 +38,47 @@ picker.set_free_space_bytes(Some(142 * 1024 * 1024 * 1024));
 //     FilePickerAction::None => {}
 // }
 ```
+
+
+## Image previews
+
+The `image-preview` feature is enabled by default. Hosts that only need the
+file-manager UI may keep using `picker.render(frame, area)`. That path still
+shows the preview pane's pending/error/placeholder text, but it intentionally
+does not perform terminal graphics protocol detection or image protocol
+creation inside the reusable crate.
+
+For actual terminal image previews, own a single `ratatui_image::picker::Picker`
+in the host application, render with `render_with_image_picker(...)`, and call
+`prepare_image_preview_protocol(...)` after the frame has been drawn. This keeps
+terminal capability detection startup-owned and keeps disk I/O, image decode,
+and protocol creation out of the render path.
+
+```rust,no_run
+use ratatui_image::picker::Picker;
+
+let mut image_picker = Picker::from_termios().unwrap_or_else(|_| Picker::new((8, 16)));
+image_picker.guess_protocol();
+let mut image_picker_generation = 0usize;
+
+// In the draw loop:
+// terminal.draw(|frame| {
+//     picker.render_with_image_picker(frame, area, &mut image_picker, image_picker_generation);
+// })?;
+//
+// if picker.prepare_image_preview_protocol(&mut image_picker, image_picker_generation) {
+//     // Request another frame so the newly prepared protocol state is visible.
+// }
+
+// When the terminal is resized or cell metrics/protocol assumptions change:
+// image_picker = Picker::from_termios().unwrap_or_else(|_| Picker::new((8, 16)));
+// image_picker.guess_protocol();
+// image_picker_generation = image_picker_generation.saturating_add(1);
+// picker.invalidate_image_preview_cache();
+```
+
+Applications that compile with `--no-default-features` do not build the image
+preview code paths or pull in `ratatui-image` / `image`.
 
 ## Design points
 

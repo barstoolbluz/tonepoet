@@ -1,6 +1,9 @@
 //! Application state for the standalone TUI
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 use crate::config::TonepoetConfig;
 use crate::convert::formats::AudioFormat;
@@ -3125,6 +3128,70 @@ pub struct ArtworkFacts {
     pub entries: Vec<crate::tui::probe::ArtworkInfo>,
 }
 
+/// Result of an asynchronous embedded-artwork decode request.
+pub struct ArtworkPreviewLoadResult {
+    pub path: std::path::PathBuf,
+    pub picture_type: lofty::picture::PictureType,
+    pub generation: usize,
+    pub result: Result<image::DynamicImage, String>,
+}
+
+/// Cached decoded artwork preview for the Artwork tab.
+///
+/// The protocol state is intentionally not cloned; stale clones should reload
+/// lazily from the file path and picture type rather than sharing terminal
+/// protocol state across editor instances.
+pub struct ArtworkPreviewCache {
+    pub path: std::path::PathBuf,
+    pub picture_type: lofty::picture::PictureType,
+    /// Preview content area used when encoding this terminal image.
+    /// StatefulProtocol values must be recreated when pane geometry changes.
+    pub preview_area: ratatui::layout::Rect,
+    /// App-level terminal picker generation. Incremented when terminal
+    /// resize/cell-size changes require image protocol state to be rebuilt.
+    pub protocol_generation: usize,
+    pub generation: usize,
+    pub decoded_generation: Option<usize>,
+    pub decoded_image: Option<image::DynamicImage>,
+    pub receiver: Option<mpsc::Receiver<ArtworkPreviewLoadResult>>,
+    pub image_protocol: Option<Box<dyn ratatui_image::protocol::StatefulProtocol>>,
+    pub error: Option<String>,
+}
+
+impl fmt::Debug for ArtworkPreviewCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArtworkPreviewCache")
+            .field("path", &self.path)
+            .field("picture_type", &self.picture_type)
+            .field("preview_area", &self.preview_area)
+            .field("protocol_generation", &self.protocol_generation)
+            .field("generation", &self.generation)
+            .field("decoded_generation", &self.decoded_generation)
+            .field("has_decoded_image", &self.decoded_image.is_some())
+            .field("has_receiver", &self.receiver.is_some())
+            .field("has_image_protocol", &self.image_protocol.is_some())
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl Clone for ArtworkPreviewCache {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            picture_type: self.picture_type.clone(),
+            preview_area: self.preview_area,
+            protocol_generation: self.protocol_generation,
+            generation: self.generation,
+            decoded_generation: self.decoded_generation,
+            decoded_image: None,
+            receiver: None,
+            image_protocol: None,
+            error: self.error.clone(),
+        }
+    }
+}
+
 /// First-class issue reporting for read-only tabs and save eligibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataIssue {
@@ -3972,7 +4039,8 @@ impl PresentationTab {
 ///   fields outside this model.
 /// - `active_tab < presentation_tabs.len()` whenever `presentation_tabs` is
 ///   non-empty; accessors clamp defensively for stale test fixtures.
-/// - Rendering never performs filesystem, tag, media-probe, or save I/O.
+/// - Rendering never performs broad filesystem/tag/media-probe/save I/O; the Artwork tab
+///   may lazily read and cache only the selected embedded picture for previews.
 /// - Background worker results enter via explicit reduction methods.
 /// - Read-only tab scroll values are clamped before they are stored.
 #[derive(Debug, Clone)]
@@ -4004,6 +4072,8 @@ pub struct MetadataEditorModel {
     pub details_analysis_generation: u64,
     pub details_analysis: Option<MetadataDetailsAnalysisState>,
     pub artwork_cursor: usize,
+    pub artwork_preview_generation: usize,
+    pub artwork_preview_cache: Option<ArtworkPreviewCache>,
     pub artwork_write_generation: u64,
     pub artwork_write: Option<MetadataArtworkWriteState>,
     pub file_picker: Option<MetadataFilePickerState>,
@@ -4041,6 +4111,8 @@ impl Default for MetadataEditorModel {
             details_analysis_generation: 0,
             details_analysis: None,
             artwork_cursor: 0,
+            artwork_preview_generation: 0,
+            artwork_preview_cache: None,
             artwork_write_generation: 0,
             artwork_write: None,
             file_picker: None,
@@ -4156,7 +4228,8 @@ impl std::ops::DerefMut for MetadataEditorState {
 ///   active editable source.
 /// - `per_file_values.len() == paths.len()` for every file-backed editable row.
 /// - `active_tab < presentation_tabs.len()` whenever `presentation_tabs` is non-empty.
-/// - rendering never performs filesystem, tag, media-probe, or save I/O.
+/// - rendering never performs broad filesystem/tag/media-probe/save I/O; the Artwork tab
+///   may lazily read and cache only the selected embedded picture for previews.
 /// - read-only tab scroll values are clamped before storage.
 #[derive(Debug, Clone)]
 pub struct MetadataEditorState {
@@ -4363,11 +4436,164 @@ impl MetadataEditorState {
         old != next
     }
 
+    pub fn invalidate_artwork_preview_cache(&mut self) {
+        self.artwork_preview_generation = self.artwork_preview_generation.saturating_add(1);
+        self.artwork_preview_cache = None;
+    }
+
+
+    pub fn request_artwork_preview_load(
+        &mut self,
+        path: std::path::PathBuf,
+        picture_type: lofty::picture::PictureType,
+    ) {
+        if self
+            .artwork_preview_cache
+            .as_ref()
+            .map(|cache| {
+                cache.path == path
+                    && cache.picture_type == picture_type
+                    && (cache.receiver.is_some()
+                        || cache.decoded_image.is_some()
+                        || cache.error.is_some())
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let generation = self.artwork_preview_generation.saturating_add(1);
+        self.artwork_preview_generation = generation;
+        let (tx, rx) = mpsc::channel();
+        self.artwork_preview_cache = Some(ArtworkPreviewCache {
+            path: path.clone(),
+            picture_type: picture_type.clone(),
+            preview_area: ratatui::layout::Rect::default(),
+            protocol_generation: 0,
+            generation,
+            decoded_generation: None,
+            decoded_image: None,
+            receiver: Some(rx),
+            image_protocol: None,
+            error: None,
+        });
+
+        thread::spawn(move || {
+            let result = crate::tui::probe::read_embedded_picture_bytes(&path, picture_type.clone())
+                .and_then(|bytes| image::load_from_memory(&bytes).map_err(|e| format!("Failed to decode artwork: {e}")));
+            let _ = tx.send(ArtworkPreviewLoadResult {
+                path,
+                picture_type,
+                generation,
+                result,
+            });
+        });
+    }
+
+    pub fn poll_artwork_preview_load(&mut self) {
+        let Some(cache) = self.artwork_preview_cache.as_mut() else {
+            return;
+        };
+        let Some(rx) = cache.receiver.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                if cache.path == result.path
+                    && cache.picture_type == result.picture_type
+                    && cache.generation == result.generation
+                {
+                    cache.image_protocol = None;
+                    cache.preview_area = ratatui::layout::Rect::default();
+                    match result.result {
+                        Ok(image) => {
+                            cache.decoded_generation = Some(result.generation);
+                            cache.decoded_image = Some(image);
+                            cache.error = None;
+                        }
+                        Err(error) => {
+                            cache.decoded_generation = Some(result.generation);
+                            cache.decoded_image = None;
+                            cache.error = Some(error);
+                        }
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                cache.receiver = Some(rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                cache.error = Some("Artwork preview worker exited before completing".to_string());
+            }
+        }
+    }
+
+
+    pub fn prepare_artwork_preview_protocol(
+        &mut self,
+        image_picker: &mut ratatui_image::picker::Picker,
+        protocol_generation: usize,
+    ) -> bool {
+        let had_receiver = self
+            .artwork_preview_cache
+            .as_ref()
+            .map(|cache| cache.receiver.is_some())
+            .unwrap_or(false);
+        self.poll_artwork_preview_load();
+        let decode_completed = had_receiver
+            && self
+                .artwork_preview_cache
+                .as_ref()
+                .map(|cache| cache.receiver.is_none())
+                .unwrap_or(false);
+
+        let Some(cache) = self.artwork_preview_cache.as_mut() else {
+            return decode_completed;
+        };
+        let Some(decoded) = cache.decoded_image.as_ref() else {
+            return decode_completed;
+        };
+        if cache.preview_area.width == 0 || cache.preview_area.height == 0 {
+            return decode_completed;
+        }
+        if cache.image_protocol.is_some() && cache.protocol_generation == protocol_generation {
+            return decode_completed;
+        }
+
+        cache.image_protocol = Some(image_picker.new_resize_protocol(decoded.clone()));
+        cache.protocol_generation = protocol_generation;
+        cache.error = None;
+        true
+    }
+
+    pub fn set_artwork_cursor(&mut self, next: usize) -> bool {
+        let len = crate::tui::metadata_view_models::artwork_action_row_count(self);
+        if len == 0 {
+            let changed = self.artwork_cursor != 0 || self.artwork_preview_cache.is_some();
+            self.artwork_cursor = 0;
+            if self.artwork_preview_cache.is_some() {
+                self.invalidate_artwork_preview_cache();
+            }
+            return changed;
+        }
+        let next = next.min(len - 1);
+        let changed = self.artwork_cursor != next;
+        self.artwork_cursor = next;
+        if changed {
+            self.invalidate_artwork_preview_cache();
+        }
+        changed
+    }
+
     pub fn move_artwork_cursor(&mut self, delta: isize) -> bool {
         let len = crate::tui::metadata_view_models::artwork_action_row_count(self);
         if len == 0 {
+            let changed = self.artwork_cursor != 0 || self.artwork_preview_cache.is_some();
             self.artwork_cursor = 0;
-            return false;
+            if self.artwork_preview_cache.is_some() {
+                self.invalidate_artwork_preview_cache();
+            }
+            return changed;
         }
         let old = self.artwork_cursor.min(len - 1);
         let step = delta.checked_abs().unwrap_or(isize::MAX) as usize;
@@ -4377,7 +4603,11 @@ impl MetadataEditorState {
             old.saturating_add(step).min(len - 1)
         };
         self.artwork_cursor = next;
-        old != next
+        let changed = old != next;
+        if changed {
+            self.invalidate_artwork_preview_cache();
+        }
+        changed
     }
 
     /// Recompute dirty state for the active surface from authoritative row data.
@@ -4411,6 +4641,7 @@ impl MetadataEditorState {
         self.model.presentation_selector_cursor = active_tab;
         self.model.presentation_selector_scroll = active_tab;
         self.model.presentation_selector_open = false;
+        self.invalidate_artwork_preview_cache();
     }
 
     pub fn shows_presentation_control(&self) -> bool {
@@ -4430,6 +4661,7 @@ impl MetadataEditorState {
         self.content_tab = tab;
         self.restore_active_content_tab_scroll();
         self.reset_content_tab_interaction();
+        self.invalidate_artwork_preview_cache();
         true
     }
 
@@ -4681,6 +4913,7 @@ impl MetadataEditorState {
         self.presentation_selector_scroll = self
             .presentation_selector_scroll
             .min(self.presentation_tabs.len().saturating_sub(1));
+        self.invalidate_artwork_preview_cache();
         true
     }
 
@@ -5744,8 +5977,20 @@ pub struct AppState {
     /// as the preferred start directory for the next artwork picker session.
     pub last_artwork_picker_dir: Option<std::path::PathBuf>,
 
+    /// Terminal image protocol picker detected once at startup and refreshed on resize.
+    pub image_picker: ratatui_image::picker::Picker,
+    /// Monotonic generation for terminal image protocol/cell-size changes.
+    pub image_picker_generation: usize,
+
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
+}
+
+fn new_terminal_image_picker() -> ratatui_image::picker::Picker {
+    let mut picker = ratatui_image::picker::Picker::from_termios()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::new((8, 12)));
+    picker.guess_protocol();
+    picker
 }
 
 impl AppState {
@@ -5847,6 +6092,8 @@ impl AppState {
             keychain: KeychainState::default(),
             archive_passwords: std::collections::HashMap::new(),
             last_artwork_picker_dir: None,
+            image_picker: new_terminal_image_picker(),
+            image_picker_generation: 0,
             hover_target: None,
             analysis_results: Vec::new(),
             analysis_pending: 0,
@@ -5859,6 +6106,55 @@ impl AppState {
             compare_results: Vec::new(),
             compare_pending: 0,
             tool_check_cache: once_cell::sync::OnceCell::new(),
+        }
+    }
+
+    /// Refresh terminal graphics protocol detection after a terminal resize.
+    ///
+    /// `ratatui-image` protocol state is encoded for terminal cell geometry.
+    /// Re-detecting the picker and advancing this generation forces metadata
+    /// and file-picker preview caches to rebuild instead of reusing stale
+    /// StatefulProtocol values after the terminal size/cell metrics change.
+    pub fn refresh_image_picker_after_resize(&mut self) {
+        self.image_picker = new_terminal_image_picker();
+        self.image_picker_generation = self.image_picker_generation.saturating_add(1);
+
+        if let ActiveOverlay::MetadataEditor(state) = &mut self.active_overlay {
+            state.invalidate_artwork_preview_cache();
+            if let Some(file_picker) = state.file_picker.as_mut() {
+                file_picker.picker.invalidate_image_preview_cache();
+            }
+        }
+        if let Some(state) = self.pending_metadata_editor.as_mut() {
+            state.invalidate_artwork_preview_cache();
+            if let Some(file_picker) = state.file_picker.as_mut() {
+                file_picker.picker.invalidate_image_preview_cache();
+            }
+        }
+        self.force_redraw = true;
+    }
+
+
+    /// Advance image-preview loading/encoding outside the render path.
+    ///
+    /// Render records the desired preview pane geometry. This update pass polls
+    /// non-blocking decode workers and, once decoded pixels and geometry are
+    /// both available, builds terminal protocol state from the startup-owned
+    /// image picker so the next frame can render without synchronous disk/tag/
+    /// image decode or protocol creation work.
+    pub fn prepare_image_preview_protocols(&mut self) {
+        let protocol_generation = self.image_picker_generation;
+        let mut changed = false;
+        if let ActiveOverlay::MetadataEditor(state) = &mut self.active_overlay {
+            changed |= state.prepare_artwork_preview_protocol(&mut self.image_picker, protocol_generation);
+            if let Some(file_picker) = state.file_picker.as_mut() {
+                changed |= file_picker
+                    .picker
+                    .prepare_image_preview_protocol(&mut self.image_picker, protocol_generation);
+            }
+        }
+        if changed {
+            self.force_redraw = true;
         }
     }
 
@@ -9013,6 +9309,62 @@ mod metadata_presentation_tab_tests {
 
         assert!(!state.scroll_read_only_content_by(1, 12, 5));
         assert_eq!(state.scroll, 3);
+    }
+
+
+
+    #[test]
+    fn artwork_preview_cache_clone_drops_terminal_protocol_and_worker_state() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cache = ArtworkPreviewCache {
+            path: std::path::PathBuf::from("/tmp/source.flac"),
+            picture_type: lofty::picture::PictureType::LeadArtist,
+            preview_area: ratatui::layout::Rect::new(1, 2, 20, 10),
+            protocol_generation: 7,
+            generation: 42,
+            decoded_generation: Some(42),
+            decoded_image: None,
+            receiver: Some(rx),
+            image_protocol: None,
+            error: Some("decode failed".to_string()),
+        };
+
+        let cloned = cache.clone();
+
+        assert_eq!(cloned.path, cache.path);
+        assert_eq!(cloned.picture_type, lofty::picture::PictureType::LeadArtist);
+        assert_eq!(cloned.preview_area, cache.preview_area);
+        assert_eq!(cloned.protocol_generation, 7);
+        assert_eq!(cloned.generation, 42);
+        assert_eq!(cloned.decoded_generation, Some(42));
+        assert!(cloned.decoded_image.is_none());
+        assert!(cloned.receiver.is_none());
+        assert!(cloned.image_protocol.is_none());
+        assert_eq!(cloned.error.as_deref(), Some("decode failed"));
+    }
+
+    #[test]
+    fn artwork_preview_invalidation_clears_cache_and_advances_generation() {
+        let mut state = write_state();
+        let before = state.artwork_preview_generation;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        state.artwork_preview_cache = Some(ArtworkPreviewCache {
+            path: std::path::PathBuf::from("/tmp/source.flac"),
+            picture_type: lofty::picture::PictureType::Composer,
+            preview_area: ratatui::layout::Rect::new(1, 1, 16, 8),
+            protocol_generation: 1,
+            generation: before,
+            decoded_generation: None,
+            decoded_image: None,
+            receiver: Some(rx),
+            image_protocol: None,
+            error: None,
+        });
+
+        state.invalidate_artwork_preview_cache();
+
+        assert!(state.artwork_preview_cache.is_none());
+        assert!(state.artwork_preview_generation > before);
     }
 
     #[test]

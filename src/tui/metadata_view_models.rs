@@ -363,16 +363,15 @@ pub fn build_artwork_view_model(state: &MetadataEditorState) -> ArtworkViewModel
 
     let files = &state.active_surface().technical_details.files;
     let file_count = files.len().max(state.active_surface().paths.len());
-    let mut aggregates: BTreeMap<String, ArtworkAggregate> = BTreeMap::new();
+    let mut aggregates: BTreeMap<u8, ArtworkAggregate> = BTreeMap::new();
 
     for (file_idx, file) in files.iter().enumerate() {
         for art in &file.artwork_facts.entries {
-            let label = artwork_known_bucket(&art.picture_type)
-                .map(str::to_string)
-                .unwrap_or_else(|| artwork_type_label(&art.picture_type));
+            let picture_type = art.picture_type.clone();
+            let label = artwork_type_label(&picture_type);
             let aggregate = aggregates
-                .entry(label.clone())
-                .or_insert_with(|| ArtworkAggregate::new(label));
+                .entry(picture_type.as_u8())
+                .or_insert_with(|| ArtworkAggregate::new(label, picture_type));
             aggregate.present_files.insert(file_idx);
             aggregate.entry_count += 1;
             aggregate.details.insert(artwork_detail(art));
@@ -380,24 +379,34 @@ pub fn build_artwork_view_model(state: &MetadataEditorState) -> ArtworkViewModel
     }
 
     let mut rows = Vec::new();
-    for bucket in ["Front Cover", "Back Cover", "Artist", "Disc", "Icon"] {
+    for (bucket, picture_type) in canonical_artwork_rows() {
         let index = rows.len();
-        if let Some(aggregate) = aggregates.remove(bucket) {
-            rows.push(artwork_aggregate_view_row(&aggregate, file_count, index, state.artwork_cursor));
+        if let Some(aggregate) = aggregates.remove(&picture_type.as_u8()) {
+            rows.push(artwork_aggregate_view_row(
+                &aggregate,
+                file_count,
+                index,
+                state.artwork_cursor,
+            ));
         } else {
             rows.push(ArtworkCoverageRow {
                 index,
                 kind: bucket.to_string(),
                 status: "«not present»".to_string(),
                 detail: String::new(),
-                picture_type: artwork_bucket_picture_type(bucket),
+                picture_type,
                 selected: state.artwork_cursor == index,
             });
         }
     }
     for aggregate in aggregates.values() {
         let index = rows.len();
-        rows.push(artwork_aggregate_view_row(aggregate, file_count, index, state.artwork_cursor));
+        rows.push(artwork_aggregate_view_row(
+            aggregate,
+            file_count,
+            index,
+            state.artwork_cursor,
+        ));
     }
 
     ArtworkViewModel {
@@ -1442,15 +1451,17 @@ fn replaygain_cell(values: &[String], idx: usize) -> String {
 
 struct ArtworkAggregate {
     label: String,
+    picture_type: lofty::picture::PictureType,
     present_files: BTreeSet<usize>,
     entry_count: usize,
     details: BTreeSet<String>,
 }
 
 impl ArtworkAggregate {
-    fn new(label: String) -> Self {
+    fn new(label: String, picture_type: lofty::picture::PictureType) -> Self {
         Self {
             label,
+            picture_type,
             present_files: BTreeSet::new(),
             entry_count: 0,
             details: BTreeSet::new(),
@@ -1473,7 +1484,7 @@ fn artwork_aggregate_view_row(
             aggregate.entry_count,
         ),
         detail: artwork_detail_summary(&aggregate.details),
-        picture_type: artwork_bucket_picture_type(&aggregate.label),
+        picture_type: aggregate.picture_type.clone(),
         selected: cursor == index,
     }
 }
@@ -1482,15 +1493,14 @@ pub fn artwork_action_row_count(state: &MetadataEditorState) -> usize {
     build_artwork_view_model(state).rows.len()
 }
 
-fn artwork_bucket_picture_type(bucket: &str) -> lofty::picture::PictureType {
-    match bucket {
-        "Front Cover" => lofty::picture::PictureType::CoverFront,
-        "Back Cover" => lofty::picture::PictureType::CoverBack,
-        "Artist" => lofty::picture::PictureType::Artist,
-        "Disc" => lofty::picture::PictureType::Media,
-        "Icon" => lofty::picture::PictureType::Icon,
-        _ => lofty::picture::PictureType::Other,
-    }
+fn canonical_artwork_rows() -> [(&'static str, lofty::picture::PictureType); 5] {
+    [
+        ("Front Cover", lofty::picture::PictureType::CoverFront),
+        ("Back Cover", lofty::picture::PictureType::CoverBack),
+        ("Artist", lofty::picture::PictureType::Artist),
+        ("Disc", lofty::picture::PictureType::Media),
+        ("Icon", lofty::picture::PictureType::Icon),
+    ]
 }
 
 fn artwork_presence_status(present_files: usize, file_count: usize, entry_count: usize) -> String {
@@ -1550,26 +1560,11 @@ fn artwork_type_label(picture_type: &lofty::picture::PictureType) -> String {
     artwork_type_label_from_id3_code(picture_type.as_u8())
 }
 
-fn artwork_known_bucket(picture_type: &lofty::picture::PictureType) -> Option<&'static str> {
-    artwork_known_bucket_from_id3_code(picture_type.as_u8())
-}
-
-fn artwork_known_bucket_from_id3_code(code: u8) -> Option<&'static str> {
-    match code {
-        3 => Some("Front Cover"),
-        4 => Some("Back Cover"),
-        6 => Some("Disc"),
-        7 | 8 => Some("Artist"),
-        1 | 2 => Some("Icon"),
-        _ => None,
-    }
-}
-
 fn artwork_type_label_from_id3_code(code: u8) -> String {
     match code {
         0 => "Other".to_string(),
         1 => "Icon".to_string(),
-        2 => "Icon".to_string(),
+        2 => "Other Icon".to_string(),
         3 => "Front Cover".to_string(),
         4 => "Back Cover".to_string(),
         5 => "Leaflet".to_string(),
@@ -1826,14 +1821,64 @@ mod tests {
     }
 
     #[test]
-    fn artwork_bucket_mapping_uses_id3_type_codes() {
-        assert_eq!(artwork_known_bucket_from_id3_code(3), Some("Front Cover"));
-        assert_eq!(artwork_known_bucket_from_id3_code(4), Some("Back Cover"));
-        assert_eq!(artwork_known_bucket_from_id3_code(6), Some("Disc"));
-        assert_eq!(artwork_known_bucket_from_id3_code(7), Some("Artist"));
-        assert_eq!(artwork_known_bucket_from_id3_code(8), Some("Artist"));
-        assert_eq!(artwork_known_bucket_from_id3_code(1), Some("Icon"));
-        assert_eq!(artwork_known_bucket_from_id3_code(0), None);
+    fn artwork_canonical_rows_keep_exact_picture_types() {
+        let rows = canonical_artwork_rows();
+        assert_eq!(rows[0], ("Front Cover", lofty::picture::PictureType::CoverFront));
+        assert_eq!(rows[1], ("Back Cover", lofty::picture::PictureType::CoverBack));
+        assert_eq!(rows[2], ("Artist", lofty::picture::PictureType::Artist));
+        assert_eq!(rows[3], ("Disc", lofty::picture::PictureType::Media));
+        assert_eq!(rows[4], ("Icon", lofty::picture::PictureType::Icon));
+    }
+
+    #[test]
+    fn artwork_rows_preserve_non_canonical_picture_types() {
+        let mut metadata = super::super::probe::SourceMetadata::default();
+        metadata.artwork.push(ArtworkInfo {
+            picture_type: lofty::picture::PictureType::LeadArtist,
+            mime_type: "image/jpeg".to_string(),
+            data_size: 184_000,
+            width: Some(500),
+            height: Some(500),
+        });
+        metadata.artwork.push(ArtworkInfo {
+            picture_type: lofty::picture::PictureType::Leaflet,
+            mime_type: "image/png".to_string(),
+            data_size: 92_000,
+            width: Some(640),
+            height: Some(480),
+        });
+        metadata.artwork.push(ArtworkInfo {
+            picture_type: lofty::picture::PictureType::Composer,
+            mime_type: "image/webp".to_string(),
+            data_size: 64_000,
+            width: Some(256),
+            height: Some(256),
+        });
+        let state = details_state_for_file(MetadataFileDetails::from_open_cache(
+            PathBuf::from("/tmp/artwork.flac"),
+            Some(100),
+            None,
+            None,
+            None,
+            FileReadState::Readable,
+            FileWriteEligibility::Writable,
+            metadata,
+        ));
+
+        let vm = build_artwork_view_model(&state);
+        let lead_artist = vm.rows.iter().find(|row| row.kind == "Lead Artist").unwrap();
+        assert_eq!(lead_artist.picture_type, lofty::picture::PictureType::LeadArtist);
+        assert_eq!(lead_artist.status, "Embedded artwork");
+
+        let leaflet = vm.rows.iter().find(|row| row.kind == "Leaflet").unwrap();
+        assert_eq!(leaflet.picture_type, lofty::picture::PictureType::Leaflet);
+
+        let composer = vm.rows.iter().find(|row| row.kind == "Composer").unwrap();
+        assert_eq!(composer.picture_type, lofty::picture::PictureType::Composer);
+
+        let canonical_artist = vm.rows.iter().find(|row| row.kind == "Artist").unwrap();
+        assert_eq!(canonical_artist.picture_type, lofty::picture::PictureType::Artist);
+        assert_eq!(canonical_artist.status, "«not present»");
     }
 
 
@@ -1902,6 +1947,8 @@ mod tests {
     }
     #[test]
     fn artwork_type_label_has_numbered_fallback() {
+        assert_eq!(artwork_type_label_from_id3_code(2), "Other Icon");
+        assert_eq!(artwork_type_label_from_id3_code(7), "Lead Artist");
         assert_eq!(artwork_type_label_from_id3_code(16), "Movie Screen Capture");
         assert_eq!(artwork_type_label_from_id3_code(17), "Bright Colored Fish");
         assert_eq!(artwork_type_label_from_id3_code(221), "Picture type 221");

@@ -10,6 +10,10 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "image-preview")]
+use std::sync::mpsc::{self, Receiver};
+#[cfg(feature = "image-preview")]
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Selection policy for callers that need files, directories, or both.
@@ -350,6 +354,9 @@ pub struct FilePickerConfig {
     pub theme: FilePickerTheme,
     pub selection_mode: FilePickerSelectionMode,
     pub show_hidden: bool,
+    /// Show a right-side preview pane when the optional image-preview feature is enabled.
+    /// Image-filter pickers enable this automatically; callers may set it for custom image filters.
+    pub show_preview: bool,
     pub operation_policy: FileOperationPolicy,
 }
 
@@ -362,6 +369,7 @@ impl Default for FilePickerConfig {
             theme: FilePickerTheme::default(),
             selection_mode: FilePickerSelectionMode::Files,
             show_hidden: false,
+            show_preview: false,
             operation_policy: FileOperationPolicy::default(),
         }
     }
@@ -378,6 +386,81 @@ pub(crate) struct FilePickerLayoutMetrics {
 pub(crate) struct LastClick {
     pub action: FilePickerHitAction,
     pub at: Instant,
+}
+
+#[cfg(feature = "image-preview")]
+pub(crate) struct ImagePreviewLoadResult {
+    pub generation: usize,
+    pub path: PathBuf,
+    pub result: Result<image::DynamicImage, String>,
+}
+
+#[cfg(feature = "image-preview")]
+pub(crate) struct ImagePreviewCache {
+    pub path: Option<PathBuf>,
+    /// Preview content area used to encode the cached terminal image.
+    /// StatefulProtocol instances are cell-dimension sensitive and must be
+    /// rebuilt when the pane geometry changes.
+    pub preview_area: Option<Rect>,
+    /// Host-owned terminal image picker generation. Hosts increment this when
+    /// terminal resize/cell-size changes require protocol state to be rebuilt.
+    pub protocol_generation: usize,
+    /// Monotonic request generation for async preview loads.
+    pub generation: usize,
+    /// Generation of the decoded image currently waiting for protocol encoding.
+    pub decoded_generation: Option<usize>,
+    pub decoded_image: Option<image::DynamicImage>,
+    pub receiver: Option<Receiver<ImagePreviewLoadResult>>,
+    pub protocol: Option<Box<dyn ratatui_image::protocol::StatefulProtocol>>,
+    pub error: Option<String>,
+}
+
+#[cfg(feature = "image-preview")]
+impl Default for ImagePreviewCache {
+    fn default() -> Self {
+        Self {
+            path: None,
+            preview_area: None,
+            protocol_generation: 0,
+            generation: 0,
+            decoded_generation: None,
+            decoded_image: None,
+            receiver: None,
+            protocol: None,
+            error: None,
+        }
+    }
+}
+
+#[cfg(feature = "image-preview")]
+impl fmt::Debug for ImagePreviewCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImagePreviewCache")
+            .field("path", &self.path)
+            .field("preview_area", &self.preview_area)
+            .field("protocol_generation", &self.protocol_generation)
+            .field("generation", &self.generation)
+            .field("decoded_generation", &self.decoded_generation)
+            .field("has_decoded_image", &self.decoded_image.is_some())
+            .field("has_receiver", &self.receiver.is_some())
+            .field("has_protocol", &self.protocol.is_some())
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+#[cfg(feature = "image-preview")]
+impl Clone for ImagePreviewCache {
+    fn clone(&self) -> Self {
+        let mut cloned = Self::default();
+        cloned.path = self.path.clone();
+        cloned.preview_area = self.preview_area;
+        cloned.protocol_generation = self.protocol_generation;
+        cloned.generation = self.generation;
+        cloned.decoded_generation = self.decoded_generation;
+        cloned.error = self.error.clone();
+        cloned
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -408,6 +491,9 @@ pub struct FilePickerState {
     pub(crate) previous_focus: FilePickerFocus,
     pub(crate) selection_mode: FilePickerSelectionMode,
     pub(crate) show_hidden: bool,
+    pub(crate) show_preview: bool,
+    #[cfg(feature = "image-preview")]
+    pub(crate) image_preview_cache: ImagePreviewCache,
     pub(crate) sort_key: FilePickerSortKey,
     pub(crate) sort_reverse: bool,
     pub(crate) clipboard: Option<FilePickerClipboard>,
@@ -430,6 +516,7 @@ pub struct FilePickerState {
 impl FilePickerState {
     pub fn new(config: FilePickerConfig) -> Self {
         let start_dir = normalize_start_dir(&config.start_dir);
+        let show_preview = config.show_preview || matches!(config.filter, FilePickerFilter::Images);
         let mut state = Self {
             current_dir: start_dir.clone(),
             history_back: Vec::new(),
@@ -457,6 +544,9 @@ impl FilePickerState {
             previous_focus: FilePickerFocus::Files,
             selection_mode: config.selection_mode,
             show_hidden: config.show_hidden,
+            show_preview,
+            #[cfg(feature = "image-preview")]
+            image_preview_cache: ImagePreviewCache::default(),
             sort_key: FilePickerSortKey::Name,
             sort_reverse: false,
             clipboard: None,
@@ -508,6 +598,10 @@ impl FilePickerState {
         self.show_hidden
     }
 
+    pub fn show_preview(&self) -> bool {
+        self.show_preview
+    }
+
     pub fn set_show_hidden(&mut self, show_hidden: bool) {
         if self.show_hidden != show_hidden {
             self.show_hidden = show_hidden;
@@ -553,6 +647,154 @@ impl FilePickerState {
 
     pub fn set_free_space_bytes(&mut self, free_space_bytes: Option<u64>) {
         self.free_space_bytes = free_space_bytes;
+    }
+
+    /// Drop any cached image preview protocol state.
+    ///
+    /// Hosts should call this after terminal/cell-size changes when they do not
+    /// use `render_with_image_picker` protocol generations to force a reload.
+    #[cfg(feature = "image-preview")]
+    pub fn invalidate_image_preview_cache(&mut self) {
+        self.image_preview_cache.generation = self.image_preview_cache.generation.saturating_add(1);
+        self.image_preview_cache.path = None;
+        self.image_preview_cache.preview_area = None;
+        self.image_preview_cache.protocol_generation = 0;
+        self.image_preview_cache.decoded_generation = None;
+        self.image_preview_cache.decoded_image = None;
+        self.image_preview_cache.receiver = None;
+        self.image_preview_cache.protocol = None;
+        self.image_preview_cache.error = None;
+    }
+
+
+    /// Start an asynchronous image-preview decode for `path` if it is not
+    /// already the active request. The worker performs all disk I/O and image
+    /// decoding off the render path; rendering only polls the completed result
+    /// and builds terminal protocol state from already decoded pixels.
+    #[cfg(feature = "image-preview")]
+    pub(crate) fn request_image_preview_load(&mut self, path: PathBuf) {
+        if self.image_preview_cache.path.as_ref() == Some(&path)
+            && (self.image_preview_cache.receiver.is_some()
+                || self.image_preview_cache.decoded_image.is_some()
+                || self.image_preview_cache.error.is_some())
+        {
+            return;
+        }
+
+        let generation = self.image_preview_cache.generation.saturating_add(1);
+        self.image_preview_cache = ImagePreviewCache {
+            path: Some(path.clone()),
+            preview_area: None,
+            protocol_generation: 0,
+            generation,
+            decoded_generation: None,
+            decoded_image: None,
+            receiver: None,
+            protocol: None,
+            error: None,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.image_preview_cache.receiver = Some(rx);
+        thread::spawn(move || {
+            let result = std::fs::read(&path)
+                .map_err(|e| format!("read failed: {e}"))
+                .and_then(|bytes| image::load_from_memory(&bytes).map_err(|e| format!("decode failed: {e}")));
+            let _ = tx.send(ImagePreviewLoadResult { generation, path, result });
+        });
+    }
+
+    /// Clear image-preview state for non-image selections or directory changes.
+    #[cfg(feature = "image-preview")]
+    pub(crate) fn clear_image_preview_load(&mut self) {
+        self.invalidate_image_preview_cache();
+    }
+
+    /// Ensure the current file selection has a pending or completed async
+    /// preview load. This is invoked from cursor/navigation changes so render
+    /// does not synchronously read or decode image files.
+    #[cfg(feature = "image-preview")]
+    pub(crate) fn request_image_preview_for_current_selection(&mut self) {
+        let Some(entry) = self.entries.get(self.file_cursor) else {
+            self.clear_image_preview_load();
+            return;
+        };
+        if entry.is_dir || !crate::filter::is_supported_preview_image_extension(&entry.path) {
+            self.clear_image_preview_load();
+            return;
+        }
+        self.request_image_preview_load(entry.path.clone());
+    }
+
+    /// Poll at most one completed async preview decode without blocking.
+    #[cfg(feature = "image-preview")]
+    pub(crate) fn poll_image_preview_load(&mut self) {
+        let Some(rx) = self.image_preview_cache.receiver.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                if self.image_preview_cache.path.as_ref() == Some(&result.path)
+                    && self.image_preview_cache.generation == result.generation
+                {
+                    self.image_preview_cache.protocol = None;
+                    self.image_preview_cache.preview_area = None;
+                    match result.result {
+                        Ok(image) => {
+                            self.image_preview_cache.decoded_generation = Some(result.generation);
+                            self.image_preview_cache.decoded_image = Some(image);
+                            self.image_preview_cache.error = None;
+                        }
+                        Err(error) => {
+                            self.image_preview_cache.decoded_generation = Some(result.generation);
+                            self.image_preview_cache.decoded_image = None;
+                            self.image_preview_cache.error = Some(error);
+                        }
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.image_preview_cache.receiver = Some(rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.image_preview_cache.error = Some("Preview worker exited before completing".to_string());
+            }
+        }
+    }
+
+
+    /// Build or rebuild terminal protocol state for a decoded image preview.
+    /// This is intentionally called by the host update loop after drawing has
+    /// recorded pane geometry, not from the render path itself.
+    #[cfg(feature = "image-preview")]
+    pub fn prepare_image_preview_protocol(
+        &mut self,
+        picker: &mut ratatui_image::picker::Picker,
+        protocol_generation: usize,
+    ) -> bool {
+        let had_receiver = self.image_preview_cache.receiver.is_some();
+        self.poll_image_preview_load();
+        let decode_completed = had_receiver && self.image_preview_cache.receiver.is_none();
+
+        let Some(decoded) = self.image_preview_cache.decoded_image.as_ref() else {
+            return decode_completed;
+        };
+        let Some(preview_area) = self.image_preview_cache.preview_area else {
+            return decode_completed;
+        };
+        if preview_area.width == 0 || preview_area.height == 0 {
+            return decode_completed;
+        }
+        if self.image_preview_cache.protocol.is_some()
+            && self.image_preview_cache.protocol_generation == protocol_generation
+        {
+            return decode_completed;
+        }
+
+        self.image_preview_cache.protocol = Some(picker.new_resize_protocol(decoded.clone()));
+        self.image_preview_cache.protocol_generation = protocol_generation;
+        self.image_preview_cache.error = None;
+        true
     }
 
     pub fn file_operation_policy(&self) -> FileOperationPolicy {
@@ -682,6 +924,8 @@ impl FilePickerState {
                 self.file_cursor = 0;
                 self.file_scroll = 0;
                 self.selected = None;
+                #[cfg(feature = "image-preview")]
+                self.clear_image_preview_load();
                 self.sync_address_from_current_dir();
                 return;
             }
@@ -732,6 +976,8 @@ impl FilePickerState {
             self.ensure_file_cursor_visible(self.file_visible_rows());
         }
         self.sync_address_from_current_dir();
+        #[cfg(feature = "image-preview")]
+        self.request_image_preview_for_current_selection();
         refresh_tree_children(&mut self.tree_nodes, &self.current_dir, self.show_hidden);
         self.select_tree_node_for_current_dir();
     }
@@ -758,6 +1004,8 @@ impl FilePickerState {
         self.file_cursor = 0;
         self.file_scroll = 0;
         self.selected = None;
+        #[cfg(feature = "image-preview")]
+        self.clear_image_preview_load();
         self.menu_open = false;
         self.submenu_open = false;
         self.properties_open = false;
@@ -854,11 +1102,15 @@ impl FilePickerState {
             self.file_cursor = 0;
             self.file_scroll = 0;
             self.selected = None;
+            #[cfg(feature = "image-preview")]
+            self.clear_image_preview_load();
             return;
         }
         self.file_cursor = index.min(self.entries.len() - 1);
         self.selected = self.entries.get(self.file_cursor).map(|entry| entry.path.clone());
         self.ensure_file_cursor_visible(visible_rows);
+        #[cfg(feature = "image-preview")]
+        self.request_image_preview_for_current_selection();
     }
 
     pub fn move_file_cursor(&mut self, delta: isize, visible_rows: usize) {
@@ -866,6 +1118,8 @@ impl FilePickerState {
             self.file_cursor = 0;
             self.file_scroll = 0;
             self.selected = None;
+            #[cfg(feature = "image-preview")]
+            self.clear_image_preview_load();
             return;
         }
         let step = delta.unsigned_abs();
@@ -1456,7 +1710,7 @@ fn file_type_label(path: PathBuf, is_dir: bool, is_symlink: bool) -> String {
         Some(ext) if matches!(ext.as_str(), "toml") => "TOML".to_string(),
         Some(ext) if matches!(ext.as_str(), "md") => "Markdown".to_string(),
         Some(ext) if matches!(ext.as_str(), "txt") => "Text".to_string(),
-        Some(ext) if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tif" | "tiff") => ext.to_ascii_uppercase(),
+        Some(ext) if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp") => ext.to_ascii_uppercase(),
         Some(ext) if matches!(ext.as_str(), "flac" | "wav" | "aiff" | "aif" | "wv" | "mp3" | "m4a" | "aac" | "ogg" | "opus") => ext.to_ascii_uppercase(),
         Some(ext) => ext.to_ascii_uppercase(),
         None => "File".to_string(),
@@ -1652,6 +1906,28 @@ mod tests {
     }
 
     #[test]
+    fn image_filter_enables_preview_pane_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.show_preview());
+    }
+
+    #[test]
+    fn explicit_preview_config_enables_custom_preview_pane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            show_preview: true,
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.show_preview());
+    }
+
+    #[test]
     fn directories_are_visible_under_image_filter() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::create_dir(temp.path().join("child")).expect("dir");
@@ -1753,6 +2029,62 @@ mod tests {
         picker.create_name_cursor = picker.create_name_buffer.len();
         assert!(picker.commit_create_name());
         assert!(temp.path().join("named.txt").exists());
+    }
+
+
+
+    #[cfg(feature = "image-preview")]
+    #[test]
+    fn image_preview_load_is_requested_on_image_selection_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("a.png");
+        let second = temp.path().join("b.png");
+        fs::write(&first, b"not a real png").expect("first");
+        fs::write(&second, b"not a real png either").expect("second");
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        let second_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == second)
+            .expect("second image visible");
+
+        picker.set_file_cursor(second_index, 4);
+
+        assert_eq!(picker.image_preview_cache.path.as_deref(), Some(second.as_path()));
+        assert!(
+            picker.image_preview_cache.receiver.is_some()
+                || picker.image_preview_cache.decoded_image.is_some()
+                || picker.image_preview_cache.error.is_some(),
+            "selection change should create or complete an async preview request"
+        );
+    }
+
+    #[cfg(feature = "image-preview")]
+    #[test]
+    fn image_preview_cache_invalidation_drops_async_and_decoded_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("cover.png");
+        fs::write(&file, b"not a real png").expect("file");
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        picker.request_image_preview_load(file.clone());
+        assert_eq!(picker.image_preview_cache.path.as_deref(), Some(file.as_path()));
+
+        picker.invalidate_image_preview_cache();
+
+        assert!(picker.image_preview_cache.path.is_none());
+        assert!(picker.image_preview_cache.receiver.is_none());
+        assert!(picker.image_preview_cache.decoded_image.is_none());
+        assert!(picker.image_preview_cache.protocol.is_none());
     }
 
     #[cfg(unix)]

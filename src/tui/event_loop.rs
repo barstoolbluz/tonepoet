@@ -44,6 +44,7 @@ pub async fn run_app(
             app.force_redraw = false;
         }
         terminal.draw(|f| draw_ui(f, app))?;
+        app.prepare_image_preview_protocols();
 
         // 3. Check quit
         if app.should_quit {
@@ -63,7 +64,7 @@ pub async fn run_app(
                 Event::Key(key) => handle_key(app, key, &tx),
                 Event::Mouse(mouse) => handle_mouse(app, mouse, &tx),
                 Event::Paste(text) => handle_paste(app, &text),
-                Event::Resize(_, _) => {} // redraw handled by loop
+                Event::Resize(_, _) => app.refresh_image_picker_after_resize(),
                 _ => {}
             }
         }
@@ -1338,6 +1339,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     }
                     state.file_picker = None;
                     state.pending_artwork_type = None;
+                    state.invalidate_artwork_preview_cache();
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     reduced = true;
                 }

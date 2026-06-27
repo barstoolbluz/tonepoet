@@ -576,6 +576,37 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
     Ok(source_metadata_from_tags(path, tagged_file.tags(), true))
 }
 
+/// Lazily read raw embedded artwork bytes for one picture type.
+///
+/// The metadata editor stores only lightweight artwork facts in normal read
+/// state. Preview rendering calls this for the currently selected artwork row,
+/// so large images are not eagerly retained for every file/frame.
+pub fn read_embedded_picture_bytes(
+    path: &Path,
+    picture_type: lofty::picture::PictureType,
+) -> Result<Vec<u8>, String> {
+    use lofty::file::TaggedFileExt;
+
+    let tagged_file = lofty::read_from_path(path)
+        .map_err(|e| format!("Failed to read artwork from '{}': {}", path.display(), e))?;
+
+    for tag in tagged_file.tags() {
+        if let Some(picture) = tag
+            .pictures()
+            .iter()
+            .find(|picture| picture.pic_type() == picture_type)
+        {
+            return Ok(picture.data().to_vec());
+        }
+    }
+
+    Err(format!(
+        "No embedded {:?} artwork found in '{}'",
+        picture_type,
+        path.display()
+    ))
+}
+
 /// Synthesize source-level metadata for a SACD ISO from the Master
 /// TOC + SACDText. Maps:
 ///   - master_text.album_title  → meta.album   (album of the ISO)

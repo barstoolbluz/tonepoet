@@ -3457,12 +3457,13 @@ fn handle_metadata_artwork_key(
             clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
         }
         KeyCode::Home => {
-            state.artwork_cursor = 0;
+            state.set_artwork_cursor(0);
             clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
         }
         KeyCode::End => {
-            state.artwork_cursor = crate::tui::metadata_view_models::artwork_action_row_count(state)
+            let last = crate::tui::metadata_view_models::artwork_action_row_count(state)
                 .saturating_sub(1);
+            state.set_artwork_cursor(last);
             clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
         }
         KeyCode::Enter | KeyCode::Char('+') => {
@@ -3490,7 +3491,7 @@ fn metadata_editor_current_artwork_type(
     crate::tui::metadata_view_models::build_artwork_view_model(state)
         .rows
         .get(state.artwork_cursor)
-        .map(|row| row.picture_type)
+        .map(|row| row.picture_type.clone())
 }
 
 fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super::app::MetadataEditorState>) {
@@ -11375,7 +11376,7 @@ fn handle_metadata_editor_mouse(
                 }
                 Some(super::button_map::TuiButton::MetadataArtworkRow(idx)) => {
                     if state.content_tab == crate::tui::app::ContentTab::Artwork {
-                        state.artwork_cursor = idx;
+                        state.set_artwork_cursor(idx);
                         clamp_metadata_read_only_scroll(&mut state, metadata_editor_read_only_visible_rows());
                     }
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
@@ -11384,7 +11385,7 @@ fn handle_metadata_editor_mouse(
                 Some(super::button_map::TuiButton::MetadataArtworkAdd(idx))
                 | Some(super::button_map::TuiButton::MetadataArtworkReplace(idx)) => {
                     if state.content_tab == crate::tui::app::ContentTab::Artwork {
-                        state.artwork_cursor = idx;
+                        state.set_artwork_cursor(idx);
                         if state.read_only {
                             app.set_status("metadata editor: read-only source; artwork cannot be written");
                         } else if state.artwork_write.is_some() {
@@ -11399,7 +11400,7 @@ fn handle_metadata_editor_mouse(
                 }
                 Some(super::button_map::TuiButton::MetadataArtworkRemove(idx)) => {
                     if state.content_tab == crate::tui::app::ContentTab::Artwork {
-                        state.artwork_cursor = idx;
+                        state.set_artwork_cursor(idx);
                         metadata_editor_dispatch_artwork_remove(app, &mut state, tx);
                     }
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);

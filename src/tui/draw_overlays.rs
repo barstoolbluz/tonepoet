@@ -60,7 +60,14 @@ fn truncate_to_chars(s: &str, max: usize) -> String {
 /// Draw any active overlay on top of the main content
 pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
-        draw_metadata_editor(f, state, &mut app.button_map);
+        let image_picker_generation = app.image_picker_generation;
+        draw_metadata_editor(
+            f,
+            state,
+            &mut app.button_map,
+            &mut app.image_picker,
+            image_picker_generation,
+        );
         return;
     }
 
@@ -3917,6 +3924,8 @@ fn draw_metadata_editor(
     f: &mut Frame,
     state: &mut super::app::MetadataEditorState,
     button_map: &mut super::button_map::ButtonRenderMap,
+    image_picker: &mut ratatui_image::picker::Picker,
+    image_picker_generation: usize,
 ) {
     use super::app::{ContentTab, MetadataEditorPhase};
 
@@ -3979,9 +3988,17 @@ fn draw_metadata_editor(
     }
 
     if state.content_tab != ContentTab::Metadata {
-        draw_metadata_read_only_tab(f, state, content_area, footer_area, button_map);
+        draw_metadata_read_only_tab(
+            f,
+            state,
+            content_area,
+            footer_area,
+            button_map,
+            image_picker,
+            image_picker_generation,
+        );
         if let Some(picker) = state.file_picker.as_mut() {
-            draw_file_picker_overlay(f, picker, popup, button_map);
+            draw_file_picker_overlay(f, picker, popup, button_map, image_picker, image_picker_generation);
         }
         draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
         return;
@@ -4445,7 +4462,7 @@ fn draw_metadata_editor(
         footer_area,
     );
     if let Some(picker) = state.file_picker.as_mut() {
-        draw_file_picker_overlay(f, picker, popup, button_map);
+        draw_file_picker_overlay(f, picker, popup, button_map, image_picker, image_picker_generation);
     }
     draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
 }
@@ -4476,6 +4493,8 @@ fn draw_file_picker_overlay(
     session: &mut super::app::MetadataFilePickerState,
     parent: Rect,
     _button_map: &mut super::button_map::ButtonRenderMap,
+    image_picker: &mut ratatui_image::picker::Picker,
+    image_picker_generation: usize,
 ) {
     // The reusable picker owns hit testing through `handle_mouse()`. Tonepoet
     // intentionally does not mirror these regions into ButtonRenderMap; the
@@ -4484,20 +4503,31 @@ fn draw_file_picker_overlay(
     let area = file_picker_overlay_area(parent);
     let free_space = fs2::available_space(session.picker.current_dir()).ok();
     session.picker.set_free_space_bytes(free_space);
-    session.picker.render(f, area);
+    session
+        .picker
+        .render_with_image_picker(f, area, image_picker, image_picker_generation);
 }
 
 fn draw_metadata_read_only_tab(
     f: &mut Frame,
-    state: &super::app::MetadataEditorState,
+    state: &mut super::app::MetadataEditorState,
     content_area: Rect,
     footer_area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
+    image_picker: &mut ratatui_image::picker::Picker,
+    image_picker_generation: usize,
 ) {
     if state.content_tab == super::app::ContentTab::ReplayGain {
         draw_metadata_replaygain_tab(f, state, content_area);
     } else if state.content_tab == super::app::ContentTab::Artwork {
-        draw_metadata_artwork_tab(f, state, content_area, button_map);
+        draw_metadata_artwork_tab(
+            f,
+            state,
+            content_area,
+            button_map,
+            image_picker,
+            image_picker_generation,
+        );
     } else {
         let lines = metadata_read_only_lines(state);
         let total = lines.len();
@@ -4812,9 +4842,11 @@ fn draw_metadata_replaygain_tab(
 
 fn draw_metadata_artwork_tab(
     f: &mut Frame,
-    state: &super::app::MetadataEditorState,
+    state: &mut super::app::MetadataEditorState,
     content_area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
+    image_picker: &mut ratatui_image::picker::Picker,
+    image_picker_generation: usize,
 ) {
     let vm = super::metadata_view_models::build_artwork_view_model(state);
     if vm.disc_not_applicable {
@@ -4848,14 +4880,34 @@ fn draw_metadata_artwork_tab(
     if table_height == 0 {
         return;
     }
-    let table_area = Rect::new(
+    let body_area = Rect::new(
         content_area.x,
         content_area.y.saturating_add(top_height),
         content_area.width,
         table_height,
     );
-    let body_capacity = table_area.height.saturating_sub(1) as usize;
     let selected = (!vm.rows.is_empty()).then(|| state.artwork_cursor.min(vm.rows.len().saturating_sub(1)));
+    let show_preview = body_area.width >= 64 && body_area.height >= 6;
+    let table_area = if show_preview {
+        let preview_width = body_area.width.saturating_mul(28).saturating_div(100).clamp(16, 28);
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(preview_width), Constraint::Min(32)])
+            .split(body_area);
+        draw_artwork_preview_pane(
+            f,
+            state,
+            &vm,
+            selected,
+            panes[0],
+            image_picker,
+            image_picker_generation,
+        );
+        panes[1]
+    } else {
+        body_area
+    };
+    let body_capacity = table_area.height.saturating_sub(1) as usize;
     let (row_offset, visible_rows) = replaygain_table_window(
         vm.rows.len(),
         selected.unwrap_or(0),
@@ -4900,6 +4952,105 @@ fn draw_metadata_artwork_tab(
     f.render_stateful_widget(table, table_area, &mut table_state);
 
     record_artwork_table_button_hits(&vm.rows, table_area, row_offset, visible_rows, button_map);
+}
+
+fn draw_artwork_preview_pane(
+    f: &mut Frame,
+    state: &mut super::app::MetadataEditorState,
+    vm: &super::metadata_view_models::ArtworkViewModel,
+    selected: Option<usize>,
+    area: Rect,
+    _image_picker: &mut ratatui_image::picker::Picker,
+    image_picker_generation: usize,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::TEXT_DIM))
+        .title("Preview");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(row) = selected.and_then(|idx| vm.rows.get(idx)) else {
+        draw_preview_placeholder(f, inner, "No preview");
+        return;
+    };
+    if !artwork_row_has_embedded(row) {
+        draw_preview_placeholder(f, inner, "No preview");
+        return;
+    }
+    let Some(path) = artwork_preview_source_path(state, row) else {
+        draw_preview_placeholder(f, inner, "Preview unavailable");
+        return;
+    };
+
+    let picture_type = row.picture_type.clone();
+    let needs_request = state
+        .artwork_preview_cache
+        .as_ref()
+        .map(|cache| cache.path != path || cache.picture_type != picture_type)
+        .unwrap_or(true);
+
+    if needs_request {
+        state.request_artwork_preview_load(path.clone(), picture_type);
+    }
+
+    let Some(cache) = state.artwork_preview_cache.as_mut() else {
+        draw_preview_placeholder(f, inner, "Preview unavailable");
+        return;
+    };
+
+    let area_changed = cache.preview_area != inner;
+    let protocol_changed = cache.protocol_generation != image_picker_generation;
+    if area_changed || protocol_changed {
+        cache.preview_area = inner;
+        cache.protocol_generation = image_picker_generation;
+        cache.image_protocol = None;
+    }
+
+    if let Some(protocol) = cache.image_protocol.as_mut() {
+        let image = ratatui_image::StatefulImage::new(None);
+        f.render_stateful_widget(image, inner, protocol);
+    } else {
+        let message = if cache.receiver.is_some() {
+            "Loading preview…"
+        } else if cache.decoded_image.is_some() {
+            "Preparing preview…"
+        } else {
+            cache.error.as_deref().unwrap_or("Preview unavailable")
+        };
+        draw_preview_placeholder(f, inner, message);
+    }
+}
+
+fn artwork_preview_source_path(
+    state: &super::app::MetadataEditorState,
+    row: &super::metadata_view_models::ArtworkCoverageRow,
+) -> Option<std::path::PathBuf> {
+    state
+        .active_surface()
+        .technical_details
+        .files
+        .iter()
+        .find(|file| {
+            file.artwork_facts
+                .entries
+                .iter()
+                .any(|art| art.picture_type.as_u8() == row.picture_type.as_u8())
+        })
+        .map(|file| file.file_facts.path.clone())
+        .or_else(|| state.active_surface().paths.first().cloned())
+}
+
+fn draw_preview_placeholder(f: &mut Frame, area: Rect, message: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text = truncate_to_chars(message, area.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(theme::TEXT_DIM))))
+            .alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn record_artwork_table_button_hits(
@@ -7595,9 +7746,18 @@ mod file_picker_overlay_contract_tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut button_map = crate::tui::button_map::ButtonRenderMap::new();
 
+        let mut image_picker = ratatui_image::picker::Picker::new((8, 12));
+        let image_picker_generation = 0;
         terminal
             .draw(|frame| {
-                draw_file_picker_overlay(frame, &mut session, Rect::new(0, 0, 100, 30), &mut button_map);
+                draw_file_picker_overlay(
+                    frame,
+                    &mut session,
+                    Rect::new(0, 0, 100, 30),
+                    &mut button_map,
+                    &mut image_picker,
+                    image_picker_generation,
+                );
             })
             .expect("draw");
 
