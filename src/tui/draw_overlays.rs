@@ -61,12 +61,14 @@ fn truncate_to_chars(s: &str, max: usize) -> String {
 pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
     if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
         let image_picker_generation = app.image_picker_generation;
+        let image_repaint_generation = app.image_repaint_generation;
         draw_metadata_editor(
             f,
             state,
             &mut app.button_map,
             &mut app.image_picker,
             image_picker_generation,
+            image_repaint_generation,
         );
         return;
     }
@@ -3926,6 +3928,7 @@ fn draw_metadata_editor(
     button_map: &mut super::button_map::ButtonRenderMap,
     image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
+    image_repaint_generation: usize,
 ) {
     use super::app::{ContentTab, MetadataEditorPhase};
 
@@ -3996,9 +3999,18 @@ fn draw_metadata_editor(
             button_map,
             image_picker,
             image_picker_generation,
+            image_repaint_generation,
         );
         if let Some(picker) = state.file_picker.as_mut() {
-            draw_file_picker_overlay(f, picker, popup, button_map, image_picker, image_picker_generation);
+            draw_file_picker_overlay(
+                f,
+                picker,
+                popup,
+                button_map,
+                image_picker,
+                image_picker_generation,
+                image_repaint_generation,
+            );
         }
         draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
         return;
@@ -4462,7 +4474,15 @@ fn draw_metadata_editor(
         footer_area,
     );
     if let Some(picker) = state.file_picker.as_mut() {
-        draw_file_picker_overlay(f, picker, popup, button_map, image_picker, image_picker_generation);
+        draw_file_picker_overlay(
+            f,
+            picker,
+            popup,
+            button_map,
+            image_picker,
+            image_picker_generation,
+            image_repaint_generation,
+        );
     }
     draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
 }
@@ -4495,6 +4515,7 @@ fn draw_file_picker_overlay(
     _button_map: &mut super::button_map::ButtonRenderMap,
     image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
+    image_repaint_generation: usize,
 ) {
     // The reusable picker owns hit testing through `handle_mouse()`. Tonepoet
     // intentionally does not mirror these regions into ButtonRenderMap; the
@@ -4505,7 +4526,13 @@ fn draw_file_picker_overlay(
     session.picker.set_free_space_bytes(free_space);
     session
         .picker
-        .render_with_image_picker(f, area, image_picker, image_picker_generation);
+        .render_with_image_picker_and_repaint_generation(
+            f,
+            area,
+            image_picker,
+            image_picker_generation,
+            image_repaint_generation,
+        );
 }
 
 fn draw_metadata_read_only_tab(
@@ -4516,6 +4543,7 @@ fn draw_metadata_read_only_tab(
     button_map: &mut super::button_map::ButtonRenderMap,
     image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
+    image_repaint_generation: usize,
 ) {
     if state.content_tab == super::app::ContentTab::ReplayGain {
         draw_metadata_replaygain_tab(f, state, content_area);
@@ -4527,6 +4555,7 @@ fn draw_metadata_read_only_tab(
             button_map,
             image_picker,
             image_picker_generation,
+            image_repaint_generation,
         );
     } else {
         let lines = metadata_read_only_lines(state);
@@ -4847,6 +4876,7 @@ fn draw_metadata_artwork_tab(
     button_map: &mut super::button_map::ButtonRenderMap,
     image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
+    image_repaint_generation: usize,
 ) {
     let vm = super::metadata_view_models::build_artwork_view_model(state);
     if vm.disc_not_applicable {
@@ -4902,6 +4932,7 @@ fn draw_metadata_artwork_tab(
             panes[0],
             image_picker,
             image_picker_generation,
+            image_repaint_generation,
         );
         panes[1]
     } else {
@@ -4962,6 +4993,7 @@ fn draw_artwork_preview_pane(
     area: Rect,
     _image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
+    image_repaint_generation: usize,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4999,15 +5031,18 @@ fn draw_artwork_preview_pane(
         return;
     };
 
-    // Update cached area and generation for the post-draw prepare cycle,
-    // but keep rendering the existing protocol until prepare rebuilds it.
-    // Clearing here causes a visible flash on mouse move.
-    cache.preview_area = inner;
-    cache.protocol_generation = image_picker_generation;
+    // Record desired geometry/generation for the post-draw prepare cycle.
+    // These fields intentionally do not claim that the cached protocol was
+    // already encoded for this geometry or host generation.
+    cache.desired_preview_area = inner;
+    cache.desired_protocol_generation = image_picker_generation;
 
-    if let Some(protocol) = cache.image_protocol.as_mut() {
-        let image = ratatui_image::StatefulImage::new(None);
-        f.render_stateful_widget(image, inner, protocol);
+    if cache.image_protocol.is_some() {
+        if let Some(protocol) = cache.image_protocol.as_mut() {
+            let image = ratatui_image::StatefulImage::new(None);
+            f.render_stateful_widget(image, inner, protocol);
+            force_terminal_image_repaint(f, inner, image_repaint_generation);
+        }
     } else {
         let message = if cache.receiver.is_some() {
             "Loading preview…"
@@ -5018,6 +5053,44 @@ fn draw_artwork_preview_pane(
         };
         draw_preview_placeholder(f, inner, message);
     }
+}
+
+
+fn force_terminal_image_repaint(f: &mut Frame<'_>, area: Rect, repaint_generation: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    // ratatui-image writes graphics protocols into buffer cells as terminal
+    // escape-string symbols. If the symbol bytes are unchanged, ratatui's diff
+    // can skip re-emitting that command even when mouse motion has damaged the
+    // terminal-side graphics layer. Dirty the command cell through ratatui-owned
+    // style metadata rather than by appending raw escape sequences to the
+    // symbol; the style tracker remains authoritative and cached protocol state
+    // is not rebuilt per frame.
+    let repaint_color = repaint_generation_color(repaint_generation);
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height);
+    let buffer = f.buffer_mut();
+    for y in area.y..bottom {
+        for x in area.x..right {
+            let cell = buffer.get_mut(x, y);
+            if cell.symbol().contains('\u{1b}') {
+                cell.fg = repaint_color;
+                return;
+            }
+        }
+    }
+}
+
+fn repaint_generation_color(repaint_generation: usize) -> Color {
+    let key = repaint_generation as u64;
+    let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17) ^ key;
+    Color::Rgb(
+        (mixed & 0xff) as u8,
+        ((mixed >> 8) & 0xff) as u8,
+        ((mixed >> 16) & 0xff) as u8,
+    )
 }
 
 fn artwork_preview_source_path(
@@ -7755,6 +7828,7 @@ mod file_picker_overlay_contract_tests {
                     &mut button_map,
                     &mut image_picker,
                     image_picker_generation,
+                    0,
                 );
             })
             .expect("draw");

@@ -398,13 +398,18 @@ pub(crate) struct ImagePreviewLoadResult {
 #[cfg(feature = "image-preview")]
 pub(crate) struct ImagePreviewCache {
     pub path: Option<PathBuf>,
-    /// Preview content area used to encode the cached terminal image.
-    /// StatefulProtocol instances are cell-dimension sensitive and must be
-    /// rebuilt when the pane geometry changes.
-    pub preview_area: Option<Rect>,
-    /// Host-owned terminal image picker generation. Hosts increment this when
-    /// terminal resize/cell-size changes require protocol state to be rebuilt.
-    pub protocol_generation: usize,
+    /// Most recent preview content area requested by render. This is desired
+    /// geometry only; it is not evidence that the cached protocol was encoded
+    /// for this area.
+    pub desired_preview_area: Option<Rect>,
+    /// Preview area for which `protocol` was actually prepared.
+    pub encoded_preview_area: Option<Rect>,
+    /// Most recent host-owned terminal image picker generation requested by
+    /// render. Hosts increment this when terminal resize/cell-size changes
+    /// require protocol state to be rebuilt.
+    pub desired_protocol_generation: usize,
+    /// Host generation for which `protocol` was actually prepared.
+    pub encoded_protocol_generation: usize,
     /// Monotonic request generation for async preview loads.
     pub generation: usize,
     /// Generation of the decoded image currently waiting for protocol encoding.
@@ -420,8 +425,10 @@ impl Default for ImagePreviewCache {
     fn default() -> Self {
         Self {
             path: None,
-            preview_area: None,
-            protocol_generation: 0,
+            desired_preview_area: None,
+            encoded_preview_area: None,
+            desired_protocol_generation: 0,
+            encoded_protocol_generation: 0,
             generation: 0,
             decoded_generation: None,
             decoded_image: None,
@@ -437,8 +444,10 @@ impl fmt::Debug for ImagePreviewCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ImagePreviewCache")
             .field("path", &self.path)
-            .field("preview_area", &self.preview_area)
-            .field("protocol_generation", &self.protocol_generation)
+            .field("desired_preview_area", &self.desired_preview_area)
+            .field("encoded_preview_area", &self.encoded_preview_area)
+            .field("desired_protocol_generation", &self.desired_protocol_generation)
+            .field("encoded_protocol_generation", &self.encoded_protocol_generation)
             .field("generation", &self.generation)
             .field("decoded_generation", &self.decoded_generation)
             .field("has_decoded_image", &self.decoded_image.is_some())
@@ -454,8 +463,10 @@ impl Clone for ImagePreviewCache {
     fn clone(&self) -> Self {
         let mut cloned = Self::default();
         cloned.path = self.path.clone();
-        cloned.preview_area = self.preview_area;
-        cloned.protocol_generation = self.protocol_generation;
+        cloned.desired_preview_area = self.desired_preview_area;
+        cloned.encoded_preview_area = self.encoded_preview_area;
+        cloned.desired_protocol_generation = self.desired_protocol_generation;
+        cloned.encoded_protocol_generation = self.encoded_protocol_generation;
         cloned.generation = self.generation;
         cloned.decoded_generation = self.decoded_generation;
         cloned.error = self.error.clone();
@@ -657,8 +668,10 @@ impl FilePickerState {
     pub fn invalidate_image_preview_cache(&mut self) {
         self.image_preview_cache.generation = self.image_preview_cache.generation.saturating_add(1);
         self.image_preview_cache.path = None;
-        self.image_preview_cache.preview_area = None;
-        self.image_preview_cache.protocol_generation = 0;
+        self.image_preview_cache.desired_preview_area = None;
+        self.image_preview_cache.encoded_preview_area = None;
+        self.image_preview_cache.desired_protocol_generation = 0;
+        self.image_preview_cache.encoded_protocol_generation = 0;
         self.image_preview_cache.decoded_generation = None;
         self.image_preview_cache.decoded_image = None;
         self.image_preview_cache.receiver = None;
@@ -684,8 +697,10 @@ impl FilePickerState {
         let generation = self.image_preview_cache.generation.saturating_add(1);
         self.image_preview_cache = ImagePreviewCache {
             path: Some(path.clone()),
-            preview_area: None,
-            protocol_generation: 0,
+            desired_preview_area: None,
+            encoded_preview_area: None,
+            desired_protocol_generation: 0,
+            encoded_protocol_generation: 0,
             generation,
             decoded_generation: None,
             decoded_image: None,
@@ -738,7 +753,8 @@ impl FilePickerState {
                     && self.image_preview_cache.generation == result.generation
                 {
                     self.image_preview_cache.protocol = None;
-                    self.image_preview_cache.preview_area = None;
+                    self.image_preview_cache.encoded_preview_area = None;
+                    self.image_preview_cache.encoded_protocol_generation = 0;
                     match result.result {
                         Ok(image) => {
                             self.image_preview_cache.decoded_generation = Some(result.generation);
@@ -779,20 +795,24 @@ impl FilePickerState {
         let Some(decoded) = self.image_preview_cache.decoded_image.as_ref() else {
             return decode_completed;
         };
-        let Some(preview_area) = self.image_preview_cache.preview_area else {
+        let Some(preview_area) = self.image_preview_cache.desired_preview_area else {
             return decode_completed;
         };
         if preview_area.width == 0 || preview_area.height == 0 {
             return decode_completed;
         }
+        let desired_protocol_generation = protocol_generation;
+        self.image_preview_cache.desired_protocol_generation = desired_protocol_generation;
         if self.image_preview_cache.protocol.is_some()
-            && self.image_preview_cache.protocol_generation == protocol_generation
+            && self.image_preview_cache.encoded_protocol_generation == desired_protocol_generation
+            && self.image_preview_cache.encoded_preview_area == Some(preview_area)
         {
             return decode_completed;
         }
 
         self.image_preview_cache.protocol = Some(picker.new_resize_protocol(decoded.clone()));
-        self.image_preview_cache.protocol_generation = protocol_generation;
+        self.image_preview_cache.encoded_protocol_generation = desired_protocol_generation;
+        self.image_preview_cache.encoded_preview_area = Some(preview_area);
         self.image_preview_cache.error = None;
         true
     }

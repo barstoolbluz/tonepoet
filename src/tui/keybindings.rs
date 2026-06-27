@@ -14660,6 +14660,11 @@ fn retry_failed(app: &mut AppState) {
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
     // Metadata editor mouse: intercept all events when the editor is open.
     if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
+        // Mouse movement can damage terminal graphics layers without changing
+        // the ratatui buffer. Advance a repaint generation so image preview
+        // widgets re-emit their cached terminal image command on the next draw
+        // without rebuilding resize/encode protocol state.
+        app.request_image_preview_repaint();
         handle_metadata_editor_mouse(app, mouse, tx);
         return;
     }

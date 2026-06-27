@@ -3144,12 +3144,18 @@ pub struct ArtworkPreviewLoadResult {
 pub struct ArtworkPreviewCache {
     pub path: std::path::PathBuf,
     pub picture_type: lofty::picture::PictureType,
-    /// Preview content area used when encoding this terminal image.
-    /// StatefulProtocol values must be recreated when pane geometry changes.
-    pub preview_area: ratatui::layout::Rect,
-    /// App-level terminal picker generation. Incremented when terminal
-    /// resize/cell-size changes require image protocol state to be rebuilt.
-    pub protocol_generation: usize,
+    /// Most recent preview content area requested by render. This is desired
+    /// geometry only; it is not evidence that the cached protocol was encoded
+    /// for this area.
+    pub desired_preview_area: ratatui::layout::Rect,
+    /// Preview area for which `image_protocol` was actually prepared.
+    pub encoded_preview_area: ratatui::layout::Rect,
+    /// App-level terminal picker generation requested by render. Incremented
+    /// when terminal resize/cell-size changes require image protocol state to
+    /// be rebuilt.
+    pub desired_protocol_generation: usize,
+    /// App generation for which `image_protocol` was actually prepared.
+    pub encoded_protocol_generation: usize,
     pub generation: usize,
     pub decoded_generation: Option<usize>,
     pub decoded_image: Option<image::DynamicImage>,
@@ -3163,8 +3169,10 @@ impl fmt::Debug for ArtworkPreviewCache {
         f.debug_struct("ArtworkPreviewCache")
             .field("path", &self.path)
             .field("picture_type", &self.picture_type)
-            .field("preview_area", &self.preview_area)
-            .field("protocol_generation", &self.protocol_generation)
+            .field("desired_preview_area", &self.desired_preview_area)
+            .field("encoded_preview_area", &self.encoded_preview_area)
+            .field("desired_protocol_generation", &self.desired_protocol_generation)
+            .field("encoded_protocol_generation", &self.encoded_protocol_generation)
             .field("generation", &self.generation)
             .field("decoded_generation", &self.decoded_generation)
             .field("has_decoded_image", &self.decoded_image.is_some())
@@ -3180,8 +3188,10 @@ impl Clone for ArtworkPreviewCache {
         Self {
             path: self.path.clone(),
             picture_type: self.picture_type.clone(),
-            preview_area: self.preview_area,
-            protocol_generation: self.protocol_generation,
+            desired_preview_area: self.desired_preview_area,
+            encoded_preview_area: self.encoded_preview_area,
+            desired_protocol_generation: self.desired_protocol_generation,
+            encoded_protocol_generation: self.encoded_protocol_generation,
             generation: self.generation,
             decoded_generation: self.decoded_generation,
             decoded_image: None,
@@ -4468,8 +4478,10 @@ impl MetadataEditorState {
         self.artwork_preview_cache = Some(ArtworkPreviewCache {
             path: path.clone(),
             picture_type: picture_type.clone(),
-            preview_area: ratatui::layout::Rect::default(),
-            protocol_generation: 0,
+            desired_preview_area: ratatui::layout::Rect::default(),
+            encoded_preview_area: ratatui::layout::Rect::default(),
+            desired_protocol_generation: 0,
+            encoded_protocol_generation: 0,
             generation,
             decoded_generation: None,
             decoded_image: None,
@@ -4504,7 +4516,8 @@ impl MetadataEditorState {
                     && cache.generation == result.generation
                 {
                     cache.image_protocol = None;
-                    cache.preview_area = ratatui::layout::Rect::default();
+                    cache.encoded_preview_area = ratatui::layout::Rect::default();
+                    cache.encoded_protocol_generation = 0;
                     match result.result {
                         Ok(image) => {
                             cache.decoded_generation = Some(result.generation);
@@ -4553,15 +4566,21 @@ impl MetadataEditorState {
         let Some(decoded) = cache.decoded_image.as_ref() else {
             return decode_completed;
         };
-        if cache.preview_area.width == 0 || cache.preview_area.height == 0 {
+        let desired_area = cache.desired_preview_area;
+        if desired_area.width == 0 || desired_area.height == 0 {
             return decode_completed;
         }
-        if cache.image_protocol.is_some() && cache.protocol_generation == protocol_generation {
+        cache.desired_protocol_generation = protocol_generation;
+        if cache.image_protocol.is_some()
+            && cache.encoded_protocol_generation == protocol_generation
+            && cache.encoded_preview_area == desired_area
+        {
             return decode_completed;
         }
 
         cache.image_protocol = Some(image_picker.new_resize_protocol(decoded.clone()));
-        cache.protocol_generation = protocol_generation;
+        cache.encoded_protocol_generation = protocol_generation;
+        cache.encoded_preview_area = desired_area;
         cache.error = None;
         true
     }
@@ -5981,6 +6000,9 @@ pub struct AppState {
     pub image_picker: ratatui_image::picker::Picker,
     /// Monotonic generation for terminal image protocol/cell-size changes.
     pub image_picker_generation: usize,
+    /// Monotonic generation used to force terminal image command re-emission
+    /// after mouse movement or other terminal-side graphics damage.
+    pub image_repaint_generation: usize,
 
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
@@ -6094,6 +6116,7 @@ impl AppState {
             last_artwork_picker_dir: None,
             image_picker: new_terminal_image_picker(),
             image_picker_generation: 0,
+            image_repaint_generation: 0,
             hover_target: None,
             analysis_results: Vec::new(),
             analysis_pending: 0,
@@ -6131,7 +6154,14 @@ impl AppState {
                 file_picker.picker.invalidate_image_preview_cache();
             }
         }
+        self.request_image_preview_repaint();
         self.force_redraw = true;
+    }
+
+    /// Advance the repaint generation used to re-emit already prepared terminal
+    /// graphics commands without rebuilding cached image protocol state.
+    pub fn request_image_preview_repaint(&mut self) {
+        self.image_repaint_generation = self.image_repaint_generation.saturating_add(1);
     }
 
 
@@ -9320,8 +9350,10 @@ mod metadata_presentation_tab_tests {
         let cache = ArtworkPreviewCache {
             path: std::path::PathBuf::from("/tmp/source.flac"),
             picture_type: lofty::picture::PictureType::LeadArtist,
-            preview_area: ratatui::layout::Rect::new(1, 2, 20, 10),
-            protocol_generation: 7,
+            desired_preview_area: ratatui::layout::Rect::new(1, 2, 20, 10),
+            encoded_preview_area: ratatui::layout::Rect::new(1, 2, 20, 10),
+            desired_protocol_generation: 7,
+            encoded_protocol_generation: 7,
             generation: 42,
             decoded_generation: Some(42),
             decoded_image: None,
@@ -9334,8 +9366,10 @@ mod metadata_presentation_tab_tests {
 
         assert_eq!(cloned.path, cache.path);
         assert_eq!(cloned.picture_type, lofty::picture::PictureType::LeadArtist);
-        assert_eq!(cloned.preview_area, cache.preview_area);
-        assert_eq!(cloned.protocol_generation, 7);
+        assert_eq!(cloned.desired_preview_area, cache.desired_preview_area);
+        assert_eq!(cloned.encoded_preview_area, cache.encoded_preview_area);
+        assert_eq!(cloned.desired_protocol_generation, 7);
+        assert_eq!(cloned.encoded_protocol_generation, 7);
         assert_eq!(cloned.generation, 42);
         assert_eq!(cloned.decoded_generation, Some(42));
         assert!(cloned.decoded_image.is_none());
@@ -9352,8 +9386,10 @@ mod metadata_presentation_tab_tests {
         state.artwork_preview_cache = Some(ArtworkPreviewCache {
             path: std::path::PathBuf::from("/tmp/source.flac"),
             picture_type: lofty::picture::PictureType::Composer,
-            preview_area: ratatui::layout::Rect::new(1, 1, 16, 8),
-            protocol_generation: 1,
+            desired_preview_area: ratatui::layout::Rect::new(1, 1, 16, 8),
+            encoded_preview_area: ratatui::layout::Rect::new(1, 1, 16, 8),
+            desired_protocol_generation: 1,
+            encoded_protocol_generation: 1,
             generation: before,
             decoded_generation: None,
             decoded_image: None,

@@ -3,6 +3,8 @@ use crate::state::{
     FilePickerMenuAction, FilePickerState, HitRegion, ToolbarAction,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+#[cfg(feature = "image-preview")]
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
@@ -13,19 +15,21 @@ use std::time::{Duration, SystemTime};
 struct ImageRenderContext<'a> {
     picker: Option<&'a mut ratatui_image::picker::Picker>,
     protocol_generation: usize,
+    repaint_generation: usize,
 }
 
 #[cfg(feature = "image-preview")]
 impl<'a> ImageRenderContext<'a> {
     fn none() -> Self {
-        Self { picker: None, protocol_generation: 0 }
+        Self { picker: None, protocol_generation: 0, repaint_generation: 0 }
     }
 
     fn with_picker(
         picker: &'a mut ratatui_image::picker::Picker,
         protocol_generation: usize,
+        repaint_generation: usize,
     ) -> Self {
-        Self { picker: Some(picker), protocol_generation }
+        Self { picker: Some(picker), protocol_generation, repaint_generation }
     }
 }
 
@@ -63,10 +67,35 @@ impl FilePickerState {
         image_picker: &mut ratatui_image::picker::Picker,
         protocol_generation: usize,
     ) {
+        self.render_with_image_picker_and_repaint_generation(
+            frame,
+            area,
+            image_picker,
+            protocol_generation,
+            0,
+        );
+    }
+
+    /// Render with a host-owned terminal image picker and image repaint generation.
+    ///
+    /// `repaint_generation` should be incremented by the host when an external
+    /// event, such as mouse motion, can damage or uncover terminal graphics
+    /// without changing the ratatui buffer. The picker keeps cached
+    /// `StatefulProtocol` values and only nudges ratatui's diff for the image
+    /// command cell, avoiding per-frame resize/encode rebuilds.
+    #[cfg(feature = "image-preview")]
+    pub fn render_with_image_picker_and_repaint_generation(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        image_picker: &mut ratatui_image::picker::Picker,
+        protocol_generation: usize,
+        repaint_generation: usize,
+    ) {
         self.render_with_image_context(
             frame,
             area,
-            ImageRenderContext::with_picker(image_picker, protocol_generation),
+            ImageRenderContext::with_picker(image_picker, protocol_generation, repaint_generation),
         );
     }
 
@@ -285,13 +314,11 @@ impl FilePickerState {
             self.request_image_preview_load(entry.path.clone());
         }
 
-        // Update cached area and generation for prepare_image_preview_protocol,
-        // but do NOT clear the protocol here — let it continue rendering the
-        // existing image until prepare rebuilds it. Clearing causes a visible
-        // flash on every mouse move because the protocol is destroyed before
-        // the post-draw prepare cycle can recreate it.
-        self.image_preview_cache.preview_area = Some(inner);
-        self.image_preview_cache.protocol_generation = image_ctx.protocol_generation;
+        // Record desired geometry/generation for prepare_image_preview_protocol.
+        // These fields intentionally do not claim that the cached protocol was
+        // already encoded for this geometry or host generation.
+        self.image_preview_cache.desired_preview_area = Some(inner);
+        self.image_preview_cache.desired_protocol_generation = image_ctx.protocol_generation;
 
         if image_ctx.picker.is_none() {
             self.image_preview_cache.error = Some(
@@ -299,9 +326,12 @@ impl FilePickerState {
             );
         }
 
-        if let Some(protocol) = self.image_preview_cache.protocol.as_mut() {
-            let image = ratatui_image::StatefulImage::new(None);
-            frame.render_stateful_widget(image, inner, protocol);
+        if self.image_preview_cache.protocol.is_some() {
+            if let Some(protocol) = self.image_preview_cache.protocol.as_mut() {
+                let image = ratatui_image::StatefulImage::new(None);
+                frame.render_stateful_widget(image, inner, protocol);
+                Self::force_terminal_image_repaint(frame, inner, image_ctx.repaint_generation);
+            }
         } else {
             let message = if self.image_preview_cache.receiver.is_some() {
                 "Loading preview…"
@@ -316,6 +346,47 @@ impl FilePickerState {
             render_preview_message(frame, inner, message, self.theme.text_dim);
         }
     }
+
+
+#[cfg(feature = "image-preview")]
+fn force_terminal_image_repaint(frame: &mut Frame<'_>, area: Rect, repaint_generation: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    // Graphics protocols such as Kitty, Sixel, and iTerm2 are emitted into a
+    // ratatui cell as terminal escape-string symbols. If the symbol bytes are
+    // unchanged, ratatui's diff can skip re-emitting the graphics command even
+    // when mouse movement has damaged the terminal-side graphics layer. Dirty
+    // that command cell through ratatui-owned style metadata rather than by
+    // appending raw escape sequences to the symbol. The style tracker therefore
+    // remains authoritative for terminal style state, while the protocol object
+    // remains cached and is not rebuilt per frame.
+    let repaint_color = Self::repaint_generation_color(repaint_generation);
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height);
+    let buffer = frame.buffer_mut();
+    for y in area.y..bottom {
+        for x in area.x..right {
+            let cell = buffer.get_mut(x, y);
+            if cell.symbol().contains('\u{1b}') {
+                cell.fg = repaint_color;
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "image-preview")]
+fn repaint_generation_color(repaint_generation: usize) -> Color {
+    let key = repaint_generation as u64;
+    let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17) ^ key;
+    Color::Rgb(
+        (mixed & 0xff) as u8,
+        ((mixed >> 8) & 0xff) as u8,
+        ((mixed >> 16) & 0xff) as u8,
+    )
+}
 
     #[cfg(not(feature = "image-preview"))]
     fn render_preview_pane(
