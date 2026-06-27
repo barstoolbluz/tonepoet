@@ -201,6 +201,13 @@ pub enum AppMessage {
         purpose: crate::tui::app::FilePickerPurpose,
         path: Option<std::path::PathBuf>,
     },
+    /// Progress snapshot for a hosted long-running file task. The reusable
+    /// progress state lives in `tui-file-picker`; Tonepoet only matches the
+    /// session id and feeds the snapshot into the active overlay.
+    FileTaskProgress {
+        session_id: u64,
+        update: tui_file_picker::FileTaskProgressUpdate,
+    },
     /// Result of add/replace/remove artwork launched from the Artwork tab.
     MetadataEditorArtworkWriteComplete {
         session_id: u64,

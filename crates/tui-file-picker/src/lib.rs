@@ -7,12 +7,18 @@
 
 mod filter;
 mod input;
+mod progress;
 mod render;
 mod state;
 mod theme;
 mod tree;
 
 pub use filter::FilePickerFilter;
+pub use progress::{
+    ConflictAction, ConflictItemKind, ConflictPromptState, ConflictResolution, FileTaskKind, FileTaskPhase,
+    FileTaskErrorRecord, FileTaskProgressState, FileTaskProgressUpdate, FileTaskScope,
+    FileTaskUserAction, ProgressItem, ProgressTotals, ProgressUnit,
+};
 pub use state::{
     CrossDeviceCutPolicy, DeleteMode, DeletePolicy, FileOperationPolicy, FilePickerAction,
     FilePickerClipboard, FilePickerClipboardMode, FilePickerConfig, FilePickerCreateKind,

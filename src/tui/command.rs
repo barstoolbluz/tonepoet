@@ -322,7 +322,7 @@ pub enum Command {
     /// Move selected browse file(s) to the system trash (XDG Trash on
     /// Linux, Finder Trash on macOS). Shows confirmation first.
     Delete,
-    /// Copy selected file(s) to a destination. Empty arg opens a TextEdit
+    /// Copy selected file(s) to a destination. Empty arg opens a directory
     /// picker. `:cp!` variant replaces existing files.
     Copy {
         dest: String,
@@ -1477,10 +1477,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             execute_rename(app, &new_name, tx);
         }
         Command::Copy { dest, force } => {
-            execute_file_op(app, &dest, force, false);
+            execute_file_op(app, &dest, force, false, tx);
         }
         Command::Move { dest, force } => {
-            execute_file_op(app, &dest, force, true);
+            execute_file_op(app, &dest, force, true, tx);
         }
         Command::Browse => {
             // If invoked from the convert screen, set return_target so the
@@ -4657,9 +4657,15 @@ fn execute_delete(app: &mut AppState) {
 }
 
 /// Execute a `:cp` / `:mv` command. Collects selected files on Browse,
-/// then either opens a TextEdit picker for the destination (if no arg)
+/// then either opens a directory picker for the destination (if no arg)
 /// or performs the operation directly (if arg provided).
-fn execute_file_op(app: &mut AppState, dest: &str, force: bool, is_move: bool) {
+fn execute_file_op(
+    app: &mut AppState,
+    dest: &str,
+    force: bool,
+    is_move: bool,
+    tx: &mpsc::Sender<AppMessage>,
+) {
     if app.current_screen != AppScreen::Browse {
         let cmd = if is_move { ":mv" } else { ":cp" };
         app.set_status(format!("{} only works on the Browse screen", cmd));
@@ -4675,29 +4681,79 @@ fn execute_file_op(app: &mut AppState, dest: &str, force: bool, is_move: bool) {
         return;
     }
 
+    if dest.trim().is_empty() {
+        open_file_picker_for_copy_move(app, sources, force, is_move);
+        return;
+    }
+
     let target = if is_move {
         TextEditTarget::BrowseMove { sources, force }
     } else {
         TextEditTarget::BrowseCopy { sources, force }
     };
-    let label = if is_move { "move to" } else { "copy to" };
 
-    if dest.trim().is_empty() {
-        // No destination arg — open picker pre-filled with current dir.
-        let initial = app.browse.current_dir.display().to_string();
-        app.active_overlay = ActiveOverlay::TextEdit {
-            input: super::text_input::TextInputState::new(if initial.ends_with('/') {
-                initial
-            } else {
-                format!("{}/", initial)
-            }),
-            target,
-            label: label.to_string(),
-        };
+    // Destination provided — perform directly through the tx-aware path so
+    // the browse screen gets the same immediate probe refresh as text-edit
+    // completions and picker completions.
+    let dest_expanded = expand_path(dest.trim());
+    super::keybindings::apply_file_op_with_tx(app, target, &dest_expanded, tx);
+}
+
+/// Open the reusable file picker as a Browse-screen destination chooser for
+/// copy/move operations. The source set is captured by the caller before this
+/// function installs the modal overlay, making the eventual completion
+/// idempotent with respect to later browse cursor or selection changes.
+pub(super) fn open_file_picker_for_copy_move(
+    app: &mut AppState,
+    sources: Vec<PathBuf>,
+    force: bool,
+    is_move: bool,
+) {
+    if app.current_screen != AppScreen::Browse {
+        let cmd = if is_move { ":mv" } else { ":cp" };
+        app.set_status(format!("{} only works on the Browse screen", cmd));
+        return;
+    }
+    if sources.is_empty() {
+        app.set_status("no files selected for copy/move");
+        return;
+    }
+
+    let start_dir = if app.browse.current_dir.is_dir() {
+        app.browse.current_dir.clone()
     } else {
-        // Destination provided — perform directly via the apply handler.
-        let dest_expanded = expand_path(dest.trim());
-        super::keybindings::apply_file_op_pub(app, target, &dest_expanded);
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    let title = if is_move { "Move to..." } else { "Copy to..." }.to_string();
+    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+        start_dir,
+        filter: tui_file_picker::FilePickerFilter::All,
+        title: title.clone(),
+        theme: super::keybindings::file_picker_theme_from_tonepoet_theme(),
+        selection_mode: tui_file_picker::FilePickerSelectionMode::Directories,
+        operation_policy: directory_destination_picker_policy(),
+        ..tui_file_picker::FilePickerConfig::default()
+    });
+    let purpose = if is_move {
+        FilePickerPurpose::MoveTo { sources, force }
+    } else {
+        FilePickerPurpose::CopyTo { sources, force }
+    };
+    app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(purpose, picker));
+    app.set_status(format!("{}: choose a destination folder", title));
+}
+
+fn directory_destination_picker_policy() -> tui_file_picker::FileOperationPolicy {
+    tui_file_picker::FileOperationPolicy {
+        allow_new_file: false,
+        allow_new_folder: true,
+        allow_cut: false,
+        allow_copy: false,
+        allow_paste: false,
+        allow_delete: false,
+        symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
+        cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
+        delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
     }
 }
 

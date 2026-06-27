@@ -98,9 +98,9 @@ pub enum ContextAction {
     EditMetadata(crate::tui::probe::MetadataField),
     /// Open the full metadata editor overlay.
     EditMetadataFull,
-    /// Copy the selected file(s) to a destination (opens TextEdit picker).
+    /// Copy the selected file(s) to a destination (opens directory picker).
     CopyTo,
-    /// Move the selected file(s) to a destination (opens TextEdit picker).
+    /// Move the selected file(s) to a destination (opens directory picker).
     MoveTo,
     /// Refresh the browse listing.
     Refresh,
@@ -1250,18 +1250,12 @@ pub fn execute_context_action(
             super::keybindings::open_bulk_rename(app, audio_paths);
         }
         ContextAction::CopyTo => {
-            let cmd = super::command::Command::Copy {
-                dest: String::new(),
-                force: false,
-            };
-            super::command::execute_command(app, cmd, tx);
+            let sources = super::command::collect_selection_for_file_ops(app);
+            super::command::open_file_picker_for_copy_move(app, sources, false, false);
         }
         ContextAction::MoveTo => {
-            let cmd = super::command::Command::Move {
-                dest: String::new(),
-                force: false,
-            };
-            super::command::execute_command(app, cmd, tx);
+            let sources = super::command::collect_selection_for_file_ops(app);
+            super::command::open_file_picker_for_copy_move(app, sources, false, true);
         }
         ContextAction::Refresh => {
             if app.current_screen == AppScreen::Browse {

@@ -1,6 +1,6 @@
 use crate::state::{
     intersect_rect, DeleteConfirmButton, FilePickerCreateKind, FilePickerFocus, FilePickerHitAction,
-    FilePickerMenuAction, FilePickerState, HitRegion, ToolbarAction,
+    FilePickerMenuAction, FilePickerSelectionMode, FilePickerState, HitRegion, ToolbarAction,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -153,18 +153,21 @@ impl FilePickerState {
         let mut spans = Vec::new();
         let mut x = area.x;
         let toolbar_right = area.x.saturating_add(area.width);
-        let buttons = [
-            ("‹ Back", Some(ToolbarAction::Back), self.history_back.is_empty()),
-            ("› Forward", Some(ToolbarAction::Forward), self.history_forward.is_empty()),
-            ("↑ Up", Some(ToolbarAction::Up), self.current_dir.parent().is_none()),
-            ("│", None, true),
+        let mut buttons = vec![
+            ("‹ Back".to_string(), Some(ToolbarAction::Back), self.history_back.is_empty()),
+            ("› Forward".to_string(), Some(ToolbarAction::Forward), self.history_forward.is_empty()),
+            ("↑ Up".to_string(), Some(ToolbarAction::Up), self.current_dir.parent().is_none()),
+            ("│".to_string(), None, true),
             (
-                if self.menu_open { "File Operations ▴" } else { "File Operations ▾" },
+                (if self.menu_open { "File Operations ▴" } else { "File Operations ▾" }).to_string(),
                 Some(ToolbarAction::FileOperations),
                 false,
             ),
-            ("Properties", Some(ToolbarAction::Properties), self.current_selection().is_none()),
+            ("Properties".to_string(), Some(ToolbarAction::Properties), self.current_selection().is_none()),
         ];
+        if self.selection_mode == FilePickerSelectionMode::Directories {
+            buttons.push(("Select Folder".to_string(), Some(ToolbarAction::AcceptSelection), false));
+        }
         for (idx, (label, action, disabled)) in buttons.iter().enumerate() {
             if idx > 0 {
                 spans.push(Span::raw("  "));
@@ -173,7 +176,7 @@ impl FilePickerState {
 
             if action.is_none() {
                 let width = label.chars().count() as u16;
-                spans.push(Span::styled((*label).to_string(), self.theme.border_dim));
+                spans.push(Span::styled(label.clone(), self.theme.border_dim));
                 x = x.saturating_add(width);
                 continue;
             }
@@ -434,6 +437,8 @@ impl FilePickerState {
             let entry = &self.entries[idx];
             let style = if idx == self.file_cursor && self.focus == FilePickerFocus::Files {
                 self.theme.selected
+            } else if self.selection_mode == FilePickerSelectionMode::Directories && !entry.is_dir {
+                self.theme.menu_disabled
             } else if entry.is_dir {
                 self.theme.folder
             } else {
@@ -944,6 +949,24 @@ mod tests {
             rect_contains_rect(toolbar_area, file_ops),
             "toolbar geometry not clipped: {:?}",
             file_ops
+        );
+    }
+
+    #[test]
+    fn directory_mode_renders_select_folder_toolbar_button() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::Directories,
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| picker.render(frame, Rect::new(0, 0, 96, 18))).expect("draw");
+
+        assert!(
+            picker.toolbar_button_rect(ToolbarAction::AcceptSelection).is_some(),
+            "directory picker should expose an explicit Select Folder button"
         );
     }
 

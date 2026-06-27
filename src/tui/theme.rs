@@ -21,6 +21,22 @@ pub const PURPLE: Color = Color::Rgb(187, 154, 247);
 pub const CYAN: Color = Color::Rgb(115, 218, 202);
 pub const RED: Color = Color::Rgb(247, 118, 142);
 
+// Progress dialog — derived from the base theme so custom themes inherit correctly.
+pub const PROGRESS_DIALOG_BG: Color = SURFACE;
+pub const PROGRESS_DIALOG_TEXT: Color = TEXT_BRIGHT;
+pub const PROGRESS_DIALOG_BORDER: Color = CYAN;
+pub const PROGRESS_DIALOG_TITLE: Color = TEXT_BRIGHT;
+pub const PROGRESS_DIALOG_LABEL: Color = TEXT_MUTED;
+pub const PROGRESS_DIALOG_CURRENT_FILE: Color = CYAN;
+pub const PROGRESS_DIALOG_DIM: Color = TEXT_DIM;
+pub const PROGRESS_DIALOG_BAR_FILLED: Color = CYAN;
+pub const PROGRESS_DIALOG_BAR_UNFILLED: Color = BORDER_DIM;
+pub const PROGRESS_DIALOG_PERCENT: Color = TEXT_BRIGHT;
+pub const PROGRESS_DIALOG_BUTTON_BG: Color = TEXT;
+pub const PROGRESS_DIALOG_BUTTON_FG: Color = BG;
+pub const PROGRESS_DIALOG_ABORT_BG: Color = RED;
+pub const PROGRESS_DIALOG_ABORT_FG: Color = BG;
+
 // Hover
 pub const HOVER_BG: Color = SURFACE; // Subtle background lift on hover
 

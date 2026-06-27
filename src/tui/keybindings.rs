@@ -1485,6 +1485,22 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::DiscBrowser(_) => {
             super::disc_browser_actions::handle_disc_browser_key(app, key);
         }
+        ActiveOverlay::FilePicker(mut session) => {
+            let session_id = session.session_id;
+            let purpose = session.purpose.clone();
+            let action = session.picker.handle_key(key);
+            if let Err(err) = send_file_picker_completion(tx, session_id, purpose, action) {
+                app.set_status(format!("file picker: failed to queue completion: {err}"));
+            }
+            app.active_overlay = ActiveOverlay::FilePicker(session);
+        }
+        ActiveOverlay::FileTaskProgress(mut session) => {
+            let action = session.progress.handle_key(key);
+            handle_file_task_user_action(app, &mut session, action);
+            if !matches!(app.active_overlay, ActiveOverlay::None) {
+                app.active_overlay = ActiveOverlay::FileTaskProgress(session);
+            }
+        }
         ActiveOverlay::Confirmation { action, .. } => {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -3531,12 +3547,12 @@ fn artwork_file_picker_policy() -> tui_file_picker::FileOperationPolicy {
     tui_file_picker::FileOperationPolicy::default()
 }
 
-fn file_picker_theme_from_tonepoet_theme() -> tui_file_picker::FilePickerTheme {
+pub(super) fn file_picker_theme_from_tonepoet_theme() -> tui_file_picker::FilePickerTheme {
     use ratatui::style::{Modifier, Style};
     tui_file_picker::FilePickerTheme {
         border: Style::default().fg(super::theme::CYAN),
         border_dim: Style::default().fg(super::theme::BORDER_DIM),
-        title: Style::default().fg(super::theme::CYAN).add_modifier(Modifier::BOLD),
+        title: Style::default().fg(super::theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD),
         toolbar: Style::default().fg(super::theme::TEXT_BRIGHT),
         toolbar_active: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
         button: Style::default().fg(super::theme::BG).bg(super::theme::CYAN),
@@ -3549,15 +3565,180 @@ fn file_picker_theme_from_tonepoet_theme() -> tui_file_picker::FilePickerTheme {
         text: Style::default().fg(super::theme::TEXT),
         text_dim: Style::default().fg(super::theme::TEXT_MUTED),
         folder: Style::default().fg(super::theme::AMBER),
+        current_file: Style::default().fg(super::theme::CYAN),
         selected: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
+        progress_dialog: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_TEXT)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
+        progress_border: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_BORDER)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
+        progress_title: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_TITLE)
+            .bg(super::theme::PROGRESS_DIALOG_BG)
+            .add_modifier(Modifier::BOLD),
+        progress_label: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_LABEL)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
+        progress_text: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_TEXT)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
+        progress_text_dim: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_DIM)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
+        progress_current_file: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_CURRENT_FILE)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
+        progress_button: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_BUTTON_FG)
+            .bg(super::theme::PROGRESS_DIALOG_BUTTON_BG),
+        progress_button_focused: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_BUTTON_FG)
+            .bg(super::theme::PROGRESS_DIALOG_TITLE)
+            .add_modifier(Modifier::BOLD),
+        progress_destructive: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_ABORT_FG)
+            .bg(super::theme::PROGRESS_DIALOG_ABORT_BG)
+            .add_modifier(Modifier::BOLD),
         header: Style::default().fg(super::theme::TEXT_DIM).add_modifier(Modifier::BOLD),
         status: Style::default().fg(super::theme::TEXT).bg(super::theme::SURFACE),
         menu: Style::default().fg(super::theme::TEXT_BRIGHT).bg(super::theme::SURFACE),
         menu_selected: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
         menu_disabled: Style::default().fg(super::theme::TEXT_MUTED).bg(super::theme::SURFACE),
         accelerator: Style::default().fg(super::theme::AMBER).add_modifier(Modifier::UNDERLINED),
-        destructive: Style::default().fg(super::theme::RED).add_modifier(Modifier::BOLD),
+        destructive: Style::default()
+            .fg(super::theme::BG)
+            .bg(super::theme::RED)
+            .add_modifier(Modifier::BOLD),
+        progress_filled: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_BAR_FILLED)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
+        progress_unfilled: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_BAR_UNFILLED)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
+        progress_percent: Style::default()
+            .fg(super::theme::PROGRESS_DIALOG_PERCENT)
+            .bg(super::theme::PROGRESS_DIALOG_BG),
         error: Style::default().fg(super::theme::RED),
+    }
+}
+
+#[cfg(test)]
+mod progress_dialog_theme_tests {
+    use super::file_picker_theme_from_tonepoet_theme;
+    use crate::tui::theme;
+
+    #[test]
+    fn tonepoet_progress_dialog_theme_matches_mockup_palette() {
+        let mapped = file_picker_theme_from_tonepoet_theme();
+
+        assert_eq!(mapped.progress_dialog.fg, Some(theme::PROGRESS_DIALOG_TEXT));
+        assert_eq!(mapped.progress_dialog.bg, Some(theme::PROGRESS_DIALOG_BG));
+
+        assert_eq!(mapped.progress_border.fg, Some(theme::PROGRESS_DIALOG_BORDER));
+        assert_eq!(mapped.progress_border.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_title.fg, Some(theme::PROGRESS_DIALOG_TITLE));
+        assert_eq!(mapped.progress_title.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_label.fg, Some(theme::PROGRESS_DIALOG_LABEL));
+        assert_eq!(mapped.progress_label.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_text.fg, Some(theme::PROGRESS_DIALOG_TEXT));
+        assert_eq!(mapped.progress_text.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_text_dim.fg, Some(theme::PROGRESS_DIALOG_DIM));
+        assert_eq!(mapped.progress_text_dim.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_current_file.fg, Some(theme::PROGRESS_DIALOG_CURRENT_FILE));
+        assert_eq!(mapped.progress_current_file.bg, Some(theme::PROGRESS_DIALOG_BG));
+
+        assert_eq!(mapped.progress_filled.fg, Some(theme::PROGRESS_DIALOG_BAR_FILLED));
+        assert_eq!(mapped.progress_filled.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_unfilled.fg, Some(theme::PROGRESS_DIALOG_BAR_UNFILLED));
+        assert_eq!(mapped.progress_unfilled.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_percent.fg, Some(theme::PROGRESS_DIALOG_PERCENT));
+        assert_eq!(mapped.progress_percent.bg, Some(theme::PROGRESS_DIALOG_BG));
+
+        assert_eq!(mapped.progress_button.fg, Some(theme::PROGRESS_DIALOG_BUTTON_FG));
+        assert_eq!(mapped.progress_button.bg, Some(theme::PROGRESS_DIALOG_BUTTON_BG));
+        assert_eq!(mapped.progress_destructive.fg, Some(theme::PROGRESS_DIALOG_ABORT_FG));
+        assert_eq!(mapped.progress_destructive.bg, Some(theme::PROGRESS_DIALOG_ABORT_BG));
+    }
+
+    #[test]
+    fn tonepoet_progress_dialog_render_uses_mockup_palette() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+        use std::path::PathBuf;
+        use tui_file_picker::{
+            FileTaskKind, FileTaskPhase, FileTaskProgressState, FileTaskProgressUpdate,
+            FileTaskScope, ProgressItem, ProgressTotals, ProgressUnit,
+        };
+
+        let mut progress = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            file_picker_theme_from_tonepoet_theme(),
+        );
+        progress.set_scope(FileTaskScope {
+            source_root: Some(PathBuf::from("~/Documents/Audio")),
+            source_summary: String::new(),
+            destination: Some(PathBuf::from("~/library/abb/Gregg Allman - Laid Back")),
+            destination_summary: None,
+        });
+        progress.apply_update(FileTaskProgressUpdate::Snapshot {
+            phase: FileTaskPhase::Running,
+            status: "Copying".to_string(),
+            current_item: Some(ProgressItem {
+                label: "03 - Midnight Rider.flac".to_string(),
+                source: None,
+                destination: None,
+                bytes_done: 62,
+                bytes_total: Some(100),
+            }),
+            totals: ProgressTotals {
+                items_done: 4,
+                items_total: Some(10),
+                item_unit: ProgressUnit::Files,
+                bytes_done: 47,
+                bytes_total: Some(100),
+                folders_done: 0,
+                folders_total: Some(0),
+                unknown_size_items: 0,
+                completed: 4,
+                skipped: 0,
+                errors: 0,
+                overwritten: 0,
+                renamed: 0,
+                merged: 0,
+                not_attempted: 0,
+            },
+            rate_bytes_per_sec: Some(82 * 1024 * 1024),
+        });
+
+        let backend = TestBackend::new(52, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| progress.render(frame, Rect::new(0, 0, 52, 12)))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+
+        let assert_cell = |x: u16, y: u16, fg, bg| {
+            let cell = buffer.get(x, y);
+            assert_eq!(cell.fg, fg, "unexpected fg at ({x},{y})");
+            assert_eq!(cell.bg, bg, "unexpected bg at ({x},{y})");
+        };
+
+        assert_cell(0, 0, theme::PROGRESS_DIALOG_BORDER, theme::PROGRESS_DIALOG_BG);
+        assert_cell(3, 0, theme::PROGRESS_DIALOG_TITLE, theme::PROGRESS_DIALOG_BG);
+        assert_cell(3, 1, theme::PROGRESS_DIALOG_LABEL, theme::PROGRESS_DIALOG_BG);
+        assert_cell(10, 1, theme::PROGRESS_DIALOG_TEXT, theme::PROGRESS_DIALOG_BG);
+        assert_cell(4, 4, theme::PROGRESS_DIALOG_DIM, theme::PROGRESS_DIALOG_BG);
+        assert_cell(5, 4, theme::PROGRESS_DIALOG_CURRENT_FILE, theme::PROGRESS_DIALOG_BG);
+        assert_cell(4, 5, theme::PROGRESS_DIALOG_BAR_FILLED, theme::PROGRESS_DIALOG_BG);
+        assert_cell(29, 5, theme::PROGRESS_DIALOG_BAR_UNFILLED, theme::PROGRESS_DIALOG_BG);
+        assert_cell(47, 5, theme::PROGRESS_DIALOG_PERCENT, theme::PROGRESS_DIALOG_BG);
+        assert_cell(3, 8, theme::PROGRESS_DIALOG_DIM, theme::PROGRESS_DIALOG_BG);
+        assert_cell(10, 10, theme::PROGRESS_DIALOG_BUTTON_FG, theme::PROGRESS_DIALOG_BUTTON_BG);
+        assert_cell(33, 10, theme::PROGRESS_DIALOG_ABORT_FG, theme::PROGRESS_DIALOG_ABORT_BG);
+        assert_cell(1, 3, theme::PROGRESS_DIALOG_TEXT, theme::PROGRESS_DIALOG_BG);
     }
 }
 
@@ -3661,6 +3842,86 @@ fn handle_metadata_file_picker_mouse(
     let action = session.picker.handle_mouse(mouse, area);
     if let Err(err) = send_file_picker_completion(tx, session_id, purpose, action) {
         app.set_status(format!("file picker: failed to queue completion: {err}"));
+    }
+}
+
+fn handle_global_file_picker_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    let mut session = match overlay {
+        ActiveOverlay::FilePicker(session) => session,
+        other => {
+            app.active_overlay = other;
+            return;
+        }
+    };
+    let session_id = session.session_id;
+    let purpose = session.purpose.clone();
+    let action = session.picker.handle_mouse(mouse, Rect::default());
+    if let Err(err) = send_file_picker_completion(tx, session_id, purpose, action) {
+        app.set_status(format!("file picker: failed to queue completion: {err}"));
+    }
+    app.active_overlay = ActiveOverlay::FilePicker(session);
+}
+
+fn handle_file_task_progress_mouse(app: &mut AppState, mouse: MouseEvent) {
+    let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    let mut session = match overlay {
+        ActiveOverlay::FileTaskProgress(session) => session,
+        other => {
+            app.active_overlay = other;
+            return;
+        }
+    };
+    let action = session.progress.handle_mouse(mouse, Rect::default());
+    let acknowledge = matches!(action, tui_file_picker::FileTaskUserAction::Acknowledge);
+    handle_file_task_user_action(app, &mut session, action);
+    if !acknowledge {
+        app.active_overlay = ActiveOverlay::FileTaskProgress(session);
+    }
+}
+
+fn handle_file_task_user_action(
+    app: &mut AppState,
+    session: &mut super::app::FileTaskProgressSession,
+    action: tui_file_picker::FileTaskUserAction,
+) {
+    use super::app::FileTaskControl;
+    match action {
+        tui_file_picker::FileTaskUserAction::None => {}
+        tui_file_picker::FileTaskUserAction::Pause => {
+            let _ = session.controls.send(FileTaskControl::Pause);
+            app.set_status("pause requested");
+        }
+        tui_file_picker::FileTaskUserAction::Resume => {
+            let _ = session.controls.send(FileTaskControl::Resume);
+            app.set_status("resume requested");
+        }
+        tui_file_picker::FileTaskUserAction::SkipCurrent => {
+            let _ = session.controls.send(FileTaskControl::SkipCurrent);
+            app.set_status("skip requested");
+        }
+        tui_file_picker::FileTaskUserAction::Abort => {
+            let _ = session.controls.send(FileTaskControl::Abort);
+            app.set_status("abort requested");
+        }
+        tui_file_picker::FileTaskUserAction::Acknowledge => {
+            app.active_overlay = ActiveOverlay::None;
+        }
+        tui_file_picker::FileTaskUserAction::ChooseConflictResolution(resolution) => {
+            if let Some(conflict) = session.progress.conflict.as_ref() {
+                let _ = session.controls.send(FileTaskControl::ConflictResolution {
+                    request_id: conflict.request_id,
+                    resolution,
+                });
+                app.set_status("conflict resolution sent");
+            } else {
+                app.set_status("ignored conflict resolution without active conflict");
+            }
+        }
     }
 }
 
@@ -13834,21 +14095,41 @@ fn apply_text_edit(
     }
 }
 
-/// Public entry point for file ops triggered with a destination arg
-/// (`:cp /dest` or `:mv /dest`). Called from command.rs when the
-/// destination is provided inline rather than via the TextEdit picker.
-pub fn apply_file_op_pub(app: &mut AppState, target: TextEditTarget, dest: &str) {
-    // We need a tx for probe_current after refresh, but we don't have
-    // one in this context. Set a flag to probe on next event loop tick.
+/// Public tx-aware entry point for file ops triggered with an already-resolved
+/// destination. Use this whenever the caller has the event-loop sender so copy,
+/// move, text-edit completion, command execution, and file-picker completion all
+/// take the same immediate browse refresh/probe path.
+pub(super) fn apply_file_op_with_tx(
+    app: &mut AppState,
+    target: TextEditTarget,
+    dest: &str,
+    tx: &mpsc::Sender<AppMessage>,
+) {
     match target {
         TextEditTarget::BrowseCopy { sources, force } => {
-            do_file_op_no_tx(app, &sources, dest, force, false);
+            do_file_op(app, &sources, dest, force, false, tx);
         }
         TextEditTarget::BrowseMove { sources, force } => {
-            do_file_op_no_tx(app, &sources, dest, force, true);
+            do_file_op(app, &sources, dest, force, true, tx);
         }
         _ => {}
     }
+}
+
+/// Guardrail for obsolete no-tx file-op callers.
+///
+/// Real copy/move operations require the event-loop sender so they can use the
+/// hosted hardened worker, reusable progress/conflict overlay, stale-session
+/// checks, and immediate browse refresh/probe path.
+pub fn apply_file_op_pub(app: &mut AppState, target: TextEditTarget, dest: &str) {
+    let _ = (target, dest);
+    // There is intentionally no independent no-tx copy/move engine. All real
+    // file operations must go through do_file_op(..., tx), which owns the
+    // hardened worker, conflict protocol, progress overlay, no-clobber
+    // finalization, plan-tree execution, and browse refresh/probe path. Keeping
+    // a second synchronous engine risks semantic drift and unsafe reintroduction
+    // of check-then-clobber behavior.
+    app.set_status("copy/move requires an event-loop sender; operation not started");
 }
 
 /// Perform a copy or move operation. Version with tx for probe refresh.
@@ -13860,205 +14141,2790 @@ fn do_file_op(
     is_move: bool,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    do_file_op_inner(app, sources, dest, force, is_move);
-    app.browse.refresh();
-    app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-}
-
-/// Perform a copy or move without tx (when called from command.rs with
-/// inline destination). Browse refresh is done; probe happens on next
-/// cursor move.
-fn do_file_op_no_tx(
-    app: &mut AppState,
-    sources: &[std::path::PathBuf],
-    dest: &str,
-    force: bool,
-    is_move: bool,
-) {
-    do_file_op_inner(app, sources, dest, force, is_move);
-    app.browse.refresh();
-}
-
-/// Core copy/move logic. Operates on each source path, reports results
-/// via status message.
-fn do_file_op_inner(
-    app: &mut AppState,
-    sources: &[std::path::PathBuf],
-    dest: &str,
-    force: bool,
-    is_move: bool,
-) {
-    let dest_dir = std::path::PathBuf::from(dest.trim());
-    if !dest_dir.exists() {
-        // Try to create the destination directory.
-        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-            app.set_status(format!("failed to create destination: {}", e));
-            return;
-        }
-    }
-    if !dest_dir.is_dir() {
-        app.set_status(format!(
-            "destination is not a directory: {}",
-            dest_dir.display()
-        ));
+    if sources.is_empty() {
+        app.set_status("no files selected for copy/move");
         return;
     }
 
-    let op_name = if is_move { "moved" } else { "copied" };
-    let mut succeeded = 0usize;
-    let mut skipped = 0usize;
-    let mut errors = 0usize;
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    let kind = if is_move {
+        tui_file_picker::FileTaskKind::Move
+    } else {
+        tui_file_picker::FileTaskKind::Copy
+    };
+    let title = if is_move { "Moving files" } else { "Copying files" };
+    let mut progress = tui_file_picker::FileTaskProgressState::new(
+        kind,
+        title,
+        file_picker_theme_from_tonepoet_theme(),
+    );
+    progress.set_scope(file_task_scope_for_job(sources, std::path::Path::new(dest.trim())));
+    let session = super::app::FileTaskProgressSession::new(progress, control_tx);
+    let session_id = session.session_id;
+    app.active_overlay = ActiveOverlay::FileTaskProgress(session);
+    app.set_status(format!(
+        "{} {} item(s)...",
+        if is_move { "moving" } else { "copying" },
+        sources.len()
+    ));
 
-    for source in sources {
-        let file_name = match source.file_name() {
-            Some(n) => n.to_owned(),
-            None => {
-                errors += 1;
-                continue;
-            }
-        };
-        let target = dest_dir.join(&file_name);
-
-        // Skip if source and target are the same path (copying a file
-        // onto itself with force=true would corrupt it). Two checks:
-        // 1. Raw path comparison (catches same-dir obvious case).
-        // 2. Canonicalized comparison when both resolve (catches case-
-        //    insensitive filesystems and symlink-resolved equivalence).
-        //    Only compared when BOTH succeed — if either fails (e.g.,
-        //    target doesn't exist yet), we skip this check to avoid
-        //    false positives from None == None.
-        if source == &target {
-            skipped += 1;
-            continue;
-        }
-        if let (Ok(src_canon), Ok(dst_canon)) = (source.canonicalize(), target.canonicalize()) {
-            if src_canon == dst_canon {
-                skipped += 1;
-                continue;
-            }
-        }
-
-        // Check for existing destination.
-        if target.exists() && !force {
-            skipped += 1;
-            continue;
-        }
-
-        let result = if is_move {
-            move_path(source, &target)
-        } else {
-            copy_path(source, &target)
-        };
-
-        match result {
-            Ok(()) => succeeded += 1,
-            Err(e) => {
-                log::warn!(
-                    "{} failed: {} → {}: {}",
-                    op_name,
-                    source.display(),
-                    target.display(),
-                    e
-                );
-                errors += 1;
-            }
-        }
-    }
-
-    // Clear multi-selection after the operation.
     app.browse.clear_multi_selection();
 
-    // Build status message.
-    let mut parts = vec![format!("{} {} file(s)", op_name, succeeded)];
-    if skipped > 0 {
-        parts.push(format!("{} skipped (exists)", skipped));
-    }
-    if errors > 0 {
-        parts.push(format!("{} errors", errors));
-    }
-    app.set_status(parts.join(", "));
+    let job = FileTaskJob {
+        session_id,
+        sources: sources.to_vec(),
+        dest: dest.trim().to_string(),
+        force,
+        is_move,
+    };
+    spawn_file_task_worker(job, tx.clone(), control_rx);
 }
 
-/// Copy a file or directory to `target`. For directories, copies
-/// recursively.
-fn copy_path(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
-    if source.is_dir() {
-        copy_dir_recursive(source, target)
-    } else {
-        std::fs::copy(source, target)
-            .map(|_| ())
-            .map_err(|e| format!("{}", e))
+
+#[derive(Debug, Clone)]
+struct FileTaskJob {
+    session_id: u64,
+    sources: Vec<std::path::PathBuf>,
+    dest: String,
+    force: bool,
+    is_move: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTaskStep {
+    Completed,
+    Skipped,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FileTaskPathStats {
+    files: u64,
+    folders: u64,
+    bytes: u64,
+}
+
+impl FileTaskPathStats {
+    fn add(&mut self, other: Self) {
+        self.files = self.files.saturating_add(other.files);
+        self.folders = self.folders.saturating_add(other.folders);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+
+    fn work_items(self) -> u64 {
+        self.files
     }
 }
 
-/// Recursive directory copy. Skips symlinks to avoid loops and
-/// unexpected out-of-tree copies (consistent with browse scan policy).
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir: {}", e))?;
-    let entries = std::fs::read_dir(src).map_err(|e| format!("readdir: {}", e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("entry: {}", e))?;
-        let file_type = entry.file_type().map_err(|e| format!("filetype: {}", e))?;
-        // Skip symlinks — following them could leave the source tree
-        // or create infinite loops.
-        if file_type.is_symlink() {
-            continue;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTaskPlanKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone)]
+struct FileTaskPlanNode {
+    source: std::path::PathBuf,
+    target: std::path::PathBuf,
+    kind: FileTaskPlanKind,
+    stats: FileTaskPathStats,
+    children: Vec<FileTaskPlanNode>,
+}
+
+#[derive(Debug, Clone)]
+struct FileTaskPlan {
+    roots: Vec<FileTaskPlanNode>,
+    totals: FileTaskPathStats,
+}
+
+#[derive(Debug, Clone)]
+enum FileTaskPlanBuildStep {
+    Ready(FileTaskPlan),
+    Aborted,
+}
+
+#[derive(Debug, Clone)]
+enum FileTaskMeasureStep {
+    Measured(FileTaskPlanNode),
+    Skipped,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTaskConflictApplied {
+    None,
+    Overwrite,
+    Merge,
+    Rename,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileTaskConflictDecision {
+    UsePath {
+        path: std::path::PathBuf,
+        applied: FileTaskConflictApplied,
+    },
+    Skip,
+    Abort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTaskApplyAllPolicy {
+    Overwrite,
+    Merge,
+    Skip,
+}
+
+struct FileTaskWorker {
+    job: FileTaskJob,
+    tx: mpsc::Sender<AppMessage>,
+    controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
+    totals: tui_file_picker::ProgressTotals,
+    started_at: std::time::Instant,
+    last_report_at: std::time::Instant,
+    paused: bool,
+    terminal_error: Option<String>,
+    next_conflict_id: u64,
+    apply_all_policy: Option<FileTaskApplyAllPolicy>,
+    /// A SkipCurrent request received while the worker is at a non-skippable
+    /// checkpoint. Non-skippable phases must not consume skip intent; the next
+    /// skippable leaf/root operation owns the request.
+    pending_skip_current: bool,
+}
+
+impl FileTaskWorker {
+    fn new(
+        job: FileTaskJob,
+        tx: mpsc::Sender<AppMessage>,
+        controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
+    ) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            job,
+            tx,
+            controls,
+            totals: tui_file_picker::ProgressTotals::default(),
+            started_at: now,
+            last_report_at: now,
+            paused: false,
+            terminal_error: None,
+            next_conflict_id: 0,
+            apply_all_policy: None,
+            pending_skip_current: false,
         }
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|e| format!("copy: {}", e))?;
-        }
     }
-    Ok(())
-}
 
-/// Move a file or directory to `target`. Tries `fs::rename` first (fast,
-/// same-filesystem). If that fails with a cross-device error, falls back
-/// to copy+verify+delete (ACID: original is only deleted after the copy
-/// is confirmed via size match).
-fn move_path(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
-    // Try fast rename first.
-    match std::fs::rename(source, target) {
-        Ok(()) => return Ok(()),
-        Err(e) => {
-            // ErrorKind::CrossesDevices is nightly-only. Check the raw
-            // OS error: EXDEV = 18 on Linux, same concept on macOS.
-            let is_cross_device = e.raw_os_error() == Some(18) // EXDEV on Linux
-                || e.to_string().to_lowercase().contains("cross-device");
-            if !is_cross_device {
-                return Err(format!("{}", e));
+    fn run(mut self) {
+        match self.run_inner() {
+            Ok(FileTaskStep::Completed) => {
+                let op = if self.job.is_move { "moved" } else { "copied" };
+                let mut status = format!(
+                    "{} {} file(s), {} folder(s), {} skipped, {} overwritten, {} renamed, {} merged, {} errors",
+                    op,
+                    self.totals.completed,
+                    self.totals.folders_done,
+                    self.totals.skipped,
+                    self.totals.overwritten,
+                    self.totals.renamed,
+                    self.totals.merged,
+                    self.totals.errors
+                );
+                if self.totals.not_attempted > 0 {
+                    status.push_str(&format!(", {} not attempted", self.totals.not_attempted));
+                }
+                if let Some(error) = self.terminal_error.as_ref() {
+                    status.push_str("; ");
+                    status.push_str(error);
+                }
+                if self.totals.errors > 0 || self.terminal_error.is_some() {
+                    self.send(tui_file_picker::FileTaskProgressUpdate::Failed {
+                        status,
+                        totals: self.totals,
+                    });
+                } else {
+                    self.send(tui_file_picker::FileTaskProgressUpdate::Finished {
+                        status,
+                        totals: self.totals,
+                    });
+                }
             }
-            // Fall through to copy+delete.
+            Ok(FileTaskStep::Aborted) => {
+                if let Some(total) = self.totals.items_total {
+                    self.totals.not_attempted = total.saturating_sub(self.totals.items_done);
+                }
+                self.send(tui_file_picker::FileTaskProgressUpdate::Aborted {
+                    status: format!(
+                        "file task aborted: {} completed, {} skipped, {} errors, {} not attempted",
+                        self.totals.completed,
+                        self.totals.skipped,
+                        self.totals.errors,
+                        self.totals.not_attempted
+                    ),
+                    totals: self.totals,
+                });
+            }
+            Ok(FileTaskStep::Skipped) => {
+                self.send(tui_file_picker::FileTaskProgressUpdate::Finished {
+                    status: "file task completed with skipped file(s)".to_string(),
+                    totals: self.totals,
+                });
+            }
+            Err(error) => {
+                self.totals.errors = self.totals.errors.saturating_add(1);
+                self.record_error(None, None, error.clone());
+                self.send(tui_file_picker::FileTaskProgressUpdate::Failed {
+                    status: error,
+                    totals: self.totals,
+                });
+            }
         }
     }
 
-    // Cross-device fallback: copy, verify, delete.
-    copy_path(source, target)?;
+    fn run_inner(&mut self) -> Result<FileTaskStep, String> {
+        let dest_dir = std::path::PathBuf::from(self.job.dest.trim());
 
-    // Verify: compare sizes (basic integrity check).
-    if source.is_file() {
-        let src_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
-        let dst_size = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
-        if src_size != dst_size {
-            // Copy succeeded but sizes differ — don't delete original.
-            return Err(
-                "cross-device move: size mismatch after copy, original preserved".to_string(),
+        // Build the recursive file-task plan before mutating the destination.
+        // This keeps unsafe destination-inside-source cases idempotent and lets
+        // the reusable progress overlay show the whole job as recursive files,
+        // not merely as the number of selected top-level roots. Planning itself
+        // can be slow for large or remote trees, so it emits Preparing snapshots
+        // and honors host Abort/Pause/Skip intent before any destination writes.
+        let sources = self.job.sources.clone();
+        let plan = match self.build_file_task_plan_progress(&sources, &dest_dir)? {
+            FileTaskPlanBuildStep::Ready(plan) => plan,
+            FileTaskPlanBuildStep::Aborted => return Ok(FileTaskStep::Aborted),
+        };
+        self.totals.items_total = Some(plan.totals.files.saturating_add(self.totals.items_done));
+        self.totals.item_unit = tui_file_picker::ProgressUnit::Files;
+        self.totals.folders_total = Some(plan.totals.folders);
+        self.totals.bytes_total = Some(plan.totals.bytes);
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Preparing,
+            format!(
+                "prepared file task: {} {}, {} {}",
+                plan.totals.files,
+                if plan.totals.files == 1 { "file" } else { "files" },
+                plan.totals.folders,
+                if plan.totals.folders == 1 { "folder" } else { "folders" }
+            ),
+            None,
+            true,
+        );
+
+        if plan.roots.is_empty() {
+            return Ok(FileTaskStep::Completed);
+        }
+
+        if !dest_dir.exists() {
+            std::fs::create_dir_all(&dest_dir)
+                .map_err(|e| format!("failed to create destination: {e}"))?;
+        }
+        if !dest_dir.is_dir() {
+            return Err(format!("destination is not a directory: {}", dest_dir.display()));
+        }
+
+        for root in plan.roots {
+            match self.poll_controls_no_skip(None)? {
+                FileTaskStep::Aborted => return Ok(FileTaskStep::Aborted),
+                FileTaskStep::Skipped => {},
+                FileTaskStep::Completed => {}
+            }
+
+            if root.source == root.target {
+                self.mark_skipped_stats(root.stats);
+                continue;
+            }
+            if let (Ok(src_canon), Ok(dst_canon)) = (root.source.canonicalize(), root.target.canonicalize()) {
+                if src_canon == dst_canon {
+                    self.mark_skipped_stats(root.stats);
+                    continue;
+                }
+            }
+            let step = if self.job.is_move {
+                self.move_path_progress_node(&root)
+            } else {
+                self.copy_path_progress_node(&root)
+            };
+            match step {
+                Ok(FileTaskStep::Completed) => {}
+                Ok(FileTaskStep::Skipped) => self.mark_skipped_stats(root.stats),
+                Ok(FileTaskStep::Aborted) => return Ok(FileTaskStep::Aborted),
+                Err(error) => {
+                    log::warn!(
+                        "{} failed: {} -> {}: {}",
+                        if self.job.is_move { "move" } else { "copy" },
+                        root.source.display(),
+                        root.target.display(),
+                        error
+                    );
+                    let errors_before = self.totals.errors;
+                    self.mark_error_stats(root.stats);
+                    if self.totals.errors == errors_before {
+                        self.record_accounted_failure(Some(&root.source), Some(&root.target), error);
+                    } else {
+                        self.record_error(Some(&root.source), Some(&root.target), error);
+                    }
+                }
+            }
+        }
+        Ok(FileTaskStep::Completed)
+    }
+
+    fn build_file_task_plan_progress(
+        &mut self,
+        sources: &[std::path::PathBuf],
+        dest_dir: &std::path::Path,
+    ) -> Result<FileTaskPlanBuildStep, String> {
+        let mut roots = Vec::with_capacity(sources.len());
+        let mut totals = FileTaskPathStats::default();
+        self.totals.item_unit = tui_file_picker::ProgressUnit::Files;
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Preparing,
+            "scanning selected files...".to_string(),
+            None,
+            true,
+        );
+
+        for source in sources {
+            let file_name = source
+                .file_name()
+                .ok_or_else(|| format!("source has no file name: {}", source.display()))?
+                .to_owned();
+            let target = dest_dir.join(file_name);
+            let current = progress_item_for_paths(source, &target, 0, None);
+            match self.poll_controls_for_phase(
+                Some(current.clone()),
+                true,
+                tui_file_picker::FileTaskPhase::Preparing,
+            )? {
+                FileTaskStep::Completed => {}
+                FileTaskStep::Aborted => return Ok(FileTaskPlanBuildStep::Aborted),
+                FileTaskStep::Skipped => {
+                    self.mark_planning_skipped(source, &target);
+                    continue;
+                }
+            }
+
+            let source_type = std::fs::symlink_metadata(source)
+                .map_err(|e| format!("stat source {}: {}", source.display(), e))?
+                .file_type();
+            if source_type.is_dir() {
+                ensure_not_copying_dir_into_itself(source, &target)?;
+            }
+            self.snapshot(
+                tui_file_picker::FileTaskPhase::Preparing,
+                format!("Scanning {}", display_name(source)),
+                Some(current),
+                true,
+            );
+
+            match self.build_file_task_plan_node_progress_from_root(source, &target)? {
+                FileTaskMeasureStep::Measured(node) => {
+                    totals.add(node.stats);
+                    roots.push(node);
+                }
+                FileTaskMeasureStep::Skipped => self.mark_planning_skipped(source, &target),
+                FileTaskMeasureStep::Aborted => return Ok(FileTaskPlanBuildStep::Aborted),
+            }
+        }
+
+        Ok(FileTaskPlanBuildStep::Ready(FileTaskPlan { roots, totals }))
+    }
+
+    fn build_file_task_plan_node_progress_from_root(
+        &mut self,
+        path: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<FileTaskMeasureStep, String> {
+        // The selected root was already displayed and polled by
+        // build_file_task_plan_progress(). Do not poll the same root a second
+        // time here: doing so can consume a queued SkipCurrent at the parent
+        // instead of at the first child the UI displays next.
+        self.build_file_task_plan_node_progress_inner(path, target, false)
+    }
+
+    fn build_file_task_plan_node_progress(
+        &mut self,
+        path: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<FileTaskMeasureStep, String> {
+        self.build_file_task_plan_node_progress_inner(path, target, true)
+    }
+
+    fn build_file_task_plan_node_progress_inner(
+        &mut self,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        poll_current_node: bool,
+    ) -> Result<FileTaskMeasureStep, String> {
+        let current = progress_item_for_paths(path, target, 0, None);
+        if poll_current_node {
+            match self.poll_controls_for_phase(
+                Some(current.clone()),
+                true,
+                tui_file_picker::FileTaskPhase::Preparing,
+            )? {
+                FileTaskStep::Completed => {}
+                FileTaskStep::Skipped => return Ok(FileTaskMeasureStep::Skipped),
+                FileTaskStep::Aborted => return Ok(FileTaskMeasureStep::Aborted),
+            }
+        }
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Preparing,
+            format!("Scanning {}", display_name(path)),
+            Some(current),
+            false,
+        );
+
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("stat source {}: {}", path.display(), e))?;
+        let file_type = metadata.file_type();
+        if file_type.is_file() {
+            let stats = FileTaskPathStats { files: 1, folders: 0, bytes: metadata.len() };
+            return Ok(FileTaskMeasureStep::Measured(FileTaskPlanNode {
+                source: path.to_path_buf(),
+                target: target.to_path_buf(),
+                kind: FileTaskPlanKind::File,
+                stats,
+                children: Vec::new(),
+            }));
+        }
+        if file_type.is_symlink() {
+            let stats = FileTaskPathStats { files: 1, folders: 0, bytes: 0 };
+            return Ok(FileTaskMeasureStep::Measured(FileTaskPlanNode {
+                source: path.to_path_buf(),
+                target: target.to_path_buf(),
+                kind: FileTaskPlanKind::Symlink,
+                stats,
+                children: Vec::new(),
+            }));
+        }
+        if file_type.is_dir() {
+            let mut stats = FileTaskPathStats { files: 0, folders: 1, bytes: 0 };
+            let mut children = Vec::new();
+            for entry in std::fs::read_dir(path).map_err(|e| format!("readdir {}: {}", path.display(), e))? {
+                let entry = entry.map_err(|e| format!("entry: {e}"))?;
+                let child_path = entry.path();
+                let child_target = target.join(entry.file_name());
+                match self.build_file_task_plan_node_progress(&child_path, &child_target)? {
+                    FileTaskMeasureStep::Measured(child) => {
+                        stats.add(child.stats);
+                        children.push(child);
+                    }
+                    FileTaskMeasureStep::Skipped => {
+                        self.mark_planning_skipped(&child_path, &child_target);
+                        continue;
+                    }
+                    FileTaskMeasureStep::Aborted => return Ok(FileTaskMeasureStep::Aborted),
+                }
+            }
+            return Ok(FileTaskMeasureStep::Measured(FileTaskPlanNode {
+                source: path.to_path_buf(),
+                target: target.to_path_buf(),
+                kind: FileTaskPlanKind::Directory,
+                stats,
+                children,
+            }));
+        }
+        Err(format!(
+            "unsupported file type, refusing to plan: {}",
+            path.display()
+        ))
+    }
+
+    fn mark_planning_skipped(
+        &mut self,
+        source: &std::path::Path,
+        target: &std::path::Path,
+    ) {
+        self.totals.items_done = self.totals.items_done.saturating_add(1);
+        self.totals.skipped = self.totals.skipped.saturating_add(1);
+        self.totals.unknown_size_items = self.totals.unknown_size_items.saturating_add(1);
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Preparing,
+            format!("Skipped {} during planning", display_name(source)),
+            Some(progress_item_for_paths(source, target, 0, None)),
+            true,
+        );
+    }
+
+    #[allow(dead_code)]
+    fn mark_completed_file(&mut self) {
+        self.mark_completed_file_with(FileTaskConflictApplied::None);
+    }
+
+    fn mark_completed_file_with(&mut self, applied: FileTaskConflictApplied) {
+        self.totals.items_done = self.totals.items_done.saturating_add(1);
+        self.totals.completed = self.totals.completed.saturating_add(1);
+        self.mark_conflict_applied(applied);
+    }
+
+    #[allow(dead_code)]
+    fn mark_completed_folder(&mut self) {
+        self.mark_completed_folder_with(FileTaskConflictApplied::None);
+    }
+
+    fn mark_completed_folder_with(&mut self, applied: FileTaskConflictApplied) {
+        self.totals.folders_done = self.totals.folders_done.saturating_add(1);
+        self.mark_conflict_applied(applied);
+    }
+
+    fn mark_conflict_applied(&mut self, applied: FileTaskConflictApplied) {
+        match applied {
+            FileTaskConflictApplied::Overwrite => {
+                self.totals.overwritten = self.totals.overwritten.saturating_add(1);
+            }
+            FileTaskConflictApplied::Merge => {
+                self.totals.merged = self.totals.merged.saturating_add(1);
+            }
+            FileTaskConflictApplied::Rename => {
+                self.totals.renamed = self.totals.renamed.saturating_add(1);
+            }
+            FileTaskConflictApplied::None => {}
+        }
+    }
+
+    fn mark_completed_stats(&mut self, stats: FileTaskPathStats) {
+        self.totals.items_done = self.totals.items_done.saturating_add(stats.files);
+        self.totals.completed = self.totals.completed.saturating_add(stats.files);
+        self.totals.folders_done = self.totals.folders_done.saturating_add(stats.folders);
+        self.totals.bytes_done = self.totals.bytes_done.saturating_add(stats.bytes);
+    }
+
+    fn mark_skipped_stats(&mut self, stats: FileTaskPathStats) {
+        let items = stats.work_items().max(1);
+        self.totals.items_done = self.totals.items_done.saturating_add(stats.work_items());
+        self.totals.skipped = self.totals.skipped.saturating_add(items);
+        self.totals.folders_done = self.totals.folders_done.saturating_add(stats.folders);
+    }
+
+    fn mark_error_stats(&mut self, stats: FileTaskPathStats) {
+        let planned_files = stats.work_items();
+        let remaining_files = self
+            .totals
+            .items_total
+            .map(|total| total.saturating_sub(self.totals.items_done))
+            .unwrap_or(planned_files);
+        let accounted_files = planned_files.min(remaining_files);
+        let error_items = if planned_files == 0 {
+            1
+        } else {
+            accounted_files
+        };
+        self.totals.items_done = self.totals.items_done.saturating_add(accounted_files);
+        self.totals.errors = self.totals.errors.saturating_add(error_items);
+        let remaining_folders = self
+            .totals
+            .folders_total
+            .map(|total| total.saturating_sub(self.totals.folders_done))
+            .unwrap_or(stats.folders);
+        self.totals.folders_done = self
+            .totals
+            .folders_done
+            .saturating_add(stats.folders.min(remaining_folders));
+    }
+
+    fn record_error(
+        &self,
+        source: Option<&std::path::Path>,
+        target: Option<&std::path::Path>,
+        message: String,
+    ) {
+        let item_label = source.map(display_name).unwrap_or_else(|| "file task".to_string());
+        self.send(tui_file_picker::FileTaskProgressUpdate::RecordError {
+            error: tui_file_picker::FileTaskErrorRecord {
+                item_label,
+                source: source.map(|path| path.to_path_buf()),
+                destination: target.map(|path| path.to_path_buf()),
+                message,
+            },
+            totals: self.totals,
+        });
+    }
+
+    fn record_accounted_failure(
+        &mut self,
+        source: Option<&std::path::Path>,
+        target: Option<&std::path::Path>,
+        message: String,
+    ) {
+        if self.terminal_error.is_none() {
+            self.terminal_error = Some(message.clone());
+        }
+        self.record_error(source, target, message);
+    }
+
+    fn resolve_destination_conflict(
+        &mut self,
+        source: &std::path::Path,
+        target: &std::path::Path,
+        item_kind: tui_file_picker::ConflictItemKind,
+    ) -> Result<FileTaskConflictDecision, String> {
+        let Ok(existing_meta) = std::fs::symlink_metadata(target) else {
+            return Ok(FileTaskConflictDecision::UsePath {
+                path: target.to_path_buf(),
+                applied: FileTaskConflictApplied::None,
+            });
+        };
+
+        if self.job.force {
+            let applied = if item_kind == tui_file_picker::ConflictItemKind::Directory
+                && existing_meta.file_type().is_dir()
+            {
+                FileTaskConflictApplied::Merge
+            } else {
+                FileTaskConflictApplied::Overwrite
+            };
+            return Ok(FileTaskConflictDecision::UsePath {
+                path: target.to_path_buf(),
+                applied,
+            });
+        }
+
+        let existing_is_dir = existing_meta.file_type().is_dir();
+        if let Some(policy) = self.apply_all_policy {
+            match policy {
+                FileTaskApplyAllPolicy::Skip => return Ok(FileTaskConflictDecision::Skip),
+                FileTaskApplyAllPolicy::Overwrite
+                    if !(item_kind == tui_file_picker::ConflictItemKind::Directory && existing_is_dir) =>
+                {
+                    return Ok(FileTaskConflictDecision::UsePath {
+                        path: target.to_path_buf(),
+                        applied: FileTaskConflictApplied::Overwrite,
+                    });
+                }
+                FileTaskApplyAllPolicy::Merge
+                    if item_kind == tui_file_picker::ConflictItemKind::Directory && existing_is_dir =>
+                {
+                    return Ok(FileTaskConflictDecision::UsePath {
+                        path: target.to_path_buf(),
+                        applied: FileTaskConflictApplied::Merge,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let source_is_dir = item_kind == tui_file_picker::ConflictItemKind::Directory;
+        let mut choices = if source_is_dir && existing_is_dir {
+            vec![
+                tui_file_picker::ConflictAction::Merge,
+                tui_file_picker::ConflictAction::Skip,
+                tui_file_picker::ConflictAction::Rename,
+                tui_file_picker::ConflictAction::Abort,
+            ]
+        } else {
+            vec![
+                tui_file_picker::ConflictAction::Overwrite,
+                tui_file_picker::ConflictAction::Skip,
+                tui_file_picker::ConflictAction::Rename,
+                tui_file_picker::ConflictAction::Abort,
+            ]
+        };
+        if source_is_dir && !existing_is_dir {
+            choices = vec![
+                tui_file_picker::ConflictAction::Overwrite,
+                tui_file_picker::ConflictAction::Skip,
+                tui_file_picker::ConflictAction::Rename,
+                tui_file_picker::ConflictAction::Abort,
+            ];
+        }
+
+        self.next_conflict_id = self.next_conflict_id.saturating_add(1);
+        let request_id = self.next_conflict_id;
+        let mut conflict = tui_file_picker::ConflictPromptState::new(
+            request_id,
+            format!("{} already exists", display_name(target)),
+            format!(
+                "{} destination already exists for {}",
+                item_kind_label(item_kind),
+                display_name(source)
+            ),
+            item_kind,
+        );
+        conflict.source = Some(source.to_path_buf());
+        conflict.destination = Some(target.to_path_buf());
+        conflict.choices = choices;
+        conflict.selected = 0;
+        self.send(tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict });
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Paused,
+            format!("waiting for conflict resolution for {}", display_name(source)),
+            Some(progress_item_for_paths(source, target, 0, None)),
+            true,
+        );
+
+        loop {
+            match self.controls.recv() {
+                Ok(super::app::FileTaskControl::ConflictResolution { request_id: id, resolution }) => {
+                    if id != request_id {
+                        continue;
+                    }
+                    let decision = self.apply_conflict_resolution(source, target, item_kind, resolution)?;
+                    self.send(tui_file_picker::FileTaskProgressUpdate::ClearConflict);
+                    return Ok(decision);
+                }
+                Ok(super::app::FileTaskControl::Abort) => {
+                    self.send(tui_file_picker::FileTaskProgressUpdate::ClearConflict);
+                    return Ok(FileTaskConflictDecision::Abort);
+                }
+                Ok(super::app::FileTaskControl::SkipCurrent) => {
+                    self.send(tui_file_picker::FileTaskProgressUpdate::ClearConflict);
+                    return Ok(FileTaskConflictDecision::Skip);
+                }
+                Ok(super::app::FileTaskControl::Pause) => {
+                    self.paused = true;
+                    self.snapshot(
+                        tui_file_picker::FileTaskPhase::Paused,
+                        "paused at conflict".to_string(),
+                        Some(progress_item_for_paths(source, target, 0, None)),
+                        true,
+                    );
+                }
+                Ok(super::app::FileTaskControl::Resume) => {
+                    self.paused = false;
+                    self.snapshot(
+                        tui_file_picker::FileTaskPhase::Paused,
+                        "waiting for conflict resolution".to_string(),
+                        Some(progress_item_for_paths(source, target, 0, None)),
+                        true,
+                    );
+                }
+                Err(_) => return Ok(FileTaskConflictDecision::Abort),
+            }
+        }
+    }
+
+    fn apply_conflict_resolution(
+        &mut self,
+        _source: &std::path::Path,
+        target: &std::path::Path,
+        item_kind: tui_file_picker::ConflictItemKind,
+        resolution: tui_file_picker::ConflictResolution,
+    ) -> Result<FileTaskConflictDecision, String> {
+        match resolution {
+            tui_file_picker::ConflictResolution::Overwrite { apply_to_all } => {
+                if apply_to_all {
+                    self.apply_all_policy = Some(FileTaskApplyAllPolicy::Overwrite);
+                }
+                Ok(FileTaskConflictDecision::UsePath {
+                    path: target.to_path_buf(),
+                    applied: FileTaskConflictApplied::Overwrite,
+                })
+            }
+            tui_file_picker::ConflictResolution::Merge { apply_to_all } => {
+                if apply_to_all {
+                    self.apply_all_policy = Some(FileTaskApplyAllPolicy::Merge);
+                }
+                Ok(FileTaskConflictDecision::UsePath {
+                    path: target.to_path_buf(),
+                    applied: FileTaskConflictApplied::Merge,
+                })
+            }
+            tui_file_picker::ConflictResolution::Skip { apply_to_all } => {
+                if apply_to_all {
+                    self.apply_all_policy = Some(FileTaskApplyAllPolicy::Skip);
+                }
+                Ok(FileTaskConflictDecision::Skip)
+            }
+            tui_file_picker::ConflictResolution::Rename => Ok(FileTaskConflictDecision::UsePath {
+                path: deterministic_non_conflicting_path(target, item_kind),
+                applied: FileTaskConflictApplied::Rename,
+            }),
+            tui_file_picker::ConflictResolution::Abort => Ok(FileTaskConflictDecision::Abort),
+        }
+    }
+
+    fn move_path_progress_node(
+        &mut self,
+        node: &FileTaskPlanNode,
+    ) -> Result<FileTaskStep, String> {
+        let source = node.source.as_path();
+        let target = node.target.as_path();
+        let stats = node.stats;
+        if matches!(node.kind, FileTaskPlanKind::Directory) {
+            ensure_not_copying_dir_into_itself(source, target)?;
+        }
+
+        // For normal non-force same-filesystem moves, first attempt a true
+        // no-clobber rename. On Linux this uses renameat2(RENAME_NOREPLACE),
+        // so a destination created concurrently cannot be overwritten. If the
+        // platform/filesystem does not support that primitive, or if the move is
+        // cross-device or conflicts, fall back to the conflict-aware
+        // copy/no-clobber-finalize/verify/remove path.
+        if !self.job.force {
+            match try_fast_no_clobber_rename(source, target) {
+                Ok(()) => {
+                    self.mark_completed_stats(stats);
+                    let item = progress_item_for_paths(source, target, stats.bytes, Some(stats.bytes));
+                    self.snapshot(
+                        tui_file_picker::FileTaskPhase::Running,
+                        format!("Moved {}", display_name(source)),
+                        Some(item),
+                        true,
+                    );
+                    return Ok(FileTaskStep::Completed);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return self.move_via_copy_verify_remove_node(node);
+                }
+                Err(e) if is_cross_device_error(&e)
+                    || e.kind() == std::io::ErrorKind::Unsupported =>
+                {
+                    return self.move_via_copy_verify_remove_node(node);
+                }
+                Err(e) => return Err(format!("rename without replacing: {e}")),
+            }
+        }
+
+        // Explicit force may deliberately replace according to platform rename
+        // semantics when no pre-existing destination was detected. If a
+        // destination is already present, route through the conflict/finalization
+        // engine so directory/file replacement policy remains explicit and
+        // consistent.
+        if std::fs::symlink_metadata(target).is_ok() {
+            return self.move_via_copy_verify_remove_node(node);
+        }
+
+        match std::fs::rename(source, target) {
+            Ok(()) => {
+                self.mark_completed_stats(stats);
+                let item = progress_item_for_paths(source, target, stats.bytes, Some(stats.bytes));
+                self.snapshot(
+                    tui_file_picker::FileTaskPhase::Running,
+                    format!("Moved {}", display_name(source)),
+                    Some(item),
+                    true,
+                );
+                return Ok(FileTaskStep::Completed);
+            }
+            Err(e) => {
+                if !is_cross_device_error(&e) {
+                    return Err(format!("{e}"));
+                }
+            }
+        }
+
+        self.move_via_copy_verify_remove_node(node)
+    }
+
+    fn move_via_copy_verify_remove_node(
+        &mut self,
+        node: &FileTaskPlanNode,
+    ) -> Result<FileTaskStep, String> {
+        let source = node.source.as_path();
+        let target = node.target.as_path();
+        let metadata = std::fs::symlink_metadata(source)
+            .map_err(|e| format!("stat source {}: {}", source.display(), e))?;
+        let file_type = metadata.file_type();
+        let item_kind = conflict_item_kind_for_plan(node);
+        let source_is_dir = file_type.is_dir();
+        let decision = self.resolve_destination_conflict(source, target, item_kind)?;
+        let (resolved_target, applied) = match decision {
+            FileTaskConflictDecision::UsePath { path, applied } => (path, applied),
+            FileTaskConflictDecision::Skip => return Ok(FileTaskStep::Skipped),
+            FileTaskConflictDecision::Abort => return Ok(FileTaskStep::Aborted),
+        };
+        let mut copy_node = node.clone();
+        if resolved_target.as_path() != node.target.as_path() {
+            retarget_plan_node(&mut copy_node, &resolved_target);
+        }
+        let errors_before_copy = self.totals.errors;
+        let skipped_before_copy = self.totals.skipped;
+        let copied = self.copy_path_progress_resolved_node(&copy_node, applied)?;
+        if copied != FileTaskStep::Completed {
+            return Ok(copied);
+        }
+        if self.totals.errors > errors_before_copy || self.totals.skipped > skipped_before_copy {
+            self.record_accounted_failure(
+                Some(source),
+                Some(&resolved_target),
+                "move left original in place because copied tree was incomplete".to_string(),
+            );
+            return Ok(FileTaskStep::Completed);
+        }
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Verifying,
+            format!("Verifying {}", display_name(source)),
+            Some(progress_item_for_paths(source, &resolved_target, 0, None)),
+            true,
+        );
+        if let Err(e) = verify_copied_path(source, &resolved_target) {
+            self.record_accounted_failure(
+                Some(source),
+                Some(&resolved_target),
+                format!(
+                    "move verification failed; original preserved: {}",
+                    e
+                ),
+            );
+            return Ok(FileTaskStep::Completed);
+        }
+        match self.poll_controls_no_skip(None)? {
+            FileTaskStep::Aborted => return Ok(FileTaskStep::Aborted),
+            FileTaskStep::Skipped => {},
+            FileTaskStep::Completed => {}
+        }
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Custom("Removing source...".to_string()),
+            format!("Removing source {}", display_name(source)),
+            Some(progress_item_for_paths(source, &resolved_target, 0, None)),
+            true,
+        );
+        if source_is_dir {
+            std::fs::remove_dir_all(source).map_err(|e| format!("remove original dir: {e}"))?;
+        } else {
+            std::fs::remove_file(source).map_err(|e| format!("remove original: {e}"))?;
+        }
+        Ok(FileTaskStep::Completed)
+    }
+
+    fn copy_path_progress_node(
+        &mut self,
+        node: &FileTaskPlanNode,
+    ) -> Result<FileTaskStep, String> {
+        let item_kind = conflict_item_kind_for_plan(node);
+        let decision = self.resolve_destination_conflict(&node.source, &node.target, item_kind)?;
+        let (target, applied) = match decision {
+            FileTaskConflictDecision::UsePath { path, applied } => (path, applied),
+            FileTaskConflictDecision::Skip => return Ok(FileTaskStep::Skipped),
+            FileTaskConflictDecision::Abort => return Ok(FileTaskStep::Aborted),
+        };
+        let mut resolved_node = node.clone();
+        if target.as_path() != node.target.as_path() {
+            retarget_plan_node(&mut resolved_node, &target);
+        }
+        self.copy_path_progress_resolved_node(&resolved_node, applied)
+    }
+
+    fn copy_path_progress_resolved_node(
+        &mut self,
+        node: &FileTaskPlanNode,
+        applied: FileTaskConflictApplied,
+    ) -> Result<FileTaskStep, String> {
+        match node.kind {
+            FileTaskPlanKind::Symlink => {
+                match self.poll_controls(Some(progress_item_for_paths(&node.source, &node.target, 0, Some(0))))? {
+                    FileTaskStep::Completed => {}
+                    other => return Ok(other),
+                }
+                copy_symlink_atomic(
+                    &node.source,
+                    &node.target,
+                    matches!(applied, FileTaskConflictApplied::Overwrite) || self.job.force,
+                )?;
+                self.mark_completed_file_with(applied);
+                Ok(FileTaskStep::Completed)
+            }
+            FileTaskPlanKind::Directory => self.copy_dir_plan_progress_resolved(node, applied),
+            FileTaskPlanKind::File => {
+                self.copy_regular_file_progress_resolved(&node.source, &node.target, node.stats.bytes, applied)
+            }
+        }
+    }
+
+    fn copy_dir_plan_progress_resolved(
+        &mut self,
+        node: &FileTaskPlanNode,
+        applied: FileTaskConflictApplied,
+    ) -> Result<FileTaskStep, String> {
+        let source = node.source.as_path();
+        let target = node.target.as_path();
+        ensure_not_copying_dir_into_itself(source, target)?;
+        match self.poll_controls_no_skip(Some(progress_item_for_paths(source, target, 0, None)))? {
+            FileTaskStep::Completed => {}
+            FileTaskStep::Aborted => return Ok(FileTaskStep::Aborted),
+            FileTaskStep::Skipped => {},
+        }
+        let should_merge = matches!(applied, FileTaskConflictApplied::Merge);
+        let should_replace_path = matches!(applied, FileTaskConflictApplied::Overwrite) || self.job.force;
+        match std::fs::symlink_metadata(target) {
+            Ok(existing) if existing.file_type().is_dir() => {
+                if !should_merge {
+                    return Err(format!(
+                        "destination directory exists without merge policy: {}",
+                        target.display()
+                    ));
+                }
+            }
+            Ok(_) if should_replace_path => {
+                remove_existing_file_or_symlink(target)
+                    .map_err(|e| format!("replace non-directory target: {e}"))?;
+                std::fs::create_dir(target).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!("destination appeared during directory replacement: {}", target.display())
+                    } else {
+                        format!("mkdir: {e}")
+                    }
+                })?;
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "destination exists and is not a directory: {}",
+                    target.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(target).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!("destination directory exists: {}", target.display())
+                    } else {
+                        format!("mkdir: {e}")
+                    }
+                })?;
+            }
+            Err(e) => return Err(format!("stat destination {}: {e}", target.display())),
+        }
+        self.mark_completed_folder_with(applied);
+        for child in &node.children {
+            match self.copy_path_progress_node(child) {
+                Err(error) => {
+                    log::warn!(
+                        "{} failed: {} -> {}: {}",
+                        if self.job.is_move { "move" } else { "copy" },
+                        child.source.display(),
+                        child.target.display(),
+                        error
+                    );
+                    self.mark_error_stats(child.stats);
+                    self.record_error(Some(&child.source), Some(&child.target), error);
+                }
+                Ok(FileTaskStep::Completed) => {}
+                Ok(FileTaskStep::Skipped) => self.mark_skipped_stats(child.stats),
+                Ok(FileTaskStep::Aborted) => return Ok(FileTaskStep::Aborted),
+            }
+        }
+        if let Ok(metadata) = std::fs::metadata(source) {
+            let _ = std::fs::set_permissions(target, metadata.permissions());
+        }
+        Ok(FileTaskStep::Completed)
+    }
+
+    #[cfg(test)]
+    fn copy_path_progress(
+        &mut self,
+        source: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<FileTaskStep, String> {
+        let node = build_file_task_plan_node(source, target)?;
+        self.copy_path_progress_node(&node)
+    }
+
+    fn copy_regular_file_progress_resolved(
+        &mut self,
+        source: &std::path::Path,
+        target: &std::path::Path,
+        total_bytes: u64,
+        applied: FileTaskConflictApplied,
+    ) -> Result<FileTaskStep, String> {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
+        }
+        if let Ok(target_meta) = std::fs::symlink_metadata(target) {
+            if target_meta.file_type().is_dir() {
+                return Err(format!("destination is a directory: {}", target.display()));
+            }
+            if !self.job.force && !matches!(applied, FileTaskConflictApplied::Overwrite) {
+                return Err(format!("unresolved destination conflict: {}", target.display()));
+            }
+        }
+
+        let progress_bytes_start = self.totals.bytes_done;
+        let (temp_target, mut output) = create_temp_output_file(target)?;
+        let mut input = match std::fs::File::open(source) {
+            Ok(input) => input,
+            Err(e) => {
+                cleanup_temp_file(&temp_target);
+                return Err(format!("open source: {e}"));
+            }
+        };
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut item_done = 0u64;
+
+        let finish_incomplete = |totals: &mut tui_file_picker::ProgressTotals,
+                                 output: std::fs::File,
+                                 temp_target: &std::path::Path,
+                                 progress_bytes_start: u64| {
+            drop(output);
+            cleanup_temp_file(temp_target);
+            totals.bytes_done = progress_bytes_start;
+        };
+
+        loop {
+            let current = progress_item_for_paths(source, target, item_done, Some(total_bytes));
+            match self.poll_controls(Some(current.clone()))? {
+                FileTaskStep::Completed => {}
+                FileTaskStep::Skipped => {
+                    finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
+                    return Ok(FileTaskStep::Skipped);
+                }
+                FileTaskStep::Aborted => {
+                    finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
+                    return Ok(FileTaskStep::Aborted);
+                }
+            }
+            let read = match std::io::Read::read(&mut input, &mut buffer) {
+                Ok(read) => read,
+                Err(e) => {
+                    finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
+                    return Err(format!("read: {e}"));
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            if let Err(e) = std::io::Write::write_all(&mut output, &buffer[..read]) {
+                finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
+                return Err(format!("write: {e}"));
+            }
+            item_done = item_done.saturating_add(read as u64);
+            self.totals.bytes_done = self.totals.bytes_done.saturating_add(read as u64);
+            self.snapshot(
+                if self.paused { tui_file_picker::FileTaskPhase::Paused } else { tui_file_picker::FileTaskPhase::Running },
+                format!(
+                    "{} {}",
+                    if self.job.is_move { "Moving" } else { "Copying" },
+                    display_name(source)
+                ),
+                Some(progress_item_for_paths(source, target, item_done, Some(total_bytes))),
+                false,
             );
         }
+        if let Err(e) = std::io::Write::flush(&mut output) {
+            finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
+            return Err(format!("flush: {e}"));
+        }
+        if let Ok(metadata) = std::fs::metadata(source) {
+            let _ = std::fs::set_permissions(&temp_target, metadata.permissions());
+        }
+        if let Err(e) = output.sync_all() {
+            finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
+            return Err(format!("sync: {e}"));
+        }
+        drop(output);
+        if let Err(e) = finalize_temp_file(
+            &temp_target,
+            target,
+            self.job.force || matches!(applied, FileTaskConflictApplied::Overwrite),
+        ) {
+            cleanup_temp_file(&temp_target);
+            self.totals.bytes_done = progress_bytes_start;
+            return Err(e);
+        }
+        self.mark_completed_file_with(applied);
+        Ok(FileTaskStep::Completed)
     }
 
-    // Delete original.
-    if source.is_dir() {
-        std::fs::remove_dir_all(source).map_err(|e| format!("remove original dir: {}", e))?;
-    } else {
-        std::fs::remove_file(source).map_err(|e| format!("remove original: {}", e))?;
+    #[cfg(test)]
+    fn copy_dir_recursive_progress(
+        &mut self,
+        source: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<FileTaskStep, String> {
+        self.copy_path_progress(source, target)
+    }
+
+    #[cfg(test)]
+    fn copy_regular_file_progress(
+        &mut self,
+        source: &std::path::Path,
+        target: &std::path::Path,
+        _total_bytes: u64,
+    ) -> Result<FileTaskStep, String> {
+        self.copy_path_progress(source, target)
+    }
+
+    fn poll_controls(
+        &mut self,
+        current_item: Option<tui_file_picker::ProgressItem>,
+    ) -> Result<FileTaskStep, String> {
+        self.poll_controls_for_phase(current_item, true, tui_file_picker::FileTaskPhase::Running)
+    }
+
+    fn poll_controls_no_skip(
+        &mut self,
+        current_item: Option<tui_file_picker::ProgressItem>,
+    ) -> Result<FileTaskStep, String> {
+        self.poll_controls_for_phase(current_item, false, tui_file_picker::FileTaskPhase::Running)
+    }
+
+    fn poll_controls_for_phase(
+        &mut self,
+        current_item: Option<tui_file_picker::ProgressItem>,
+        allow_skip_current: bool,
+        active_phase: tui_file_picker::FileTaskPhase,
+    ) -> Result<FileTaskStep, String> {
+        let mut paused_in_this_poll = false;
+        loop {
+            match self.controls.try_recv() {
+                Ok(super::app::FileTaskControl::Abort) => return Ok(FileTaskStep::Aborted),
+                Ok(super::app::FileTaskControl::SkipCurrent) => {
+                    if allow_skip_current {
+                        return Ok(FileTaskStep::Skipped);
+                    }
+                    self.pending_skip_current = true;
+                }
+                Ok(super::app::FileTaskControl::Pause) => {
+                    paused_in_this_poll = true;
+                    self.paused = true;
+                    self.snapshot(
+                        tui_file_picker::FileTaskPhase::Paused,
+                        "paused".to_string(),
+                        current_item.clone(),
+                        true,
+                    );
+                }
+                Ok(super::app::FileTaskControl::Resume) => {
+                    self.paused = false;
+                    self.snapshot(
+                        active_phase.clone(),
+                        "resuming".to_string(),
+                        current_item.clone(),
+                        true,
+                    );
+                    if paused_in_this_poll {
+                        // A queued Pause/Resume pair is commonly used by tests
+                        // to advance to a visible checkpoint. Do not drain later
+                        // controls in the same poll; let the next displayed node
+                        // own those actions.
+                        break;
+                    }
+                }
+                Ok(super::app::FileTaskControl::ConflictResolution { .. }) => {
+                    // Conflict responses are only meaningful while a conflict prompt is active.
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        while self.paused {
+            match self.controls.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(super::app::FileTaskControl::Abort) => return Ok(FileTaskStep::Aborted),
+                Ok(super::app::FileTaskControl::SkipCurrent) => {
+                    if allow_skip_current {
+                        return Ok(FileTaskStep::Skipped);
+                    }
+                    self.pending_skip_current = true;
+                }
+                Ok(super::app::FileTaskControl::Resume) => {
+                    self.paused = false;
+                    self.snapshot(
+                        active_phase.clone(),
+                        "resuming".to_string(),
+                        current_item.clone(),
+                        true,
+                    );
+                    break;
+                }
+                Ok(super::app::FileTaskControl::Pause) => {}
+                Ok(super::app::FileTaskControl::ConflictResolution { .. }) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.snapshot(
+                        tui_file_picker::FileTaskPhase::Paused,
+                        "paused".to_string(),
+                        current_item.clone(),
+                        false,
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        if allow_skip_current && self.pending_skip_current {
+            self.pending_skip_current = false;
+            return Ok(FileTaskStep::Skipped);
+        }
+
+        Ok(FileTaskStep::Completed)
+    }
+
+    fn snapshot(
+        &mut self,
+        phase: tui_file_picker::FileTaskPhase,
+        status: String,
+        current_item: Option<tui_file_picker::ProgressItem>,
+        force: bool,
+    ) {
+        let now = std::time::Instant::now();
+        if !force && now.saturating_duration_since(self.last_report_at) < std::time::Duration::from_millis(80) {
+            return;
+        }
+        self.last_report_at = now;
+        let elapsed = now.saturating_duration_since(self.started_at).as_secs().max(1);
+        let rate = Some(self.totals.bytes_done / elapsed);
+        self.send(tui_file_picker::FileTaskProgressUpdate::Snapshot {
+            phase,
+            status,
+            current_item,
+            totals: self.totals,
+            rate_bytes_per_sec: rate,
+        });
+    }
+
+    fn send(&self, update: tui_file_picker::FileTaskProgressUpdate) {
+        let _ = self.tx.blocking_send(AppMessage::FileTaskProgress {
+            session_id: self.job.session_id,
+            update,
+        });
+    }
+}
+
+fn spawn_file_task_worker(
+    job: FileTaskJob,
+    tx: mpsc::Sender<AppMessage>,
+    controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
+) {
+    std::thread::spawn(move || FileTaskWorker::new(job, tx, controls).run());
+}
+
+fn progress_item_for_paths(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    bytes_done: u64,
+    bytes_total: Option<u64>,
+) -> tui_file_picker::ProgressItem {
+    tui_file_picker::ProgressItem {
+        label: display_name(source),
+        source: Some(source.to_path_buf()),
+        destination: Some(target.to_path_buf()),
+        bytes_done,
+        bytes_total,
+    }
+}
+
+fn display_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn file_task_scope_for_job(
+    sources: &[std::path::PathBuf],
+    dest_dir: &std::path::Path,
+) -> tui_file_picker::FileTaskScope {
+    let source_root = common_source_root(sources);
+    let source_summary = match sources {
+        [] => "no selected items".to_string(),
+        [single] => single.display().to_string(),
+        many => format!("{} selected items", many.len()),
+    };
+    tui_file_picker::FileTaskScope {
+        source_root,
+        source_summary,
+        destination: Some(dest_dir.to_path_buf()),
+        destination_summary: Some(dest_dir.display().to_string()),
+    }
+}
+
+fn common_source_root(sources: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    match sources {
+        [] => None,
+        [single] => Some(single.clone()),
+        many => {
+            let first_parent = many.first()?.parent()?.to_path_buf();
+            if many.iter().all(|path| path.parent() == Some(first_parent.as_path())) {
+                Some(first_parent)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+static FILE_TASK_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn create_temp_output_file(
+    target: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::fs::File), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("target has no parent directory: {}", target.display()))?;
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let pid = std::process::id();
+    for _ in 0..128 {
+        let nonce = FILE_TASK_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_name = format!(".{}.tonepoet-part-{}-{}.tmp", file_name, pid, nonce);
+        let temp_path = parent.join(temp_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create temporary target: {e}")),
+        }
+    }
+    Err(format!(
+        "could not create a unique temporary target for {}",
+        target.display()
+    ))
+}
+
+fn cleanup_temp_file(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+
+/// Try to move `source` to `target` without replacing anything already at
+/// `target`. This is an optimization, not the only correctness mechanism: when
+/// the platform cannot provide an atomic no-replace rename, callers must fall
+/// back to the copy/no-clobber-finalize/verify/remove engine.
+#[cfg(target_os = "linux")]
+fn try_fast_no_clobber_rename(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let old = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("source path contains NUL: {}", source.display()),
+        )
+    })?;
+    let new = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("target path contains NUL: {}", target.display()),
+        )
+    })?;
+
+    // Linux renameat2 flag value. libc does not expose RENAME_NOREPLACE on all
+    // targets, so keep the constant local and documented.
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EEXIST) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            error,
+        )),
+        Some(libc::EXDEV) => Err(error),
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "atomic no-clobber rename is not supported by this kernel/filesystem",
+            ))
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_fast_no_clobber_rename(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    let _ = (source, target);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-clobber rename is not available on this platform through std",
+    ))
+}
+
+fn is_cross_device_error(error: &std::io::Error) -> bool {
+    is_cross_device_raw_os_error(error.raw_os_error())
+        || {
+            let message = error.to_string().to_lowercase();
+            message.contains("cross-device") || message.contains("not same device")
+        }
+}
+
+#[cfg(unix)]
+fn is_cross_device_raw_os_error(code: Option<i32>) -> bool {
+    code == Some(libc::EXDEV)
+}
+
+#[cfg(windows)]
+fn is_cross_device_raw_os_error(code: Option<i32>) -> bool {
+    // Windows ERROR_NOT_SAME_DEVICE. Keep this local instead of depending on a
+    // platform bindings crate from this TUI module.
+    const ERROR_NOT_SAME_DEVICE: i32 = 17;
+    code == Some(ERROR_NOT_SAME_DEVICE)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_cross_device_raw_os_error(_code: Option<i32>) -> bool {
+    false
+}
+
+fn finalize_temp_file(
+    temp_path: &std::path::Path,
+    target: &std::path::Path,
+    replace_existing: bool,
+) -> Result<(), String> {
+    if replace_existing {
+        return replace_temp_file(temp_path, target);
+    }
+    persist_temp_file_no_clobber(temp_path, target)
+}
+
+/// Persist a completed temporary file to its final destination without ever
+/// clobbering an existing path. The preferred same-directory hard-link publish
+/// fails atomically if `target` exists. The fallback reserves `target` with
+/// `create_new(true)`, which also cannot overwrite a concurrently-created file.
+fn persist_temp_file_no_clobber(
+    temp_path: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
+    }
+
+    match std::fs::hard_link(temp_path, target) {
+        Ok(()) => {
+            cleanup_temp_file(temp_path);
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!("destination exists: {}", target.display()));
+        }
+        Err(_) => {
+            // Filesystems such as some network mounts may not support hard links.
+            // Reserve the final path with create_new so this fallback still has
+            // true no-clobber behavior. If copying into the reserved file fails,
+            // remove only that reserved file, which this function created.
+        }
+    }
+
+    let mut reserved = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("destination exists: {}", target.display())
+            } else {
+                format!("reserve destination {}: {e}", target.display())
+            }
+        })?;
+    let reserved_identity = reserved
+        .metadata()
+        .map_err(|e| format!("stat reserved destination {}: {e}", target.display()))?;
+    let copy_result = (|| -> Result<(), String> {
+        let mut input = std::fs::File::open(temp_path).map_err(|e| format!("open temp: {e}"))?;
+        std::io::copy(&mut input, &mut reserved).map_err(|e| format!("publish temp: {e}"))?;
+        std::io::Write::flush(&mut reserved).map_err(|e| format!("flush published file: {e}"))?;
+        reserved.sync_all().map_err(|e| format!("sync published file: {e}"))?;
+        Ok(())
+    })();
+    drop(reserved);
+    if let Err(error) = copy_result {
+        cleanup_reserved_destination_if_ours(target, &reserved_identity);
+        return Err(error);
+    }
+    cleanup_temp_file(temp_path);
+    Ok(())
+}
+
+/// Remove a fallback-created destination only when the path still names the
+/// exact file handle this operation reserved with create_new(true). On Unix we
+/// can prove that by comparing device/inode identity. On platforms where the
+/// standard library exposes no stable path identity, this intentionally does
+/// nothing: leaking our reserved partial file is safer than unlinking a path
+/// another process may have replaced.
+#[cfg(unix)]
+fn cleanup_reserved_destination_if_ours(
+    target: &std::path::Path,
+    reserved_identity: &std::fs::Metadata,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(current) = std::fs::symlink_metadata(target) else {
+        return;
+    };
+    if current.dev() == reserved_identity.dev() && current.ino() == reserved_identity.ino() {
+        let _ = std::fs::remove_file(target);
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_reserved_destination_if_ours(
+    _target: &std::path::Path,
+    _reserved_identity: &std::fs::Metadata,
+) {
+}
+
+/// Deliberately replace a final destination after explicit overwrite/force
+/// policy. Directories are never replaced by file finalization. On Unix, rename
+/// replaces the symlink path itself rather than following it; on Windows the
+/// existing file/symlink is removed first because std rename will not replace it.
+fn replace_temp_file(temp_path: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    if let Ok(target_meta) = std::fs::symlink_metadata(target) {
+        if target_meta.file_type().is_dir() {
+            return Err(format!("destination is a directory: {}", target.display()));
+        }
+    }
+
+    #[cfg(windows)]
+    if std::fs::symlink_metadata(target).is_ok() {
+        remove_existing_file_or_symlink(target).map_err(|e| format!("replace target: {e}"))?;
+    }
+
+    std::fs::rename(temp_path, target).map_err(|e| format!("rename temporary target: {e}"))
+}
+
+fn remove_existing_file_or_symlink(path: &std::path::Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    let file_type = meta.file_type();
+    if file_type.is_dir() {
+        return std::fs::remove_dir(path);
+    }
+    #[cfg(windows)]
+    if file_type.is_symlink() && std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+        return std::fs::remove_dir(path);
+    }
+    std::fs::remove_file(path)
+}
+
+fn deterministic_non_conflicting_path(
+    target: &std::path::Path,
+    _item_kind: tui_file_picker::ConflictItemKind,
+) -> std::path::PathBuf {
+    if std::fs::symlink_metadata(target).is_err() {
+        return target.to_path_buf();
+    }
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = target
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("item");
+    let extension = target.extension().and_then(|ext| ext.to_str());
+    for idx in 1u64..10_000 {
+        let suffix = if idx == 1 {
+            " copy".to_string()
+        } else {
+            format!(" copy {}", idx)
+        };
+        let name = match extension {
+            Some(ext) if !ext.is_empty() => format!("{}{}.{}", stem, suffix, ext),
+            _ => format!("{}{}", stem, suffix),
+        };
+        let candidate = parent.join(name);
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{} copy {}", stem, FILE_TASK_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+}
+
+fn item_kind_label(kind: tui_file_picker::ConflictItemKind) -> &'static str {
+    match kind {
+        tui_file_picker::ConflictItemKind::File => "file",
+        tui_file_picker::ConflictItemKind::Directory => "directory",
+        tui_file_picker::ConflictItemKind::Symlink => "symlink",
+        tui_file_picker::ConflictItemKind::Other => "item",
+    }
+}
+
+
+fn conflict_item_kind_for_plan(node: &FileTaskPlanNode) -> tui_file_picker::ConflictItemKind {
+    match node.kind {
+        FileTaskPlanKind::File => tui_file_picker::ConflictItemKind::File,
+        FileTaskPlanKind::Directory => tui_file_picker::ConflictItemKind::Directory,
+        FileTaskPlanKind::Symlink => tui_file_picker::ConflictItemKind::Symlink,
+    }
+}
+
+fn retarget_plan_node(node: &mut FileTaskPlanNode, new_target: &std::path::Path) {
+    node.target = new_target.to_path_buf();
+    if matches!(node.kind, FileTaskPlanKind::Directory) {
+        let parent_target = node.target.clone();
+        for child in &mut node.children {
+            if let Some(name) = child.source.file_name().map(|name| name.to_os_string()) {
+                let child_target = parent_target.join(name);
+                retarget_plan_node(child, &child_target);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn build_file_task_plan(
+    sources: &[std::path::PathBuf],
+    dest_dir: &std::path::Path,
+) -> Result<FileTaskPlan, String> {
+    let mut roots = Vec::with_capacity(sources.len());
+    let mut totals = FileTaskPathStats::default();
+
+    for source in sources {
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| format!("source has no file name: {}", source.display()))?
+            .to_owned();
+        let target = dest_dir.join(file_name);
+        let source_type = std::fs::symlink_metadata(source)
+            .map_err(|e| format!("stat source {}: {}", source.display(), e))?
+            .file_type();
+        if source_type.is_dir() {
+            ensure_not_copying_dir_into_itself(source, &target)?;
+        }
+        let node = build_file_task_plan_node(source, &target)?;
+        totals.add(node.stats);
+        roots.push(node);
+    }
+
+    Ok(FileTaskPlan { roots, totals })
+}
+
+#[cfg(test)]
+fn build_file_task_plan_node(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<FileTaskPlanNode, String> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|e| format!("stat source {}: {}", source.display(), e))?;
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        let stats = FileTaskPathStats { files: 1, folders: 0, bytes: metadata.len() };
+        return Ok(FileTaskPlanNode {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+            kind: FileTaskPlanKind::File,
+            stats,
+            children: Vec::new(),
+        });
+    }
+    if file_type.is_symlink() {
+        let stats = FileTaskPathStats { files: 1, folders: 0, bytes: 0 };
+        return Ok(FileTaskPlanNode {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+            kind: FileTaskPlanKind::Symlink,
+            stats,
+            children: Vec::new(),
+        });
+    }
+    if file_type.is_dir() {
+        let mut stats = FileTaskPathStats { files: 0, folders: 1, bytes: 0 };
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(source).map_err(|e| format!("readdir {}: {}", source.display(), e))? {
+            let entry = entry.map_err(|e| format!("entry: {e}"))?;
+            let child = build_file_task_plan_node(&entry.path(), &target.join(entry.file_name()))?;
+            stats.add(child.stats);
+            children.push(child);
+        }
+        return Ok(FileTaskPlanNode {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+            kind: FileTaskPlanKind::Directory,
+            stats,
+            children,
+        });
+    }
+    Err(format!(
+        "unsupported file type, refusing to plan: {}",
+        source.display()
+    ))
+}
+
+fn ensure_not_copying_dir_into_itself(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    let source_canon = source
+        .canonicalize()
+        .map_err(|e| format!("canonicalize source {}: {}", source.display(), e))?;
+
+    if let Ok(target_canon) = target.canonicalize() {
+        if target_canon.starts_with(&source_canon) {
+            return Err(format!(
+                "refusing to copy or move directory into itself: {} -> {}",
+                source.display(),
+                target.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    if let Some(parent_canon) = canonical_existing_ancestor(target) {
+        if parent_canon.starts_with(&source_canon) {
+            return Err(format!(
+                "refusing to copy or move directory into itself: {} -> {}",
+                source.display(),
+                target.display()
+            ));
+        }
     }
 
     Ok(())
+}
+
+fn canonical_existing_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cursor = path.parent();
+    while let Some(parent) = cursor {
+        if let Ok(canonical) = parent.canonicalize() {
+            return Some(canonical);
+        }
+        cursor = parent.parent();
+    }
+    None
+}
+
+fn verify_copied_path(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    let src_meta = std::fs::symlink_metadata(source)
+        .map_err(|e| format!("stat source {}: {}", source.display(), e))?;
+    let dst_meta = std::fs::symlink_metadata(target)
+        .map_err(|e| format!("stat target {}: {}", target.display(), e))?;
+    let src_type = src_meta.file_type();
+    let dst_type = dst_meta.file_type();
+
+    if src_type.is_symlink() {
+        if !dst_type.is_symlink() {
+            return Err(format!("target is not a symlink: {}", target.display()));
+        }
+        let src_link = std::fs::read_link(source)
+            .map_err(|e| format!("read source symlink {}: {}", source.display(), e))?;
+        let dst_link = std::fs::read_link(target)
+            .map_err(|e| format!("read target symlink {}: {}", target.display(), e))?;
+        if src_link != dst_link {
+            return Err(format!(
+                "symlink target mismatch: {} -> {:?}, {} -> {:?}",
+                source.display(),
+                src_link,
+                target.display(),
+                dst_link
+            ));
+        }
+        return Ok(());
+    }
+
+    if src_type.is_dir() {
+        if !dst_type.is_dir() {
+            return Err(format!("target is not a directory: {}", target.display()));
+        }
+        for entry in std::fs::read_dir(source).map_err(|e| format!("readdir: {}", e))? {
+            let entry = entry.map_err(|e| format!("entry: {}", e))?;
+            verify_copied_path(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    if src_type.is_file() {
+        if !dst_type.is_file() {
+            return Err(format!("target is not a regular file: {}", target.display()));
+        }
+        if src_meta.len() != dst_meta.len() {
+            return Err(format!(
+                "file size mismatch: {} has {}, {} has {} bytes",
+                source.display(),
+                src_meta.len(),
+                target.display(),
+                dst_meta.len()
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "unsupported file type, refusing to verify: {}",
+        source.display()
+    ))
+}
+
+
+#[cfg(unix)]
+fn copy_symlink_atomic(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    replace_existing: bool,
+) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {}", e))?;
+    }
+    let link_target = std::fs::read_link(source)
+        .map_err(|e| format!("read symlink {}: {}", source.display(), e))?;
+
+    if !replace_existing {
+        return std::os::unix::fs::symlink(&link_target, target).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("destination exists: {}", target.display())
+            } else {
+                format!("copy symlink: {}", e)
+            }
+        });
+    }
+
+    if let Ok(meta) = std::fs::symlink_metadata(target) {
+        if meta.file_type().is_dir() {
+            return Err(format!("destination is a directory: {}", target.display()));
+        }
+    }
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("link");
+    let pid = std::process::id();
+    for _ in 0..128 {
+        let nonce = FILE_TASK_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = parent.join(format!(".{}.tonepoet-link-{}-{}.tmp", name, pid, nonce));
+        match std::os::unix::fs::symlink(&link_target, &temp) {
+            Ok(()) => {
+                let result = std::fs::rename(&temp, target)
+                    .map_err(|e| format!("rename temporary symlink: {}", e));
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&temp);
+                }
+                return result;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("copy symlink: {}", e)),
+        }
+    }
+    Err(format!("could not create a unique temporary symlink for {}", target.display()))
+}
+
+#[cfg(windows)]
+fn copy_symlink_atomic(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    replace_existing: bool,
+) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {}", e))?;
+    }
+    if std::fs::symlink_metadata(target).is_ok() {
+        if !replace_existing {
+            return Err(format!("destination exists: {}", target.display()));
+        }
+        remove_existing_file_or_symlink(target)
+            .map_err(|e| format!("replace target symlink: {}", e))?;
+    }
+    copy_symlink(source, target)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink_atomic(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    _replace_existing: bool,
+) -> Result<(), String> {
+    copy_symlink(source, target)
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {}", e))?;
+    }
+    let link_target = std::fs::read_link(source)
+        .map_err(|e| format!("read symlink {}: {}", source.display(), e))?;
+    let create_result = if source.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+        std::os::windows::fs::symlink_dir(&link_target, target)
+    } else {
+        std::os::windows::fs::symlink_file(&link_target, target)
+    };
+    match create_result {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(format!("destination exists: {}", target.display()))
+        }
+        Err(e) => Err(format!("copy symlink: {}", e)),
+    }
+}
+
+
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink(source: &std::path::Path, _target: &std::path::Path) -> Result<(), String> {
+    Err(format!(
+        "copying symlinks is not supported on this platform: {}",
+        source.display()
+    ))
+}
+
+#[cfg(test)]
+mod file_operation_safety_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn directory_copy_rejects_descendant_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("track.flac"), b"audio").expect("source file");
+
+        let target = source.join("nested").join("source");
+        let err = copy_path_for_test(&source, &target).expect_err("descendant copy must fail");
+
+        assert!(
+            err.contains("refusing to copy or move directory into itself"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !source.join("nested").exists(),
+            "unsafe descendant parent must not be created"
+        );
+        assert!(
+            !target.exists(),
+            "unsafe descendant target must not be created"
+        );
+    }
+
+    #[test]
+    fn destination_directory_preflight_rejects_source_descendant_before_create() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir(&source).expect("source dir");
+
+        let dest_dir = source.join("nested");
+        let err = ensure_not_copying_dir_into_itself(&source, &dest_dir)
+            .expect_err("destination inside source must fail");
+
+        assert!(
+            err.contains("refusing to copy or move directory into itself"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dest_dir.exists(),
+            "containment preflight must not create destination directory"
+        );
+    }
+
+    #[test]
+    fn directory_copy_rejects_same_directory_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir(&source).expect("source dir");
+
+        let err = copy_path_for_test(&source, &source).expect_err("same-dir copy must fail");
+
+        assert!(
+            err.contains("refusing to copy or move directory into itself"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn recursive_verify_rejects_missing_directory_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir(&source).expect("source dir");
+        fs::create_dir(&target).expect("target dir");
+        fs::write(source.join("track.flac"), b"audio").expect("source file");
+
+        let err = verify_copied_path(&source, &target).expect_err("missing file must fail");
+
+        assert!(
+            err.contains("stat target"),
+            "unexpected verification error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_copy_preserves_symlink_and_verifies_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("track.flac"), b"audio").expect("source file");
+        std::os::unix::fs::symlink("track.flac", source.join("link.flac"))
+            .expect("source symlink");
+
+        copy_path_for_test(&source, &target).expect("copy tree");
+        verify_copied_path(&source, &target).expect("verify copied tree");
+
+        let copied_link = fs::read_link(target.join("link.flac")).expect("copied symlink");
+        assert_eq!(copied_link, std::path::PathBuf::from("track.flac"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_overwrite_replaces_destination_symlink_not_referent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        let referent = temp.path().join("referent");
+
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("track.flac"), b"audio").expect("source file");
+        fs::create_dir(&referent).expect("referent dir");
+        fs::write(referent.join("keep.flac"), b"keep").expect("referent file");
+        std::os::unix::fs::symlink(&referent, &target).expect("target symlink");
+
+        copy_path_for_test(&source, &target).expect("force copy over symlink");
+
+        let target_meta = fs::symlink_metadata(&target).expect("target metadata");
+        assert!(target_meta.file_type().is_dir(), "target path becomes a real directory");
+        assert!(
+            !target_meta.file_type().is_symlink(),
+            "overwrite must replace the symlink path itself"
+        );
+        assert_eq!(fs::read(target.join("track.flac")).expect("copied file"), b"audio");
+        assert_eq!(
+            fs::read(referent.join("keep.flac")).expect("referent preserved"),
+            b"keep"
+        );
+        assert!(
+            !referent.join("track.flac").exists(),
+            "copy must not follow target symlink into its referent"
+        );
+    }
+
+    fn worker_for_test(
+        force: bool,
+        controls: std::sync::mpsc::Receiver<crate::tui::app::FileTaskControl>,
+    ) -> FileTaskWorker {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        drop(rx);
+        FileTaskWorker::new(
+            FileTaskJob {
+                session_id: 1,
+                sources: Vec::new(),
+                dest: String::new(),
+                force,
+                is_move: false,
+            },
+            tx,
+            controls,
+        )
+    }
+
+    fn copy_path_for_test(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = worker_for_test(true, control_rx);
+        let node = build_file_task_plan_node(source, target)?;
+        match worker.copy_path_progress_node(&node)? {
+            FileTaskStep::Completed => Ok(()),
+            FileTaskStep::Skipped => Err("copy skipped".to_string()),
+            FileTaskStep::Aborted => Err("copy aborted".to_string()),
+        }
+    }
+
+    fn temp_file_names(dir: &std::path::Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains("tonepoet-part"))
+            .collect()
+    }
+
+    #[test]
+    fn accounted_failure_does_not_double_disposition_planned_files() {
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = worker_for_test(true, control_rx);
+        worker.totals.items_total = Some(2);
+        worker.totals.item_unit = tui_file_picker::ProgressUnit::Files;
+        worker.totals.items_done = 2;
+        worker.totals.completed = 2;
+        worker.totals.folders_total = Some(1);
+        worker.totals.folders_done = 1;
+
+        worker.mark_error_stats(FileTaskPathStats {
+            files: 2,
+            folders: 1,
+            bytes: 16,
+        });
+        worker.record_accounted_failure(
+            None,
+            None,
+            "verification failed after files were already accounted".to_string(),
+        );
+
+        assert_eq!(worker.totals.items_done, 2);
+        assert_eq!(worker.totals.completed, 2);
+        assert_eq!(worker.totals.errors, 0);
+        assert_eq!(worker.totals.folders_done, 1);
+        assert!(worker.terminal_error.is_some());
+    }
+
+    #[test]
+    fn non_skippable_poll_defers_skip_until_next_skippable_item() {
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::SkipCurrent)
+            .expect("queue skip");
+        let mut worker = worker_for_test(false, control_rx);
+
+        let non_skippable = worker
+            .poll_controls_no_skip(None)
+            .expect("non-skippable poll should not fail");
+        assert_eq!(non_skippable, FileTaskStep::Completed);
+        assert!(
+            worker.pending_skip_current,
+            "non-skippable phases must preserve SkipCurrent intent"
+        );
+
+        let skippable = worker
+            .poll_controls(Some(tui_file_picker::ProgressItem {
+                label: "next.flac".to_string(),
+                source: None,
+                destination: None,
+                bytes_done: 0,
+                bytes_total: None,
+            }))
+            .expect("skippable poll should receive deferred skip");
+        assert_eq!(skippable, FileTaskStep::Skipped);
+        assert!(
+            !worker.pending_skip_current,
+            "deferred SkipCurrent is consumed by the next skippable item"
+        );
+    }
+
+    #[test]
+    fn deferred_skip_does_not_override_later_abort() {
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::SkipCurrent)
+            .expect("queue skip");
+        let mut worker = worker_for_test(false, control_rx);
+
+        assert_eq!(
+            worker.poll_controls_no_skip(None).expect("defer skip"),
+            FileTaskStep::Completed
+        );
+        assert!(worker.pending_skip_current);
+
+        control_tx
+            .send(crate::tui::app::FileTaskControl::Abort)
+            .expect("queue abort");
+        assert_eq!(
+            worker.poll_controls(Some(tui_file_picker::ProgressItem::new("next.flac")))
+                .expect("abort should win"),
+            FileTaskStep::Aborted
+        );
+    }
+
+    #[test]
+    fn queued_skip_during_directory_copy_skips_one_child_not_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("a.flac"), b"a".to_vec()).expect("a");
+        fs::write(source.join("b.flac"), b"b".to_vec()).expect("b");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::SkipCurrent)
+            .expect("queue skip");
+        let mut worker = worker_for_test(true, control_rx);
+
+        let result = worker
+            .copy_dir_recursive_progress(&source, &target)
+            .expect("copy dir with folder-level skip");
+
+        assert_eq!(result, FileTaskStep::Completed);
+        let copied_children = [target.join("a.flac"), target.join("b.flac")]
+            .into_iter()
+            .filter(|path| path.exists())
+            .count();
+        assert_eq!(copied_children, 1, "one child is skipped, not the whole tree");
+        assert_eq!(worker.totals.completed, 1);
+        assert_eq!(worker.totals.skipped, 1);
+    }
+
+    #[test]
+    fn skipped_progress_copy_preserves_existing_target_and_rolls_back_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"new audio".to_vec()).expect("source");
+        fs::write(&target, b"existing audio".to_vec()).expect("target");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::SkipCurrent)
+            .expect("queue skip");
+        let mut worker = worker_for_test(true, control_rx);
+        worker.totals.bytes_done = 1234;
+
+        let result = worker
+            .copy_regular_file_progress(&source, &target, 9)
+            .expect("skip copy");
+
+        assert_eq!(result, FileTaskStep::Skipped);
+        assert_eq!(fs::read(&target).expect("target preserved"), b"existing audio".to_vec());
+        assert_eq!(worker.totals.bytes_done, 1234);
+        assert!(
+            temp_file_names(temp.path()).is_empty(),
+            "skip must remove only the temporary partial file"
+        );
+    }
+
+    #[test]
+    fn completed_progress_copy_replaces_existing_target_atomically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"new audio".to_vec()).expect("source");
+        fs::write(&target, b"existing audio".to_vec()).expect("target");
+
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = worker_for_test(true, control_rx);
+
+        let result = worker
+            .copy_regular_file_progress(&source, &target, 9)
+            .expect("copy");
+
+        assert_eq!(result, FileTaskStep::Completed);
+        assert_eq!(fs::read(&target).expect("target replaced"), b"new audio".to_vec());
+        assert_eq!(worker.totals.completed, 1);
+        assert_eq!(worker.totals.bytes_done, 9);
+        assert!(
+            temp_file_names(temp.path()).is_empty(),
+            "completed copy must not leave a temporary file"
+        );
+    }
+
+
+    #[test]
+    fn conflict_skip_leaves_existing_destination_untouched() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"new audio").expect("source");
+        fs::write(&target, b"existing audio").expect("target");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::ConflictResolution {
+                request_id: 1,
+                resolution: tui_file_picker::ConflictResolution::Skip { apply_to_all: false },
+            })
+            .expect("queue skip conflict");
+        let mut worker = worker_for_test(false, control_rx);
+
+        let result = worker
+            .copy_regular_file_progress(&source, &target, 9)
+            .expect("conflict skip");
+
+        assert_eq!(result, FileTaskStep::Skipped);
+        assert_eq!(fs::read(&target).expect("target preserved"), b"existing audio");
+        assert_eq!(worker.totals.completed, 0);
+    }
+
+    #[test]
+    fn conflict_overwrite_replaces_only_after_confirmation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"new audio").expect("source");
+        fs::write(&target, b"existing audio").expect("target");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::ConflictResolution {
+                request_id: 1,
+                resolution: tui_file_picker::ConflictResolution::Overwrite { apply_to_all: false },
+            })
+            .expect("queue overwrite conflict");
+        let mut worker = worker_for_test(false, control_rx);
+
+        let result = worker
+            .copy_regular_file_progress(&source, &target, 9)
+            .expect("conflict overwrite");
+
+        assert_eq!(result, FileTaskStep::Completed);
+        assert_eq!(fs::read(&target).expect("target replaced"), b"new audio");
+        assert_eq!(worker.totals.completed, 1);
+        assert_eq!(worker.totals.overwritten, 1);
+    }
+
+    #[test]
+    fn conflict_rename_uses_deterministic_non_conflicting_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"new audio").expect("source");
+        fs::write(&target, b"existing audio").expect("target");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::ConflictResolution {
+                request_id: 1,
+                resolution: tui_file_picker::ConflictResolution::Rename,
+            })
+            .expect("queue rename conflict");
+        let mut worker = worker_for_test(false, control_rx);
+
+        let result = worker
+            .copy_regular_file_progress(&source, &target, 9)
+            .expect("conflict rename");
+
+        assert_eq!(result, FileTaskStep::Completed);
+        assert_eq!(fs::read(&target).expect("target preserved"), b"existing audio");
+        assert_eq!(fs::read(temp.path().join("target copy.flac")).expect("renamed copy"), b"new audio");
+        assert_eq!(worker.totals.renamed, 1);
+    }
+
+    #[test]
+    fn apply_to_all_skip_applies_to_subsequent_conflicts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let one = temp.path().join("one.flac");
+        let two = temp.path().join("two.flac");
+        let dst_one = temp.path().join("dst-one.flac");
+        let dst_two = temp.path().join("dst-two.flac");
+        fs::write(&one, b"new one").expect("one");
+        fs::write(&two, b"new two").expect("two");
+        fs::write(&dst_one, b"old one").expect("dst one");
+        fs::write(&dst_two, b"old two").expect("dst two");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::ConflictResolution {
+                request_id: 1,
+                resolution: tui_file_picker::ConflictResolution::Skip { apply_to_all: true },
+            })
+            .expect("queue skip all");
+        let mut worker = worker_for_test(false, control_rx);
+
+        assert_eq!(
+            worker.copy_regular_file_progress(&one, &dst_one, 7).expect("skip one"),
+            FileTaskStep::Skipped
+        );
+        assert_eq!(
+            worker.copy_regular_file_progress(&two, &dst_two, 7).expect("skip two"),
+            FileTaskStep::Skipped
+        );
+        assert_eq!(fs::read(&dst_one).expect("one preserved"), b"old one");
+        assert_eq!(fs::read(&dst_two).expect("two preserved"), b"old two");
+    }
+
+    #[test]
+    fn stale_conflict_response_is_ignored() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"new audio").expect("source");
+        fs::write(&target, b"existing audio").expect("target");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::ConflictResolution {
+                request_id: 999,
+                resolution: tui_file_picker::ConflictResolution::Overwrite { apply_to_all: false },
+            })
+            .expect("queue stale overwrite");
+        control_tx
+            .send(crate::tui::app::FileTaskControl::ConflictResolution {
+                request_id: 1,
+                resolution: tui_file_picker::ConflictResolution::Skip { apply_to_all: false },
+            })
+            .expect("queue current skip");
+        let mut worker = worker_for_test(false, control_rx);
+
+        let result = worker
+            .copy_regular_file_progress(&source, &target, 9)
+            .expect("stale conflict ignored");
+
+        assert_eq!(result, FileTaskStep::Skipped);
+        assert_eq!(fs::read(&target).expect("target preserved"), b"existing audio");
+    }
+
+    #[test]
+    fn progress_plan_can_be_aborted_before_destination_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("track.flac"), b"audio").expect("track");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::Abort)
+            .expect("queue abort");
+        let mut worker = worker_for_test(true, control_rx);
+
+        let result = worker
+            .build_file_task_plan_progress(&[source.clone()], &dest)
+            .expect("planning should handle abort");
+
+        assert!(matches!(result, FileTaskPlanBuildStep::Aborted));
+        assert!(!dest.exists(), "aborted planning must not create destination");
+    }
+
+    #[test]
+    fn progress_plan_pause_resume_then_scans_recursive_totals() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let disc = source.join("disc1");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&source).expect("source dir");
+        fs::create_dir(&disc).expect("nested dir");
+        fs::write(source.join("cover.jpg"), b"cover").expect("cover");
+        fs::write(disc.join("track01.flac"), b"audio-1").expect("track01");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::Pause)
+            .expect("queue pause");
+        control_tx
+            .send(crate::tui::app::FileTaskControl::Resume)
+            .expect("queue resume");
+        let mut worker = worker_for_test(true, control_rx);
+
+        let result = worker
+            .build_file_task_plan_progress(&[source.clone()], &dest)
+            .expect("planning should resume");
+        let FileTaskPlanBuildStep::Ready(plan) = result else {
+            panic!("planning should complete after resume");
+        };
+
+        assert_eq!(plan.totals.files, 2);
+        assert_eq!(plan.totals.folders, 2);
+        assert_eq!(plan.totals.bytes, 5 + 7);
+        assert!(!worker.paused);
+        assert!(!dest.exists(), "planning must not create destination");
+    }
+
+    #[test]
+    fn progress_plan_skip_current_selected_root_and_continues() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skipped = temp.path().join("skip-me");
+        let copied = temp.path().join("copy-me");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&skipped).expect("skipped dir");
+        fs::write(skipped.join("a.flac"), b"a").expect("a");
+        fs::create_dir(&copied).expect("copied dir");
+        fs::write(copied.join("b.flac"), b"bb").expect("b");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::SkipCurrent)
+            .expect("queue skip");
+        let mut worker = worker_for_test(true, control_rx);
+
+        let result = worker
+            .build_file_task_plan_progress(&[skipped.clone(), copied.clone()], &dest)
+            .expect("planning should handle skip");
+        let FileTaskPlanBuildStep::Ready(plan) = result else {
+            panic!("planning should continue after skip");
+        };
+
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].source, copied);
+        assert_eq!(plan.totals.files, 1);
+        assert_eq!(plan.totals.bytes, 2);
+        assert_eq!(worker.totals.skipped, 1);
+        assert_eq!(worker.totals.items_done, 1);
+        assert_eq!(worker.totals.unknown_size_items, 1);
+        assert!(!dest.exists(), "planning must not create destination");
+    }
+
+    #[test]
+    fn file_task_plan_counts_recursive_files_folders_and_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let disc = source.join("disc1");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&source).expect("source dir");
+        fs::create_dir(&disc).expect("nested dir");
+        fs::write(source.join("cover.jpg"), b"cover").expect("cover");
+        fs::write(disc.join("track01.flac"), b"audio-1").expect("track01");
+        fs::write(disc.join("track02.flac"), b"audio-22").expect("track02");
+
+        let plan = build_file_task_plan(&[source.clone()], &dest).expect("plan");
+
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].source, source);
+        assert_eq!(plan.roots[0].target, dest.join("album"));
+        assert_eq!(plan.totals.files, 3);
+        assert_eq!(plan.totals.folders, 2);
+        assert_eq!(plan.totals.bytes, 5 + 7 + 8);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fast_no_clobber_rename_moves_when_destination_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"audio").expect("source");
+
+        try_fast_no_clobber_rename(&source, &target).expect("fast no-clobber rename");
+
+        assert!(!source.exists(), "source should have been renamed");
+        assert_eq!(fs::read(&target).expect("target"), b"audio");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fast_no_clobber_rename_refuses_existing_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"source").expect("source");
+        fs::write(&target, b"existing").expect("target");
+
+        let err = try_fast_no_clobber_rename(&source, &target)
+            .expect_err("destination must not be replaced");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).expect("source preserved"), b"source");
+        assert_eq!(fs::read(&target).expect("target preserved"), b"existing");
+    }
+
+    #[test]
+    fn no_clobber_finalization_refuses_existing_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("track.flac");
+        fs::write(&target, b"existing").expect("target");
+        let (temp_path, mut output) = create_temp_output_file(&target).expect("temp output");
+        use std::io::Write;
+        output.write_all(b"new").expect("write temp");
+        output.sync_all().expect("sync temp");
+        drop(output);
+
+        let err = finalize_temp_file(&temp_path, &target, false)
+            .expect_err("no-clobber finalization must fail");
+
+        assert!(err.contains("destination exists"), "unexpected error: {err}");
+        assert_eq!(fs::read(&target).expect("target preserved"), b"existing");
+        cleanup_temp_file(&temp_path);
+    }
+
+    #[test]
+    fn overwrite_finalization_replaces_only_when_explicit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("track.flac");
+        fs::write(&target, b"existing").expect("target");
+        let (temp_path, mut output) = create_temp_output_file(&target).expect("temp output");
+        use std::io::Write;
+        output.write_all(b"new").expect("write temp");
+        output.sync_all().expect("sync temp");
+        drop(output);
+
+        finalize_temp_file(&temp_path, &target, true).expect("explicit overwrite");
+
+        assert_eq!(fs::read(&target).expect("target replaced"), b"new");
+    }
+
+    #[test]
+    fn no_clobber_finalization_refuses_late_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("track.flac");
+        let (temp_path, mut output) = create_temp_output_file(&target).expect("temp output");
+        use std::io::Write;
+        output.write_all(b"new").expect("write temp");
+        output.sync_all().expect("sync temp");
+        drop(output);
+        assert!(fs::symlink_metadata(&target).is_err(), "target starts absent");
+
+        fs::write(&target, b"late").expect("late destination");
+        let err = finalize_temp_file(&temp_path, &target, false)
+            .expect_err("late destination must not be clobbered");
+
+        assert!(err.contains("destination exists"), "unexpected error: {err}");
+        assert_eq!(fs::read(&target).expect("late target preserved"), b"late");
+        cleanup_temp_file(&temp_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_destination_cleanup_does_not_remove_replaced_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("reserved.flac");
+        fs::write(&target, b"ours").expect("reserved");
+        let reserved_identity = fs::symlink_metadata(&target).expect("reserved identity");
+        fs::remove_file(&target).expect("simulate external replacement");
+        fs::write(&target, b"external").expect("external replacement");
+
+        cleanup_reserved_destination_if_ours(&target, &reserved_identity);
+
+        assert_eq!(fs::read(&target).expect("replacement preserved"), b"external");
+    }
+
+    #[test]
+    fn skip_during_recursive_planning_skips_child_not_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("a.flac"), b"a").expect("a");
+        fs::write(source.join("b.flac"), b"bb").expect("b");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx.send(crate::tui::app::FileTaskControl::Pause).expect("pause root scan");
+        control_tx.send(crate::tui::app::FileTaskControl::Resume).expect("resume root scan");
+        control_tx.send(crate::tui::app::FileTaskControl::SkipCurrent).expect("skip first child");
+        let mut worker = worker_for_test(false, control_rx);
+
+        let result = worker
+            .build_file_task_plan_progress(&[source.clone()], &dest)
+            .expect("planning should continue after child skip");
+        let FileTaskPlanBuildStep::Ready(plan) = result else {
+            panic!("planning should complete after child skip");
+        };
+
+        assert_eq!(plan.roots.len(), 1, "parent/root remains planned");
+        assert_eq!(plan.roots[0].source, source);
+        assert_eq!(plan.totals.files, 1, "one child remains planned");
+        assert_eq!(worker.totals.skipped, 1);
+        assert_eq!(worker.totals.unknown_size_items, 1);
+        assert!(!dest.exists(), "planning must not create destination");
+    }
+
+    #[test]
+    fn directory_merge_counts_as_merged_not_overwritten() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let target = temp.path().join("album-copy");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("new.flac"), b"new").expect("new");
+        fs::create_dir(&target).expect("target dir");
+        fs::write(target.join("old.flac"), b"old").expect("old");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::ConflictResolution {
+                request_id: 1,
+                resolution: tui_file_picker::ConflictResolution::Merge { apply_to_all: false },
+            })
+            .expect("queue merge");
+        let mut worker = worker_for_test(false, control_rx);
+
+        let result = worker
+            .copy_dir_recursive_progress(&source, &target)
+            .expect("merge directory");
+
+        assert_eq!(result, FileTaskStep::Completed);
+        assert_eq!(worker.totals.merged, 1);
+        assert_eq!(worker.totals.overwritten, 0);
+        assert!(target.join("old.flac").exists());
+        assert_eq!(fs::read(target.join("new.flac")).expect("new copied"), b"new");
+    }
+
+    #[test]
+    fn file_task_plan_rejects_descendant_destination_before_create() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let nested_dest = source.join("nested");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("track.flac"), b"audio").expect("source file");
+
+        let err = build_file_task_plan(&[source.clone()], &nested_dest)
+            .expect_err("descendant destination must fail during planning");
+
+        assert!(
+            err.contains("refusing to copy or move directory into itself"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !nested_dest.exists(),
+            "planning must not create the unsafe nested destination"
+        );
+    }
 }
 
 /// Commit a rename for a browse entry: validates the new name, constructs the
@@ -14666,6 +17532,16 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         // without rebuilding resize/encode protocol state.
         app.request_image_preview_repaint();
         handle_metadata_editor_mouse(app, mouse, tx);
+        return;
+    }
+    // Global reusable file picker: the picker crate owns hit testing for its
+    // last rendered geometry.
+    if matches!(app.active_overlay, ActiveOverlay::FilePicker(_)) {
+        handle_global_file_picker_mouse(app, mouse, tx);
+        return;
+    }
+    if matches!(app.active_overlay, ActiveOverlay::FileTaskProgress(_)) {
+        handle_file_task_progress_mouse(app, mouse);
         return;
     }
     // MbSelect picker: dedicated handler (clickable rows, footer pills,

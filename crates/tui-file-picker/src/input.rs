@@ -414,6 +414,7 @@ impl FilePickerState {
                 }
                 FilePickerAction::None
             }
+            ToolbarAction::AcceptSelection => self.accept_current_selection(),
             ToolbarAction::Go => self.commit_address(),
         }
     }
@@ -602,6 +603,25 @@ mod tests {
         let index = picker.entries().iter().position(|entry| entry.path == file).expect("file visible");
         picker.set_file_cursor(index, 4);
         assert_eq!(picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), FilePickerAction::Selected(file));
+    }
+
+    #[test]
+    fn space_accepts_current_directory_in_directory_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child");
+        fs::create_dir(&child).expect("child");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::Directories,
+            ..FilePickerConfig::default()
+        });
+        let child_index = picker.entries().iter().position(|entry| entry.path == child).expect("child visible");
+        picker.set_file_cursor(child_index, 4);
+
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            FilePickerAction::Selected(temp.path().to_path_buf())
+        );
     }
 
     #[test]

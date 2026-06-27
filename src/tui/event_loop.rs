@@ -395,6 +395,33 @@ fn reduce_file_picker_complete(
                 }
             }
         }
+        super::app::FilePickerPurpose::CopyTo { sources, force }
+        | super::app::FilePickerPurpose::MoveTo { sources, force } => {
+            let is_move = matches!(purpose, super::app::FilePickerPurpose::MoveTo { .. });
+            let op = if is_move { "move" } else { "copy" };
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status(format!("file picker: ignored stale {op} completion"));
+                return;
+            }
+            let Some(dest_dir) = path else {
+                app.set_status(format!("{op} cancelled"));
+                return;
+            };
+            if !dest_dir.is_dir() {
+                app.set_status(format!(
+                    "{op} destination is not a directory: {}",
+                    dest_dir.display()
+                ));
+                return;
+            }
+            let target = if is_move {
+                super::app::TextEditTarget::BrowseMove { sources, force }
+            } else {
+                super::app::TextEditTarget::BrowseCopy { sources, force }
+            };
+            let dest = dest_dir.to_string_lossy().into_owned();
+            super::keybindings::apply_file_op_with_tx(app, target, &dest, tx);
+        }
         super::app::FilePickerPurpose::Generic { id } => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status(format!("file picker purpose '{id}': ignored stale completion"));
@@ -421,6 +448,62 @@ fn reduce_file_picker_complete(
     }
 }
 
+
+fn reduce_file_task_progress(
+    app: &mut AppState,
+    session_id: u64,
+    update: tui_file_picker::FileTaskProgressUpdate,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let terminal = matches!(
+        &update,
+        tui_file_picker::FileTaskProgressUpdate::Finished { .. }
+            | tui_file_picker::FileTaskProgressUpdate::Failed { .. }
+            | tui_file_picker::FileTaskProgressUpdate::Aborted { .. }
+    );
+    let status = match &update {
+        tui_file_picker::FileTaskProgressUpdate::SetScope { .. }
+        | tui_file_picker::FileTaskProgressUpdate::ClearConflict => None,
+        tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict } => {
+            Some(format!("file task conflict: {}", conflict.title))
+        }
+        tui_file_picker::FileTaskProgressUpdate::Snapshot { status, .. }
+        | tui_file_picker::FileTaskProgressUpdate::Finished { status, .. }
+        | tui_file_picker::FileTaskProgressUpdate::Failed { status, .. }
+        | tui_file_picker::FileTaskProgressUpdate::Aborted { status, .. } => Some(status.clone()),
+        tui_file_picker::FileTaskProgressUpdate::RecordError { error, .. } => {
+            Some(format!("file task error: {}", error.message))
+        }
+    };
+
+    let mut status_to_set: Option<String> = None;
+    let mut refresh_after_terminal = false;
+    match &mut app.active_overlay {
+        ActiveOverlay::FileTaskProgress(session) if session.session_id == session_id => {
+            session.progress.apply_update(update);
+            status_to_set = status;
+            refresh_after_terminal = terminal;
+        }
+        ActiveOverlay::FileTaskProgress(_) => {
+            status_to_set = Some(format!("file task: ignored stale progress for session {session_id}"));
+        }
+        _ if terminal => {
+            status_to_set = status;
+            refresh_after_terminal = true;
+        }
+        _ => {}
+    }
+
+    if let Some(status) = status_to_set {
+        app.set_status(status);
+    }
+    if refresh_after_terminal {
+        app.browse.refresh();
+        app.browse.probe_current_with_db(tx, Some(&app.db));
+        super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+    }
+}
+
 fn close_matching_file_picker(
     app: &mut AppState,
     session_id: u64,
@@ -429,6 +512,12 @@ fn close_matching_file_picker(
     let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
     let mut matched = false;
     match overlay {
+        ActiveOverlay::FilePicker(session) => {
+            matched = session.session_id == session_id && &session.purpose == purpose;
+            if !matched {
+                app.active_overlay = ActiveOverlay::FilePicker(session);
+            }
+        }
         ActiveOverlay::MetadataEditor(mut state) => {
             let matches_open_picker = state
                 .file_picker
@@ -1134,6 +1223,9 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         }
         AppMessage::FilePickerComplete { session_id, purpose, path } => {
             reduce_file_picker_complete(app, session_id, purpose, path, tx);
+        }
+        AppMessage::FileTaskProgress { session_id, update } => {
+            reduce_file_task_progress(app, session_id, update, tx);
         }
         AppMessage::MetadataEditorDetailsProbeComplete { session_id, generation, total, results } => {
             let mut reduced = false;
@@ -3132,5 +3224,308 @@ mod artwork_file_picker_completion_tests {
             }
             other => panic!("expected metadata editor after stale completion, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_move_file_picker_flow_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{FilePickerPurpose, MetadataFilePickerState};
+    use crate::tui::browse::{BrowseEntry, EntryKind};
+    use crate::tui::command::Command;
+    use crate::tui::context_menu::{execute_context_action, ContextAction};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(16);
+        tx
+    }
+
+    fn app_with_selected_path(current_dir: &Path, path: PathBuf, kind: EntryKind) -> AppState {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = current_dir.to_path_buf();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "selected".to_string());
+        let size = fs::metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
+        app.browse.entries = vec![BrowseEntry::new(path, name, kind, size, None)];
+        app.browse.selected_index = 0;
+        app.browse.multi_selected.clear();
+        app.active_overlay = ActiveOverlay::None;
+        app
+    }
+
+    fn active_picker(app: &AppState) -> &MetadataFilePickerState {
+        match &app.active_overlay {
+            ActiveOverlay::FilePicker(session) => session,
+            other => panic!("expected file picker overlay, got {other:?}"),
+        }
+    }
+
+    fn assert_copy_picker(app: &AppState, expected_sources: &[PathBuf]) {
+        let session = active_picker(app);
+        match &session.purpose {
+            FilePickerPurpose::CopyTo { sources, force } => {
+                assert_eq!(sources, expected_sources);
+                assert!(!force);
+            }
+            other => panic!("expected CopyTo picker purpose, got {other:?}"),
+        }
+        assert_eq!(
+            session.picker.selection_mode(),
+            tui_file_picker::FilePickerSelectionMode::Directories
+        );
+    }
+
+    fn assert_move_picker(app: &AppState, expected_sources: &[PathBuf]) {
+        let session = active_picker(app);
+        match &session.purpose {
+            FilePickerPurpose::MoveTo { sources, force } => {
+                assert_eq!(sources, expected_sources);
+                assert!(!force);
+            }
+            other => panic!("expected MoveTo picker purpose, got {other:?}"),
+        }
+        assert_eq!(
+            session.picker.selection_mode(),
+            tui_file_picker::FilePickerSelectionMode::Directories
+        );
+    }
+
+    #[test]
+    fn context_menu_copy_and_move_open_directory_picker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        fs::write(&source, b"audio").expect("source file");
+
+        let mut copy_app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        execute_context_action(&mut copy_app, ContextAction::CopyTo, &tx(), false);
+        assert_copy_picker(&copy_app, &[source.clone()]);
+
+        let mut move_app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        execute_context_action(&mut move_app, ContextAction::MoveTo, &tx(), false);
+        assert_move_picker(&move_app, &[source]);
+    }
+
+    #[test]
+    fn bare_cp_and_mv_commands_open_directory_picker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        fs::write(&source, b"audio").expect("source file");
+
+        let mut copy_app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        crate::tui::command::execute_command(
+            &mut copy_app,
+            Command::Copy { dest: String::new(), force: false },
+            &tx(),
+        );
+        assert_copy_picker(&copy_app, &[source.clone()]);
+
+        let mut move_app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        crate::tui::command::execute_command(
+            &mut move_app,
+            Command::Move { dest: String::new(), force: false },
+            &tx(),
+        );
+        assert_move_picker(&move_app, &[source]);
+    }
+
+    #[test]
+    fn picker_selected_destination_starts_copy_progress_overlay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let dest = temp.path().join("dest");
+        fs::write(&source, b"audio").expect("source file");
+        fs::create_dir(&dest).expect("dest dir");
+
+        let mut app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        crate::tui::command::execute_command(
+            &mut app,
+            Command::Copy { dest: String::new(), force: false },
+            &tx(),
+        );
+        let session = active_picker(&app);
+        let session_id = session.session_id;
+        let purpose = session.purpose.clone();
+
+        handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id,
+                purpose,
+                path: Some(dest.clone()),
+            },
+            &tx(),
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::FileTaskProgress(session) => {
+                assert_eq!(session.progress.kind, tui_file_picker::FileTaskKind::Copy);
+            }
+            other => panic!("expected copy progress overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picker_selected_destination_starts_move_progress_overlay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let dest = temp.path().join("dest");
+        fs::write(&source, b"audio").expect("source file");
+        fs::create_dir(&dest).expect("dest dir");
+
+        let mut app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        crate::tui::command::execute_command(
+            &mut app,
+            Command::Move { dest: String::new(), force: false },
+            &tx(),
+        );
+        let session = active_picker(&app);
+        let session_id = session.session_id;
+        let purpose = session.purpose.clone();
+
+        handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id,
+                purpose,
+                path: Some(dest.clone()),
+            },
+            &tx(),
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::FileTaskProgress(session) => {
+                assert_eq!(session.progress.kind, tui_file_picker::FileTaskKind::Move);
+            }
+            other => panic!("expected move progress overlay, got {other:?}"),
+        }
+    }
+
+
+
+    #[test]
+    fn directory_mode_move_rejects_destination_inside_source_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let nested_dest = source.join("nested");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("track.flac"), b"audio").expect("source file");
+        fs::create_dir(&nested_dest).expect("nested destination dir");
+
+        let mut app = app_with_selected_path(temp.path(), source.clone(), EntryKind::Directory);
+        crate::tui::command::execute_command(
+            &mut app,
+            Command::Move { dest: String::new(), force: false },
+            &tx(),
+        );
+        let session = active_picker(&app);
+        let session_id = session.session_id;
+        let purpose = session.purpose.clone();
+
+        handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id,
+                purpose,
+                path: Some(nested_dest.clone()),
+            },
+            &tx(),
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::FileTaskProgress(session) => {
+                assert_eq!(session.progress.kind, tui_file_picker::FileTaskKind::Move);
+            }
+            other => panic!("expected move progress overlay, got {other:?}"),
+        }
+        assert!(source.exists(), "worker preflight must preserve the source directory");
+        assert!(
+            !nested_dest.join("album").exists(),
+            "recursive destination target must not be created synchronously"
+        );
+    }
+
+    #[test]
+    fn stale_copy_move_picker_completion_is_ignored() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let dest = temp.path().join("dest");
+        fs::write(&source, b"audio").expect("source file");
+        fs::create_dir(&dest).expect("dest dir");
+
+        let mut app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        crate::tui::command::execute_command(
+            &mut app,
+            Command::Copy { dest: String::new(), force: false },
+            &tx(),
+        );
+        let session = active_picker(&app);
+        let active_session_id = session.session_id;
+        let purpose = session.purpose.clone();
+
+        handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id: active_session_id.saturating_add(1),
+                purpose,
+                path: Some(dest.clone()),
+            },
+            &tx(),
+        );
+
+        assert_eq!(active_picker(&app).session_id, active_session_id);
+        assert!(!dest.join("track.flac").exists(), "stale completion must not copy");
+        let status = app.status_message.as_ref().map(|(message, _)| message.as_str());
+        assert!(
+            status.unwrap_or_default().contains("ignored stale copy completion"),
+            "unexpected status: {status:?}"
+        );
+    }
+
+    #[test]
+    fn directory_mode_copy_rejects_destination_inside_source_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let nested_dest = source.join("nested");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("track.flac"), b"audio").expect("source file");
+        fs::create_dir(&nested_dest).expect("nested destination dir");
+
+        let mut app = app_with_selected_path(temp.path(), source.clone(), EntryKind::Directory);
+        crate::tui::command::execute_command(
+            &mut app,
+            Command::Copy { dest: String::new(), force: false },
+            &tx(),
+        );
+        let session = active_picker(&app);
+        let session_id = session.session_id;
+        let purpose = session.purpose.clone();
+
+        handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id,
+                purpose,
+                path: Some(nested_dest.clone()),
+            },
+            &tx(),
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::FileTaskProgress(session) => {
+                assert_eq!(session.progress.kind, tui_file_picker::FileTaskKind::Copy);
+            }
+            other => panic!("expected copy progress overlay, got {other:?}"),
+        }
+        assert!(source.exists(), "worker preflight must preserve the source directory");
+        assert!(
+            !nested_dest.join("album").exists(),
+            "recursive destination target must not be created synchronously"
+        );
     }
 }

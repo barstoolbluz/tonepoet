@@ -111,6 +111,9 @@ pub enum ToolbarAction {
     Up,
     FileOperations,
     Properties,
+    /// Accept the current picker result. In directory-selection mode this
+    /// confirms the current directory rather than the highlighted child.
+    AcceptSelection,
     Go,
 }
 
@@ -1353,9 +1356,6 @@ impl FilePickerState {
 
     pub fn accept_current_selection(&mut self) -> FilePickerAction {
         if self.selection_mode == FilePickerSelectionMode::Directories {
-            if let Some(selected) = self.selected.clone().filter(|path| path.is_dir()) {
-                return FilePickerAction::Selected(selected);
-            }
             return FilePickerAction::Selected(self.current_dir.clone());
         }
         let Some(entry) = self.entries.get(self.file_cursor).cloned() else {
@@ -2006,6 +2006,32 @@ mod tests {
         assert!(picker.entries().iter().any(|entry| entry.name == "child"));
         assert!(picker.entries().iter().any(|entry| entry.name == "cover.png"));
         assert!(!picker.entries().iter().any(|entry| entry.name == "notes.txt"));
+    }
+
+    #[test]
+    fn directory_mode_accepts_current_dir_not_highlighted_child() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child");
+        fs::create_dir(&child).expect("child");
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::Directories,
+            ..FilePickerConfig::default()
+        });
+        let child_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == child)
+            .expect("child visible");
+        picker.set_file_cursor(child_index, 8);
+
+        assert_eq!(picker.selected_path(), Some(child.as_path()));
+        assert_eq!(
+            picker.accept_current_selection(),
+            FilePickerAction::Selected(temp.path().to_path_buf())
+        );
+        assert_eq!(picker.current_dir(), temp.path());
     }
 
     #[test]

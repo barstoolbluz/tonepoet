@@ -73,6 +73,28 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         return;
     }
 
+    if let ActiveOverlay::FilePicker(session) = &mut app.active_overlay {
+        let image_picker_generation = app.image_picker_generation;
+        let image_repaint_generation = app.image_repaint_generation;
+        let parent = f.size();
+        draw_file_picker_overlay(
+            f,
+            session,
+            parent,
+            &mut app.button_map,
+            &mut app.image_picker,
+            image_picker_generation,
+            image_repaint_generation,
+        );
+        return;
+    }
+
+    if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+        let area = file_task_progress_overlay_area(f.size());
+        session.progress.render(f, area);
+        return;
+    }
+
     // Clone overlay data to avoid borrow issues for overlays whose rendering does
     // not need to refresh crate-owned hit-test state.
     let overlay = app.active_overlay.clone();
@@ -125,6 +147,8 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::Help { screen, scroll } => {
             super::help::draw_help(f, screen, scroll);
         }
+        ActiveOverlay::FilePicker(_) => {}
+        ActiveOverlay::FileTaskProgress(_) => {}
         ActiveOverlay::MetadataEditor(_) => {}
         ActiveOverlay::CuePreview(ref state) => {
             draw_cue_preview(f, state, &mut app.button_map);
@@ -4500,6 +4524,17 @@ pub(crate) fn file_picker_overlay_area(parent: Rect) -> Rect {
         .saturating_div(100)
         .max(16)
         .min(parent.height.saturating_sub(2));
+    Rect::new(
+        parent.x + parent.width.saturating_sub(width) / 2,
+        parent.y + parent.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn file_task_progress_overlay_area(parent: Rect) -> Rect {
+    let width = parent.width.min(92).max(parent.width.min(44));
+    let height = parent.height.min(19).max(parent.height.min(13));
     Rect::new(
         parent.x + parent.width.saturating_sub(width) / 2,
         parent.y + parent.height.saturating_sub(height) / 2,

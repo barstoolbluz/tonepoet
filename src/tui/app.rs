@@ -2545,6 +2545,12 @@ pub enum ActiveOverlay {
         /// Scroll offset in the help content.
         scroll: usize,
     },
+    /// Reusable global file picker overlay used outside the metadata editor.
+    FilePicker(MetadataFilePickerState),
+    /// Reusable file-task progress overlay hosted by Tonepoet. The state and
+    /// renderer live in the file-picker crate; this wrapper only stores the
+    /// app-side control channel and session identity.
+    FileTaskProgress(FileTaskProgressSession),
     /// Full metadata tag editor overlay.
     MetadataEditor(Box<MetadataEditorState>),
     /// Read-only preview of a proposed CUE sheet (from `:cue-mb` /
@@ -2926,6 +2932,45 @@ pub struct MetadataArtworkWriteState {
     pub file_count: usize,
 }
 
+
+/// App-side control requests for a hosted file task.
+///
+/// These are intentionally app-local: the reusable picker crate emits semantic
+/// [`tui_file_picker::FileTaskUserAction`] values, and Tonepoet maps them to
+/// these concrete worker controls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTaskControl {
+    Pause,
+    Resume,
+    SkipCurrent,
+    Abort,
+    ConflictResolution {
+        request_id: u64,
+        resolution: tui_file_picker::ConflictResolution,
+    },
+}
+
+/// Host wrapper around the reusable crate-owned progress overlay.
+#[derive(Debug, Clone)]
+pub struct FileTaskProgressSession {
+    pub session_id: u64,
+    pub progress: tui_file_picker::FileTaskProgressState,
+    pub controls: mpsc::Sender<FileTaskControl>,
+}
+
+impl FileTaskProgressSession {
+    pub fn new(
+        progress: tui_file_picker::FileTaskProgressState,
+        controls: mpsc::Sender<FileTaskControl>,
+    ) -> Self {
+        Self {
+            session_id: next_file_task_session_id(),
+            progress,
+            controls,
+        }
+    }
+}
+
 /// Tonepoet-specific purpose for a reusable file-picker session.
 ///
 /// The picker crate intentionally does not know what a selected path means.
@@ -2938,6 +2983,22 @@ pub enum FilePickerPurpose {
     },
     SelectFile,
     SelectDirectory,
+    /// Browse-screen destination picker for copy operations.
+    ///
+    /// `sources` is captured before the picker opens so later cursor or
+    /// selection changes cannot redirect the operation.
+    CopyTo {
+        sources: Vec<PathBuf>,
+        force: bool,
+    },
+    /// Browse-screen destination picker for move operations.
+    ///
+    /// `sources` is captured before the picker opens so later cursor or
+    /// selection changes cannot redirect the operation.
+    MoveTo {
+        sources: Vec<PathBuf>,
+        force: bool,
+    },
     Generic {
         id: String,
     },
@@ -3225,6 +3286,9 @@ static METADATA_EDITOR_DETAILS_SESSION_COUNTER: std::sync::atomic::AtomicU64 =
 static FILE_PICKER_SESSION_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
+static FILE_TASK_SESSION_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 /// Allocate a process-unique file-picker session id.
 ///
 /// Every picker completion carries this id back to the event loop. The reducer
@@ -3234,6 +3298,14 @@ static FILE_PICKER_SESSION_COUNTER: std::sync::atomic::AtomicU64 =
 /// artwork picker session.
 pub fn next_file_picker_session_id() -> u64 {
     FILE_PICKER_SESSION_COUNTER.fetch_add(
+        1,
+        std::sync::atomic::Ordering::Relaxed,
+    )
+}
+
+/// Allocate a process-unique file-task progress session id.
+pub fn next_file_task_session_id() -> u64 {
+    FILE_TASK_SESSION_COUNTER.fetch_add(
         1,
         std::sync::atomic::Ordering::Relaxed,
     )
