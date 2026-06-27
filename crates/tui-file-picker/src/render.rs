@@ -285,13 +285,13 @@ impl FilePickerState {
             self.request_image_preview_load(entry.path.clone());
         }
 
-        let area_changed = self.image_preview_cache.preview_area != Some(inner);
-        let protocol_changed = self.image_preview_cache.protocol_generation != image_ctx.protocol_generation;
-        if area_changed || protocol_changed {
-            self.image_preview_cache.preview_area = Some(inner);
-            self.image_preview_cache.protocol_generation = image_ctx.protocol_generation;
-            self.image_preview_cache.protocol = None;
-        }
+        // Update cached area and generation for prepare_image_preview_protocol,
+        // but do NOT clear the protocol here — let it continue rendering the
+        // existing image until prepare rebuilds it. Clearing causes a visible
+        // flash on every mouse move because the protocol is destroyed before
+        // the post-draw prepare cycle can recreate it.
+        self.image_preview_cache.preview_area = Some(inner);
+        self.image_preview_cache.protocol_generation = image_ctx.protocol_generation;
 
         if image_ctx.picker.is_none() {
             self.image_preview_cache.error = Some(

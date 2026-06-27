@@ -4999,13 +4999,11 @@ fn draw_artwork_preview_pane(
         return;
     };
 
-    let area_changed = cache.preview_area != inner;
-    let protocol_changed = cache.protocol_generation != image_picker_generation;
-    if area_changed || protocol_changed {
-        cache.preview_area = inner;
-        cache.protocol_generation = image_picker_generation;
-        cache.image_protocol = None;
-    }
+    // Update cached area and generation for the post-draw prepare cycle,
+    // but keep rendering the existing protocol until prepare rebuilds it.
+    // Clearing here causes a visible flash on mouse move.
+    cache.preview_area = inner;
+    cache.protocol_generation = image_picker_generation;
 
     if let Some(protocol) = cache.image_protocol.as_mut() {
         let image = ratatui_image::StatefulImage::new(None);

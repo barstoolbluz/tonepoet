@@ -6153,9 +6153,10 @@ impl AppState {
                     .prepare_image_preview_protocol(&mut self.image_picker, protocol_generation);
             }
         }
-        if changed {
-            self.force_redraw = true;
-        }
+        // No force_redraw — the next normal render cycle picks up the new
+        // protocol. force_redraw triggers terminal.clear() which causes a
+        // visible full-screen flash.
+        let _ = changed;
     }
 
     /// Set a status message that will auto-clear after 5 seconds
