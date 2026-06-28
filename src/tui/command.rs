@@ -4731,6 +4731,11 @@ pub(super) fn open_file_picker_for_copy_move(
         title: title.clone(),
         theme: super::keybindings::file_picker_theme_from_tonepoet_theme(),
         selection_mode: tui_file_picker::FilePickerSelectionMode::Directories,
+        // Destination pickers always start in explicit "Ask" mode. Even `:cp!`
+        // / `:mv!` force commands should not silently pre-select overwrite after
+        // the user has chosen to go through the interactive destination picker;
+        // the user can still click "Overwrite" before starting the operation.
+        conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Ask),
         operation_policy: directory_destination_picker_policy(),
         ..tui_file_picker::FilePickerConfig::default()
     });

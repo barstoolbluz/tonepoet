@@ -5,13 +5,14 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_ERROR_RECORDS: usize = 8;
 const DEFAULT_MAX_CONFLICT_RECORDS: usize = 8;
 const MIN_PROGRESS_DIALOG_WIDTH: u16 = 52;
 const PROGRESS_DIALOG_HEIGHT: u16 = 12;
+const CONFLICT_DIALOG_HEIGHT: u16 = 15;
 
 /// Generic category label for a long-running file-oriented task.
 ///
@@ -290,6 +291,14 @@ pub enum FileTaskProgressUpdate {
     ShowConflict {
         conflict: ConflictPromptState,
     },
+    /// Refine the displayed comparison data for the currently active conflict.
+    /// Hosts use this for non-blocking best-effort metadata such as directory
+    /// content size. Stale request ids are ignored by `FileTaskProgressState`.
+    UpdateConflictExistingStats {
+        request_id: u64,
+        size: u64,
+        modified: Option<SystemTime>,
+    },
     /// Clear the active conflict prompt after the host has applied or abandoned
     /// a resolution.
     ClearConflict,
@@ -333,10 +342,10 @@ pub enum FileTaskUserAction {
 /// mutation, and account the resulting disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAction {
-    /// Replace an existing destination for this item.
+    /// Replace the existing destination. Hosts interpret this contextually:
+    /// directory-to-directory conflicts merge into the destination directory,
+    /// while file/symlink/item conflicts replace the existing path.
     Overwrite,
-    /// Merge a source directory into an existing destination directory.
-    Merge,
     /// Skip this item and continue the job.
     Skip,
     /// Ask the host to choose a deterministic non-conflicting destination.
@@ -349,7 +358,6 @@ impl ConflictAction {
     fn label(self) -> &'static str {
         match self {
             Self::Overwrite => "Overwrite",
-            Self::Merge => "Merge",
             Self::Skip => "Skip",
             Self::Rename => "Rename",
             Self::Abort => "Abort",
@@ -357,7 +365,7 @@ impl ConflictAction {
     }
 
     fn supports_apply_to_all(self) -> bool {
-        matches!(self, Self::Overwrite | Self::Merge | Self::Skip)
+        matches!(self, Self::Overwrite | Self::Skip)
     }
 }
 
@@ -368,8 +376,9 @@ impl ConflictAction {
 /// apply the chosen policy safely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictResolution {
+    /// Replace or merge, depending on the current conflict context. Directory
+    /// into existing directory means merge; other conflicts mean replace.
     Overwrite { apply_to_all: bool },
-    Merge { apply_to_all: bool },
     Skip { apply_to_all: bool },
     Rename,
     Abort,
@@ -402,6 +411,15 @@ pub struct ConflictPromptState {
     pub choices: Vec<ConflictAction>,
     pub selected: usize,
     pub apply_to_all: bool,
+    /// 1-based index for this conflict within the current job.
+    pub conflict_index: u64,
+    /// Total known conflicts for the current job, if the host computed one from
+    /// its plan. `None` avoids presenting a misleading "N of M" count.
+    pub conflict_count: Option<u64>,
+    pub existing_size: Option<u64>,
+    pub existing_modified: Option<SystemTime>,
+    pub incoming_size: Option<u64>,
+    pub incoming_modified: Option<SystemTime>,
 }
 
 impl ConflictPromptState {
@@ -426,6 +444,12 @@ impl ConflictPromptState {
             ],
             selected: 0,
             apply_to_all: false,
+            conflict_index: request_id,
+            conflict_count: None,
+            existing_size: None,
+            existing_modified: None,
+            incoming_size: None,
+            incoming_modified: None,
         }
     }
 
@@ -440,7 +464,6 @@ impl ConflictPromptState {
             .unwrap_or(false);
         match self.selected_action()? {
             ConflictAction::Overwrite => Some(ConflictResolution::Overwrite { apply_to_all }),
-            ConflictAction::Merge => Some(ConflictResolution::Merge { apply_to_all }),
             ConflictAction::Skip => Some(ConflictResolution::Skip { apply_to_all }),
             ConflictAction::Rename => Some(ConflictResolution::Rename),
             ConflictAction::Abort => Some(ConflictResolution::Abort),
@@ -566,6 +589,32 @@ impl FileTaskProgressState {
             }
             FileTaskProgressUpdate::ShowConflict { conflict } => {
                 self.show_conflict(conflict);
+            }
+            FileTaskProgressUpdate::UpdateConflictExistingStats { request_id, size, modified } => {
+                let active_matches = self
+                    .conflict
+                    .as_ref()
+                    .map(|conflict| conflict.request_id == request_id)
+                    .unwrap_or(false);
+                if active_matches {
+                    if let Some(conflict) = self.conflict.as_mut() {
+                        conflict.existing_size = Some(size);
+                        if let Some(modified) = modified.clone() {
+                            conflict.existing_modified = Some(modified);
+                        }
+                    }
+                    if let Some(record) = self
+                        .conflict_records
+                        .iter_mut()
+                        .rev()
+                        .find(|conflict| conflict.request_id == request_id)
+                    {
+                        record.existing_size = Some(size);
+                        if let Some(modified) = modified.clone() {
+                            record.existing_modified = Some(modified);
+                        }
+                    }
+                }
             }
             FileTaskProgressUpdate::ClearConflict => {
                 self.clear_conflict();
@@ -717,11 +766,10 @@ impl FileTaskProgressState {
                 .map(FileTaskUserAction::ChooseConflictResolution)
                 .unwrap_or(FileTaskUserAction::None),
             KeyCode::Char('o') => self.choose_conflict_action(ConflictAction::Overwrite),
-            KeyCode::Char('m') => self.choose_conflict_action(ConflictAction::Merge),
             KeyCode::Char('s') => self.choose_conflict_action(ConflictAction::Skip),
             KeyCode::Char('r') => self.choose_conflict_action(ConflictAction::Rename),
             KeyCode::Char('a') => self.choose_conflict_action(ConflictAction::Abort),
-            KeyCode::Esc => FileTaskUserAction::None,
+            KeyCode::Esc => self.choose_conflict_action(ConflictAction::Abort),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.choose_conflict_action(ConflictAction::Abort)
             }
@@ -746,10 +794,20 @@ impl FileTaskProgressState {
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.hit_regions.clear();
         self.last_area = Some(area);
-        if area.width < MIN_PROGRESS_DIALOG_WIDTH || area.height < PROGRESS_DIALOG_HEIGHT {
+        let dialog_height = if self.conflict.is_some() {
+            CONFLICT_DIALOG_HEIGHT
+        } else {
+            PROGRESS_DIALOG_HEIGHT
+        };
+        if area.width < MIN_PROGRESS_DIALOG_WIDTH || area.height < dialog_height {
             frame.render_widget(Clear, area);
             frame.render_widget(
-                Paragraph::new("Progress overlay needs at least 52x12 cells").style(self.theme.error),
+                Paragraph::new(format!(
+                    "Progress overlay needs at least {}x{} cells",
+                    MIN_PROGRESS_DIALOG_WIDTH,
+                    dialog_height
+                ))
+                .style(self.theme.error),
                 area,
             );
             return;
@@ -757,7 +815,7 @@ impl FileTaskProgressState {
 
         // Use the full available width (clamped to minimum), center vertically.
         let dialog_width = area.width.max(MIN_PROGRESS_DIALOG_WIDTH);
-        let dialog_area = centered_fixed_rect(area, dialog_width, PROGRESS_DIALOG_HEIGHT);
+        let dialog_area = centered_fixed_rect(area, dialog_width, dialog_height);
         frame.render_widget(Clear, dialog_area);
         if self.conflict.is_some() {
             self.render_conflict(frame, dialog_area);
@@ -780,70 +838,102 @@ impl FileTaskProgressState {
         self.render_total_summary_row(frame, area, 6);
         self.render_total_progress_row(frame, area, 7);
         self.render_transfer_stats_row(frame, area, 8);
-        self.render_rule(frame, area, 9, '├', '┤');
+        self.render_rule(frame, area, 9, '\u{251c}', '\u{2524}');
         self.render_action_row(frame, area, 10, self.progress_buttons());
-        self.render_rule(frame, area, 11, '└', '┘');
+        self.render_rule(frame, area, 11, '\u{2514}', '\u{2518}');
     }
 
     fn render_conflict(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let separator_row = area.height.saturating_sub(3);
-        let button_row = area.height.saturating_sub(2);
-        let bottom_row = area.height.saturating_sub(1);
+        debug_assert!(area.width >= MIN_PROGRESS_DIALOG_WIDTH);
+        debug_assert_eq!(area.height, CONFLICT_DIALOG_HEIGHT);
 
-        self.render_title_bar(frame, area, 0);
+        frame.render_widget(Paragraph::new("").style(self.theme.progress_dialog), area);
         if let Some(conflict) = self.conflict.as_ref() {
-            self.render_bordered_spans(
-                frame,
-                area,
-                1,
-                vec![
-                    Span::styled("  conflict: ", self.theme.error),
-                    Span::styled(
-                        fit_text(&conflict.title, area.width.saturating_sub(14) as usize).0,
-                        self.theme.error,
-                    ),
-                ],
-            );
-            self.render_bordered_text(frame, area, 2, &format!("  {}", conflict.message), self.theme.progress_text);
-            let destination = conflict
-                .destination
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "—".to_string());
+            let title = conflict_dialog_title(conflict);
+            self.render_title_bar_with_title(frame, area, 0, &title);
+            self.render_empty_row(frame, area, 1);
             self.render_bordered_text(
                 frame,
                 area,
-                3,
-                &format!("  Destination: {}", destination),
-                self.theme.progress_text_dim,
+                2,
+                item_kind_conflict_statement(conflict.item_kind),
+                self.theme.progress_text,
             );
+            self.render_empty_row(frame, area, 3);
+
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let item_name = conflict_item_name(conflict);
+            let item_text = format!("    {}", fit_text(&item_name, inner_width.saturating_sub(4)).0);
+            self.render_bordered_text(frame, area, 4, &item_text, self.theme.progress_current_file);
+
+            let parent = conflict_parent_display(conflict);
+            let parent_text = format!("    {}", fit_text(&parent, inner_width.saturating_sub(4)).0);
+            self.render_bordered_text(frame, area, 5, &parent_text, self.theme.progress_text_dim);
+
+            self.render_empty_row(frame, area, 6);
             self.render_bordered_text(
                 frame,
                 area,
-                4,
-                &format!(
-                    "  [{}] Apply to all conflicts",
-                    if conflict.apply_to_all { "x" } else { " " }
+                7,
+                &conflict_comparison_text(
+                    "existing",
+                    conflict.existing_size,
+                    conflict.existing_modified,
                 ),
                 self.theme.progress_text_dim,
             );
+            self.render_bordered_text(
+                frame,
+                area,
+                8,
+                &conflict_comparison_text(
+                    "incoming",
+                    conflict.incoming_size,
+                    conflict.incoming_modified,
+                ),
+                self.theme.progress_text,
+            );
+            self.render_empty_row(frame, area, 9);
+
+            let marker = if conflict.apply_to_all { "\u{00d7}" } else { " " };
+            let checkbox = format!("    [{}] Apply to all remaining conflicts", marker);
+            self.render_bordered_text(frame, area, 10, &checkbox, self.theme.progress_text_dim);
+            let width = checkbox.chars().count().min(inner_width) as u16;
+            let rect = Rect::new(area.x.saturating_add(1), area.y.saturating_add(10), width, 1);
+            if let Some(clipped) = intersect_rect(rect, area) {
+                self.hit_regions.push(ProgressHitRegion {
+                    rect: clipped,
+                    action: ProgressHitAction::ToggleApplyAll,
+                });
+            }
+
+            self.render_empty_row(frame, area, 11);
         }
-        self.render_extra_rows(frame, area, 5, separator_row);
-        self.render_rule(frame, area, separator_row, '├', '┤');
-        self.render_action_row(frame, area, button_row, self.conflict_buttons());
-        self.render_rule(frame, area, bottom_row, '└', '┘');
+        self.render_rule(frame, area, 12, '\u{251c}', '\u{2524}');
+        self.render_action_row(frame, area, 13, self.conflict_buttons());
+        self.render_rule(frame, area, 14, '\u{2514}', '\u{2518}');
     }
 
     fn render_title_bar(&self, frame: &mut Frame<'_>, area: Rect, row: u16) {
+        self.render_title_bar_with_title(frame, area, row, &self.title);
+    }
+
+    fn render_title_bar_with_title(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        row: u16,
+        title: &str,
+    ) {
         let width = area.width as usize;
         let available_title = width.saturating_sub(6);
-        let title = fit_text(&self.title, available_title).0;
+        let title = fit_text(title, available_title).0;
         let title_width = title.chars().count();
         let filler = width.saturating_sub(3 + title_width + 1 + 1);
         let line = Line::from(vec![
-            Span::styled("┌─ ", self.theme.progress_border),
+            Span::styled("\u{250c}\u{2500} ", self.theme.progress_border),
             Span::styled(title, self.theme.progress_title),
-            Span::styled(format!(" {}┐", "─".repeat(filler)), self.theme.progress_border),
+            Span::styled(format!(" {}\u{2510}", "\u{2500}".repeat(filler)), self.theme.progress_border),
         ]);
         self.render_full_line(frame, area, row, line);
     }
@@ -970,49 +1060,6 @@ impl FileTaskProgressState {
         self.render_bordered_text(frame, area, row, &text, self.theme.progress_text_dim);
     }
 
-    fn render_extra_rows(&self, frame: &mut Frame<'_>, area: Rect, start_row: u16, end_row: u16) {
-        if start_row >= end_row {
-            return;
-        }
-
-        let mut lines: Vec<(String, Style)> = Vec::new();
-        if self.is_terminal() || self.totals.errors > 0 || !self.status.is_empty() {
-            lines.push((format!("  {}  {}", self.phase.label(), self.status), phase_style(&self.theme, &self.phase)));
-        }
-        if self.totals.completed > 0
-            || self.totals.skipped > 0
-            || self.totals.overwritten > 0
-            || self.totals.renamed > 0
-            || self.totals.merged > 0
-            || self.totals.errors > 0
-            || self.totals.not_attempted > 0
-            || self.totals.unknown_size_items > 0
-        {
-            lines.push((format!("  {}", self.counts_text()), self.counts_style()));
-        }
-        for error in self.error_records.iter().rev() {
-            let label = if error.item_label.is_empty() {
-                error
-                    .source
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "unknown item".to_string())
-            } else {
-                error.item_label.clone()
-            };
-            lines.push((format!("  error: {} — {}", label, error.message), self.theme.error));
-        }
-
-        for row in start_row..end_row {
-            let idx = (row - start_row) as usize;
-            if let Some((line, style)) = lines.get(idx) {
-                self.render_bordered_text(frame, area, row, line, *style);
-            } else {
-                self.render_empty_row(frame, area, row);
-            }
-        }
-    }
-
     fn render_action_row(
         &mut self,
         frame: &mut Frame<'_>,
@@ -1066,7 +1113,7 @@ impl FileTaskProgressState {
         let Some(conflict) = self.conflict.as_ref() else {
             return self.progress_buttons();
         };
-        let mut buttons: Vec<(String, ProgressHitAction, Style)> = conflict
+        conflict
             .choices
             .iter()
             .enumerate()
@@ -1079,15 +1126,14 @@ impl FileTaskProgressState {
                 } else {
                     self.theme.progress_button
                 };
-                (format!(" {} ", action.label()), ProgressHitAction::Conflict(*action), style)
+                let label = if *action == ConflictAction::Abort {
+                    " Esc Abort ".to_string()
+                } else {
+                    format!(" {} ", action.label())
+                };
+                (label, ProgressHitAction::Conflict(*action), style)
             })
-            .collect();
-        buttons.push((
-            format!(" {} Apply all ", if conflict.apply_to_all { "[x]" } else { "[ ]" }),
-            ProgressHitAction::ToggleApplyAll,
-            self.theme.progress_button,
-        ));
-        buttons
+            .collect()
     }
 
     fn progress_bar_spans(&self, area: Rect, ratio: f64) -> Vec<Span<'static>> {
@@ -1141,37 +1187,6 @@ impl FileTaskProgressState {
         match self.totals.bytes_total {
             Some(total) => format!("{} / {}", format_bytes(self.totals.bytes_done), format_bytes(total)),
             None => format_bytes(self.totals.bytes_done),
-        }
-    }
-
-    fn counts_text(&self) -> String {
-        let mut parts = vec![
-            format!("completed {}", self.totals.completed),
-            format!("skipped {}", self.totals.skipped),
-            format!("overwritten {}", self.totals.overwritten),
-            format!("renamed {}", self.totals.renamed),
-            format!("merged {}", self.totals.merged),
-            format!("errors {}", self.totals.errors),
-        ];
-        if let Some(total) = self.totals.folders_total {
-            if total > 0 {
-                parts.push(format!("folders {}/{}", self.totals.folders_done, total));
-            }
-        }
-        if self.totals.not_attempted > 0 {
-            parts.push(format!("not attempted {}", self.totals.not_attempted));
-        }
-        if self.totals.unknown_size_items > 0 {
-            parts.push(format!("unknown-size {}", self.totals.unknown_size_items));
-        }
-        parts.join("   ")
-    }
-
-    fn counts_style(&self) -> Style {
-        if self.totals.errors > 0 {
-            self.theme.error
-        } else {
-            self.theme.progress_text_dim
         }
     }
 
@@ -1268,6 +1283,106 @@ fn fit_text(text: &str, max: usize) -> (String, bool) {
 }
 
 
+
+fn conflict_dialog_title(conflict: &ConflictPromptState) -> String {
+    let index = conflict.conflict_index.max(1);
+    match conflict.conflict_count {
+        Some(count) if count > 0 => format!("Conflict {} of {}", index, count.max(index)),
+        _ => format!("Conflict {}", index),
+    }
+}
+
+fn item_kind_conflict_statement(kind: ConflictItemKind) -> &'static str {
+    match kind {
+        ConflictItemKind::Directory => "  A folder of the same name already exists here:",
+        ConflictItemKind::File => "  A file of the same name already exists here:",
+        ConflictItemKind::Symlink => "  A symlink of the same name already exists here:",
+        ConflictItemKind::Other => "  An item of the same name already exists here:",
+    }
+}
+
+fn conflict_item_name(conflict: &ConflictPromptState) -> String {
+    conflict
+        .destination
+        .as_deref()
+        .and_then(Path::file_name)
+        .or_else(|| conflict.source.as_deref().and_then(Path::file_name))
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| conflict.title.clone())
+}
+
+fn conflict_parent_display(conflict: &ConflictPromptState) -> String {
+    let parent = conflict
+        .destination
+        .as_deref()
+        .and_then(Path::parent)
+        .or_else(|| conflict.source.as_deref().and_then(Path::parent));
+    parent
+        .map(|path| with_trailing_separator(display_path_with_home(path)))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn conflict_comparison_text(
+    label: &str,
+    size: Option<u64>,
+    modified: Option<SystemTime>,
+) -> String {
+    let size = size.map(format_bytes).unwrap_or_else(|| "--".to_string());
+    let modified = modified.map(format_system_date).unwrap_or_else(|| "--".to_string());
+    format!("    {:<8}    {:<8}    {}", label, size, modified)
+}
+
+fn display_path_with_home(path: &Path) -> String {
+    if let Some(home) = home_dir_for_display() {
+        if let Ok(stripped) = path.strip_prefix(&home) {
+            if stripped.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~{}{}", std::path::MAIN_SEPARATOR, stripped.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn home_dir_for_display() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn with_trailing_separator(mut path: String) -> String {
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    if !path.ends_with(&sep) {
+        path.push(std::path::MAIN_SEPARATOR);
+    }
+    path
+}
+
+fn format_system_date(time: SystemTime) -> String {
+    let days = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (duration.as_secs() / 86_400) as i64,
+        Err(err) => -(((err.duration().as_secs() + 86_399) / 86_400) as i64),
+    };
+    let (year, month, day) = civil_from_days(days);
+    format!("{:04}-{:02}-{:02}", year, month, day)
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
+}
+
 fn normalized_ratio(ratio: f64) -> f64 {
     if ratio.is_finite() {
         ratio.clamp(0.0, 1.0)
@@ -1340,7 +1455,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::Terminal;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
@@ -1747,6 +1862,55 @@ mod tests {
     }
 
     #[test]
+    fn async_conflict_stats_update_only_mutates_matching_active_prompt() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            FilePickerTheme::default(),
+        );
+        state.apply_update(FileTaskProgressUpdate::ShowConflict {
+            conflict: ConflictPromptState::new(
+                41,
+                "album already exists",
+                "directory destination already exists",
+                ConflictItemKind::Directory,
+            ),
+        });
+
+        state.apply_update(FileTaskProgressUpdate::UpdateConflictExistingStats {
+            request_id: 40,
+            size: 1234,
+            modified: Some(UNIX_EPOCH),
+        });
+        assert_eq!(
+            state.conflict.as_ref().expect("conflict").existing_size,
+            None,
+            "stale async stats must not affect the active conflict"
+        );
+
+        state.apply_update(FileTaskProgressUpdate::UpdateConflictExistingStats {
+            request_id: 41,
+            size: 5678,
+            modified: Some(UNIX_EPOCH + Duration::from_secs(86_400)),
+        });
+        let conflict = state.conflict.as_ref().expect("conflict");
+        assert_eq!(conflict.existing_size, Some(5678));
+        assert_eq!(conflict.existing_modified, Some(UNIX_EPOCH + Duration::from_secs(86_400)));
+
+        state.apply_update(FileTaskProgressUpdate::ClearConflict);
+        state.apply_update(FileTaskProgressUpdate::UpdateConflictExistingStats {
+            request_id: 41,
+            size: 9999,
+            modified: None,
+        });
+        assert_eq!(
+            state.conflict_records.last().expect("record").existing_size,
+            Some(5678),
+            "late async stats after the prompt closes must not rewrite history"
+        );
+    }
+
+    #[test]
     fn conflict_prompt_tab_selects_skip_and_space_toggles_apply_all() {
         let mut state = FileTaskProgressState::new(
             FileTaskKind::Move,
@@ -1790,16 +1954,109 @@ mod tests {
         conflict.destination = Some(PathBuf::from("/tmp/track.flac"));
         state.apply_update(FileTaskProgressUpdate::ShowConflict { conflict });
 
-        let backend = TestBackend::new(60, 14);
+        let backend = TestBackend::new(60, 15);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| state.render(frame, Rect::new(0, 0, 60, 14)))
+            .draw(|frame| state.render(frame, Rect::new(0, 0, 60, 15)))
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
 
-        assert!(rendered.contains("conflict"));
+        assert!(rendered.contains("Conflict 1"));
         assert!(rendered.contains("Overwrite"));
         assert!(rendered.contains("Skip"));
+    }
+
+    #[test]
+    fn redesigned_conflict_dialog_renders_required_content_without_legacy_redundancy() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            FilePickerTheme::default(),
+        );
+        let mut conflict = ConflictPromptState::new(
+            2,
+            "legacy red title should not render",
+            "directory destination already exists for Chicago",
+            ConflictItemKind::Directory,
+        );
+        conflict.conflict_index = 2;
+        conflict.conflict_count = Some(3);
+        conflict.source = Some(PathBuf::from("/music/incoming/Chicago - Chicago II (1970)"));
+        conflict.destination = Some(PathBuf::from("/tmp/Chicago - Chicago II (1970)"));
+        conflict.existing_size = None;
+        conflict.incoming_size = Some(9);
+        conflict.existing_modified = Some(UNIX_EPOCH);
+        conflict.incoming_modified = Some(UNIX_EPOCH + Duration::from_secs(86_400));
+        conflict.apply_to_all = true;
+        state.apply_update(FileTaskProgressUpdate::ShowConflict { conflict });
+
+        let backend = TestBackend::new(72, 15);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| state.render(frame, Rect::new(0, 0, 72, 15)))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{:?}", buffer);
+
+        assert!(buffer_row(buffer, 0, 72).contains("Conflict 2 of 3"));
+        assert!(buffer_row(buffer, 2, 72).contains("A folder of the same name already exists here:"));
+        assert!(buffer_row(buffer, 4, 72).contains("Chicago - Chicago II (1970)"));
+        assert!(buffer_row(buffer, 5, 72).contains("/tmp/"));
+        assert!(buffer_row(buffer, 7, 72).contains("existing"));
+        assert!(buffer_row(buffer, 7, 72).contains("--"));
+        assert!(buffer_row(buffer, 7, 72).contains("1970-01-01"));
+        assert!(buffer_row(buffer, 8, 72).contains("incoming"));
+        assert!(buffer_row(buffer, 8, 72).contains("1970-01-02"));
+        assert!(buffer_row(buffer, 10, 72).contains("[×] Apply to all remaining conflicts"));
+        assert!(buffer_row(buffer, 13, 72).contains("Overwrite"));
+        assert!(buffer_row(buffer, 13, 72).contains("Skip"));
+        assert!(buffer_row(buffer, 13, 72).contains("Rename"));
+        assert!(buffer_row(buffer, 13, 72).contains("Esc Abort"));
+        assert!(!rendered.contains("directory destination already exists for"));
+        assert!(!rendered.contains("legacy red title should not render"));
+        assert!(!rendered.contains("Merge"));
+    }
+
+    #[test]
+    fn conflict_checkbox_mouse_hit_region_toggles_apply_to_all() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            FilePickerTheme::default(),
+        );
+        state.apply_update(FileTaskProgressUpdate::ShowConflict {
+            conflict: ConflictPromptState::new(
+                9,
+                "track.flac already exists",
+                "file destination already exists",
+                ConflictItemKind::File,
+            ),
+        });
+
+        let area = Rect::new(0, 0, 60, 15);
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| state.render(frame, area)).expect("draw");
+        assert!(!state.conflict.as_ref().expect("conflict").apply_to_all);
+
+        let action = state.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 6,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(action, FileTaskUserAction::None);
+        assert!(state.conflict.as_ref().expect("conflict").apply_to_all);
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            FileTaskUserAction::ChooseConflictResolution(ConflictResolution::Overwrite {
+                apply_to_all: true,
+            })
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::state::{
-    intersect_rect, DeleteConfirmButton, FilePickerCreateKind, FilePickerFocus, FilePickerHitAction,
-    FilePickerMenuAction, FilePickerSelectionMode, FilePickerState, HitRegion, ToolbarAction,
+    intersect_rect, ConflictPolicyPreset, DeleteConfirmButton, FilePickerCreateKind, FilePickerFocus,
+    FilePickerHitAction, FilePickerMenuAction, FilePickerSelectionMode, FilePickerState, HitRegion,
+    ToolbarAction,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -120,23 +121,45 @@ impl FilePickerState {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ])
-            .split(inner);
+        let toolbar_area;
+        if self.conflict_policy.is_some() {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
 
-        self.render_toolbar(frame, rows[0]);
-        self.render_address(frame, rows[1]);
-        self.render_split_pane(frame, rows[2], &mut image_ctx);
-        self.render_status(frame, rows[3]);
+            toolbar_area = rows[0];
+            self.render_toolbar(frame, rows[0]);
+            self.render_address(frame, rows[1]);
+            self.render_split_pane(frame, rows[2], &mut image_ctx);
+            self.render_conflict_policy_row(frame, rows[3]);
+            self.render_status(frame, rows[4]);
+        } else {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            toolbar_area = rows[0];
+            self.render_toolbar(frame, rows[0]);
+            self.render_address(frame, rows[1]);
+            self.render_split_pane(frame, rows[2], &mut image_ctx);
+            self.render_status(frame, rows[3]);
+        }
 
         if self.menu_open {
-            self.render_file_operations_menu(frame, rows[0]);
+            self.render_file_operations_menu(frame, toolbar_area);
         }
         if self.properties_open {
             self.render_properties_popup(frame, area);
@@ -478,6 +501,51 @@ impl FilePickerState {
             .highlight_style(self.theme.selected)
             .highlight_symbol(" ");
         frame.render_stateful_widget(table, inner, &mut self.file_table_state);
+    }
+
+
+    fn render_conflict_policy_row(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(selected_policy) = self.conflict_policy else {
+            return;
+        };
+        let label = "If exists:";
+        let mut spans = Vec::new();
+        let mut x = area.x;
+        spans.push(Span::styled(label.to_string(), self.theme.label));
+        x = x.saturating_add(label.chars().count() as u16);
+        spans.push(Span::raw("  "));
+        x = x.saturating_add(2);
+
+        for (idx, (policy, button_label)) in [
+            (ConflictPolicyPreset::Ask, "Ask"),
+            (ConflictPolicyPreset::Overwrite, "Overwrite"),
+            (ConflictPolicyPreset::Skip, "Skip"),
+        ]
+        .iter()
+        .copied()
+        .enumerate()
+        {
+            if idx > 0 {
+                spans.push(Span::raw("  "));
+                x = x.saturating_add(2);
+            }
+            let style = if policy == selected_policy {
+                self.theme.button_focused
+            } else {
+                self.theme.button
+            };
+            spans.push(button_span(button_label, style));
+            let width = button_width(button_label);
+            let rect = Rect::new(x, area.y, width, 1);
+            let _ = self.record_hit_region_clipped(
+                rect,
+                area,
+                FilePickerHitAction::ConflictPolicy(policy),
+            );
+            x = x.saturating_add(width);
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_status(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -891,7 +959,7 @@ fn same_display_path(a: &std::path::Path, b: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FilePickerConfig, FilePickerFilter};
+    use crate::{ConflictPolicyPreset, FilePickerConfig, FilePickerFilter};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier, Style};
@@ -915,6 +983,52 @@ mod tests {
         assert_eq!(picker.last_rendered_area(), Some(Rect::new(1, 1, 90, 24)));
         assert!(picker.file_visible_rows() > 1);
         assert!(picker.hit_regions().iter().any(|hit| matches!(hit.action, FilePickerHitAction::FileRow(_))));
+    }
+
+
+    #[test]
+    fn conflict_policy_row_renders_and_registers_hit_regions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::Directories,
+            conflict_policy: Some(ConflictPolicyPreset::Ask),
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(90, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 80, 18)))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("If exists:"));
+        assert!(rendered.contains("Overwrite"));
+        assert!(picker.hit_regions().iter().any(|hit| {
+            matches!(hit.action, FilePickerHitAction::ConflictPolicy(ConflictPolicyPreset::Overwrite))
+        }));
+    }
+
+    #[test]
+    fn generic_picker_omits_conflict_policy_row() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::Directories,
+            conflict_policy: None,
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(90, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 80, 18)))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(!rendered.contains("If exists:"));
+        assert!(!picker.hit_regions().iter().any(|hit| {
+            matches!(hit.action, FilePickerHitAction::ConflictPolicy(_))
+        }));
     }
 
     #[test]

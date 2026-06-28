@@ -399,6 +399,7 @@ fn reduce_file_picker_complete(
         | super::app::FilePickerPurpose::MoveTo { sources, force } => {
             let is_move = matches!(purpose, super::app::FilePickerPurpose::MoveTo { .. });
             let op = if is_move { "move" } else { "copy" };
+            let conflict_policy = matching_file_picker_conflict_policy(app, session_id, &purpose);
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status(format!("file picker: ignored stale {op} completion"));
                 return;
@@ -420,7 +421,13 @@ fn reduce_file_picker_complete(
                 super::app::TextEditTarget::BrowseCopy { sources, force }
             };
             let dest = dest_dir.to_string_lossy().into_owned();
-            super::keybindings::apply_file_op_with_tx(app, target, &dest, tx);
+            super::keybindings::apply_file_op_with_tx_and_conflict_policy(
+                app,
+                target,
+                &dest,
+                tx,
+                conflict_policy,
+            );
         }
         super::app::FilePickerPurpose::Generic { id } => {
             if !close_matching_file_picker(app, session_id, &purpose) {
@@ -463,6 +470,7 @@ fn reduce_file_task_progress(
     );
     let status = match &update {
         tui_file_picker::FileTaskProgressUpdate::SetScope { .. }
+        | tui_file_picker::FileTaskProgressUpdate::UpdateConflictExistingStats { .. }
         | tui_file_picker::FileTaskProgressUpdate::ClearConflict => None,
         tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict } => {
             Some(format!("file task conflict: {}", conflict.title))
@@ -501,6 +509,27 @@ fn reduce_file_task_progress(
         app.browse.refresh();
         app.browse.probe_current_with_db(tx, Some(&app.db));
         super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+    }
+}
+
+
+fn matching_file_picker_conflict_policy(
+    app: &AppState,
+    session_id: u64,
+    purpose: &super::app::FilePickerPurpose,
+) -> Option<tui_file_picker::ConflictPolicyPreset> {
+    match &app.active_overlay {
+        ActiveOverlay::FilePicker(session)
+            if session.session_id == session_id && &session.purpose == purpose =>
+        {
+            session.picker.conflict_policy()
+        }
+        ActiveOverlay::MetadataEditor(state) => state
+            .file_picker
+            .as_ref()
+            .filter(|picker| picker.session_id == session_id && &picker.purpose == purpose)
+            .and_then(|picker| picker.picker.conflict_policy()),
+        _ => None,
     }
 }
 
@@ -3332,6 +3361,73 @@ mod copy_move_file_picker_flow_tests {
             &tx(),
         );
         assert_move_picker(&move_app, &[source]);
+    }
+
+    #[test]
+    fn force_copy_picker_still_defaults_to_ask_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        fs::write(&source, b"audio").expect("source file");
+
+        let mut app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        crate::tui::command::execute_command(
+            &mut app,
+            Command::Copy { dest: String::new(), force: true },
+            &tx(),
+        );
+
+        let session = active_picker(&app);
+        match &session.purpose {
+            FilePickerPurpose::CopyTo { sources, force } => {
+                assert_eq!(sources.as_slice(), &[source.clone()]);
+                assert!(*force, "the force flag is preserved for the eventual operation");
+            }
+            other => panic!("expected CopyTo picker purpose, got {other:?}"),
+        }
+        assert_eq!(
+            session.picker.conflict_policy(),
+            Some(tui_file_picker::ConflictPolicyPreset::Ask),
+            "interactive destination pickers always start in Ask mode; users must opt into preset overwrite"
+        );
+    }
+
+    #[test]
+    fn selected_copy_move_policy_is_read_before_picker_is_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        fs::write(&source, b"audio").expect("source file");
+
+        let mut app = app_with_selected_path(temp.path(), source.clone(), EntryKind::OtherFile);
+        crate::tui::command::execute_command(
+            &mut app,
+            Command::Copy { dest: String::new(), force: false },
+            &tx(),
+        );
+        let session = active_picker(&app);
+        let session_id = session.session_id;
+        let purpose = session.purpose.clone();
+
+        match &mut app.active_overlay {
+            ActiveOverlay::FilePicker(session) => {
+                session
+                    .picker
+                    .set_conflict_policy(Some(tui_file_picker::ConflictPolicyPreset::Skip));
+            }
+            other => panic!("expected file picker overlay, got {other:?}"),
+        }
+
+        assert_eq!(
+            matching_file_picker_conflict_policy(&app, session_id, &purpose),
+            Some(tui_file_picker::ConflictPolicyPreset::Skip),
+            "event-loop completion must snapshot the selected policy before closing the picker"
+        );
+        assert!(close_matching_file_picker(&mut app, session_id, &purpose));
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(
+            matching_file_picker_conflict_policy(&app, session_id, &purpose),
+            None,
+            "after close, the picker state is gone; reading after close would lose the policy"
+        );
     }
 
     #[test]

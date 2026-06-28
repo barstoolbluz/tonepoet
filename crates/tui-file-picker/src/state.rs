@@ -104,6 +104,23 @@ pub enum FilePickerAction {
     Cancelled,
 }
 
+/// Caller-visible policy for handling destination-name conflicts in copy/move
+/// destination pickers. `Ask` preserves the interactive prompt, while
+/// `Overwrite` and `Skip` let the host apply a whole-job policy before the
+/// worker starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPolicyPreset {
+    Ask,
+    Overwrite,
+    Skip,
+}
+
+impl Default for ConflictPolicyPreset {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolbarAction {
     Back,
@@ -133,6 +150,7 @@ pub enum FilePickerHitAction {
     Address,
     TreeRow(usize),
     FileRow(usize),
+    ConflictPolicy(ConflictPolicyPreset),
     Menu(FilePickerMenuAction),
     MenuNew,
     Submenu(FilePickerMenuAction),
@@ -360,6 +378,10 @@ pub struct FilePickerConfig {
     /// Show a right-side preview pane when the optional image-preview feature is enabled.
     /// Image-filter pickers enable this automatically; callers may set it for custom image filters.
     pub show_preview: bool,
+    /// Optional copy/move conflict-policy preset row. Most pickers leave this
+    /// hidden; destination pickers set it to `Some(Ask)` or a caller-selected
+    /// default.
+    pub conflict_policy: Option<ConflictPolicyPreset>,
     pub operation_policy: FileOperationPolicy,
 }
 
@@ -373,6 +395,7 @@ impl Default for FilePickerConfig {
             selection_mode: FilePickerSelectionMode::Files,
             show_hidden: false,
             show_preview: false,
+            conflict_policy: None,
             operation_policy: FileOperationPolicy::default(),
         }
     }
@@ -513,6 +536,7 @@ pub struct FilePickerState {
     pub(crate) selection_mode: FilePickerSelectionMode,
     pub(crate) show_hidden: bool,
     pub(crate) show_preview: bool,
+    pub(crate) conflict_policy: Option<ConflictPolicyPreset>,
     #[cfg(feature = "image-preview")]
     pub(crate) image_preview_cache: ImagePreviewCache,
     pub(crate) sort_key: FilePickerSortKey,
@@ -566,6 +590,7 @@ impl FilePickerState {
             selection_mode: config.selection_mode,
             show_hidden: config.show_hidden,
             show_preview,
+            conflict_policy: config.conflict_policy,
             #[cfg(feature = "image-preview")]
             image_preview_cache: ImagePreviewCache::default(),
             sort_key: FilePickerSortKey::Name,
@@ -621,6 +646,14 @@ impl FilePickerState {
 
     pub fn show_preview(&self) -> bool {
         self.show_preview
+    }
+
+    pub fn conflict_policy(&self) -> Option<ConflictPolicyPreset> {
+        self.conflict_policy
+    }
+
+    pub fn set_conflict_policy(&mut self, policy: Option<ConflictPolicyPreset>) {
+        self.conflict_policy = policy;
     }
 
     pub fn set_show_hidden(&mut self, show_hidden: bool) {

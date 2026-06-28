@@ -363,6 +363,10 @@ impl FilePickerState {
                 self.set_file_cursor(index, self.file_visible_rows());
                 FilePickerAction::None
             }
+            FilePickerHitAction::ConflictPolicy(policy) => {
+                self.conflict_policy = Some(policy);
+                FilePickerAction::None
+            }
             FilePickerHitAction::MenuNew => self.open_new_submenu_if_enabled(),
             FilePickerHitAction::Menu(action) | FilePickerHitAction::Submenu(action) => {
                 self.apply_menu_action_if_enabled(action)

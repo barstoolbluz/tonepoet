@@ -13970,10 +13970,10 @@ fn apply_text_edit(
             commit_browse_rename(app, original_path, trimmed, tx);
         }
         TextEditTarget::BrowseCopy { sources, force } => {
-            do_file_op(app, &sources, trimmed, force, false, tx);
+            do_file_op(app, &sources, trimmed, force, false, tx, None);
         }
         TextEditTarget::BrowseMove { sources, force } => {
-            do_file_op(app, &sources, trimmed, force, true, tx);
+            do_file_op(app, &sources, trimmed, force, true, tx, None);
         }
         TextEditTarget::BrowseMetadata { path, field } => {
             // Race check: refuse if the file is currently being converted.
@@ -14105,12 +14105,22 @@ pub(super) fn apply_file_op_with_tx(
     dest: &str,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    apply_file_op_with_tx_and_conflict_policy(app, target, dest, tx, None);
+}
+
+pub(super) fn apply_file_op_with_tx_and_conflict_policy(
+    app: &mut AppState,
+    target: TextEditTarget,
+    dest: &str,
+    tx: &mpsc::Sender<AppMessage>,
+    conflict_policy: Option<tui_file_picker::ConflictPolicyPreset>,
+) {
     match target {
         TextEditTarget::BrowseCopy { sources, force } => {
-            do_file_op(app, &sources, dest, force, false, tx);
+            do_file_op(app, &sources, dest, force, false, tx, conflict_policy);
         }
         TextEditTarget::BrowseMove { sources, force } => {
-            do_file_op(app, &sources, dest, force, true, tx);
+            do_file_op(app, &sources, dest, force, true, tx, conflict_policy);
         }
         _ => {}
     }
@@ -14140,6 +14150,7 @@ fn do_file_op(
     force: bool,
     is_move: bool,
     tx: &mpsc::Sender<AppMessage>,
+    conflict_policy: Option<tui_file_picker::ConflictPolicyPreset>,
 ) {
     if sources.is_empty() {
         app.set_status("no files selected for copy/move");
@@ -14176,6 +14187,7 @@ fn do_file_op(
         dest: dest.trim().to_string(),
         force,
         is_move,
+        conflict_policy,
     };
     spawn_file_task_worker(job, tx.clone(), control_rx);
 }
@@ -14188,6 +14200,7 @@ struct FileTaskJob {
     dest: String,
     force: bool,
     is_move: bool,
+    conflict_policy: Option<tui_file_picker::ConflictPolicyPreset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14272,7 +14285,6 @@ enum FileTaskConflictDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileTaskApplyAllPolicy {
     Overwrite,
-    Merge,
     Skip,
 }
 
@@ -14286,7 +14298,9 @@ struct FileTaskWorker {
     paused: bool,
     terminal_error: Option<String>,
     next_conflict_id: u64,
+    conflict_count: Option<u64>,
     apply_all_policy: Option<FileTaskApplyAllPolicy>,
+    scoped_overwrite_roots: Vec<std::path::PathBuf>,
     /// A SkipCurrent request received while the worker is at a non-skippable
     /// checkpoint. Non-skippable phases must not consume skip intent; the next
     /// skippable leaf/root operation owns the request.
@@ -14300,6 +14314,13 @@ impl FileTaskWorker {
         controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
     ) -> Self {
         let now = std::time::Instant::now();
+        let apply_all_policy = match job.conflict_policy {
+            Some(tui_file_picker::ConflictPolicyPreset::Overwrite) => {
+                Some(FileTaskApplyAllPolicy::Overwrite)
+            }
+            Some(tui_file_picker::ConflictPolicyPreset::Skip) => Some(FileTaskApplyAllPolicy::Skip),
+            Some(tui_file_picker::ConflictPolicyPreset::Ask) | None => None,
+        };
         Self {
             job,
             tx,
@@ -14310,7 +14331,9 @@ impl FileTaskWorker {
             paused: false,
             terminal_error: None,
             next_conflict_id: 0,
-            apply_all_policy: None,
+            conflict_count: None,
+            apply_all_policy,
+            scoped_overwrite_roots: Vec::new(),
             pending_skip_current: false,
         }
     }
@@ -14423,6 +14446,8 @@ impl FileTaskWorker {
         if !dest_dir.is_dir() {
             return Err(format!("destination is not a directory: {}", dest_dir.display()));
         }
+
+        self.conflict_count = Some(count_existing_conflicts(&plan.roots));
 
         for root in plan.roots {
             match self.poll_controls_no_skip(None)? {
@@ -14757,10 +14782,11 @@ impl FileTaskWorker {
 
     fn resolve_destination_conflict(
         &mut self,
-        source: &std::path::Path,
-        target: &std::path::Path,
-        item_kind: tui_file_picker::ConflictItemKind,
+        node: &FileTaskPlanNode,
     ) -> Result<FileTaskConflictDecision, String> {
+        let source = node.source.as_path();
+        let target = node.target.as_path();
+        let item_kind = conflict_item_kind_for_plan(node);
         let Ok(existing_meta) = std::fs::symlink_metadata(target) else {
             return Ok(FileTaskConflictDecision::UsePath {
                 path: target.to_path_buf(),
@@ -14768,9 +14794,29 @@ impl FileTaskWorker {
             });
         };
 
-        if self.job.force {
+        let existing_is_dir = existing_meta.file_type().is_dir();
+        if let Some(policy) = self.apply_all_policy {
+            match policy {
+                FileTaskApplyAllPolicy::Skip => return Ok(FileTaskConflictDecision::Skip),
+                FileTaskApplyAllPolicy::Overwrite => {
+                    let applied = if item_kind == tui_file_picker::ConflictItemKind::Directory
+                        && existing_is_dir
+                    {
+                        FileTaskConflictApplied::Merge
+                    } else {
+                        FileTaskConflictApplied::Overwrite
+                    };
+                    return Ok(FileTaskConflictDecision::UsePath {
+                        path: target.to_path_buf(),
+                        applied,
+                    });
+                }
+            }
+        }
+
+        if self.is_under_scoped_overwrite(target) {
             let applied = if item_kind == tui_file_picker::ConflictItemKind::Directory
-                && existing_meta.file_type().is_dir()
+                && existing_is_dir
             {
                 FileTaskConflictApplied::Merge
             } else {
@@ -14782,54 +14828,26 @@ impl FileTaskWorker {
             });
         }
 
-        let existing_is_dir = existing_meta.file_type().is_dir();
-        if let Some(policy) = self.apply_all_policy {
-            match policy {
-                FileTaskApplyAllPolicy::Skip => return Ok(FileTaskConflictDecision::Skip),
-                FileTaskApplyAllPolicy::Overwrite
-                    if !(item_kind == tui_file_picker::ConflictItemKind::Directory && existing_is_dir) =>
-                {
-                    return Ok(FileTaskConflictDecision::UsePath {
-                        path: target.to_path_buf(),
-                        applied: FileTaskConflictApplied::Overwrite,
-                    });
-                }
-                FileTaskApplyAllPolicy::Merge
-                    if item_kind == tui_file_picker::ConflictItemKind::Directory && existing_is_dir =>
-                {
-                    return Ok(FileTaskConflictDecision::UsePath {
-                        path: target.to_path_buf(),
-                        applied: FileTaskConflictApplied::Merge,
-                    });
-                }
-                _ => {}
-            }
+        if self.job.conflict_policy.is_none() && self.job.force {
+            let applied = if item_kind == tui_file_picker::ConflictItemKind::Directory
+                && existing_is_dir
+            {
+                FileTaskConflictApplied::Merge
+            } else {
+                FileTaskConflictApplied::Overwrite
+            };
+            return Ok(FileTaskConflictDecision::UsePath {
+                path: target.to_path_buf(),
+                applied,
+            });
         }
 
-        let source_is_dir = item_kind == tui_file_picker::ConflictItemKind::Directory;
-        let mut choices = if source_is_dir && existing_is_dir {
-            vec![
-                tui_file_picker::ConflictAction::Merge,
-                tui_file_picker::ConflictAction::Skip,
-                tui_file_picker::ConflictAction::Rename,
-                tui_file_picker::ConflictAction::Abort,
-            ]
-        } else {
-            vec![
-                tui_file_picker::ConflictAction::Overwrite,
-                tui_file_picker::ConflictAction::Skip,
-                tui_file_picker::ConflictAction::Rename,
-                tui_file_picker::ConflictAction::Abort,
-            ]
-        };
-        if source_is_dir && !existing_is_dir {
-            choices = vec![
-                tui_file_picker::ConflictAction::Overwrite,
-                tui_file_picker::ConflictAction::Skip,
-                tui_file_picker::ConflictAction::Rename,
-                tui_file_picker::ConflictAction::Abort,
-            ];
-        }
+        let choices = vec![
+            tui_file_picker::ConflictAction::Overwrite,
+            tui_file_picker::ConflictAction::Skip,
+            tui_file_picker::ConflictAction::Rename,
+            tui_file_picker::ConflictAction::Abort,
+        ];
 
         self.next_conflict_id = self.next_conflict_id.saturating_add(1);
         let request_id = self.next_conflict_id;
@@ -14847,7 +14865,23 @@ impl FileTaskWorker {
         conflict.destination = Some(target.to_path_buf());
         conflict.choices = choices;
         conflict.selected = 0;
+        conflict.conflict_index = request_id;
+        conflict.conflict_count = self.conflict_count.filter(|count| *count > 0);
+        conflict.existing_size = conflict_existing_display_size(&existing_meta);
+        let existing_modified = existing_meta.modified().ok();
+        conflict.existing_modified = existing_modified.clone();
+        let incoming_meta = std::fs::symlink_metadata(source).ok();
+        conflict.incoming_size = conflict_incoming_display_size(node, incoming_meta.as_ref());
+        conflict.incoming_modified = incoming_meta.as_ref().and_then(|meta| meta.modified().ok());
         self.send(tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict });
+        maybe_spawn_existing_directory_size_probe(
+            self.job.session_id,
+            self.tx.clone(),
+            request_id,
+            target,
+            &existing_meta,
+            existing_modified,
+        );
         self.snapshot(
             tui_file_picker::FileTaskPhase::Paused,
             format!("waiting for conflict resolution for {}", display_name(source)),
@@ -14896,6 +14930,12 @@ impl FileTaskWorker {
         }
     }
 
+    fn is_under_scoped_overwrite(&self, target: &std::path::Path) -> bool {
+        self.scoped_overwrite_roots
+            .iter()
+            .any(|root| target != root.as_path() && target.starts_with(root))
+    }
+
     fn apply_conflict_resolution(
         &mut self,
         _source: &std::path::Path,
@@ -14908,18 +14948,22 @@ impl FileTaskWorker {
                 if apply_to_all {
                     self.apply_all_policy = Some(FileTaskApplyAllPolicy::Overwrite);
                 }
+                let existing_is_dir = std::fs::symlink_metadata(target)
+                    .map(|meta| meta.file_type().is_dir())
+                    .unwrap_or(false);
+                let applied = if item_kind == tui_file_picker::ConflictItemKind::Directory
+                    && existing_is_dir
+                {
+                    if !apply_to_all {
+                        self.scoped_overwrite_roots.push(target.to_path_buf());
+                    }
+                    FileTaskConflictApplied::Merge
+                } else {
+                    FileTaskConflictApplied::Overwrite
+                };
                 Ok(FileTaskConflictDecision::UsePath {
                     path: target.to_path_buf(),
-                    applied: FileTaskConflictApplied::Overwrite,
-                })
-            }
-            tui_file_picker::ConflictResolution::Merge { apply_to_all } => {
-                if apply_to_all {
-                    self.apply_all_policy = Some(FileTaskApplyAllPolicy::Merge);
-                }
-                Ok(FileTaskConflictDecision::UsePath {
-                    path: target.to_path_buf(),
-                    applied: FileTaskConflictApplied::Merge,
+                    applied,
                 })
             }
             tui_file_picker::ConflictResolution::Skip { apply_to_all } => {
@@ -15014,13 +15058,12 @@ impl FileTaskWorker {
         node: &FileTaskPlanNode,
     ) -> Result<FileTaskStep, String> {
         let source = node.source.as_path();
-        let target = node.target.as_path();
+        let _target = node.target.as_path();
         let metadata = std::fs::symlink_metadata(source)
             .map_err(|e| format!("stat source {}: {}", source.display(), e))?;
         let file_type = metadata.file_type();
-        let item_kind = conflict_item_kind_for_plan(node);
         let source_is_dir = file_type.is_dir();
-        let decision = self.resolve_destination_conflict(source, target, item_kind)?;
+        let decision = self.resolve_destination_conflict(node)?;
         let (resolved_target, applied) = match decision {
             FileTaskConflictDecision::UsePath { path, applied } => (path, applied),
             FileTaskConflictDecision::Skip => return Ok(FileTaskStep::Skipped),
@@ -15084,8 +15127,7 @@ impl FileTaskWorker {
         &mut self,
         node: &FileTaskPlanNode,
     ) -> Result<FileTaskStep, String> {
-        let item_kind = conflict_item_kind_for_plan(node);
-        let decision = self.resolve_destination_conflict(&node.source, &node.target, item_kind)?;
+        let decision = self.resolve_destination_conflict(node)?;
         let (target, applied) = match decision {
             FileTaskConflictDecision::UsePath { path, applied } => (path, applied),
             FileTaskConflictDecision::Skip => return Ok(FileTaskStep::Skipped),
@@ -15845,6 +15887,162 @@ fn conflict_item_kind_for_plan(node: &FileTaskPlanNode) -> tui_file_picker::Conf
     }
 }
 
+
+fn count_existing_conflicts(nodes: &[FileTaskPlanNode]) -> u64 {
+    nodes
+        .iter()
+        .map(|node| {
+            if std::fs::symlink_metadata(&node.target).is_ok() {
+                // A pre-existing target is one user-visible conflict group. If this
+                // is a directory, the resolution chosen for that directory (overwrite,
+                // skip, rename, or abort) determines the whole subtree, and scoped
+                // overwrite auto-resolves descendant conflicts without another prompt.
+                1
+            } else {
+                count_existing_conflicts(&node.children)
+            }
+        })
+        .sum()
+}
+
+fn conflict_incoming_display_size(
+    node: &FileTaskPlanNode,
+    metadata: Option<&std::fs::Metadata>,
+) -> Option<u64> {
+    match node.kind {
+        FileTaskPlanKind::Directory => Some(node.stats.bytes),
+        FileTaskPlanKind::File => metadata.map(|meta| meta.len()).or(Some(node.stats.bytes)),
+        FileTaskPlanKind::Symlink => metadata.map(|meta| meta.len()),
+    }
+}
+
+fn conflict_existing_display_size(metadata: &std::fs::Metadata) -> Option<u64> {
+    if metadata.file_type().is_dir() {
+        // Directory metadata length is an inode/directory-entry implementation
+        // detail, not user-visible content size. The prompt starts with an
+        // honest unknown and may be refined by a non-blocking local-filesystem
+        // probe if that can finish inside the explicit budget below.
+        None
+    } else {
+        Some(metadata.len())
+    }
+}
+
+const FILE_TASK_EXISTING_DIR_SIZE_MAX_ENTRIES: u64 = 20_000;
+const FILE_TASK_EXISTING_DIR_SIZE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn maybe_spawn_existing_directory_size_probe(
+    session_id: u64,
+    tx: mpsc::Sender<AppMessage>,
+    request_id: u64,
+    target: &std::path::Path,
+    existing_meta: &std::fs::Metadata,
+    existing_modified: Option<std::time::SystemTime>,
+) {
+    if !existing_meta.file_type().is_dir() || !should_probe_existing_directory_size(target) {
+        return;
+    }
+
+    let target = target.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("file-task-conflict-dir-size".to_string())
+        .spawn(move || {
+            let Some(size) = measure_existing_directory_size_for_prompt(&target) else {
+                return;
+            };
+            let _ = tx.blocking_send(AppMessage::FileTaskProgress {
+                session_id,
+                update: tui_file_picker::FileTaskProgressUpdate::UpdateConflictExistingStats {
+                    request_id,
+                    size,
+                    modified: existing_modified,
+                },
+            });
+        });
+}
+
+fn should_probe_existing_directory_size(path: &std::path::Path) -> bool {
+    // The size probe is a UI refinement only. Be conservative: launch it only
+    // when the filesystem looks local. Remote, FUSE, automount, and unknown
+    // filesystems keep the initial `--` display so conflict resolution never
+    // waits on slow metadata traversal.
+    existing_directory_size_probe_filesystem_is_local(path).unwrap_or(false)
+}
+
+fn measure_existing_directory_size_for_prompt(path: &std::path::Path) -> Option<u64> {
+    let started = std::time::Instant::now();
+    let mut stack = vec![path.to_path_buf()];
+    let mut entries_seen = 0u64;
+    let mut bytes = 0u64;
+
+    while let Some(dir) = stack.pop() {
+        if entries_seen >= FILE_TASK_EXISTING_DIR_SIZE_MAX_ENTRIES
+            || started.elapsed() >= FILE_TASK_EXISTING_DIR_SIZE_BUDGET
+        {
+            return None;
+        }
+        let read_dir = std::fs::read_dir(&dir).ok()?;
+        for entry in read_dir {
+            if entries_seen >= FILE_TASK_EXISTING_DIR_SIZE_MAX_ENTRIES
+                || started.elapsed() >= FILE_TASK_EXISTING_DIR_SIZE_BUDGET
+            {
+                return None;
+            }
+            let entry = entry.ok()?;
+            entries_seen = entries_seen.saturating_add(1);
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if metadata.file_type().is_dir() {
+                stack.push(path);
+            } else {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+
+    Some(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn existing_directory_size_probe_filesystem_is_local(path: &std::path::Path) -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(!is_remote_or_virtual_filesystem_magic(stat.f_type as i64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn existing_directory_size_probe_filesystem_is_local(_path: &std::path::Path) -> Option<bool> {
+    // `std` has no portable filesystem-type API. On non-Linux platforms this
+    // feature remains conservative until a platform-specific local/remote
+    // classifier is added.
+    None
+}
+
+fn is_remote_or_virtual_filesystem_magic(magic: i64) -> bool {
+    matches!(
+        magic,
+        0x6969       // NFS_SUPER_MAGIC
+            | 0x517B // SMB_SUPER_MAGIC
+            | 0xFF534D42 // CIFS_MAGIC_NUMBER
+            | 0x65735546 // FUSE_SUPER_MAGIC; includes sshfs and many remote/user-space mounts
+            | 0x00C36400 // CEPH_SUPER_MAGIC
+            | 0x73757245 // CODA_SUPER_MAGIC
+            | 0x0000564C // NCP_SUPER_MAGIC
+            | 0x5346414F // AFS_SUPER_MAGIC
+            | 0x01021997 // 9P_SUPER_MAGIC
+            | 0x00000187 // AUTOFS_SUPER_MAGIC
+            | 0x00009FA0 // PROC_SUPER_MAGIC
+            | 0x62656572 // SYSFS_MAGIC
+            | 0x64626720 // DEBUGFS_MAGIC
+            | 0x958458F6 // HUGETLBFS_MAGIC
+    )
+}
+
 fn retarget_plan_node(node: &mut FileTaskPlanNode, new_target: &std::path::Path) {
     node.target = new_target.to_path_buf();
     if matches!(node.kind, FileTaskPlanKind::Directory) {
@@ -16284,19 +16482,50 @@ mod file_operation_safety_tests {
         force: bool,
         controls: std::sync::mpsc::Receiver<crate::tui::app::FileTaskControl>,
     ) -> FileTaskWorker {
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        worker_for_test_with_policy(force, controls, None)
+    }
+
+    fn worker_for_test_with_policy(
+        force: bool,
+        controls: std::sync::mpsc::Receiver<crate::tui::app::FileTaskControl>,
+        conflict_policy: Option<tui_file_picker::ConflictPolicyPreset>,
+    ) -> FileTaskWorker {
+        let (worker, rx) = worker_for_test_with_policy_and_rx(force, controls, conflict_policy);
         drop(rx);
-        FileTaskWorker::new(
+        worker
+    }
+
+    fn worker_for_test_with_policy_and_rx(
+        force: bool,
+        controls: std::sync::mpsc::Receiver<crate::tui::app::FileTaskControl>,
+        conflict_policy: Option<tui_file_picker::ConflictPolicyPreset>,
+    ) -> (FileTaskWorker, tokio::sync::mpsc::Receiver<AppMessage>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let worker = FileTaskWorker::new(
             FileTaskJob {
                 session_id: 1,
                 sources: Vec::new(),
                 dest: String::new(),
                 force,
                 is_move: false,
+                conflict_policy,
             },
             tx,
             controls,
-        )
+        );
+        (worker, rx)
+    }
+
+    fn drain_file_task_updates(
+        rx: &mut tokio::sync::mpsc::Receiver<AppMessage>,
+    ) -> Vec<tui_file_picker::FileTaskProgressUpdate> {
+        let mut updates = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let AppMessage::FileTaskProgress { update, .. } = message {
+                updates.push(update);
+            }
+        }
+        updates
     }
 
     fn copy_path_for_test(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
@@ -16601,6 +16830,115 @@ mod file_operation_safety_tests {
         assert_eq!(fs::read(&dst_two).expect("two preserved"), b"old two");
     }
 
+
+    #[test]
+    fn conflict_policy_skip_skips_existing_destination_without_prompt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"new audio").expect("source");
+        fs::write(&target, b"existing audio").expect("target");
+
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = worker_for_test_with_policy(
+            false,
+            control_rx,
+            Some(tui_file_picker::ConflictPolicyPreset::Skip),
+        );
+
+        let result = worker
+            .copy_regular_file_progress(&source, &target, 9)
+            .expect("conflict policy skip");
+
+        assert_eq!(result, FileTaskStep::Skipped);
+        assert_eq!(fs::read(&target).expect("target preserved"), b"existing audio");
+        assert_eq!(worker.totals.completed, 0);
+    }
+
+    #[test]
+    fn conflict_policy_overwrite_merges_directory_and_overwrites_child_conflicts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let target = temp.path().join("album-copy");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("same.flac"), b"new").expect("source file");
+        fs::create_dir(&target).expect("target dir");
+        fs::write(target.join("same.flac"), b"old").expect("target file");
+
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = worker_for_test_with_policy(
+            false,
+            control_rx,
+            Some(tui_file_picker::ConflictPolicyPreset::Overwrite),
+        );
+
+        let result = worker
+            .copy_dir_recursive_progress(&source, &target)
+            .expect("conflict policy overwrite");
+
+        assert_eq!(result, FileTaskStep::Completed);
+        assert_eq!(fs::read(target.join("same.flac")).expect("overwritten child"), b"new");
+        assert_eq!(worker.totals.merged, 1);
+        assert_eq!(worker.totals.overwritten, 1);
+    }
+
+    #[test]
+    fn conflict_policy_skip_suppresses_conflict_prompt_update() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let target = temp.path().join("target.flac");
+        fs::write(&source, b"new audio").expect("source");
+        fs::write(&target, b"existing audio").expect("target");
+
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let (mut worker, mut rx) = worker_for_test_with_policy_and_rx(
+            false,
+            control_rx,
+            Some(tui_file_picker::ConflictPolicyPreset::Skip),
+        );
+
+        let result = worker
+            .copy_regular_file_progress(&source, &target, 9)
+            .expect("conflict policy skip");
+
+        assert_eq!(result, FileTaskStep::Skipped);
+        let updates = drain_file_task_updates(&mut rx);
+        assert!(
+            !updates.iter().any(|update| matches!(update, tui_file_picker::FileTaskProgressUpdate::ShowConflict { .. })),
+            "preset Skip should resolve the conflict without showing a prompt: {updates:?}"
+        );
+    }
+
+    #[test]
+    fn conflict_policy_overwrite_suppresses_directory_and_child_conflict_prompts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let target = temp.path().join("album-copy");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("same.flac"), b"new").expect("source file");
+        fs::create_dir(&target).expect("target dir");
+        fs::write(target.join("same.flac"), b"old").expect("target file");
+
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let (mut worker, mut rx) = worker_for_test_with_policy_and_rx(
+            false,
+            control_rx,
+            Some(tui_file_picker::ConflictPolicyPreset::Overwrite),
+        );
+
+        let result = worker
+            .copy_dir_recursive_progress(&source, &target)
+            .expect("conflict policy overwrite");
+
+        assert_eq!(result, FileTaskStep::Completed);
+        assert_eq!(fs::read(target.join("same.flac")).expect("overwritten child"), b"new");
+        let updates = drain_file_task_updates(&mut rx);
+        assert!(
+            !updates.iter().any(|update| matches!(update, tui_file_picker::FileTaskProgressUpdate::ShowConflict { .. })),
+            "preset Overwrite should suppress both directory and descendant conflict prompts: {updates:?}"
+        );
+    }
+
     #[test]
     fn stale_conflict_response_is_ignored() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -16876,33 +17214,170 @@ mod file_operation_safety_tests {
     }
 
     #[test]
-    fn directory_merge_counts_as_merged_not_overwritten() {
+    fn directory_overwrite_merges_existing_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("album");
         let target = temp.path().join("album-copy");
         fs::create_dir(&source).expect("source dir");
         fs::write(source.join("new.flac"), b"new").expect("new");
+        fs::write(source.join("same.flac"), b"new same").expect("same source");
         fs::create_dir(&target).expect("target dir");
         fs::write(target.join("old.flac"), b"old").expect("old");
+        fs::write(target.join("same.flac"), b"old same").expect("same target");
 
         let (control_tx, control_rx) = std::sync::mpsc::channel();
         control_tx
             .send(crate::tui::app::FileTaskControl::ConflictResolution {
                 request_id: 1,
-                resolution: tui_file_picker::ConflictResolution::Merge { apply_to_all: false },
+                resolution: tui_file_picker::ConflictResolution::Overwrite { apply_to_all: false },
             })
-            .expect("queue merge");
+            .expect("queue overwrite");
         let mut worker = worker_for_test(false, control_rx);
 
         let result = worker
             .copy_dir_recursive_progress(&source, &target)
-            .expect("merge directory");
+            .expect("overwrite directory");
 
         assert_eq!(result, FileTaskStep::Completed);
         assert_eq!(worker.totals.merged, 1);
-        assert_eq!(worker.totals.overwritten, 0);
+        assert_eq!(worker.totals.overwritten, 1);
         assert!(target.join("old.flac").exists());
         assert_eq!(fs::read(target.join("new.flac")).expect("new copied"), b"new");
+        assert_eq!(
+            fs::read(target.join("same.flac")).expect("same overwritten"),
+            b"new same"
+        );
+    }
+
+    #[test]
+    fn conflict_count_collapses_existing_directory_subtree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_root = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        let album = source_root.join("album");
+        let loose = source_root.join("loose.flac");
+        fs::create_dir_all(&album).expect("source album");
+        fs::create_dir_all(&dest).expect("dest");
+        fs::write(album.join("same.flac"), b"incoming same").expect("source same");
+        fs::write(&loose, b"incoming loose").expect("source loose");
+        fs::create_dir(dest.join("album")).expect("existing target album");
+        fs::write(dest.join("album").join("same.flac"), b"existing same")
+            .expect("existing nested conflict");
+        fs::write(dest.join("loose.flac"), b"existing loose").expect("existing loose");
+
+        let plan = build_file_task_plan(&[album, loose], &dest).expect("plan");
+
+        assert_eq!(
+            count_existing_conflicts(&plan.roots),
+            2,
+            "the existing directory is one promptable conflict group; its child conflict is scoped"
+        );
+    }
+
+    #[test]
+    fn nested_directory_prompt_uses_promptable_conflict_count() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_root = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        let album = source_root.join("album");
+        let loose = source_root.join("loose.flac");
+        fs::create_dir_all(&album).expect("source album");
+        fs::create_dir_all(&dest).expect("dest");
+        fs::write(album.join("same.flac"), b"incoming same").expect("source same");
+        fs::write(&loose, b"incoming loose").expect("source loose");
+        fs::create_dir(dest.join("album")).expect("existing target album");
+        fs::write(dest.join("album").join("same.flac"), b"existing same")
+            .expect("existing nested conflict");
+        fs::write(dest.join("loose.flac"), b"existing loose").expect("existing loose");
+        let plan = build_file_task_plan(&[album, loose], &dest).expect("plan");
+
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        control_tx
+            .send(crate::tui::app::FileTaskControl::ConflictResolution {
+                request_id: 1,
+                resolution: tui_file_picker::ConflictResolution::Skip { apply_to_all: false },
+            })
+            .expect("queue skip");
+        let (mut worker, mut rx) = worker_for_test_with_policy_and_rx(false, control_rx, None);
+        worker.conflict_count = Some(count_existing_conflicts(&plan.roots));
+
+        let decision = worker
+            .resolve_destination_conflict(&plan.roots[0])
+            .expect("resolve directory conflict");
+        assert_eq!(decision, FileTaskConflictDecision::Skip);
+
+        let updates = drain_file_task_updates(&mut rx);
+        let prompt = updates
+            .iter()
+            .find_map(|update| match update {
+                tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict } => Some(conflict),
+                _ => None,
+            })
+            .expect("show conflict update");
+        assert_eq!(prompt.conflict_index, 1);
+        assert_eq!(
+            prompt.conflict_count,
+            Some(2),
+            "directory child conflicts must not inflate Conflict N of M when scoped resolution suppresses child prompts"
+        );
+    }
+
+    #[test]
+    fn directory_conflict_display_sizes_are_plan_size_or_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let target = temp.path().join("dest").join("album");
+        fs::create_dir_all(&source).expect("source dir");
+        fs::create_dir_all(&target).expect("target dir");
+        fs::write(source.join("a.flac"), b"aaaa").expect("source a");
+        fs::write(source.join("b.flac"), b"bbbbbbb").expect("source b");
+        fs::write(target.join("old.flac"), b"oldyy").expect("existing file");
+
+        let node = build_file_task_plan_node(&source, &target).expect("node");
+        let source_meta = fs::symlink_metadata(&source).expect("source metadata");
+        let target_meta = fs::symlink_metadata(&target).expect("target metadata");
+
+        assert_eq!(
+            conflict_incoming_display_size(&node, Some(&source_meta)),
+            Some(11),
+            "incoming directory size comes from recursive plan stats, not directory metadata length"
+        );
+        assert_eq!(
+            conflict_existing_display_size(&target_meta),
+            None,
+            "existing directory size is shown as unknown rather than blocking on a recursive scan or displaying inode metadata length"
+        );
+    }
+
+    #[test]
+    fn existing_directory_size_probe_can_measure_small_local_tree_without_metadata_len() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("existing");
+        fs::create_dir_all(dir.join("nested")).expect("dirs");
+        fs::write(dir.join("old.flac"), b"oldyy").expect("file");
+        fs::write(dir.join("nested").join("more.flac"), b"more").expect("nested file");
+
+        assert_eq!(
+            measure_existing_directory_size_for_prompt(&dir),
+            Some(9),
+            "the async probe computes content bytes for a small tree; metadata.len() is not used"
+        );
+    }
+
+    #[test]
+    fn remote_virtual_filesystem_magic_values_are_not_size_probe_candidates() {
+        assert!(is_remote_or_virtual_filesystem_magic(0x6969), "NFS is remote");
+        assert!(is_remote_or_virtual_filesystem_magic(0xFF534D42), "CIFS/SMB is remote");
+        assert!(
+            is_remote_or_virtual_filesystem_magic(0x65735546),
+            "FUSE may be remote or user-space and should not be synchronously walked for UI decoration"
+        );
+        assert!(is_remote_or_virtual_filesystem_magic(0x00000187), "autofs may trigger mounts");
+        assert!(is_remote_or_virtual_filesystem_magic(0x00009FA0), "procfs is virtual");
+        assert!(
+            !is_remote_or_virtual_filesystem_magic(0xEF53),
+            "ext-family local filesystems are eligible for the async best-effort probe"
+        );
     }
 
     #[test]

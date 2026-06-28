@@ -20,7 +20,7 @@ pub use progress::{
     FileTaskUserAction, ProgressItem, ProgressTotals, ProgressUnit,
 };
 pub use state::{
-    CrossDeviceCutPolicy, DeleteMode, DeletePolicy, FileOperationPolicy, FilePickerAction,
+    ConflictPolicyPreset, CrossDeviceCutPolicy, DeleteMode, DeletePolicy, FileOperationPolicy, FilePickerAction,
     FilePickerClipboard, FilePickerClipboardMode, FilePickerConfig, FilePickerCreateKind,
     FilePickerEntry, FilePickerError, FilePickerFocus, FilePickerHitAction,
     FilePickerMenuAction, FilePickerSelectionMode, FilePickerSortKey, FilePickerState,
