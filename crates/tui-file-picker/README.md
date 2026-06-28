@@ -64,12 +64,21 @@ will rebuild the cached `StatefulProtocol` from already-decoded pixels only for
 Kitty, and only when that generation changes. Non-Kitty protocols ignore the
 retransmit generation.
 
+Tmux/byobu note: do not run Kitty protocol detection through tmux. Force
+`ProtocolType::Halfblocks` when `TMUX` or a tmux `TERM_PROGRAM` is present;
+otherwise a Kitty-capable outer terminal can send protocol responses that tmux
+prints into the pane as text.
+
 ```rust,no_run
 use std::time::{Duration, Instant};
 use ratatui_image::picker::{Picker, ProtocolType};
 
 let mut image_picker = Picker::from_termios().unwrap_or_else(|_| Picker::new((8, 16)));
-image_picker.guess_protocol();
+if std::env::var_os("TMUX").is_some() || std::env::var("TERM_PROGRAM").as_deref() == Ok("tmux") {
+    image_picker.protocol_type = ProtocolType::Halfblocks;
+} else {
+    image_picker.guess_protocol();
+}
 let mut image_picker_generation = 0usize;
 let mut kitty_retransmit_generation = 0usize;
 let mut last_kitty_retransmit = None::<Instant>;
@@ -113,7 +122,11 @@ if image_picker.protocol_type() == ProtocolType::Kitty {
 
 // When the terminal is resized or cell metrics/protocol assumptions change:
 image_picker = Picker::from_termios().unwrap_or_else(|_| Picker::new((8, 16)));
-image_picker.guess_protocol();
+if std::env::var_os("TMUX").is_some() || std::env::var("TERM_PROGRAM").as_deref() == Ok("tmux") {
+    image_picker.protocol_type = ProtocolType::Halfblocks;
+} else {
+    image_picker.guess_protocol();
+}
 image_picker_generation = image_picker_generation.saturating_add(1);
 last_kitty_retransmit = None;
 picker.invalidate_image_preview_cache();

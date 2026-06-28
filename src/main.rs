@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{broadcast, RwLock};
 
 use tonepoet::config::TonepoetConfig;
@@ -264,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let log_level = if cli.verbose { "debug" } else { "info" };
-    init_logging(log_level, matches!(cli.command, Commands::Tui { .. }));
+    init_logging(log_level, matches!(&cli.command, Commands::Tui { .. }));
 
     let config = TonepoetConfig::load().unwrap_or_default();
 
@@ -370,6 +370,122 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn install_terminal_restore_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+
+    INSTALL.call_once(|| {
+        let original_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if terminal_session_is_owned_by_current_thread() {
+                let _ = restore_terminal_state_after_tui();
+                original_hook(info);
+            } else if terminal_session_is_active() {
+                // A panic on a non-owner thread while the TUI owns the terminal
+                // is not safe to treat as an ordinary, recoverable JoinError:
+                // the UI state may now be inconsistent, and printing a panic
+                // inside the alternate screen can corrupt the display. Restore
+                // the terminal once, report the panic through the original hook,
+                // and fail fast instead of letting the foreground TUI continue
+                // after a background task has unwound unexpectedly.
+                let _ = restore_terminal_state_after_tui();
+                original_hook(info);
+                std::process::abort();
+            } else {
+                original_hook(info);
+            }
+        }));
+    });
+}
+
+fn terminal_session_owner() -> &'static Mutex<Option<std::thread::ThreadId>> {
+    static OWNER: OnceLock<Mutex<Option<std::thread::ThreadId>>> = OnceLock::new();
+    OWNER.get_or_init(|| Mutex::new(None))
+}
+
+fn terminal_session_is_active() -> bool {
+    terminal_session_owner()
+        .lock()
+        .map(|owner| owner.is_some())
+        .unwrap_or(false)
+}
+
+fn terminal_session_is_owned_by_current_thread() -> bool {
+    let current = std::thread::current().id();
+    terminal_session_owner()
+        .lock()
+        .map(|owner| owner.as_ref().map(|id| *id == current).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+fn register_terminal_session_owner(owner: std::thread::ThreadId) {
+    if let Ok(mut slot) = terminal_session_owner().lock() {
+        *slot = Some(owner);
+    }
+}
+
+fn clear_terminal_session_owner(owner: std::thread::ThreadId) {
+    if let Ok(mut slot) = terminal_session_owner().lock() {
+        if slot.as_ref().map(|id| *id == owner).unwrap_or(false) {
+            *slot = None;
+        }
+    }
+}
+
+fn restore_terminal_state_after_tui() -> std::io::Result<()> {
+    use crossterm::{
+        cursor::Show,
+        event::{DisableBracketedPaste, DisableMouseCapture},
+        execute,
+        terminal::{disable_raw_mode, LeaveAlternateScreen},
+    };
+
+    let raw_mode_result = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let terminal_result = execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        Show
+    );
+
+    raw_mode_result?;
+    terminal_result
+}
+
+struct TerminalRestoreGuard {
+    armed: bool,
+    owner_thread: std::thread::ThreadId,
+}
+
+impl TerminalRestoreGuard {
+    fn armed() -> Self {
+        let owner_thread = std::thread::current().id();
+        register_terminal_session_owner(owner_thread);
+        Self {
+            armed: true,
+            owner_thread,
+        }
+    }
+
+    fn disarm(&mut self) {
+        if self.armed {
+            clear_terminal_session_owner(self.owner_thread);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = restore_terminal_state_after_tui();
+            clear_terminal_session_owner(self.owner_thread);
+            self.armed = false;
+        }
+    }
 }
 
 /// Initialize env_logger. In TUI mode, logs are redirected to a file at
@@ -1038,13 +1154,16 @@ fn preset_to_options(preset: &tonepoet_wizard::ConversionPreset) -> ConversionOp
 
 async fn run_wizard(_config: &TonepoetConfig) -> anyhow::Result<()> {
     use crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+        event::{self, EnableMouseCapture, Event, KeyCode, KeyModifiers},
         execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{enable_raw_mode, EnterAlternateScreen},
     };
     use ratatui::prelude::*;
 
+    install_terminal_restore_panic_hook();
+
     enable_raw_mode()?;
+    let mut terminal_restore = TerminalRestoreGuard::armed();
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
@@ -1089,13 +1208,9 @@ async fn run_wizard(_config: &TonepoetConfig) -> anyhow::Result<()> {
     };
 
     // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    restore_terminal_state_after_tui()?;
     terminal.show_cursor()?;
+    terminal_restore.disarm();
 
     if let Some(options) = result {
         println!(
@@ -1475,18 +1590,19 @@ fn run_config(show: bool, reset: bool, path: bool, config: &TonepoetConfig) -> a
 
 async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Result<()> {
     use crossterm::{
-        event::{
-            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        },
+        event::{EnableBracketedPaste, EnableMouseCapture},
         execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{enable_raw_mode, EnterAlternateScreen},
     };
     use ratatui::prelude::*;
     use tonepoet::tui::app::AppState;
     use tonepoet::tui::event_loop::run_app;
 
+    install_terminal_restore_panic_hook();
+
     // Set up terminal
     enable_raw_mode()?;
+    let mut terminal_restore = TerminalRestoreGuard::armed();
     let mut stdout = std::io::stdout();
     execute!(
         stdout,
@@ -1542,14 +1658,9 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     let result = run_app(&mut terminal, &mut app, tx, rx).await;
 
     // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
+    restore_terminal_state_after_tui()?;
     terminal.show_cursor()?;
+    terminal_restore.disarm();
 
     result.map_err(|e| anyhow::anyhow!("{}", e))
 }
@@ -2737,5 +2848,30 @@ mod dvda_cli_tests {
             parse_dvda_group("MultiChannel"),
             DvdaGroupSelection::PreferMultichannel
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_restore_session_tests {
+    use super::{
+        terminal_session_is_active, terminal_session_is_owned_by_current_thread,
+        TerminalRestoreGuard,
+    };
+
+    #[test]
+    fn terminal_session_restore_authority_is_limited_to_owner_thread() {
+        let mut guard = TerminalRestoreGuard::armed();
+
+        assert!(terminal_session_is_active());
+        assert!(terminal_session_is_owned_by_current_thread());
+
+        let handle = std::thread::spawn(|| {
+            assert!(terminal_session_is_active());
+            assert!(!terminal_session_is_owned_by_current_thread());
+        });
+        handle.join().expect("worker thread should not panic");
+
+        guard.disarm();
+        assert!(!terminal_session_is_active());
     }
 }

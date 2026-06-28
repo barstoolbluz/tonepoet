@@ -6109,8 +6109,145 @@ pub struct AppState {
 fn new_terminal_image_picker() -> ratatui_image::picker::Picker {
     let mut picker = ratatui_image::picker::Picker::from_termios()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::new((8, 12)));
-    picker.guess_protocol();
+    configure_terminal_image_picker_protocol_for_current_environment(&mut picker);
     picker
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalImageProtocolProbeDecision {
+    ForceHalfblocks,
+    GuessProtocol,
+}
+
+trait TerminalImagePickerProtocolProbe {
+    fn protocol_type(&self) -> ratatui_image::picker::ProtocolType;
+    fn force_halfblocks_protocol(&mut self);
+    fn guess_terminal_protocol(&mut self);
+}
+
+impl TerminalImagePickerProtocolProbe for ratatui_image::picker::Picker {
+    fn protocol_type(&self) -> ratatui_image::picker::ProtocolType {
+        self.protocol_type
+    }
+
+    fn force_halfblocks_protocol(&mut self) {
+        self.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
+    }
+
+    fn guess_terminal_protocol(&mut self) {
+        ratatui_image::picker::Picker::guess_protocol(self);
+    }
+}
+
+fn configure_terminal_image_picker_protocol_for_current_environment<P>(picker: &mut P)
+where
+    P: TerminalImagePickerProtocolProbe,
+{
+    configure_terminal_image_picker_protocol(
+        picker,
+        terminal_image_protocol_probe_decision_for_current_environment(),
+    );
+}
+
+fn configure_terminal_image_picker_protocol<P>(
+    picker: &mut P,
+    decision: TerminalImageProtocolProbeDecision,
+)
+where
+    P: TerminalImagePickerProtocolProbe,
+{
+    match decision {
+        TerminalImageProtocolProbeDecision::ForceHalfblocks => picker.force_halfblocks_protocol(),
+        TerminalImageProtocolProbeDecision::GuessProtocol => picker.guess_terminal_protocol(),
+    }
+}
+
+fn terminal_image_protocol_probe_decision_for_current_environment(
+) -> TerminalImageProtocolProbeDecision {
+    terminal_image_protocol_probe_decision_for_environment(
+        std::env::var_os("TMUX").as_deref(),
+        std::env::var_os("TERM_PROGRAM").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+        std::env::var_os("BYOBU_BACKEND").as_deref(),
+    )
+}
+
+fn terminal_image_protocol_probe_decision_for_environment(
+    tmux: Option<&std::ffi::OsStr>,
+    term_program: Option<&std::ffi::OsStr>,
+    term: Option<&std::ffi::OsStr>,
+    byobu_backend: Option<&std::ffi::OsStr>,
+) -> TerminalImageProtocolProbeDecision {
+    if tmux_like_environment(tmux, term_program, term, byobu_backend) {
+        TerminalImageProtocolProbeDecision::ForceHalfblocks
+    } else {
+        TerminalImageProtocolProbeDecision::GuessProtocol
+    }
+}
+
+fn enforce_safe_terminal_image_picker_protocol_for_current_environment<P>(picker: &mut P) -> bool
+where
+    P: TerminalImagePickerProtocolProbe,
+{
+    enforce_safe_terminal_image_picker_protocol(
+        picker,
+        terminal_image_protocol_probe_decision_for_current_environment(),
+    )
+}
+
+fn enforce_safe_terminal_image_picker_protocol<P>(
+    picker: &mut P,
+    decision: TerminalImageProtocolProbeDecision,
+) -> bool
+where
+    P: TerminalImagePickerProtocolProbe,
+{
+    if decision != TerminalImageProtocolProbeDecision::ForceHalfblocks
+        || picker.protocol_type() == ratatui_image::picker::ProtocolType::Halfblocks
+    {
+        return false;
+    }
+
+    picker.force_halfblocks_protocol();
+    true
+}
+
+fn tmux_like_environment(
+    tmux: Option<&std::ffi::OsStr>,
+    term_program: Option<&std::ffi::OsStr>,
+    term: Option<&std::ffi::OsStr>,
+    byobu_backend: Option<&std::ffi::OsStr>,
+) -> bool {
+    if non_empty_env_value(tmux) {
+        return true;
+    }
+
+    let term_program = lower_env_value(term_program);
+    if term_program.as_deref() == Some("tmux") {
+        return true;
+    }
+
+    let byobu_backend = lower_env_value(byobu_backend);
+    if byobu_backend.as_deref() == Some("tmux") {
+        return true;
+    }
+
+    let term = lower_env_value(term);
+    term.as_deref()
+        .map(|term| term == "tmux" || term.starts_with("tmux-"))
+        .unwrap_or(false)
+}
+
+fn non_empty_env_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.map(|value| !value.is_empty()).unwrap_or(false)
+}
+
+fn lower_env_value(value: Option<&std::ffi::OsStr>) -> Option<String> {
+    let value = value?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string_lossy().to_ascii_lowercase())
 }
 
 const KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL: Duration = Duration::from_millis(33);
@@ -6245,18 +6382,7 @@ impl AppState {
         self.image_picker_generation = self.image_picker_generation.saturating_add(1);
         self.last_image_kitty_retransmit_at = None;
 
-        if let ActiveOverlay::MetadataEditor(state) = &mut self.active_overlay {
-            state.invalidate_artwork_preview_cache();
-            if let Some(file_picker) = state.file_picker.as_mut() {
-                file_picker.picker.invalidate_image_preview_cache();
-            }
-        }
-        if let Some(state) = self.pending_metadata_editor.as_mut() {
-            state.invalidate_artwork_preview_cache();
-            if let Some(file_picker) = state.file_picker.as_mut() {
-                file_picker.picker.invalidate_image_preview_cache();
-            }
-        }
+        self.invalidate_terminal_image_preview_caches();
         self.request_image_preview_repaint();
         self.force_redraw = true;
     }
@@ -6293,6 +6419,41 @@ impl AppState {
     }
 
 
+    fn force_halfblocks_for_unsafe_terminal_image_protocol(&mut self) {
+        if !enforce_safe_terminal_image_picker_protocol_for_current_environment(
+            &mut self.image_picker,
+        ) {
+            return;
+        }
+
+        self.image_picker_generation = self.image_picker_generation.saturating_add(1);
+        self.image_kitty_retransmit_generation = 0;
+        self.last_image_kitty_retransmit_at = None;
+        self.invalidate_terminal_image_preview_caches();
+    }
+
+    fn invalidate_terminal_image_preview_caches(&mut self) {
+        match &mut self.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                state.invalidate_artwork_preview_cache();
+                if let Some(file_picker) = state.file_picker.as_mut() {
+                    file_picker.picker.invalidate_image_preview_cache();
+                }
+            }
+            ActiveOverlay::FilePicker(session) => {
+                session.picker.invalidate_image_preview_cache();
+            }
+            _ => {}
+        }
+
+        if let Some(state) = self.pending_metadata_editor.as_mut() {
+            state.invalidate_artwork_preview_cache();
+            if let Some(file_picker) = state.file_picker.as_mut() {
+                file_picker.picker.invalidate_image_preview_cache();
+            }
+        }
+    }
+
     /// Advance image-preview loading/encoding outside the render path.
     ///
     /// Render records the desired preview pane geometry. This update pass polls
@@ -6303,17 +6464,33 @@ impl AppState {
     /// rate-limited retransmit generation can also rebuild protocol state from
     /// cached decoded pixels after mouse-driven graphics-layer damage.
     pub fn prepare_image_preview_protocols(&mut self) {
+        // This must run before any preview path can wrap decoded pixels in a
+        // terminal protocol. In tmux/byobu it downgrades any cached Kitty picker
+        // state to Halfblocks and invalidates old protocol caches first.
+        self.force_halfblocks_for_unsafe_terminal_image_protocol();
+
         let protocol_generation = self.image_picker_generation;
         let retransmit_generation = self.image_kitty_retransmit_generation;
         let mut changed = false;
-        if let ActiveOverlay::MetadataEditor(state) = &mut self.active_overlay {
-            changed |= state.prepare_artwork_preview_protocol(
-                &mut self.image_picker,
-                protocol_generation,
-                retransmit_generation,
-            );
-            if let Some(file_picker) = state.file_picker.as_mut() {
-                changed |= file_picker
+        match &mut self.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                changed |= state.prepare_artwork_preview_protocol(
+                    &mut self.image_picker,
+                    protocol_generation,
+                    retransmit_generation,
+                );
+                if let Some(file_picker) = state.file_picker.as_mut() {
+                    changed |= file_picker
+                        .picker
+                        .prepare_image_preview_protocol_with_retransmit_generation(
+                            &mut self.image_picker,
+                            protocol_generation,
+                            retransmit_generation,
+                        );
+                }
+            }
+            ActiveOverlay::FilePicker(session) => {
+                changed |= session
                     .picker
                     .prepare_image_preview_protocol_with_retransmit_generation(
                         &mut self.image_picker,
@@ -6321,6 +6498,7 @@ impl AppState {
                         retransmit_generation,
                     );
             }
+            _ => {}
         }
         // No force_redraw — the next normal render cycle picks up the new
         // protocol. force_redraw triggers terminal.clear() which causes a
@@ -9588,4 +9766,193 @@ mod metadata_presentation_tab_tests {
         assert!(matches!(details.details_probe_state, MetadataDetailsProbeState::Unloaded));
     }
 
+}
+
+#[cfg(test)]
+mod terminal_image_protocol_environment_tests {
+    use super::{
+        configure_terminal_image_picker_protocol, enforce_safe_terminal_image_picker_protocol,
+        terminal_image_protocol_probe_decision_for_environment, tmux_like_environment,
+        TerminalImagePickerProtocolProbe, TerminalImageProtocolProbeDecision,
+    };
+    use std::ffi::OsStr;
+
+    struct RecordingPicker {
+        protocol_type: ratatui_image::picker::ProtocolType,
+        force_halfblocks_calls: usize,
+        guess_protocol_calls: usize,
+    }
+
+    impl RecordingPicker {
+        fn new(protocol_type: ratatui_image::picker::ProtocolType) -> Self {
+            Self {
+                protocol_type,
+                force_halfblocks_calls: 0,
+                guess_protocol_calls: 0,
+            }
+        }
+    }
+
+    impl TerminalImagePickerProtocolProbe for RecordingPicker {
+        fn protocol_type(&self) -> ratatui_image::picker::ProtocolType {
+            self.protocol_type
+        }
+
+        fn force_halfblocks_protocol(&mut self) {
+            self.force_halfblocks_calls += 1;
+            self.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
+        }
+
+        fn guess_terminal_protocol(&mut self) {
+            self.guess_protocol_calls += 1;
+            self.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+        }
+    }
+
+    #[test]
+    fn tmux_variable_forces_safe_terminal_image_protocol() {
+        assert!(tmux_like_environment(
+            Some(OsStr::new("/tmp/tmux-1000/default,123,0")),
+            None,
+            Some(OsStr::new("xterm-kitty")),
+            None,
+        ));
+    }
+
+    #[test]
+    fn byobu_tmux_backend_forces_safe_terminal_image_protocol() {
+        assert!(tmux_like_environment(
+            None,
+            None,
+            Some(OsStr::new("screen-256color")),
+            Some(OsStr::new("tmux")),
+        ));
+    }
+
+    #[test]
+    fn tmux_term_program_and_term_names_force_safe_terminal_image_protocol() {
+        assert!(tmux_like_environment(
+            None,
+            Some(OsStr::new("tmux")),
+            Some(OsStr::new("xterm-256color")),
+            None,
+        ));
+        assert!(tmux_like_environment(
+            None,
+            None,
+            Some(OsStr::new("tmux-256color")),
+            None,
+        ));
+        assert!(tmux_like_environment(
+            None,
+            None,
+            Some(OsStr::new("tmux-direct")),
+            None,
+        ));
+    }
+
+    #[test]
+    fn direct_kitty_ghostty_or_wezterm_hosts_are_not_forced_to_halfblocks() {
+        assert!(!tmux_like_environment(
+            None,
+            Some(OsStr::new("kitty")),
+            Some(OsStr::new("xterm-kitty")),
+            None,
+        ));
+        assert!(!tmux_like_environment(
+            None,
+            Some(OsStr::new("ghostty")),
+            Some(OsStr::new("xterm-ghostty")),
+            None,
+        ));
+        assert!(!tmux_like_environment(
+            None,
+            Some(OsStr::new("WezTerm")),
+            Some(OsStr::new("wezterm")),
+            None,
+        ));
+    }
+
+    #[test]
+    fn empty_tmux_variable_does_not_create_a_false_positive() {
+        assert!(!tmux_like_environment(
+            Some(OsStr::new("")),
+            None,
+            Some(OsStr::new("xterm-kitty")),
+            None,
+        ));
+    }
+
+    #[test]
+    fn tmux_protocol_configuration_never_calls_terminal_probe() {
+        let decision = terminal_image_protocol_probe_decision_for_environment(
+            Some(OsStr::new("/tmp/tmux-1000/default,123,0")),
+            Some(OsStr::new("ghostty")),
+            Some(OsStr::new("xterm-ghostty")),
+            None,
+        );
+        assert_eq!(decision, TerminalImageProtocolProbeDecision::ForceHalfblocks);
+
+        let mut picker = RecordingPicker::new(ratatui_image::picker::ProtocolType::Kitty);
+        configure_terminal_image_picker_protocol(&mut picker, decision);
+
+        assert_eq!(picker.guess_protocol_calls, 0);
+        assert_eq!(picker.force_halfblocks_calls, 1);
+        assert_eq!(
+            picker.protocol_type,
+            ratatui_image::picker::ProtocolType::Halfblocks
+        );
+    }
+
+    #[test]
+    fn direct_terminal_protocol_configuration_calls_terminal_probe_once() {
+        let decision = terminal_image_protocol_probe_decision_for_environment(
+            None,
+            Some(OsStr::new("ghostty")),
+            Some(OsStr::new("xterm-ghostty")),
+            None,
+        );
+        assert_eq!(decision, TerminalImageProtocolProbeDecision::GuessProtocol);
+
+        let mut picker = RecordingPicker::new(ratatui_image::picker::ProtocolType::Halfblocks);
+        configure_terminal_image_picker_protocol(&mut picker, decision);
+
+        assert_eq!(picker.force_halfblocks_calls, 0);
+        assert_eq!(picker.guess_protocol_calls, 1);
+        assert_eq!(picker.protocol_type, ratatui_image::picker::ProtocolType::Kitty);
+    }
+
+    #[test]
+    fn tmux_prepare_guard_replaces_cached_kitty_before_protocol_creation() {
+        let mut picker = RecordingPicker::new(ratatui_image::picker::ProtocolType::Kitty);
+        let changed = enforce_safe_terminal_image_picker_protocol(
+            &mut picker,
+            TerminalImageProtocolProbeDecision::ForceHalfblocks,
+        );
+
+        assert!(changed);
+        assert_eq!(picker.guess_protocol_calls, 0);
+        assert_eq!(picker.force_halfblocks_calls, 1);
+        assert_eq!(
+            picker.protocol_type,
+            ratatui_image::picker::ProtocolType::Halfblocks
+        );
+    }
+
+    #[test]
+    fn tmux_prepare_guard_is_idempotent_when_picker_is_already_halfblocks() {
+        let mut picker = RecordingPicker::new(ratatui_image::picker::ProtocolType::Halfblocks);
+        let changed = enforce_safe_terminal_image_picker_protocol(
+            &mut picker,
+            TerminalImageProtocolProbeDecision::ForceHalfblocks,
+        );
+
+        assert!(!changed);
+        assert_eq!(picker.guess_protocol_calls, 0);
+        assert_eq!(picker.force_halfblocks_calls, 0);
+        assert_eq!(
+            picker.protocol_type,
+            ratatui_image::picker::ProtocolType::Halfblocks
+        );
+    }
 }
