@@ -755,8 +755,8 @@ impl FileTaskProgressState {
             return;
         }
 
-        frame.render_widget(Clear, area);
         let dialog_area = centered_fixed_rect(area, PROGRESS_DIALOG_WIDTH, PROGRESS_DIALOG_HEIGHT);
+        frame.render_widget(Clear, dialog_area);
         if self.conflict.is_some() {
             self.render_conflict(frame, dialog_area);
         } else {
