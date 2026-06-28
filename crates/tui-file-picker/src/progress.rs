@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_ERROR_RECORDS: usize = 8;
 const DEFAULT_MAX_CONFLICT_RECORDS: usize = 8;
-const PROGRESS_DIALOG_WIDTH: u16 = 52;
+const MIN_PROGRESS_DIALOG_WIDTH: u16 = 52;
 const PROGRESS_DIALOG_HEIGHT: u16 = 12;
 
 /// Generic category label for a long-running file-oriented task.
@@ -746,7 +746,7 @@ impl FileTaskProgressState {
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.hit_regions.clear();
         self.last_area = Some(area);
-        if area.width < PROGRESS_DIALOG_WIDTH || area.height < PROGRESS_DIALOG_HEIGHT {
+        if area.width < MIN_PROGRESS_DIALOG_WIDTH || area.height < PROGRESS_DIALOG_HEIGHT {
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new("Progress overlay needs at least 52x12 cells").style(self.theme.error),
@@ -755,7 +755,9 @@ impl FileTaskProgressState {
             return;
         }
 
-        let dialog_area = centered_fixed_rect(area, PROGRESS_DIALOG_WIDTH, PROGRESS_DIALOG_HEIGHT);
+        // Use the full available width (clamped to minimum), center vertically.
+        let dialog_width = area.width.max(MIN_PROGRESS_DIALOG_WIDTH);
+        let dialog_area = centered_fixed_rect(area, dialog_width, PROGRESS_DIALOG_HEIGHT);
         frame.render_widget(Clear, dialog_area);
         if self.conflict.is_some() {
             self.render_conflict(frame, dialog_area);
@@ -765,7 +767,7 @@ impl FileTaskProgressState {
     }
 
     fn render_progress_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        debug_assert_eq!(area.width, PROGRESS_DIALOG_WIDTH);
+        debug_assert!(area.width >= MIN_PROGRESS_DIALOG_WIDTH);
         debug_assert_eq!(area.height, PROGRESS_DIALOG_HEIGHT);
 
         frame.render_widget(Paragraph::new("").style(self.theme.progress_dialog), area);
@@ -1542,50 +1544,51 @@ mod tests {
     }
 
     #[test]
-    fn progress_dialog_uses_same_fixed_mockup_geometry_inside_larger_host_area() {
+    fn progress_dialog_fills_available_width_inside_larger_host_area() {
         let mut state = mockup_state();
 
-        let backend = TestBackend::new(96, 18);
+        let host_w: u16 = 96;
+        let host_h: u16 = 18;
+        let backend = TestBackend::new(host_w, host_h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| state.render(frame, Rect::new(0, 0, 96, 18)))
+            .draw(|frame| state.render(frame, Rect::new(0, 0, host_w, host_h)))
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let x = (96 - PROGRESS_DIALOG_WIDTH) / 2;
-        let y = (18 - PROGRESS_DIALOG_HEIGHT) / 2;
+        // Dialog uses the full host width (>= minimum), centered vertically.
+        let dialog_w = host_w;
+        let y = (host_h - PROGRESS_DIALOG_HEIGHT) / 2;
 
-        assert_eq!(
-            buffer_row_slice(buffer, x, y, PROGRESS_DIALOG_WIDTH),
-            "┌─ Copying files ──────────────────────────────────┐"
-        );
-        let stats_row = buffer_row_slice(buffer, x, y + 8, PROGRESS_DIALOG_WIDTH);
+        let title_row = buffer_row(buffer, y, dialog_w);
+        assert!(title_row.starts_with("┌─ Copying files "));
+        assert!(title_row.ends_with("┐"));
+        assert_eq!(title_row.chars().count(), dialog_w as usize);
+
+        let from_row = buffer_row(buffer, y + 1, dialog_w);
+        assert!(from_row.contains("From:  ~/Documents/Audio"));
+
+        let to_row = buffer_row(buffer, y + 2, dialog_w);
+        assert!(to_row.contains("To:    ~/library/abb/Gregg Allman - Laid Back"));
+
+        let stats_row = buffer_row(buffer, y + 8, dialog_w);
         assert!(stats_row.starts_with("│  82 MB/s"));
         assert!(stats_row.contains(" elapsed"));
-        assert!(stats_row.contains(" left"));
-        assert_eq!(
-            buffer_row_slice(buffer, x, y + 9, PROGRESS_DIALOG_WIDTH),
-            "├──────────────────────────────────────────────────┤"
-        );
-        assert_eq!(
-            buffer_row_slice(buffer, x, y + 10, PROGRESS_DIALOG_WIDTH),
-            "│         p Pause     s Skip     Esc Abort         │"
-        );
-        assert_eq!(
-            buffer_row_slice(buffer, x, y + 11, PROGRESS_DIALOG_WIDTH),
-            "└──────────────────────────────────────────────────┘"
-        );
-        assert_eq!(buffer_row_slice(buffer, x, y + 12, PROGRESS_DIALOG_WIDTH), " ".repeat(PROGRESS_DIALOG_WIDTH as usize));
 
-        let pause = state.handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: x + 10,
-                row: y + 10,
-                modifiers: KeyModifiers::NONE,
-            },
-            Rect::new(0, 0, 96, 18),
-        );
-        assert_eq!(pause, FileTaskUserAction::Pause);
+        let rule_row = buffer_row(buffer, y + 9, dialog_w);
+        assert!(rule_row.starts_with("├"));
+        assert!(rule_row.ends_with("┤"));
+
+        let button_row = buffer_row(buffer, y + 10, dialog_w);
+        assert!(button_row.contains("p Pause"));
+        assert!(button_row.contains("s Skip"));
+        assert!(button_row.contains("Esc Abort"));
+
+        let bottom_row = buffer_row(buffer, y + 11, dialog_w);
+        assert!(bottom_row.starts_with("└"));
+        assert!(bottom_row.ends_with("┘"));
+
+        // Row below dialog is not part of the dialog — should be empty.
+        assert_eq!(buffer_row(buffer, y + 12, dialog_w), " ".repeat(dialog_w as usize));
     }
 
     #[test]

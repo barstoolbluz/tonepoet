@@ -4533,7 +4533,8 @@ pub(crate) fn file_picker_overlay_area(parent: Rect) -> Rect {
 }
 
 fn file_task_progress_overlay_area(parent: Rect) -> Rect {
-    let width = parent.width.min(92).max(parent.width.min(44));
+    // Use 70% of terminal width so long paths are readable, minimum 52 columns.
+    let width = ((parent.width as u32 * 70 / 100) as u16).max(52).min(parent.width);
     let height = parent.height.min(19).max(parent.height.min(13));
     Rect::new(
         parent.x + parent.width.saturating_sub(width) / 2,
