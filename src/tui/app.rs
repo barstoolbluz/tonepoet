@@ -2481,6 +2481,8 @@ pub enum WizardTarget {
 #[derive(Debug, Clone)]
 pub enum ActiveOverlay {
     None,
+    /// Three-view theme builder overlay.
+    ThemeBuilder(Box<crate::tui::theme_builder::ThemeBuilderState>),
     Confirmation {
         message: String,
         action: ConfirmAction,
@@ -5988,6 +5990,12 @@ pub struct AppState {
     /// ownership lives here so tests and future renderers do not need to
     /// consult process-global theme state.
     pub theme: crate::tui::theme::Theme,
+    pub theme_overrides: crate::tui::theme::ThemeOverrides,
+    /// Cached theme-library metadata and preview colors. Renderers read this
+    /// snapshot instead of repeatedly scanning/parsing custom theme files. The
+    /// cache is refreshed on explicit theme-library actions such as opening the
+    /// gallery, saving a theme, or deleting a custom theme.
+    pub theme_library: crate::tui::theme::ThemeLibrarySnapshot,
     pub manager: ConversionManager,
     pub db: crate::db::Database,
 
@@ -6313,13 +6321,26 @@ impl AppState {
     pub fn new(config: TonepoetConfig) -> Self {
         let mut config = config;
         let configured_theme_slug = config.ui.theme.clone();
-        let (theme, theme_startup_status) = match crate::tui::theme::theme_by_slug(&configured_theme_slug) {
-            Some(theme) => {
-                config.ui.theme = theme.slug.to_string();
-                (theme, None)
+        let theme_overrides = crate::tui::theme::ThemeOverrides::load_default().unwrap_or_default();
+        let (theme, theme_startup_status) = match crate::tui::theme::load_theme_draft(&configured_theme_slug) {
+            Ok(draft) => {
+                let resolved = crate::tui::theme::resolve_theme_draft(
+                    &draft,
+                    crate::tui::theme::ThemeApplyOptions::default(),
+                    &theme_overrides,
+                );
+                config.ui.theme = draft.slug.clone();
+                (resolved, None)
             }
-            None => {
-                let fallback = crate::tui::theme::theme_by_slug_or_default(&configured_theme_slug);
+            Err(_) => {
+                let fallback_draft = crate::tui::theme::ThemePaletteDraft::from_palette(
+                    crate::tui::theme::default_palette(),
+                );
+                let fallback = crate::tui::theme::resolve_theme_draft(
+                    &fallback_draft,
+                    crate::tui::theme::ThemeApplyOptions::default(),
+                    &theme_overrides,
+                );
                 config.ui.theme = fallback.slug.to_string();
                 (
                     fallback,
@@ -6342,6 +6363,8 @@ impl AppState {
                 crate::db::Database::open_memory().expect("in-memory DB should never fail")
             }
         };
+
+        let theme_library = crate::tui::theme::ThemeLibrarySnapshot::load();
 
         let conv_config = ConversionConfig {
             worker_count: config.conversion.worker_count,
@@ -6383,6 +6406,8 @@ impl AppState {
         Self {
             config,
             theme,
+            theme_overrides,
+            theme_library,
             manager,
             db,
             current_screen: initial_screen,
@@ -6463,20 +6488,31 @@ impl AppState {
         self.set_config_focus(next);
     }
 
+    pub fn refresh_theme_library(&mut self) {
+        self.theme_library = crate::tui::theme::ThemeLibrarySnapshot::load();
+    }
+
     pub fn set_ui_theme(&mut self, theme_slug: &str) {
-        let Some(palette) = crate::tui::theme::palette_by_slug(theme_slug) else {
-            self.set_status(format!("Unknown theme: {}", theme_slug));
-            return;
+        let draft = match crate::tui::theme::load_theme_draft(theme_slug) {
+            Ok(draft) => draft,
+            Err(_) => {
+                self.set_status(format!("Unknown theme: {}", theme_slug));
+                return;
+            }
         };
-        let next_theme = crate::tui::theme::Theme::from_palette(palette);
+        let next_theme = crate::tui::theme::resolve_theme_draft(
+            &draft,
+            crate::tui::theme::ThemeApplyOptions::default(),
+            &self.theme_overrides,
+        );
 
         self.theme = next_theme;
-        self.config.ui.theme = palette.slug.to_string();
+        self.config.ui.theme = draft.slug.clone();
         self.retheme_open_file_picker_surfaces();
         if let Err(err) = self.config.save() {
             self.set_status(format!("Theme changed, but config save failed: {}", err));
         } else {
-            self.set_status(format!("Theme: {}", palette.name));
+            self.set_status(format!("Theme: {}", draft.name));
         }
         self.force_redraw = true;
     }
@@ -6515,12 +6551,8 @@ impl AppState {
     }
 
     pub fn cycle_ui_theme(&mut self, forward: bool) {
-        let slug = if forward {
-            crate::tui::theme::next_palette_slug(self.theme.slug)
-        } else {
-            crate::tui::theme::previous_palette_slug(self.theme.slug)
-        };
-        self.set_ui_theme(slug);
+        let slug = crate::tui::theme::next_theme_slug_in_library(self.theme.slug, forward);
+        self.set_ui_theme(&slug);
     }
 
     /// Refresh terminal graphics protocol detection after a terminal resize.

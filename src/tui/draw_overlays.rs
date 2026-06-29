@@ -93,11 +93,17 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         return;
     }
 
+    if let ActiveOverlay::ThemeBuilder(state) = &mut app.active_overlay {
+        super::theme_builder::draw_theme_builder(f, state.as_ref(), &mut app.button_map, theme);
+        return;
+    }
+
     // Clone overlay data to avoid borrow issues for overlays whose rendering does
     // not need to refresh crate-owned hit-test state.
     let overlay = app.active_overlay.clone();
     match overlay {
         ActiveOverlay::None => {}
+        ActiveOverlay::ThemeBuilder(_) => {}
         ActiveOverlay::Confirmation { ref message, .. } => {
             let message = message.clone();
             draw_confirmation(f, &message, app, theme);

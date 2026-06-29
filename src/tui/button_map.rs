@@ -244,6 +244,46 @@ pub enum TuiButton {
     TemplatePickerApply,
     TemplatePickerDelete,
     TemplatePickerClose,
+
+    // Config screen appearance pane.
+    ConfigThemePrev,
+    ConfigThemeNext,
+    ConfigThemeMode,
+    ConfigThemeDark,
+    ConfigThemeLight,
+    ConfigThemeBrowse,
+
+    // Theme Builder overlay.
+    ThemeBuilderPreset,
+    ThemeBuilderMode,
+    ThemeBuilderSlot(crate::tui::theme::BuilderSlot),
+    ThemeBuilderHexField,
+    ThemeBuilderRgbSlider(usize),
+    ThemeBuilderDepth(crate::tui::theme::ColorDepth),
+    ThemeBuilderSwatchNameField,
+    ThemeBuilderSavedSwatch(usize),
+    ThemeBuilderRecentSwatch(usize),
+    ThemeBuilderSaveSwatch,
+    ThemeBuilderDeleteSwatch,
+    ThemeBuilderSave,
+    ThemeBuilderApply,
+    ThemeBuilderDerived,
+    ThemeBuilderRevert,
+    ThemeBuilderDeleteTheme,
+    ThemeBuilderDeleteConfirm,
+    ThemeBuilderDeleteCancel,
+    ThemeBuilderCancel,
+    ThemeBuilderPresetRow(usize),
+    ThemeBuilderPresetCancel,
+    ThemeBuilderDerivedRow(usize),
+    ThemeBuilderDerivedLock,
+    ThemeBuilderDerivedRelease,
+    ThemeBuilderDerivedTarget,
+    ThemeBuilderDerivedDone,
+    ThemeBuilderApplyThemeLocks,
+    ThemeBuilderApplyUserOverrides,
+    ThemeBuilderApplyConfirm,
+    ThemeBuilderApplyCancel,
 }
 
 impl TuiButton {
@@ -294,6 +334,36 @@ impl TuiButton {
             | Self::TemplatePickerApply
             | Self::TemplatePickerDelete
             | Self::TemplatePickerClose
+            | Self::ThemeBuilderPreset
+            | Self::ThemeBuilderMode
+            | Self::ThemeBuilderSlot(_)
+            | Self::ThemeBuilderHexField
+            | Self::ThemeBuilderRgbSlider(_)
+            | Self::ThemeBuilderDepth(_)
+            | Self::ThemeBuilderSwatchNameField
+            | Self::ThemeBuilderSavedSwatch(_)
+            | Self::ThemeBuilderRecentSwatch(_)
+            | Self::ThemeBuilderSaveSwatch
+            | Self::ThemeBuilderDeleteSwatch
+            | Self::ThemeBuilderSave
+            | Self::ThemeBuilderApply
+            | Self::ThemeBuilderDerived
+            | Self::ThemeBuilderRevert
+            | Self::ThemeBuilderDeleteTheme
+            | Self::ThemeBuilderDeleteConfirm
+            | Self::ThemeBuilderDeleteCancel
+            | Self::ThemeBuilderCancel
+            | Self::ThemeBuilderPresetRow(_)
+            | Self::ThemeBuilderPresetCancel
+            | Self::ThemeBuilderDerivedRow(_)
+            | Self::ThemeBuilderDerivedLock
+            | Self::ThemeBuilderDerivedRelease
+            | Self::ThemeBuilderDerivedTarget
+            | Self::ThemeBuilderDerivedDone
+            | Self::ThemeBuilderApplyThemeLocks
+            | Self::ThemeBuilderApplyUserOverrides
+            | Self::ThemeBuilderApplyConfirm
+            | Self::ThemeBuilderApplyCancel
             | Self::FormatSettingsVerify(_)
             | Self::FormatSettingsMd5(_)
             | Self::FormatSettingsAacProfile(_)
@@ -347,6 +417,12 @@ impl TuiButton {
             | Self::TemplateBuildFilenameButton
             | Self::TemplateLoadFolderButton
             | Self::TemplateLoadFilenameButton => Some(AppScreen::Convert),
+            Self::ConfigThemePrev
+            | Self::ConfigThemeNext
+            | Self::ConfigThemeMode
+            | Self::ConfigThemeDark
+            | Self::ConfigThemeLight
+            | Self::ConfigThemeBrowse => Some(AppScreen::Config),
             Self::AddFiles
             | Self::AddFolder
             | Self::Configure
