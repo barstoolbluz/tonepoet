@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -14,7 +14,6 @@ use super::button_map::{ButtonRenderMap, ColumnKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
 use super::probe::MetadataField;
-use super::theme;
 
 /// Fixed column widths (inside the list border). Name is flexible.
 const COL_SIZE_W: usize = 9;
@@ -28,7 +27,7 @@ const ROW_PREFIX: usize = 4;
 const ROW_TRAILING: usize = 2;
 
 /// Draw the full browse screen
-pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
+pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -39,8 +38,8 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         ])
         .split(area);
 
-    draw_header(f, chunks[0]);
-    draw_breadcrumb(f, chunks[1], &app.browse);
+    draw_header(f, chunks[0], theme);
+    draw_breadcrumb(f, chunks[1], &app.browse, theme);
     app.button_map.record_button(TuiButton::BrowseBreadcrumb, chunks[1]);
 
     // Split main content horizontally: list (2/3) + info (1/3)
@@ -51,14 +50,13 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
 
     let list_area = content_chunks[0];
     let hover = app.hover_target;
-    draw_browse_list(f, list_area, &mut app.browse, hover);
+    draw_browse_list(f, list_area, &mut app.browse, hover, theme);
     draw_browse_info(
         f,
         content_chunks[1],
         &app.browse,
         &mut app.button_map,
-        hover,
-    );
+        hover, theme);
 
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
@@ -67,6 +65,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         app.current_screen,
         &mut app.button_map,
         status_msg,
+        theme,
     );
 
     // Register clickable regions for mouse support (split borrow)
@@ -185,15 +184,15 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
 
 /// Draw the breadcrumb bar showing the current directory path
 /// (and the active text filter, if any).
-fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
+fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super::theme::Theme) {
     if area.width < 10 {
         return;
     }
 
     let border_color = if browse.path_input.is_some() {
-        theme::BLUE
+        theme.blue
     } else {
-        theme::BORDER_DIM
+        theme.border_dim
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -221,12 +220,12 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
         let cursor_in_visible = cursor_char_pos.saturating_sub(scroll_offset);
 
         let text_style = if input.select_all {
-            Style::default().fg(theme::BG).bg(Color::Rgb(180, 190, 210))
+            Style::default().fg(theme.bg).bg(theme.selection_bg)
         } else {
-            theme::bright()
+            theme.bright()
         };
         let spans = vec![
-            Span::styled(prefix, Style::default().fg(theme::BLUE)),
+            Span::styled(prefix, Style::default().fg(theme.blue)),
             Span::styled(visible, text_style),
         ];
         let line = Paragraph::new(Line::from(spans));
@@ -284,19 +283,19 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState) {
     let display_truncated = truncate_left(&display, path_max);
 
     let mut spans = vec![
-        Span::styled(prefix, theme::muted()),
-        Span::styled(display_truncated, theme::bright()),
+        Span::styled(prefix, theme.muted()),
+        Span::styled(display_truncated, theme.bright()),
     ];
     if !filter_suffix.is_empty() {
         spans.push(Span::styled(
             filter_suffix,
-            Style::default().fg(theme::AMBER),
+            Style::default().fg(theme.amber),
         ));
     }
     if !type_ahead_suffix.is_empty() {
         spans.push(Span::styled(
             type_ahead_suffix,
-            Style::default().fg(theme::CYAN),
+            Style::default().fg(theme.cyan),
         ));
     }
 
@@ -333,12 +332,13 @@ fn draw_browse_list(
     area: Rect,
     browse: &mut BrowseState,
     hover: Option<super::button_map::TuiButton>,
+    theme: super::theme::Theme,
 ) {
     if area.height < 4 || area.width < 20 {
         return;
     }
 
-    let border_color = theme::CYAN;
+    let border_color = theme.cyan;
     let w = area.width as usize;
     let inner_w = w.saturating_sub(2);
 
@@ -355,22 +355,22 @@ fn draw_browse_list(
 
     let search_style = if browse.search.active {
         Style::default()
-            .fg(theme::GREEN)
+            .fg(theme.green)
             .add_modifier(ratatui::style::Modifier::BOLD)
     } else {
-        theme::border(border_color)
+        theme.border(border_color)
     };
     let top_line = Line::from(vec![
-        Span::styled("┌", theme::border(border_color)),
-        Span::styled(title, theme::border(border_color)),
-        Span::styled("─".repeat(dash_count), theme::border(border_color)),
+        Span::styled("┌", theme.border(border_color)),
+        Span::styled(title, theme.border(border_color)),
+        Span::styled("─".repeat(dash_count), theme.border(border_color)),
         Span::styled(search_label, search_style),
-        Span::styled("┐", theme::border(border_color)),
+        Span::styled("┐", theme.border(border_color)),
     ]);
 
     let bot_line = Line::from(Span::styled(
         format!("└{}┘", "─".repeat(w.saturating_sub(2))),
-        theme::border(border_color),
+        theme.border(border_color),
     ));
 
     // Content rows = total - top border - header - bottom border
@@ -399,8 +399,7 @@ fn draw_browse_list(
         w,
         name_w,
         browse.sort_by,
-        browse.sort_dir,
-    ));
+        browse.sort_dir, theme));
 
     // Search panel (2 rows when active).
     if browse.search.active {
@@ -410,14 +409,14 @@ fn draw_browse_list(
             Span::styled(
                 " recursive ✓ ",
                 Style::default()
-                    .fg(theme::PILL_ACTIVE_FG)
-                    .bg(theme::GREEN)
+                    .fg(theme.pill_active_fg)
+                    .bg(theme.green)
                     .add_modifier(ratatui::style::Modifier::BOLD),
             )
         } else {
             Span::styled(
                 " recursive ",
-                Style::default().fg(theme::TEXT_DIM).bg(theme::SURFACE),
+                Style::default().fg(theme.text_dim).bg(theme.surface),
             )
         };
         let pill_w = rec_pill.width();
@@ -433,15 +432,15 @@ fn draw_browse_list(
         };
         let search_pad = inner_w.saturating_sub(3 + input_w + pill_w);
         lines.push(Line::from(vec![
-            Span::styled("│", theme::border(border_color)),
-            Span::styled(" / ", Style::default().fg(theme::AMBER)),
+            Span::styled("│", theme.border(border_color)),
+            Span::styled(" / ", Style::default().fg(theme.amber)),
             Span::styled(
                 padded,
-                Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE),
+                Style::default().fg(theme.text_bright).bg(theme.surface),
             ),
             Span::raw(" ".repeat(search_pad.max(1))),
             rec_pill,
-            Span::styled("│", theme::border(border_color)),
+            Span::styled("│", theme.border(border_color)),
         ]));
 
         // Row 2: mode cycle + sort cycle + [audio] toggle
@@ -455,14 +454,14 @@ fn draw_browse_list(
             Span::styled(
                 " audio ✓ ",
                 Style::default()
-                    .fg(theme::PILL_ACTIVE_FG)
-                    .bg(theme::GREEN)
+                    .fg(theme.pill_active_fg)
+                    .bg(theme.green)
                     .add_modifier(ratatui::style::Modifier::BOLD),
             )
         } else {
             Span::styled(
                 " all files ",
-                Style::default().fg(theme::TEXT_DIM).bg(theme::SURFACE),
+                Style::default().fg(theme.text_dim).bg(theme.surface),
             )
         };
 
@@ -471,14 +470,14 @@ fn draw_browse_list(
         let row2_content = mode_label.len() + 1 + sort_display_w + 1 + audio_pill.width();
         let row2_pad = inner_w.saturating_sub(row2_content);
         lines.push(Line::from(vec![
-            Span::styled("│", theme::border(border_color)),
-            Span::styled(mode_label, Style::default().fg(theme::CYAN)),
+            Span::styled("│", theme.border(border_color)),
+            Span::styled(mode_label, Style::default().fg(theme.cyan)),
             Span::raw(" "),
-            Span::styled(sort_label, Style::default().fg(theme::AMBER)),
+            Span::styled(sort_label, Style::default().fg(theme.amber)),
             Span::raw(" "),
             audio_pill,
             Span::raw(" ".repeat(row2_pad)),
-            Span::styled("│", theme::border(border_color)),
+            Span::styled("│", theme.border(border_color)),
         ]));
     }
 
@@ -488,11 +487,10 @@ fn draw_browse_list(
             w,
             vec![Span::styled(
                 format!("   {}", err),
-                Style::default().fg(theme::RED),
-            )],
-        ));
+                Style::default().fg(theme.destructive),
+            )], theme));
         for _ in 1..content_height {
-            lines.push(bordered_line(border_color, w, vec![]));
+            lines.push(bordered_line(border_color, w, vec![], theme));
         }
     } else if browse.entries.is_empty() {
         let msg = if browse.scan_pending.is_some() {
@@ -503,10 +501,9 @@ fn draw_browse_list(
         lines.push(bordered_line(
             border_color,
             w,
-            vec![Span::styled(msg, theme::muted())],
-        ));
+            vec![Span::styled(msg, theme.muted())], theme));
         for _ in 1..content_height {
-            lines.push(bordered_line(border_color, w, vec![]));
+            lines.push(bordered_line(border_color, w, vec![], theme));
         }
     } else {
         let start = browse.scroll_offset;
@@ -525,13 +522,12 @@ fn draw_browse_list(
                 entry,
                 is_selected,
                 is_checked,
-                is_hovered,
-            ));
+                is_hovered, theme));
         }
 
         let rendered = end - start;
         for _ in rendered..content_height {
-            lines.push(bordered_line(border_color, w, vec![]));
+            lines.push(bordered_line(border_color, w, vec![], theme));
         }
     }
 
@@ -547,12 +543,12 @@ fn draw_browse_list(
         let visible_w = visible.chars().count();
         let pad = input_width.saturating_sub(visible_w);
         lines.push(Line::from(vec![
-            Span::styled("│", theme::border(border_color)),
-            Span::styled(" / ", Style::default().fg(theme::CYAN)),
-            Span::styled(visible, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled("│", theme.border(border_color)),
+            Span::styled(" / ", Style::default().fg(theme.cyan)),
+            Span::styled(visible, Style::default().fg(theme.text_bright)),
             Span::raw(" ".repeat(pad)),
             Span::raw(" "),
-            Span::styled("│", theme::border(border_color)),
+            Span::styled("│", theme.border(border_color)),
         ]));
     }
 
@@ -583,6 +579,7 @@ fn render_header_row(
     name_w: usize,
     sort_by: SortBy,
     sort_dir: SortDir,
+    theme: super::theme::Theme,
 ) -> Line<'static> {
     let arrow = match sort_dir {
         SortDir::Asc => "▲",
@@ -594,10 +591,10 @@ fn render_header_row(
             let is_active = sort_by == col;
             let style = if is_active {
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme.cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
-                theme::muted()
+                theme.muted()
             };
             // Cell text: "label ▲" if active, else "label"
             let text: String = if is_active {
@@ -615,7 +612,7 @@ fn render_header_row(
         };
 
     let mut spans = vec![
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
         Span::raw(" ".repeat(ROW_PREFIX)),
     ];
     spans.extend(header_cell("name", SortBy::Name, name_w, false));
@@ -626,7 +623,7 @@ fn render_header_row(
     spans.push(Span::raw(" "));
     spans.extend(header_cell("type", SortBy::Type, COL_TYPE_W, false));
     spans.push(Span::raw(" ".repeat(ROW_TRAILING)));
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
 
     // Pad any shortfall to reach the right border cleanly (safety net).
     let used: usize = spans.iter().map(|s| s.width()).sum();
@@ -650,48 +647,49 @@ fn render_entry_line(
     is_selected: bool,
     is_checked: bool,
     is_hovered: bool,
+    theme: super::theme::Theme,
 ) -> Line<'static> {
     // Cursor indicator
     let cursor = if is_selected { "▸ " } else { "  " };
     let cursor_style = if is_selected {
-        Style::default().fg(theme::BLUE)
+        Style::default().fg(theme.blue)
     } else {
-        Style::default().fg(theme::TEXT_DIM)
+        Style::default().fg(theme.text_dim)
     };
 
     // Multi-select checkbox
     let check = if is_checked { "●" } else { " " };
     let check_style = if is_checked {
-        Style::default().fg(theme::CYAN)
+        Style::default().fg(theme.cyan)
     } else {
-        Style::default().fg(theme::TEXT_DIM)
+        Style::default().fg(theme.text_dim)
     };
 
     // Entry name color. Broken symlinks override to red regardless of kind.
     let name_style = if entry.is_broken_symlink {
-        Style::default().fg(theme::RED)
+        Style::default().fg(theme.destructive)
     } else {
         match &entry.kind {
-            EntryKind::ParentDir => Style::default().fg(theme::TEXT_MUTED),
-            EntryKind::Directory => Style::default().fg(theme::BLUE),
+            EntryKind::ParentDir => Style::default().fg(theme.text_muted),
+            EntryKind::Directory => Style::default().fg(theme.blue),
             EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir => {
-                Style::default().fg(theme::PURPLE)
+                Style::default().fg(theme.purple)
             }
             EntryKind::AudioFile(_) => {
                 if is_selected {
                     Style::default()
-                        .fg(theme::TEXT_BRIGHT)
+                        .fg(theme.text_bright)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::TEXT)
+                    Style::default().fg(theme.text)
                 }
             }
-            EntryKind::Archive => Style::default().fg(theme::AMBER),
+            EntryKind::Archive => Style::default().fg(theme.amber),
             EntryKind::SacdIso
             | EntryKind::DvdAudioIso
             | EntryKind::DvdVideoIso
-            | EntryKind::BlurayIso => Style::default().fg(theme::PURPLE),
-            EntryKind::OtherFile => Style::default().fg(theme::TEXT_DIM),
+            | EntryKind::BlurayIso => Style::default().fg(theme.purple),
+            EntryKind::OtherFile => Style::default().fg(theme.text_dim),
         }
     };
 
@@ -712,19 +710,19 @@ fn render_entry_line(
     let type_display = pad_or_truncate(&entry.type_label(), COL_TYPE_W, false);
 
     let mut spans = vec![
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
         Span::styled(cursor, cursor_style),
         Span::styled(check, check_style),
         Span::raw(" "),
         Span::styled(name_display, name_style),
         Span::raw(" "),
-        Span::styled(size_display, theme::muted()),
+        Span::styled(size_display, theme.muted()),
         Span::raw(" "),
-        Span::styled(date_display, theme::muted()),
+        Span::styled(date_display, theme.muted()),
         Span::raw(" "),
-        Span::styled(type_display, theme::muted()),
+        Span::styled(type_display, theme.muted()),
         Span::raw(" ".repeat(ROW_TRAILING)),
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
     ];
 
     // Pad any shortfall before the right border (safety net on narrow widths).
@@ -738,9 +736,9 @@ fn render_entry_line(
 
     // Selected row gets a subtle bg highlight; hovered row gets a dimmer one.
     let bg = if is_selected {
-        Some(theme::BORDER_DIM)
+        Some(theme.border_dim)
     } else if is_hovered {
-        Some(theme::HOVER_BG)
+        Some(theme.hover_bg)
     } else {
         None
     };
@@ -801,12 +799,13 @@ fn draw_browse_info(
     browse: &BrowseState,
     buttons: &mut ButtonRenderMap,
     hover: Option<super::button_map::TuiButton>,
+    theme: super::theme::Theme,
 ) {
     if area.height < 4 || area.width < 15 {
         return;
     }
 
-    let border_color = theme::AMBER;
+    let border_color = theme.amber;
     let w = area.width as usize;
 
     // Top border
@@ -814,15 +813,15 @@ fn draw_browse_info(
     let dash_count = w.saturating_sub(2 + title.len());
 
     let top_line = Line::from(vec![
-        Span::styled("┌", theme::border(border_color)),
-        Span::styled(title, theme::border(border_color)),
-        Span::styled("─".repeat(dash_count), theme::border(border_color)),
-        Span::styled("┐", theme::border(border_color)),
+        Span::styled("┌", theme.border(border_color)),
+        Span::styled(title, theme.border(border_color)),
+        Span::styled("─".repeat(dash_count), theme.border(border_color)),
+        Span::styled("┐", theme.border(border_color)),
     ]);
 
     let bot_line = Line::from(Span::styled(
         format!("└{}┘", "─".repeat(w.saturating_sub(2))),
-        theme::border(border_color),
+        theme.border(border_color),
     ));
 
     let content_height = (area.height as usize).saturating_sub(2);
@@ -841,11 +840,10 @@ fn draw_browse_info(
             content_width,
             analyze_hovered,
             edit_tags_hovered,
-            audio_streams_hovered,
-        )
+            audio_streams_hovered, theme)
     } else {
         InfoContent {
-            lines: vec![vec![Span::styled("   (no selection)", theme::muted())]],
+            lines: vec![vec![Span::styled("   (no selection)", theme.muted())]],
             meta_field_rows: Vec::new(),
             analyze_pill_row: None,
             edit_tags_pill_row: None,
@@ -855,13 +853,13 @@ fn draw_browse_info(
 
     // Render content lines with border
     for line_spans in info.lines.iter().take(content_height) {
-        lines.push(bordered_line(border_color, w, line_spans.clone()));
+        lines.push(bordered_line(border_color, w, line_spans.clone(), theme));
     }
 
     // Fill remaining
     let rendered = info.lines.len().min(content_height);
     for _ in rendered..content_height {
-        lines.push(bordered_line(border_color, w, vec![]));
+        lines.push(bordered_line(border_color, w, vec![], theme));
     }
 
     lines.push(bot_line);
@@ -937,6 +935,7 @@ fn entry_info_lines(
     analyze_hovered: bool,
     edit_tags_hovered: bool,
     audio_streams_hovered: bool,
+    theme: super::theme::Theme,
 ) -> InfoContent {
     // Maximum width for free-form text values: subtract the 3-space indent
     let max_value_chars = content_width.saturating_sub(3);
@@ -954,43 +953,43 @@ fn entry_info_lines(
     lines.push(vec![]);
 
     // Name section
-    lines.push(vec![Span::styled("   name", theme::muted())]);
+    lines.push(vec![Span::styled("   name", theme.muted())]);
     lines.push(vec![
         Span::raw("   "),
-        Span::styled(truncate_to(&entry.name, max_value_chars), theme::bright()),
+        Span::styled(truncate_to(&entry.name, max_value_chars), theme.bright()),
     ]);
     lines.push(vec![]);
 
     match &entry.kind {
         EntryKind::ParentDir => {
-            lines.push(vec![Span::styled("   parent directory", theme::muted())]);
+            lines.push(vec![Span::styled("   parent directory", theme.muted())]);
         }
         EntryKind::Directory => {
             lines.push(vec![
-                Span::styled("   kind    ", theme::muted()),
-                Span::styled("directory", theme::text()),
+                Span::styled("   kind    ", theme.muted()),
+                Span::styled("directory", theme.text_style()),
             ]);
             // Show directory stats if cached, or "computing…" if a stats
             // task is currently in flight for this directory.
             if let Some(stats) = browse.current_dir_stats() {
                 lines.push(vec![
-                    Span::styled("   files   ", theme::muted()),
-                    Span::styled(stats.file_count.to_string(), theme::text()),
+                    Span::styled("   files   ", theme.muted()),
+                    Span::styled(stats.file_count.to_string(), theme.text_style()),
                 ]);
                 if stats.audio_count > 0 {
                     lines.push(vec![
-                        Span::styled("   audio   ", theme::muted()),
-                        Span::styled(stats.audio_count.to_string(), theme::accent()),
+                        Span::styled("   audio   ", theme.muted()),
+                        Span::styled(stats.audio_count.to_string(), theme.accent()),
                     ]);
                 }
                 lines.push(vec![
-                    Span::styled("   size    ", theme::muted()),
-                    Span::styled(size_str(stats.total_size), theme::text()),
+                    Span::styled("   size    ", theme.muted()),
+                    Span::styled(size_str(stats.total_size), theme.text_style()),
                 ]);
             } else if browse.dir_stats_pending.contains(&entry.path) {
                 lines.push(vec![
-                    Span::styled("   files   ", theme::muted()),
-                    Span::styled("computing…", Style::default().fg(theme::TEXT_DIM)),
+                    Span::styled("   files   ", theme.muted()),
+                    Span::styled("computing…", Style::default().fg(theme.text_dim)),
                 ]);
             }
         }
@@ -1001,49 +1000,49 @@ fn entry_info_lines(
             if let Some(cached) = browse.current_cached_info() {
                 let info = &cached.source;
                 lines.push(vec![
-                    Span::styled("   format  ", theme::muted()),
-                    Span::styled(info.format_name.clone(), theme::bold(theme::BLUE)),
+                    Span::styled("   format  ", theme.muted()),
+                    Span::styled(info.format_name.clone(), theme.bold(theme.blue)),
                 ]);
                 lines.push(vec![
-                    Span::styled("   codec   ", theme::muted()),
-                    Span::styled(info.codec_display(), theme::text()),
+                    Span::styled("   codec   ", theme.muted()),
+                    Span::styled(info.codec_display(), theme.text_style()),
                 ]);
                 if info.sample_rate > 0 {
                     lines.push(vec![
-                        Span::styled("   rate    ", theme::muted()),
-                        Span::styled(info.sample_rate_display(), theme::text()),
+                        Span::styled("   rate    ", theme.muted()),
+                        Span::styled(info.sample_rate_display(), theme.text_style()),
                     ]);
                 }
                 if info.channels > 0 {
                     lines.push(vec![
-                        Span::styled("   channels", theme::muted()),
+                        Span::styled("   channels", theme.muted()),
                         Span::raw(" "),
-                        Span::styled(info.channels_display(), theme::text()),
+                        Span::styled(info.channels_display(), theme.text_style()),
                     ]);
                 }
                 if info.duration_secs > 0.0 {
                     lines.push(vec![
-                        Span::styled("   duration", theme::muted()),
+                        Span::styled("   duration", theme.muted()),
                         Span::raw(" "),
-                        Span::styled(info.duration_display(), theme::text()),
+                        Span::styled(info.duration_display(), theme.text_style()),
                     ]);
                 }
                 lines.push(vec![
-                    Span::styled("   size    ", theme::muted()),
-                    Span::styled(info.size_display(), theme::text()),
+                    Span::styled("   size    ", theme.muted()),
+                    Span::styled(info.size_display(), theme.text_style()),
                 ]);
 
                 // Pre-emphasis — show if metadata evidence detected.
                 if let Some(ref pe) = cached.metadata.preemphasis_metadata {
                     lines.push(vec![
-                        Span::styled("   pre-emph", theme::muted()),
+                        Span::styled("   pre-emph", theme.muted()),
                         Span::raw(" "),
                         Span::styled(
                             truncate_to(
                                 &format!("detected ({})", pe),
                                 max_value_chars.saturating_sub(11),
                             ),
-                            Style::default().fg(theme::RED),
+                            Style::default().fg(theme.destructive),
                         ),
                     ]);
                 }
@@ -1052,20 +1051,20 @@ fn entry_info_lines(
                 // "HDCD" in the value text rendered gold.
                 if let Some(ref hdcd) = cached.metadata.hdcd_detail {
                     let val_max = max_value_chars.saturating_sub(11);
-                    let mut spans = vec![Span::styled("   HDCD    ", theme::muted())];
+                    let mut spans = vec![Span::styled("   HDCD    ", theme.muted())];
                     if let Some(rest) = hdcd.strip_prefix("HDCD") {
                         spans.push(Span::styled(
                             "HDCD",
                             Style::default()
-                                .fg(theme::AMBER)
+                                .fg(theme.amber)
                                 .add_modifier(ratatui::style::Modifier::BOLD),
                         ));
                         spans.push(Span::styled(
                             truncate_to(rest, val_max.saturating_sub(4)),
-                            theme::text(),
+                            theme.text_style(),
                         ));
                     } else {
-                        spans.push(Span::styled(truncate_to(hdcd, val_max), theme::text()));
+                        spans.push(Span::styled(truncate_to(hdcd, val_max), theme.text_style()));
                     }
                     lines.push(spans);
                 }
@@ -1092,43 +1091,43 @@ fn entry_info_lines(
                         (false, true) => "r128",
                         _ => "loudness",
                     };
-                    lines.push(vec![Span::styled(format!("   {}", label), theme::muted())]);
+                    lines.push(vec![Span::styled(format!("   {}", label), theme.muted())]);
 
                     let rg_inline_max = max_value_chars.saturating_sub(11);
                     if let Some(g) = &meta.rg_track_gain {
                         lines.push(vec![
-                            Span::styled("   tk gain ", theme::muted()),
-                            Span::styled(truncate_to(g, rg_inline_max), theme::text()),
+                            Span::styled("   tk gain ", theme.muted()),
+                            Span::styled(truncate_to(g, rg_inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(p) = &meta.rg_track_peak {
                         lines.push(vec![
-                            Span::styled("   tk peak ", theme::muted()),
-                            Span::styled(truncate_to(p, rg_inline_max), theme::text()),
+                            Span::styled("   tk peak ", theme.muted()),
+                            Span::styled(truncate_to(p, rg_inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(g) = &meta.rg_album_gain {
                         lines.push(vec![
-                            Span::styled("   al gain ", theme::muted()),
-                            Span::styled(truncate_to(g, rg_inline_max), theme::text()),
+                            Span::styled("   al gain ", theme.muted()),
+                            Span::styled(truncate_to(g, rg_inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(p) = &meta.rg_album_peak {
                         lines.push(vec![
-                            Span::styled("   al peak ", theme::muted()),
-                            Span::styled(truncate_to(p, rg_inline_max), theme::text()),
+                            Span::styled("   al peak ", theme.muted()),
+                            Span::styled(truncate_to(p, rg_inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(g) = &meta.r128_track_gain {
                         lines.push(vec![
-                            Span::styled("   r128 tk ", theme::muted()),
-                            Span::styled(truncate_to(g, rg_inline_max), theme::text()),
+                            Span::styled("   r128 tk ", theme.muted()),
+                            Span::styled(truncate_to(g, rg_inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(g) = &meta.r128_album_gain {
                         lines.push(vec![
-                            Span::styled("   r128 al ", theme::muted()),
-                            Span::styled(truncate_to(g, rg_inline_max), theme::text()),
+                            Span::styled("   r128 al ", theme.muted()),
+                            Span::styled(truncate_to(g, rg_inline_max), theme.text_style()),
                         ]);
                     }
                 }
@@ -1140,16 +1139,16 @@ fn entry_info_lines(
                 let analyze_w = analyze_label.chars().count();
                 let analyze_pad = content_width.saturating_sub(analyze_w + 3);
                 let analyze_bg = if analyze_hovered {
-                    theme::BLUE
+                    theme.blue
                 } else {
-                    theme::PURPLE
+                    theme.purple
                 };
                 lines.push(vec![
                     Span::raw(" ".repeat(analyze_pad)),
                     Span::styled(
                         analyze_label,
                         Style::default()
-                            .fg(theme::PILL_ACTIVE_FG)
+                            .fg(theme.pill_active_fg)
                             .bg(analyze_bg)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
@@ -1162,17 +1161,17 @@ fn entry_info_lines(
                     lines.push(vec![]);
 
                     // Title: 2-line layout (label + value). Clickable on value row.
-                    lines.push(vec![Span::styled("   title", theme::muted())]);
+                    lines.push(vec![Span::styled("   title", theme.muted())]);
                     let title_value_row = lines.len();
                     if let Some(title) = &meta.title {
                         lines.push(vec![
                             Span::raw("   "),
-                            Span::styled(truncate_to(title, max_value_chars), theme::bright()),
+                            Span::styled(truncate_to(title, max_value_chars), theme.bright()),
                         ]);
                     } else {
                         lines.push(vec![Span::styled(
                             "   (click to add)",
-                            Style::default().fg(theme::TEXT_DIM),
+                            Style::default().fg(theme.text_dim),
                         )]);
                     }
                     meta_field_rows.push((MetadataField::Title, title_value_row));
@@ -1181,13 +1180,13 @@ fn entry_info_lines(
                     let artist_row = lines.len();
                     if let Some(artist) = &meta.artist {
                         lines.push(vec![
-                            Span::styled("   artist  ", theme::muted()),
-                            Span::styled(truncate_to(artist, inline_max), theme::text()),
+                            Span::styled("   artist  ", theme.muted()),
+                            Span::styled(truncate_to(artist, inline_max), theme.text_style()),
                         ]);
                     } else {
                         lines.push(vec![
-                            Span::styled("   artist  ", theme::muted()),
-                            Span::styled("(click to add)", Style::default().fg(theme::TEXT_DIM)),
+                            Span::styled("   artist  ", theme.muted()),
+                            Span::styled("(click to add)", Style::default().fg(theme.text_dim)),
                         ]);
                     }
                     meta_field_rows.push((MetadataField::Artist, artist_row));
@@ -1196,13 +1195,13 @@ fn entry_info_lines(
                     let album_row = lines.len();
                     if let Some(album) = &meta.album {
                         lines.push(vec![
-                            Span::styled("   album   ", theme::muted()),
-                            Span::styled(truncate_to(album, inline_max), theme::text()),
+                            Span::styled("   album   ", theme.muted()),
+                            Span::styled(truncate_to(album, inline_max), theme.text_style()),
                         ]);
                     } else {
                         lines.push(vec![
-                            Span::styled("   album   ", theme::muted()),
-                            Span::styled("(click to add)", Style::default().fg(theme::TEXT_DIM)),
+                            Span::styled("   album   ", theme.muted()),
+                            Span::styled("(click to add)", Style::default().fg(theme.text_dim)),
                         ]);
                     }
                     meta_field_rows.push((MetadataField::Album, album_row));
@@ -1211,13 +1210,13 @@ fn entry_info_lines(
                     let genre_row = lines.len();
                     if let Some(genre) = &meta.genre {
                         lines.push(vec![
-                            Span::styled("   genre   ", theme::muted()),
-                            Span::styled(truncate_to(genre, inline_max), theme::text()),
+                            Span::styled("   genre   ", theme.muted()),
+                            Span::styled(truncate_to(genre, inline_max), theme.text_style()),
                         ]);
                     } else {
                         lines.push(vec![
-                            Span::styled("   genre   ", theme::muted()),
-                            Span::styled("(click to add)", Style::default().fg(theme::TEXT_DIM)),
+                            Span::styled("   genre   ", theme.muted()),
+                            Span::styled("(click to add)", Style::default().fg(theme.text_dim)),
                         ]);
                     }
                     meta_field_rows.push((MetadataField::Genre, genre_row));
@@ -1226,13 +1225,13 @@ fn entry_info_lines(
                     let year_row = lines.len();
                     if let Some(year) = &meta.year {
                         lines.push(vec![
-                            Span::styled("   year    ", theme::muted()),
-                            Span::styled(truncate_to(year, inline_max), theme::text()),
+                            Span::styled("   year    ", theme.muted()),
+                            Span::styled(truncate_to(year, inline_max), theme.text_style()),
                         ]);
                     } else {
                         lines.push(vec![
-                            Span::styled("   year    ", theme::muted()),
-                            Span::styled("(click to add)", Style::default().fg(theme::TEXT_DIM)),
+                            Span::styled("   year    ", theme.muted()),
+                            Span::styled("(click to add)", Style::default().fg(theme.text_dim)),
                         ]);
                     }
                     meta_field_rows.push((MetadataField::Year, year_row));
@@ -1240,12 +1239,12 @@ fn entry_info_lines(
             } else {
                 // Not yet probed or probe failed — show basic info
                 lines.push(vec![
-                    Span::styled("   format  ", theme::muted()),
-                    Span::styled(fmt.name().to_string(), theme::bold(theme::BLUE)),
+                    Span::styled("   format  ", theme.muted()),
+                    Span::styled(fmt.name().to_string(), theme.bold(theme.blue)),
                 ]);
                 lines.push(vec![
-                    Span::styled("   size    ", theme::muted()),
-                    Span::styled(size_str(entry.size), theme::text()),
+                    Span::styled("   size    ", theme.muted()),
+                    Span::styled(size_str(entry.size), theme.text_style()),
                 ]);
 
                 // Analyze pill after basic info.
@@ -1255,16 +1254,16 @@ fn entry_info_lines(
                 let a_w = a_label.chars().count();
                 let a_pad = content_width.saturating_sub(a_w + 3);
                 let a_bg = if analyze_hovered {
-                    theme::BLUE
+                    theme.blue
                 } else {
-                    theme::PURPLE
+                    theme.purple
                 };
                 lines.push(vec![
                     Span::raw(" ".repeat(a_pad)),
                     Span::styled(
                         a_label,
                         Style::default()
-                            .fg(theme::PILL_ACTIVE_FG)
+                            .fg(theme.pill_active_fg)
                             .bg(a_bg)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
@@ -1276,16 +1275,16 @@ fn entry_info_lines(
                 let et_w2 = et_label.chars().count();
                 let et_pad2 = content_width.saturating_sub(et_w2 + 3);
                 let et_bg2 = if edit_tags_hovered {
-                    theme::BLUE
+                    theme.blue
                 } else {
-                    theme::PURPLE
+                    theme.purple
                 };
                 lines.push(vec![
                     Span::raw(" ".repeat(et_pad2)),
                     Span::styled(
                         et_label,
                         Style::default()
-                            .fg(theme::PILL_ACTIVE_FG)
+                            .fg(theme.pill_active_fg)
                             .bg(et_bg2)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
@@ -1306,16 +1305,16 @@ fn entry_info_lines(
             let et_w = et_label.chars().count();
             let et_pad = content_width.saturating_sub(et_w + 3);
             let et_bg = if edit_tags_hovered {
-                theme::BLUE
+                theme.blue
             } else {
-                theme::PURPLE
+                theme.purple
             };
             lines.push(vec![
                 Span::raw(" ".repeat(et_pad)),
                 Span::styled(
                     et_label,
                     Style::default()
-                        .fg(theme::PILL_ACTIVE_FG)
+                        .fg(theme.pill_active_fg)
                         .bg(et_bg)
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
@@ -1344,8 +1343,8 @@ fn entry_info_lines(
                 _ => unreachable!("disc info arm only handles disc entries"),
             };
             lines.push(vec![
-                Span::styled("   kind    ", theme::muted()),
-                Span::styled(disc_kind, theme::bold(theme::PURPLE)),
+                Span::styled("   kind    ", theme.muted()),
+                Span::styled(disc_kind, theme.bold(theme.purple)),
             ]);
             if let Some(contents) = browse
                 .disc_probe_cache
@@ -1353,31 +1352,31 @@ fn entry_info_lines(
                 .and_then(|cache| cache.contents_if_current(&entry.path))
             {
                 lines.push(vec![
-                    Span::styled("   streams ", theme::muted()),
-                    Span::styled(crate::tui::disc_browser::disc_summary(contents.as_ref()), theme::text()),
+                    Span::styled("   streams ", theme.muted()),
+                    Span::styled(crate::tui::disc_browser::disc_summary(contents.as_ref()), theme.text_style()),
                 ]);
                 lines.push(vec![
-                    Span::styled("   copy protection", theme::muted()),
+                    Span::styled("   copy protection", theme.muted()),
                     Span::raw(" "),
                     Span::styled(
                         truncate_to(&contents.copy_protection.description, max_value_chars.saturating_sub(18)),
-                        theme::text(),
+                        theme.text_style(),
                     ),
                 ]);
                 lines.push(vec![]);
                 for (idx, presentation) in contents.presentations.iter().enumerate().take(6) {
                     lines.push(vec![
-                        Span::styled("   ", theme::muted()),
+                        Span::styled("   ", theme.muted()),
                         Span::styled(
                             truncate_to(&crate::tui::disc_browser::presentation_summary(idx, presentation), max_value_chars),
-                            theme::text(),
+                            theme.text_style(),
                         ),
                     ]);
                 }
                 if contents.presentations.len() > 6 {
                     lines.push(vec![Span::styled(
                         format!("   … {} more audio streams", contents.presentations.len() - 6),
-                        theme::muted(),
+                        theme.muted(),
                     )]);
                 }
                 if contents.presentations.len() >= 2 {
@@ -1386,13 +1385,13 @@ fn entry_info_lines(
                     let label = " audio streams ";
                     let width = label.chars().count();
                     let pad = content_width.saturating_sub(width + 3);
-                    let bg = if audio_streams_hovered { theme::BLUE } else { theme::PURPLE };
+                    let bg = if audio_streams_hovered { theme.blue } else { theme.purple };
                     lines.push(vec![
                         Span::raw(" ".repeat(pad)),
                         Span::styled(
                             label,
                             Style::default()
-                                .fg(theme::PILL_ACTIVE_FG)
+                                .fg(theme.pill_active_fg)
                                 .bg(bg)
                                 .add_modifier(ratatui::style::Modifier::BOLD),
                         ),
@@ -1405,63 +1404,63 @@ fn entry_info_lines(
                 .and_then(|cache| cache.error_if_current(&entry.path))
             {
                 lines.push(vec![
-                    Span::styled("   status  ", theme::muted()),
-                    Span::styled(truncate_to(error, max_value_chars.saturating_sub(10)), Style::default().fg(theme::RED)),
+                    Span::styled("   status  ", theme.muted()),
+                    Span::styled(truncate_to(error, max_value_chars.saturating_sub(10)), Style::default().fg(theme.destructive)),
                 ]);
-                lines.push(vec![Span::styled("   size    ", theme::muted()), Span::styled(size_str(entry.size), theme::text())]);
+                lines.push(vec![Span::styled("   size    ", theme.muted()), Span::styled(size_str(entry.size), theme.text_style())]);
             } else {
-                lines.push(vec![Span::styled("   status  ", theme::muted()), Span::styled("Analyzing disc…", theme::muted())]);
-                lines.push(vec![Span::styled("   size    ", theme::muted()), Span::styled(size_str(entry.size), theme::text())]);
+                lines.push(vec![Span::styled("   status  ", theme.muted()), Span::styled("Analyzing disc…", theme.muted())]);
+                lines.push(vec![Span::styled("   size    ", theme.muted()), Span::styled(size_str(entry.size), theme.text_style())]);
             }
         }
         EntryKind::Archive => {
             lines.push(vec![
-                Span::styled("   kind    ", theme::muted()),
-                Span::styled("archive (7z)", theme::text()),
+                Span::styled("   kind    ", theme.muted()),
+                Span::styled("archive (7z)", theme.text_style()),
             ]);
             lines.push(vec![
-                Span::styled("   size    ", theme::muted()),
-                Span::styled(size_str(entry.size), theme::text()),
+                Span::styled("   size    ", theme.muted()),
+                Span::styled(size_str(entry.size), theme.text_style()),
             ]);
         }
         EntryKind::SacdIso => {
             lines.push(vec![
-                Span::styled("   kind    ", theme::muted()),
-                Span::styled("SACD ISO (ScarletBook)", theme::text()),
+                Span::styled("   kind    ", theme.muted()),
+                Span::styled("SACD ISO (ScarletBook)", theme.text_style()),
             ]);
             if let Some(cached) = browse.current_cached_info() {
                 let info = &cached.source;
                 lines.push(vec![
-                    Span::styled("   format  ", theme::muted()),
-                    Span::styled(info.format_name.clone(), theme::bold(theme::PURPLE)),
+                    Span::styled("   format  ", theme.muted()),
+                    Span::styled(info.format_name.clone(), theme.bold(theme.purple)),
                 ]);
                 lines.push(vec![
-                    Span::styled("   codec   ", theme::muted()),
-                    Span::styled(info.codec_display(), theme::text()),
+                    Span::styled("   codec   ", theme.muted()),
+                    Span::styled(info.codec_display(), theme.text_style()),
                 ]);
                 if info.sample_rate > 0 {
                     lines.push(vec![
-                        Span::styled("   rate    ", theme::muted()),
-                        Span::styled(info.sample_rate_display(), theme::text()),
+                        Span::styled("   rate    ", theme.muted()),
+                        Span::styled(info.sample_rate_display(), theme.text_style()),
                     ]);
                 }
                 if info.channels > 0 {
                     lines.push(vec![
-                        Span::styled("   channels", theme::muted()),
+                        Span::styled("   channels", theme.muted()),
                         Span::raw(" "),
-                        Span::styled(info.channels_display(), theme::text()),
+                        Span::styled(info.channels_display(), theme.text_style()),
                     ]);
                 }
                 if info.duration_secs > 0.0 {
                     lines.push(vec![
-                        Span::styled("   duration", theme::muted()),
+                        Span::styled("   duration", theme.muted()),
                         Span::raw(" "),
-                        Span::styled(info.duration_display(), theme::text()),
+                        Span::styled(info.duration_display(), theme.text_style()),
                     ]);
                 }
                 lines.push(vec![
-                    Span::styled("   size    ", theme::muted()),
-                    Span::styled(info.size_display(), theme::text()),
+                    Span::styled("   size    ", theme.muted()),
+                    Span::styled(info.size_display(), theme.text_style()),
                 ]);
 
                 // Album-level metadata block (from sidecar overlay
@@ -1477,32 +1476,32 @@ fn entry_info_lines(
                     lines.push(vec![]);
                     if let Some(s) = &meta.artist {
                         lines.push(vec![
-                            Span::styled("   artist  ", theme::muted()),
-                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                            Span::styled("   artist  ", theme.muted()),
+                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(s) = &meta.album {
                         lines.push(vec![
-                            Span::styled("   album   ", theme::muted()),
-                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                            Span::styled("   album   ", theme.muted()),
+                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(s) = &meta.genre {
                         lines.push(vec![
-                            Span::styled("   genre   ", theme::muted()),
-                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                            Span::styled("   genre   ", theme.muted()),
+                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(s) = &meta.year {
                         lines.push(vec![
-                            Span::styled("   year    ", theme::muted()),
-                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                            Span::styled("   year    ", theme.muted()),
+                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(s) = &meta.catalog_number {
                         lines.push(vec![
-                            Span::styled("   catalog ", theme::muted()),
-                            Span::styled(truncate_to(s, inline_max), theme::text()),
+                            Span::styled("   catalog ", theme.muted()),
+                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
                 }
@@ -1518,13 +1517,13 @@ fn entry_info_lines(
                         let label = " audio streams ";
                         let width = label.chars().count();
                         let pad = content_width.saturating_sub(width + 3);
-                        let bg = if audio_streams_hovered { theme::BLUE } else { theme::PURPLE };
+                        let bg = if audio_streams_hovered { theme.blue } else { theme.purple };
                         lines.push(vec![
                             Span::raw(" ".repeat(pad)),
                             Span::styled(
                                 label,
                                 Style::default()
-                                    .fg(theme::PILL_ACTIVE_FG)
+                                    .fg(theme.pill_active_fg)
                                     .bg(bg)
                                     .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
@@ -1543,16 +1542,16 @@ fn entry_info_lines(
                 let et_w = et_label.chars().count();
                 let et_pad = content_width.saturating_sub(et_w + 3);
                 let et_bg = if edit_tags_hovered {
-                    theme::BLUE
+                    theme.blue
                 } else {
-                    theme::PURPLE
+                    theme.purple
                 };
                 lines.push(vec![
                     Span::raw(" ".repeat(et_pad)),
                     Span::styled(
                         et_label,
                         Style::default()
-                            .fg(theme::PILL_ACTIVE_FG)
+                            .fg(theme.pill_active_fg)
                             .bg(et_bg)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
@@ -1564,8 +1563,8 @@ fn entry_info_lines(
                 // the mouse path stays available during the probe
                 // window (matches AudioFile arm's behaviour).
                 lines.push(vec![
-                    Span::styled("   size    ", theme::muted()),
-                    Span::styled(size_str(entry.size), theme::text()),
+                    Span::styled("   size    ", theme.muted()),
+                    Span::styled(size_str(entry.size), theme.text_style()),
                 ]);
                 lines.push(vec![]);
                 let edit_tags_row = lines.len();
@@ -1573,16 +1572,16 @@ fn entry_info_lines(
                 let et_w = et_label.chars().count();
                 let et_pad = content_width.saturating_sub(et_w + 3);
                 let et_bg = if edit_tags_hovered {
-                    theme::BLUE
+                    theme.blue
                 } else {
-                    theme::PURPLE
+                    theme.purple
                 };
                 lines.push(vec![
                     Span::raw(" ".repeat(et_pad)),
                     Span::styled(
                         et_label,
                         Style::default()
-                            .fg(theme::PILL_ACTIVE_FG)
+                            .fg(theme.pill_active_fg)
                             .bg(et_bg)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
@@ -1592,12 +1591,12 @@ fn entry_info_lines(
         }
         EntryKind::OtherFile => {
             lines.push(vec![
-                Span::styled("   kind    ", theme::muted()),
-                Span::styled("file", theme::text()),
+                Span::styled("   kind    ", theme.muted()),
+                Span::styled("file", theme.text_style()),
             ]);
             lines.push(vec![
-                Span::styled("   size    ", theme::muted()),
-                Span::styled(size_str(entry.size), theme::text()),
+                Span::styled("   size    ", theme.muted()),
+                Span::styled(size_str(entry.size), theme.text_style()),
             ]);
         }
     }
@@ -1606,12 +1605,12 @@ fn entry_info_lines(
     if entry.is_symlink {
         lines.push(vec![]);
         let (label, color) = if entry.is_broken_symlink {
-            ("symlink (broken)", theme::RED)
+            ("symlink (broken)", theme.destructive)
         } else {
-            ("symlink", theme::AMBER)
+            ("symlink", theme.amber)
         };
         lines.push(vec![
-            Span::styled("   ", theme::muted()),
+            Span::styled("   ", theme.muted()),
             Span::styled(label, Style::default().fg(color)),
         ]);
     }
@@ -1630,14 +1629,15 @@ fn bordered_line<'a>(
     border_color: ratatui::style::Color,
     width: usize,
     content: Vec<Span<'a>>,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
     let content_width: usize = content.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(2 + content_width);
 
-    let mut spans = vec![Span::styled("│", theme::border(border_color))];
+    let mut spans = vec![Span::styled("│", theme.border(border_color))];
     spans.extend(content);
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
 }
 

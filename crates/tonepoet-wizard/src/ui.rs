@@ -5,11 +5,18 @@ use super::types::{
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
+
+use crate::theme::WizardTheme;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WizardRenderCtx {
+    theme: WizardTheme,
+}
 
 pub struct MouseAreas {
     pub areas: Vec<(Rect, ButtonId)>,
@@ -56,57 +63,13 @@ impl MouseAreas {
     }
 
     pub fn add(&mut self, rect: Rect, id: ButtonId) {
-        use std::fs::OpenOptions;
-        use std::io::Write;
 
-        // Log area registration for debugging
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_areas.log")
-        {
-            let _ = writeln!(
-                file,
-                "Register {:?} at ({},{}) size {}x{}",
-                id, rect.x, rect.y, rect.width, rect.height
-            );
-        }
 
         self.areas.push((rect, id));
     }
 
     pub fn get_button_at(&self, x: u16, y: u16) -> Option<ButtonId> {
-        use std::fs::OpenOptions;
-        use std::io::Write;
 
-        // Log to file instead of stderr
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_debug.log")
-        {
-            let _ = writeln!(file, "\nMouse click at ({}, {})", x, y);
-            let _ = writeln!(file, "Checking {} areas:", self.areas.len());
-
-            // Log all areas for debugging
-            for (i, (rect, id)) in self.areas.iter().enumerate() {
-                let _ = writeln!(
-                    file,
-                    "  Area {}: {:?} at ({},{}) size {}x{}",
-                    i, id, rect.x, rect.y, rect.width, rect.height
-                );
-            }
-
-            // Check areas in reverse order (last added first)
-            for (rect, id) in self.areas.iter().rev() {
-                if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-                {
-                    let _ = writeln!(file, "  -> MATCH FOUND: {:?}", id);
-                    return Some(*id);
-                }
-            }
-            let _ = writeln!(file, "  -> No match found");
-        }
 
         // Still check normally (in reverse order - last added first)
         for (rect, id) in self.areas.iter().rev() {
@@ -119,17 +82,19 @@ impl MouseAreas {
 }
 
 pub fn draw_wizard(f: &mut Frame, wizard: &SimpleWizard) -> MouseAreas {
-    // Clear the areas log for this frame
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("wizard_areas.log")
-    {
-        let _ = writeln!(file, "=== New Frame - Step {} ===", wizard.current_step);
-    }
+    draw_wizard_with_theme(f, wizard, WizardTheme::default())
+}
+
+pub fn draw_wizard_with_theme(
+    f: &mut Frame,
+    wizard: &SimpleWizard,
+    theme: WizardTheme,
+) -> MouseAreas {
+    let ctx = WizardRenderCtx { theme };
+    draw_wizard_inner(f, wizard, &ctx)
+}
+
+fn draw_wizard_inner(f: &mut Frame, wizard: &SimpleWizard, ctx: &WizardRenderCtx) -> MouseAreas {
 
     let mut mouse_areas = MouseAreas::new();
 
@@ -175,7 +140,7 @@ pub fn draw_wizard(f: &mut Frame, wizard: &SimpleWizard) -> MouseAreas {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                .style(Style::default().fg(ctx.theme.error).add_modifier(Modifier::BOLD))
                 .title(" Error "),
         );
 
@@ -190,26 +155,26 @@ pub fn draw_wizard(f: &mut Frame, wizard: &SimpleWizard) -> MouseAreas {
         return mouse_areas;
     }
 
-    // Clear and set dark background
+    // Clear and fill the wizard panel background.
     f.render_widget(Clear, wizard_area);
 
-    // Fill with dark gray background (using RGB for a custom dark gray)
-    let bg_block = Block::default().style(Style::default().bg(Color::Rgb(40, 40, 40)));
+    // Fill the wizard panel with the configured background role.
+    let bg_block = Block::default().style(Style::default().bg(ctx.theme.background));
     f.render_widget(bg_block, wizard_area);
 
-    // Main border with cyan color and white title
+    // Main panel chrome uses explicit border and title roles.
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(ctx.theme.border))
         .title(Span::styled(
             " Audio Conversion Wizard ",
             Style::default()
-                .fg(Color::White)
+                .fg(ctx.theme.title)
                 .add_modifier(Modifier::BOLD),
         ))
         .title_alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Rgb(40, 40, 40)));
+        .style(Style::default().bg(ctx.theme.background));
 
     f.render_widget(block, wizard_area);
 
@@ -231,24 +196,25 @@ pub fn draw_wizard(f: &mut Frame, wizard: &SimpleWizard) -> MouseAreas {
         .split(inner);
 
     // Draw header with step indicator
-    draw_header(f, chunks[0], wizard.current_step);
+    draw_header(f, ctx, chunks[0], wizard.current_step);
 
     // Draw content based on current step
     match wizard.current_step {
-        0 => draw_format_selection(f, chunks[1], wizard, &mut mouse_areas, wizard_area),
-        1 => draw_quality_options(f, chunks[1], wizard, &mut mouse_areas, wizard_area),
-        2 => draw_additional_options(f, chunks[1], wizard, &mut mouse_areas, wizard_area),
-        3 => draw_confirmation(f, chunks[1], wizard, &mut mouse_areas),
+        0 => draw_format_selection(f, ctx, chunks[1], wizard, &mut mouse_areas, wizard_area),
+        1 => draw_quality_options(f, ctx, chunks[1], wizard, &mut mouse_areas, wizard_area),
+        2 => draw_additional_options(f, ctx, chunks[1], wizard, &mut mouse_areas, wizard_area),
+        3 => draw_confirmation(f, ctx, chunks[1], wizard, &mut mouse_areas),
         _ => {}
     }
 
     // Draw navigation
-    draw_navigation(f, chunks[2], wizard, &mut mouse_areas);
+    draw_navigation(f, ctx, chunks[2], wizard, &mut mouse_areas);
 
     // Draw popup if active
     if let Some(popup_state) = &wizard.popup_state {
         draw_popup(
             f,
+                ctx,
             wizard_area,
             popup_state,
             &mut mouse_areas,
@@ -256,23 +222,11 @@ pub fn draw_wizard(f: &mut Frame, wizard: &SimpleWizard) -> MouseAreas {
         );
     }
 
-    // Debug: Log total areas registered
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_areas.log")
-    {
-        let _ = writeln!(
-            file,
-            "\nTotal areas registered this frame: {}",
-            mouse_areas.areas.len()
-        );
-    }
 
     mouse_areas
 }
 
-fn draw_header(f: &mut Frame, area: Rect, current_step: usize) {
+fn draw_header(f: &mut Frame, ctx: &WizardRenderCtx, area: Rect, current_step: usize) {
     let steps = vec![
         "Format & Settings",
         "Quality",
@@ -288,12 +242,12 @@ fn draw_header(f: &mut Frame, area: Rect, current_step: usize) {
 
         let style = if i == current_step {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(ctx.theme.accent)
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC)
         } else if i < current_step {
-            Style::default().fg(Color::White)
+            Style::default().fg(ctx.theme.text)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(ctx.theme.text_dim)
         };
 
         spans.push(Span::styled(format!("{}. {}", i + 1, step), style));
@@ -309,6 +263,7 @@ fn draw_header(f: &mut Frame, area: Rect, current_step: usize) {
 
 fn draw_format_selection(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -321,11 +276,11 @@ fn draw_format_selection(
         .split(area);
 
     // Left side: Format selection
-    draw_format_list(f, chunks[0], wizard, mouse_areas);
+    draw_format_list(f, ctx, chunks[0], wizard, mouse_areas);
 
     // Right side: Format-specific options (only if a format is selected)
     if wizard.selected_format.is_some() {
-        draw_format_options(f, chunks[1], wizard, mouse_areas, wizard_area);
+        draw_format_options(f, ctx, chunks[1], wizard, mouse_areas, wizard_area);
     }
 
     // Show format-specific help popups
@@ -334,6 +289,7 @@ fn draw_format_selection(
             FormatSpecificHelp::WavPackCompression => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "WavPack Compression",
                     "WavPack compression modes and their encoder flags:\n\n\
@@ -368,6 +324,7 @@ fn draw_format_selection(
             FormatSpecificHelp::Mp3Bitrate => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "MP3 Bitrate",
                     "MP3 bitrate determines quality and file size:\n\n\
@@ -392,6 +349,7 @@ fn draw_format_selection(
             FormatSpecificHelp::AacProfile => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "AAC Profile",
                     "AAC profiles optimize for different bitrates:\n\n\
@@ -419,6 +377,7 @@ fn draw_format_selection(
             FormatSpecificHelp::AacBitrate => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "AAC Bitrate",
                     "AAC bitrates by profile:\n\n\
@@ -445,6 +404,7 @@ fn draw_format_selection(
             FormatSpecificHelp::OpusQuality => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Opus Quality",
                     "Opus quality presets optimize for different uses:\n\n\
@@ -478,6 +438,7 @@ fn draw_format_selection(
             FormatSpecificHelp::OpusContentType => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Opus Content Type",
                     "Optimize encoder for content type:\n\n\
@@ -511,6 +472,7 @@ fn draw_format_selection(
         // Using CopyFiles as a temporary placeholder for LosslessInfoIcon
         draw_help_box(
             f,
+                ctx,
             wizard_area,
             "Lossless Formats",
             "Lossless formats preserve 100% of the original audio data.\n\
@@ -540,6 +502,7 @@ fn draw_format_selection(
         // Using CopySubdirectories as a temporary placeholder for LossyInfoIcon
         draw_help_box(
             f,
+                ctx,
             wizard_area,
             "Lossy Formats",
             "Lossy formats reduce file size by removing audio data that's\n\
@@ -574,6 +537,7 @@ fn draw_format_selection(
 
 fn draw_format_list(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -593,9 +557,11 @@ fn draw_format_list(
     lines.push(Line::from(vec![
         Span::styled(
             "Lossless Formats ",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register lossless info icon click area
     mouse_areas.add(
@@ -626,18 +592,18 @@ fn draw_format_list(
 
         let radio = if is_selected { "◉" } else { "○" };
         let radio_style = if is_selected {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(ctx.theme.accent)
         } else {
             Style::default()
         };
 
         let text_style = if is_focused {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(ctx.theme.text)
         };
 
         let line = if is_focused {
@@ -646,8 +612,8 @@ fn draw_format_list(
                 Span::styled(
                     radio,
                     radio_style
-                        .fg(Color::White)
-                        .bg(Color::Cyan)
+                        .fg(ctx.theme.text)
+                        .bg(ctx.theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" {}", format), text_style),
@@ -682,9 +648,11 @@ fn draw_format_list(
     lines.push(Line::from(vec![
         Span::styled(
             "Lossy Formats ",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register lossy info icon click area
     mouse_areas.add(
@@ -709,18 +677,18 @@ fn draw_format_list(
 
         let radio = if is_selected { "◉" } else { "○" };
         let radio_style = if is_selected {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(ctx.theme.accent)
         } else {
             Style::default()
         };
 
         let text_style = if is_focused {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(ctx.theme.text)
         };
 
         let line = if is_focused {
@@ -729,8 +697,8 @@ fn draw_format_list(
                 Span::styled(
                     radio,
                     radio_style
-                        .fg(Color::White)
-                        .bg(Color::Cyan)
+                        .fg(ctx.theme.text)
+                        .bg(ctx.theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" {}", format), text_style),
@@ -762,6 +730,7 @@ fn draw_format_list(
 
 fn draw_format_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -775,29 +744,16 @@ fn draw_format_options(
     );
 
     // Debug which format is selected
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_format_debug.log")
-    {
-        let _ = writeln!(
-            file,
-            "draw_format_options: selected_format={:?}",
-            wizard.selected_format
-        );
-    }
 
     match wizard.selected_format {
         Some(AudioFormat::Flac) => {
-            draw_flac_format_options(f, padded_area, wizard, mouse_areas, wizard_area)
+            draw_flac_format_options(f, ctx, padded_area, wizard, mouse_areas, wizard_area)
         }
-        Some(AudioFormat::Mp3) => draw_mp3_format_options(f, padded_area, wizard, mouse_areas),
-        Some(AudioFormat::Aac) => draw_aac_format_options(f, padded_area, wizard, mouse_areas),
-        Some(AudioFormat::Opus) => draw_opus_format_options(f, padded_area, wizard, mouse_areas),
+        Some(AudioFormat::Mp3) => draw_mp3_format_options(f, ctx, padded_area, wizard, mouse_areas),
+        Some(AudioFormat::Aac) => draw_aac_format_options(f, ctx, padded_area, wizard, mouse_areas),
+        Some(AudioFormat::Opus) => draw_opus_format_options(f, ctx, padded_area, wizard, mouse_areas),
         Some(AudioFormat::WavPack) => {
-            draw_wavpack_format_options(f, padded_area, wizard, mouse_areas, wizard_area)
+            draw_wavpack_format_options(f, ctx, padded_area, wizard, mouse_areas, wizard_area)
         }
         Some(AudioFormat::Wav) | Some(AudioFormat::Aiff) => {
             // WAV and AIFF have no format-specific options
@@ -811,11 +767,11 @@ fn draw_format_options(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "This format will use the quality",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(ctx.theme.text_dim),
             )));
             lines.push(Line::from(Span::styled(
                 "settings from the next page.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(ctx.theme.text_dim),
             )));
 
             let paragraph = Paragraph::new(lines);
@@ -827,37 +783,13 @@ fn draw_format_options(
 
 fn draw_flac_format_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
     wizard_area: Rect,
 ) {
     // Debug log the area coordinates
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_coords.log")
-    {
-        let _ = writeln!(
-            file,
-            "draw_flac_format_options: area=({},{}) size {}x{}, wizard_area=({},{}) size {}x{}",
-            area.x,
-            area.y,
-            area.width,
-            area.height,
-            wizard_area.x,
-            wizard_area.y,
-            wizard_area.width,
-            wizard_area.height
-        );
-        let _ = writeln!(
-            file,
-            "  wizard.selected_format = {:?}",
-            wizard.selected_format
-        );
-    }
 
     let mut lines = vec![];
 
@@ -868,27 +800,18 @@ fn draw_flac_format_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Compression Level",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     lines.push(Line::from("")); // Add blank line after header
 
     // Register info icon click area for Compression Level
     // Position: Compression Level header = line 0 (0-indexed)
     // DEBUG: Log what Y coordinate we're using
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_coords.log")
-    {
-        let _ = writeln!(
-            file,
-            "  Registering CompressionLevel info icon at Y={}",
-            current_y
-        );
-    }
     mouse_areas.add(
         Rect::new(
             area.x + "Compression Level".len() as u16 + 2,
@@ -907,25 +830,11 @@ fn draw_flac_format_options(
             && wizard.in_quality_area
             && wizard.quality_index == i;
 
-        let line = format_option_line(label, is_selected, is_focused);
+        let line = format_option_line(ctx, label, is_selected, is_focused);
         lines.push(line);
 
         // IMPORTANT: Mouse events use absolute screen coordinates, so we need to ensure
         // our click areas use absolute coordinates too
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_coords.log")
-        {
-            let _ = writeln!(
-                file,
-                "  Registering CompressionLevelOption({}) at ({},{}) size {}x1",
-                i,
-                area.x,
-                current_y + i as u16,
-                area.width
-            );
-        }
         mouse_areas.add(
             Rect::new(area.x, current_y + i as u16, area.width, 1),
             ButtonId::CompressionLevelOption(i),
@@ -941,10 +850,12 @@ fn draw_flac_format_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Processing Options",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     lines.push(Line::from("")); // Add blank line after header
 
@@ -984,22 +895,22 @@ fn draw_flac_format_options(
 
         let checkbox = if *is_checked { "☑" } else { "☐" };
         let checkbox_style = if *is_disabled {
-            Style::default().fg(Color::DarkGray) // Greyed out if disabled
+            Style::default().fg(ctx.theme.disabled_fg) // Disabled option
         } else if *is_checked {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(ctx.theme.accent)
         } else {
             Style::default()
         };
 
         let text_style = if is_focused {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else if *is_disabled {
-            Style::default().fg(Color::DarkGray) // Greyed text if disabled
+            Style::default().fg(ctx.theme.disabled_fg) // Disabled option
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(ctx.theme.text)
         };
 
         let line = if is_focused {
@@ -1008,8 +919,8 @@ fn draw_flac_format_options(
                 Span::styled(
                     checkbox,
                     Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Cyan)
+                        .fg(ctx.theme.text)
+                        .bg(ctx.theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("  {}", label), text_style),
@@ -1040,6 +951,7 @@ fn draw_flac_format_options(
             FlacSection::CompressionLevel => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Compression Level Help",
                     "FLAC compression is ALWAYS lossless - this only affects\n\
@@ -1098,7 +1010,7 @@ fn draw_flac_format_options(
                            • Dithering",
                     )
                 };
-                draw_help_box(f, wizard_area, title, content);
+                draw_help_box(f, ctx, wizard_area, title, content);
             }
             _ => {} // Other help sections not relevant for format options page
         }
@@ -1107,6 +1019,7 @@ fn draw_flac_format_options(
 
 fn draw_mp3_format_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -1116,10 +1029,12 @@ fn draw_mp3_format_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Bitrate",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register click area for bitrate info icon
     mouse_areas.add(
@@ -1143,7 +1058,7 @@ fn draw_mp3_format_options(
             && wizard.in_quality_area
             && wizard.quality_index == i;
 
-        let line = format_option_line(bitrate, is_selected, is_focused);
+        let line = format_option_line(ctx, bitrate, is_selected, is_focused);
         lines.push(line);
 
         mouse_areas.add(
@@ -1158,6 +1073,7 @@ fn draw_mp3_format_options(
 
 fn draw_aac_format_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -1168,10 +1084,12 @@ fn draw_aac_format_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Profile",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register click area for profile info icon
     mouse_areas.add(
@@ -1190,7 +1108,7 @@ fn draw_aac_format_options(
             && wizard.in_quality_area
             && wizard.quality_index == i;
 
-        let line = format_option_line(&profile.to_string(), is_selected, is_focused);
+        let line = format_option_line(ctx, &profile.to_string(), is_selected, is_focused);
         lines.push(line);
 
         mouse_areas.add(
@@ -1209,10 +1127,12 @@ fn draw_aac_format_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Bitrate",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register click area for bitrate info icon
     mouse_areas.add(
@@ -1231,7 +1151,7 @@ fn draw_aac_format_options(
             && wizard.in_quality_area
             && wizard.quality_index == profiles.len() + i;
 
-        let line = format_option_line(bitrate, is_selected, is_focused);
+        let line = format_option_line(ctx, bitrate, is_selected, is_focused);
         lines.push(line);
 
         mouse_areas.add(
@@ -1247,6 +1167,7 @@ fn draw_aac_format_options(
 
 fn draw_opus_format_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -1254,29 +1175,17 @@ fn draw_opus_format_options(
     let mut lines = vec![];
 
     // Debug area size
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_ui.log")
-    {
-        let _ = writeln!(file, "\n=== OPUS RENDER START ===");
-        let _ = writeln!(
-            file,
-            "Area: x={}, y={}, width={}, height={}",
-            area.x, area.y, area.width, area.height
-        );
-    }
 
     // Quality (Bitrate) section
     lines.push(Line::from(vec![
         Span::styled(
             "Quality (Bitrate)",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register click area for quality info icon
     mouse_areas.add(
@@ -1302,7 +1211,7 @@ fn draw_opus_format_options(
             && wizard.in_quality_area
             && wizard.quality_index == i;
 
-        let line = format_option_line(&display_text, is_selected, is_focused);
+        let line = format_option_line(ctx, &display_text, is_selected, is_focused);
         lines.push(line);
 
         mouse_areas.add(
@@ -1321,10 +1230,12 @@ fn draw_opus_format_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Optimize for",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register click area for content type info icon
     mouse_areas.add(
@@ -1347,7 +1258,7 @@ fn draw_opus_format_options(
             && wizard.in_quality_area
             && wizard.quality_index == qualities.len() + i;
 
-        let line = format_option_line(&content_type.to_string(), is_selected, is_focused);
+        let line = format_option_line(ctx, &content_type.to_string(), is_selected, is_focused);
         lines.push(line);
 
         mouse_areas.add(
@@ -1358,35 +1269,6 @@ fn draw_opus_format_options(
     }
 
     // Debug: log what we're rendering
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_ui.log")
-    {
-        let _ = writeln!(
-            file,
-            "\nOpus render: in_quality_area={}, quality_index={}",
-            wizard.in_quality_area, wizard.quality_index
-        );
-        if wizard.in_quality_area {
-            let option_name = if wizard.quality_index < 5 {
-                qualities[wizard.quality_index].0
-            } else if wizard.quality_index < 7 {
-                match wizard.quality_index - 5 {
-                    0 => "Music",
-                    1 => "Voice",
-                    _ => "???",
-                }
-            } else {
-                "OUT OF BOUNDS"
-            };
-            let _ = writeln!(
-                file,
-                "  Currently focused on: {} (index {})",
-                option_name, wizard.quality_index
-            );
-        }
-    }
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
@@ -1394,6 +1276,7 @@ fn draw_opus_format_options(
 
 fn draw_wavpack_format_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -1406,10 +1289,12 @@ fn draw_wavpack_format_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Compression Level",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register click area for compression level info icon
     mouse_areas.add(
@@ -1442,7 +1327,7 @@ fn draw_wavpack_format_options(
             && wizard.in_quality_area
             && wizard.quality_index == i;
 
-        let line = format_option_line(mode, is_selected, is_focused);
+        let line = format_option_line(ctx, mode, is_selected, is_focused);
         lines.push(line);
 
         mouse_areas.add(
@@ -1461,10 +1346,12 @@ fn draw_wavpack_format_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Additional Options",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Register click area for additional options info icon
     mouse_areas.add(
@@ -1487,18 +1374,18 @@ fn draw_wavpack_format_options(
 
     let verify_checkbox = if is_verify_checked { "☑" } else { "☐" };
     let verify_checkbox_style = if is_verify_checked {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(ctx.theme.accent)
     } else {
         Style::default()
     };
 
     let verify_text_style = if is_verify_focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     let verify_line = if is_verify_focused {
@@ -1507,8 +1394,8 @@ fn draw_wavpack_format_options(
             Span::styled(
                 verify_checkbox,
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Cyan)
+                    .fg(ctx.theme.text)
+                    .bg(ctx.theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  Verify encoding", verify_text_style),
@@ -1518,7 +1405,7 @@ fn draw_wavpack_format_options(
             Span::raw(" "),
             Span::styled(verify_checkbox, verify_checkbox_style),
             Span::raw("  "),
-            Span::styled("Verify encoding", Style::default().fg(Color::White)),
+            Span::styled("Verify encoding", Style::default().fg(ctx.theme.text)),
         ])
     };
     lines.push(verify_line);
@@ -1538,18 +1425,18 @@ fn draw_wavpack_format_options(
 
     let checkbox = if is_checked { "☑" } else { "☐" };
     let checkbox_style = if is_checked {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(ctx.theme.accent)
     } else {
         Style::default()
     };
 
     let text_style = if is_focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     let line = if is_focused {
@@ -1558,8 +1445,8 @@ fn draw_wavpack_format_options(
             Span::styled(
                 checkbox,
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Cyan)
+                    .fg(ctx.theme.text)
+                    .bg(ctx.theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  Store MD5 checksum", text_style),
@@ -1587,6 +1474,7 @@ fn draw_wavpack_format_options(
     if wizard.show_help_for == Some(FlacSection::ProcessingOptions) {
         draw_help_box(
             f,
+                ctx,
             wizard_area,
             "WavPack Additional Options",
             "Additional options for WavPack encoding:\n\n\
@@ -1611,6 +1499,7 @@ fn draw_wavpack_format_options(
 
 fn draw_quality_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -1623,11 +1512,11 @@ fn draw_quality_options(
         | Some(AudioFormat::Aiff)
         | Some(AudioFormat::WavPack) => {
             // Lossless formats can use bit depth, sample rate, dithering, and resampling
-            draw_resampling_options(f, area, wizard, mouse_areas, wizard_area);
+            draw_resampling_options(f, ctx, area, wizard, mouse_areas, wizard_area);
         }
         Some(AudioFormat::Mp3) | Some(AudioFormat::Aac) | Some(AudioFormat::Opus) => {
             // Lossy formats only need resampling if sample rate changes
-            draw_lossy_quality_options(f, area, wizard, mouse_areas, wizard_area);
+            draw_lossy_quality_options(f, ctx, area, wizard, mouse_areas, wizard_area);
         }
         None => {
             let paragraph =
@@ -1639,25 +1528,13 @@ fn draw_quality_options(
 
 fn draw_resampling_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
     wizard_area: Rect,
 ) {
     // Debug log
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_areas.log")
-    {
-        let _ = writeln!(
-            file,
-            "draw_resampling_options called - step: {}, sample_rate: {:?}",
-            wizard.current_step, wizard.sample_rate
-        );
-    }
 
     // Split the area into two columns
     let chunks = Layout::default()
@@ -1691,10 +1568,12 @@ fn draw_resampling_options(
     left_lines.push(Line::from(vec![
         Span::styled(
             "Bit Depth",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     left_lines.push(Line::from("")); // Add blank line after header
 
@@ -1711,7 +1590,7 @@ fn draw_resampling_options(
         let is_focused =
             wizard.resampling_page_section == FlacSection::BitDepth && wizard.selected_index == i;
 
-        let line = format_option_line(label, is_selected, is_focused);
+        let line = format_option_line(ctx, label, is_selected, is_focused);
         left_lines.push(line);
 
         mouse_areas.add(
@@ -1731,10 +1610,12 @@ fn draw_resampling_options(
         left_lines.push(Line::from(vec![
             Span::styled(
                 "Dithering",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             ),
             Span::raw("  "),
-            Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+            Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
         ]));
         left_lines.push(Line::from("")); // Add blank line after header
 
@@ -1751,7 +1632,7 @@ fn draw_resampling_options(
             let is_focused = wizard.resampling_page_section == FlacSection::Dithering
                 && wizard.selected_index == i;
 
-            let line = format_option_line(&dither_type.to_string(), is_selected, is_focused);
+            let line = format_option_line(ctx, &dither_type.to_string(), is_selected, is_focused);
             left_lines.push(line);
 
             mouse_areas.add(
@@ -1769,10 +1650,12 @@ fn draw_resampling_options(
     right_lines.push(Line::from(vec![
         Span::styled(
             "Sample Rate",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     right_lines.push(Line::from("")); // Add blank line after header
 
@@ -1789,7 +1672,7 @@ fn draw_resampling_options(
         let is_focused =
             wizard.resampling_page_section == FlacSection::SampleRate && wizard.selected_index == i;
 
-        let line = format_option_line(label, is_selected, is_focused);
+        let line = format_option_line(ctx, label, is_selected, is_focused);
         right_lines.push(line);
 
         mouse_areas.add(
@@ -1807,24 +1690,15 @@ fn draw_resampling_options(
     // Resampling Quality (only show if sample rate is changing)
     if wizard.should_show_resampling() {
         // Debug log
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("target/release/wizard_areas.log")
-        {
-            let _ = writeln!(
-                file,
-                "Showing resampling options - sample_rate: {:?}",
-                wizard.sample_rate
-            );
-        }
         right_lines.push(Line::from(vec![
             Span::styled(
                 "Resampling Quality",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             ),
             Span::raw("  "),
-            Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+            Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
         ]));
         right_lines.push(Line::from("")); // Add blank line after header
 
@@ -1841,7 +1715,7 @@ fn draw_resampling_options(
             let is_focused = wizard.resampling_page_section == FlacSection::ResamplingQuality
                 && wizard.selected_index == i;
 
-            let line = format_option_line(label, is_selected, is_focused);
+            let line = format_option_line(ctx, label, is_selected, is_focused);
             right_lines.push(line);
 
             mouse_areas.add(
@@ -1858,26 +1732,16 @@ fn draw_resampling_options(
 
         // Nyquist Transition section
         // Debug log
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("target/release/wizard_areas.log")
-        {
-            let _ = writeln!(
-                file,
-                "Adding Nyquist Transition section at y={}, right_lines len before: {}",
-                right_y,
-                right_lines.len()
-            );
-        }
 
         right_lines.push(Line::from(vec![
             Span::styled(
                 "Nyquist Transition",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             ),
             Span::raw("  "),
-            Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+            Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
         ]));
         right_lines.push(Line::from("")); // Add blank line after header
 
@@ -1894,7 +1758,7 @@ fn draw_resampling_options(
             let is_focused = wizard.resampling_page_section == FlacSection::NyquistTransition
                 && wizard.selected_index == i;
 
-            let line = format_option_line(&transient.to_string(), is_selected, is_focused);
+            let line = format_option_line(ctx, &transient.to_string(), is_selected, is_focused);
             right_lines.push(line);
 
             mouse_areas.add(
@@ -1913,12 +1777,12 @@ fn draw_resampling_options(
 
             let checkbox = if insane_enabled { "☑" } else { "☐" };
             let checkbox_style = if insane_enabled {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(ctx.theme.accent)
             } else {
                 Style::default()
             };
 
-            let text_style = Style::default().fg(Color::White);
+            let text_style = Style::default().fg(ctx.theme.text);
 
             right_lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -1933,24 +1797,13 @@ fn draw_resampling_options(
         }
     } else {
         // Debug log
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("target/release/wizard_areas.log")
-        {
-            let _ = writeln!(
-                file,
-                "NOT showing resampling options - sample_rate: {:?}",
-                wizard.sample_rate
-            );
-        }
         right_lines.push(Line::from(Span::styled(
             "Resampling is not needed when",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(ctx.theme.text_dim),
         )));
         right_lines.push(Line::from(Span::styled(
             "keeping the same sample rate.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(ctx.theme.text_dim),
         )));
     }
 
@@ -1959,40 +1812,17 @@ fn draw_resampling_options(
     f.render_widget(left_paragraph, left_padded);
 
     // Debug log
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("target/release/wizard_areas.log")
-    {
-        let _ = writeln!(
-            file,
-            "Right column has {} lines, right_padded height: {}",
-            right_lines.len(),
-            right_padded.height
-        );
-    }
 
     let right_paragraph = Paragraph::new(right_lines.clone()).wrap(Wrap { trim: true });
     f.render_widget(right_paragraph, right_padded);
 
     // Show help popups for this page
-    // Debug logging
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_areas.log")
-    {
-        let _ = writeln!(
-            file,
-            "draw_resampling_options - show_help_for: {:?}",
-            wizard.show_help_for
-        );
-    }
     if let Some(section) = wizard.show_help_for {
         match section {
             FlacSection::SampleRate => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Sample Rate",
                     "The sample rate determines how many times per second\n\
@@ -2028,11 +1858,12 @@ fn draw_resampling_options(
                      • MQ (rate -m) - Medium Quality, fast\n\n\
                      💡 Ultra recommended for archival work."
                 };
-                draw_help_box(f, wizard_area, "Resampling Quality", help_text);
+                draw_help_box(f, ctx, wizard_area, "Resampling Quality", help_text);
             }
             FlacSection::BitDepth => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Bit Depth",
                     "Bit depth determines the dynamic range and noise floor.\n\
@@ -2053,6 +1884,7 @@ fn draw_resampling_options(
             FlacSection::Dithering => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Dithering",
                     "Dithering adds tiny amounts of noise to prevent\n\
@@ -2111,7 +1943,7 @@ fn draw_resampling_options(
                         Only use steeper settings if you need\n\
                         maximum frequency preservation."
                 };
-                draw_help_box(f, wizard_area, "Nyquist Transition", help_text);
+                draw_help_box(f, ctx, wizard_area, "Nyquist Transition", help_text);
             }
             _ => {} // Other help sections not relevant for this page
         }
@@ -2119,6 +1951,7 @@ fn draw_resampling_options(
 }
 fn draw_lossy_quality_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -2135,7 +1968,9 @@ fn draw_lossy_quality_options(
     let mut lines = vec![];
     lines.push(Line::from(Span::styled(
         "Quality Settings",
-        Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
     )));
     lines.push(Line::from(""));
 
@@ -2143,10 +1978,12 @@ fn draw_lossy_quality_options(
     lines.push(Line::from(vec![
         Span::styled(
             "Sample Rate",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw("  "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     lines.push(Line::from("")); // Add blank line after header
 
@@ -2161,7 +1998,7 @@ fn draw_lossy_quality_options(
         let is_focused =
             wizard.resampling_page_section == FlacSection::SampleRate && wizard.selected_index == i;
 
-        let line = format_option_line(label, is_selected, is_focused);
+        let line = format_option_line(ctx, label, is_selected, is_focused);
         lines.push(line);
 
         mouse_areas.add(
@@ -2182,10 +2019,12 @@ fn draw_lossy_quality_options(
         lines.push(Line::from(vec![
             Span::styled(
                 "Resampling Quality",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             ),
             Span::raw("  "),
-            Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+            Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
         ]));
         lines.push(Line::from("")); // Add blank line after header
 
@@ -2206,7 +2045,7 @@ fn draw_lossy_quality_options(
             let is_focused = wizard.resampling_page_section == FlacSection::ResamplingQuality
                 && wizard.selected_index == i;
 
-            let line = format_option_line(label, is_selected, is_focused);
+            let line = format_option_line(ctx, label, is_selected, is_focused);
             lines.push(line);
 
             mouse_areas.add(
@@ -2227,10 +2066,12 @@ fn draw_lossy_quality_options(
             lines.push(Line::from(vec![
                 Span::styled(
                     "Nyquist Transition",
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                    Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
                 ),
                 Span::raw("  "),
-                Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+                Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
             ]));
             lines.push(Line::from("")); // Add blank line after header
 
@@ -2251,7 +2092,7 @@ fn draw_lossy_quality_options(
                 let is_focused = wizard.resampling_page_section == FlacSection::NyquistTransition
                     && wizard.selected_index == i;
 
-                let line = format_option_line(&nyquist_type.to_string(), is_selected, is_focused);
+                let line = format_option_line(ctx, &nyquist_type.to_string(), is_selected, is_focused);
                 lines.push(line);
 
                 mouse_areas.add(
@@ -2272,11 +2113,11 @@ fn draw_lossy_quality_options(
                 let insane_enabled = wizard.ssrc_insane_mode.unwrap_or(false);
                 let checkbox = if insane_enabled { "☑" } else { "☐" };
                 let checkbox_style = if insane_enabled {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(ctx.theme.accent)
                 } else {
                     Style::default()
                 };
-                let text_style = Style::default().fg(Color::White);
+                let text_style = Style::default().fg(ctx.theme.text);
 
                 lines.push(Line::from(vec![
                     Span::raw("  "),
@@ -2298,31 +2139,17 @@ fn draw_lossy_quality_options(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Note: Lossy formats have format-specific quality",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(ctx.theme.text_dim),
     )));
     lines.push(Line::from(Span::styled(
         "settings on the previous page.",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(ctx.theme.text_dim),
     )));
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, padded_area);
 
     // Show help popups if needed
-    // Debug logging
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("wizard_areas.log")
-    {
-        let _ = writeln!(
-            file,
-            "draw_lossy_quality_options - show_help_for: {:?}",
-            wizard.show_help_for
-        );
-    }
     if let Some(help_section) = wizard.show_help_for {
         match help_section {
             FlacSection::SampleRate => {
@@ -2377,11 +2204,12 @@ fn draw_lossy_quality_options(
                             Upsampling does NOT improve quality!"
                     }
                 };
-                draw_help_box(f, wizard_area, "Sample Rate Help", help_text);
+                draw_help_box(f, ctx, wizard_area, "Sample Rate Help", help_text);
             }
             FlacSection::ResamplingQuality => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Resampling Quality Help",
                     "SoX resampling quality when changing sample rates.\n\
@@ -2405,6 +2233,7 @@ fn draw_lossy_quality_options(
             FlacSection::NyquistTransition => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Nyquist Transition Help",
                     "Anti-aliasing filter steepness during resampling.\n\
@@ -2424,6 +2253,7 @@ fn draw_lossy_quality_options(
 
 fn draw_additional_options(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     mouse_areas: &mut MouseAreas,
@@ -2445,10 +2275,12 @@ fn draw_additional_options(
     lines.push(Line::from(vec![
         Span::styled(
             header_text,
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw(" "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     lines.push(Line::from("")); // Add blank line after header
 
@@ -2478,7 +2310,7 @@ fn draw_additional_options(
         let is_selected = wizard.replaygain_mode == Some(mode);
         let is_focused = wizard.additional_options_index == i;
 
-        let line = format_option_line(desc, is_selected, is_focused);
+        let line = format_option_line(ctx, desc, is_selected, is_focused);
         lines.push(line);
 
         // Options start at line 2 (after header and blank line)
@@ -2500,10 +2332,12 @@ fn draw_additional_options(
         // line 8
         Span::styled(
             "After converting:",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw(" "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
     // Add click area for After converting info icon
     let copy_header_len = "After converting:".len();
@@ -2526,18 +2360,18 @@ fn draw_additional_options(
         "☐"
     };
     let checkbox_style = if wizard.copy_files_enabled {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(ctx.theme.accent)
     } else {
         Style::default()
     };
 
     let field_style = if is_copy_files_focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     let truncated_text = if wizard.copy_files_extensions.len() > 50 {
@@ -2552,8 +2386,8 @@ fn draw_additional_options(
             Span::styled(
                 copy_files_checkbox,
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Cyan)
+                    .fg(ctx.theme.text)
+                    .bg(ctx.theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  Copy files: [", field_style),
@@ -2567,7 +2401,7 @@ fn draw_additional_options(
             Span::raw("  Copy files: ["),
             Span::styled(
                 wizard.copy_files_extensions.clone(),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(ctx.theme.accent),
             ),
             Span::raw("]"),
         ])
@@ -2604,18 +2438,18 @@ fn draw_additional_options(
         "☐"
     };
     let subdirs_checkbox_style = if wizard.copy_subdirectories_enabled {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(ctx.theme.accent)
     } else {
         Style::default()
     };
 
     let field_style = if is_copy_subdirs_focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     let display_text = if wizard.copy_subdirectories.is_empty() {
@@ -2630,8 +2464,8 @@ fn draw_additional_options(
             Span::styled(
                 copy_subdirs_checkbox,
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Cyan)
+                    .fg(ctx.theme.text)
+                    .bg(ctx.theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  Copy subdirectories: [", field_style),
@@ -2645,7 +2479,7 @@ fn draw_additional_options(
             Span::raw("  Copy subdirectories: ["),
             Span::styled(
                 wizard.copy_subdirectories.clone(),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(ctx.theme.accent),
             ),
             Span::raw("]"),
         ])
@@ -2676,24 +2510,24 @@ fn draw_additional_options(
     let is_focused = wizard.additional_options_index == 6;
     let checkbox = if merge_option.1 { "☑" } else { "☐" };
     let checkbox_style = if merge_option.1 {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(ctx.theme.accent)
     } else {
         Style::default()
     };
 
     let text_style = if is_focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     let line = if is_focused {
         Line::from(vec![
             Span::styled(" ", text_style),
-            Span::styled(checkbox, Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(checkbox, Style::default().fg(ctx.theme.selected_fg).bg(ctx.theme.accent)),
             Span::styled(format!("  {}", merge_option.0), text_style),
         ])
     } else {
@@ -2721,10 +2555,12 @@ fn draw_additional_options(
         // line 15
         Span::styled(
             "Destination:",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ),
         Span::raw(" "),
-        Span::styled("ⓘ", Style::default().fg(Color::Cyan)),
+        Span::styled("ⓘ", Style::default().fg(ctx.theme.accent)),
     ]));
 
     // Add click area for destination info icon
@@ -2747,17 +2583,17 @@ fn draw_additional_options(
 
     let ask_style = if is_ask_focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     let ask_line = if is_ask_focused {
         Line::from(vec![
             Span::styled(" ", ask_style),
-            Span::styled(radio_ask, Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(radio_ask, Style::default().fg(ctx.theme.selected_fg).bg(ctx.theme.accent)),
             Span::styled("  Ask every time", ask_style),
         ])
     } else {
@@ -2766,7 +2602,7 @@ fn draw_additional_options(
             Span::styled(
                 radio_ask,
                 if is_ask_selected {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(ctx.theme.accent)
                 } else {
                     Style::default()
                 },
@@ -2790,11 +2626,11 @@ fn draw_additional_options(
 
     let custom_style = if is_custom_focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     // Get the custom path if it exists, or show placeholder
@@ -2825,7 +2661,7 @@ fn draw_additional_options(
             Span::styled(" ", custom_style),
             Span::styled(
                 radio_custom,
-                Style::default().fg(Color::Black).bg(Color::Cyan),
+                Style::default().fg(ctx.theme.selected_fg).bg(ctx.theme.accent),
             ),
             Span::styled("  Custom: [", custom_style),
         ];
@@ -2848,16 +2684,16 @@ fn draw_additional_options(
         // Add Browse button - highlight if focused AND Custom is selected
         let browse_style = if wizard.browse_button_focused && is_custom_selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(255, 255, 200))
-                .add_modifier(Modifier::BOLD) // Pale yellow for focus
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.warning)
+                .add_modifier(Modifier::BOLD) // focused action emphasis
         } else if wizard.hovered_button == Some(ButtonId::BrowseButton) {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(220, 220, 170))
-                .add_modifier(Modifier::BOLD) // Slightly darker pale yellow for hover
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.surface)
+                .add_modifier(Modifier::BOLD) // hovered action emphasis
         } else {
-            Style::default().fg(Color::White).bg(Color::DarkGray)
+            Style::default().fg(ctx.theme.text).bg(ctx.theme.surface)
         };
         spans.push(Span::styled(browse_button, browse_style));
 
@@ -2868,7 +2704,7 @@ fn draw_additional_options(
             Span::styled(
                 radio_custom,
                 if is_custom_selected {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(ctx.theme.accent)
                 } else {
                     Style::default()
                 },
@@ -2888,9 +2724,9 @@ fn draw_additional_options(
         spans.push(Span::styled(
             display_path,
             if is_placeholder {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(ctx.theme.text_dim)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(ctx.theme.accent)
             },
         ));
         spans.push(Span::raw("]"));
@@ -2901,11 +2737,11 @@ fn draw_additional_options(
         // Add Browse button
         let browse_style = if wizard.hovered_button == Some(ButtonId::BrowseButton) {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(220, 220, 170))
-                .add_modifier(Modifier::BOLD) // Pale yellow for hover
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.surface)
+                .add_modifier(Modifier::BOLD) // hovered action emphasis
         } else {
-            Style::default().fg(Color::White).bg(Color::DarkGray)
+            Style::default().fg(ctx.theme.text).bg(ctx.theme.surface)
         };
         spans.push(Span::styled(browse_button, browse_style));
 
@@ -2944,6 +2780,7 @@ fn draw_additional_options(
     if wizard.show_help_for == Some(FlacSection::BitDepth) && wizard.current_step == 2 {
         draw_help_box(
             f,
+                ctx,
             wizard_area,
             "ReplayGain Help",
             "ReplayGain analyzes audio to enable consistent playback volume.\n\
@@ -2978,6 +2815,7 @@ fn draw_additional_options(
             AdditionalOptionsHelp::ReplayGain => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "ReplayGain Help",
                     "ReplayGain analyzes audio to enable consistent playback volume.\n\
@@ -3064,11 +2902,12 @@ fn draw_additional_options(
                     wizard.help_page
                 };
 
-                draw_help_box_with_pages(f, wizard_area, "After Converting", &pages, current_page);
+                draw_help_box_with_pages(f, ctx, wizard_area, "After Converting", &pages, current_page);
             }
             AdditionalOptionsHelp::MergeToSingle => {
                 draw_help_box(
                     f,
+                ctx,
                     wizard_area,
                     "Merge Tracks Help",
                     "Merge all tracks to single file with cue sheet.\n\n\
@@ -3130,7 +2969,7 @@ fn draw_additional_options(
                     wizard.help_page
                 };
 
-                draw_help_box_with_pages(f, wizard_area, "Destination Help", &pages, current_page);
+                draw_help_box_with_pages(f, ctx, wizard_area, "Destination Help", &pages, current_page);
             }
         }
     }
@@ -3138,6 +2977,7 @@ fn draw_additional_options(
 
 fn draw_confirmation(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     wizard: &SimpleWizard,
     _mouse_areas: &mut MouseAreas,
@@ -3156,7 +2996,7 @@ fn draw_confirmation(
         "🎯 Conversion Settings Summary",
         Style::default()
             .add_modifier(Modifier::BOLD)
-            .fg(Color::Cyan),
+            .fg(ctx.theme.accent),
     )));
     lines.push(Line::from(Span::raw("━".repeat(40))));
     lines.push(Line::from(""));
@@ -3168,7 +3008,7 @@ fn draw_confirmation(
                 "Output Format: ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format.to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(format.to_string(), Style::default().fg(ctx.theme.accent)),
         ]));
     }
 
@@ -3178,7 +3018,9 @@ fn draw_confirmation(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "FLAC Settings:",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             )));
 
             // Bit depth
@@ -3249,7 +3091,9 @@ fn draw_confirmation(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "WavPack Settings:",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             )));
 
             if let Some(quality) = &wizard.selected_quality {
@@ -3264,7 +3108,9 @@ fn draw_confirmation(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "MP3 Settings:",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             )));
 
             if let Some(quality) = &wizard.selected_quality {
@@ -3275,7 +3121,9 @@ fn draw_confirmation(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "AAC Settings:",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             )));
 
             if let Some(profile) = wizard.aac_profile {
@@ -3290,7 +3138,9 @@ fn draw_confirmation(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Opus Settings:",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
             )));
 
             if let Some(quality) = &wizard.selected_quality {
@@ -3340,7 +3190,9 @@ fn draw_confirmation(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Additional Options:",
-        Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
     )));
 
     if let Some(mode) = wizard.replaygain_mode {
@@ -3367,7 +3219,9 @@ fn draw_confirmation(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Destination:",
-        Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        Style::default()
+                .fg(ctx.theme.title)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
     )));
     match &wizard.destination_mode {
         DestinationMode::AskEveryTime => {
@@ -3380,7 +3234,7 @@ fn draw_confirmation(
                     Span::styled(
                         "./output",
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(ctx.theme.text_dim)
                             .add_modifier(Modifier::ITALIC),
                     ),
                     Span::raw(" (default)"),
@@ -3397,19 +3251,19 @@ fn draw_confirmation(
     lines.push(Line::from(Span::styled(
         "Ready to convert? Click the Start button below or press Enter.",
         Style::default()
-            .fg(Color::Green)
+            .fg(ctx.theme.success)
             .add_modifier(Modifier::ITALIC),
     )));
     lines.push(Line::from(Span::styled(
         "Use Back button or press Esc to modify settings.",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(ctx.theme.text_dim),
     )));
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, padded_area);
 }
 
-fn draw_navigation(f: &mut Frame, area: Rect, wizard: &SimpleWizard, mouse_areas: &mut MouseAreas) {
+fn draw_navigation(f: &mut Frame, ctx: &WizardRenderCtx, area: Rect, wizard: &SimpleWizard, mouse_areas: &mut MouseAreas) {
     // Check if any help is being displayed
     let help_is_shown = wizard.show_help_for.is_some() || wizard.show_additional_help_for.is_some();
 
@@ -3426,18 +3280,18 @@ fn draw_navigation(f: &mut Frame, area: Rect, wizard: &SimpleWizard, mouse_areas
 
         let load_preset_style = if wizard.focused_nav_button == Some(ButtonId::LoadPreset) {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(180, 220, 225))
-                .add_modifier(Modifier::BOLD) // Lighter teal for focus
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.focus_bg)
+                .add_modifier(Modifier::BOLD) // focused primary action
         } else if wizard.hovered_button == Some(ButtonId::LoadPreset) {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(220, 255, 240))
-                .add_modifier(Modifier::BOLD) // Bright mint-white for hover
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.hover_bg)
+                .add_modifier(Modifier::BOLD) // hovered primary action
         } else {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(154, 189, 193)) // Normal teal
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.selected_bg) // selected primary action
         };
 
         let load_preset = Paragraph::new(" Load Preset ")
@@ -3457,18 +3311,18 @@ fn draw_navigation(f: &mut Frame, area: Rect, wizard: &SimpleWizard, mouse_areas
 
         let save_preset_style = if wizard.focused_nav_button == Some(ButtonId::SavePreset) {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(180, 220, 225))
-                .add_modifier(Modifier::BOLD) // Lighter teal for focus
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.focus_bg)
+                .add_modifier(Modifier::BOLD) // focused primary action
         } else if wizard.hovered_button == Some(ButtonId::SavePreset) {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(220, 255, 240))
-                .add_modifier(Modifier::BOLD) // Bright mint-white for hover
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.hover_bg)
+                .add_modifier(Modifier::BOLD) // hovered primary action
         } else {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(154, 189, 193)) // Normal teal
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.selected_bg) // selected primary action
         };
 
         let save_preset = Paragraph::new(" Save as Preset ")
@@ -3493,16 +3347,16 @@ fn draw_navigation(f: &mut Frame, area: Rect, wizard: &SimpleWizard, mouse_areas
 
         let back_style = if wizard.focused_nav_button == Some(ButtonId::Back) {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(255, 255, 200))
-                .add_modifier(Modifier::BOLD) // Pale yellow for focus
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.warning)
+                .add_modifier(Modifier::BOLD) // focused action emphasis
         } else if wizard.hovered_button == Some(ButtonId::Back) {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(220, 220, 170))
-                .add_modifier(Modifier::BOLD) // Slightly darker pale yellow for hover
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.surface)
+                .add_modifier(Modifier::BOLD) // hovered action emphasis
         } else {
-            Style::default().fg(Color::White).bg(Color::DarkGray)
+            Style::default().fg(ctx.theme.text).bg(ctx.theme.surface)
         };
 
         let back = Paragraph::new("  ◀ Back  ")
@@ -3527,44 +3381,44 @@ fn draw_navigation(f: &mut Frame, area: Rect, wizard: &SimpleWizard, mouse_areas
         (
             "  Next ▶  ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         (
             "  Start ▶  ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.success)
                 .add_modifier(Modifier::BOLD),
         )
     };
 
     let next_style = if wizard.focused_nav_button == Some(ButtonId::Next) {
-        // When focused, make it brighter
+        // Focused state uses the focus/background emphasis roles.
         if wizard.current_step < 3 {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightCyan)
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.hover_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightGreen)
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.success)
                 .add_modifier(Modifier::BOLD)
         }
     } else if wizard.hovered_button == Some(ButtonId::Next) {
-        // When hovered, darken slightly
+        // Hovered state uses the hover/background emphasis roles.
         if wizard.current_step < 3 {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(0, 150, 150))
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(0, 150, 0))
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.success)
                 .add_modifier(Modifier::BOLD)
         }
     } else {
@@ -3591,16 +3445,16 @@ fn draw_navigation(f: &mut Frame, area: Rect, wizard: &SimpleWizard, mouse_areas
 
     let cancel_style = if wizard.focused_nav_button == Some(ButtonId::Cancel) {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(255, 100, 100))
-            .add_modifier(Modifier::BOLD) // Light red for focus
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.error)
+            .add_modifier(Modifier::BOLD) // focused destructive action
     } else if wizard.hovered_button == Some(ButtonId::Cancel) {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(200, 80, 80))
-            .add_modifier(Modifier::BOLD) // Darker red for hover
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.error_dim)
+            .add_modifier(Modifier::BOLD) // hovered destructive action
     } else {
-        Style::default().fg(Color::White).bg(Color::DarkGray)
+        Style::default().fg(ctx.theme.text).bg(ctx.theme.surface)
     };
 
     let cancel = Paragraph::new("  Cancel  ")
@@ -3614,25 +3468,25 @@ fn draw_navigation(f: &mut Frame, area: Rect, wizard: &SimpleWizard, mouse_areas
     }
 }
 
-fn draw_help_box(f: &mut Frame, wizard_area: Rect, title: &str, content: &str) {
+fn draw_help_box(f: &mut Frame, ctx: &WizardRenderCtx, wizard_area: Rect, title: &str, content: &str) {
     // Help box covers the entire wizard area
     let help_area = wizard_area;
 
     // Clear the area first
     f.render_widget(Clear, help_area);
 
-    // Create help box with cyan border to match wizard theme
+    // Create a help box using the configured border/title roles.
     let help_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(ctx.theme.border))
         .title(Span::styled(
             format!(" {} ", title),
             Style::default()
-                .fg(Color::White)
+                .fg(ctx.theme.title)
                 .add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(Color::Rgb(40, 40, 40))); // Same as wizard background
+        .style(Style::default().bg(ctx.theme.background)); // Same as wizard background
 
     let help_inner = help_block.inner(help_area);
 
@@ -3650,11 +3504,11 @@ fn draw_help_box(f: &mut Frame, wizard_area: Rect, title: &str, content: &str) {
     // Build content with close instruction
     let full_content = format!("{}\n\n[Press Esc or click anywhere to close]", content);
 
-    // Render the content with bright white text and slight emphasis
+    // Render the content with primary text and slight emphasis
     let help_paragraph = Paragraph::new(full_content)
         .style(
             Style::default()
-                .fg(Color::White)
+                .fg(ctx.theme.text)
                 .add_modifier(Modifier::BOLD),
         )
         .wrap(Wrap { trim: true })
@@ -3664,7 +3518,7 @@ fn draw_help_box(f: &mut Frame, wizard_area: Rect, title: &str, content: &str) {
 
     // Add a subtle hint at the bottom
     let hint = Paragraph::new("Click anywhere or press Esc to close")
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(ctx.theme.accent))
         .alignment(Alignment::Center);
 
     let hint_area = Rect::new(
@@ -3678,6 +3532,7 @@ fn draw_help_box(f: &mut Frame, wizard_area: Rect, title: &str, content: &str) {
 
 fn draw_help_box_with_pages(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     wizard_area: Rect,
     title: &str,
     pages: &[&str],
@@ -3689,18 +3544,18 @@ fn draw_help_box_with_pages(
     // Clear the area first
     f.render_widget(Clear, help_area);
 
-    // Create help box with cyan border to match wizard theme
+    // Create a help box using the configured border/title roles.
     let help_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(ctx.theme.border))
         .title(Span::styled(
             format!(" {} ", title),
             Style::default()
-                .fg(Color::White)
+                .fg(ctx.theme.title)
                 .add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(Color::Rgb(40, 40, 40))); // Same as wizard background
+        .style(Style::default().bg(ctx.theme.background)); // Same as wizard background
 
     let help_inner = help_block.inner(help_area);
 
@@ -3720,17 +3575,17 @@ fn draw_help_box_with_pages(
 
     // Build content with navigation instruction if multiple pages
     let full_content = if pages.len() > 1 {
-        format!("{}\n\n[Page {} of {} - Use ← → arrows to navigate]\n[Press Esc or click anywhere to close]", 
+        format!("{}\n\n[Page {} of {} - Use ← → arrows to navigate]\n[Press Esc or click anywhere to close]",
                 content, current_page + 1, pages.len())
     } else {
         format!("{}\n\n[Press Esc or click anywhere to close]", content)
     };
 
-    // Render the content with bright white text and slight emphasis
+    // Render the content with primary text and slight emphasis
     let help_paragraph = Paragraph::new(full_content)
         .style(
             Style::default()
-                .fg(Color::White)
+                .fg(ctx.theme.text)
                 .add_modifier(Modifier::BOLD),
         )
         .wrap(Wrap { trim: true })
@@ -3750,7 +3605,7 @@ fn draw_help_box_with_pages(
     };
 
     let hint_paragraph = Paragraph::new(hint)
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(ctx.theme.accent))
         .alignment(Alignment::Center);
 
     let hint_area = Rect::new(
@@ -3764,6 +3619,7 @@ fn draw_help_box_with_pages(
 
 fn draw_popup(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     wizard_area: Rect,
     popup_state: &PopupState,
     mouse_areas: &mut MouseAreas,
@@ -3802,14 +3658,14 @@ fn draw_popup(
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(ctx.theme.border))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(Color::White)
+                .fg(ctx.theme.title)
                 .add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(ctx.theme.overlay));
 
     let inner_area = popup_block.inner(popup_area);
     f.render_widget(popup_block, popup_area);
@@ -3817,11 +3673,12 @@ fn draw_popup(
     // Draw popup content based on type
     match &popup_state.popup_type {
         PopupType::PresetName => {
-            draw_preset_name_popup(f, inner_area, popup_state, mouse_areas, hovered_button);
+            draw_preset_name_popup(f, ctx, inner_area, popup_state, mouse_areas, hovered_button);
         }
         PopupType::TextInput { .. } => {
             draw_text_input_popup(
                 f,
+                ctx,
                 inner_area,
                 popup_state,
                 mouse_areas,
@@ -3833,6 +3690,7 @@ fn draw_popup(
         PopupType::OverwriteConfirm { preset_name } => {
             draw_overwrite_confirm_popup(
                 f,
+                ctx,
                 inner_area,
                 preset_name,
                 mouse_areas,
@@ -3846,6 +3704,7 @@ fn draw_popup(
         } => {
             draw_preset_list_popup(
                 f,
+                ctx,
                 inner_area,
                 presets,
                 *selected_index,
@@ -3855,16 +3714,17 @@ fn draw_popup(
             );
         }
         PopupType::FileBrowser(browser) => {
-            draw_file_browser(f, f.size(), browser, mouse_areas, hovered_button);
+            draw_file_browser(f, ctx, f.size(), browser, mouse_areas, hovered_button);
         }
         PopupType::NewFolder { .. } => {
-            draw_new_folder_popup(f, inner_area, popup_state, mouse_areas, hovered_button);
+            draw_new_folder_popup(f, ctx, inner_area, popup_state, mouse_areas, hovered_button);
         }
     }
 }
 
 fn draw_preset_name_popup(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     popup_state: &PopupState,
     mouse_areas: &mut MouseAreas,
@@ -3886,7 +3746,7 @@ fn draw_preset_name_popup(
 
     // Draw label
     let label = Paragraph::new("Enter preset name:")
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(ctx.theme.text))
         .alignment(Alignment::Left);
     f.render_widget(label, chunks[0]);
 
@@ -3895,6 +3755,7 @@ fn draw_preset_name_popup(
     let input_is_focused = matches!(popup_state.focused_element, PopupFocus::Input);
     draw_input_field(
         f,
+                ctx,
         input_area,
         &popup_state.input_text,
         popup_state.cursor_pos,
@@ -3904,11 +3765,12 @@ fn draw_preset_name_popup(
 
     // Draw buttons (OK and Cancel)
     let button_area = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
-    draw_popup_buttons(f, button_area, mouse_areas, popup_state, hovered_button);
+    draw_popup_buttons(f, ctx, button_area, mouse_areas, popup_state, hovered_button);
 }
 
 fn draw_text_input_popup(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     popup_state: &PopupState,
     mouse_areas: &mut MouseAreas,
@@ -3949,7 +3811,7 @@ fn draw_text_input_popup(
     };
 
     let label = Paragraph::new(label_text)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(ctx.theme.text))
         .alignment(Alignment::Left);
     f.render_widget(label, chunks[0]);
 
@@ -3958,6 +3820,7 @@ fn draw_text_input_popup(
     let input_is_focused = matches!(popup_state.focused_element, PopupFocus::Input);
     draw_input_field(
         f,
+                ctx,
         input_area,
         &popup_state.input_text,
         popup_state.cursor_pos,
@@ -3966,12 +3829,12 @@ fn draw_text_input_popup(
     );
 
     // Draw buttons
-    draw_popup_buttons(f, chunks[3], mouse_areas, popup_state, hovered_button);
+    draw_popup_buttons(f, ctx, chunks[3], mouse_areas, popup_state, hovered_button);
 
     // Draw error message if present (in the last line before border)
     if let Some(error_msg) = &popup_state.error_message {
         let error = Paragraph::new(error_msg.as_str())
-            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            .style(Style::default().fg(ctx.theme.error).add_modifier(Modifier::BOLD))
             .alignment(Alignment::Center);
         f.render_widget(error, chunks[4]);
     }
@@ -3979,6 +3842,7 @@ fn draw_text_input_popup(
 
 fn draw_popup_buttons(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     mouse_areas: &mut MouseAreas,
     popup_state: &PopupState,
@@ -3995,22 +3859,22 @@ fn draw_popup_buttons(
     let ok_is_hovered = matches!(hovered_button, Some(ButtonId::PopupOk));
 
     let ok_style = if ok_is_focused {
-        // Focused: bright green with black text
+        // Focused state uses success fill with selected foreground.
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightGreen)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.success)
             .add_modifier(Modifier::BOLD)
     } else if ok_is_hovered {
-        // Hovered: lighter green
+        // Hovered state uses success fill with selected foreground.
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(100, 200, 100))
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.success)
             .add_modifier(Modifier::BOLD)
     } else {
-        // Normal: standard green
+        // Normal state uses success fill with selected foreground.
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.success)
             .add_modifier(Modifier::BOLD)
     };
 
@@ -4031,19 +3895,19 @@ fn draw_popup_buttons(
     let cancel_is_hovered = matches!(hovered_button, Some(ButtonId::PopupCancel));
 
     let cancel_style = if cancel_is_focused {
-        // Focused: bright gray with white text
+        // Focused cancel state uses disabled-surface styling.
         Style::default()
-            .fg(Color::White)
-            .bg(Color::Rgb(120, 120, 120))
+            .fg(ctx.theme.text)
+            .bg(ctx.theme.disabled_bg)
             .add_modifier(Modifier::BOLD)
     } else if cancel_is_hovered {
-        // Hovered: lighter gray
+        // Hovered cancel state uses disabled-surface styling.
         Style::default()
-            .fg(Color::White)
-            .bg(Color::Rgb(100, 100, 100))
+            .fg(ctx.theme.text)
+            .bg(ctx.theme.disabled_bg)
     } else {
-        // Normal: standard gray
-        Style::default().fg(Color::White).bg(Color::Rgb(80, 80, 80))
+        // Normal cancel state uses disabled-surface styling.
+        Style::default().fg(ctx.theme.text).bg(ctx.theme.disabled_bg)
     };
 
     let cancel_button = Paragraph::new(" Cancel ")
@@ -4055,6 +3919,7 @@ fn draw_popup_buttons(
 
 fn draw_input_field(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     text: &str,
     cursor_pos: usize,
@@ -4065,9 +3930,9 @@ fn draw_input_field(
     let border_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if is_active {
-            Color::White
+            ctx.theme.accent
         } else {
-            Color::DarkGray
+            ctx.theme.border
         }));
 
     let inner_area = border_block.inner(area);
@@ -4088,15 +3953,15 @@ fn draw_input_field(
         visible_text
     };
 
-    // Fill the inner area with dark gray background
-    let fill_block = Block::default().style(Style::default().bg(Color::DarkGray));
+    // Fill the input interior with the configured input background role.
+    let fill_block = Block::default().style(Style::default().bg(ctx.theme.input_bg));
     f.render_widget(fill_block, inner_area);
 
     // Draw the text content
     let text_style = if is_active {
-        Style::default().fg(Color::White).bg(Color::DarkGray)
+        Style::default().fg(ctx.theme.text).bg(ctx.theme.input_bg)
     } else {
-        Style::default().fg(Color::Gray).bg(Color::DarkGray)
+        Style::default().fg(ctx.theme.text_muted).bg(ctx.theme.input_bg)
     };
 
     let field = Paragraph::new(display_text).style(text_style);
@@ -4113,6 +3978,7 @@ fn draw_input_field(
 
 fn draw_overwrite_confirm_popup(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     preset_name: &str,
     mouse_areas: &mut MouseAreas,
@@ -4140,7 +4006,7 @@ fn draw_overwrite_confirm_popup(
             Span::styled(
                 preset_name,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(ctx.theme.warning)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("' already exists!"),
@@ -4150,13 +4016,13 @@ fn draw_overwrite_confirm_popup(
     ];
 
     let paragraph = Paragraph::new(message)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(ctx.theme.text))
         .alignment(Alignment::Center);
     f.render_widget(paragraph, chunks[0]);
 
     // Draw buttons (Yes and No) - reuse popup buttons
     let button_area = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
-    draw_popup_buttons(f, button_area, mouse_areas, popup_state, hovered_button);
+    draw_popup_buttons(f, ctx, button_area, mouse_areas, popup_state, hovered_button);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -4167,6 +4033,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 fn draw_preset_list_popup(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     presets: &[String],
     selected_index: usize,
@@ -4192,11 +4059,11 @@ fn draw_preset_list_popup(
     for (i, preset) in presets.iter().enumerate() {
         let style = if i == selected_index {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(ctx.theme.selected_fg)
+                .bg(ctx.theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(ctx.theme.text)
         };
         lines.push(Line::from(Span::styled(format!(" {} ", preset), style)));
 
@@ -4208,30 +4075,30 @@ fn draw_preset_list_popup(
     }
 
     let list = Paragraph::new(lines)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(ctx.theme.text))
         .wrap(Wrap { trim: false });
     f.render_widget(list, chunks[0]);
 
     // Draw buttons (OK and Cancel)
     let button_area = chunks[1];
-    draw_popup_buttons(f, button_area, mouse_areas, popup_state, hovered_button);
+    draw_popup_buttons(f, ctx, button_area, mouse_areas, popup_state, hovered_button);
 }
 
-fn format_option_line(text: &str, is_selected: bool, is_focused: bool) -> Line<'static> {
+fn format_option_line(ctx: &WizardRenderCtx, text: &str, is_selected: bool, is_focused: bool) -> Line<'static> {
     let radio = if is_selected { "◉" } else { "○" };
     let radio_style = if is_selected {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(ctx.theme.accent)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     let text_style = if is_focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(ctx.theme.text)
     };
 
     if is_focused {
@@ -4240,8 +4107,8 @@ fn format_option_line(text: &str, is_selected: bool, is_focused: bool) -> Line<'
             Span::styled(
                 radio,
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Cyan)
+                    .fg(ctx.theme.text)
+                    .bg(ctx.theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!(" {}", text), text_style),
@@ -4257,8 +4124,9 @@ fn format_option_line(text: &str, is_selected: bool, is_focused: bool) -> Line<'
 }
 
 // File browser UI functions
-pub fn draw_file_browser(
+fn draw_file_browser(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     browser: &crate::types::FileBrowser,
     mouse_areas: &mut MouseAreas,
@@ -4274,8 +4142,8 @@ pub fn draw_file_browser(
     // Clear the popup area
     f.render_widget(Clear, popup_area);
 
-    // Dark background
-    let bg_color = Color::Rgb(30, 30, 30);
+    // Popup overlay background.
+    let bg_color = ctx.theme.overlay;
 
     // Create popup block
     let popup_block = Block::default()
@@ -4284,11 +4152,11 @@ pub fn draw_file_browser(
         .title(" Select Directory ")
         .title_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(ctx.theme.title)
                 .add_modifier(Modifier::BOLD),
         )
         .title_alignment(Alignment::Left)
-        .border_style(Style::default().fg(Color::White))
+        .border_style(Style::default().fg(ctx.theme.border))
         .style(Style::default().bg(bg_color));
 
     f.render_widget(popup_block.clone(), popup_area);
@@ -4306,16 +4174,16 @@ pub fn draw_file_browser(
         .split(inner);
 
     // Current path display
-    draw_current_path(f, chunks[0], browser);
+    draw_current_path(f, ctx, chunks[0], browser);
 
     // File list
-    draw_directory_list(f, chunks[1], browser, mouse_areas);
+    draw_directory_list(f, ctx, chunks[1], browser, mouse_areas);
 
     // Buttons
-    draw_browser_buttons(f, chunks[2], browser, mouse_areas, hovered_button);
+    draw_browser_buttons(f, ctx, chunks[2], browser, mouse_areas, hovered_button);
 }
 
-fn draw_current_path(f: &mut Frame, area: Rect, browser: &crate::types::FileBrowser) {
+fn draw_current_path(f: &mut Frame, ctx: &WizardRenderCtx, area: Rect, browser: &crate::types::FileBrowser) {
     let path_str = browser.current_path.display().to_string();
     let display = if path_str.len() > (area.width as usize - 4) {
         format!(
@@ -4327,7 +4195,7 @@ fn draw_current_path(f: &mut Frame, area: Rect, browser: &crate::types::FileBrow
     };
 
     let paragraph = Paragraph::new(display)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(ctx.theme.text))
         .alignment(Alignment::Left);
 
     f.render_widget(paragraph, area);
@@ -4335,6 +4203,7 @@ fn draw_current_path(f: &mut Frame, area: Rect, browser: &crate::types::FileBrow
 
 fn draw_directory_list(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     browser: &crate::types::FileBrowser,
     mouse_areas: &mut MouseAreas,
@@ -4397,13 +4266,13 @@ fn draw_directory_list(
             let style = if is_selected && browser.focus == crate::types::BrowserFocus::List {
                 // Currently focused only
                 Style::default()
-                    .bg(Color::Rgb(60, 60, 60))
-                    .fg(Color::White)
+                    .bg(ctx.theme.surface)
+                    .fg(ctx.theme.text)
                     .add_modifier(Modifier::BOLD)
             } else if entry.is_dir {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(ctx.theme.accent)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(ctx.theme.text)
             };
 
             ListItem::new(Line::from(spans)).style(style)
@@ -4413,7 +4282,7 @@ fn draw_directory_list(
     let list_widget = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(ctx.theme.border))
             .style(Style::default()),
     );
 
@@ -4434,9 +4303,9 @@ fn draw_directory_list(
         // Draw scrollbar track
         for y in 0..scrollbar_height {
             let style = if y >= thumb_pos && y < thumb_pos + thumb_height {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(ctx.theme.accent)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(ctx.theme.text_dim)
             };
 
             let scrollbar = Paragraph::new("│").style(style);
@@ -4447,6 +4316,7 @@ fn draw_directory_list(
 
 fn draw_browser_buttons(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     browser: &crate::types::FileBrowser,
     mouse_areas: &mut MouseAreas,
@@ -4475,19 +4345,19 @@ fn draw_browser_buttons(
         ])
         .split(button_area);
 
-    // New button - Use teal like Load/Save Preset buttons
+    // New button follows the primary action role set.
     let new_style = if hovered_button == Some(ButtonId::NewFolder) {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(220, 255, 240)) // mint-white hover
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.hover_bg) // hovered primary action
     } else if browser.focus == crate::types::BrowserFocus::NewButton {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(180, 220, 225)) // light teal focus
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.focus_bg) // focused primary action
     } else {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(154, 189, 193)) // teal base
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.selected_bg) // selected primary action
     };
 
     let new_button = Paragraph::new(" New ")
@@ -4496,22 +4366,22 @@ fn draw_browser_buttons(
     f.render_widget(new_button, button_layout[0]);
     mouse_areas.add(button_layout[0], ButtonId::NewFolder);
 
-    // Select button - Use green like Start button
+    // Select button uses the success action role.
     let select_style = if hovered_button == Some(ButtonId::FileBrowserSelect) {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(0, 150, 0))
-            .add_modifier(Modifier::BOLD) // darker green hover
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.success)
+            .add_modifier(Modifier::BOLD) // hovered success action
     } else if browser.focus == crate::types::BrowserFocus::SelectButton {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightGreen)
-            .add_modifier(Modifier::BOLD) // light green focus
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.success)
+            .add_modifier(Modifier::BOLD) // focused success action
     } else {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
-            .add_modifier(Modifier::BOLD) // green base
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.success)
+            .add_modifier(Modifier::BOLD) // success action
     };
 
     let select_button = Paragraph::new(" Select ")
@@ -4523,16 +4393,16 @@ fn draw_browser_buttons(
     // Cancel button - Match wizard's Cancel button styling
     let cancel_style = if hovered_button == Some(ButtonId::FileBrowserCancel) {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(200, 80, 80))
-            .add_modifier(Modifier::BOLD) // darker red hover
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.error_dim)
+            .add_modifier(Modifier::BOLD) // hovered destructive action
     } else if browser.focus == crate::types::BrowserFocus::CancelButton {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(255, 100, 100))
-            .add_modifier(Modifier::BOLD) // light red focus
+            .fg(ctx.theme.selected_fg)
+            .bg(ctx.theme.error)
+            .add_modifier(Modifier::BOLD) // focused destructive action
     } else {
-        Style::default().fg(Color::White).bg(Color::DarkGray) // dark gray base (matching wizard)
+        Style::default().fg(ctx.theme.text).bg(ctx.theme.surface) // neutral action surface
     };
 
     let cancel_button = Paragraph::new(" Cancel ")
@@ -4542,8 +4412,9 @@ fn draw_browser_buttons(
     mouse_areas.add(button_layout[4], ButtonId::FileBrowserCancel);
 }
 
-pub fn draw_new_folder_popup(
+fn draw_new_folder_popup(
     f: &mut Frame,
+    ctx: &WizardRenderCtx,
     area: Rect,
     popup_state: &crate::types::PopupState,
     mouse_areas: &mut MouseAreas,
@@ -4552,6 +4423,7 @@ pub fn draw_new_folder_popup(
     // Use existing text input popup rendering
     draw_text_input_popup(
         f,
+                ctx,
         area,
         popup_state,
         mouse_areas,
@@ -4559,4 +4431,311 @@ pub fn draw_new_folder_popup(
         "New Folder Name",
         "Enter the name for the new folder:",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
+
+    fn sentinel_theme() -> WizardTheme {
+        WizardTheme {
+            background: Color::Rgb(1, 2, 3),
+            surface: Color::Rgb(4, 5, 6),
+            overlay: Color::Rgb(7, 8, 9),
+            border: Color::Rgb(10, 11, 12),
+            title: Color::Rgb(13, 14, 15),
+            text: Color::Rgb(16, 17, 18),
+            text_muted: Color::Rgb(19, 20, 21),
+            text_dim: Color::Rgb(22, 23, 24),
+            accent: Color::Rgb(25, 26, 27),
+            selected_bg: Color::Rgb(28, 29, 30),
+            selected_fg: Color::Rgb(31, 32, 33),
+            hover_bg: Color::Rgb(34, 35, 36),
+            focus_bg: Color::Rgb(37, 38, 39),
+            success: Color::Rgb(40, 41, 42),
+            warning: Color::Rgb(43, 44, 45),
+            error: Color::Rgb(46, 47, 48),
+            error_dim: Color::Rgb(49, 50, 51),
+            disabled_bg: Color::Rgb(52, 53, 54),
+            disabled_fg: Color::Rgb(55, 56, 57),
+            input_bg: Color::Rgb(58, 59, 60),
+        }
+    }
+
+    fn render_colors(wizard: &SimpleWizard, theme: WizardTheme) -> Vec<(Color, Color)> {
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                draw_wizard_with_theme(frame, wizard, theme);
+            })
+            .expect("draw");
+
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| (cell.fg, cell.bg))
+            .collect()
+    }
+
+    fn assert_fg(cells: &[(Color, Color)], color: Color, role: &str) {
+        assert!(
+            cells.iter().any(|(fg, _)| *fg == color),
+            "WizardTheme.{role} should affect at least one rendered foreground cell"
+        );
+    }
+
+    fn assert_bg(cells: &[(Color, Color)], color: Color, role: &str) {
+        assert!(
+            cells.iter().any(|(_, bg)| *bg == color),
+            "WizardTheme.{role} should affect at least one rendered background cell"
+        );
+    }
+
+    #[test]
+    fn wizard_theme_role_contract_renders_declared_roles() {
+        let theme = sentinel_theme();
+
+        let default_wizard = SimpleWizard::new();
+        let default_cells = render_colors(&default_wizard, theme);
+        assert_bg(&default_cells, theme.background, "background");
+        assert_fg(&default_cells, theme.text, "text");
+        assert_fg(&default_cells, theme.border, "border");
+        assert_fg(&default_cells, theme.title, "title");
+        assert_fg(&default_cells, theme.accent, "accent");
+        assert_bg(&default_cells, theme.selected_bg, "selected_bg");
+        assert_fg(&default_cells, theme.selected_fg, "selected_fg");
+
+        let mut popup_wizard = SimpleWizard::new();
+        popup_wizard.popup_state = Some(PopupState {
+            popup_type: PopupType::PresetName,
+            input_text: "Preset name".to_string(),
+            cursor_pos: 0,
+            view_offset: 0,
+            error_message: None,
+            focused_element: PopupFocus::Input,
+        });
+        let popup_cells = render_colors(&popup_wizard, theme);
+        assert_bg(&popup_cells, theme.overlay, "overlay");
+        assert_bg(&popup_cells, theme.input_bg, "input_bg");
+
+        let mut disabled_wizard = SimpleWizard::new();
+        disabled_wizard.current_step = 1;
+        disabled_wizard.selected_format = Some(AudioFormat::Flac);
+        disabled_wizard.bit_depth = Some(16);
+        let disabled_cells = render_colors(&disabled_wizard, theme);
+        assert_fg(&disabled_cells, theme.disabled_fg, "disabled_fg");
+
+        assert!(
+            !popup_cells.iter().any(|(_, bg)| *bg == theme.selected_fg),
+            "selected_fg is a foreground role and must not be used as a popup/input background"
+        );
+        assert!(
+            !popup_cells.iter().any(|(_, bg)| *bg == theme.text_dim),
+            "text_dim is a foreground role and must not be used as a popup/input background"
+        );
+    }
+
+    #[test]
+    fn draw_wizard_with_theme_uses_passed_theme() {
+        let wizard = SimpleWizard::new();
+        let theme = sentinel_theme();
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                draw_wizard_with_theme(frame, &wizard, theme);
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().any(|cell| cell.bg == theme.background),
+            "wizard background should come from the passed WizardTheme"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme.text),
+            "wizard body text should come from the passed WizardTheme"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme.border),
+            "wizard border should come from the passed WizardTheme"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme.title),
+            "wizard title should come from the passed WizardTheme"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme.accent),
+            "wizard accent foreground should come from the passed WizardTheme"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.bg == theme.selected_bg),
+            "wizard selected/highlight background should come from the passed WizardTheme"
+        );
+    }
+
+    #[test]
+    fn popup_and_input_backgrounds_use_background_roles() {
+        let mut wizard = SimpleWizard::new();
+        wizard.popup_state = Some(PopupState {
+            popup_type: PopupType::PresetName,
+            input_text: "Preset name".to_string(),
+            cursor_pos: 0,
+            view_offset: 0,
+            error_message: None,
+            focused_element: PopupFocus::Input,
+        });
+        let theme = sentinel_theme();
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                draw_wizard_with_theme(frame, &wizard, theme);
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().any(|cell| cell.bg == theme.overlay),
+            "popup background should come from WizardTheme.overlay"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.bg == theme.input_bg),
+            "input field background should come from WizardTheme.input_bg"
+        );
+        assert!(
+            !buffer.content().iter().any(|cell| cell.bg == theme.selected_fg),
+            "selected_fg is a foreground role and must not be used as a structural background"
+        );
+        assert!(
+            !buffer.content().iter().any(|cell| cell.bg == theme.text_dim),
+            "text_dim is a foreground role and must not be used as a structural background"
+        );
+    }
+
+    #[test]
+    fn disabled_options_use_disabled_foreground_role() {
+        let mut wizard = SimpleWizard::new();
+        wizard.current_step = 1;
+        wizard.selected_format = Some(AudioFormat::Flac);
+        wizard.bit_depth = Some(16);
+        let theme = sentinel_theme();
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                draw_wizard_with_theme(frame, &wizard, theme);
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme.disabled_fg),
+            "disabled wizard text should come from WizardTheme.disabled_fg"
+        );
+    }
+
+    #[test]
+    fn wizard_renderer_source_has_no_hardcoded_rgb_literals() {
+        let source = include_str!("ui.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        assert!(
+            !production_source.contains("Color::Rgb"),
+            "renderer code should use WizardTheme roles; RGB sentinels belong in tests or theme.rs"
+        );
+        for role in [
+            "background",
+            "surface",
+            "overlay",
+            "border",
+            "title",
+            "text",
+            "text_muted",
+            "text_dim",
+            "accent",
+            "selected_bg",
+            "selected_fg",
+            "hover_bg",
+            "focus_bg",
+            "success",
+            "warning",
+            "error",
+            "error_dim",
+            "disabled_bg",
+            "disabled_fg",
+            "input_bg",
+        ] {
+            let needle = format!("ctx.theme.{role}");
+            assert!(
+                production_source.contains(&needle),
+                "WizardTheme role `{role}` must have visible production renderer usage or be removed from WizardTheme"
+            );
+        }
+        for forbidden in ["bg(ctx.theme.selected_fg)", "bg(ctx.theme.text_dim)"] {
+            assert!(
+                !production_source.contains(forbidden),
+                "foreground role used as structural background: {forbidden}"
+            );
+        }
+        for stale_comment in [
+            "dark gray",
+            "custom dark gray",
+            "cyan color",
+            "white title",
+            "teal",
+            "mint-white",
+            "Pale yellow",
+            "Light red",
+            "Darker red",
+            "green base",
+        ] {
+            assert!(
+                !production_source.contains(stale_comment),
+                "stale hardcoded-color comment remains in wizard renderer: {stale_comment}"
+            );
+        }
+    }
+
+    #[test]
+    fn wizard_production_code_has_no_ambient_theme_or_file_debug_io() {
+        let sources = [
+            ("ui.rs", include_str!("ui.rs").split("#[cfg(test)]").next().unwrap_or("")),
+            ("theme.rs", include_str!("theme.rs")),
+            ("events.rs", include_str!("events.rs")),
+            ("types.rs", include_str!("types.rs")),
+            ("main.rs", include_str!("main.rs")),
+        ];
+        let forbidden = [
+            concat!("CURRENT", "_WIZARD", "_THEME"),
+            concat!("bind", "_wizard", "_theme"),
+            concat!("wizard", "_theme()"),
+            concat!("Wizard", "Theme", "Guard"),
+            concat!("thread", "_local!"),
+            concat!("wizard", "_areas", ".log"),
+            concat!("Open", "Options"),
+        ];
+
+        for (path, source) in sources {
+            for token in forbidden {
+                assert!(
+                    !source.contains(token),
+                    "forbidden Wizard ambient-theme/debug token `{token}` found in {path}"
+                );
+            }
+        }
+    }
+
 }

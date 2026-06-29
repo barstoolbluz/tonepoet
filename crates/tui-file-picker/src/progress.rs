@@ -544,6 +544,20 @@ impl FileTaskProgressState {
         self.updated_at = Instant::now();
     }
 
+    /// Return the concrete theme currently used by this progress overlay.
+    pub fn theme(&self) -> &FilePickerTheme {
+        &self.theme
+    }
+
+    /// Replace the concrete theme used by this already-open progress overlay.
+    ///
+    /// This keeps long-running copy/move/delete progress dialogs visually in
+    /// sync when the host application changes themes while the task is active.
+    pub fn set_theme(&mut self, theme: FilePickerTheme) {
+        self.theme = theme;
+        self.updated_at = Instant::now();
+    }
+
     pub fn record_error(&mut self, error: FileTaskErrorRecord) {
         self.error_records.push(error);
         let max = self.max_error_records.max(1);

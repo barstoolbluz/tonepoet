@@ -8,14 +8,13 @@ use ratatui::{
     Frame,
 };
 
-use super::theme;
 
 const ART_LINE_1: &str = "▀▀█▀▀ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀▀ ▀▀█▀▀";
 const ART_LINE_2: &str = "  █   █  █ █  █ █▀▀▀ █▀▀▀ █  █ █▀▀▀   █  ";
 const ART_LINE_3: &str = "  ▀   ▀▀▀▀ ▀  ▀ ▀▀▀▀ ▀    ▀▀▀▀ ▀▀▀▀   ▀  ";
 
 /// Draw the header: blue box with ASCII art TONEPOET + version
-pub fn draw_header(f: &mut Frame, area: Rect) {
+pub fn draw_header(f: &mut Frame, area: Rect, theme: super::theme::Theme) {
     if area.height < 7 || area.width < 50 {
         return;
     }
@@ -23,11 +22,11 @@ pub fn draw_header(f: &mut Frame, area: Rect) {
     let w = area.width as usize;
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
 
-    let border = theme::border(theme::BLUE);
+    let border = theme.border(theme.blue);
     let art_style = ratatui::style::Style::default()
-        .fg(theme::PURPLE)
+        .fg(theme.title)
         .add_modifier(Modifier::BOLD);
-    let ver_style = theme::muted();
+    let ver_style = theme.muted();
 
     let top = format!("╭{}╮", "─".repeat(w.saturating_sub(2)));
     let bot = format!("╰{}╯", "─".repeat(w.saturating_sub(2)));
@@ -79,4 +78,27 @@ pub fn draw_header(f: &mut Frame, area: Rect) {
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn draw_header_uses_passed_theme_without_frame_binding() {
+        let theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
+        let backend = TestBackend::new(80, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_header(frame, ratatui::layout::Rect::new(0, 0, 80, 7), theme))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        // Art is centered: pad_left = (80 - 2 - 42) / 2 = 18, art starts at col 19.
+        let art_cell = buffer.get(19, 2);
+        assert_eq!(art_cell.fg, theme.title);
+    }
 }

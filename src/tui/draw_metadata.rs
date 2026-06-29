@@ -2,14 +2,13 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
 use super::app::{MetadataState, SourceMode};
-use super::theme;
 
 /// Draw the metadata pane with purple border.
 pub fn draw_metadata_pane(
@@ -19,21 +18,22 @@ pub fn draw_metadata_pane(
     source_mode: &SourceMode,
     focused: bool,
     maximized: bool,
+    theme: super::theme::Theme,
 ) {
     if area.height < 4 || area.width < 30 {
         return;
     }
 
     let border_color = if focused {
-        theme::PURPLE
+        theme.purple
     } else {
-        theme::TEXT_DIM
+        theme.text_dim
     };
     let w = area.width as usize;
-    let top_line = metadata_title_line(border_color, w, maximized);
+    let top_line = metadata_title_line(border_color, w, maximized, theme);
     let bot_line = Line::from(Span::styled(
         format!("└{}┘", "─".repeat(w.saturating_sub(2))),
-        theme::border(border_color),
+        theme.border(border_color),
     ));
 
     let mut lines = vec![top_line];
@@ -47,8 +47,7 @@ pub fn draw_metadata_pane(
                 metadata.file_scroll,
                 area.height.saturating_sub(2) as usize,
                 focused,
-                metadata,
-            ));
+                metadata, theme));
         }
         SourceMode::MultiTrack { tracks, cursor, .. } => {
             lines.extend(render_track_file_list(
@@ -59,17 +58,16 @@ pub fn draw_metadata_pane(
                 metadata.file_scroll,
                 area.height.saturating_sub(2) as usize,
                 focused,
-                metadata,
-            ));
+                metadata, theme));
         }
         _ => {
-            lines.extend(render_single_metadata(border_color, w, metadata));
+            lines.extend(render_single_metadata(border_color, w, metadata, theme));
         }
     }
 
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
     while lines.len() < target_len_before_bottom {
-        lines.push(bordered_line(border_color, w, vec![]));
+        lines.push(bordered_line(border_color, w, vec![], theme));
     }
     lines.push(bot_line);
 
@@ -77,17 +75,17 @@ pub fn draw_metadata_pane(
 }
 
 /// Draw the collapsed metadata title bar.
-pub fn draw_metadata_title_bar(f: &mut Frame, area: Rect, focused: bool) {
+pub fn draw_metadata_title_bar(f: &mut Frame, area: Rect, focused: bool, theme: super::theme::Theme) {
     if area.height < 1 || area.width < 12 {
         return;
     }
     let border_color = if focused {
-        theme::PURPLE
+        theme.purple
     } else {
-        theme::TEXT_DIM
+        theme.text_dim
     };
     f.render_widget(
-        Paragraph::new(vec![metadata_title_line(border_color, area.width as usize, false)]),
+        Paragraph::new(vec![metadata_title_line(border_color, area.width as usize, false, theme)]),
         area,
     );
 }
@@ -96,18 +94,19 @@ fn metadata_title_line<'a>(
     border_color: ratatui::style::Color,
     width: usize,
     maximized: bool,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
     let title = " metadata ";
     let indicator = if maximized { "▾" } else { "▸" };
-    let bar_style = Style::default().fg(Color::Black).bg(border_color);
+    let bar_style = Style::default().fg(theme.bg).bg(border_color);
     let left_spans = vec![
-        Span::styled("┌", theme::border(border_color)),
+        Span::styled("┌", theme.border(border_color)),
         Span::styled(format!(" {indicator}{title}"), bar_style),
     ];
     let right_spans = vec![
-        Span::styled("a", Style::default().fg(theme::TEXT_MUTED).bg(border_color)),
+        Span::styled("a", Style::default().fg(theme.text_muted).bg(border_color)),
         Span::styled("dvanced ", bar_style),
-        Span::styled("┐", theme::border(border_color)),
+        Span::styled("┐", theme.border(border_color)),
     ];
     let fixed_width = Line::from(left_spans.clone()).width()
         + Line::from(right_spans.clone()).width();
@@ -125,11 +124,12 @@ fn render_single_metadata<'a>(
     border_color: ratatui::style::Color,
     w: usize,
     metadata: &'a MetadataState,
+    theme: super::theme::Theme,
 ) -> Vec<Line<'a>> {
-    let dash = Span::styled("—", Style::default().fg(theme::TEXT_DIM));
+    let dash = Span::styled("—", Style::default().fg(theme.text_dim));
     let field_or_dash = |val: &'a Option<String>| -> Span<'a> {
         match val {
-            Some(v) if !v.is_empty() => Span::styled(v.clone(), theme::text()),
+            Some(v) if !v.is_empty() => Span::styled(v.clone(), theme.text_style()),
             _ => dash.clone(),
         }
     };
@@ -138,10 +138,9 @@ fn render_single_metadata<'a>(
         border_color,
         w,
         vec![
-            Span::styled("   title   ", theme::muted()),
+            Span::styled("   title   ", theme.muted()),
             field_or_dash(&metadata.title),
-        ],
-    );
+        ], theme);
 
     let half_w = w.saturating_sub(8) / 2;
     let artist_val = field_or_dash(&metadata.artist);
@@ -152,13 +151,12 @@ fn render_single_metadata<'a>(
         border_color,
         w,
         vec![
-            Span::styled("   artist  ", theme::muted()),
+            Span::styled("   artist  ", theme.muted()),
             artist_val,
             Span::raw(" ".repeat(gap)),
-            Span::styled("album  ", theme::muted()),
+            Span::styled("album  ", theme.muted()),
             album_val,
-        ],
-    );
+        ], theme);
 
     let genre_val = field_or_dash(&metadata.genre);
     let year_val = field_or_dash(&metadata.year);
@@ -168,13 +166,12 @@ fn render_single_metadata<'a>(
         border_color,
         w,
         vec![
-            Span::styled("   genre   ", theme::muted()),
+            Span::styled("   genre   ", theme.muted()),
             genre_val,
             Span::raw(" ".repeat(gap2)),
-            Span::styled("year   ", theme::muted()),
+            Span::styled("year   ", theme.muted()),
             year_val,
-        ],
-    );
+        ], theme);
 
     vec![title_row, row2, row3]
 }
@@ -188,6 +185,7 @@ fn render_batch_file_list<'a>(
     visible: usize,
     focused: bool,
     metadata: &'a MetadataState,
+    theme: super::theme::Theme,
 ) -> Vec<Line<'a>> {
     if paths.is_empty() || visible == 0 {
         return Vec::new();
@@ -205,7 +203,7 @@ fn render_batch_file_list<'a>(
                 .unwrap_or_else(|| path.display().to_string());
             let label = format!("{:>3}. ", idx + 1);
             let summary = if idx == cursor { metadata_summary(metadata) } else { None };
-            file_row(border_color, w, &label, &name, summary.as_deref(), idx == cursor, focused)
+            file_row(border_color, w, &label, &name, summary.as_deref(), idx == cursor, focused, theme)
         })
         .collect()
 }
@@ -219,6 +217,7 @@ fn render_track_file_list<'a>(
     visible: usize,
     focused: bool,
     metadata: &'a MetadataState,
+    theme: super::theme::Theme,
 ) -> Vec<Line<'a>> {
     if tracks.is_empty() || visible == 0 {
         return Vec::new();
@@ -238,7 +237,7 @@ fn render_track_file_list<'a>(
                 .unwrap_or_else(|| format!("track {}", track.number));
             let label = format!("{:>3}. ", track.number);
             let summary = if idx == cursor { metadata_summary(metadata) } else { None };
-            file_row(border_color, w, &label, &name, summary.as_deref(), idx == cursor, focused)
+            file_row(border_color, w, &label, &name, summary.as_deref(), idx == cursor, focused, theme)
         })
         .collect()
 }
@@ -265,19 +264,20 @@ fn file_row<'a>(
     summary: Option<&str>,
     selected: bool,
     focused: bool,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
     let style = if selected && focused {
         Style::default()
-            .fg(theme::PILL_ACTIVE_FG)
-            .bg(theme::PURPLE)
+            .fg(theme.pill_active_fg)
+            .bg(theme.purple)
             .add_modifier(Modifier::BOLD)
     } else if selected {
-        Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.purple).add_modifier(Modifier::BOLD)
     } else {
-        theme::text()
+        theme.text_style()
     };
-    let label_style = if selected { style } else { theme::muted() };
-    let summary_style = if selected { style } else { theme::muted() };
+    let label_style = if selected { style } else { theme.muted() };
+    let summary_style = if selected { style } else { theme.muted() };
 
     let content_width = width.saturating_sub(2);
     let leading_width = 2usize;
@@ -302,7 +302,7 @@ fn file_row<'a>(
         spans.push(Span::styled(summary_text.to_string(), summary_style));
     }
 
-    bordered_line(border_color, width, spans)
+    bordered_line(border_color, width, spans, theme)
 }
 
 fn metadata_summary(metadata: &MetadataState) -> Option<String> {
@@ -325,14 +325,15 @@ fn bordered_line<'a>(
     border_color: ratatui::style::Color,
     width: usize,
     content: Vec<Span<'a>>,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
     let content_width: usize = content.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(2 + content_width);
 
-    let mut spans = vec![Span::styled("│", theme::border(border_color))];
+    let mut spans = vec![Span::styled("│", theme.border(border_color))];
     spans.extend(content);
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
 }
 

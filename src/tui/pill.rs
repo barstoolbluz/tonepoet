@@ -3,7 +3,6 @@
 use ratatui::style::Style;
 use ratatui::text::Span;
 
-use super::theme;
 
 /// A single option in a pill row
 #[derive(Debug, Clone)]
@@ -103,7 +102,7 @@ impl<T: Clone + PartialEq> PillState<T> {
 }
 
 /// Render a pill row as a Vec of Spans
-pub fn render_pill_spans<T: Clone>(state: &PillState<T>, row_focused: bool) -> Vec<Span<'static>> {
+pub fn render_pill_spans<T: Clone>(state: &PillState<T>, row_focused: bool, theme: super::theme::Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
     for (i, opt) in state.options.iter().enumerate() {
@@ -115,19 +114,19 @@ pub fn render_pill_spans<T: Clone>(state: &PillState<T>, row_focused: bool) -> V
 
         let style = if !opt.enabled {
             // Disabled — always dimmed, even if selected
-            Style::default().fg(theme::BORDER_DIM)
+            Style::default().fg(theme.border_dim)
         } else if i == state.selected {
             // Active/selected pill (and enabled)
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::PILL_ACTIVE_BG)
+                .fg(theme.pill_active_fg)
+                .bg(theme.pill_active_bg)
                 .add_modifier(ratatui::style::Modifier::BOLD)
         } else if row_focused {
             // Available pill in focused row — brighter to show navigable
-            Style::default().fg(theme::TEXT_MUTED)
+            Style::default().fg(theme.text_muted)
         } else {
             // Available pill in unfocused row
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         };
 
         spans.push(Span::styled(label, style));

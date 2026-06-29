@@ -1009,6 +1009,45 @@ mod tests {
         }));
     }
 
+
+
+    #[test]
+    fn set_theme_changes_rendered_styles_on_next_draw() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("cover.png"), b"png").expect("file");
+        let mut first_theme = crate::FilePickerTheme::default();
+        first_theme.border = Style::default().fg(Color::Rgb(1, 2, 3));
+        first_theme.title = Style::default().fg(Color::Rgb(4, 5, 6));
+        first_theme.selected = Style::default()
+            .fg(Color::Rgb(7, 8, 9))
+            .bg(Color::Rgb(10, 11, 12))
+            .add_modifier(Modifier::BOLD);
+        let mut second_theme = first_theme.clone();
+        second_theme.border = Style::default().fg(Color::Rgb(21, 22, 23));
+        second_theme.title = Style::default().fg(Color::Rgb(24, 25, 26));
+        second_theme.selected = Style::default()
+            .fg(Color::Rgb(27, 28, 29))
+            .bg(Color::Rgb(30, 31, 32))
+            .add_modifier(Modifier::BOLD);
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            theme: first_theme,
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let area = Rect::new(0, 0, 90, 24);
+
+        terminal.draw(|frame| picker.render(frame, area)).expect("first draw");
+        assert_eq!(terminal.backend().buffer().get(0, 0).fg, Color::Rgb(1, 2, 3));
+
+        picker.set_theme(second_theme);
+        terminal.draw(|frame| picker.render(frame, area)).expect("second draw");
+        assert_eq!(terminal.backend().buffer().get(0, 0).fg, Color::Rgb(21, 22, 23));
+    }
+
     #[test]
     fn generic_picker_omits_conflict_policy_row() {
         let temp = tempfile::tempdir().expect("tempdir");

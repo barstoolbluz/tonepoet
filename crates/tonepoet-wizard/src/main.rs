@@ -8,6 +8,7 @@ use std::io;
 
 mod events;
 mod presets;
+mod theme;
 mod types;
 mod ui;
 
@@ -61,19 +62,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         wizard.handle_mouse(mouse, button_id);
 
                         if wizard.should_exit {
-                            // Debug logging
-                            use std::fs::OpenOptions;
-                            use std::io::Write;
-                            if let Ok(mut file) = OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("wizard_areas.log")
-                            {
-                                let _ = writeln!(
-                                    file,
-                                    "Main loop: Exiting wizard due to should_exit flag"
-                                );
-                            }
                             break; // Exit the wizard when Cancel is clicked
                         }
 

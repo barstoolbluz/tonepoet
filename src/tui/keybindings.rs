@@ -186,14 +186,26 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
 
 fn handle_config_key(app: &mut AppState, key: KeyEvent) {
     match (key.code, key.modifiers) {
-        // Tab toggles focus between settings and keychain panes.
-        (KeyCode::Tab, KeyModifiers::NONE) | (KeyCode::BackTab, KeyModifiers::SHIFT) => {
-            app.keychain.focused = !app.keychain.focused;
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            app.cycle_config_focus(true);
+            return;
+        }
+        (KeyCode::BackTab, _) => {
+            app.cycle_config_focus(false);
+            return;
+        }
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Appearance => {
+            app.cycle_ui_theme(false);
+            return;
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Appearance => {
+            app.cycle_ui_theme(true);
+            return;
         }
         _ => {}
     }
 
-    if !app.keychain.focused {
+    if app.config_focus != ConfigFocus::Keychain {
         return;
     }
 
@@ -3531,7 +3543,7 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
         start_dir: dir,
         filter: tui_file_picker::FilePickerFilter::Images,
         title: "Select artwork image".to_string(),
-        theme: file_picker_theme_from_tonepoet_theme(),
+        theme: file_picker_theme_from_theme(&app.theme),
         selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
         operation_policy: artwork_file_picker_policy(),
         ..tui_file_picker::FilePickerConfig::default()
@@ -3547,118 +3559,345 @@ fn artwork_file_picker_policy() -> tui_file_picker::FileOperationPolicy {
     tui_file_picker::FileOperationPolicy::default()
 }
 
-pub(super) fn file_picker_theme_from_tonepoet_theme() -> tui_file_picker::FilePickerTheme {
+pub(crate) fn file_picker_theme_from_theme(theme: &super::theme::Theme) -> tui_file_picker::FilePickerTheme {
     use ratatui::style::{Modifier, Style};
     tui_file_picker::FilePickerTheme {
-        border: Style::default().fg(super::theme::CYAN),
-        border_dim: Style::default().fg(super::theme::BORDER_DIM),
-        title: Style::default().fg(super::theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD),
-        toolbar: Style::default().fg(super::theme::TEXT_BRIGHT),
-        toolbar_active: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
-        button: Style::default().fg(super::theme::BG).bg(super::theme::CYAN),
+        border: Style::default().fg(theme.cyan),
+        border_dim: Style::default().fg(theme.border_dim),
+        title: Style::default().fg(theme.text_bright).add_modifier(Modifier::BOLD),
+        toolbar: Style::default().fg(theme.text_bright),
+        toolbar_active: Style::default().fg(theme.bg).bg(theme.cyan).add_modifier(Modifier::BOLD),
+        button: Style::default().fg(theme.bg).bg(theme.cyan),
         button_focused: Style::default()
-            .fg(super::theme::BG)
-            .bg(super::theme::TEXT_BRIGHT)
+            .fg(theme.bg)
+            .bg(theme.text_bright)
             .add_modifier(Modifier::BOLD),
-        button_disabled: Style::default().fg(super::theme::TEXT_MUTED).bg(super::theme::BORDER_DIM),
-        label: Style::default().fg(super::theme::TEXT_DIM),
-        text: Style::default().fg(super::theme::TEXT),
-        text_dim: Style::default().fg(super::theme::TEXT_MUTED),
-        folder: Style::default().fg(super::theme::AMBER),
-        current_file: Style::default().fg(super::theme::CYAN),
-        selected: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
+        button_disabled: Style::default().fg(theme.text_muted).bg(theme.border_dim),
+        label: Style::default().fg(theme.text_dim),
+        text: Style::default().fg(theme.text),
+        text_dim: Style::default().fg(theme.text_muted),
+        folder: Style::default().fg(theme.amber),
+        current_file: Style::default().fg(theme.cyan),
+        selected: Style::default().fg(theme.bg).bg(theme.cyan).add_modifier(Modifier::BOLD),
         progress_dialog: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_TEXT)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
+            .fg(theme.progress_dialog_text)
+            .bg(theme.progress_dialog_bg),
         progress_border: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_BORDER)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
+            .fg(theme.progress_dialog_border)
+            .bg(theme.progress_dialog_bg),
         progress_title: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_TITLE)
-            .bg(super::theme::PROGRESS_DIALOG_BG)
+            .fg(theme.progress_dialog_title)
+            .bg(theme.progress_dialog_bg)
             .add_modifier(Modifier::BOLD),
         progress_label: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_LABEL)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
+            .fg(theme.progress_dialog_label)
+            .bg(theme.progress_dialog_bg),
         progress_text: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_TEXT)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
+            .fg(theme.progress_dialog_text)
+            .bg(theme.progress_dialog_bg),
         progress_text_dim: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_DIM)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
+            .fg(theme.progress_dialog_dim)
+            .bg(theme.progress_dialog_bg),
         progress_current_file: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_CURRENT_FILE)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
+            .fg(theme.progress_dialog_current_file)
+            .bg(theme.progress_dialog_bg),
         progress_button: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_BUTTON_FG)
-            .bg(super::theme::PROGRESS_DIALOG_BUTTON_BG),
+            .fg(theme.progress_dialog_button_fg)
+            .bg(theme.progress_dialog_button_bg),
         progress_button_focused: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_BUTTON_FG)
-            .bg(super::theme::PROGRESS_DIALOG_TITLE)
+            .fg(theme.progress_dialog_button_fg)
+            .bg(theme.progress_dialog_title)
             .add_modifier(Modifier::BOLD),
         progress_destructive: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_ABORT_FG)
-            .bg(super::theme::PROGRESS_DIALOG_ABORT_BG)
+            .fg(theme.progress_dialog_abort_fg)
+            .bg(theme.progress_dialog_abort_bg)
             .add_modifier(Modifier::BOLD),
-        header: Style::default().fg(super::theme::TEXT_DIM).add_modifier(Modifier::BOLD),
-        status: Style::default().fg(super::theme::TEXT).bg(super::theme::SURFACE),
-        menu: Style::default().fg(super::theme::TEXT_BRIGHT).bg(super::theme::SURFACE),
-        menu_selected: Style::default().fg(super::theme::BG).bg(super::theme::CYAN).add_modifier(Modifier::BOLD),
-        menu_disabled: Style::default().fg(super::theme::TEXT_MUTED).bg(super::theme::SURFACE),
-        accelerator: Style::default().fg(super::theme::AMBER).add_modifier(Modifier::UNDERLINED),
+        header: Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD),
+        status: Style::default().fg(theme.text).bg(theme.surface),
+        menu: Style::default().fg(theme.text_bright).bg(theme.surface),
+        menu_selected: Style::default().fg(theme.bg).bg(theme.cyan).add_modifier(Modifier::BOLD),
+        menu_disabled: Style::default().fg(theme.text_muted).bg(theme.surface),
+        accelerator: Style::default().fg(theme.amber).add_modifier(Modifier::UNDERLINED),
         destructive: Style::default()
-            .fg(super::theme::BG)
-            .bg(super::theme::RED)
+            .fg(theme.bg)
+            .bg(theme.destructive)
             .add_modifier(Modifier::BOLD),
         progress_filled: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_BAR_FILLED)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
+            .fg(theme.progress_dialog_bar_filled)
+            .bg(theme.progress_dialog_bg),
         progress_unfilled: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_BAR_UNFILLED)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
+            .fg(theme.progress_dialog_bar_unfilled)
+            .bg(theme.progress_dialog_bg),
         progress_percent: Style::default()
-            .fg(super::theme::PROGRESS_DIALOG_PERCENT)
-            .bg(super::theme::PROGRESS_DIALOG_BG),
-        error: Style::default().fg(super::theme::RED),
+            .fg(theme.progress_dialog_percent)
+            .bg(theme.progress_dialog_bg),
+        error: Style::default().fg(theme.error),
     }
 }
 
 #[cfg(test)]
 mod progress_dialog_theme_tests {
-    use super::file_picker_theme_from_tonepoet_theme;
+    use super::{file_picker_theme_from_theme, handle_config_key};
+    use crate::tui::test_support::XdgConfigHomeGuard;
     use crate::tui::theme;
+
+    fn picker_theme(slug: &str) -> (theme::Theme, tui_file_picker::FilePickerTheme) {
+        let theme = theme::theme_by_slug(slug).expect("theme slug");
+        let picker_theme = file_picker_theme_from_theme(&theme);
+        (theme, picker_theme)
+    }
 
     #[test]
     fn tonepoet_progress_dialog_theme_matches_mockup_palette() {
-        let mapped = file_picker_theme_from_tonepoet_theme();
+        let (theme, mapped) = picker_theme("tokyo-night");
 
-        assert_eq!(mapped.progress_dialog.fg, Some(theme::PROGRESS_DIALOG_TEXT));
-        assert_eq!(mapped.progress_dialog.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_dialog.fg, Some(theme.progress_dialog_text));
+        assert_eq!(mapped.progress_dialog.bg, Some(theme.progress_dialog_bg));
 
-        assert_eq!(mapped.progress_border.fg, Some(theme::PROGRESS_DIALOG_BORDER));
-        assert_eq!(mapped.progress_border.bg, Some(theme::PROGRESS_DIALOG_BG));
-        assert_eq!(mapped.progress_title.fg, Some(theme::PROGRESS_DIALOG_TITLE));
-        assert_eq!(mapped.progress_title.bg, Some(theme::PROGRESS_DIALOG_BG));
-        assert_eq!(mapped.progress_label.fg, Some(theme::PROGRESS_DIALOG_LABEL));
-        assert_eq!(mapped.progress_label.bg, Some(theme::PROGRESS_DIALOG_BG));
-        assert_eq!(mapped.progress_text.fg, Some(theme::PROGRESS_DIALOG_TEXT));
-        assert_eq!(mapped.progress_text.bg, Some(theme::PROGRESS_DIALOG_BG));
-        assert_eq!(mapped.progress_text_dim.fg, Some(theme::PROGRESS_DIALOG_DIM));
-        assert_eq!(mapped.progress_text_dim.bg, Some(theme::PROGRESS_DIALOG_BG));
-        assert_eq!(mapped.progress_current_file.fg, Some(theme::PROGRESS_DIALOG_CURRENT_FILE));
-        assert_eq!(mapped.progress_current_file.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_border.fg, Some(theme.progress_dialog_border));
+        assert_eq!(mapped.progress_border.bg, Some(theme.progress_dialog_bg));
+        assert_eq!(mapped.progress_title.fg, Some(theme.progress_dialog_title));
+        assert_eq!(mapped.progress_title.bg, Some(theme.progress_dialog_bg));
+        assert_eq!(mapped.progress_label.fg, Some(theme.progress_dialog_label));
+        assert_eq!(mapped.progress_label.bg, Some(theme.progress_dialog_bg));
+        assert_eq!(mapped.progress_text.fg, Some(theme.progress_dialog_text));
+        assert_eq!(mapped.progress_text.bg, Some(theme.progress_dialog_bg));
+        assert_eq!(mapped.progress_text_dim.fg, Some(theme.progress_dialog_dim));
+        assert_eq!(mapped.progress_text_dim.bg, Some(theme.progress_dialog_bg));
+        assert_eq!(mapped.progress_current_file.fg, Some(theme.progress_dialog_current_file));
+        assert_eq!(mapped.progress_current_file.bg, Some(theme.progress_dialog_bg));
 
-        assert_eq!(mapped.progress_filled.fg, Some(theme::PROGRESS_DIALOG_BAR_FILLED));
-        assert_eq!(mapped.progress_filled.bg, Some(theme::PROGRESS_DIALOG_BG));
-        assert_eq!(mapped.progress_unfilled.fg, Some(theme::PROGRESS_DIALOG_BAR_UNFILLED));
-        assert_eq!(mapped.progress_unfilled.bg, Some(theme::PROGRESS_DIALOG_BG));
-        assert_eq!(mapped.progress_percent.fg, Some(theme::PROGRESS_DIALOG_PERCENT));
-        assert_eq!(mapped.progress_percent.bg, Some(theme::PROGRESS_DIALOG_BG));
+        assert_eq!(mapped.progress_filled.fg, Some(theme.progress_dialog_bar_filled));
+        assert_eq!(mapped.progress_filled.bg, Some(theme.progress_dialog_bg));
+        assert_eq!(mapped.progress_unfilled.fg, Some(theme.progress_dialog_bar_unfilled));
+        assert_eq!(mapped.progress_unfilled.bg, Some(theme.progress_dialog_bg));
+        assert_eq!(mapped.progress_percent.fg, Some(theme.progress_dialog_percent));
+        assert_eq!(mapped.progress_percent.bg, Some(theme.progress_dialog_bg));
 
-        assert_eq!(mapped.progress_button.fg, Some(theme::PROGRESS_DIALOG_BUTTON_FG));
-        assert_eq!(mapped.progress_button.bg, Some(theme::PROGRESS_DIALOG_BUTTON_BG));
-        assert_eq!(mapped.progress_destructive.fg, Some(theme::PROGRESS_DIALOG_ABORT_FG));
-        assert_eq!(mapped.progress_destructive.bg, Some(theme::PROGRESS_DIALOG_ABORT_BG));
+        assert_eq!(mapped.progress_button.fg, Some(theme.progress_dialog_button_fg));
+        assert_eq!(mapped.progress_button.bg, Some(theme.progress_dialog_button_bg));
+        assert_eq!(mapped.progress_destructive.fg, Some(theme.progress_dialog_abort_fg));
+        assert_eq!(mapped.progress_destructive.bg, Some(theme.progress_dialog_abort_bg));
+    }
+
+    #[test]
+    fn file_picker_theme_mapping_is_locked_for_dark_and_light_themes() {
+        for slug in ["tokyo-night", "catppuccin-latte"] {
+            let (theme, mapped) = picker_theme(slug);
+            assert_eq!(mapped.border.fg, Some(theme.cyan), "border fg for {slug}");
+            assert_eq!(mapped.border_dim.fg, Some(theme.border_dim), "dim border fg for {slug}");
+            assert_eq!(mapped.title.fg, Some(theme.text_bright), "title fg for {slug}");
+            assert!(mapped.title.add_modifier.contains(ratatui::style::Modifier::BOLD), "title must be bold for {slug}");
+            assert_eq!(mapped.text.fg, Some(theme.text), "text fg for {slug}");
+            assert_eq!(mapped.text_dim.fg, Some(theme.text_muted), "dim text fg for {slug}");
+            assert_eq!(mapped.folder.fg, Some(theme.amber), "folder fg for {slug}");
+            assert_eq!(mapped.current_file.fg, Some(theme.cyan), "current file fg for {slug}");
+            assert_eq!(mapped.selected.bg, Some(theme.cyan), "selected bg for {slug}");
+            assert_eq!(mapped.selected.fg, Some(theme.bg), "selected fg for {slug}");
+            assert_eq!(mapped.progress_dialog.bg, Some(theme.progress_dialog_bg), "progress bg for {slug}");
+            assert_eq!(mapped.progress_button.fg, Some(theme.progress_dialog_button_fg), "button fg for {slug}");
+            assert_eq!(mapped.progress_button.bg, Some(theme.progress_dialog_button_bg), "button bg for {slug}");
+            assert_eq!(mapped.progress_destructive.fg, Some(theme.progress_dialog_abort_fg), "abort fg for {slug}");
+            assert_eq!(mapped.progress_destructive.bg, Some(theme.progress_dialog_abort_bg), "abort bg for {slug}");
+            assert_eq!(mapped.destructive.bg, Some(theme.destructive), "destructive bg for {slug}");
+            assert_eq!(mapped.error.fg, Some(theme.error), "error fg for {slug}");
+        }
+    }
+
+    #[test]
+    fn already_open_file_picker_can_be_rethemed_in_place() {
+        use tui_file_picker::{FilePickerConfig, FilePickerState};
+
+        let (initial_theme, initial_picker_theme) = picker_theme("tokyo-night");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: dir.path().to_path_buf(),
+            theme: initial_picker_theme,
+            ..FilePickerConfig::default()
+        });
+        assert_eq!(picker.theme().selected.bg, Some(initial_theme.cyan));
+
+        let (next_theme, next_picker_theme) = picker_theme("catppuccin-latte");
+        picker.set_theme(next_picker_theme);
+
+        assert_eq!(picker.theme().selected.bg, Some(next_theme.cyan));
+        assert_eq!(picker.theme().selected.fg, Some(next_theme.bg));
+        assert_eq!(picker.theme().progress_dialog.bg, Some(next_theme.progress_dialog_bg));
+    }
+
+    #[test]
+    fn already_open_file_task_progress_can_be_rethemed_in_place() {
+        use tui_file_picker::{FileTaskKind, FileTaskProgressState};
+
+        let (initial_theme, initial_picker_theme) = picker_theme("tokyo-night");
+        let mut progress = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            initial_picker_theme,
+        );
+        assert_eq!(progress.theme().progress_dialog.bg, Some(initial_theme.progress_dialog_bg));
+
+        let (next_theme, next_picker_theme) = picker_theme("rose-pine-dawn");
+        progress.set_theme(next_picker_theme);
+
+        assert_eq!(progress.theme().progress_dialog.bg, Some(next_theme.progress_dialog_bg));
+        assert_eq!(progress.theme().progress_button.fg, Some(next_theme.progress_dialog_button_fg));
+        assert_eq!(progress.theme().progress_destructive.bg, Some(next_theme.progress_dialog_abort_bg));
+    }
+
+
+
+    #[test]
+    fn tonepoet_file_picker_theme_mapping_has_no_global_theme_helper() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/keybindings.rs"))
+            .expect("keybindings source");
+        let forbidden = ["file_picker_theme", "from_tonepoet_theme"].join("_");
+        assert!(
+            !source.contains(&forbidden),
+            "file picker themes must be derived from AppState.theme, not a global active theme helper"
+        );
+    }
+
+    #[test]
+    fn reusable_file_picker_crate_does_not_consult_tonepoet_theme_globals() {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/tui-file-picker/src");
+        for entry in std::fs::read_dir(crate_dir).expect("picker crate src") {
+            let entry = entry.expect("dir entry");
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(entry.path()).expect("rust source");
+            assert!(
+                !source.contains(concat!("theme", "::", "active")) && !source.contains(concat!("crate", "::", "tui", "::", "theme")),
+                "reusable file-picker crate must remain Tonepoet-theme agnostic: {:?}",
+                entry.path()
+            );
+        }
+    }
+
+    #[test]
+    fn config_screen_theme_key_cycles_theme_and_marks_frame_dirty() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{AppScreen, AppState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-keybindings-theme-test");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.config.ui.theme = "tokyo-night".to_string();
+        app.theme = theme::theme_by_slug("tokyo-night").expect("tokyo night");
+        app.force_redraw = false;
+
+        handle_config_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.config.ui.theme, "gruvbox");
+        assert_eq!(app.theme.slug, "gruvbox");
+        assert!(app.force_redraw, "theme interaction must force immediate redraw");
+    }
+
+    #[test]
+    fn config_screen_focus_is_explicit_and_cycles_through_all_panes() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{AppScreen, AppState, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        assert_eq!(app.config_focus, ConfigFocus::Appearance);
+        assert!(!app.keychain.focused);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.config_focus, ConfigFocus::Conversion);
+        assert!(!app.keychain.focused);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.config_focus, ConfigFocus::Keychain);
+        assert!(app.keychain.focused);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.config_focus, ConfigFocus::Conversion);
+        assert!(!app.keychain.focused);
+
+        app.set_config_focus(ConfigFocus::Keychain);
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.config_focus, ConfigFocus::Appearance);
+        assert!(!app.keychain.focused);
+    }
+
+    #[test]
+    fn config_theme_keys_only_apply_when_appearance_pane_has_focus() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{AppScreen, AppState, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-keybindings-theme-test");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.config.ui.theme = "tokyo-night".to_string();
+        app.theme = theme::theme_by_slug("tokyo-night").expect("tokyo night");
+
+        app.set_config_focus(ConfigFocus::Conversion);
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.config.ui.theme, "tokyo-night");
+        assert_eq!(app.theme.slug, "tokyo-night");
+
+        app.set_config_focus(ConfigFocus::Keychain);
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.config.ui.theme, "tokyo-night");
+        assert_eq!(app.theme.slug, "tokyo-night");
+
+        app.set_config_focus(ConfigFocus::Appearance);
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.config.ui.theme, "gruvbox");
+        assert_eq!(app.theme.slug, "gruvbox");
+    }
+
+    #[test]
+    fn config_shift_tab_moves_focus_backward_for_crossterm_backtab_variants() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{AppScreen, AppState, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.set_config_focus(ConfigFocus::Conversion);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.config_focus, ConfigFocus::Appearance);
+
+        app.set_config_focus(ConfigFocus::Appearance);
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.config_focus, ConfigFocus::Keychain);
+    }
+
+    #[test]
+    fn config_key_handling_does_not_use_keychain_focus_as_theme_proxy() {
+        let keybindings = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/keybindings.rs"),
+        )
+        .expect("keybindings source");
+        let keybindings_runtime = keybindings.split("#[cfg(test)]").next().unwrap_or(&keybindings);
+        let draw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/draw.rs"),
+        )
+        .expect("draw source");
+        let draw_runtime = draw.split("#[cfg(test)]").next().unwrap_or(&draw);
+
+        for source in [keybindings_runtime, draw_runtime] {
+            assert!(
+                !source.contains("!app.keychain.focused"),
+                "Config appearance focus must not be inferred from not-keychain-focused"
+            );
+            assert!(
+                !source.contains("app.keychain.focused == false"),
+                "Config appearance focus must not be inferred from not-keychain-focused"
+            );
+        }
     }
 
     #[test]
@@ -3672,10 +3911,11 @@ mod progress_dialog_theme_tests {
             FileTaskScope, ProgressItem, ProgressTotals, ProgressUnit,
         };
 
+        let tonepoet_theme = theme::theme_by_slug("tokyo-night").expect("theme");
         let mut progress = FileTaskProgressState::new(
             FileTaskKind::Copy,
             "Copying files",
-            file_picker_theme_from_tonepoet_theme(),
+            file_picker_theme_from_theme(&tonepoet_theme),
         );
         progress.set_scope(FileTaskScope {
             source_root: Some(PathBuf::from("~/Documents/Audio")),
@@ -3726,19 +3966,19 @@ mod progress_dialog_theme_tests {
             assert_eq!(cell.bg, bg, "unexpected bg at ({x},{y})");
         };
 
-        assert_cell(0, 0, theme::PROGRESS_DIALOG_BORDER, theme::PROGRESS_DIALOG_BG);
-        assert_cell(3, 0, theme::PROGRESS_DIALOG_TITLE, theme::PROGRESS_DIALOG_BG);
-        assert_cell(3, 1, theme::PROGRESS_DIALOG_LABEL, theme::PROGRESS_DIALOG_BG);
-        assert_cell(10, 1, theme::PROGRESS_DIALOG_TEXT, theme::PROGRESS_DIALOG_BG);
-        assert_cell(4, 4, theme::PROGRESS_DIALOG_DIM, theme::PROGRESS_DIALOG_BG);
-        assert_cell(5, 4, theme::PROGRESS_DIALOG_CURRENT_FILE, theme::PROGRESS_DIALOG_BG);
-        assert_cell(4, 5, theme::PROGRESS_DIALOG_BAR_FILLED, theme::PROGRESS_DIALOG_BG);
-        assert_cell(29, 5, theme::PROGRESS_DIALOG_BAR_UNFILLED, theme::PROGRESS_DIALOG_BG);
-        assert_cell(47, 5, theme::PROGRESS_DIALOG_PERCENT, theme::PROGRESS_DIALOG_BG);
-        assert_cell(3, 8, theme::PROGRESS_DIALOG_DIM, theme::PROGRESS_DIALOG_BG);
-        assert_cell(10, 10, theme::PROGRESS_DIALOG_BUTTON_FG, theme::PROGRESS_DIALOG_BUTTON_BG);
-        assert_cell(33, 10, theme::PROGRESS_DIALOG_ABORT_FG, theme::PROGRESS_DIALOG_ABORT_BG);
-        assert_cell(1, 3, theme::PROGRESS_DIALOG_TEXT, theme::PROGRESS_DIALOG_BG);
+        assert_cell(0, 0, tonepoet_theme.progress_dialog_border, tonepoet_theme.progress_dialog_bg);
+        assert_cell(3, 0, tonepoet_theme.progress_dialog_title, tonepoet_theme.progress_dialog_bg);
+        assert_cell(3, 1, tonepoet_theme.progress_dialog_label, tonepoet_theme.progress_dialog_bg);
+        assert_cell(10, 1, tonepoet_theme.progress_dialog_text, tonepoet_theme.progress_dialog_bg);
+        assert_cell(4, 4, tonepoet_theme.progress_dialog_dim, tonepoet_theme.progress_dialog_bg);
+        assert_cell(5, 4, tonepoet_theme.progress_dialog_current_file, tonepoet_theme.progress_dialog_bg);
+        assert_cell(4, 5, tonepoet_theme.progress_dialog_bar_filled, tonepoet_theme.progress_dialog_bg);
+        assert_cell(29, 5, tonepoet_theme.progress_dialog_bar_unfilled, tonepoet_theme.progress_dialog_bg);
+        assert_cell(47, 5, tonepoet_theme.progress_dialog_percent, tonepoet_theme.progress_dialog_bg);
+        assert_cell(3, 8, tonepoet_theme.progress_dialog_dim, tonepoet_theme.progress_dialog_bg);
+        assert_cell(10, 10, tonepoet_theme.progress_dialog_button_fg, tonepoet_theme.progress_dialog_button_bg);
+        assert_cell(33, 10, tonepoet_theme.progress_dialog_abort_fg, tonepoet_theme.progress_dialog_abort_bg);
+        assert_cell(1, 3, tonepoet_theme.progress_dialog_text, tonepoet_theme.progress_dialog_bg);
     }
 }
 
@@ -14167,7 +14407,7 @@ fn do_file_op(
     let mut progress = tui_file_picker::FileTaskProgressState::new(
         kind,
         title,
-        file_picker_theme_from_tonepoet_theme(),
+        file_picker_theme_from_theme(&app.theme),
     );
     progress.set_scope(file_task_scope_for_job(sources, std::path::Path::new(dest.trim())));
     let session = super::app::FileTaskProgressSession::new(progress, control_tx);

@@ -9,10 +9,9 @@ use ratatui::{
 };
 
 use super::app::PresetState;
-use super::theme;
 
 /// Draw the preset overlay (floating panel, bottom-right)
-pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
+pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState, theme: super::theme::Theme) {
     let area = f.size();
     let width: u16 = 36;
     let list_height = preset.overlay_list.len() as u16;
@@ -26,11 +25,11 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::TEXT_DIM))
+        .border_style(Style::default().fg(theme.text_dim))
         .title(Span::styled(
             " PRESETS ",
             Style::default()
-                .fg(theme::TEXT_MUTED)
+                .fg(theme.text_muted)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay_area);
@@ -42,21 +41,21 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
     if let Some(input) = &preset.naming_input {
         lines.push(Line::from(Span::styled(
             "save as:",
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme.text_muted),
         )));
         // Scrolled view: leave 2 cols for leading/trailing space
         let visible_width = (inner.width as usize).saturating_sub(2);
         let (view, cursor_col) = input.view(visible_width);
         lines.push(Line::from(vec![Span::styled(
             format!(" {} ", view),
-            Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE),
+            Style::default().fg(theme.text_bright).bg(theme.surface),
         )]));
         use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            pill("Enter save", theme::GREEN),
+            pill("Enter save", theme.green, theme),
             gap(),
-            pill("Esc cancel", theme::PURPLE),
+            pill("Esc cancel", theme.purple, theme),
         ]));
 
         let p = Paragraph::new(lines);
@@ -70,14 +69,14 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
     // Section label
     lines.push(Line::from(Span::styled(
         "saved presets",
-        Style::default().fg(theme::TEXT_MUTED),
+        Style::default().fg(theme.text_muted),
     )));
 
     // Preset list
     if preset.overlay_list.is_empty() {
         lines.push(Line::from(Span::styled(
             " (none)",
-            Style::default().fg(theme::TEXT_DIM),
+            Style::default().fg(theme.text_dim),
         )));
     } else {
         for (i, name) in preset.overlay_list.iter().enumerate() {
@@ -90,23 +89,23 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
                 Span::styled(
                     marker,
                     if is_selected {
-                        Style::default().fg(theme::BLUE)
+                        Style::default().fg(theme.blue)
                     } else {
-                        Style::default().fg(theme::TEXT_DIM)
+                        Style::default().fg(theme.text_dim)
                     },
                 ),
                 Span::styled(
                     name.clone(),
                     if is_selected {
-                        Style::default().fg(theme::TEXT_BRIGHT)
+                        Style::default().fg(theme.text_bright)
                     } else {
-                        Style::default().fg(theme::TEXT)
+                        Style::default().fg(theme.text)
                     },
                 ),
             ];
 
             if is_active {
-                spans.push(Span::styled(" active", Style::default().fg(theme::CYAN)));
+                spans.push(Span::styled(" active", Style::default().fg(theme.cyan)));
             }
 
             lines.push(Line::from(spans));
@@ -116,19 +115,19 @@ pub fn draw_presets_overlay(f: &mut Frame, preset: &PresetState) {
     // Separator
     lines.push(Line::from(Span::styled(
         "─".repeat(inner.width as usize),
-        Style::default().fg(theme::BORDER_DIM),
+        Style::default().fg(theme.border_dim),
     )));
 
     // Action pills
     use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
     lines.push(Line::from(vec![
-        pill("n new", theme::GREEN),
+        pill("n new", theme.green, theme),
         gap(),
-        pill("d dup", theme::AMBER),
+        pill("d dup", theme.amber, theme),
         gap(),
-        pill("x del", theme::RED),
+        pill("x del", theme.destructive, theme),
         gap(),
-        pill("Esc close", theme::PURPLE),
+        pill("Esc close", theme.purple, theme),
     ]));
 
     let p = Paragraph::new(lines);

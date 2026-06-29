@@ -648,6 +648,22 @@ impl FilePickerState {
         self.show_preview
     }
 
+    /// Return the concrete theme currently used by this picker instance.
+    pub fn theme(&self) -> &FilePickerTheme {
+        &self.theme
+    }
+
+    /// Replace the concrete theme used by this already-open picker.
+    ///
+    /// Hosts that support runtime theme changes must call this for every
+    /// retained picker session after re-deriving their application theme. New
+    /// pickers receive the theme through [`FilePickerConfig`], but open pickers
+    /// keep their own copy so in-flight UI state is not coupled to global host
+    /// state.
+    pub fn set_theme(&mut self, theme: FilePickerTheme) {
+        self.theme = theme;
+    }
+
     pub fn conflict_policy(&self) -> Option<ConflictPolicyPreset> {
         self.conflict_policy
     }

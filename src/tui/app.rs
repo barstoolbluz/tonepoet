@@ -2969,6 +2969,10 @@ impl FileTaskProgressSession {
             controls,
         }
     }
+
+    pub fn set_theme(&mut self, theme: tui_file_picker::FilePickerTheme) {
+        self.progress.set_theme(theme);
+    }
 }
 
 /// Tonepoet-specific purpose for a reusable file-picker session.
@@ -3032,6 +3036,10 @@ impl MetadataFilePickerState {
 
     pub fn current_dir(&self) -> &std::path::Path {
         self.picker.current_dir()
+    }
+
+    pub fn set_theme(&mut self, theme: tui_file_picker::FilePickerTheme) {
+        self.picker.set_theme(theme);
     }
 }
 
@@ -5814,6 +5822,46 @@ pub enum TextEditTarget {
     ArchivePassword(std::path::PathBuf),
 }
 
+
+/// Explicit focus target for the Config screen.
+///
+/// Keep this separate from `KeychainState`: password-list state should not also
+/// decide whether unrelated Appearance or Conversion controls receive input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFocus {
+    Appearance,
+    Conversion,
+    Keychain,
+}
+
+impl Default for ConfigFocus {
+    fn default() -> Self {
+        Self::Appearance
+    }
+}
+
+impl ConfigFocus {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Appearance => Self::Conversion,
+            Self::Conversion => Self::Keychain,
+            Self::Keychain => Self::Appearance,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Appearance => Self::Keychain,
+            Self::Conversion => Self::Appearance,
+            Self::Keychain => Self::Conversion,
+        }
+    }
+
+    pub fn keychain_focused(self) -> bool {
+        matches!(self, Self::Keychain)
+    }
+}
+
 /// State for the password keychain section on the Config screen.
 #[derive(Debug, Clone)]
 pub struct KeychainState {
@@ -5823,7 +5871,9 @@ pub struct KeychainState {
     pub selected: usize,
     /// Whether passwords are shown in cleartext or masked.
     pub reveal: bool,
-    /// Whether the keychain section is focused (vs the settings section).
+    /// Deprecated compatibility mirror for older tests/helpers.
+    ///
+    /// `AppState::config_focus` is the source of truth for Config-screen focus.
     pub focused: bool,
     /// Whether passwords have been loaded from disk.
     pub loaded: bool,
@@ -5934,6 +5984,10 @@ pub struct PendingCtdbRepair {
 /// Main application state
 pub struct AppState {
     pub config: TonepoetConfig,
+    /// Resolved runtime TUI theme. Config stores only the slug; render-time
+    /// ownership lives here so tests and future renderers do not need to
+    /// consult process-global theme state.
+    pub theme: crate::tui::theme::Theme,
     pub manager: ConversionManager,
     pub db: crate::db::Database,
 
@@ -6069,6 +6123,9 @@ pub struct AppState {
 
     /// Bookmarks list + overlay state (persisted to ~/.config/tonepoet/bookmarks.toml).
     pub bookmarks: crate::tui::bookmarks::BookmarksState,
+
+    /// Focus target on the Config screen.
+    pub config_focus: ConfigFocus,
 
     /// Password keychain state for the Config screen.
     pub keychain: KeychainState,
@@ -6254,6 +6311,25 @@ const KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
 impl AppState {
     pub fn new(config: TonepoetConfig) -> Self {
+        let mut config = config;
+        let configured_theme_slug = config.ui.theme.clone();
+        let (theme, theme_startup_status) = match crate::tui::theme::theme_by_slug(&configured_theme_slug) {
+            Some(theme) => {
+                config.ui.theme = theme.slug.to_string();
+                (theme, None)
+            }
+            None => {
+                let fallback = crate::tui::theme::theme_by_slug_or_default(&configured_theme_slug);
+                config.ui.theme = fallback.slug.to_string();
+                (
+                    fallback,
+                    Some(format!(
+                        "Unknown configured theme '{}'; using {}",
+                        configured_theme_slug, fallback.name
+                    )),
+                )
+            }
+        };
         // Open the SQLite database FIRST — needed for queue load + other init.
         let db = match crate::db::Database::open() {
             Ok(db) => {
@@ -6306,6 +6382,7 @@ impl AppState {
 
         Self {
             config,
+            theme,
             manager,
             db,
             current_screen: initial_screen,
@@ -6336,7 +6413,7 @@ impl AppState {
             pending_metadata_editor: None,
             pending_cue_preview: None,
             pending_mb_select: None,
-            status_message: None,
+            status_message: theme_startup_status.map(|message| (message, std::time::Instant::now())),
             processing_active: false,
             should_quit: false,
             force_redraw: false,
@@ -6348,6 +6425,7 @@ impl AppState {
             pending_browse_rename: None,
             recent,
             bookmarks,
+            config_focus: ConfigFocus::default(),
             keychain: KeychainState::default(),
             archive_passwords: std::collections::HashMap::new(),
             last_artwork_picker_dir: None,
@@ -6369,6 +6447,80 @@ impl AppState {
             compare_pending: 0,
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
+    }
+
+    pub fn set_config_focus(&mut self, focus: ConfigFocus) {
+        self.config_focus = focus;
+        self.keychain.focused = focus.keychain_focused();
+    }
+
+    pub fn cycle_config_focus(&mut self, forward: bool) {
+        let next = if forward {
+            self.config_focus.next()
+        } else {
+            self.config_focus.previous()
+        };
+        self.set_config_focus(next);
+    }
+
+    pub fn set_ui_theme(&mut self, theme_slug: &str) {
+        let Some(palette) = crate::tui::theme::palette_by_slug(theme_slug) else {
+            self.set_status(format!("Unknown theme: {}", theme_slug));
+            return;
+        };
+        let next_theme = crate::tui::theme::Theme::from_palette(palette);
+
+        self.theme = next_theme;
+        self.config.ui.theme = palette.slug.to_string();
+        self.retheme_open_file_picker_surfaces();
+        if let Err(err) = self.config.save() {
+            self.set_status(format!("Theme changed, but config save failed: {}", err));
+        } else {
+            self.set_status(format!("Theme: {}", palette.name));
+        }
+        self.force_redraw = true;
+    }
+
+    /// Re-derive concrete file-picker/progress-dialog themes for retained
+    /// picker-owned state after the Tonepoet theme changes.
+    ///
+    /// New picker sessions receive `AppState::theme` through construction, but
+    /// open picker and progress sessions intentionally own concrete
+    /// `FilePickerTheme` values. Retint them in place so Config-screen theme
+    /// changes apply immediately to already-open overlays as well as future
+    /// ones.
+    pub fn retheme_open_file_picker_surfaces(&mut self) {
+        let picker_theme = crate::tui::keybindings::file_picker_theme_from_theme(&self.theme);
+
+        match &mut self.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                if let Some(file_picker) = state.file_picker.as_mut() {
+                    file_picker.set_theme(picker_theme.clone());
+                }
+            }
+            ActiveOverlay::FilePicker(session) => {
+                session.set_theme(picker_theme.clone());
+            }
+            ActiveOverlay::FileTaskProgress(session) => {
+                session.set_theme(picker_theme.clone());
+            }
+            _ => {}
+        }
+
+        if let Some(state) = self.pending_metadata_editor.as_mut() {
+            if let Some(file_picker) = state.file_picker.as_mut() {
+                file_picker.set_theme(picker_theme);
+            }
+        }
+    }
+
+    pub fn cycle_ui_theme(&mut self, forward: bool) {
+        let slug = if forward {
+            crate::tui::theme::next_palette_slug(self.theme.slug)
+        } else {
+            crate::tui::theme::previous_palette_slug(self.theme.slug)
+        };
+        self.set_ui_theme(slug);
     }
 
     /// Refresh terminal graphics protocol detection after a terminal resize.
@@ -9954,5 +10106,187 @@ mod terminal_image_protocol_environment_tests {
             picker.protocol_type,
             ratatui_image::picker::ProtocolType::Halfblocks
         );
+    }
+}
+
+#[cfg(test)]
+mod app_state_theme_ownership_tests {
+    use super::*;
+    use crate::tui::test_support::XdgConfigHomeGuard;
+
+    fn isolated_config_home() -> XdgConfigHomeGuard {
+        XdgConfigHomeGuard::new("tonepoet-app-theme-test")
+    }
+
+    fn config_with_theme(slug: &str) -> TonepoetConfig {
+        let mut config = TonepoetConfig::default();
+        config.conversion.persist_queue = false;
+        config.ui.theme = slug.to_string();
+        config
+    }
+
+    #[test]
+    fn app_state_new_resolves_configured_theme() {
+        let _home = isolated_config_home();
+
+        let app = AppState::new(config_with_theme("rose-pine-dawn"));
+
+        assert_eq!(app.theme.slug, "rose-pine-dawn");
+        assert_eq!(app.config.ui.theme, "rose-pine-dawn");
+    }
+
+    #[test]
+    fn unknown_theme_slug_falls_back_at_startup_and_canonicalizes_config() {
+        let _home = isolated_config_home();
+
+        let app = AppState::new(config_with_theme("not-a-theme"));
+
+        assert_eq!(app.theme.slug, crate::tui::theme::default_theme_slug());
+        assert_eq!(app.config.ui.theme, crate::tui::theme::default_theme_slug());
+        assert!(app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.contains("Unknown configured theme"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn set_ui_theme_updates_runtime_theme_and_config_slug_together() {
+        let home = isolated_config_home();
+        let mut app = AppState::new(config_with_theme("tokyo-night"));
+
+        app.set_ui_theme("kanagawa-lotus");
+
+        assert_eq!(app.theme.slug, "kanagawa-lotus");
+        assert_eq!(app.config.ui.theme, "kanagawa-lotus");
+        assert!(app.force_redraw);
+
+        let persisted = std::fs::read_to_string(home.path().join("tonepoet/config.toml"))
+            .expect("persisted config");
+        assert!(persisted.contains("theme = \"kanagawa-lotus\""));
+    }
+
+    #[test]
+    fn set_ui_theme_rejects_unknown_slugs_without_mutating_theme_or_config() {
+        let _home = isolated_config_home();
+        let mut app = AppState::new(config_with_theme("catppuccin"));
+        app.force_redraw = false;
+
+        app.set_ui_theme("not-a-theme");
+
+        assert_eq!(app.theme.slug, "catppuccin");
+        assert_eq!(app.config.ui.theme, "catppuccin");
+        assert!(!app.force_redraw);
+        assert!(app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.contains("Unknown theme"))
+            .unwrap_or(false));
+    }
+
+
+
+    #[test]
+    fn unknown_theme_slug_is_not_persisted_through_ui_actions() {
+        let home = isolated_config_home();
+        let mut app = AppState::new(config_with_theme("tokyo-night"));
+
+        app.set_ui_theme("gruvbox");
+        let before = std::fs::read_to_string(home.path().join("tonepoet/config.toml"))
+            .expect("persisted config after valid theme");
+        assert!(before.contains("theme = \"gruvbox\""));
+
+        app.force_redraw = false;
+        app.set_ui_theme("not-a-theme");
+
+        assert_eq!(app.theme.slug, "gruvbox");
+        assert_eq!(app.config.ui.theme, "gruvbox");
+        assert!(!app.force_redraw);
+        let after = std::fs::read_to_string(home.path().join("tonepoet/config.toml"))
+            .expect("persisted config after invalid theme");
+        assert_eq!(after, before, "invalid theme slugs must not be written as valid UI choices");
+    }
+
+    #[test]
+    fn set_ui_theme_rethemes_existing_active_file_picker() {
+        let _home = isolated_config_home();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut app = AppState::new(config_with_theme("tokyo-night"));
+        let initial_picker_theme = crate::tui::keybindings::file_picker_theme_from_theme(&app.theme);
+        let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            theme: initial_picker_theme.clone(),
+            ..tui_file_picker::FilePickerConfig::default()
+        });
+        app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+            FilePickerPurpose::Generic { id: "theme-test".to_string() },
+            picker,
+        ));
+
+        app.set_ui_theme("catppuccin-latte");
+
+        match &app.active_overlay {
+            ActiveOverlay::FilePicker(session) => {
+                assert_ne!(session.picker.theme().selected.bg, initial_picker_theme.selected.bg);
+                assert_eq!(session.picker.theme().selected.bg, Some(app.theme.cyan));
+                assert_eq!(session.picker.theme().selected.fg, Some(app.theme.bg));
+                assert_eq!(session.picker.theme().progress_dialog.bg, Some(app.theme.progress_dialog_bg));
+            }
+            other => panic!("expected active file picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_ui_theme_rethemes_existing_active_file_task_progress() {
+        let _home = isolated_config_home();
+        let mut app = AppState::new(config_with_theme("tokyo-night"));
+        let initial_picker_theme = crate::tui::keybindings::file_picker_theme_from_theme(&app.theme);
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            initial_picker_theme.clone(),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        app.active_overlay = ActiveOverlay::FileTaskProgress(FileTaskProgressSession::new(progress, control_tx));
+
+        app.set_ui_theme("rose-pine-dawn");
+
+        match &app.active_overlay {
+            ActiveOverlay::FileTaskProgress(session) => {
+                assert_ne!(session.progress.theme().progress_dialog.bg, initial_picker_theme.progress_dialog.bg);
+                assert_eq!(session.progress.theme().progress_dialog.bg, Some(app.theme.progress_dialog_bg));
+                assert_eq!(session.progress.theme().progress_button.fg, Some(app.theme.progress_dialog_button_fg));
+                assert_eq!(session.progress.theme().progress_destructive.bg, Some(app.theme.progress_dialog_abort_bg));
+            }
+            other => panic!("expected active file-task progress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_file_picker_after_set_ui_theme_uses_app_theme() {
+        let _home = isolated_config_home();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut app = AppState::new(config_with_theme("tokyo-night"));
+
+        app.set_ui_theme("kanagawa-lotus");
+        let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            theme: crate::tui::keybindings::file_picker_theme_from_theme(&app.theme),
+            ..tui_file_picker::FilePickerConfig::default()
+        });
+
+        assert_eq!(picker.theme().selected.bg, Some(app.theme.cyan));
+        assert_eq!(picker.theme().selected.fg, Some(app.theme.bg));
+        assert_eq!(picker.theme().progress_dialog.bg, Some(app.theme.progress_dialog_bg));
+    }
+
+    #[test]
+    fn tokyo_night_remains_the_default_runtime_theme() {
+        let _home = isolated_config_home();
+
+        let app = AppState::new(TonepoetConfig::default());
+
+        assert_eq!(app.config.ui.theme, crate::tui::theme::default_theme_slug());
+        assert_eq!(app.theme.slug, crate::tui::theme::default_theme_slug());
     }
 }

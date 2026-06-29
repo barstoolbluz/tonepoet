@@ -12,12 +12,11 @@ use ratatui::{
 };
 
 use super::app::AppState;
-use super::theme;
 
 /// Draw a 1-row strip showing persistent queue conversion stats.
 /// Transient `status_message` content is intentionally NOT rendered here —
 /// it belongs in the footer context bar so every screen can display it.
-pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState) {
+pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState, theme: super::theme::Theme) {
     let items = &app.items_snapshot;
 
     let total = items.len();
@@ -50,32 +49,32 @@ pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState) {
     if total > 0 {
         spans.push(Span::styled(
             format!("{}/{} completed", completed, total),
-            Style::default().fg(theme::GREEN),
+            Style::default().fg(theme.green),
         ));
         if failed > 0 {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(
                 format!("{} failed", failed),
-                Style::default().fg(theme::RED),
+                Style::default().fg(theme.destructive),
             ));
         }
         if processing > 0 {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(
                 format!("{} processing", processing),
-                Style::default().fg(theme::CYAN),
+                Style::default().fg(theme.cyan),
             ));
         }
         if queued > 0 {
             spans.push(Span::raw(" | "));
-            spans.push(Span::styled(format!("{} queued", queued), theme::bright()));
+            spans.push(Span::styled(format!("{} queued", queued), theme.bright()));
         }
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(format!("{} workers", workers), theme::muted()));
+        spans.push(Span::styled(format!("{} workers", workers), theme.muted()));
     } else {
         spans.push(Span::styled(
             "empty queue — press a to add files",
-            theme::muted(),
+            theme.muted(),
         ));
     }
 
@@ -85,7 +84,7 @@ pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState) {
             spans.push(Span::styled(
                 "PAUSED",
                 Style::default()
-                    .fg(theme::AMBER)
+                    .fg(theme.amber)
                     .add_modifier(Modifier::BOLD),
             ));
         } else {
@@ -93,7 +92,7 @@ pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState) {
             spans.push(Span::styled(
                 "CONVERTING",
                 Style::default()
-                    .fg(theme::GREEN)
+                    .fg(theme.green)
                     .add_modifier(Modifier::BOLD),
             ));
         }

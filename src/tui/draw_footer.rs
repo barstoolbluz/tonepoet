@@ -10,7 +10,6 @@ use ratatui::{
 
 use super::app::AppScreen;
 use super::button_map::{ButtonRenderMap, TuiButton};
-use super::theme;
 
 /// Draw both footer rows (tabs + context bar) into a 2-line area.
 /// Also registers clickable regions for the tab bar into `buttons`.
@@ -21,6 +20,7 @@ pub fn draw_footer(
     current_screen: AppScreen,
     buttons: &mut ButtonRenderMap,
     status_message: Option<&str>,
+    theme: super::theme::Theme,
 ) {
     if area.height < 2 {
         return;
@@ -31,12 +31,12 @@ pub fn draw_footer(
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
-    draw_tab_bar(f, chunks[0], current_screen, buttons);
-    draw_context_bar(f, chunks[1], current_screen, status_message);
+    draw_tab_bar(f, chunks[0], current_screen, buttons, theme);
+    draw_context_bar(f, chunks[1], current_screen, status_message, theme);
 }
 
 /// Draw the numbered tab bar: 1 convert | 2 browse | 3 library | 4 queue | 5 config
-fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen, buttons: &mut ButtonRenderMap) {
+fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen, buttons: &mut ButtonRenderMap, theme: super::theme::Theme) {
     let tabs = AppScreen::tabs();
     let tab_width = area.width as usize / tabs.len();
 
@@ -57,23 +57,23 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen, buttons: &mut But
         let is_active = *tab == current;
 
         if i > 0 {
-            spans.push(Span::styled("│", Style::default().fg(theme::BORDER_DIM)));
+            spans.push(Span::styled("│", Style::default().fg(theme.border_dim)));
         }
 
         // Key badge
         let key_style = if is_active {
             Style::default()
-                .fg(theme::BG)
-                .bg(theme::BLUE)
+                .fg(theme.bg)
+                .bg(theme.blue)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::TEXT_MUTED).bg(theme::BORDER_DIM)
+            Style::default().fg(theme.tab_inactive).bg(theme.border_dim)
         };
 
         let label_style = if is_active {
-            Style::default().fg(theme::TEXT_BRIGHT)
+            Style::default().fg(theme.text_bright)
         } else {
-            Style::default().fg(theme::TEXT_MUTED)
+            Style::default().fg(theme.tab_inactive)
         };
 
         // Pad to distribute evenly
@@ -88,13 +88,13 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen, buttons: &mut But
         spans.push(Span::raw(" ".repeat(pad_right)));
     }
 
-    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::SURFACE));
+    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface));
     f.render_widget(bar, area);
 }
 
 /// Draw the context-sensitive keybinding bar.
 /// If `status_message` is Some, render the message in amber instead of keybinding hints.
-fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_message: Option<&str>) {
+fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_message: Option<&str>, theme: super::theme::Theme) {
     // When a transient status message is set, it replaces the hints on this row.
     if let Some(msg) = status_message {
         let max_chars = (area.width as usize).saturating_sub(2);
@@ -107,27 +107,27 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_messag
         let bar = Paragraph::new(Line::from(Span::styled(
             display,
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         )));
         f.render_widget(bar, area);
         return;
     }
 
-    let groups = hint_groups_for(current);
+    let groups = hint_groups_for(current, theme);
     let visible = truncate_groups_to_width(&groups, area.width as usize);
 
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (gi, group) in visible.iter().enumerate() {
         if gi > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(theme::BORDER_DIM)));
+            spans.push(Span::styled(" │ ", Style::default().fg(theme.border_dim)));
         }
         for hint in group {
             spans.push(Span::styled(hint.key, Style::default().fg(hint.color)));
             if !hint.label.is_empty() {
                 spans.push(Span::styled(
                     format!(" {} ", hint.label),
-                    Style::default().fg(theme::TEXT_MUTED),
+                    Style::default().fg(theme.text_muted),
                 ));
             }
         }
@@ -162,38 +162,38 @@ const fn h(
 }
 
 /// Hint groups per screen. Groups are separated by ` │ ` dividers when rendered.
-fn hint_groups_for(current: AppScreen) -> Vec<Vec<Hint>> {
+fn hint_groups_for(current: AppScreen, theme: super::theme::Theme) -> Vec<Vec<Hint>> {
     // Minimal hints: 3-5 essentials per screen + universal `: command │ ? help`.
     // Full keybinding reference available via `?` help overlay.
     let screen_hints = match current {
         AppScreen::Convert => vec![
-            h("tab", "pane", theme::BLUE, 0),
-            h("←→", "select", theme::BLUE, 0),
-            h(":max", "pane", theme::BLUE, 2),
-            h(":commit", "enqueue", theme::GREEN, 0),
+            h("tab", "pane", theme.blue, 0),
+            h("←→", "select", theme.blue, 0),
+            h(":max", "pane", theme.blue, 2),
+            h(":commit", "enqueue", theme.green, 0),
         ],
         AppScreen::Browse => vec![
-            h("↑↓", "navigate", theme::BLUE, 0),
-            h("enter", "open", theme::GREEN, 0),
-            h("space", "select", theme::BLUE, 0),
+            h("↑↓", "navigate", theme.blue, 0),
+            h("enter", "open", theme.green, 0),
+            h("space", "select", theme.blue, 0),
         ],
         AppScreen::Queue => vec![
-            h("↑↓", "navigate", theme::BLUE, 0),
-            h("s", "start", theme::GREEN, 0),
-            h("space", "select", theme::BLUE, 0),
+            h("↑↓", "navigate", theme.blue, 0),
+            h("s", "start", theme.green, 0),
+            h("space", "select", theme.blue, 0),
         ],
         AppScreen::Config => vec![
-            h("tab", "focus", theme::BLUE, 0),
-            h("a", "add", theme::GREEN, 0),
-            h("d", "delete", theme::RED, 0),
+            h("tab", "focus", theme.blue, 0),
+            h("a", "add", theme.green, 0),
+            h("d", "delete", theme.destructive, 0),
         ],
         _ => vec![],
     };
     vec![
         screen_hints,
         vec![
-            h(":", "command", theme::CYAN, 0),
-            h("?", "help", theme::AMBER, 0),
+            h(":", "command", theme.cyan, 0),
+            h("?", "help", theme.amber, 0),
         ],
     ]
 }

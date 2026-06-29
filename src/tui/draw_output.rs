@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -10,7 +10,6 @@ use ratatui::{
 
 use super::app::{FormatField, FormatState, ResamplerChoice, DsdGainMode};
 use super::pill::render_pill_spans;
-use super::theme;
 
 /// Draw the format pane with green border.
 ///
@@ -23,24 +22,25 @@ pub fn draw_format_pane(
     format_state: &FormatState,
     focused: bool,
     maximized: bool,
+    theme: super::theme::Theme,
 ) {
     if area.height < 6 || area.width < 30 {
         return;
     }
 
-    let border_color = if focused { theme::GREEN } else { theme::TEXT_DIM };
+    let border_color = if focused { theme.green } else { theme.text_dim };
     let w = area.width as usize;
     let is_dsd = format_state.is_dsd_selected();
 
-    let top_line = format_title_line(border_color, w, maximized);
+    let top_line = format_title_line(border_color, w, maximized, theme);
 
     let bot_line = Line::from(Span::styled(
         format!("└{}┘", "─".repeat(w.saturating_sub(2))),
-        theme::border(border_color),
+        theme.border(border_color),
     ));
 
     let mut lines = vec![top_line];
-    lines.push(bordered_line(border_color, w, vec![]));
+    lines.push(bordered_line(border_color, w, vec![], theme));
     lines.push(pill_row(
         border_color,
         w,
@@ -48,10 +48,8 @@ pub fn draw_format_pane(
         "",
         &render_pill_spans(
             &format_state.format,
-            focused && format_state.field_focus == FormatField::Format,
-        ),
-        focused && format_state.field_focus == FormatField::Format,
-    ));
+            focused && format_state.field_focus == FormatField::Format, theme),
+        focused && format_state.field_focus == FormatField::Format, theme));
 
     if is_dsd {
         lines.push(pill_row(
@@ -61,17 +59,14 @@ pub fn draw_format_pane(
             "",
             &render_pill_spans(
                 &format_state.sample_rate,
-                focused && format_state.field_focus == FormatField::DsdRate,
-            ),
-            focused && format_state.field_focus == FormatField::DsdRate,
-        ));
+                focused && format_state.field_focus == FormatField::DsdRate, theme),
+            focused && format_state.field_focus == FormatField::DsdRate, theme));
         lines.push(static_row(
             border_color,
             w,
             "bit depth  ",
             "1-bit",
-            focused && format_state.field_focus == FormatField::BitDepth,
-        ));
+            focused && format_state.field_focus == FormatField::BitDepth, theme));
         lines.push(pill_row(
             border_color,
             w,
@@ -79,10 +74,8 @@ pub fn draw_format_pane(
             "",
             &render_pill_spans(
                 &format_state.noise_shaper,
-                focused && format_state.field_focus == FormatField::NoiseShaper,
-            ),
-            focused && format_state.field_focus == FormatField::NoiseShaper,
-        ));
+                focused && format_state.field_focus == FormatField::NoiseShaper, theme),
+            focused && format_state.field_focus == FormatField::NoiseShaper, theme));
         lines.push(pill_row(
             border_color,
             w,
@@ -90,10 +83,8 @@ pub fn draw_format_pane(
             "",
             &render_pill_spans(
                 &format_state.modulator_order,
-                focused && format_state.field_focus == FormatField::ModulatorOrder,
-            ),
-            focused && format_state.field_focus == FormatField::ModulatorOrder,
-        ));
+                focused && format_state.field_focus == FormatField::ModulatorOrder, theme),
+            focused && format_state.field_focus == FormatField::ModulatorOrder, theme));
         lines.push(pill_row(
             border_color,
             w,
@@ -101,10 +92,8 @@ pub fn draw_format_pane(
             "",
             &render_pill_spans(
                 &format_state.conversion_preset,
-                focused && format_state.field_focus == FormatField::ConversionPreset,
-            ),
-            focused && format_state.field_focus == FormatField::ConversionPreset,
-        ));
+                focused && format_state.field_focus == FormatField::ConversionPreset, theme),
+            focused && format_state.field_focus == FormatField::ConversionPreset, theme));
     } else {
         lines.push(pill_row(
             border_color,
@@ -113,10 +102,8 @@ pub fn draw_format_pane(
             "kHz",
             &render_pill_spans(
                 &format_state.sample_rate,
-                focused && format_state.field_focus == FormatField::SampleRate,
-            ),
-            focused && format_state.field_focus == FormatField::SampleRate,
-        ));
+                focused && format_state.field_focus == FormatField::SampleRate, theme),
+            focused && format_state.field_focus == FormatField::SampleRate, theme));
         lines.push(pill_row(
             border_color,
             w,
@@ -124,10 +111,8 @@ pub fn draw_format_pane(
             "bit",
             &render_pill_spans(
                 &format_state.bit_depth,
-                focused && format_state.field_focus == FormatField::BitDepth,
-            ),
-            focused && format_state.field_focus == FormatField::BitDepth,
-        ));
+                focused && format_state.field_focus == FormatField::BitDepth, theme),
+            focused && format_state.field_focus == FormatField::BitDepth, theme));
         lines.push(pill_row(
             border_color,
             w,
@@ -135,17 +120,15 @@ pub fn draw_format_pane(
             "",
             &render_pill_spans(
                 &format_state.resampler,
-                focused && format_state.field_focus == FormatField::Resampler,
-            ),
-            focused && format_state.field_focus == FormatField::Resampler,
-        ));
+                focused && format_state.field_focus == FormatField::Resampler, theme),
+            focused && format_state.field_focus == FormatField::Resampler, theme));
         let ssrc_dither_override = format_state.ssrc_dither_override_active();
         let dither_focused = focused
             && format_state.field_focus == FormatField::Dither
             && !ssrc_dither_override;
-        let rendered_dither = render_pill_spans(&format_state.dither, dither_focused);
+        let rendered_dither = render_pill_spans(&format_state.dither, dither_focused, theme);
         let dither_spans = if ssrc_dither_override {
-            dim_pill_spans(&rendered_dither)
+            dim_pill_spans(&rendered_dither, theme)
         } else {
             rendered_dither
         };
@@ -155,8 +138,7 @@ pub fn draw_format_pane(
             "dither     ",
             format_state.ssrc_dither_status_label().unwrap_or(""),
             &dither_spans,
-            dither_focused,
-        ));
+            dither_focused, theme));
         lines.push(pill_row(
             border_color,
             w,
@@ -164,10 +146,8 @@ pub fn draw_format_pane(
             "",
             &render_pill_spans(
                 &format_state.replaygain,
-                focused && format_state.field_focus == FormatField::ReplayGain,
-            ),
-            focused && format_state.field_focus == FormatField::ReplayGain,
-        ));
+                focused && format_state.field_focus == FormatField::ReplayGain, theme),
+            focused && format_state.field_focus == FormatField::ReplayGain, theme));
         if format_state.dsd_to_pcm_gain_available() {
             lines.push(pill_row(
                 border_color,
@@ -176,17 +156,14 @@ pub fn draw_format_pane(
                 "",
                 &render_pill_spans(
                     &format_state.dsd_gain_mode,
-                    focused && format_state.field_focus == FormatField::DsdGain,
-                ),
-                focused && format_state.field_focus == FormatField::DsdGain,
-            ));
+                    focused && format_state.field_focus == FormatField::DsdGain, theme),
+                focused && format_state.field_focus == FormatField::DsdGain, theme));
             lines.push(dsd_gain_db_row(
                 border_color,
                 w,
                 format_state.dsd_gain_db,
                 *format_state.dsd_gain_mode.selected_value() == DsdGainMode::Manual,
-                focused && format_state.field_focus == FormatField::DsdGainDb,
-            ));
+                focused && format_state.field_focus == FormatField::DsdGainDb, theme));
         }
     }
 
@@ -201,18 +178,18 @@ pub fn draw_format_pane(
             | crate::convert::formats::AudioFormat::WavPack
     );
     if maximized && containers.len() > 1 {
-        lines.push(bordered_line(border_color, w, vec![]));
+        lines.push(bordered_line(border_color, w, vec![], theme));
         let container_spans: Vec<Span> = containers
             .iter()
             .enumerate()
             .flat_map(|(i, c)| {
                 let selected = i == format_state.selected_container_index;
                 let style = if !c.enabled {
-                    Style::default().fg(ratatui::style::Color::DarkGray)
+                    Style::default().fg(theme.text_dim)
                 } else if selected {
-                    Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)
+                    Style::default().fg(theme.green).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::TEXT_DIM)
+                    Style::default().fg(theme.text_dim)
                 };
                 let mut spans = vec![Span::styled(format!(" {} ", c.display_name), style)];
                 if i + 1 < containers.len() {
@@ -224,8 +201,7 @@ pub fn draw_format_pane(
         if has_format_settings {
             let fmt_name = format_state.format.selected_value().name().to_lowercase();
             lines.push(container_row_with_settings_pill(
-                border_color, w, &container_spans, focused, &fmt_name,
-            ));
+                border_color, w, &container_spans, focused, &fmt_name, theme));
         } else {
             lines.push(pill_row(
                 border_color,
@@ -233,8 +209,7 @@ pub fn draw_format_pane(
                 "container ",
                 "",
                 &container_spans,
-                focused,
-            ));
+                focused, theme));
         }
     }
 
@@ -245,13 +220,12 @@ pub fn draw_format_pane(
             ResamplerChoice::None
         );
     if resampler_active {
-        lines.push(bordered_line(border_color, w, vec![]));
-        let resample_label_style = if focused { theme::bright() } else { theme::muted() };
+        lines.push(bordered_line(border_color, w, vec![], theme));
+        let resample_label_style = if focused { theme.bright() } else { theme.muted() };
         lines.push(bordered_line(
             border_color,
             w,
-            vec![Span::styled("   resampling", resample_label_style)],
-        ));
+            vec![Span::styled("   resampling", resample_label_style)], theme));
         use tonepoet_pipeline::enums::ResampleQuality;
         let mut quality_list: Vec<(ResampleQuality, &str)> = vec![
             (ResampleQuality::Low, "low"),
@@ -271,11 +245,11 @@ pub fn draw_format_pane(
                 let selected = *q == format_state.resample_quality;
                 let style = if selected {
                     Style::default()
-                        .fg(theme::PILL_ACTIVE_FG)
-                        .bg(theme::GREEN)
+                        .fg(theme.pill_active_fg)
+                        .bg(theme.green)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::TEXT_DIM)
+                    Style::default().fg(theme.text_dim)
                 };
                 let mut spans = vec![Span::styled(format!(" {} ", label), style)];
                 if i < quality_count - 1 {
@@ -298,8 +272,7 @@ pub fn draw_format_pane(
                 "preset     ",
                 &quality_pills,
                 focused,
-                name,
-            ));
+                name, theme));
         } else {
             lines.push(pill_row(
                 border_color,
@@ -307,15 +280,14 @@ pub fn draw_format_pane(
                 "preset     ",
                 "",
                 &quality_pills,
-                focused,
-            ));
+                focused, theme));
         }
     }
 
-    lines.push(bordered_line(border_color, w, vec![]));
+    lines.push(bordered_line(border_color, w, vec![], theme));
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
     while lines.len() < target_len_before_bottom {
-        lines.push(bordered_line(border_color, w, vec![]));
+        lines.push(bordered_line(border_color, w, vec![], theme));
     }
     lines.push(bot_line);
 
@@ -324,29 +296,31 @@ pub fn draw_format_pane(
 
 
 /// Draw the collapsed format title bar.
-pub fn draw_format_title_bar(f: &mut Frame, area: Rect, focused: bool) {
+pub fn draw_format_title_bar(f: &mut Frame, area: Rect, focused: bool, theme: super::theme::Theme) {
     if area.height < 1 || area.width < 12 {
         return;
     }
-    let border_color = if focused { theme::GREEN } else { theme::TEXT_DIM };
+    let border_color = if focused { theme.green } else { theme.text_dim };
     f.render_widget(
-        Paragraph::new(vec![format_title_line(border_color, area.width as usize, false)]),
+        Paragraph::new(vec![format_title_line(border_color, area.width as usize, false, theme)]),
         area,
     );
 }
 
-fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maximized: bool) -> Line<'a> {
+fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maximized: bool,
+    theme: super::theme::Theme,
+) -> Line<'a> {
     let title = " format ";
     let indicator = if maximized { "▾" } else { "▸" };
-    let bar_style = Style::default().fg(Color::Black).bg(border_color);
+    let bar_style = Style::default().fg(theme.bg).bg(border_color);
     let left_spans = vec![
-        Span::styled("┌", theme::border(border_color)),
+        Span::styled("┌", theme.border(border_color)),
         Span::styled(format!(" {indicator}{title}"), bar_style),
     ];
     let right_spans = vec![
-        Span::styled("a", Style::default().fg(theme::TEXT_MUTED).bg(border_color)),
+        Span::styled("a", Style::default().fg(theme.text_muted).bg(border_color)),
         Span::styled("dvanced ", bar_style),
-        Span::styled("┐", theme::border(border_color)),
+        Span::styled("┐", theme.border(border_color)),
     ];
     let fixed_width = Line::from(left_spans.clone()).width()
         + Line::from(right_spans.clone()).width();
@@ -366,18 +340,19 @@ fn static_row<'a>(
     label: &'a str,
     value: &'a str,
     focused: bool,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
-    let label_style = if focused { theme::bright() } else { theme::muted() };
-    let value_style = if focused { theme::bright() } else { theme::muted() };
+    let label_style = if focused { theme.bright() } else { theme.muted() };
+    let value_style = if focused { theme.bright() } else { theme.muted() };
     let mut spans = vec![
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
         Span::styled(format!("   {}  ", label), label_style),
         Span::styled(value, value_style),
     ];
     let content_width: usize = spans.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(content_width + 1);
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
 }
 
@@ -387,23 +362,24 @@ fn dsd_gain_db_row(
     gain_db: f32,
     manual_enabled: bool,
     focused: bool,
+    theme: super::theme::Theme,
 ) -> Line<'static> {
-    let label_style = if focused { theme::bright() } else { theme::muted() };
+    let label_style = if focused { theme.bright() } else { theme.muted() };
     let control_style = if focused {
-        theme::bright().add_modifier(Modifier::BOLD)
+        theme.bright().add_modifier(Modifier::BOLD)
     } else if manual_enabled {
-        theme::muted()
+        theme.muted()
     } else {
-        Style::default().fg(ratatui::style::Color::DarkGray)
+        Style::default().fg(theme.text_dim)
     };
     let hint_style = if manual_enabled {
-        theme::muted()
+        theme.muted()
     } else {
-        Style::default().fg(ratatui::style::Color::DarkGray)
+        Style::default().fg(theme.text_dim)
     };
 
     let mut spans = vec![
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
         Span::styled("   gain dB    ", label_style),
         Span::styled("< ", control_style),
         Span::styled(format!("{gain_db:+.2} dB"), control_style),
@@ -418,15 +394,17 @@ fn dsd_gain_db_row(
     let content_width: usize = spans.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(content_width + 1);
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
 
     Line::from(spans)
 }
 
-fn dim_pill_spans<'a>(spans: &[Span<'a>]) -> Vec<Span<'a>> {
+fn dim_pill_spans<'a>(spans: &[Span<'a>],
+    theme: super::theme::Theme,
+) -> Vec<Span<'a>> {
     spans
         .iter()
-        .map(|span| Span::styled(span.content.clone(), Style::default().fg(Color::DarkGray)))
+        .map(|span| Span::styled(span.content.clone(), Style::default().fg(theme.text_dim)))
         .collect()
 }
 
@@ -437,24 +415,25 @@ fn pill_row<'a>(
     suffix: &'a str,
     pills: &[Span<'a>],
     focused: bool,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
-    let label_style = if focused { theme::bright() } else { theme::muted() };
+    let label_style = if focused { theme.bright() } else { theme.muted() };
 
     let mut spans = vec![
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
         Span::styled(format!("   {}  ", label), label_style),
     ];
     spans.extend_from_slice(pills);
 
     if !suffix.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(suffix, theme::muted()));
+        spans.push(Span::styled(suffix, theme.muted()));
     }
 
     let content_width: usize = spans.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(content_width + 1);
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
 
     Line::from(spans)
 }
@@ -463,14 +442,15 @@ fn bordered_line<'a>(
     border_color: ratatui::style::Color,
     width: usize,
     content: Vec<Span<'a>>,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
     let content_width: usize = content.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(2 + content_width);
 
-    let mut spans = vec![Span::styled("│", theme::border(border_color))];
+    let mut spans = vec![Span::styled("│", theme.border(border_color))];
     spans.extend(content);
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
 }
 
@@ -481,8 +461,9 @@ fn container_row_with_settings_pill<'a>(
     pills: &[Span<'a>],
     focused: bool,
     settings_name: &str,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
-    row_with_settings_pill(border_color, width, "container  ", pills, focused, settings_name)
+    row_with_settings_pill(border_color, width, "container  ", pills, focused, settings_name, theme)
 }
 
 /// Generic row with left-aligned pills and a right-aligned settings pill.
@@ -493,20 +474,21 @@ fn row_with_settings_pill<'a>(
     pills: &[Span<'a>],
     focused: bool,
     settings_name: &str,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
-    let label_style = if focused { theme::bright() } else { theme::muted() };
+    let label_style = if focused { theme.bright() } else { theme.muted() };
     let pill_text = format!(" {} settings ", settings_name);
     let pill_width = pill_text.len();
     let settings_pill = Span::styled(
         pill_text,
         Style::default()
-            .fg(theme::PILL_ACTIVE_FG)
-            .bg(theme::PURPLE)
+            .fg(theme.pill_active_fg)
+            .bg(theme.purple)
             .add_modifier(Modifier::BOLD),
     );
 
     let mut spans = vec![
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
         Span::styled(format!("   {}  ", label), label_style),
     ];
     spans.extend_from_slice(pills);
@@ -523,6 +505,6 @@ fn row_with_settings_pill<'a>(
         let padding = width.saturating_sub(content_width + 1);
         spans.push(Span::raw(" ".repeat(padding)));
     }
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
 }

@@ -57,7 +57,7 @@ pub enum DitherType {
 /// These control how aggressively the anti-aliasing filter removes frequencies
 /// near the Nyquist limit during resampling operations:
 /// - Gentle (95%) = Preserves 95% of Nyquist frequency, gentler rolloff
-/// - Steep (99.7%) = Preserves 99.7% of Nyquist frequency, sharper rolloff  
+/// - Steep (99.7%) = Preserves 99.7% of Nyquist frequency, sharper rolloff
 /// - BrickWall (SSRC) = Uses SSRC resampler instead of SoX, overrides quality setting
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NyquistTransition {
@@ -819,17 +819,6 @@ impl FileBrowser {
     pub fn refresh_entries(&mut self) {
         self.entries.clear();
 
-        // Debug logging
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_areas.log")
-        {
-            let _ = writeln!(file, "\n=== FileBrowser refresh_entries ===");
-            let _ = writeln!(file, "Current path: {:?}", self.current_path);
-        }
 
         // Add parent directory option
         if let Some(parent) = self.current_path.parent() {
@@ -850,13 +839,6 @@ impl FileBrowser {
         match std::fs::read_dir(&self.current_path) {
             Ok(entries) => {
                 let mut dir_entries = Vec::new();
-                if let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("wizard_areas.log")
-                {
-                    let _ = writeln!(file, "Successfully reading directory");
-                }
 
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
@@ -870,7 +852,6 @@ impl FileBrowser {
                     let metadata = entry.metadata().ok();
                     let is_dir = metadata.as_ref().map_or(false, |m| m.is_dir());
 
-                    // Removed debug logging
 
                     // Only show directories in the file browser
                     if !is_dir {
@@ -901,15 +882,7 @@ impl FileBrowser {
 
                 self.entries.extend(dir_entries);
             }
-            Err(e) => {
-                if let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("wizard_areas.log")
-                {
-                    let _ = writeln!(file, "Error reading directory: {}", e);
-                }
-            }
+            Err(_) => {}
         }
 
         // Reset selection if out of bounds
@@ -919,38 +892,14 @@ impl FileBrowser {
     }
 
     pub fn enter_selected(&mut self) {
-        use std::fs::OpenOptions;
-        use std::io::Write;
 
         if let Some(entry) = self.entries.get(self.selected_index) {
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("wizard_areas.log")
-            {
-                let _ = writeln!(file, "\n=== enter_selected ===");
-                let _ = writeln!(file, "Selected: {} (path: {:?})", entry.name, entry.path);
-            }
 
             if entry.is_dir {
                 // Canonicalize the path to handle .. properly
                 if let Ok(canonical) = entry.path.canonicalize() {
-                    if let Ok(mut file) = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("wizard_areas.log")
-                    {
-                        let _ = writeln!(file, "Canonicalized to: {:?}", canonical);
-                    }
                     self.current_path = canonical;
                 } else {
-                    if let Ok(mut file) = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("wizard_areas.log")
-                    {
-                        let _ = writeln!(file, "Failed to canonicalize, using: {:?}", entry.path);
-                    }
                     self.current_path = entry.path.clone();
                 }
                 self.selected_index = 0;

@@ -6,6 +6,7 @@
 
 pub mod events;
 pub mod presets;
+pub mod theme;
 pub mod types;
 pub mod ui;
 
@@ -16,6 +17,7 @@ pub use types::{
     SimpleWizard,
 };
 
-pub use ui::{draw_wizard, ButtonId, MouseAreas};
+pub use theme::WizardTheme;
+pub use ui::{draw_wizard, draw_wizard_with_theme, ButtonId, MouseAreas};
 
 pub use presets::{ConversionPreset, PresetManager};

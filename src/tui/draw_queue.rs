@@ -13,7 +13,7 @@ use super::button_map::TuiButton;
 use crate::convert::{ConversionItem, ConversionStatus};
 
 /// Draw the queue content area (item list + action bar)
-pub fn draw_queue_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
+pub fn draw_queue_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -22,18 +22,18 @@ pub fn draw_queue_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         ])
         .split(area);
 
-    draw_item_list(f, chunks[0], app);
-    draw_action_bar(f, chunks[1], app);
+    draw_item_list(f, chunks[0], app, theme);
+    draw_action_bar(f, chunks[1], app, theme);
 }
 
 /// Draw the scrollable queue item list
-fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
+fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(theme.text_dim))
         .title(Span::styled(
             format!(" Queue ({}) ", app.items_snapshot.len()),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text_bright),
         ));
 
     let inner = block.inner(area);
@@ -42,7 +42,7 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
     if app.items_snapshot.is_empty() {
         let empty = Paragraph::new(Line::from(vec![Span::styled(
             "No files in queue. Press 'a' to add files or 'f' to add a folder.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_dim),
         )]));
         f.render_widget(empty, inner);
         return;
@@ -68,6 +68,7 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             idx == app.selected_index,
             is_hovered,
             app,
+            theme,
         );
         app.button_map
             .record_button(TuiButton::QueueItem(idx), item_area);
@@ -86,11 +87,11 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 message: Some(msg),
                 phase,
                 ..
-            } if !msg.is_empty() => Some((msg.clone(), super::theme::GREEN)),
+            } if !msg.is_empty() => Some((msg.clone(), theme.green)),
             ConversionStatus::Completed { output_path, .. } => {
                 let path = output_path.display().to_string();
                 if !path.is_empty() {
-                    Some((path, super::theme::GREEN))
+                    Some((path, theme.green))
                 } else {
                     None
                 }
@@ -110,14 +111,14 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                             successful + failed,
                             path
                         ),
-                        Color::Yellow,
+                        theme.amber,
                     ))
                 } else {
                     None
                 }
             }
             ConversionStatus::Failed { error, .. } if !error.is_empty() => {
-                Some((error.clone(), Color::Red))
+                Some((error.clone(), theme.destructive))
             }
             _ => None,
         };
@@ -133,10 +134,10 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                     let more = total_tracks - max_sub_lines;
                     let more_area = Rect::new(inner.x, y, inner.width, 1);
                     let more_text = Paragraph::new(Line::from(vec![
-                        Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("  \u{2514} ", Style::default().fg(theme.text_dim)),
                         Span::styled(
                             format!("... and {} more tracks", more),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.text_dim),
                         ),
                     ]));
                     f.render_widget(more_text, more_area);
@@ -154,8 +155,8 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 };
                 let sub_area = Rect::new(inner.x, y, inner.width, 1);
                 let sub_line = Paragraph::new(Line::from(vec![
-                    Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(sub_text, Style::default().fg(super::theme::BLUE)),
+                    Span::styled("  \u{2514} ", Style::default().fg(theme.text_dim)),
+                    Span::styled(sub_text, Style::default().fg(theme.blue)),
                 ]));
                 f.render_widget(sub_line, sub_area);
                 y += 1;
@@ -166,10 +167,10 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 let n = item.active_tracks.len();
                 let summary_area = Rect::new(inner.x, y, inner.width, 1);
                 let summary = Paragraph::new(Line::from(vec![
-                    Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("  \u{2514} ", Style::default().fg(theme.text_dim)),
                     Span::styled(
                         format!("{n} tracks converting\u{2026}"),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.text_dim),
                     ),
                 ]));
                 f.render_widget(summary, summary_area);
@@ -180,7 +181,7 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             if y < inner.y + inner.height {
                 let detail_area = Rect::new(inner.x, y, inner.width, 1);
                 let detail = Paragraph::new(Line::from(vec![
-                    Span::styled("  \u{2514} ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("  \u{2514} ", Style::default().fg(theme.text_dim)),
                     Span::styled(text, Style::default().fg(color)),
                 ]));
                 f.render_widget(detail, detail_area);
@@ -200,6 +201,7 @@ fn draw_queue_item(
     is_selected: bool,
     is_hovered: bool,
     _app: &AppState,
+    theme: super::theme::Theme,
 ) {
     if area.width < 10 {
         return;
@@ -220,10 +222,10 @@ fn draw_queue_item(
     };
     let sel_style = if is_selected {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme.amber)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.text_dim)
     };
 
     // File name (truncated)
@@ -249,7 +251,7 @@ fn draw_queue_item(
 
     // Status rendering
     let (status_spans, _status_style) =
-        render_item_status(item, area.width.saturating_sub(max_name_len as u16 + 12));
+        render_item_status(item, area.width.saturating_sub(max_name_len as u16 + 12), theme);
 
     let mut spans = vec![
         Span::styled(format!("{} ", sel_char), sel_style),
@@ -257,24 +259,24 @@ fn draw_queue_item(
             display_name,
             if is_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme.text_bright)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme.text_bright)
             },
         ),
         Span::styled(
             format!("  {} ", format_str),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.cyan),
         ),
     ];
     spans.extend(status_spans);
 
     // Apply row highlight for selected/hovered item
     let row_style = if is_selected {
-        Style::default().bg(Color::Rgb(30, 30, 50))
+        Style::default().bg(theme.selection_bg)
     } else if is_hovered {
-        Style::default().bg(super::theme::HOVER_BG)
+        Style::default().bg(theme.hover_bg)
     } else {
         Style::default()
     };
@@ -308,23 +310,23 @@ fn draw_queue_item(
                 1,
             );
             let pct = (pct_value / 100.0).clamp(0.0, 1.0);
-            draw_crt_gauge(f, gauge_area, pct, &label);
+            draw_crt_gauge(f, gauge_area, pct, &label, theme);
         }
     }
 }
 
 /// Render status text for a queue item
-fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>, Style) {
+fn render_item_status(item: &ConversionItem, _width: u16, theme: super::theme::Theme) -> (Vec<Span<'static>>, Style) {
     match &item.status {
         ConversionStatus::NotConfigured => (
             vec![Span::styled(
                 "Not Configured",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_dim),
             )],
             Style::default(),
         ),
         ConversionStatus::Queued => (
-            vec![Span::styled("Queued", Style::default().fg(Color::White))],
+            vec![Span::styled("Queued", Style::default().fg(theme.text_bright))],
             Style::default(),
         ),
         ConversionStatus::Processing {
@@ -340,7 +342,7 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
             (
                 vec![Span::styled(
                     format!("{:.0}% {}", pct, phase_name),
-                    Style::default().fg(super::theme::GREEN),
+                    Style::default().fg(theme.green),
                 )],
                 Style::default(),
             )
@@ -348,7 +350,7 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
         ConversionStatus::Completed { .. } => (
             vec![Span::styled(
                 "Completed",
-                Style::default().fg(super::theme::GREEN),
+                Style::default().fg(theme.green),
             )],
             Style::default(),
         ),
@@ -357,22 +359,22 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
         } => (
             vec![Span::styled(
                 format!("Partial {}/{}", successful, successful + failed),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.amber),
             )],
             Style::default(),
         ),
         ConversionStatus::Failed { .. } => (
-            vec![Span::styled("Failed", Style::default().fg(Color::Red))],
+            vec![Span::styled("Failed", Style::default().fg(theme.destructive))],
             Style::default(),
         ),
         ConversionStatus::Paused => (
-            vec![Span::styled("Paused", Style::default().fg(Color::Yellow))],
+            vec![Span::styled("Paused", Style::default().fg(theme.amber))],
             Style::default(),
         ),
         ConversionStatus::Cancelled => (
             vec![Span::styled(
                 "Cancelled",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_dim),
             )],
             Style::default(),
         ),
@@ -384,9 +386,8 @@ fn render_item_status(item: &ConversionItem, _width: u16) -> (Vec<Span<'static>>
 ///
 /// Alternates between brighter and dimmer columns in the filled region
 /// to simulate the vertical phosphor stripe pattern of a CRT display.
-/// Uses `theme::GREEN` (the start pill color) as the base fill color.
-fn draw_crt_gauge(f: &mut Frame, area: Rect, ratio: f32, label: &str) {
-    use super::theme;
+/// Uses `theme.green` (the start pill color) as the base fill color.
+fn draw_crt_gauge(f: &mut Frame, area: Rect, ratio: f32, label: &str, theme: super::theme::Theme) {
 
     if area.is_empty() {
         return;
@@ -395,8 +396,8 @@ fn draw_crt_gauge(f: &mut Frame, area: Rect, ratio: f32, label: &str) {
     let buf = f.buffer_mut();
     let filled_width = ((area.width as f32) * ratio).round() as u16;
 
-    let fill_color = theme::GREEN;
-    let bg_empty = Color::Rgb(30, 30, 30);
+    let fill_color = theme.green;
+    let bg_empty = theme.input_unfocused_bg;
 
     let y = area.y;
     for col in 0..area.width {
@@ -420,28 +421,27 @@ fn draw_crt_gauge(f: &mut Frame, area: Rect, ratio: f32, label: &str) {
         let cell = buf.get_mut(x, y);
         cell.set_char(ch);
         if col < filled_width {
-            cell.set_fg(Color::Rgb(15, 15, 15)).set_bg(fill_color);
+            cell.set_fg(theme.bg).set_bg(fill_color);
         } else {
-            cell.set_fg(Color::Rgb(120, 120, 120)).set_bg(bg_empty);
+            cell.set_fg(theme.text_dim).set_bg(bg_empty);
         }
     }
 }
 
 /// Draw the action bar at the bottom of the queue screen
-fn draw_action_bar(f: &mut Frame, area: Rect, app: &mut AppState) {
+fn draw_action_bar(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
     use super::draw_overlays::{footer_pill_pub, pill_gap_pub};
-    use super::theme;
 
     let pills: Vec<(&str, TuiButton, Color)> = vec![
-        ("a add files", TuiButton::AddFiles, theme::BLUE),
-        ("f add folder", TuiButton::AddFolder, theme::BLUE),
-        ("c configure", TuiButton::Configure, theme::PURPLE),
-        ("s start", TuiButton::Convert, theme::GREEN),
-        ("p pause", TuiButton::Pause, theme::AMBER),
-        ("x stop", TuiButton::Stop, theme::RED),
-        ("r retry", TuiButton::RetryFailed, theme::CYAN),
-        ("C-l clear done", TuiButton::ClearFinished, theme::PURPLE),
-        ("clear all", TuiButton::ClearAll, theme::RED),
+        ("a add files", TuiButton::AddFiles, theme.blue),
+        ("f add folder", TuiButton::AddFolder, theme.blue),
+        ("c configure", TuiButton::Configure, theme.purple),
+        ("s start", TuiButton::Convert, theme.green),
+        ("p pause", TuiButton::Pause, theme.amber),
+        ("x stop", TuiButton::Stop, theme.destructive),
+        ("r retry", TuiButton::RetryFailed, theme.cyan),
+        ("C-l clear done", TuiButton::ClearFinished, theme.purple),
+        ("clear all", TuiButton::ClearAll, theme.destructive),
     ];
 
     let mut spans: Vec<Span> = Vec::new();
@@ -453,7 +453,7 @@ fn draw_action_bar(f: &mut Frame, area: Rect, app: &mut AppState) {
             x += 1; // gap is 1 char
             spans.push(gap);
         }
-        let pill = footer_pill_pub(label, *color);
+        let pill = footer_pill_pub(label, *color, theme);
         let pill_width = (label.len() + 2) as u16; // " label " padding
         app.button_map
             .record_button(*btn, Rect::new(x, area.y, pill_width, 1));

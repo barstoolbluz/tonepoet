@@ -59,4 +59,6 @@ pub mod sacd_sidecar;
 pub mod template_builder;
 pub mod text_input;
 pub mod theme;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod verify;

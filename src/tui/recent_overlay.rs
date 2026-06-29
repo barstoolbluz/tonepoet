@@ -9,12 +9,11 @@ use ratatui::{
 };
 
 use super::recent_files::RecentFilesState;
-use super::theme;
 
 /// Draw the recent files overlay as a centered floating panel.
 /// Takes `&mut RecentFilesState` so it can publish the visible row count
 /// back into the state (used by `ensure_visible` for scroll math).
-pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
+pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState, theme: super::theme::Theme) {
     let area = f.size();
     let width: u16 = 60.min(area.width.saturating_sub(4));
     let list_height = state.entries.len() as u16;
@@ -28,11 +27,11 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::CYAN))
+        .border_style(Style::default().fg(theme.cyan))
         .title(Span::styled(
             " RECENT FILES ",
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay_area);
@@ -44,7 +43,7 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
     if state.entries.is_empty() {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("(no recent files)", theme::muted()),
+            Span::styled("(no recent files)", theme.muted()),
         ]));
     } else {
         // Compute per-line width budget for the path after the marker, name, and age columns.
@@ -80,9 +79,9 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
 
             let marker = if is_selected { "▸ " } else { "  " };
             let marker_style = if is_selected {
-                Style::default().fg(theme::BLUE)
+                Style::default().fg(theme.blue)
             } else {
-                Style::default().fg(theme::TEXT_DIM)
+                Style::default().fg(theme.text_dim)
             };
 
             let name = entry
@@ -111,10 +110,10 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
 
             let name_style = if is_selected {
                 Style::default()
-                    .fg(theme::TEXT_BRIGHT)
+                    .fg(theme.text_bright)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::TEXT)
+                Style::default().fg(theme.text)
             };
 
             // Build spans: marker + name + gap + parent + gap + age (right-ish)
@@ -128,9 +127,9 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
                 Span::styled(marker, marker_style),
                 Span::styled(name_display, name_style),
                 Span::raw(" ".repeat(name_pad + 1)),
-                Span::styled(parent_display, theme::muted()),
+                Span::styled(parent_display, theme.muted()),
                 Span::raw(" ".repeat(parent_pad + 1)),
-                Span::styled(age, theme::muted()),
+                Span::styled(age, theme.muted()),
             ]));
         }
     }
@@ -139,11 +138,11 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState) {
     use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        pill("Enter load", theme::GREEN),
+        pill("Enter load", theme.green, theme),
         gap(),
-        pill("d delete", theme::RED),
+        pill("d delete", theme.destructive, theme),
         gap(),
-        pill("Esc close", theme::PURPLE),
+        pill("Esc close", theme.purple, theme),
     ]));
 
     let paragraph = Paragraph::new(lines);

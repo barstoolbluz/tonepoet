@@ -13,20 +13,19 @@ use super::app::{
     FormatSettingsFocus, FormatSettingsKind, MbSelectState, SourceMode,
 };
 use super::button_map::TuiButton;
-use super::theme;
 use crate::convert::ConversionStatus;
 
 /// Render a pill-style footer button: ` label ` with colored background.
 /// Public alias for use from other modules (help.rs, etc.).
-pub fn footer_pill_pub(label: &str, bg: Color) -> Span<'static> {
-    footer_pill(label, bg)
+pub fn footer_pill_pub(label: &str, bg: Color, theme: super::theme::Theme) -> Span<'static> {
+    footer_pill(label, bg, theme)
 }
 
-fn footer_pill(label: &str, bg: Color) -> Span<'static> {
+fn footer_pill(label: &str, bg: Color, theme: super::theme::Theme) -> Span<'static> {
     Span::styled(
         format!(" {} ", label),
         Style::default()
-            .fg(theme::PILL_ACTIVE_FG)
+            .fg(theme.pill_active_fg)
             .bg(bg)
             .add_modifier(Modifier::BOLD),
     )
@@ -58,7 +57,7 @@ fn truncate_to_chars(s: &str, max: usize) -> String {
 }
 
 /// Draw any active overlay on top of the main content
-pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
+pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
         let image_picker_generation = app.image_picker_generation;
         let image_repaint_generation = app.image_repaint_generation;
@@ -68,8 +67,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             &mut app.button_map,
             &mut app.image_picker,
             image_picker_generation,
-            image_repaint_generation,
-        );
+            image_repaint_generation, theme);
         return;
     }
 
@@ -102,17 +100,17 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         ActiveOverlay::None => {}
         ActiveOverlay::Confirmation { ref message, .. } => {
             let message = message.clone();
-            draw_confirmation(f, &message, app);
+            draw_confirmation(f, &message, app, theme);
         }
         ActiveOverlay::ErrorDetail { error, .. } => {
-            draw_error_detail(f, &error);
+            draw_error_detail(f, &error, theme);
         }
         ActiveOverlay::ItemInfo { ref item } => {
-            draw_item_info(f, item);
+            draw_item_info(f, item, theme);
         }
         ActiveOverlay::FileInput { ref input } => {
             let input = input.clone();
-            draw_file_input(f, &input);
+            draw_file_input(f, &input, theme);
         }
         ActiveOverlay::CommandInput {
             ref input,
@@ -120,7 +118,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         } => {
             let input = input.clone();
             let completion = completion.clone();
-            draw_command_input(f, &input, completion.as_ref());
+            draw_command_input(f, &input, completion.as_ref(), theme);
         }
         ActiveOverlay::TextEdit {
             ref input,
@@ -129,47 +127,47 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
         } => {
             let input = input.clone();
             let label = label.clone();
-            draw_text_edit(f, &label, &input);
+            draw_text_edit(f, &label, &input, theme);
         }
         ActiveOverlay::BatchList { scroll } => {
-            draw_batch_list(f, app, scroll);
+            draw_batch_list(f, app, scroll, theme);
         }
         ActiveOverlay::ContextMenu { ref levels, origin } => {
-            draw_context_menu_stack(f, levels, origin);
+            draw_context_menu_stack(f, levels, origin, theme);
         }
         ActiveOverlay::BulkRename(ref state) => {
             let state = state.clone();
-            draw_bulk_rename(f, &state);
+            draw_bulk_rename(f, &state, theme);
         }
         ActiveOverlay::Analysis { scroll } => {
-            draw_analysis(f, &app.analysis_results, scroll);
+            draw_analysis(f, &app.analysis_results, scroll, theme);
         }
         ActiveOverlay::Help { screen, scroll } => {
-            super::help::draw_help(f, screen, scroll);
+            super::help::draw_help(f, screen, scroll, theme);
         }
         ActiveOverlay::FilePicker(_) => {}
         ActiveOverlay::FileTaskProgress(_) => {}
         ActiveOverlay::MetadataEditor(_) => {}
         ActiveOverlay::CuePreview(ref state) => {
-            draw_cue_preview(f, state, &mut app.button_map);
+            draw_cue_preview(f, state, &mut app.button_map, theme);
         }
         ActiveOverlay::MbSelect(ref state) => {
-            draw_mb_select(f, state, &mut app.button_map);
+            draw_mb_select(f, state, &mut app.button_map, theme);
         }
         ActiveOverlay::Verify { scroll } => {
-            draw_verify(f, &app.verify_results, scroll);
+            draw_verify(f, &app.verify_results, scroll, theme);
         }
         ActiveOverlay::BitCompare { scroll } => {
-            draw_bit_compare(f, &app.compare_results, scroll);
+            draw_bit_compare(f, &app.compare_results, scroll, theme);
         }
         ActiveOverlay::Preemphasis { scroll } => {
-            draw_preemphasis(f, &app.preemph_results, scroll);
+            draw_preemphasis(f, &app.preemph_results, scroll, theme);
         }
         ActiveOverlay::CueImportReview {
             ref changes,
             scroll,
         } => {
-            draw_cue_import_review(f, changes, scroll);
+            draw_cue_import_review(f, changes, scroll, theme);
         }
         ActiveOverlay::GnudbSelect {
             ref matches,
@@ -177,22 +175,22 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             scroll,
             ..
         } => {
-            draw_gnudb_select(f, matches, selected, scroll);
+            draw_gnudb_select(f, matches, selected, scroll, theme);
         }
         ActiveOverlay::GnudbReview(ref state) => {
-            draw_gnudb_review(f, state);
+            draw_gnudb_review(f, state, theme);
         }
         ActiveOverlay::AccurateRipVerify(ref state) => {
-            draw_accuraterip_verify(f, state);
+            draw_accuraterip_verify(f, state, theme);
         }
         ActiveOverlay::CtdbVerify(ref state) => {
-            draw_ctdb_verify(f, state);
+            draw_ctdb_verify(f, state, theme);
         }
         ActiveOverlay::ArBatchReport { ref result, scroll } => {
-            draw_ar_batch_report(f, result, scroll);
+            draw_ar_batch_report(f, result, scroll, theme);
         }
         ActiveOverlay::TemplateBuilder(ref state) => {
-            super::template_builder::draw_template_builder(f, state, &mut app.button_map);
+            super::template_builder::draw_template_builder(f, state, &mut app.button_map, theme);
         }
         ActiveOverlay::TemplatePicker {
             target,
@@ -211,10 +209,11 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
                 preview,
                 active_template.as_deref(),
                 &mut app.button_map,
+                theme,
             );
         }
         ActiveOverlay::DiscBrowser(ref state) => {
-            crate::tui::disc_browser::draw_disc_browser(f, state, &mut app.button_map);
+            crate::tui::disc_browser::draw_disc_browser(f, state, &mut app.button_map, theme);
         }
         ActiveOverlay::FormatSettings {
             ref kind,
@@ -222,23 +221,23 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState) {
             help_scroll,
         } => {
             let kind = kind.clone();
-            draw_format_settings(f, &kind, focus, help_scroll, &mut app.button_map);
+            draw_format_settings(f, &kind, focus, help_scroll, &mut app.button_map, theme);
         }
     }
 
     // Preset overlay (independent of ActiveOverlay — uses its own flag)
     if app.preset.overlay_open {
-        super::presets_overlay::draw_presets_overlay(f, &app.preset);
+        super::presets_overlay::draw_presets_overlay(f, &app.preset, theme);
     }
 
     // Recent files overlay (independent of ActiveOverlay — uses its own flag)
     if app.recent.overlay_open {
-        super::recent_overlay::draw_recent_overlay(f, &mut app.recent);
+        super::recent_overlay::draw_recent_overlay(f, &mut app.recent, theme);
     }
 
     // Bookmarks overlay (independent of ActiveOverlay — uses its own flag)
     if app.bookmarks.overlay_open {
-        super::bookmarks_overlay::draw_bookmarks_overlay(f, &mut app.bookmarks);
+        super::bookmarks_overlay::draw_bookmarks_overlay(f, &mut app.bookmarks, theme);
     }
 }
 
@@ -252,6 +251,7 @@ fn draw_context_menu_stack(
     f: &mut Frame,
     levels: &[super::context_menu::MenuLevel],
     origin: (u16, u16),
+    theme: super::theme::Theme,
 ) {
     if levels.is_empty() {
         return;
@@ -266,14 +266,14 @@ fn draw_context_menu_stack(
     let focused_idx = levels.len() - 1;
     for (i, level) in levels.iter().enumerate() {
         let has_focus = i == focused_idx;
-        let _ = render_menu_panel_at(f, &level.entries, level.selected, rects[i], has_focus);
+        let _ = render_menu_panel_at(f, &level.entries, level.selected, rects[i], has_focus, theme);
     }
 
     if let Some((preview_entries, rect_idx)) = preview {
         // Preview is unfocused and has no selection — pass usize::MAX
         // so neither the focus highlight nor the is-expanded breadcrumb
         // highlight fires on any row.
-        let _ = render_menu_panel_at(f, preview_entries, usize::MAX, rects[rect_idx], false);
+        let _ = render_menu_panel_at(f, preview_entries, usize::MAX, rects[rect_idx], false, theme);
     }
 }
 
@@ -314,6 +314,7 @@ fn render_menu_panel_at(
     selected: usize,
     popup: Rect,
     has_focus: bool,
+    theme: super::theme::Theme,
 ) -> Rect {
     use super::context_menu::ContextMenuEntry;
 
@@ -323,9 +324,9 @@ fn render_menu_panel_at(
 
     f.render_widget(Clear, popup);
     let border_color = if has_focus {
-        theme::AMBER
+        theme.amber
     } else {
-        theme::BORDER_DIM
+        theme.border_dim
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -350,7 +351,7 @@ fn render_menu_panel_at(
         .map(|(i, entry)| match entry {
             ContextMenuEntry::Separator => Line::from(Span::styled(
                 "─".repeat(inner_w),
-                Style::default().fg(theme::BORDER_DIM),
+                Style::default().fg(theme.border_dim),
             )),
             ContextMenuEntry::Item(item) => {
                 let is_selected = has_focus
@@ -359,14 +360,14 @@ fn render_menu_panel_at(
                         .map(|&idx| idx == i)
                         .unwrap_or(false);
                 let style = if !item.enabled {
-                    Style::default().fg(theme::TEXT_DIM)
+                    Style::default().fg(theme.text_dim)
                 } else if is_selected {
                     Style::default()
-                        .fg(theme::BG)
-                        .bg(theme::BLUE)
+                        .fg(theme.bg)
+                        .bg(theme.blue)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::TEXT_BRIGHT)
+                    Style::default().fg(theme.text_bright)
                 };
                 let shortcut_str = item
                     .shortcut
@@ -396,11 +397,11 @@ fn render_menu_panel_at(
                         .unwrap_or(false);
                 let style = if is_selected || is_expanded {
                     Style::default()
-                        .fg(theme::BG)
-                        .bg(theme::BLUE)
+                        .fg(theme.bg)
+                        .bg(theme.blue)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::TEXT_BRIGHT)
+                    Style::default().fg(theme.text_bright)
                 };
                 let indicator = " >";
                 let label_w = label.chars().count();
@@ -436,7 +437,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// doesn't match the actual list height — the clamp here is defensive
 /// (only fires when list height differs from the estimate) and doesn't
 /// feed back into persistent state.
-fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
+fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize, theme: super::theme::Theme) {
     let (paths, cursor) = match &app.convert.source.mode {
         // Defensive: an empty Batch shouldn't exist (from_paths returns
         // Empty for 0 paths, remove collapses to Empty/Single), but if
@@ -456,11 +457,11 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::AMBER))
+        .border_style(Style::default().fg(theme.amber))
         .title(Span::styled(
             format!(" batch · {} files ", paths.len()),
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -509,12 +510,12 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
                 Line::from(Span::styled(
                     text,
                     Style::default()
-                        .fg(theme::BG)
-                        .bg(theme::AMBER)
+                        .fg(theme.bg)
+                        .bg(theme.amber)
                         .add_modifier(Modifier::BOLD),
                 ))
             } else {
-                Line::from(Span::styled(text, Style::default().fg(theme::TEXT_BRIGHT)))
+                Line::from(Span::styled(text, Style::default().fg(theme.text_bright)))
             }
         })
         .collect();
@@ -524,27 +525,27 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize) {
 
     // Footer pills.
     let hint = Paragraph::new(Line::from(vec![
-        footer_pill("d remove", theme::RED),
+        footer_pill("d remove", theme.destructive, theme),
         pill_gap(),
-        footer_pill("Esc close", theme::PURPLE),
+        footer_pill("Esc close", theme.purple, theme),
     ]))
     .alignment(Alignment::Center);
     f.render_widget(hint, chunks[1]);
 }
 
 /// Draw a confirmation dialog
-fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState) {
+fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState, theme: super::theme::Theme) {
     let area = f.size();
     let popup = centered_rect(50, 9, area);
 
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::AMBER))
+        .border_style(Style::default().fg(theme.amber))
         .title(Span::styled(
             " Confirm ",
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -564,8 +565,8 @@ fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState) {
     f.render_widget(msg, chunks[0]);
 
     // Pill-styled buttons using the standard footer_pill pattern.
-    let yes_pill = footer_pill("Y yes", theme::GREEN);
-    let no_pill = footer_pill("N no", theme::RED);
+    let yes_pill = footer_pill("Y yes", theme.green, theme);
+    let no_pill = footer_pill("N no", theme.destructive, theme);
     let gap_span = pill_gap();
     let yes_w = yes_pill.width() as u16;
     let gap_w = gap_span.width() as u16;
@@ -590,17 +591,17 @@ fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState) {
 }
 
 /// Draw an error detail popup
-fn draw_error_detail(f: &mut Frame, error: &str) {
+fn draw_error_detail(f: &mut Frame, error: &str, theme: super::theme::Theme) {
     let area = f.size();
     let popup = centered_rect(60, 12, area);
 
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(theme.destructive))
         .title(Span::styled(
             " Error Detail ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -612,27 +613,27 @@ fn draw_error_detail(f: &mut Frame, error: &str) {
 
     let error_text = Paragraph::new(error.to_string())
         .wrap(Wrap { trim: true })
-        .style(Style::default().fg(Color::Red));
+        .style(Style::default().fg(theme.destructive));
     f.render_widget(error_text, chunks[0]);
 
-    let hint = Paragraph::new(Line::from(vec![footer_pill("Esc close", theme::PURPLE)]))
+    let hint = Paragraph::new(Line::from(vec![footer_pill("Esc close", theme.purple, theme)]))
         .alignment(Alignment::Center);
     f.render_widget(hint, chunks[1]);
 }
 
 /// Draw item info popup
-fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
+fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem, theme: super::theme::Theme) {
     let area = f.size();
     let popup = centered_rect(70, 16, area);
 
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.cyan))
         .title(Span::styled(
             " Item Info ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -702,72 +703,72 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem) {
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("File: ", Style::default().fg(Color::Gray)),
-            Span::styled(name.to_string(), Style::default().fg(Color::White)),
+            Span::styled("File: ", Style::default().fg(theme.text_muted)),
+            Span::styled(name.to_string(), Style::default().fg(theme.text_bright)),
         ]),
         Line::from(vec![
-            Span::styled("Path: ", Style::default().fg(Color::Gray)),
+            Span::styled("Path: ", Style::default().fg(theme.text_muted)),
             Span::styled(
                 item.input_path
                     .parent()
                     .unwrap_or(&item.input_path)
                     .display()
                     .to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_dim),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Size: ", Style::default().fg(Color::Gray)),
-            Span::styled(size, Style::default().fg(Color::White)),
+            Span::styled("Size: ", Style::default().fg(theme.text_muted)),
+            Span::styled(size, Style::default().fg(theme.text_bright)),
         ]),
         Line::from(vec![
-            Span::styled("Input: ", Style::default().fg(Color::Gray)),
+            Span::styled("Input: ", Style::default().fg(theme.text_muted)),
             Span::styled(
                 format!("{:?}", item.input_format),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.cyan),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Output: ", Style::default().fg(Color::Gray)),
+            Span::styled("Output: ", Style::default().fg(theme.text_muted)),
             Span::styled(
                 item.output_format.name().to_string(),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.green),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::Gray)),
-            Span::styled(status_str, Style::default().fg(Color::Yellow)),
+            Span::styled("Status: ", Style::default().fg(theme.text_muted)),
+            Span::styled(status_str, Style::default().fg(theme.amber)),
         ]),
     ];
 
     if let Some(log_path) = log_path_str {
         lines.push(Line::from(vec![
-            Span::styled("Log: ", Style::default().fg(Color::Gray)),
-            Span::styled(log_path, Style::default().fg(Color::DarkGray)),
+            Span::styled("Log: ", Style::default().fg(theme.text_muted)),
+            Span::styled(log_path, Style::default().fg(theme.text_dim)),
         ]));
     }
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), chunks[0]);
     f.render_widget(
-        Paragraph::new(Line::from(footer_pill("Esc close", theme::PURPLE)))
+        Paragraph::new(Line::from(footer_pill("Esc close", theme.purple, theme)))
             .alignment(Alignment::Center),
         chunks[1],
     );
 }
 
 /// Draw file input overlay for adding files
-fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
+fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState, theme: super::theme::Theme) {
     let area = f.size();
     let popup = centered_rect(60, 7, area);
 
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue))
+        .border_style(Style::default().fg(theme.blue))
         .title(Span::styled(
             " Add File/Folder Path ",
             Style::default()
-                .fg(Color::Blue)
+                .fg(theme.blue)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -784,7 +785,7 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
 
     let hint = Paragraph::new(Line::from(vec![Span::styled(
         "Enter a file or folder path:",
-        Style::default().fg(Color::Gray),
+        Style::default().fg(theme.text_muted),
     )]));
     f.render_widget(hint, chunks[0]);
 
@@ -798,24 +799,24 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState) {
     };
     let input_widget = Paragraph::new(Line::from(vec![Span::styled(
         display_input,
-        Style::default().fg(Color::White),
+        Style::default().fg(theme.text_bright),
     )]))
-    .style(Style::default().bg(Color::Rgb(55, 60, 80)));
+    .style(Style::default().bg(theme.input_focused_bg));
     f.render_widget(input_widget, chunks[1]);
 
     f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
 
     let help = Paragraph::new(Line::from(vec![
-        footer_pill("Enter confirm", theme::GREEN),
+        footer_pill("Enter confirm", theme.green, theme),
         pill_gap(),
-        footer_pill("Esc cancel", theme::PURPLE),
+        footer_pill("Esc cancel", theme.purple, theme),
     ]))
     .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
 
 /// Draw a generic text edit overlay (for editing a single field)
-fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInputState) {
+fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInputState, theme: super::theme::Theme) {
     let area = f.size();
     // Dynamic popup width: 80 if terminal allows it, otherwise shrink to fit.
     // Reserve 4 cols of margin (2 each side) when room allows.
@@ -825,11 +826,11 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue))
+        .border_style(Style::default().fg(theme.blue))
         .title(Span::styled(
             format!(" Edit {} ", label),
             Style::default()
-                .fg(Color::Blue)
+                .fg(theme.blue)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -846,7 +847,7 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
 
     let hint = Paragraph::new(Line::from(vec![Span::styled(
         format!("Enter new {}:", label),
-        Style::default().fg(Color::Gray),
+        Style::default().fg(theme.text_muted),
     )]));
     f.render_widget(hint, chunks[0]);
 
@@ -859,17 +860,17 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
     };
     let input_widget = Paragraph::new(Line::from(vec![Span::styled(
         display_input,
-        Style::default().fg(Color::White),
+        Style::default().fg(theme.text_bright),
     )]))
-    .style(Style::default().bg(Color::Rgb(55, 60, 80)));
+    .style(Style::default().bg(theme.input_focused_bg));
     f.render_widget(input_widget, chunks[1]);
 
     f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
 
     let help = Paragraph::new(Line::from(vec![
-        footer_pill("Enter save", theme::GREEN),
+        footer_pill("Enter save", theme.green, theme),
         pill_gap(),
-        footer_pill("Esc cancel", theme::PURPLE),
+        footer_pill("Esc cancel", theme.purple, theme),
     ]))
     .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
@@ -882,9 +883,10 @@ fn draw_format_settings(
     focus: FormatSettingsFocus,
     help_scroll: Option<usize>,
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     if let Some(scroll) = help_scroll {
-        draw_format_settings_help(f, kind, scroll);
+        draw_format_settings_help(f, kind, scroll, theme);
         return;
     }
     let area = f.size();
@@ -911,11 +913,11 @@ fn draw_format_settings(
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::GREEN))
+        .border_style(Style::default().fg(theme.green))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(theme::GREEN)
+                .fg(theme.green)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -969,30 +971,30 @@ fn draw_format_settings(
             compression_input,
             verify,
             md5,
-        } => draw_flac_fields(f, compression_input, *verify, *md5, focus, &chunks, buttons),
+        } => draw_flac_fields(f, compression_input, *verify, *md5, focus, &chunks, buttons, theme),
         FormatSettingsKind::Aac {
             profile,
             quality_preset,
             bitrate_input,
-        } => draw_aac_fields(f, *profile, *quality_preset, bitrate_input, focus, &chunks, buttons),
+        } => draw_aac_fields(f, *profile, *quality_preset, bitrate_input, focus, &chunks, buttons, theme),
         FormatSettingsKind::Opus {
             content_type,
             quality_preset,
             bitrate_input,
             complexity_input,
-        } => draw_opus_fields(f, *content_type, *quality_preset, bitrate_input, complexity_input, focus, &chunks, buttons),
+        } => draw_opus_fields(f, *content_type, *quality_preset, bitrate_input, complexity_input, focus, &chunks, buttons, theme),
         FormatSettingsKind::Mp3 {
             mode,
             vbr_quality_input,
             quality_preset,
             bitrate_input,
-        } => draw_mp3_fields(f, *mode, vbr_quality_input, *quality_preset, bitrate_input, focus, &chunks, buttons),
+        } => draw_mp3_fields(f, *mode, vbr_quality_input, *quality_preset, bitrate_input, focus, &chunks, buttons, theme),
         FormatSettingsKind::WavPack {
             mode,
             hybrid,
             bitrate_input,
             correction,
-        } => draw_wavpack_fields(f, *mode, *hybrid, bitrate_input, *correction, focus, &chunks, buttons),
+        } => draw_wavpack_fields(f, *mode, *hybrid, bitrate_input, *correction, focus, &chunks, buttons, theme),
         FormatSettingsKind::Ssrc {
             attenuation_input,
             min_phase,
@@ -1006,8 +1008,7 @@ fn draw_format_settings(
             pdf_type_input,
             focus,
             &chunks,
-            buttons,
-        ),
+            buttons, theme),
         FormatSettingsKind::Sox {
             chebyshev,
             bandwidth_input,
@@ -1023,22 +1024,21 @@ fn draw_format_settings(
             f, *chebyshev, bandwidth_input, phase_input, *allow_aliasing,
             sinc_taps_input, sinc_attenuation_input, sinc_passband_input,
             sinc_transition_input, sinc_kaiser_beta_input, *sinc_phase,
-            focus, &chunks, buttons,
-        ),
+            focus, &chunks, buttons, theme),
         FormatSettingsKind::Soxr {
             chebyshev,
             cutoff_input,
             phase_input,
-        } => draw_soxr_fields(f, *chebyshev, cutoff_input, phase_input, focus, &chunks, buttons),
+        } => draw_soxr_fields(f, *chebyshev, cutoff_input, phase_input, focus, &chunks, buttons, theme),
     }
 
     // Footer (shared)
     let footer = Paragraph::new(Line::from(vec![
-        footer_pill("Enter save", theme::GREEN),
+        footer_pill("Enter save", theme.green, theme),
         pill_gap(),
-        footer_pill("Esc cancel", theme::PURPLE),
+        footer_pill("Esc cancel", theme.purple, theme),
         pill_gap(),
-        footer_pill("? help", theme::BLUE),
+        footer_pill("? help", theme.blue, theme),
     ]))
     .alignment(Alignment::Center);
     f.render_widget(footer, chunks[footer_idx]);
@@ -1052,23 +1052,24 @@ fn draw_flac_fields(
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     // Compression level (text input field)
     let comp_focused = focus == FormatSettingsFocus::Compression;
-    let comp_label_style = if comp_focused { theme::bright() } else { theme::muted() };
+    let comp_label_style = if comp_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[1].width.saturating_sub(16) as usize;
     let (view, cursor_col) = compression_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
     let input_bg = if comp_focused {
-        Color::Rgb(55, 60, 80)
+        theme.input_focused_bg
     } else {
-        Color::Rgb(40, 45, 65)
+        theme.input_unfocused_bg
     };
     let comp_line = Line::from(vec![
         Span::styled("  compression  ", comp_label_style),
         Span::styled(
             format!(" {} ", display_val),
-            Style::default().fg(Color::White).bg(input_bg),
+            Style::default().fg(theme.text_bright).bg(input_bg),
         ),
     ]);
     f.render_widget(Paragraph::new(comp_line), chunks[1]);
@@ -1078,8 +1079,8 @@ fn draw_flac_fields(
 
     // Verify toggle pills
     let verify_focused = focus == FormatSettingsFocus::Verify;
-    let verify_label_style = if verify_focused { theme::bright() } else { theme::muted() };
-    let (off_style, on_style) = toggle_pill_styles(verify, verify_focused);
+    let verify_label_style = if verify_focused { theme.bright() } else { theme.muted() };
+    let (off_style, on_style) = toggle_pill_styles(verify, verify_focused, theme);
     let verify_line = Line::from(vec![
         Span::styled("  verify       ", verify_label_style),
         Span::styled(" off ", off_style),
@@ -1096,8 +1097,8 @@ fn draw_flac_fields(
 
     // MD5 checksum toggle pills
     let md5_focused = focus == FormatSettingsFocus::Md5;
-    let md5_label_style = if md5_focused { theme::bright() } else { theme::muted() };
-    let (off_style_md5, on_style_md5) = toggle_pill_styles(md5, md5_focused);
+    let md5_label_style = if md5_focused { theme.bright() } else { theme.muted() };
+    let (off_style_md5, on_style_md5) = toggle_pill_styles(md5, md5_focused, theme);
     let md5_line = Line::from(vec![
         Span::styled("  md5 checksum ", md5_label_style),
         Span::styled(" on ", on_style_md5),
@@ -1121,12 +1122,13 @@ fn draw_aac_fields(
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     use tonepoet_pipeline::enums::AacProfile;
 
     // Profile pills: LC / HE / HEv2
     let prof_focused = focus == FormatSettingsFocus::AacProfile;
-    let prof_label_style = if prof_focused { theme::bright() } else { theme::muted() };
+    let prof_label_style = if prof_focused { theme.bright() } else { theme.muted() };
     let profiles = [
         (AacProfile::LcAac, "LC"),
         (AacProfile::HeAac, "HE"),
@@ -1138,13 +1140,13 @@ fn draw_aac_fields(
         let selected = *p == profile;
         let style = if selected {
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::GREEN)
+                .fg(theme.pill_active_fg)
+                .bg(theme.green)
                 .add_modifier(Modifier::BOLD)
         } else if prof_focused {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
@@ -1163,7 +1165,7 @@ fn draw_aac_fields(
 
     // Quality preset pills (profile-dependent)
     let qual_focused = focus == FormatSettingsFocus::AacQuality;
-    let qual_label_style = if qual_focused { theme::bright() } else { theme::muted() };
+    let qual_label_style = if qual_focused { theme.bright() } else { theme.muted() };
     let presets = super::app::aac_presets_for_profile(profile);
     let mut qual_spans = vec![Span::styled("  quality      ", qual_label_style)];
     let mut qx = chunks[2].x + 15;
@@ -1171,13 +1173,13 @@ fn draw_aac_fields(
         let selected = quality_preset == Some(i);
         let style = if selected {
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::GREEN)
+                .fg(theme.pill_active_fg)
+                .bg(theme.green)
                 .add_modifier(Modifier::BOLD)
         } else if qual_focused {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
@@ -1196,22 +1198,22 @@ fn draw_aac_fields(
 
     // Bitrate text entry field
     let br_focused = focus == FormatSettingsFocus::AacBitrate;
-    let br_label_style = if br_focused { theme::bright() } else { theme::muted() };
+    let br_label_style = if br_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[3].width.saturating_sub(22) as usize; // label(15) + suffix(~7)
     let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
     let input_bg = if br_focused {
-        Color::Rgb(55, 60, 80)
+        theme.input_focused_bg
     } else {
-        Color::Rgb(40, 45, 65)
+        theme.input_unfocused_bg
     };
     let br_line = Line::from(vec![
         Span::styled("  bitrate      ", br_label_style),
         Span::styled(
             format!(" {} ", display_val),
-            Style::default().fg(Color::White).bg(input_bg),
+            Style::default().fg(theme.text_bright).bg(input_bg),
         ),
-        Span::styled(" kbps", theme::muted()),
+        Span::styled(" kbps", theme.muted()),
     ]);
     f.render_widget(Paragraph::new(br_line), chunks[3]);
     if br_focused {
@@ -1230,12 +1232,13 @@ fn draw_opus_fields(
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     use tonepoet_pipeline::enums::OpusContentType;
 
     // Content type pills: auto / music / speech
     let ct_focused = focus == FormatSettingsFocus::OpusContentType;
-    let ct_label_style = if ct_focused { theme::bright() } else { theme::muted() };
+    let ct_label_style = if ct_focused { theme.bright() } else { theme.muted() };
     let types = [
         (OpusContentType::Auto, "auto"),
         (OpusContentType::Music, "music"),
@@ -1247,13 +1250,13 @@ fn draw_opus_fields(
         let selected = *t == content_type;
         let style = if selected {
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::GREEN)
+                .fg(theme.pill_active_fg)
+                .bg(theme.green)
                 .add_modifier(Modifier::BOLD)
         } else if ct_focused {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
@@ -1272,7 +1275,7 @@ fn draw_opus_fields(
 
     // Quality preset pills
     let qual_focused = focus == FormatSettingsFocus::OpusQuality;
-    let qual_label_style = if qual_focused { theme::bright() } else { theme::muted() };
+    let qual_label_style = if qual_focused { theme.bright() } else { theme.muted() };
     let presets = super::app::OPUS_PRESETS;
     let mut qual_spans = vec![Span::styled("  quality      ", qual_label_style)];
     let mut qx = chunks[2].x + 15;
@@ -1280,13 +1283,13 @@ fn draw_opus_fields(
         let selected = quality_preset == Some(i);
         let style = if selected {
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::GREEN)
+                .fg(theme.pill_active_fg)
+                .bg(theme.green)
                 .add_modifier(Modifier::BOLD)
         } else if qual_focused {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
@@ -1305,22 +1308,22 @@ fn draw_opus_fields(
 
     // Bitrate text entry field
     let br_focused = focus == FormatSettingsFocus::OpusBitrate;
-    let br_label_style = if br_focused { theme::bright() } else { theme::muted() };
+    let br_label_style = if br_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[3].width.saturating_sub(22) as usize;
     let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
     let input_bg = if br_focused {
-        Color::Rgb(55, 60, 80)
+        theme.input_focused_bg
     } else {
-        Color::Rgb(40, 45, 65)
+        theme.input_unfocused_bg
     };
     let br_line = Line::from(vec![
         Span::styled("  bitrate      ", br_label_style),
         Span::styled(
             format!(" {} ", display_val),
-            Style::default().fg(Color::White).bg(input_bg),
+            Style::default().fg(theme.text_bright).bg(input_bg),
         ),
-        Span::styled(" kbps", theme::muted()),
+        Span::styled(" kbps", theme.muted()),
     ]);
     f.render_widget(Paragraph::new(br_line), chunks[3]);
     if br_focused {
@@ -1329,20 +1332,20 @@ fn draw_opus_fields(
 
     // Complexity text entry field
     let comp_focused = focus == FormatSettingsFocus::OpusComplexity;
-    let comp_label_style = if comp_focused { theme::bright() } else { theme::muted() };
+    let comp_label_style = if comp_focused { theme.bright() } else { theme.muted() };
     let visible_width_c = chunks[4].width.saturating_sub(16) as usize;
     let (view_c, cursor_col_c) = complexity_input.view(visible_width_c.max(1));
     let display_val_c = if view_c.is_empty() { " ".to_string() } else { view_c };
     let comp_bg = if comp_focused {
-        Color::Rgb(55, 60, 80)
+        theme.input_focused_bg
     } else {
-        Color::Rgb(40, 45, 65)
+        theme.input_unfocused_bg
     };
     let comp_line = Line::from(vec![
         Span::styled("  complexity   ", comp_label_style),
         Span::styled(
             format!(" {} ", display_val_c),
-            Style::default().fg(Color::White).bg(comp_bg),
+            Style::default().fg(theme.text_bright).bg(comp_bg),
         ),
     ]);
     f.render_widget(Paragraph::new(comp_line), chunks[4]);
@@ -1360,16 +1363,17 @@ fn draw_mp3_fields(
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     use tonepoet_pipeline::enums::Mp3Mode;
 
     let is_vbr = mode == Mp3Mode::Vbr;
-    let greyed = Style::default().fg(Color::DarkGray);
-    let greyed_bg = Color::Rgb(30, 33, 45);
+    let greyed = Style::default().fg(theme.text_dim);
+    let greyed_bg = theme.input_disabled_bg;
 
     // Row 1: Mode pills (VBR/CBR/ABR) — always active
     let mode_focused = focus == FormatSettingsFocus::Mp3Mode;
-    let mode_label_style = if mode_focused { theme::bright() } else { theme::muted() };
+    let mode_label_style = if mode_focused { theme.bright() } else { theme.muted() };
     let modes = [
         (Mp3Mode::Vbr, "VBR"),
         (Mp3Mode::Cbr, "CBR"),
@@ -1381,13 +1385,13 @@ fn draw_mp3_fields(
         let selected = *m == mode;
         let style = if selected {
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::GREEN)
+                .fg(theme.pill_active_fg)
+                .bg(theme.green)
                 .add_modifier(Modifier::BOLD)
         } else if mode_focused {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
@@ -1406,18 +1410,18 @@ fn draw_mp3_fields(
 
     // Row 2: VBR quality text entry — greyed when CBR/ABR
     let vbr_focused = focus == FormatSettingsFocus::Mp3VbrQuality;
-    let vbr_label_style = if !is_vbr { greyed } else if vbr_focused { theme::bright() } else { theme::muted() };
+    let vbr_label_style = if !is_vbr { greyed } else if vbr_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[2].width.saturating_sub(16) as usize;
     let (view, cursor_col) = vbr_quality_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
     let input_bg = if !is_vbr {
         greyed_bg
     } else if vbr_focused {
-        Color::Rgb(55, 60, 80)
+        theme.input_focused_bg
     } else {
-        Color::Rgb(40, 45, 65)
+        theme.input_unfocused_bg
     };
-    let fg = if !is_vbr { Color::DarkGray } else { Color::White };
+    let fg = if !is_vbr { theme.text_dim } else { theme.text_bright };
     let vbr_line = Line::from(vec![
         Span::styled("  vbr quality  ", vbr_label_style),
         Span::styled(
@@ -1432,7 +1436,7 @@ fn draw_mp3_fields(
 
     // Row 3: Preset pills — greyed when VBR
     let preset_focused = focus == FormatSettingsFocus::Mp3Preset;
-    let preset_label_style = if is_vbr { greyed } else if preset_focused { theme::bright() } else { theme::muted() };
+    let preset_label_style = if is_vbr { greyed } else if preset_focused { theme.bright() } else { theme.muted() };
     let presets = super::app::MP3_BITRATE_PRESETS;
     let mut preset_spans = vec![Span::styled("  preset       ", preset_label_style)];
     let mut px = chunks[3].x + 15;
@@ -1442,13 +1446,13 @@ fn draw_mp3_fields(
             greyed
         } else if selected {
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::GREEN)
+                .fg(theme.pill_active_fg)
+                .bg(theme.green)
                 .add_modifier(Modifier::BOLD)
         } else if preset_focused {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
@@ -1470,25 +1474,25 @@ fn draw_mp3_fields(
 
     // Row 4: Bitrate text entry — greyed when VBR
     let br_focused = focus == FormatSettingsFocus::Mp3Bitrate;
-    let br_label_style = if is_vbr { greyed } else if br_focused { theme::bright() } else { theme::muted() };
+    let br_label_style = if is_vbr { greyed } else if br_focused { theme.bright() } else { theme.muted() };
     let visible_width_br = chunks[4].width.saturating_sub(22) as usize;
     let (view_br, cursor_col_br) = bitrate_input.view(visible_width_br.max(1));
     let display_val_br = if view_br.is_empty() { " ".to_string() } else { view_br };
     let br_bg = if is_vbr {
         greyed_bg
     } else if br_focused {
-        Color::Rgb(55, 60, 80)
+        theme.input_focused_bg
     } else {
-        Color::Rgb(40, 45, 65)
+        theme.input_unfocused_bg
     };
-    let br_fg = if is_vbr { Color::DarkGray } else { Color::White };
+    let br_fg = if is_vbr { theme.text_dim } else { theme.text_bright };
     let br_line = Line::from(vec![
         Span::styled("  bitrate      ", br_label_style),
         Span::styled(
             format!(" {} ", display_val_br),
             Style::default().fg(br_fg).bg(br_bg),
         ),
-        Span::styled(" kbps", if is_vbr { greyed } else { theme::muted() }),
+        Span::styled(" kbps", if is_vbr { greyed } else { theme.muted() }),
     ]);
     f.render_widget(Paragraph::new(br_line), chunks[4]);
     if br_focused && !is_vbr {
@@ -1505,15 +1509,16 @@ fn draw_wavpack_fields(
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     use tonepoet_pipeline::enums::WavPackMode;
 
-    let greyed = Style::default().fg(Color::DarkGray);
-    let greyed_bg = Color::Rgb(30, 33, 45);
+    let greyed = Style::default().fg(theme.text_dim);
+    let greyed_bg = theme.input_disabled_bg;
 
     // Row 1: Mode pills (fast/normal/high/very high) — always active
     let mode_focused = focus == FormatSettingsFocus::WavPackMode;
-    let mode_label_style = if mode_focused { theme::bright() } else { theme::muted() };
+    let mode_label_style = if mode_focused { theme.bright() } else { theme.muted() };
     let modes = [
         (WavPackMode::Fast, "fast"),
         (WavPackMode::Normal, "normal"),
@@ -1526,13 +1531,13 @@ fn draw_wavpack_fields(
         let selected = *m == mode;
         let style = if selected {
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
-                .bg(theme::GREEN)
+                .fg(theme.pill_active_fg)
+                .bg(theme.green)
                 .add_modifier(Modifier::BOLD)
         } else if mode_focused {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
@@ -1551,8 +1556,8 @@ fn draw_wavpack_fields(
 
     // Row 2: Hybrid toggle (off/on) — always active
     let hyb_focused = focus == FormatSettingsFocus::WavPackHybrid;
-    let hyb_label_style = if hyb_focused { theme::bright() } else { theme::muted() };
-    let (off_style, on_style) = toggle_pill_styles(hybrid, hyb_focused);
+    let hyb_label_style = if hyb_focused { theme.bright() } else { theme.muted() };
+    let (off_style, on_style) = toggle_pill_styles(hybrid, hyb_focused, theme);
     let hyb_line = Line::from(vec![
         Span::styled("  hybrid       ", hyb_label_style),
         Span::styled(" off ", off_style),
@@ -1566,19 +1571,19 @@ fn draw_wavpack_fields(
 
     // Row 3: Bitrate text entry — greyed when hybrid off
     let br_focused = focus == FormatSettingsFocus::WavPackBitrate;
-    let br_label_style = if !hybrid { greyed } else if br_focused { theme::bright() } else { theme::muted() };
+    let br_label_style = if !hybrid { greyed } else if br_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[3].width.saturating_sub(24) as usize;
     let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
     let display_val = if view.is_empty() { " ".to_string() } else { view };
-    let br_bg = if !hybrid { greyed_bg } else if br_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
-    let br_fg = if !hybrid { Color::DarkGray } else { Color::White };
+    let br_bg = if !hybrid { greyed_bg } else if br_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
+    let br_fg = if !hybrid { theme.text_dim } else { theme.text_bright };
     let br_line = Line::from(vec![
         Span::styled("  bitrate      ", br_label_style),
         Span::styled(
             format!(" {} ", display_val),
             Style::default().fg(br_fg).bg(br_bg),
         ),
-        Span::styled(" kbps/ch", if !hybrid { greyed } else { theme::muted() }),
+        Span::styled(" kbps/ch", if !hybrid { greyed } else { theme.muted() }),
     ]);
     f.render_widget(Paragraph::new(br_line), chunks[3]);
     if br_focused && hybrid {
@@ -1587,9 +1592,9 @@ fn draw_wavpack_fields(
 
     // Row 4: Correction toggle (off/on) — greyed when hybrid off
     let cor_focused = focus == FormatSettingsFocus::WavPackCorrection;
-    let cor_label_style = if !hybrid { greyed } else if cor_focused { theme::bright() } else { theme::muted() };
+    let cor_label_style = if !hybrid { greyed } else if cor_focused { theme.bright() } else { theme.muted() };
     if hybrid {
-        let (cor_off, cor_on) = toggle_pill_styles(correction, cor_focused);
+        let (cor_off, cor_on) = toggle_pill_styles(correction, cor_focused, theme);
         let cor_line = Line::from(vec![
             Span::styled("  correction   ", cor_label_style),
             Span::styled(" off ", cor_off),
@@ -1621,10 +1626,11 @@ fn draw_ssrc_fields(
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     // Row 1: Attenuation text entry
     let att_focused = focus == FormatSettingsFocus::SsrcAttenuation;
-    let att_ls = if att_focused { theme::bright() } else { theme::muted() };
+    let att_ls = if att_focused { theme.bright() } else { theme.muted() };
     let att_vw = chunks[1].width.saturating_sub(22) as usize;
     let (att_v, att_cc) = attenuation_input.view(att_vw.max(1));
     let (att_d, att_is_placeholder) = if att_v.is_empty() {
@@ -1633,16 +1639,16 @@ fn draw_ssrc_fields(
         (att_v, false)
     };
     let att_bg = if att_focused {
-        Color::Rgb(55, 60, 80)
+        theme.input_focused_bg
     } else {
-        Color::Rgb(40, 45, 65)
+        theme.input_unfocused_bg
     };
-    let att_fg = if att_is_placeholder { theme::TEXT_DIM } else { Color::White };
+    let att_fg = if att_is_placeholder { theme.text_dim } else { theme.text_bright };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("  attenuation    ", att_ls),
             Span::styled(format!(" {} ", att_d), Style::default().fg(att_fg).bg(att_bg)),
-            Span::styled(" dB", theme::muted()),
+            Span::styled(" dB", theme.muted()),
         ])),
         chunks[1],
     );
@@ -1652,8 +1658,8 @@ fn draw_ssrc_fields(
 
     // Row 2: Min phase toggle (off/on)
     let mp_focused = focus == FormatSettingsFocus::SsrcMinPhase;
-    let mp_ls = if mp_focused { theme::bright() } else { theme::muted() };
-    let (mp_off, mp_on) = toggle_pill_styles(min_phase, mp_focused);
+    let mp_ls = if mp_focused { theme.bright() } else { theme.muted() };
+    let (mp_off, mp_on) = toggle_pill_styles(min_phase, mp_focused, theme);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("  min phase      ", mp_ls),
@@ -1675,7 +1681,7 @@ fn draw_ssrc_fields(
 
     // Row 3: Explicit SSRC --dither ID text entry
     let dither_focused = focus == FormatSettingsFocus::SsrcDitherId;
-    let dither_ls = if dither_focused { theme::bright() } else { theme::muted() };
+    let dither_ls = if dither_focused { theme.bright() } else { theme.muted() };
     draw_ssrc_numeric_input(
         f,
         chunks[3],
@@ -1684,12 +1690,11 @@ fn draw_ssrc_fields(
         dither_id_input,
         dither_ls,
         dither_focused,
-        "0-99",
-    );
+        "0-99", theme);
 
     // Row 4: Explicit SSRC --pdf type text entry
     let pdf_focused = focus == FormatSettingsFocus::SsrcPdf;
-    let pdf_ls = if pdf_focused { theme::bright() } else { theme::muted() };
+    let pdf_ls = if pdf_focused { theme.bright() } else { theme.muted() };
     draw_ssrc_numeric_input(
         f,
         chunks[4],
@@ -1698,8 +1703,7 @@ fn draw_ssrc_fields(
         pdf_type_input,
         pdf_ls,
         pdf_focused,
-        "0=rect 1=tri",
-    );
+        "0=rect 1=tri", theme);
 }
 
 fn draw_ssrc_numeric_input(
@@ -1711,6 +1715,7 @@ fn draw_ssrc_numeric_input(
     label_style: Style,
     focused: bool,
     suffix: &'static str,
+    theme: super::theme::Theme,
 ) {
     let visible_width = rect.width.saturating_sub(31) as usize;
     let (view, cursor_col) = input.view(visible_width.max(1));
@@ -1720,17 +1725,17 @@ fn draw_ssrc_numeric_input(
         (view, false)
     };
     let input_bg = if focused {
-        Color::Rgb(55, 60, 80)
+        theme.input_focused_bg
     } else {
-        Color::Rgb(40, 45, 65)
+        theme.input_unfocused_bg
     };
-    let input_fg = if is_placeholder { theme::TEXT_DIM } else { Color::White };
+    let input_fg = if is_placeholder { theme.text_dim } else { theme.text_bright };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(label, label_style),
             Span::styled(format!(" {} ", display), Style::default().fg(input_fg).bg(input_bg)),
             Span::raw("  "),
-            Span::styled(suffix, theme::muted()),
+            Span::styled(suffix, theme.muted()),
         ])),
         rect,
     );
@@ -2219,7 +2224,7 @@ pub fn format_settings_help_popup_rect(area_w: u16, area_h: u16) -> Rect {
 }
 
 /// Render context-specific help text for the format/resampler settings overlay.
-fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind, scroll: usize) {
+fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind, scroll: usize, theme: super::theme::Theme) {
     let area = f.size();
     let popup = format_settings_help_popup_rect(area.width, area.height);
 
@@ -2237,11 +2242,11 @@ fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind, scroll: u
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BLUE))
+        .border_style(Style::default().fg(theme.blue))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(theme::BLUE)
+                .fg(theme.blue)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -2266,7 +2271,7 @@ fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind, scroll: u
         }
         all_lines.push(Line::from(Span::styled(
             format!("  {}", label),
-            Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.green).add_modifier(Modifier::BOLD),
         )));
         for d in *desc {
             if d.is_empty() {
@@ -2274,7 +2279,7 @@ fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind, scroll: u
             } else {
                 all_lines.push(Line::from(Span::styled(
                     format!("      {}", d),
-                    Style::default().fg(theme::TEXT),
+                    Style::default().fg(theme.text),
                 )));
             }
         }
@@ -2288,10 +2293,10 @@ fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind, scroll: u
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer: Esc close + scroll indicator if content overflows.
-    let mut footer_spans = vec![footer_pill("Esc close", theme::PURPLE)];
+    let mut footer_spans = vec![footer_pill("Esc close", theme.purple, theme)];
     if total > visible {
         footer_spans.push(pill_gap());
-        footer_spans.push(footer_pill("↑↓ scroll", theme::BLUE));
+        footer_spans.push(footer_pill("↑↓ scroll", theme.blue, theme));
     }
     let footer = Paragraph::new(Line::from(footer_spans)).alignment(Alignment::Center);
     f.render_widget(footer, chunks[1]);
@@ -2312,18 +2317,19 @@ fn draw_sox_fields(
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     use tonepoet_pipeline::enums::SoxSincPhase;
 
-    let greyed = Style::default().fg(Color::DarkGray);
-    let greyed_bg = Color::Rgb(30, 33, 45);
+    let greyed = Style::default().fg(theme.text_dim);
+    let greyed_bg = theme.input_disabled_bg;
 
     // ── Rate section (chunks[1..4]) ──
 
     // Row 1: Chebyshev toggle
     let cheb_focused = focus == FormatSettingsFocus::SoxChebyshev;
-    let cheb_label_style = if cheb_focused { theme::bright() } else { theme::muted() };
-    let (off_s, on_s) = toggle_pill_styles(chebyshev, cheb_focused);
+    let cheb_label_style = if cheb_focused { theme.bright() } else { theme.muted() };
+    let (off_s, on_s) = toggle_pill_styles(chebyshev, cheb_focused, theme);
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  chebyshev       ", cheb_label_style),
         Span::styled(" off ", off_s), Span::raw(" "), Span::styled(" on ", on_s),
@@ -2334,27 +2340,27 @@ fn draw_sox_fields(
 
     // Row 2: Nyquist cutoff — greyed when chebyshev on
     let bw_focused = focus == FormatSettingsFocus::SoxBandwidth;
-    let bw_ls = if chebyshev { greyed } else if bw_focused { theme::bright() } else { theme::muted() };
+    let bw_ls = if chebyshev { greyed } else if bw_focused { theme.bright() } else { theme.muted() };
     let bw_vw = chunks[2].width.saturating_sub(22) as usize;
     let (bw_v, bw_cc) = bandwidth_input.view(bw_vw.max(1));
     let (bw_d, bw_is_placeholder) = if bw_v.is_empty() { ("95".to_string(), true) } else { (bw_v, false) };
-    let bw_bg = if chebyshev { greyed_bg } else if bw_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
-    let bw_fg = if chebyshev { Color::DarkGray } else if bw_is_placeholder { theme::TEXT_DIM } else { Color::White };
+    let bw_bg = if chebyshev { greyed_bg } else if bw_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
+    let bw_fg = if chebyshev { theme.text_dim } else if bw_is_placeholder { theme.text_dim } else { theme.text_bright };
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  nyquist cutoff  ", bw_ls),
         Span::styled(format!(" {} ", bw_d), Style::default().fg(bw_fg).bg(bw_bg)),
-        Span::styled(" %", if chebyshev { greyed } else { theme::muted() }),
+        Span::styled(" %", if chebyshev { greyed } else { theme.muted() }),
     ])), chunks[2]);
     if bw_focused && !chebyshev { f.set_cursor(chunks[2].x + 19 + bw_cc, chunks[2].y); }
 
     // Row 3: Phase
     let ph_focused = focus == FormatSettingsFocus::SoxPhase;
-    let ph_ls = if ph_focused { theme::bright() } else { theme::muted() };
+    let ph_ls = if ph_focused { theme.bright() } else { theme.muted() };
     let ph_vw = chunks[3].width.saturating_sub(19) as usize;
     let (ph_v, ph_cc) = phase_input.view(ph_vw.max(1));
     let (ph_d, ph_is_placeholder) = if ph_v.is_empty() { ("50".to_string(), true) } else { (ph_v, false) };
-    let ph_bg = if ph_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
-    let ph_fg = if ph_is_placeholder { theme::TEXT_DIM } else { Color::White };
+    let ph_bg = if ph_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
+    let ph_fg = if ph_is_placeholder { theme.text_dim } else { theme.text_bright };
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  phase           ", ph_ls),
         Span::styled(format!(" {} ", ph_d), Style::default().fg(ph_fg).bg(ph_bg)),
@@ -2363,8 +2369,8 @@ fn draw_sox_fields(
 
     // Row 4: Aliasing toggle
     let al_focused = focus == FormatSettingsFocus::SoxAliasing;
-    let al_ls = if al_focused { theme::bright() } else { theme::muted() };
-    let (al_off, al_on) = toggle_pill_styles(allow_aliasing, al_focused);
+    let al_ls = if al_focused { theme.bright() } else { theme.muted() };
+    let (al_off, al_on) = toggle_pill_styles(allow_aliasing, al_focused, theme);
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  aliasing        ", al_ls),
         Span::styled(" off ", al_off), Span::raw(" "), Span::styled(" on ", al_on),
@@ -2375,47 +2381,54 @@ fn draw_sox_fields(
 
     // ── Sinc section header (chunks[6]) + fields (chunks[7..12]) ──
 
-    let sinc_label_style = if focused_in_sinc(focus) { theme::bright() } else { theme::muted() };
+    let sinc_label_style = if focused_in_sinc(focus) { theme.bright() } else { theme.muted() };
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled("  sinc filter", sinc_label_style),
     ])), chunks[6]);
 
-    // Helper: render a text entry row for sinc fields
+    // Helper: render a text entry row for sinc fields.
     fn sinc_text_row<'a>(
-        label: &'a str, input: &super::text_input::TextInputState, suffix: &'a str,
-        focused: bool, chunk: Rect, f: &mut Frame,
+        label: &'a str,
+        input: &super::text_input::TextInputState,
+        suffix: &'a str,
+        focused: bool,
+        chunk: Rect,
+        f: &mut Frame,
+        theme: super::theme::Theme,
     ) -> u16 {
-        let ls = if focused { theme::bright() } else { theme::muted() };
+        let ls = if focused { theme.bright() } else { theme.muted() };
         let vw = chunk.width.saturating_sub(22) as usize;
         let (v, cc) = input.view(vw.max(1));
         let d = if v.is_empty() { " ".to_string() } else { v };
-        let bg = if focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
+        let bg = if focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
         let mut spans = vec![
             Span::styled(label, ls),
-            Span::styled(format!(" {} ", d), Style::default().fg(Color::White).bg(bg)),
+            Span::styled(format!(" {} ", d), Style::default().fg(theme.text_bright).bg(bg)),
         ];
         if !suffix.is_empty() {
-            spans.push(Span::styled(suffix, theme::muted()));
+            spans.push(Span::styled(suffix, theme.muted()));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), chunk);
-        if focused { f.set_cursor(chunk.x + 19 + cc, chunk.y); }
+        if focused {
+            f.set_cursor(chunk.x + 19 + cc, chunk.y);
+        }
         cc
     }
 
     sinc_text_row("  taps            ", sinc_taps_input, "",
-        focus == FormatSettingsFocus::SoxSincTaps, chunks[7], f);
+        focus == FormatSettingsFocus::SoxSincTaps, chunks[7], f, theme);
     sinc_text_row("  attenuation     ", sinc_attenuation_input, " dB",
-        focus == FormatSettingsFocus::SoxSincAttenuation, chunks[8], f);
+        focus == FormatSettingsFocus::SoxSincAttenuation, chunks[8], f, theme);
     sinc_text_row("  passband        ", sinc_passband_input, " Hz",
-        focus == FormatSettingsFocus::SoxSincPassband, chunks[9], f);
+        focus == FormatSettingsFocus::SoxSincPassband, chunks[9], f, theme);
     sinc_text_row("  transition      ", sinc_transition_input, " Hz",
-        focus == FormatSettingsFocus::SoxSincTransition, chunks[10], f);
+        focus == FormatSettingsFocus::SoxSincTransition, chunks[10], f, theme);
     sinc_text_row("  kaiser beta     ", sinc_kaiser_beta_input, "",
-        focus == FormatSettingsFocus::SoxSincKaiserBeta, chunks[11], f);
+        focus == FormatSettingsFocus::SoxSincKaiserBeta, chunks[11], f, theme);
 
     // Row 12: Sinc phase pills (linear/minimum/intermediate)
     let sp_focused = focus == FormatSettingsFocus::SoxSincPhase;
-    let sp_ls = if sp_focused { theme::bright() } else { theme::muted() };
+    let sp_ls = if sp_focused { theme.bright() } else { theme.muted() };
     let phases = [
         (Some(SoxSincPhase::Linear), "linear"),
         (Some(SoxSincPhase::Minimum), "minimum"),
@@ -2426,11 +2439,11 @@ fn draw_sox_fields(
     for (i, (p, label)) in phases.iter().enumerate() {
         let selected = *p == sinc_phase;
         let style = if selected {
-            Style::default().fg(theme::PILL_ACTIVE_FG).bg(theme::GREEN).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.pill_active_fg).bg(theme.green).add_modifier(Modifier::BOLD)
         } else if sp_focused {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
         let pill_w = pill_text.len() as u16;
@@ -2461,11 +2474,12 @@ fn draw_soxr_fields(
     focus: FormatSettingsFocus,
     chunks: &[Rect],
     buttons: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     // Row 1: Chebyshev toggle (off/on)
     let cheb_focused = focus == FormatSettingsFocus::SoxrChebyshev;
-    let cheb_label_style = if cheb_focused { theme::bright() } else { theme::muted() };
-    let (off_style, on_style) = toggle_pill_styles(chebyshev, cheb_focused);
+    let cheb_label_style = if cheb_focused { theme.bright() } else { theme.muted() };
+    let (off_style, on_style) = toggle_pill_styles(chebyshev, cheb_focused, theme);
     let cheb_line = Line::from(vec![
         Span::styled("  chebyshev       ", cheb_label_style),
         Span::styled(" off ", off_style),
@@ -2479,16 +2493,16 @@ fn draw_soxr_fields(
 
     // Row 2: Cutoff text entry
     let co_focused = focus == FormatSettingsFocus::SoxrCutoff;
-    let co_label_style = if co_focused { theme::bright() } else { theme::muted() };
+    let co_label_style = if co_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[2].width.saturating_sub(20) as usize;
     let (view, cursor_col) = cutoff_input.view(visible_width.max(1));
     let (display_val, co_is_placeholder) = if view.is_empty() { ("95".to_string(), true) } else { (view, false) };
-    let co_bg = if co_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
-    let co_fg = if co_is_placeholder { theme::TEXT_DIM } else { Color::White };
+    let co_bg = if co_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
+    let co_fg = if co_is_placeholder { theme.text_dim } else { theme.text_bright };
     let co_line = Line::from(vec![
         Span::styled("  nyquist cutoff  ", co_label_style),
         Span::styled(format!(" {} ", display_val), Style::default().fg(co_fg).bg(co_bg)),
-        Span::styled(" %", theme::muted()),
+        Span::styled(" %", theme.muted()),
     ]);
     f.render_widget(Paragraph::new(co_line), chunks[2]);
     if co_focused {
@@ -2497,12 +2511,12 @@ fn draw_soxr_fields(
 
     // Row 3: Phase text entry
     let ph_focused = focus == FormatSettingsFocus::SoxrPhase;
-    let ph_label_style = if ph_focused { theme::bright() } else { theme::muted() };
+    let ph_label_style = if ph_focused { theme.bright() } else { theme.muted() };
     let visible_width_ph = chunks[3].width.saturating_sub(16) as usize;
     let (view_ph, cursor_col_ph) = phase_input.view(visible_width_ph.max(1));
     let (display_val_ph, ph_is_placeholder) = if view_ph.is_empty() { ("50".to_string(), true) } else { (view_ph, false) };
-    let ph_bg = if ph_focused { Color::Rgb(55, 60, 80) } else { Color::Rgb(40, 45, 65) };
-    let ph_fg = if ph_is_placeholder { theme::TEXT_DIM } else { Color::White };
+    let ph_bg = if ph_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
+    let ph_fg = if ph_is_placeholder { theme.text_dim } else { theme.text_bright };
     let ph_line = Line::from(vec![
         Span::styled("  phase           ", ph_label_style),
         Span::styled(format!(" {} ", display_val_ph), Style::default().fg(ph_fg).bg(ph_bg)),
@@ -2513,15 +2527,15 @@ fn draw_soxr_fields(
     }
 }
 
-fn toggle_pill_styles(value: bool, focused: bool) -> (Style, Style) {
+fn toggle_pill_styles(value: bool, focused: bool, theme: super::theme::Theme) -> (Style, Style) {
     let active = Style::default()
-        .fg(theme::PILL_ACTIVE_FG)
-        .bg(theme::GREEN)
+        .fg(theme.pill_active_fg)
+        .bg(theme.green)
         .add_modifier(Modifier::BOLD);
     let inactive = if focused {
-        Style::default().fg(theme::TEXT_DIM)
+        Style::default().fg(theme.text_dim)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.text_dim)
     };
     if value {
         (inactive, active) // false=dim, true=active
@@ -2606,6 +2620,7 @@ fn draw_command_input(
     f: &mut Frame,
     input: &super::text_input::TextInputState,
     completion: Option<&super::app::CompletionState>,
+    theme: super::theme::Theme,
 ) {
     let area = f.size();
     // Command line occupies the very last row; when completion is
@@ -2625,11 +2640,11 @@ fn draw_command_input(
 
     // Render ": <input>"
     let line = Line::from(vec![
-        Span::styled(":", Style::default().fg(Color::Rgb(122, 162, 247))), // blue
-        Span::styled(view, Style::default().fg(Color::Rgb(192, 202, 245))), // bright
+        Span::styled(":", Style::default().fg(theme.blue)), // blue
+        Span::styled(view, Style::default().fg(theme.text_bright)), // bright
     ]);
 
-    let cmd = Paragraph::new(line).style(Style::default().bg(Color::Rgb(26, 27, 38))); // BG color
+    let cmd = Paragraph::new(line).style(Style::default().bg(theme.bg)); // BG color
     f.render_widget(cmd, cmd_area);
 
     // Optional hint row above the command line when cycling matches.
@@ -2654,14 +2669,14 @@ fn draw_command_input(
         let elided = if n > preview_n { " …" } else { "" };
 
         let hint_line = Line::from(vec![
-            Span::styled(count, Style::default().fg(Color::Rgb(187, 154, 247))), // purple
-            Span::styled(preview, Style::default().fg(Color::Rgb(169, 177, 214))), // muted bright
+            Span::styled(count, Style::default().fg(theme.purple)), // purple
+            Span::styled(preview, Style::default().fg(theme.text)), // muted bright
             Span::styled(
                 elided.to_string(),
-                Style::default().fg(Color::Rgb(86, 95, 137)),
+                Style::default().fg(theme.text_dim),
             ), // dim
         ]);
-        let hint = Paragraph::new(hint_line).style(Style::default().bg(Color::Rgb(26, 27, 38)));
+        let hint = Paragraph::new(hint_line).style(Style::default().bg(theme.bg));
         f.render_widget(hint, hint_area);
     }
 
@@ -2670,7 +2685,7 @@ fn draw_command_input(
 }
 
 /// Draw the bulk rename wizard overlay.
-fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
+fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState, theme: super::theme::Theme) {
     use super::rename_plan::OpStatus;
 
     let area = f.size();
@@ -2689,11 +2704,11 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::AMBER))
+        .border_style(Style::default().fg(theme.amber))
         .title(Span::styled(
             " Bulk Rename -- Template ",
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -2721,17 +2736,17 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     let template_focused = state.focus == BulkRenameFocus::Template;
     let label_style = if template_focused {
         Style::default()
-            .fg(theme::AMBER)
+            .fg(theme.amber)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme::TEXT_MUTED)
+        Style::default().fg(theme.text_muted)
     };
     let input_w = chunks[0].width.saturating_sub(11) as usize; // "Template: " = 10 chars + 1
     let (visible, cursor_col) = state.template_input.view(input_w);
     let input_style = if template_focused {
-        Style::default().fg(theme::TEXT_BRIGHT)
+        Style::default().fg(theme.text_bright)
     } else {
-        Style::default().fg(theme::TEXT_MUTED)
+        Style::default().fg(theme.text_muted)
     };
     let template_line = Line::from(vec![
         Span::styled("Template: ", label_style),
@@ -2746,7 +2761,7 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     // ── Placeholder hints ────────────────────────────────────────
     let hint = Line::from(Span::styled(
         "%N% %NN% %NNN% %TITLE% %ARTIST% %ALBUM% %YEAR% %GENRE% %CATALOG% %EXT%",
-        Style::default().fg(theme::TEXT_MUTED),
+        Style::default().fg(theme.text_muted),
     ));
     f.render_widget(Paragraph::new(hint), chunks[1]);
 
@@ -2764,18 +2779,18 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     let mut summary_spans = vec![
         Span::styled(
             format!("{} files", total),
-            Style::default().fg(theme::TEXT_BRIGHT),
+            Style::default().fg(theme.text_bright),
         ),
-        Span::styled(" · ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(" · ", Style::default().fg(theme.text_muted)),
         Span::styled(
             format!("{} pending", pending),
-            Style::default().fg(theme::GREEN),
+            Style::default().fg(theme.green),
         ),
     ];
     if skipped > 0 {
         summary_spans.push(Span::styled(
             format!(" · {} skipped", skipped),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme.text_muted),
         ));
     }
     if conflicts > 0 {
@@ -2785,13 +2800,13 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
                 conflicts,
                 if conflicts == 1 { "" } else { "s" }
             ),
-            Style::default().fg(theme::RED),
+            Style::default().fg(theme.destructive),
         ));
     }
     if failed > 0 {
         summary_spans.push(Span::styled(
             format!(" · {} failed", failed),
-            Style::default().fg(theme::RED),
+            Style::default().fg(theme.destructive),
         ));
     }
     let summary = Line::from(summary_spans);
@@ -2800,7 +2815,7 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     // ── Separator ────────────────────────────────────────────────
     let sep = "─".repeat(chunks[4].width as usize);
     f.render_widget(
-        Paragraph::new(Span::styled(sep, Style::default().fg(theme::TEXT_MUTED))),
+        Paragraph::new(Span::styled(sep, Style::default().fg(theme.text_muted))),
         chunks[4],
     );
 
@@ -2839,11 +2854,11 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
             let is_selected = idx == selected && state.focus == BulkRenameFocus::List;
 
             let (icon, icon_color) = match &op.status {
-                OpStatus::Pending => (">>", theme::GREEN),
-                OpStatus::Skipped(_) => ("..", theme::TEXT_MUTED),
-                OpStatus::Conflict => ("!!", theme::RED),
-                OpStatus::Succeeded => ("ok", theme::GREEN),
-                OpStatus::Failed(_) => ("!!", theme::RED),
+                OpStatus::Pending => (">>", theme.green),
+                OpStatus::Skipped(_) => ("..", theme.text_muted),
+                OpStatus::Conflict => ("!!", theme.destructive),
+                OpStatus::Succeeded => ("ok", theme.green),
+                OpStatus::Failed(_) => ("!!", theme.destructive),
             };
 
             let target_name = &op.target_relative;
@@ -2875,25 +2890,25 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
             };
 
             let target_style = match &op.status {
-                OpStatus::Pending => Style::default().fg(theme::TEXT_BRIGHT),
-                OpStatus::Skipped(_) => Style::default().fg(theme::TEXT_MUTED),
-                OpStatus::Conflict => Style::default().fg(theme::RED),
-                OpStatus::Succeeded => Style::default().fg(theme::GREEN),
-                OpStatus::Failed(_) => Style::default().fg(theme::RED),
+                OpStatus::Pending => Style::default().fg(theme.text_bright),
+                OpStatus::Skipped(_) => Style::default().fg(theme.text_muted),
+                OpStatus::Conflict => Style::default().fg(theme.destructive),
+                OpStatus::Succeeded => Style::default().fg(theme.green),
+                OpStatus::Failed(_) => Style::default().fg(theme.destructive),
             };
 
             let line = Line::from(vec![
                 Span::styled(format!("{:<3}", icon), Style::default().fg(icon_color)),
                 Span::styled(target_display, target_style),
-                Span::styled(" <- ", Style::default().fg(theme::TEXT_MUTED)),
-                Span::styled(source_display, Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(" <- ", Style::default().fg(theme.text_muted)),
+                Span::styled(source_display, Style::default().fg(theme.text_muted)),
             ]);
 
             let row_area = Rect::new(list_area.x, list_area.y + row as u16, list_area.width, 1);
 
             if is_selected {
                 let sel_style = Style::default()
-                    .bg(Color::Rgb(52, 56, 80))
+                    .bg(theme.selection_bg)
                     .add_modifier(Modifier::BOLD);
                 f.render_widget(Paragraph::new(line).style(sel_style), row_area);
             } else {
@@ -2905,25 +2920,25 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
     // ── Footer pills ────────────────────────────────────────────
     let footer_parts = if state.focus == BulkRenameFocus::Template {
         vec![
-            footer_pill("Tab list", theme::AMBER),
+            footer_pill("Tab list", theme.amber, theme),
             pill_gap(),
-            footer_pill("Enter commit", theme::GREEN),
+            footer_pill("Enter commit", theme.green, theme),
             pill_gap(),
-            footer_pill("Esc cancel", theme::PURPLE),
+            footer_pill("Esc cancel", theme.purple, theme),
         ]
     } else {
         vec![
-            footer_pill("Tab tmpl", theme::AMBER),
+            footer_pill("Tab tmpl", theme.amber, theme),
             pill_gap(),
-            footer_pill("e edit", theme::CYAN),
+            footer_pill("e edit", theme.cyan, theme),
             pill_gap(),
-            footer_pill("c cue", theme::CYAN),
+            footer_pill("c cue", theme.cyan, theme),
             pill_gap(),
-            footer_pill("C caps", theme::CYAN),
+            footer_pill("C caps", theme.cyan, theme),
             pill_gap(),
-            footer_pill("Enter commit", theme::GREEN),
+            footer_pill("Enter commit", theme.green, theme),
             pill_gap(),
-            footer_pill("Esc cancel", theme::PURPLE),
+            footer_pill("Esc cancel", theme.purple, theme),
         ]
     };
     f.render_widget(
@@ -2933,7 +2948,7 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState) {
 }
 
 /// Draw the analysis results overlay.
-fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scroll: usize) {
+fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scroll: usize, theme: super::theme::Theme) {
     use super::analyze::dr_label;
 
     let area = f.size();
@@ -2951,11 +2966,11 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::PURPLE))
+        .border_style(Style::default().fg(theme.purple))
         .title(Span::styled(
             " Analysis Results ",
             Style::default()
-                .fg(theme::PURPLE)
+                .fg(theme.purple)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -2986,15 +3001,15 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
         lines.push(Line::from(Span::styled(
             format!("  {}", name),
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         )));
 
         let dr_color = match r.dr_value {
-            0..=3 => theme::RED,
-            4..=7 => theme::AMBER,
-            8..=13 => theme::GREEN,
-            _ => theme::CYAN,
+            0..=3 => theme.destructive,
+            4..=7 => theme.amber,
+            8..=13 => theme.green,
+            _ => theme.cyan,
         };
 
         let entries: Vec<(&str, String, Color)> = vec![
@@ -3006,12 +3021,12 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
             (
                 "Sample Peak",
                 format!("{:.1} dBFS", r.peak_db),
-                theme::TEXT_BRIGHT,
+                theme.text_bright,
             ),
             (
                 "RMS Level",
                 format!("{:.1} dBFS", r.rms_db),
-                theme::TEXT_BRIGHT,
+                theme.text_bright,
             ),
             (
                 "Clipping",
@@ -3021,9 +3036,9 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
                     format!("{} samples", r.clipping_count)
                 },
                 if r.clipping_count == 0 {
-                    theme::GREEN
+                    theme.green
                 } else {
-                    theme::RED
+                    theme.destructive
                 },
             ),
             (
@@ -3034,9 +3049,9 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
                     format!("{:.6} (significant!)", r.dc_bias)
                 },
                 if r.dc_bias.abs() < 0.001 {
-                    theme::TEXT_MUTED
+                    theme.text_muted
                 } else {
-                    theme::AMBER
+                    theme.amber
                 },
             ),
             (
@@ -3056,9 +3071,9 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
                     .map(|d| d != r.actual_bit_depth)
                     .unwrap_or(false)
                 {
-                    theme::AMBER
+                    theme.amber
                 } else {
-                    theme::TEXT_BRIGHT
+                    theme.text_bright
                 },
             ),
         ];
@@ -3066,10 +3081,10 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
         // LUFS + true peak (if available).
         let mut extra: Vec<(&str, String, Color)> = Vec::new();
         if let Some(lufs) = r.lufs {
-            extra.push(("Loudness", format!("{:.1} LUFS", lufs), theme::TEXT_BRIGHT));
+            extra.push(("Loudness", format!("{:.1} LUFS", lufs), theme.text_bright));
         }
         if let Some(tp) = r.true_peak_dbtp {
-            extra.push(("True Peak", format!("{:.1} dBTP", tp), theme::TEXT_BRIGHT));
+            extra.push(("True Peak", format!("{:.1} dBTP", tp), theme.text_bright));
         }
         // Pre-emphasis line (Phase 2-safe: PRE flags and catalog candidates only).
         if let Some(pe_conf) = r.preemphasis {
@@ -3098,7 +3113,7 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
                 _ => None,
             };
             if let Some(value) = value {
-                extra.push(("Pre-emphasis", value, theme::AMBER));
+                extra.push(("Pre-emphasis", value, theme.amber));
             }
         }
 
@@ -3106,7 +3121,7 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("    {:<width$}", label, width = label_w),
-                    theme::muted(),
+                    theme.muted(),
                 ),
                 Span::styled(value.clone(), Style::default().fg(*color)),
             ]));
@@ -3117,24 +3132,24 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
             if let Some(ref detail) = r.hdcd_detail {
                 let mut spans = vec![Span::styled(
                     format!("    {:<width$}", "HDCD", width = label_w),
-                    theme::muted(),
+                    theme.muted(),
                 )];
                 // Split "HDCD (details...)" into gold "HDCD" + normal rest.
                 if let Some(rest) = detail.strip_prefix("HDCD") {
                     spans.push(Span::styled(
                         "HDCD",
                         Style::default()
-                            .fg(theme::AMBER)
+                            .fg(theme.amber)
                             .add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
                         rest.to_string(),
-                        Style::default().fg(theme::TEXT_BRIGHT),
+                        Style::default().fg(theme.text_bright),
                     ));
                 } else {
                     spans.push(Span::styled(
                         detail.clone(),
-                        Style::default().fg(theme::TEXT_BRIGHT),
+                        Style::default().fg(theme.text_bright),
                     ));
                 }
                 lines.push(Line::from(spans));
@@ -3151,15 +3166,15 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
 
     // Footer pills.
     let footer = Line::from(vec![
-        footer_pill(":analyze!", theme::AMBER),
+        footer_pill(":analyze!", theme.amber, theme),
         pill_gap(),
-        footer_pill(":write-dr", theme::BLUE),
+        footer_pill(":write-dr", theme.blue, theme),
         pill_gap(),
-        footer_pill(":write-rg-track", theme::GREEN),
+        footer_pill(":write-rg-track", theme.green, theme),
         pill_gap(),
-        footer_pill(":write-rg-album", theme::GREEN),
+        footer_pill(":write-rg-album", theme.green, theme),
         pill_gap(),
-        footer_pill("Esc close", theme::PURPLE),
+        footer_pill("Esc close", theme.purple, theme),
     ]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
@@ -3210,6 +3225,7 @@ fn draw_content_tabs(
     state: &super::app::MetadataEditorState,
     area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     // 2-line box-drawing tab rendering.
     // Line 1: ┌─ Active ─┐   Inactive
@@ -3223,11 +3239,11 @@ fn draw_content_tabs(
     // ReplayGain shifts it to ReplayGain + Artwork.
     let slots = content_tab_slots_for_width(state.content_tab, area.width);
 
-    let border_style = Style::default().fg(theme::CYAN);
+    let border_style = Style::default().fg(theme.cyan);
     let active_label_style = Style::default()
-        .fg(theme::CYAN)
+        .fg(theme.cyan)
         .add_modifier(Modifier::BOLD);
-    let inactive_label_style = Style::default().fg(theme::TEXT_DIM);
+    let inactive_label_style = Style::default().fg(theme.text_dim);
 
     let mut line1_spans: Vec<Span> = vec![Span::raw(" ")];
     let mut x = area.x + 1;
@@ -3434,6 +3450,7 @@ fn draw_metadata_presentation_dropdown_popup(
     state: &super::app::MetadataEditorState,
     content_area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     if !state.shows_presentation_control() || !state.presentation_selector_open {
         return;
@@ -3477,11 +3494,11 @@ fn draw_metadata_presentation_dropdown_popup(
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::CYAN))
+        .border_style(Style::default().fg(theme.cyan))
         .title(Span::styled(
             " Presentation ",
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -3524,15 +3541,15 @@ fn draw_metadata_presentation_dropdown_popup(
         );
         let style = if highlighted {
             Style::default()
-                .fg(theme::AMBER)
-                .bg(theme::SURFACE)
+                .fg(theme.amber)
+                .bg(theme.surface)
                 .add_modifier(Modifier::BOLD)
         } else if active {
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::TEXT_BRIGHT)
+            Style::default().fg(theme.text_bright)
         };
         lines.push(Line::from(Span::styled(text, style)));
         button_map.record_button(
@@ -3953,6 +3970,7 @@ fn draw_metadata_editor(
     image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
     image_repaint_generation: usize,
+    theme: super::theme::Theme,
 ) {
     use super::app::{ContentTab, MetadataEditorPhase};
 
@@ -3964,9 +3982,9 @@ fn draw_metadata_editor(
 
     let title = editor_title(state);
     let border_color = if state.any_presentation_dirty() {
-        theme::AMBER
+        theme.amber
     } else {
-        theme::CYAN
+        theme.cyan
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4000,7 +4018,7 @@ fn draw_metadata_editor(
     let content_area = layout.content_area;
     let footer_area = layout.footer_area;
 
-    draw_content_tabs(f, state, tab_area, button_map);
+    draw_content_tabs(f, state, tab_area, button_map, theme);
 
     let content_h = content_area.height as usize;
     let inner_w = content_area.width as usize;
@@ -4008,9 +4026,8 @@ fn draw_metadata_editor(
     // Detail edit mode is part of the editable Metadata tab.
     if state.phase == MetadataEditorPhase::DetailEdit {
         draw_metadata_detail(
-            f, state, content_area, footer_area, inner_w, content_h, button_map,
-        );
-        draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
+            f, state, content_area, footer_area, inner_w, content_h, button_map, theme);
+        draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map, theme);
         return;
     }
 
@@ -4023,8 +4040,7 @@ fn draw_metadata_editor(
             button_map,
             image_picker,
             image_picker_generation,
-            image_repaint_generation,
-        );
+            image_repaint_generation, theme);
         if let Some(picker) = state.file_picker.as_mut() {
             draw_file_picker_overlay(
                 f,
@@ -4036,7 +4052,7 @@ fn draw_metadata_editor(
                 image_repaint_generation,
             );
         }
-        draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
+        draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map, theme);
         return;
     }
 
@@ -4068,14 +4084,14 @@ fn draw_metadata_editor(
 
         let key_style = if is_deleted {
             Style::default()
-                .fg(theme::TEXT_DIM)
+                .fg(theme.text_dim)
                 .add_modifier(Modifier::CROSSED_OUT)
         } else if is_cursor {
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD)
         } else {
-            theme::muted()
+            theme.muted()
         };
 
         // Value — show inline editor if this row is being edited.
@@ -4184,7 +4200,7 @@ fn draw_metadata_editor(
                     };
                     let visible_end = (drop_scroll + max_drop_rows).min(total_rows);
 
-                    let drop_bg = Style::default().bg(Color::Rgb(30, 30, 46));
+                    let drop_bg = Style::default().bg(theme.dropdown_bg);
 
                     for row in drop_scroll..visible_end {
                         let row_chars = &display_rows[row];
@@ -4194,7 +4210,7 @@ fn draw_metadata_editor(
                         } else {
                             Span::styled(
                                 " ".repeat(key_chars),
-                                Style::default().bg(Color::Rgb(30, 30, 46)),
+                                Style::default().bg(theme.dropdown_bg),
                             )
                         };
 
@@ -4216,14 +4232,14 @@ fn draw_metadata_editor(
                             let pad = val_max.saturating_sub(used);
                             lines.push(Line::from(vec![
                                 prefix,
-                                Span::styled(before, drop_bg.fg(theme::TEXT_BRIGHT)),
+                                Span::styled(before, drop_bg.fg(theme.text_bright)),
                                 Span::styled(
                                     cur_ch,
-                                    Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                                    Style::default().fg(theme.bg).bg(theme.text_bright),
                                 ),
                                 Span::styled(
                                     format!("{}{}", after, " ".repeat(pad)),
-                                    drop_bg.fg(theme::TEXT_BRIGHT),
+                                    drop_bg.fg(theme.text_bright),
                                 ),
                             ]));
                         } else {
@@ -4233,7 +4249,7 @@ fn draw_metadata_editor(
                                 prefix,
                                 Span::styled(
                                     format!("{}{}", text, " ".repeat(pad)),
-                                    drop_bg.fg(theme::TEXT_BRIGHT),
+                                    drop_bg.fg(theme.text_bright),
                                 ),
                             ]));
                         }
@@ -4262,12 +4278,12 @@ fn draw_metadata_editor(
                 };
                 lines.push(Line::from(vec![
                     Span::styled(key_display, key_style),
-                    Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(before, Style::default().fg(theme.text_bright)),
                     Span::styled(
                         cursor_ch,
-                        Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                        Style::default().fg(theme.bg).bg(theme.text_bright),
                     ),
-                    Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(after, Style::default().fg(theme.text_bright)),
                 ]));
                 continue;
             }
@@ -4286,18 +4302,18 @@ fn draw_metadata_editor(
 
         let val_style = if is_deleted {
             Style::default()
-                .fg(theme::RED)
+                .fg(theme.destructive)
                 .add_modifier(Modifier::CROSSED_OUT)
         } else if is_dirty {
-            Style::default().fg(theme::GREEN)
+            Style::default().fg(theme.green)
         } else if entry.is_mixed {
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::ITALIC)
         } else if entry.is_binary {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         } else {
-            Style::default().fg(theme::TEXT_BRIGHT)
+            Style::default().fg(theme.text_bright)
         };
 
         // Hide the bulk pill on rows showing `<multiple values>`; the
@@ -4330,10 +4346,10 @@ fn draw_metadata_editor(
 
         let pill_style = match pill {
             super::probe::MbRevertPill::Revert => Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
             super::probe::MbRevertPill::UseMb => Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD),
             super::probe::MbRevertPill::None => Style::default(),
         };
@@ -4353,7 +4369,7 @@ fn draw_metadata_editor(
                 spans.push(Span::styled(
                     view_text.to_string(),
                     Style::default()
-                        .fg(theme::BLUE)
+                        .fg(theme.blue)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -4412,24 +4428,24 @@ fn draw_metadata_editor(
                 Span::styled(
                     " + ",
                     Style::default()
-                        .fg(theme::GREEN)
+                        .fg(theme.green)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                Span::styled(before, Style::default().fg(theme.text_bright)),
                 Span::styled(
                     cursor_ch,
-                    Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                    Style::default().fg(theme.bg).bg(theme.text_bright),
                 ),
-                Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
+                Span::styled(after, Style::default().fg(theme.text_bright)),
             ]));
         }
     } else {
         let add_style = if is_cursor_add {
             Style::default()
-                .fg(theme::GREEN)
+                .fg(theme.green)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::TEXT_DIM)
+            Style::default().fg(theme.text_dim)
         };
         lines.push(Line::from(Span::styled(" + Add field...", add_style)));
     }
@@ -4448,7 +4464,7 @@ fn draw_metadata_editor(
             // the appropriate :mb-back / :gnudb-back command —
             // reconstructs the prior overlay from cache, no requery.
             if state.mb_back.is_some() || state.gnudb_back.is_some() {
-                spans.push(footer_pill("← back", theme::AMBER));
+                spans.push(footer_pill("← back", theme.amber, theme));
                 spans.push(pill_gap());
             }
             // Click dispatches `:tags-mb`, which routes through
@@ -4457,36 +4473,36 @@ fn draw_metadata_editor(
             // here with the matching tuple in `keybindings.rs`'s
             // footer hit-test list — see
             // `project_editor_footer_pills.md` memory entry.
-            spans.push(footer_pill(":tags-mb", theme::CYAN));
+            spans.push(footer_pill(":tags-mb", theme.cyan, theme));
             spans.push(pill_gap());
             spans.extend_from_slice(&[
-                footer_pill(":fix-caps", theme::BLUE),
+                footer_pill(":fix-caps", theme.blue, theme),
                 pill_gap(),
-                footer_pill(":d delete", theme::RED),
+                footer_pill(":d delete", theme.destructive, theme),
                 pill_gap(),
-                footer_pill(":u undo", theme::AMBER),
+                footer_pill(":u undo", theme.amber, theme),
                 pill_gap(),
-                footer_pill(":a add", theme::CYAN),
+                footer_pill(":a add", theme.cyan, theme),
                 pill_gap(),
-                footer_pill(":w save", theme::GREEN),
+                footer_pill(":w save", theme.green, theme),
                 pill_gap(),
-                footer_pill("Esc close", theme::PURPLE),
+                footer_pill("Esc close", theme.purple, theme),
             ]);
             Line::from(spans)
         }
         MetadataEditorPhase::InlineEdit => Line::from(vec![
-            footer_pill("Enter confirm", theme::GREEN),
+            footer_pill("Enter confirm", theme.green, theme),
             pill_gap(),
-            footer_pill("Esc cancel", theme::PURPLE),
+            footer_pill("Esc cancel", theme.purple, theme),
         ]),
         MetadataEditorPhase::AddingKey => Line::from(vec![
-            footer_pill("Enter confirm", theme::GREEN),
+            footer_pill("Enter confirm", theme.green, theme),
             pill_gap(),
-            footer_pill("Esc cancel", theme::PURPLE),
+            footer_pill("Esc cancel", theme.purple, theme),
         ]),
         MetadataEditorPhase::Saving => Line::from(Span::styled(
             " Saving... ",
-            Style::default().fg(theme::AMBER),
+            Style::default().fg(theme.amber),
         )),
         MetadataEditorPhase::DetailEdit => {
             // Unreachable — DetailEdit returns early above.
@@ -4508,7 +4524,7 @@ fn draw_metadata_editor(
             image_repaint_generation,
         );
     }
-    draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map);
+    draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map, theme);
 }
 
 pub(crate) fn file_picker_overlay_area(parent: Rect) -> Rect {
@@ -4580,9 +4596,10 @@ fn draw_metadata_read_only_tab(
     image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
     image_repaint_generation: usize,
+    theme: super::theme::Theme,
 ) {
     if state.content_tab == super::app::ContentTab::ReplayGain {
-        draw_metadata_replaygain_tab(f, state, content_area);
+        draw_metadata_replaygain_tab(f, state, content_area, theme);
     } else if state.content_tab == super::app::ContentTab::Artwork {
         draw_metadata_artwork_tab(
             f,
@@ -4591,10 +4608,9 @@ fn draw_metadata_read_only_tab(
             button_map,
             image_picker,
             image_picker_generation,
-            image_repaint_generation,
-        );
+            image_repaint_generation, theme);
     } else {
-        let lines = metadata_read_only_lines(state);
+        let lines = metadata_read_only_lines(state, theme);
         let total = lines.len();
         let visible = content_area.height as usize;
         let scroll = state.scroll.min(total.saturating_sub(visible));
@@ -4602,7 +4618,7 @@ fn draw_metadata_read_only_tab(
         f.render_widget(Paragraph::new(visible_lines), content_area);
     }
 
-    draw_metadata_read_only_footer(state, footer_area, button_map, f);
+    draw_metadata_read_only_footer(state, footer_area, button_map, f, theme);
 }
 
 fn draw_metadata_read_only_footer(
@@ -4610,57 +4626,58 @@ fn draw_metadata_read_only_footer(
     footer_area: Rect,
     button_map: &mut super::button_map::ButtonRenderMap,
     f: &mut Frame,
+    theme: super::theme::Theme,
 ) {
     let mut pills: Vec<(&str, Color, Option<super::button_map::TuiButton>)> = Vec::new();
     match state.content_tab {
         super::app::ContentTab::ReplayGain => {
             pills.push((
                 "s scan",
-                theme::GREEN,
+                theme.green,
                 Some(super::button_map::TuiButton::MetadataReplayGainScanTrack),
             ));
             pills.push((
                 "a album",
-                theme::GREEN,
+                theme.green,
                 Some(super::button_map::TuiButton::MetadataReplayGainScanAlbum),
             ));
         }
         super::app::ContentTab::Artwork => {
             pills.push((
                 "+ artwork",
-                theme::GREEN,
+                theme.green,
                 Some(super::button_map::TuiButton::MetadataArtworkAdd(state.artwork_cursor)),
             ));
             pills.push((
                 "Del remove",
-                theme::RED,
+                theme.destructive,
                 Some(super::button_map::TuiButton::MetadataArtworkRemove(state.artwork_cursor)),
             ));
         }
         super::app::ContentTab::Details => {
             if state.details_analysis.is_some() {
-                pills.push(("Analyzing...", theme::AMBER, None));
+                pills.push(("Analyzing...", theme.amber, None));
             } else if super::metadata_view_models::details_analyze_applicable(state) {
                 pills.push((
                     "a analyze",
-                    theme::GREEN,
+                    theme.green,
                     Some(super::button_map::TuiButton::MetadataDetailsAnalyze),
                 ));
             }
             if state.active_surface().technical_details.details_probe_issue_count() > 0 {
-                pills.push(("Ctrl+R retry", theme::AMBER, None));
+                pills.push(("Ctrl+R retry", theme.amber, None));
             }
         }
         super::app::ContentTab::Metadata => {}
     }
-    pills.push(("Esc close", theme::PURPLE, None));
+    pills.push(("Esc close", theme.purple, None));
 
     let mut spans = Vec::new();
     for (idx, (label, bg, _)) in pills.iter().enumerate() {
         if idx > 0 {
             spans.push(pill_gap());
         }
-        spans.push(footer_pill(label, *bg));
+        spans.push(footer_pill(label, *bg, theme));
     }
 
     record_centered_footer_pills(&pills, footer_area, button_map);
@@ -4701,16 +4718,42 @@ pub(crate) fn metadata_read_only_line_count(
     state: &super::app::MetadataEditorState,
 ) -> usize {
     match state.content_tab {
+        super::app::ContentTab::Details => metadata_details_line_count(state),
+        super::app::ContentTab::ReplayGain => metadata_replaygain_line_count(state),
         super::app::ContentTab::Artwork => metadata_artwork_table_line_count(state),
-        _ => metadata_read_only_lines(state).len(),
+        super::app::ContentTab::Metadata => 0,
     }
 }
 
-fn metadata_read_only_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
+fn metadata_details_line_count(state: &super::app::MetadataEditorState) -> usize {
+    let vm = super::metadata_view_models::build_details_view_model(state);
+    let mut count = 1 + vm.location.len(); // Location section + fields.
+    if vm.probe_status.is_some() {
+        count += 1;
+    }
+    if vm.analysis_status.is_some() {
+        count += 1;
+    }
+    if !vm.read_issues.is_empty() {
+        count += 2 + vm.read_issues.len(); // blank + section + rows.
+    }
+    count + 2 + vm.general.len() // blank + General section + fields.
+}
+
+fn metadata_replaygain_line_count(state: &super::app::MetadataEditorState) -> usize {
+    let vm = super::metadata_view_models::build_replaygain_view_model(state);
+    let mut count = 1 + vm.summary.len(); // Summary section + fields.
+    if vm.scan_status.is_some() {
+        count += 1;
+    }
+    count + 2 // blank + Tracks section.
+}
+
+fn metadata_read_only_lines(state: &super::app::MetadataEditorState, theme: super::theme::Theme) -> Vec<Line<'static>> {
     match state.content_tab {
-        super::app::ContentTab::Details => metadata_details_lines(state),
-        super::app::ContentTab::ReplayGain => metadata_replaygain_lines(state),
-        super::app::ContentTab::Artwork => metadata_artwork_non_table_lines(state),
+        super::app::ContentTab::Details => metadata_details_lines(state, theme),
+        super::app::ContentTab::ReplayGain => metadata_replaygain_lines(state, theme),
+        super::app::ContentTab::Artwork => metadata_artwork_non_table_lines(state, theme),
         super::app::ContentTab::Metadata => Vec::new(),
     }
 }
@@ -4718,18 +4761,29 @@ fn metadata_read_only_lines(state: &super::app::MetadataEditorState) -> Vec<Line
 fn metadata_artwork_table_line_count(state: &super::app::MetadataEditorState) -> usize {
     let vm = super::metadata_view_models::build_artwork_view_model(state);
     if vm.disc_not_applicable {
-        return metadata_artwork_non_table_lines(state).len();
+        return metadata_artwork_non_table_line_count(&vm);
     }
     let issue_rows = if vm.read_issues.is_empty() { 0 } else { 2 + vm.read_issues.len() + 1 };
     issue_rows + 1 + vm.rows.len()
 }
 
+fn metadata_artwork_non_table_line_count(vm: &super::metadata_view_models::ArtworkViewModel) -> usize {
+    let mut count = usize::from(vm.disc_not_applicable);
+    if !vm.read_issues.is_empty() {
+        if count > 0 {
+            count += 1;
+        }
+        count += 1 + vm.read_issues.len();
+    }
+    count
+}
 
-fn section_line(title: &str) -> Line<'static> {
+
+fn section_line(title: &str, theme: super::theme::Theme) -> Line<'static> {
     Line::from(Span::styled(
         title.to_string(),
         Style::default()
-            .fg(theme::CYAN)
+            .fg(theme.cyan)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -4738,56 +4792,56 @@ fn kv_line(label: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(format!("  {:<22} {}", format!("{}:", label), value.into()))
 }
 
-fn metadata_details_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
-    render_details_view_model(&super::metadata_view_models::build_details_view_model(state))
+fn metadata_details_lines(state: &super::app::MetadataEditorState, theme: super::theme::Theme) -> Vec<Line<'static>> {
+    render_details_view_model(&super::metadata_view_models::build_details_view_model(state), theme)
 }
 
-fn metadata_replaygain_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
-    replaygain_summary_lines(&super::metadata_view_models::build_replaygain_view_model(state))
+fn metadata_replaygain_lines(state: &super::app::MetadataEditorState, theme: super::theme::Theme) -> Vec<Line<'static>> {
+    replaygain_summary_lines(&super::metadata_view_models::build_replaygain_view_model(state), theme)
 }
 
-fn metadata_artwork_non_table_lines(state: &super::app::MetadataEditorState) -> Vec<Line<'static>> {
+fn metadata_artwork_non_table_lines(state: &super::app::MetadataEditorState, theme: super::theme::Theme) -> Vec<Line<'static>> {
     let vm = super::metadata_view_models::build_artwork_view_model(state);
     let mut lines = Vec::new();
     if vm.disc_not_applicable {
         lines.push(Line::from(Span::styled(
             "  No embedded artwork for disc-backed presentations",
-            Style::default().fg(theme::TEXT_DIM),
+            Style::default().fg(theme.text_dim),
         )));
     }
     if !vm.read_issues.is_empty() {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-        lines.push(section_line("Read issues"));
-        lines.extend(render_issue_rows(&vm.read_issues));
+        lines.push(section_line("Read issues", theme));
+        lines.extend(render_issue_rows(&vm.read_issues, theme));
     }
     lines
 }
 
-fn render_details_view_model(vm: &super::metadata_view_models::DetailsViewModel) -> Vec<Line<'static>> {
+fn render_details_view_model(vm: &super::metadata_view_models::DetailsViewModel, theme: super::theme::Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(section_line("Location"));
+    lines.push(section_line("Location", theme));
     lines.extend(vm.location.iter().map(render_detail_field));
     if let Some(status) = &vm.probe_status {
         lines.push(Line::from(Span::styled(
             format!("  {}", status),
-            Style::default().fg(theme::TEXT_DIM),
+            Style::default().fg(theme.text_dim),
         )));
     }
     if let Some(status) = &vm.analysis_status {
         lines.push(Line::from(Span::styled(
             format!("  {}", status),
-            Style::default().fg(theme::AMBER),
+            Style::default().fg(theme.amber),
         )));
     }
     if !vm.read_issues.is_empty() {
         lines.push(Line::from(""));
-        lines.push(section_line("Read issues"));
-        lines.extend(render_issue_rows(&vm.read_issues));
+        lines.push(section_line("Read issues", theme));
+        lines.extend(render_issue_rows(&vm.read_issues, theme));
     }
     lines.push(Line::from(""));
-    lines.push(section_line("General"));
+    lines.push(section_line("General", theme));
     lines.extend(vm.general.iter().map(render_detail_field));
     lines
 }
@@ -4796,18 +4850,18 @@ fn render_detail_field(row: &super::metadata_view_models::DetailField) -> Line<'
     kv_line(&row.key, row.value.clone())
 }
 
-fn replaygain_summary_lines(vm: &super::metadata_view_models::ReplayGainViewModel) -> Vec<Line<'static>> {
+fn replaygain_summary_lines(vm: &super::metadata_view_models::ReplayGainViewModel, theme: super::theme::Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(section_line("Summary"));
+    lines.push(section_line("Summary", theme));
     lines.extend(vm.summary.iter().map(render_detail_field));
     if let Some(status) = &vm.scan_status {
         lines.push(Line::from(Span::styled(
             format!("  {}", status),
-            Style::default().fg(theme::AMBER),
+            Style::default().fg(theme.amber),
         )));
     }
     lines.push(Line::from(""));
-    lines.push(section_line("Tracks"));
+    lines.push(section_line("Tracks", theme));
     lines
 }
 
@@ -4837,9 +4891,10 @@ fn draw_metadata_replaygain_tab(
     f: &mut Frame,
     state: &super::app::MetadataEditorState,
     content_area: Rect,
+    theme: super::theme::Theme,
 ) {
     let vm = super::metadata_view_models::build_replaygain_view_model(state);
-    let summary_lines = replaygain_summary_lines(&vm);
+    let summary_lines = replaygain_summary_lines(&vm, theme);
     let summary_height = (summary_lines.len() as u16).min(content_area.height);
     if summary_height > 0 {
         let summary_area = Rect::new(
@@ -4875,7 +4930,7 @@ fn draw_metadata_replaygain_tab(
     );
 
     let header = Row::new(vec!["Track", "Track Gain", "Album Gain", "Track Peak", "Album Peak"])
-        .style(Style::default().fg(theme::TEXT_DIM))
+        .style(Style::default().fg(theme.text_dim))
         .bottom_margin(1);
     let rows: Vec<Row<'static>> = vm
         .rows
@@ -4885,10 +4940,10 @@ fn draw_metadata_replaygain_tab(
         .map(|row| {
             Row::new(vec![
                 Cell::from(row.title.clone()),
-                Cell::from(row.track_gain.clone()).style(Style::default().fg(theme::TEXT_BRIGHT)),
-                Cell::from(row.album_gain.clone()).style(Style::default().fg(theme::TEXT_BRIGHT)),
-                Cell::from(row.track_peak.clone()).style(Style::default().fg(theme::TEXT_BRIGHT)),
-                Cell::from(row.album_peak.clone()).style(Style::default().fg(theme::TEXT_BRIGHT)),
+                Cell::from(row.track_gain.clone()).style(Style::default().fg(theme.text_bright)),
+                Cell::from(row.album_gain.clone()).style(Style::default().fg(theme.text_bright)),
+                Cell::from(row.track_peak.clone()).style(Style::default().fg(theme.text_bright)),
+                Cell::from(row.album_peak.clone()).style(Style::default().fg(theme.text_bright)),
             ])
         })
         .collect();
@@ -4913,10 +4968,11 @@ fn draw_metadata_artwork_tab(
     image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
     image_repaint_generation: usize,
+    theme: super::theme::Theme,
 ) {
     let vm = super::metadata_view_models::build_artwork_view_model(state);
     if vm.disc_not_applicable {
-        let lines = metadata_artwork_non_table_lines(state);
+        let lines = metadata_artwork_non_table_lines(state, theme);
         let total = lines.len();
         let visible = content_area.height as usize;
         let scroll = state.scroll.min(total.saturating_sub(visible));
@@ -4927,13 +4983,13 @@ fn draw_metadata_artwork_tab(
 
     let mut top_lines = Vec::new();
     if !vm.read_issues.is_empty() {
-        top_lines.push(section_line("Read issues"));
-        top_lines.extend(render_issue_rows(&vm.read_issues));
+        top_lines.push(section_line("Read issues", theme));
+        top_lines.extend(render_issue_rows(&vm.read_issues, theme));
         top_lines.push(Line::from(""));
     }
     top_lines.push(Line::from(Span::styled(
         "  Click Add/Replace/Remove • Enter/+ add or replace • Delete/d remove",
-        Style::default().fg(theme::TEXT_DIM),
+        Style::default().fg(theme.text_dim),
     )));
 
     let top_height = (top_lines.len() as u16).min(content_area.height);
@@ -4968,8 +5024,7 @@ fn draw_metadata_artwork_tab(
             panes[0],
             image_picker,
             image_picker_generation,
-            image_repaint_generation,
-        );
+            image_repaint_generation, theme);
         panes[1]
     } else {
         body_area
@@ -4982,7 +5037,7 @@ fn draw_metadata_artwork_tab(
     );
 
     let header = Row::new(vec!["Artwork Type", "Status", "Details", "Action"])
-        .style(Style::default().fg(theme::TEXT_DIM))
+        .style(Style::default().fg(theme.text_dim))
         .bottom_margin(0);
     let rows: Vec<Row<'static>> = vm
         .rows
@@ -4994,9 +5049,9 @@ fn draw_metadata_artwork_tab(
                 Cell::from(row.kind.clone()),
                 Cell::from(row.status.clone()),
                 Cell::from(row.detail.clone()),
-                artwork_action_cell(row),
+                artwork_action_cell(row, theme),
             ])
-            .style(Style::default().fg(if row.selected { theme::AMBER } else { theme::TEXT_BRIGHT }))
+            .style(Style::default().fg(if row.selected { theme.amber } else { theme.text_bright }))
         })
         .collect();
     let widths = [
@@ -5007,7 +5062,7 @@ fn draw_metadata_artwork_tab(
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .highlight_style(Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(theme.amber).add_modifier(Modifier::BOLD))
         .highlight_symbol("▸ ")
         .block(Block::default());
     let mut table_state = TableState::default();
@@ -5036,24 +5091,25 @@ fn draw_artwork_preview_pane(
     _image_picker: &mut ratatui_image::picker::Picker,
     image_picker_generation: usize,
     _image_repaint_generation: usize,
+    theme: super::theme::Theme,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::TEXT_DIM))
+        .border_style(Style::default().fg(theme.text_dim))
         .title("Preview");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let Some(row) = selected.and_then(|idx| vm.rows.get(idx)) else {
-        draw_preview_placeholder(f, inner, "No preview");
+        draw_preview_placeholder(f, inner, "No preview", theme);
         return;
     };
     if !artwork_row_has_embedded(row) {
-        draw_preview_placeholder(f, inner, "No preview");
+        draw_preview_placeholder(f, inner, "No preview", theme);
         return;
     }
     let Some(path) = artwork_preview_source_path(state, row) else {
-        draw_preview_placeholder(f, inner, "Preview unavailable");
+        draw_preview_placeholder(f, inner, "Preview unavailable", theme);
         return;
     };
 
@@ -5069,7 +5125,7 @@ fn draw_artwork_preview_pane(
     }
 
     let Some(cache) = state.artwork_preview_cache.as_mut() else {
-        draw_preview_placeholder(f, inner, "Preview unavailable");
+        draw_preview_placeholder(f, inner, "Preview unavailable", theme);
         return;
     };
 
@@ -5092,7 +5148,7 @@ fn draw_artwork_preview_pane(
         } else {
             cache.error.as_deref().unwrap_or("Preview unavailable")
         };
-        draw_preview_placeholder(f, inner, message);
+        draw_preview_placeholder(f, inner, message, theme);
     }
 }
 
@@ -5116,13 +5172,13 @@ fn artwork_preview_source_path(
         .or_else(|| state.active_surface().paths.first().cloned())
 }
 
-fn draw_preview_placeholder(f: &mut Frame, area: Rect, message: &str) {
+fn draw_preview_placeholder(f: &mut Frame, area: Rect, message: &str, theme: super::theme::Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let text = truncate_to_chars(message, area.width as usize);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(theme::TEXT_DIM))))
+        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(theme.text_dim))))
             .alignment(Alignment::Center),
         area,
     );
@@ -5182,14 +5238,14 @@ mod replaygain_table_window_tests {
     }
 }
 
-fn artwork_action_cell(row: &super::metadata_view_models::ArtworkCoverageRow) -> Cell<'static> {
-    let btn = Style::default().fg(theme::BG).bg(theme::CYAN);
+fn artwork_action_cell(row: &super::metadata_view_models::ArtworkCoverageRow, theme: super::theme::Theme) -> Cell<'static> {
+    let btn = Style::default().fg(theme.bg).bg(theme.cyan);
     let gap = Span::raw(" ");
     if artwork_row_has_embedded(row) {
         Cell::from(Line::from(vec![
             Span::styled(" Replace ", btn),
             gap,
-            Span::styled(" Remove ", Style::default().fg(theme::BG).bg(theme::AMBER)),
+            Span::styled(" Remove ", Style::default().fg(theme.bg).bg(theme.amber)),
         ]))
     } else {
         Cell::from(Line::from(vec![
@@ -5202,16 +5258,16 @@ fn artwork_row_has_embedded(row: &super::metadata_view_models::ArtworkCoverageRo
     row.status.trim() != "«not present»" && !row.status.trim().is_empty()
 }
 
-fn render_issue_rows(rows: &[super::metadata_view_models::IssueViewRow]) -> Vec<Line<'static>> {
+fn render_issue_rows(rows: &[super::metadata_view_models::IssueViewRow], theme: super::theme::Theme) -> Vec<Line<'static>> {
     rows.iter()
-        .map(|row| metadata_issue_line(&row.label, &row.kind, &row.reason))
+        .map(|row| metadata_issue_line(&row.label, &row.kind, &row.reason, theme))
         .collect()
 }
 
-fn metadata_issue_line(label: &str, kind: &str, err: &str) -> Line<'static> {
+fn metadata_issue_line(label: &str, kind: &str, err: &str, theme: super::theme::Theme) -> Line<'static> {
     Line::from(Span::styled(
         format!("  {}: {}: {}", label, kind, err.trim()),
-        Style::default().fg(theme::RED),
+        Style::default().fg(theme.destructive),
     ))
 }
 
@@ -5250,6 +5306,7 @@ fn draw_metadata_detail(
     inner_w: usize,
     content_h: usize,
     button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     let field_idx = state.detail_field_idx;
     let entry = match state.active_surface().entries.get(field_idx) {
@@ -5295,7 +5352,7 @@ fn draw_metadata_detail(
     lines.push(Line::from(Span::styled(
         format!("  {}", entry.display_key),
         Style::default()
-            .fg(theme::CYAN)
+            .fg(theme.cyan)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
@@ -5308,10 +5365,10 @@ fn draw_metadata_detail(
 
         let label_style = if is_cursor {
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD)
         } else {
-            theme::muted()
+            theme.muted()
         };
 
         // Inline edit within detail?
@@ -5340,12 +5397,12 @@ fn draw_metadata_detail(
                 };
                 lines.push(Line::from(vec![
                     Span::styled(label_display.clone(), label_style),
-                    Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(before, Style::default().fg(theme.text_bright)),
                     Span::styled(
                         cursor_ch,
-                        Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                        Style::default().fg(theme.bg).bg(theme.text_bright),
                     ),
-                    Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(after, Style::default().fg(theme.text_bright)),
                 ]));
                 continue;
             }
@@ -5357,11 +5414,11 @@ fn draw_metadata_detail(
             .map(|o| o != val)
             .unwrap_or(false);
         let val_style = if changed {
-            Style::default().fg(theme::GREEN)
+            Style::default().fg(theme.green)
         } else if is_cursor {
-            Style::default().fg(theme::TEXT_BRIGHT)
+            Style::default().fg(theme.text_bright)
         } else {
-            Style::default().fg(theme::TEXT_BRIGHT)
+            Style::default().fg(theme.text_bright)
         };
 
         let val_sanitized = val.replace('\n', "↵").replace('\r', "");
@@ -5378,7 +5435,7 @@ fn draw_metadata_detail(
             truncate_to_chars(&val_sanitized, detail_val_max)
         };
         let val_style = if block_reason.is_some() {
-            theme::muted()
+            theme.muted()
         } else {
             val_style
         };
@@ -5403,15 +5460,14 @@ fn draw_metadata_detail(
             if super::command::is_cue_importable(&entry.display_key) {
                 pills.push(footer_pill(
                     &format!(":import-cue ({})", entry.display_key),
-                    theme::BLUE,
-                ));
+                    theme.blue, theme));
                 pills.push(pill_gap());
             }
         }
         pills.extend_from_slice(&[
-            footer_pill("Enter confirm", theme::GREEN),
+            footer_pill("Enter confirm", theme.green, theme),
             pill_gap(),
-            footer_pill("Esc cancel", theme::PURPLE),
+            footer_pill("Esc cancel", theme.purple, theme),
         ]);
         Line::from(pills)
     } else {
@@ -5426,19 +5482,18 @@ fn draw_metadata_detail(
             if super::command::is_cue_importable(&entry.display_key) {
                 pills.push(footer_pill(
                     &format!(":import-cue ({})", entry.display_key),
-                    theme::BLUE,
-                ));
+                    theme.blue, theme));
                 pills.push(pill_gap());
             }
             if super::keybindings::is_fix_caps_applicable(&entry.display_key) {
-                pills.push(footer_pill(":fix-caps", theme::BLUE));
+                pills.push(footer_pill(":fix-caps", theme.blue, theme));
                 pills.push(pill_gap());
             }
         }
         pills.extend_from_slice(&[
-            footer_pill("Enter edit", theme::GREEN),
+            footer_pill("Enter edit", theme.green, theme),
             pill_gap(),
-            footer_pill("Esc back", theme::PURPLE),
+            footer_pill("Esc back", theme.purple, theme),
         ]);
         let mut revert_offset: Option<u16> = None;
         let mut revert_w_chars: u16 = 0;
@@ -5448,8 +5503,8 @@ fn draw_metadata_detail(
             if super::probe::entry_has_mb_proposed(entry) {
                 let pill_state = super::probe::mb_pill_state_field(entry);
                 let revert_pill: Option<(&str, ratatui::style::Color)> = match pill_state {
-                    super::probe::MbRevertPill::Revert => Some(("revert", theme::AMBER)),
-                    super::probe::MbRevertPill::UseMb => Some(("use MB", theme::CYAN)),
+                    super::probe::MbRevertPill::Revert => Some(("revert", theme.amber)),
+                    super::probe::MbRevertPill::UseMb => Some(("use MB", theme.cyan)),
                     super::probe::MbRevertPill::None => None,
                 };
                 // Wider gap to set the MB-action pills apart from the
@@ -5462,7 +5517,7 @@ fn draw_metadata_detail(
                     running += span.content.chars().count() as u16;
                 }
                 if let Some((label, bg)) = revert_pill {
-                    let span = footer_pill(label, bg);
+                    let span = footer_pill(label, bg, theme);
                     revert_w_chars = span.content.chars().count() as u16;
                     revert_offset = Some(running);
                     pills.push(span);
@@ -5470,7 +5525,7 @@ fn draw_metadata_detail(
                     pills.push(pill_gap());
                     running += 1;
                 }
-                let restore_span = footer_pill("restore", theme::BLUE);
+                let restore_span = footer_pill("restore", theme.blue, theme);
                 restore_w_chars = restore_span.content.chars().count() as u16;
                 restore_offset = Some(running);
                 pills.push(restore_span);
@@ -5509,7 +5564,7 @@ fn draw_metadata_detail(
 }
 
 /// Draw the verify results overlay.
-fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: usize) {
+fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: usize, theme: super::theme::Theme) {
     let area = f.size();
     let w = (area.width * 70 / 100)
         .max(40)
@@ -5525,11 +5580,11 @@ fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: u
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::GREEN))
+        .border_style(Style::default().fg(theme.green))
         .title(Span::styled(
             " Verify Results ",
             Style::default()
-                .fg(theme::GREEN)
+                .fg(theme.green)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -5555,7 +5610,7 @@ fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: u
             Span::styled(
                 format!("{} passed", passed),
                 Style::default()
-                    .fg(theme::GREEN)
+                    .fg(theme.green)
                     .add_modifier(Modifier::BOLD),
             ),
         ]
@@ -5564,12 +5619,12 @@ fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: u
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("{} passed", passed),
-                Style::default().fg(theme::GREEN),
+                Style::default().fg(theme.green),
             ),
-            Span::styled(", ", theme::muted()),
+            Span::styled(", ", theme.muted()),
             Span::styled(
                 format!("{} failed", failed),
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
             ),
         ]
     };
@@ -5585,9 +5640,9 @@ fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: u
             .unwrap_or_else(|| r.path.display().to_string());
 
         let (icon, icon_color) = if r.passed {
-            (" ✓ ", theme::GREEN)
+            (" ✓ ", theme.green)
         } else {
-            (" ✗ ", theme::RED)
+            (" ✗ ", theme.destructive)
         };
 
         lines.push(Line::from(vec![
@@ -5595,11 +5650,11 @@ fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: u
                 icon,
                 Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(name, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled(name, Style::default().fg(theme.text_bright)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("   ", Style::default()),
-            Span::styled(&r.detail, Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(&r.detail, Style::default().fg(theme.text_dim)),
         ]));
     }
 
@@ -5611,7 +5666,7 @@ fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: u
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer pill.
-    let footer = Line::from(vec![footer_pill("Esc close", theme::GREEN)]);
+    let footer = Line::from(vec![footer_pill("Esc close", theme.green, theme)]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
@@ -5619,7 +5674,7 @@ fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: u
 }
 
 /// Draw the bit-compare results overlay.
-fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult], scroll: usize) {
+fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult], scroll: usize, theme: super::theme::Theme) {
     let area = f.size();
     let w = (area.width * 75 / 100)
         .max(50)
@@ -5635,11 +5690,11 @@ fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult]
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::CYAN))
+        .border_style(Style::default().fg(theme.cyan))
         .title(Span::styled(
             " Bit Compare Results ",
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -5665,7 +5720,7 @@ fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult]
             Span::styled(
                 format!("{} pair(s): all bit-identical", identical),
                 Style::default()
-                    .fg(theme::GREEN)
+                    .fg(theme.green)
                     .add_modifier(Modifier::BOLD),
             ),
         ]
@@ -5674,12 +5729,12 @@ fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult]
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("{} identical", identical),
-                Style::default().fg(theme::GREEN),
+                Style::default().fg(theme.green),
             ),
-            Span::styled(", ", theme::muted()),
+            Span::styled(", ", theme.muted()),
             Span::styled(
                 format!("{} differ", differ),
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
             ),
         ]
     };
@@ -5700,9 +5755,9 @@ fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult]
             .unwrap_or_else(|| r.target_path.display().to_string());
 
         let (icon, icon_color) = if r.identical {
-            (" ✓ ", theme::GREEN)
+            (" ✓ ", theme.green)
         } else {
-            (" ✗ ", theme::RED)
+            (" ✗ ", theme.destructive)
         };
 
         lines.push(Line::from(vec![
@@ -5710,18 +5765,18 @@ fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult]
                 icon,
                 Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(ref_name, Style::default().fg(theme::TEXT_BRIGHT)),
-            Span::styled("  vs  ", theme::muted()),
-            Span::styled(target_name, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled(ref_name, Style::default().fg(theme.text_bright)),
+            Span::styled("  vs  ", theme.muted()),
+            Span::styled(target_name, Style::default().fg(theme.text_bright)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("   ", Style::default()),
             Span::styled(
                 r.detail.clone(),
                 Style::default().fg(if r.identical {
-                    theme::TEXT_DIM
+                    theme.text_dim
                 } else {
-                    theme::RED
+                    theme.destructive
                 }),
             ),
         ]));
@@ -5735,7 +5790,7 @@ fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult]
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer pill.
-    let footer = Line::from(vec![footer_pill("Esc close", theme::CYAN)]);
+    let footer = Line::from(vec![footer_pill("Esc close", theme.cyan, theme)]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
@@ -5747,6 +5802,7 @@ fn draw_preemphasis(
     f: &mut Frame,
     results: &[super::preemphasis::PreemphasisResult],
     scroll: usize,
+    theme: super::theme::Theme,
 ) {
     use super::preemphasis::PreemphasisConfidence;
 
@@ -5765,11 +5821,11 @@ fn draw_preemphasis(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::PURPLE))
+        .border_style(Style::default().fg(theme.purple))
         .title(Span::styled(
             " Pre-emphasis Detection ",
             Style::default()
-                .fg(theme::PURPLE)
+                .fg(theme.purple)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -5803,21 +5859,21 @@ fn draw_preemphasis(
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("{} PRE flag", detected),
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(", ", theme::muted()),
+            Span::styled(", ", theme.muted()),
             Span::styled(
                 format!("{} catalog candidate", candidates),
-                Style::default().fg(theme::AMBER),
+                Style::default().fg(theme.amber),
             ),
-            Span::styled(format!("  ({} total)", results.len()), theme::muted()),
+            Span::styled(format!("  ({} total)", results.len()), theme.muted()),
         ]
     } else {
         vec![
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("Not detected in {} file(s)", results.len()),
-                Style::default().fg(theme::GREEN),
+                Style::default().fg(theme.green),
             ),
         ]
     };
@@ -5832,11 +5888,11 @@ fn draw_preemphasis(
             .unwrap_or_else(|| r.path.display().to_string());
 
         let (icon, icon_color) = match r.confidence {
-            PreemphasisConfidence::Detected => (" ✓ ", theme::AMBER),
-            PreemphasisConfidence::StrongCandidate => (" ✓ ", theme::AMBER),
-            PreemphasisConfidence::Possible => (" ? ", theme::AMBER),
-            PreemphasisConfidence::NotDetected => (" · ", theme::TEXT_DIM),
-            PreemphasisConfidence::Indeterminate => (" - ", theme::TEXT_DIM),
+            PreemphasisConfidence::Detected => (" ✓ ", theme.amber),
+            PreemphasisConfidence::StrongCandidate => (" ✓ ", theme.amber),
+            PreemphasisConfidence::Possible => (" ? ", theme.amber),
+            PreemphasisConfidence::NotDetected => (" · ", theme.text_dim),
+            PreemphasisConfidence::Indeterminate => (" - ", theme.text_dim),
         };
 
         let conf_label = match r.confidence {
@@ -5851,7 +5907,7 @@ fn draw_preemphasis(
                 icon,
                 Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(name, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled(name, Style::default().fg(theme.text_bright)),
             if !conf_label.is_empty() {
                 Span::styled(format!("  {}", conf_label), Style::default().fg(icon_color))
             } else {
@@ -5860,7 +5916,7 @@ fn draw_preemphasis(
         ]));
         lines.push(Line::from(vec![
             Span::styled("   ", Style::default()),
-            Span::styled(r.detail.clone(), Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(r.detail.clone(), Style::default().fg(theme.text_dim)),
         ]));
     }
 
@@ -5871,7 +5927,7 @@ fn draw_preemphasis(
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
-    let footer = Line::from(vec![footer_pill("Esc close", theme::PURPLE)]);
+    let footer = Line::from(vec![footer_pill("Esc close", theme.purple, theme)]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
@@ -5879,7 +5935,7 @@ fn draw_preemphasis(
 }
 
 /// Draw the CUE import review overlay showing proposed changes.
-fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange], scroll: usize) {
+fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange], scroll: usize, theme: super::theme::Theme) {
     let area = f.size();
     let w = (area.width * 80 / 100)
         .max(50)
@@ -5900,11 +5956,11 @@ fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange]
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::CYAN))
+        .border_style(Style::default().fg(theme.cyan))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -5934,7 +5990,7 @@ fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange]
             lines.push(Line::from(Span::styled(
                 format!("  {}", change.filename),
                 Style::default()
-                    .fg(theme::AMBER)
+                    .fg(theme.amber)
                     .add_modifier(Modifier::BOLD),
             )));
             current_file = Some(&change.filename);
@@ -5953,10 +6009,10 @@ fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange]
         );
 
         lines.push(Line::from(vec![
-            Span::styled(label, theme::muted()),
-            Span::styled(old_display, Style::default().fg(theme::RED)),
-            Span::styled(" → ", theme::muted()),
-            Span::styled(new_display, Style::default().fg(theme::GREEN)),
+            Span::styled(label, theme.muted()),
+            Span::styled(old_display, Style::default().fg(theme.destructive)),
+            Span::styled(" → ", theme.muted()),
+            Span::styled(new_display, Style::default().fg(theme.green)),
         ]));
     }
 
@@ -5966,9 +6022,9 @@ fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange]
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     let footer = Line::from(vec![
-        footer_pill("Enter accept", theme::GREEN),
+        footer_pill("Enter accept", theme.green, theme),
         pill_gap(),
-        footer_pill("Esc cancel", theme::PURPLE),
+        footer_pill("Esc cancel", theme.purple, theme),
     ]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
@@ -5982,6 +6038,7 @@ fn draw_gnudb_select(
     matches: &[super::gnudb::GnudbMatch],
     selected: usize,
     scroll: usize,
+    theme: super::theme::Theme,
 ) {
     let area = f.size();
     let w = (area.width * 70 / 100)
@@ -6003,11 +6060,11 @@ fn draw_gnudb_select(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::CYAN))
+        .border_style(Style::default().fg(theme.cyan))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -6030,17 +6087,17 @@ fn draw_gnudb_select(
         let prefix = if is_sel { " ► " } else { "   " };
         let style = if is_sel {
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::TEXT_BRIGHT)
+            Style::default().fg(theme.text_bright)
         };
         let cat_style = if is_sel {
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            theme::muted()
+            theme.muted()
         };
         lines.push(Line::from(vec![
             Span::styled(prefix, style),
@@ -6055,9 +6112,9 @@ fn draw_gnudb_select(
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     let footer = Line::from(vec![
-        footer_pill("Enter select", theme::GREEN),
+        footer_pill("Enter select", theme.green, theme),
         pill_gap(),
-        footer_pill("Esc cancel", theme::PURPLE),
+        footer_pill("Esc cancel", theme.purple, theme),
     ]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
@@ -6066,7 +6123,7 @@ fn draw_gnudb_select(
 }
 
 /// Draw the GNUDB review overlay — editable preview of GNUDB tags.
-fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
+fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme: super::theme::Theme) {
     use super::app::GnudbRowKind;
 
     let page = &state.pages[state.active_page];
@@ -6097,11 +6154,11 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::CYAN))
+        .border_style(Style::default().fg(theme.cyan))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(theme::CYAN)
+                .fg(theme.cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -6135,14 +6192,14 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                 spans.push(Span::styled(
                     format!(" {} ", label),
                     Style::default()
-                        .fg(theme::PILL_ACTIVE_FG)
-                        .bg(theme::CYAN)
+                        .fg(theme.pill_active_fg)
+                        .bg(theme.cyan)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::styled(
                     format!(" {} ", label),
-                    Style::default().fg(theme::TEXT_DIM),
+                    Style::default().fg(theme.text_dim),
                 ));
             }
             spans.push(Span::raw(" "));
@@ -6165,10 +6222,10 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                 };
                 let label_style = if is_cursor {
                     Style::default()
-                        .fg(theme::AMBER)
+                        .fg(theme.amber)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    theme::muted()
+                    theme.muted()
                 };
 
                 if is_editing {
@@ -6193,12 +6250,12 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                                 format!("    {:<w$}", field, w = label_w - 4),
                                 label_style,
                             ),
-                            Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                            Span::styled(before, Style::default().fg(theme.text_bright)),
                             Span::styled(
                                 cur_ch,
-                                Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                                Style::default().fg(theme.bg).bg(theme.text_bright),
                             ),
-                            Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
+                            Span::styled(after, Style::default().fg(theme.text_bright)),
                         ]));
                         continue;
                     }
@@ -6206,7 +6263,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
 
                 lines.push(Line::from(vec![
                     Span::styled(format!("    {:<w$}", field, w = label_w - 4), label_style),
-                    Span::styled(value.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(value.to_string(), Style::default().fg(theme.text_bright)),
                 ]));
             }
 
@@ -6216,7 +6273,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                 let dashes = inner_w.saturating_sub(header.len() + 5);
                 lines.push(Line::from(Span::styled(
                     format!(" ── {} {}", header, "─".repeat(dashes)),
-                    theme::muted(),
+                    theme.muted(),
                 )));
             }
 
@@ -6229,10 +6286,10 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                 };
                 let label_style = if is_cursor {
                     Style::default()
-                        .fg(theme::AMBER)
+                        .fg(theme.amber)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    theme::muted()
+                    theme.muted()
                 };
 
                 if is_editing {
@@ -6257,12 +6314,12 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
                                 format!("    {:<w$}", field, w = label_w - 4),
                                 label_style,
                             ),
-                            Span::styled(before, Style::default().fg(theme::TEXT_BRIGHT)),
+                            Span::styled(before, Style::default().fg(theme.text_bright)),
                             Span::styled(
                                 cur_ch,
-                                Style::default().fg(theme::BG).bg(theme::TEXT_BRIGHT),
+                                Style::default().fg(theme.bg).bg(theme.text_bright),
                             ),
-                            Span::styled(after, Style::default().fg(theme::TEXT_BRIGHT)),
+                            Span::styled(after, Style::default().fg(theme.text_bright)),
                         ]));
                         continue;
                     }
@@ -6270,7 +6327,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
 
                 lines.push(Line::from(vec![
                     Span::styled(format!("    {:<w$}", field, w = label_w - 4), label_style),
-                    Span::styled(value.to_string(), Style::default().fg(theme::TEXT_BRIGHT)),
+                    Span::styled(value.to_string(), Style::default().fg(theme.text_bright)),
                 ]));
             }
         }
@@ -6284,24 +6341,24 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
     // Footer.
     let footer = if state.edit_input.is_some() {
         Line::from(vec![
-            footer_pill("Enter confirm", theme::GREEN),
+            footer_pill("Enter confirm", theme.green, theme),
             pill_gap(),
-            footer_pill("Esc cancel", theme::PURPLE),
+            footer_pill("Esc cancel", theme.purple, theme),
         ])
     } else {
         let mut pills = Vec::new();
         if state.origin_matches.is_some() {
-            pills.push(footer_pill("b back", theme::AMBER));
+            pills.push(footer_pill("b back", theme.amber, theme));
             pills.push(pill_gap());
         }
         pills.extend_from_slice(&[
-            footer_pill("Enter edit", theme::GREEN),
+            footer_pill("Enter edit", theme.green, theme),
             pill_gap(),
-            footer_pill("c fix-caps", theme::BLUE),
+            footer_pill("c fix-caps", theme.blue, theme),
             pill_gap(),
-            footer_pill("a accept", theme::CYAN),
+            footer_pill("a accept", theme.cyan, theme),
             pill_gap(),
-            footer_pill("Esc cancel", theme::PURPLE),
+            footer_pill("Esc cancel", theme.purple, theme),
         ]);
         Line::from(pills)
     };
@@ -6313,7 +6370,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState) {
 
 // ── AccurateRip verification results overlay ────────────────────────
 
-fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
+fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState, theme: super::theme::Theme) {
     use super::accuraterip::ArTrackStatus;
 
     let area = f.size();
@@ -6339,11 +6396,11 @@ fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
         .filter(|t| t.status == ArTrackStatus::Verified)
         .count();
     let border_color = if verified == n_tracks && n_tracks > 0 {
-        theme::GREEN
+        theme.green
     } else if verified > 0 {
-        theme::AMBER
+        theme.amber
     } else {
-        theme::RED
+        theme.destructive
     };
 
     let title = if state.pages.len() > 1 {
@@ -6406,14 +6463,14 @@ fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
                 spans.push(Span::styled(
                     format!(" {} ", label),
                     Style::default()
-                        .fg(theme::PILL_ACTIVE_FG)
-                        .bg(theme::CYAN)
+                        .fg(theme.pill_active_fg)
+                        .bg(theme.cyan)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::styled(
                     format!(" {} ", label),
-                    Style::default().fg(theme::TEXT_DIM),
+                    Style::default().fg(theme.text_dim),
                 ));
             }
             spans.push(Span::raw(" "));
@@ -6429,14 +6486,14 @@ fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
         Span::styled(
             summary,
             Style::default()
-                .fg(theme::TEXT_BRIGHT)
+                .fg(theme.text_bright)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
     // Disc ID for diagnostics.
     lines.push(Line::from(vec![
-        Span::styled("  Disc ID: ", Style::default().fg(theme::TEXT_DIM)),
-        Span::styled(&result.disc_id_str, Style::default().fg(theme::TEXT_DIM)),
+        Span::styled("  Disc ID: ", Style::default().fg(theme.text_dim)),
+        Span::styled(&result.disc_id_str, Style::default().fg(theme.text_dim)),
     ]));
     lines.push(Line::from(""));
 
@@ -6459,15 +6516,15 @@ fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
                 };
                 (
                     " ✓ ",
-                    theme::GREEN,
+                    theme.green,
                     format!("AR confidence {} (offset {})", conf, offset_str),
                 )
             }
-            ArTrackStatus::Mismatch => (" ✗ ", theme::RED, "CRC mismatch".to_string()),
+            ArTrackStatus::Mismatch => (" ✗ ", theme.destructive, "CRC mismatch".to_string()),
             ArTrackStatus::NoDiscInDatabase => {
-                (" ? ", theme::AMBER, "disc not in database".to_string())
+                (" ? ", theme.amber, "disc not in database".to_string())
             }
-            ArTrackStatus::Error(e) => (" ! ", theme::RED, format!("error: {}", e)),
+            ArTrackStatus::Error(e) => (" ! ", theme.destructive, format!("error: {}", e)),
         };
 
         let track_label = format!("{:02} - {}", t.track_number, name);
@@ -6476,11 +6533,11 @@ fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
                 icon,
                 Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(track_label, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled(track_label, Style::default().fg(theme.text_bright)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("     ", Style::default()),
-            Span::styled(detail, Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(detail, Style::default().fg(theme.text_dim)),
         ]));
     }
 
@@ -6492,18 +6549,18 @@ fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer pills.
-    let mut pills = vec![footer_pill("Esc close", theme::GREEN)];
+    let mut pills = vec![footer_pill("Esc close", theme.green, theme)];
     let has_unmatched = result
         .tracks
         .iter()
         .any(|t| t.status == ArTrackStatus::Mismatch);
     if result.was_common_scan && has_unmatched {
         pills.push(pill_gap());
-        pills.push(footer_pill(":ar! full scan", theme::BLUE));
+        pills.push(footer_pill(":ar! full scan", theme.blue, theme));
     }
     if super::accuraterip::detect_uniform_offset(result).is_some() {
         pills.push(pill_gap());
-        pills.push(footer_pill(":ar-fix correct offset", theme::PURPLE));
+        pills.push(footer_pill(":ar-fix correct offset", theme.purple, theme));
     }
 
     let footer = Line::from(pills);
@@ -6515,7 +6572,7 @@ fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState) {
 
 // ── AR batch report overlay ─────────────────────────────────────────
 
-fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResult, scroll: usize) {
+fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResult, scroll: usize, theme: super::theme::Theme) {
     let area = f.size();
     let w = (area.width * 80 / 100)
         .max(60)
@@ -6541,11 +6598,11 @@ fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResul
         verified, total,
     );
     let border_color = if verified == total && total > 0 {
-        theme::GREEN
+        theme.green
     } else if verified > 0 {
-        theme::AMBER
+        theme.amber
     } else {
-        theme::RED
+        theme.destructive
     };
 
     let block = Block::default()
@@ -6586,16 +6643,16 @@ fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResul
                 verified, not_in_db, mismatched
             ),
             Style::default()
-                .fg(theme::TEXT_BRIGHT)
+                .fg(theme.text_bright)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
     if let Some(ref rp) = result.report_path {
         lines.push(Line::from(vec![
-            Span::styled("  Report: ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled("  Report: ", Style::default().fg(theme.text_dim)),
             Span::styled(
                 rp.display().to_string(),
-                Style::default().fg(theme::TEXT_DIM),
+                Style::default().fg(theme.text_dim),
             ),
         ]));
     }
@@ -6604,15 +6661,15 @@ fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResul
     // Per-album results.
     for a in &result.albums {
         let (icon, color) = if a.error.is_some() {
-            (" ! ", theme::RED)
+            (" ! ", theme.destructive)
         } else if a.not_in_db {
-            (" ? ", theme::AMBER)
+            (" ? ", theme.amber)
         } else if a.verified == a.total_tracks && a.total_tracks > 0 {
-            (" ✓ ", theme::GREEN)
+            (" ✓ ", theme.green)
         } else if a.mismatched > 0 {
-            (" ✗ ", theme::RED)
+            (" ✗ ", theme.destructive)
         } else {
-            (" ~ ", theme::AMBER)
+            (" ~ ", theme.amber)
         };
 
         lines.push(Line::from(vec![
@@ -6620,7 +6677,7 @@ fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResul
                 icon,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(&a.album_name, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled(&a.album_name, Style::default().fg(theme.text_bright)),
         ]));
 
         let detail = if let Some(ref e) = a.error {
@@ -6642,7 +6699,7 @@ fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResul
         };
         lines.push(Line::from(vec![
             Span::styled("     ", Style::default()),
-            Span::styled(detail, Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(detail, Style::default().fg(theme.text_dim)),
         ]));
     }
 
@@ -6652,7 +6709,7 @@ fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResul
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
-    let footer = Line::from(vec![footer_pill("Esc close", theme::GREEN)]);
+    let footer = Line::from(vec![footer_pill("Esc close", theme.green, theme)]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
@@ -6661,7 +6718,7 @@ fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResul
 
 // ── CTDB verification results overlay ───────────────────────────────
 
-fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
+fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState, theme: super::theme::Theme) {
     use super::ctdb::CtdbTrackStatus;
 
     let area = f.size();
@@ -6694,11 +6751,11 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
         })
         .count();
     let border_color = if verified == n_tracks && n_tracks > 0 {
-        theme::GREEN
+        theme.green
     } else if verified > 0 {
-        theme::AMBER
+        theme.amber
     } else {
-        theme::RED
+        theme.destructive
     };
 
     let title = if state.pages.len() > 1 {
@@ -6765,14 +6822,14 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
                 spans.push(Span::styled(
                     format!(" {} ", label),
                     Style::default()
-                        .fg(theme::PILL_ACTIVE_FG)
-                        .bg(theme::CYAN)
+                        .fg(theme.pill_active_fg)
+                        .bg(theme.cyan)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::styled(
                     format!(" {} ", label),
-                    Style::default().fg(theme::TEXT_DIM),
+                    Style::default().fg(theme.text_dim),
                 ));
             }
             spans.push(Span::raw(" "));
@@ -6787,7 +6844,7 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
         Span::styled(
             summary,
             Style::default()
-                .fg(theme::TEXT_BRIGHT)
+                .fg(theme.text_bright)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -6806,7 +6863,7 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
                 let parity = if t.has_parity { " [parity]" } else { "" };
                 (
                     " ✓ ",
-                    theme::GREEN,
+                    theme.green,
                     format!("CTDB confidence {}{}", conf, parity),
                 )
             }
@@ -6818,7 +6875,7 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
                 let conf = t.confidence.unwrap_or(0);
                 (
                     " ✓ ",
-                    theme::GREEN,
+                    theme.green,
                     format!(
                         "CTDB RS-verified, confidence {} (CRC differs: {:08X})",
                         conf, t.computed_crc32
@@ -6833,14 +6890,14 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
                 };
                 (
                     " ✗ ",
-                    theme::RED,
+                    theme.destructive,
                     format!("CRC mismatch (computed {:08X}){}", t.computed_crc32, parity),
                 )
             }
             CtdbTrackStatus::NoDiscInDatabase => {
-                (" ? ", theme::AMBER, "disc not in database".to_string())
+                (" ? ", theme.amber, "disc not in database".to_string())
             }
-            CtdbTrackStatus::Error(e) => (" ! ", theme::RED, format!("error: {}", e)),
+            CtdbTrackStatus::Error(e) => (" ! ", theme.destructive, format!("error: {}", e)),
         };
 
         let track_label = format!("{:02} - {}", t.track_number, name);
@@ -6849,11 +6906,11 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
                 icon,
                 Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(track_label, Style::default().fg(theme::TEXT_BRIGHT)),
+            Span::styled(track_label, Style::default().fg(theme.text_bright)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("     ", Style::default()),
-            Span::styled(detail, Style::default().fg(theme::TEXT_DIM)),
+            Span::styled(detail, Style::default().fg(theme.text_dim)),
         ]));
     }
 
@@ -6870,10 +6927,10 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState) {
         .any(|t| t.status == CtdbTrackStatus::Mismatch);
     let has_parity = result.tracks.iter().any(|t| t.has_parity);
 
-    let mut footer_spans = vec![footer_pill("Esc close", theme::GREEN)];
+    let mut footer_spans = vec![footer_pill("Esc close", theme.green, theme)];
     if has_mismatch && has_parity {
         footer_spans.push(Span::raw("  "));
-        footer_spans.push(footer_pill(":ctdb-repair", theme::AMBER));
+        footer_spans.push(footer_pill(":ctdb-repair", theme.amber, theme));
     }
     let footer_line = Line::from(footer_spans);
     f.render_widget(
@@ -6886,6 +6943,7 @@ fn draw_cue_preview(
     f: &mut Frame,
     state: &CuePreviewState,
     button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     let area = f.size();
     let w = (area.width * 80 / 100)
@@ -6908,11 +6966,11 @@ fn draw_cue_preview(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::AMBER))
+        .border_style(Style::default().fg(theme.amber))
         .title(Span::styled(
             format!(" CUE preview · {} ", title_name),
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -6940,7 +6998,7 @@ fn draw_cue_preview(
     f.render_widget(
         Paragraph::new(Span::styled(
             summary,
-            Style::default().fg(theme::TEXT_BRIGHT),
+            Style::default().fg(theme.text_bright),
         )),
         chunks[0],
     );
@@ -6948,7 +7006,7 @@ fn draw_cue_preview(
     f.render_widget(
         Paragraph::new(Span::styled(
             "─".repeat(chunks[1].width as usize),
-            theme::muted(),
+            theme.muted(),
         )),
         chunks[1],
     );
@@ -6978,18 +7036,18 @@ fn draw_cue_preview(
             };
             let body_style = if on_edit {
                 Style::default()
-                    .fg(theme::TEXT_BRIGHT)
-                    .bg(theme::SURFACE)
+                    .fg(theme.text_bright)
+                    .bg(theme.surface)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::TEXT)
+                Style::default().fg(theme.text)
             };
             let gutter_style = if on_edit {
                 Style::default()
-                    .fg(theme::AMBER)
+                    .fg(theme.amber)
                     .add_modifier(Modifier::BOLD)
             } else {
-                theme::muted()
+                theme.muted()
             };
             // Register the line rect for click hit-testing.
             let visible_row = (idx - scroll) as u16;
@@ -6999,7 +7057,7 @@ fn draw_cue_preview(
             );
             Line::from(vec![
                 Span::styled(format!(" {} ", line_no), gutter_style),
-                Span::styled("│ ", theme::muted()),
+                Span::styled("│ ", theme.muted()),
                 Span::styled(body_text, body_style),
             ])
         })
@@ -7022,12 +7080,12 @@ fn draw_cue_preview(
             Span::styled(
                 commit_label,
                 Style::default()
-                    .fg(theme::GREEN)
+                    .fg(theme.green)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 cancel_label,
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
             ),
         ]);
         f.render_widget(Paragraph::new(footer), chunks[3]);
@@ -7050,22 +7108,22 @@ fn draw_cue_preview(
         let footer = Line::from(vec![
             Span::styled(
                 close_label,
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 top_label,
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme.cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 bot_label,
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme.cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  read-only  ", theme::muted()),
-            Span::styled(format!("    {}", pos), theme::muted()),
+            Span::styled("  read-only  ", theme.muted()),
+            Span::styled(format!("    {}", pos), theme.muted()),
         ]);
         f.render_widget(Paragraph::new(footer), chunks[3]);
         let cw = close_label.chars().count() as u16;
@@ -7094,27 +7152,27 @@ fn draw_cue_preview(
             Span::styled(
                 save_label,
                 Style::default()
-                    .fg(theme::GREEN)
+                    .fg(theme.green)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 cancel_label,
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 top_label,
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme.cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 bot_label,
                 Style::default()
-                    .fg(theme::CYAN)
+                    .fg(theme.cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  double-click line to edit  ", theme::muted()),
-            Span::styled(format!("    {}", pos), theme::muted()),
+            Span::styled("  double-click line to edit  ", theme.muted()),
+            Span::styled(format!("    {}", pos), theme.muted()),
         ]);
         f.render_widget(Paragraph::new(footer), chunks[3]);
         let sw = save_label.chars().count() as u16;
@@ -7144,6 +7202,7 @@ fn draw_mb_select(
     f: &mut Frame,
     state: &MbSelectState,
     button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     let area = f.size();
     let w = (area.width * 80 / 100)
@@ -7160,11 +7219,11 @@ fn draw_mb_select(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::PURPLE))
+        .border_style(Style::default().fg(theme.purple))
         .title(Span::styled(
             format!(" MusicBrainz · {} matches ", state.releases.len()),
             Style::default()
-                .fg(theme::PURPLE)
+                .fg(theme.purple)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -7190,7 +7249,7 @@ fn draw_mb_select(
         Paragraph::new(Span::styled(
             "  #  Title · Year · Catalog · Score",
             Style::default()
-                .fg(theme::TEXT_BRIGHT)
+                .fg(theme.text_bright)
                 .add_modifier(Modifier::BOLD),
         )),
         chunks[0],
@@ -7198,7 +7257,7 @@ fn draw_mb_select(
     f.render_widget(
         Paragraph::new(Span::styled(
             "─".repeat(chunks[1].width as usize),
-            theme::muted(),
+            theme.muted(),
         )),
         chunks[1],
     );
@@ -7232,11 +7291,11 @@ fn draw_mb_select(
             let body = format!("{}{}  {}  ·  {}  ·  {}", prefix, n, title, year, cat,);
             let style = if is_cursor {
                 Style::default()
-                    .fg(theme::TEXT_BRIGHT)
-                    .bg(theme::SURFACE)
+                    .fg(theme.text_bright)
+                    .bg(theme.surface)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::TEXT)
+                Style::default().fg(theme.text)
             };
             // Register the row rect for mouse hit-testing.
             let visible_row = (i - scroll) as u16;
@@ -7253,11 +7312,11 @@ fn draw_mb_select(
     f.render_widget(
         Paragraph::new(Span::styled(
             "─".repeat(chunks[3].width as usize),
-            theme::muted(),
+            theme.muted(),
         )),
         chunks[3],
     );
-    draw_mb_select_tracks(f, state, chunks[4]);
+    draw_mb_select_tracks(f, state, chunks[4], theme);
 
     // Footer pills: clickable Accept / Cancel + scroll hint.
     let accept_label = " [Accept] ";
@@ -7267,14 +7326,14 @@ fn draw_mb_select(
         Span::styled(
             accept_label,
             Style::default()
-                .fg(theme::GREEN)
+                .fg(theme.green)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             cancel_label,
-            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(scroll_hint, theme::muted()),
+        Span::styled(scroll_hint, theme.muted()),
     ]);
     f.render_widget(Paragraph::new(footer), chunks[5]);
     // Register footer pill rects.
@@ -7296,12 +7355,12 @@ fn draw_mb_select(
 /// "Fetching tracks…" placeholder so users know one is on the way; on
 /// detail with no tracks shows "No tracks in MB record" rather than
 /// blank space.
-fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect) {
+fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect, theme: super::theme::Theme) {
     if area.height == 0 {
         return;
     }
     let placeholder = |msg: &str| -> Paragraph<'_> {
-        Paragraph::new(Span::styled(msg.to_string(), theme::muted()))
+        Paragraph::new(Span::styled(msg.to_string(), theme.muted()))
     };
     let Some(row) = state.releases.get(state.selected) else {
         f.render_widget(placeholder("No release selected"), area);
@@ -7333,7 +7392,7 @@ fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect) {
             };
             Line::from(Span::styled(
                 format!("  {:>2}. {}", t.position, title),
-                Style::default().fg(theme::TEXT),
+                Style::default().fg(theme.text),
             ))
         })
         .chain(
@@ -7341,7 +7400,7 @@ fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect) {
                 .then(|| {
                     Line::from(Span::styled(
                         format!("  … +{} more", total - (visible - 1)),
-                        theme::muted(),
+                        theme.muted(),
                     ))
                 })
                 .into_iter(),
@@ -7515,6 +7574,7 @@ mod tests {
 
     #[test]
     fn content_tabs_render_clickable_controls() {
+        let theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
         let state = fixture();
         let mut button_map = super::super::button_map::ButtonRenderMap::new();
         let backend = ratatui::backend::TestBackend::new(80, 3);
@@ -7526,8 +7586,7 @@ mod tests {
                     f,
                     &state,
                     Rect::new(0, 0, 80, 2),
-                    &mut button_map,
-                );
+                    &mut button_map, theme);
             })
             .expect("draw content tabs");
 

@@ -709,6 +709,7 @@ pub fn draw_disc_browser(
     f: &mut ratatui::Frame,
     state: &DiscBrowserState,
     buttons: &mut crate::tui::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
     use ratatui::style::{Modifier, Style};
@@ -728,11 +729,11 @@ pub fn draw_disc_browser(
         .unwrap_or_else(|| state.source_path.display().to_string());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(crate::tui::theme::PURPLE))
+        .border_style(Style::default().fg(theme.purple))
         .title(Span::styled(
             format!(" Audio Streams: {title} "),
             Style::default()
-                .fg(crate::tui::theme::PURPLE)
+                .fg(theme.purple)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -774,11 +775,11 @@ pub fn draw_disc_browser(
                 let check = if checked { "●" } else { "○" };
                 let style = if selected {
                     Style::default()
-                        .fg(crate::tui::theme::PILL_ACTIVE_FG)
-                        .bg(crate::tui::theme::PURPLE)
+                        .fg(theme.pill_active_fg)
+                        .bg(theme.purple)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(crate::tui::theme::TEXT)
+                    Style::default().fg(theme.text)
                 };
                 let text = format!(
                     " {marker} {disclosure} {check} {}",
@@ -801,7 +802,7 @@ pub fn draw_disc_browser(
                 let text = format!("      {}", track_summary(track));
                 lines.push(Line::from(vec![Span::styled(
                     truncate_text(&text, content_width),
-                    Style::default().fg(crate::tui::theme::TEXT_DIM),
+                    Style::default().fg(theme.text_dim),
                 )]));
             }
         }
@@ -830,13 +831,13 @@ pub fn draw_disc_browser(
         "Stream Convert N/A"
     };
     let footer = Line::from(vec![
-        footer_pill(convert_footer_label, crate::tui::theme::PURPLE),
+        footer_pill(convert_footer_label, theme.purple, theme),
         Span::raw("  "),
-        footer_pill("E Expand", crate::tui::theme::PURPLE),
+        footer_pill("E Expand", theme.purple, theme),
         Span::raw("  "),
-        footer_pill("Space Select", crate::tui::theme::PURPLE),
+        footer_pill("Space Select", theme.purple, theme),
         Span::raw("  "),
-        footer_pill("Esc Close", crate::tui::theme::PURPLE),
+        footer_pill("Esc Close", theme.purple, theme),
     ]);
     f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), chunks[1]);
 
@@ -911,11 +912,11 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn footer_pill(label: &str, bg: ratatui::style::Color) -> ratatui::text::Span<'static> {
+fn footer_pill(label: &str, bg: ratatui::style::Color, theme: super::theme::Theme) -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(
         format!(" {label} "),
         ratatui::style::Style::default()
-            .fg(crate::tui::theme::PILL_ACTIVE_FG)
+            .fg(theme.pill_active_fg)
             .bg(bg)
             .add_modifier(ratatui::style::Modifier::BOLD),
     )

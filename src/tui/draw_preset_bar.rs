@@ -10,7 +10,6 @@ use ratatui::{
 
 use super::app::PresetState;
 use super::button_map::{ButtonRenderMap, TuiButton};
-use super::theme;
 
 /// Draw the preset bar row and register clickable regions
 pub fn draw_preset_bar(
@@ -18,12 +17,13 @@ pub fn draw_preset_bar(
     area: Rect,
     preset: &PresetState,
     buttons: &mut ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     if area.width < 20 {
         return;
     }
 
-    let mut spans = vec![Span::styled("  preset  ", theme::muted())];
+    let mut spans = vec![Span::styled("  preset  ", theme.muted())];
 
     // Track x position of the preset pill for click registration
     let mut preset_pill_rect: Option<Rect> = None;
@@ -38,8 +38,8 @@ pub fn draw_preset_bar(
         spans.push(Span::styled(
             pill_text,
             Style::default()
-                .fg(theme::PILL_PRESET_FG)
-                .bg(theme::PILL_PRESET_BG)
+                .fg(theme.pill_preset_fg)
+                .bg(theme.pill_preset_bg)
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -48,12 +48,12 @@ pub fn draw_preset_bar(
             spans.push(Span::styled(
                 "(modified)",
                 Style::default()
-                    .fg(theme::TEXT_MUTED)
+                    .fg(theme.text_muted)
                     .add_modifier(Modifier::DIM),
             ));
         }
     } else {
-        spans.push(Span::styled("none", Style::default().fg(theme::TEXT_DIM)));
+        spans.push(Span::styled("none", Style::default().fg(theme.text_dim)));
     }
 
     // Right-aligned shortcut hints: "p presets  s save" = 17 chars
@@ -62,11 +62,11 @@ pub fn draw_preset_bar(
     let gap = (area.width as usize).saturating_sub(left_width + hints_text_width + 2);
 
     spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled("p", theme::muted()));
-    spans.push(Span::styled(" presets", theme::accent()));
+    spans.push(Span::styled("p", theme.muted()));
+    spans.push(Span::styled(" presets", theme.accent()));
     spans.push(Span::raw("  "));
-    spans.push(Span::styled("s", theme::muted()));
-    spans.push(Span::styled(" save", theme::accent()));
+    spans.push(Span::styled("s", theme.muted()));
+    spans.push(Span::styled(" save", theme.accent()));
 
     // Compute button positions for right-side hints
     let hints_start_x = area.x + (left_width + gap) as u16;

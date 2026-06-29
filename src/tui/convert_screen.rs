@@ -18,10 +18,9 @@ use super::draw_output_options::{draw_output_options_pane, draw_output_options_t
 use super::draw_preset_bar::draw_preset_bar;
 use super::draw_source::{draw_source_pane, draw_source_title_bar};
 use super::pill::PillState;
-use super::theme;
 
 /// Draw the full convert screen.
-pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
+pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
     let layout = app.convert.layout;
     let pane_constraint = |pane: ConvertFocus, default_height: u16| -> Constraint {
         match layout {
@@ -51,29 +50,28 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         .split(area);
 
     // Pass 1: draw with immutable state reads.
-    draw_header(f, chunks[0]);
+    draw_header(f, chunks[0], theme);
     {
         let preset = &app.preset;
         let buttons = &mut app.button_map;
-        draw_preset_bar(f, chunks[2], preset, buttons);
+        draw_preset_bar(f, chunks[2], preset, buttons, theme);
     }
 
     let source_focused = app.convert.focus == ConvertFocus::Source;
     if app.convert.is_collapsed(ConvertFocus::Source) {
-        draw_source_title_bar(f, chunks[4], &app.convert.source, source_focused);
+        draw_source_title_bar(f, chunks[4], &app.convert.source, source_focused, theme);
     } else {
         draw_source_pane(
             f,
             chunks[4],
             &app.convert.source,
             source_focused,
-            app.convert.is_maximized(ConvertFocus::Source),
-        );
+            app.convert.is_maximized(ConvertFocus::Source), theme);
     }
 
     let metadata_focused = app.convert.focus == ConvertFocus::Metadata;
     if app.convert.is_collapsed(ConvertFocus::Metadata) {
-        draw_metadata_title_bar(f, chunks[5], metadata_focused);
+        draw_metadata_title_bar(f, chunks[5], metadata_focused, theme);
     } else {
         draw_metadata_pane(
             f,
@@ -81,26 +79,24 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
             &app.convert.metadata,
             &app.convert.source.mode,
             metadata_focused,
-            app.convert.is_maximized(ConvertFocus::Metadata),
-        );
+            app.convert.is_maximized(ConvertFocus::Metadata), theme);
     }
 
     let format_focused = app.convert.focus == ConvertFocus::Format;
     if app.convert.is_collapsed(ConvertFocus::Format) {
-        draw_format_title_bar(f, chunks[6], format_focused);
+        draw_format_title_bar(f, chunks[6], format_focused, theme);
     } else {
         draw_format_pane(
             f,
             chunks[6],
             &app.convert.format,
             format_focused,
-            app.convert.is_maximized(ConvertFocus::Format),
-        );
+            app.convert.is_maximized(ConvertFocus::Format), theme);
     }
 
     let output_focused = app.convert.focus == ConvertFocus::OutputOptions;
     if app.convert.is_collapsed(ConvertFocus::OutputOptions) {
-        draw_output_options_title_bar(f, chunks[7], output_focused);
+        draw_output_options_title_bar(f, chunks[7], output_focused, theme);
     } else {
         draw_output_options_pane(
             f,
@@ -110,11 +106,10 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
             app.convert.source.mode.total_source_size(),
             &app.convert.format,
             output_focused,
-            app.convert.is_maximized(ConvertFocus::OutputOptions),
-        );
+            app.convert.is_maximized(ConvertFocus::OutputOptions), theme);
     }
 
-    draw_convert_action_bar(f, chunks[9], &mut app.button_map);
+    draw_convert_action_bar(f, chunks[9], &mut app.button_map, theme);
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
         f,
@@ -122,6 +117,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState) {
         app.current_screen,
         &mut app.button_map,
         status_msg,
+        theme,
     );
 
     // Pass 2: register buttons for the same frame.
@@ -481,15 +477,15 @@ fn register_pill_row<T: Clone>(
 }
 
 /// Draw the convert screen action bar with enqueue + enqueue+start pills, centered.
-fn draw_convert_action_bar(f: &mut Frame, area: Rect, buttons: &mut ButtonRenderMap) {
+fn draw_convert_action_bar(f: &mut Frame, area: Rect, buttons: &mut ButtonRenderMap, theme: super::theme::Theme) {
     use super::draw_overlays::{footer_pill_pub, pill_gap_pub};
 
     let pills: &[(&str, TuiButton, Color)] = &[
-        ("enqueue", TuiButton::SourceEnqueueButton, theme::GREEN),
+        ("enqueue", TuiButton::SourceEnqueueButton, theme.green),
         (
             "enqueue + start",
             TuiButton::SourceEnqueueStartButton,
-            theme::BLUE,
+            theme.blue,
         ),
     ];
 
@@ -508,7 +504,7 @@ fn draw_convert_action_bar(f: &mut Frame, area: Rect, buttons: &mut ButtonRender
             spans.push(pill_gap_pub());
             x += 1;
         }
-        let pill = footer_pill_pub(label, *color);
+        let pill = footer_pill_pub(label, *color, theme);
         let pill_width = label.len() as u16 + 2;
         buttons.record_button(*btn, Rect::new(x, area.y, pill_width, 1));
         x += pill_width;

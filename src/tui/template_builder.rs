@@ -18,7 +18,6 @@ use ratatui::{
 use super::app::{TemplateBuilderFocus, TemplateBuilderState, TemplateTarget};
 use super::button_map::{ButtonRenderMap, TuiButton};
 use super::text_input::TextInputState;
-use super::theme;
 
 // =========================================================================
 // Token definitions
@@ -275,6 +274,7 @@ pub fn draw_template_builder(
     f: &mut Frame,
     state: &TemplateBuilderState,
     button_map: &mut ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
     let area = f.size();
     let w = (area.width * 80 / 100)
@@ -298,11 +298,11 @@ pub fn draw_template_builder(
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::AMBER))
+        .border_style(Style::default().fg(theme.amber))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -317,12 +317,12 @@ pub fn draw_template_builder(
 
     // ── Template input line ──
     {
-        let label = Span::styled("  Template:  ", theme::muted());
+        let label = Span::styled("  Template:  ", theme.muted());
         let (visible_text, cursor_col) = state.template_input.view(iw.saturating_sub(14));
         let input_style = if state.focus == TemplateBuilderFocus::TemplateInput {
-            Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
+            Style::default().fg(theme.text_bright).bg(theme.input_focused_bg)
         } else {
-            Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 30))
+            Style::default().fg(theme.text_bright).bg(theme.input_unfocused_bg)
         };
         let input_span = Span::styled(
             format!("{:width$}", visible_text, width = iw.saturating_sub(14)),
@@ -341,7 +341,7 @@ pub fn draw_template_builder(
         let header = Line::from(Span::styled(
             "  ── Saved templates ──",
             Style::default()
-                .fg(theme::TEXT_DIM)
+                .fg(theme.text_dim)
                 .add_modifier(Modifier::BOLD),
         ));
         f.render_widget(
@@ -353,7 +353,7 @@ pub fn draw_template_builder(
         if state.saved_templates.is_empty() {
             let empty = Line::from(Span::styled(
                 "    (none saved)",
-                Style::default().fg(theme::TEXT_DIM),
+                Style::default().fg(theme.text_dim),
             ));
             f.render_widget(
                 Paragraph::new(empty),
@@ -370,9 +370,9 @@ pub fn draw_template_builder(
                     state.focus == TemplateBuilderFocus::SavedList && idx == state.saved_selected;
                 let marker = if is_selected { "  ▸ " } else { "    " };
                 let style = if is_selected {
-                    Style::default().fg(theme::AMBER)
+                    Style::default().fg(theme.amber)
                 } else {
-                    Style::default().fg(theme::TEXT)
+                    Style::default().fg(theme.text)
                 };
                 let display: String = if tmpl.len() > iw.saturating_sub(8) {
                     let trunc: String = tmpl.chars().take(iw.saturating_sub(11)).collect();
@@ -406,7 +406,7 @@ pub fn draw_template_builder(
         let header = Line::from(Span::styled(
             format!("  ── {} ──", cat.label),
             Style::default()
-                .fg(theme::TEXT_DIM)
+                .fg(theme.text_dim)
                 .add_modifier(Modifier::BOLD),
         ));
         if cy < inner.y + inner.height {
@@ -432,13 +432,13 @@ pub fn draw_template_builder(
                     state.focus == TemplateBuilderFocus::TokenGrid && grid_idx == state.grid_cursor;
                 let style = if is_highlighted {
                     Style::default()
-                        .fg(theme::BG)
-                        .bg(theme::AMBER)
+                        .fg(theme.bg)
+                        .bg(theme.amber)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .fg(theme::PILL_ACTIVE_FG)
-                        .bg(theme::BLUE)
+                        .fg(theme.pill_active_fg)
+                        .bg(theme.blue)
                         .add_modifier(Modifier::BOLD)
                 };
                 let pill = Span::styled(label, style);
@@ -462,7 +462,7 @@ pub fn draw_template_builder(
         let header = Line::from(Span::styled(
             "  ── Separators ──",
             Style::default()
-                .fg(theme::TEXT_DIM)
+                .fg(theme.text_dim)
                 .add_modifier(Modifier::BOLD),
         ));
         f.render_widget(
@@ -484,13 +484,13 @@ pub fn draw_template_builder(
                 state.focus == TemplateBuilderFocus::TokenGrid && grid_idx == state.grid_cursor;
             let style = if is_highlighted {
                 Style::default()
-                    .fg(theme::BG)
-                    .bg(theme::AMBER)
+                    .fg(theme.bg)
+                    .bg(theme.amber)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(theme::PILL_ACTIVE_FG)
-                    .bg(theme::PURPLE)
+                    .fg(theme.pill_active_fg)
+                    .bg(theme.purple)
                     .add_modifier(Modifier::BOLD)
             };
             let pill = Span::styled(display, style);
@@ -512,10 +512,10 @@ pub fn draw_template_builder(
     cy += 1;
     if cy < inner.y + inner.height {
         let pills: &[(&str, TuiButton, Color)] = &[
-            ("apply", TuiButton::TemplateBuilderApply, theme::GREEN),
-            ("save", TuiButton::TemplateBuilderSave, theme::BLUE),
-            ("clear", TuiButton::TemplateBuilderClear, theme::PURPLE),
-            ("x delete", TuiButton::TemplateBuilderDelete, theme::RED),
+            ("apply", TuiButton::TemplateBuilderApply, theme.green),
+            ("save", TuiButton::TemplateBuilderSave, theme.blue),
+            ("clear", TuiButton::TemplateBuilderClear, theme.purple),
+            ("x delete", TuiButton::TemplateBuilderDelete, theme.destructive),
         ];
 
         let total_w: u16 = pills
@@ -536,7 +536,7 @@ pub fn draw_template_builder(
             let pill = Span::styled(
                 format!(" {} ", label),
                 Style::default()
-                    .fg(theme::PILL_ACTIVE_FG)
+                    .fg(theme.pill_active_fg)
                     .bg(*color)
                     .add_modifier(Modifier::BOLD),
             );
@@ -547,7 +547,7 @@ pub fn draw_template_builder(
 
         // Esc close (not a button — just a hint)
         spans.push(Span::raw("  "));
-        spans.push(Span::styled("Esc close", theme::muted()));
+        spans.push(Span::styled("Esc close", theme.muted()));
 
         f.render_widget(
             Paragraph::new(Line::from(spans)),
@@ -609,8 +609,8 @@ pub fn draw_template_picker(
     preview: &str,
     active_template: Option<&str>,
     button_map: &mut ButtonRenderMap,
+    theme: super::theme::Theme,
 ) {
-    use super::theme;
 
     let area = f.size();
     let w = (area.width * 75 / 100).max(50).min(area.width.saturating_sub(2));
@@ -630,7 +630,7 @@ pub fn draw_template_picker(
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::CYAN))
+        .border_style(Style::default().fg(theme.cyan))
         .title(format!(" {} ", title_label))
         .title_alignment(ratatui::layout::Alignment::Center);
     f.render_widget(block, outer);
@@ -643,7 +643,7 @@ pub fn draw_template_picker(
     if templates.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "No saved templates",
-            theme::muted(),
+            theme.muted(),
         )));
         f.render_widget(empty, Rect::new(inner.x + 1, cy, inner.width.saturating_sub(2), 1));
         cy += 1;
@@ -658,22 +658,22 @@ pub fn draw_template_picker(
 
             // Selection indicator
             if is_selected {
-                spans.push(Span::styled("▸ ", Style::default().fg(theme::CYAN)));
+                spans.push(Span::styled("▸ ", Style::default().fg(theme.cyan)));
             } else {
                 spans.push(Span::raw("  "));
             }
 
             // Template text
             let style = if is_selected {
-                Style::default().fg(theme::TEXT_BRIGHT).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme.text_bright).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::TEXT)
+                Style::default().fg(theme.text)
             };
             spans.push(Span::styled(tmpl.clone(), style));
 
             // Active badge
             if is_active {
-                spans.push(Span::styled(" (active)", Style::default().fg(theme::GREEN)));
+                spans.push(Span::styled(" (active)", Style::default().fg(theme.green)));
             }
 
             let row_rect = Rect::new(inner.x, cy, inner.width, 1);
@@ -691,13 +691,13 @@ pub fn draw_template_picker(
 
     // Preview label
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled("Example:", theme::muted()))),
+        Paragraph::new(Line::from(Span::styled("Example:", theme.muted()))),
         Rect::new(inner.x + 1, cy, inner.width.saturating_sub(2), 1),
     );
     cy += 1;
 
     // Preview value
-    let preview_style = Style::default().fg(theme::TEXT_BRIGHT);
+    let preview_style = Style::default().fg(theme.text_bright);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(preview, preview_style))),
         Rect::new(inner.x + 2, cy, inner.width.saturating_sub(4), 1),
@@ -706,9 +706,9 @@ pub fn draw_template_picker(
 
     // Footer pills
     let pills: &[(&str, TuiButton, Color)] = &[
-        ("apply", TuiButton::TemplatePickerApply, theme::GREEN),
-        ("delete", TuiButton::TemplatePickerDelete, theme::RED),
-        ("close", TuiButton::TemplatePickerClose, theme::PURPLE),
+        ("apply", TuiButton::TemplatePickerApply, theme.green),
+        ("delete", TuiButton::TemplatePickerDelete, theme.destructive),
+        ("close", TuiButton::TemplatePickerClose, theme.purple),
     ];
     let total_w: u16 = pills
         .iter()
@@ -727,7 +727,7 @@ pub fn draw_template_picker(
         let pill = Span::styled(
             format!(" {} ", label),
             Style::default()
-                .fg(theme::PILL_ACTIVE_FG)
+                .fg(theme.pill_active_fg)
                 .bg(*color)
                 .add_modifier(Modifier::BOLD),
         );

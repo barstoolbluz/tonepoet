@@ -4,7 +4,7 @@ use std::path::Path;
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -12,7 +12,6 @@ use ratatui::{
 
 use super::app::{SourceMode, SourceState};
 use super::probe::SourceInfo;
-use super::theme;
 use crate::convert::formats::AudioFormat;
 
 /// Label shown on the clickable "browse files" pill on the source pane.
@@ -101,15 +100,16 @@ pub fn draw_source_pane(
     source: &SourceState,
     focused: bool,
     maximized: bool,
+    theme: super::theme::Theme,
 ) {
     if area.height < 4 || area.width < 30 {
         return;
     }
 
     let border_color = if focused {
-        theme::AMBER
+        theme.amber
     } else {
-        theme::TEXT_DIM
+        theme.text_dim
     };
     let w = area.width as usize;
 
@@ -119,16 +119,16 @@ pub fn draw_source_pane(
         SourceMode::MultiTrack { .. } => " source (tracks) ",
         _ => " source ",
     };
-    let top_line = source_title_line(border_color, w, title, maximized);
+    let top_line = source_title_line(border_color, w, title, maximized, theme);
 
     // Bottom border: └───┘
     let bot_line = Line::from(Span::styled(
         format!("└{}┘", "─".repeat(w.saturating_sub(2))),
-        theme::border(border_color),
+        theme.border(border_color),
     ));
 
     let content_lines = match &source.mode {
-        SourceMode::Empty => render_empty(border_color, w),
+        SourceMode::Empty => render_empty(border_color, w, theme),
         SourceMode::Single {
             path,
             info,
@@ -139,8 +139,7 @@ pub fn draw_source_pane(
             w,
             path,
             info.as_ref(),
-            probe_notice.as_deref(),
-        ),
+            probe_notice.as_deref(), theme),
         SourceMode::MultiTrack {
             path,
             info,
@@ -170,8 +169,7 @@ pub fn draw_source_pane(
             selected,
             area.height,
             disc_contents.as_deref(),
-            selected_presentation_id.as_ref(),
-        ),
+            selected_presentation_id.as_ref(), theme),
         SourceMode::Batch {
             paths,
             cursor,
@@ -197,15 +195,14 @@ pub fn draw_source_pane(
             *total_size,
             *album_count,
             format_histogram,
-            area.height,
-        ),
+            area.height, theme),
     };
 
     let mut lines = vec![top_line];
     lines.extend(content_lines);
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
     while lines.len() < target_len_before_bottom {
-        lines.push(bordered_line(border_color, w, vec![]));
+        lines.push(bordered_line(border_color, w, vec![], theme));
     }
     lines.push(bot_line);
 
@@ -215,11 +212,11 @@ pub fn draw_source_pane(
 
 
 /// Draw the collapsed source title bar.
-pub fn draw_source_title_bar(f: &mut Frame, area: Rect, source: &SourceState, focused: bool) {
+pub fn draw_source_title_bar(f: &mut Frame, area: Rect, source: &SourceState, focused: bool, theme: super::theme::Theme) {
     if area.height < 1 || area.width < 12 {
         return;
     }
-    let border_color = if focused { theme::AMBER } else { theme::TEXT_DIM };
+    let border_color = if focused { theme.amber } else { theme.text_dim };
     let title = match source.mode {
         SourceMode::Batch { .. } => " source (batch) ",
         SourceMode::MultiTrack { .. } => " source (tracks) ",
@@ -229,8 +226,7 @@ pub fn draw_source_title_bar(f: &mut Frame, area: Rect, source: &SourceState, fo
         border_color,
         area.width as usize,
         title,
-        false,
-    )]), area);
+        false, theme)]), area);
 }
 
 fn source_title_line<'a>(
@@ -238,17 +234,18 @@ fn source_title_line<'a>(
     width: usize,
     title: &'a str,
     maximized: bool,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
     let indicator = if maximized { "▾" } else { "▸" };
-    let bar_style = Style::default().fg(Color::Black).bg(border_color);
+    let bar_style = Style::default().fg(theme.bg).bg(border_color);
     let left_spans = vec![
-        Span::styled("┌", theme::border(border_color)),
+        Span::styled("┌", theme.border(border_color)),
         Span::styled(format!(" {indicator}{title}"), bar_style),
     ];
     let right_spans = vec![
-        Span::styled("a", Style::default().fg(theme::TEXT_MUTED).bg(border_color)),
+        Span::styled("a", Style::default().fg(theme.text_muted).bg(border_color)),
         Span::styled("dvanced ", bar_style),
-        Span::styled("┐", theme::border(border_color)),
+        Span::styled("┐", theme.border(border_color)),
     ];
     let fixed_width = Line::from(left_spans.clone()).width()
         + Line::from(right_spans.clone()).width();
@@ -263,19 +260,20 @@ fn source_title_line<'a>(
 }
 
 /// Render the Empty placeholder content.
-fn render_empty<'a>(border_color: ratatui::style::Color, w: usize) -> Vec<Line<'a>> {
+fn render_empty<'a>(border_color: ratatui::style::Color, w: usize,
+    theme: super::theme::Theme,
+) -> Vec<Line<'a>> {
     vec![
-        bordered_line(border_color, w, vec![]),
+        bordered_line(border_color, w, vec![], theme),
         bordered_line(
             border_color,
             w,
             vec![Span::styled(
                 "   press :browse or click the pill below to pick a source file",
-                theme::muted(),
-            )],
-        ),
-        bordered_line(border_color, w, vec![]),
-        browse_pill_row(border_color, w),
+                theme.muted(),
+            )], theme),
+        bordered_line(border_color, w, vec![], theme),
+        browse_pill_row(border_color, w, theme),
     ]
 }
 
@@ -286,6 +284,7 @@ fn render_single<'a>(
     path: &std::path::Path,
     info: Option<&SourceInfo>,
     probe_notice: Option<&str>,
+    theme: super::theme::Theme,
 ) -> Vec<Line<'a>> {
     let Some(info) = info else {
         // Path is known but no reliable probe info is available yet. When the
@@ -296,56 +295,53 @@ fn render_single<'a>(
                 border_color,
                 w,
                 vec![
-                    Span::styled("   warning   ", theme::muted()),
+                    Span::styled("   warning   ", theme.muted()),
                     Span::styled(
                         truncate_to(notice, w.saturating_sub(15)),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme.amber),
                     ),
-                ],
-            )
+                ], theme)
         } else {
             bordered_line(
                 border_color,
                 w,
-                vec![Span::styled("   probing…", theme::muted())],
-            )
+                vec![Span::styled("   probing…", theme.muted())], theme)
         };
         return vec![
             bordered_line(
                 border_color,
                 w,
                 vec![
-                    Span::styled("   path      ", theme::muted()),
-                    Span::styled(shorten_path(path, w.saturating_sub(16)), theme::bright()),
-                ],
-            ),
+                    Span::styled("   path      ", theme.muted()),
+                    Span::styled(shorten_path(path, w.saturating_sub(16)), theme.bright()),
+                ], theme),
             status_line,
-            bordered_line(border_color, w, vec![]),
-            browse_pill_row(border_color, w),
+            bordered_line(border_color, w, vec![], theme),
+            browse_pill_row(border_color, w, theme),
         ];
     };
 
     let path_truncated = shorten_path(path, w.saturating_sub(16));
 
     let mut format_parts = vec![
-        Span::styled("   format    ", theme::muted()),
-        Span::styled(info.format_name.clone(), theme::bold(theme::BLUE)),
+        Span::styled("   format    ", theme.muted()),
+        Span::styled(info.format_name.clone(), theme.bold(theme.blue)),
     ];
     if !info.codec.is_empty() {
-        format_parts.push(Span::styled(" │ ", theme::muted()));
-        format_parts.push(Span::styled(info.codec_display(), theme::text()));
+        format_parts.push(Span::styled(" │ ", theme.muted()));
+        format_parts.push(Span::styled(info.codec_display(), theme.text_style()));
     }
     if info.sample_rate > 0 {
-        format_parts.push(Span::styled(" │ ", theme::muted()));
-        format_parts.push(Span::styled(info.sample_rate_display(), theme::text()));
+        format_parts.push(Span::styled(" │ ", theme.muted()));
+        format_parts.push(Span::styled(info.sample_rate_display(), theme.text_style()));
     }
     if info.channels > 0 {
-        format_parts.push(Span::styled(" │ ", theme::muted()));
-        format_parts.push(Span::styled(info.channels_display(), theme::text()));
+        format_parts.push(Span::styled(" │ ", theme.muted()));
+        format_parts.push(Span::styled(info.channels_display(), theme.text_style()));
     }
     if info.file_size > 0 {
-        format_parts.push(Span::styled(" │ ", theme::muted()));
-        format_parts.push(Span::styled(info.size_display(), theme::text()));
+        format_parts.push(Span::styled(" │ ", theme.muted()));
+        format_parts.push(Span::styled(info.size_display(), theme.text_style()));
     }
 
     vec![
@@ -353,20 +349,18 @@ fn render_single<'a>(
             border_color,
             w,
             vec![
-                Span::styled("   path      ", theme::muted()),
-                Span::styled(path_truncated, theme::bright()),
-            ],
-        ),
-        bordered_line(border_color, w, format_parts),
+                Span::styled("   path      ", theme.muted()),
+                Span::styled(path_truncated, theme.bright()),
+            ], theme),
+        bordered_line(border_color, w, format_parts, theme),
         bordered_line(
             border_color,
             w,
             vec![
-                Span::styled("   duration  ", theme::muted()),
-                Span::styled(info.duration_display(), theme::text()),
-            ],
-        ),
-        two_pill_row(border_color, w, BROWSE_PILL_LABEL),
+                Span::styled("   duration  ", theme.muted()),
+                Span::styled(info.duration_display(), theme.text_style()),
+            ], theme),
+        two_pill_row(border_color, w, BROWSE_PILL_LABEL, theme),
     ]
 }
 
@@ -398,6 +392,7 @@ fn render_batch<'a>(
     album_count: usize,
     format_histogram: &[(AudioFormat, usize)],
     pane_height: u16,
+    theme: super::theme::Theme,
 ) -> Vec<Line<'a>> {
     let n = paths.len();
     let mut lines = Vec::new();
@@ -414,10 +409,9 @@ fn render_batch<'a>(
         border_color,
         w,
         vec![
-            Span::styled("   batch     ", theme::muted()),
-            Span::styled(summary_line, theme::bold(theme::BLUE)),
-        ],
-    ));
+            Span::styled("   batch     ", theme.muted()),
+            Span::styled(summary_line, theme.bold(theme.blue)),
+        ], theme));
 
     // Line 2: currently previewed file. This is the same shared cursor used
     // by the metadata file list, so moving in either pane keeps the source
@@ -446,13 +440,12 @@ fn render_batch<'a>(
         border_color,
         w,
         vec![
-            Span::styled("   selected  ", theme::muted()),
+            Span::styled("   selected  ", theme.muted()),
             Span::styled(
                 truncate_to(&selected_text, w.saturating_sub(15)),
-                theme::bold(theme::CYAN),
+                theme.bold(theme.cyan),
             ),
-        ],
-    ));
+        ], theme));
 
     // Line 3: persistent batch-level probe notice, when present. This is
     // intentionally separate from the status bar so warnings remain visible
@@ -462,13 +455,12 @@ fn render_batch<'a>(
             border_color,
             w,
             vec![
-                Span::styled("   warning   ", theme::muted()),
+                Span::styled("   warning   ", theme.muted()),
                 Span::styled(
                     truncate_to(notice, w.saturating_sub(15)),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme.amber),
                 ),
-            ],
-        ));
+            ], theme));
         4
     } else {
         3
@@ -488,10 +480,9 @@ fn render_batch<'a>(
         border_color,
         w,
         vec![
-            Span::styled("   formats   ", theme::muted()),
-            Span::styled(truncate_to(&hist_str, w.saturating_sub(15)), theme::text()),
-        ],
-    ));
+            Span::styled("   formats   ", theme.muted()),
+            Span::styled(truncate_to(&hist_str, w.saturating_sub(15)), theme.text_style()),
+        ], theme));
 
     // Inline file list. The list is cursor-windowed rather than always
     // starting at zero, so cursor moves from the source pane and from the
@@ -535,9 +526,9 @@ fn render_batch<'a>(
                 })
                 .unwrap_or_default();
             let fg = if abs == cursor {
-                Color::Cyan
+                theme.cyan
             } else {
-                Color::White
+                theme.text_bright
             };
             let prefix = if abs == cursor { "▶ " } else { "  " };
             let numbered = format!("{}{}. {}", prefix, abs + 1, filename);
@@ -545,7 +536,7 @@ fn render_batch<'a>(
             let padded = format!("   {:<width$}", truncated, width = col_width.saturating_sub(3));
             row_spans.push(Span::styled(padded, Style::default().fg(fg)));
         }
-        lines.push(bordered_line(border_color, w, row_spans));
+        lines.push(bordered_line(border_color, w, row_spans, theme));
     }
 
     if has_overflow && list_rows > item_rows {
@@ -563,12 +554,11 @@ fn render_batch<'a>(
             w,
             vec![Span::styled(
                 truncate_to(&message, w.saturating_sub(4)),
-                Style::default().fg(Color::DarkGray),
-            )],
-        ));
+                Style::default().fg(theme.text_dim),
+            )], theme));
     }
 
-    lines.push(two_pill_row(border_color, w, EXPAND_PILL_LABEL));
+    lines.push(two_pill_row(border_color, w, EXPAND_PILL_LABEL, theme));
 
     lines
 }
@@ -695,24 +685,25 @@ fn truncate_left_to_chars(s: &str, max_width: usize) -> String {
 }
 
 /// Render the "browse files" pill row, right-aligned inside the source pane.
-fn browse_pill_row(border_color: ratatui::style::Color, width: usize) -> Line<'static> {
-    pill_row(border_color, width, BROWSE_PILL_LABEL)
+fn browse_pill_row(border_color: ratatui::style::Color, width: usize, theme: super::theme::Theme) -> Line<'static> {
+    pill_row(border_color, width, BROWSE_PILL_LABEL, theme)
 }
 
-/// Row with two pills: a primary pill (right-aligned) and an analyze pill
+/// Row with two pills: a primary pill (right-aligned, theme) and an analyze pill
 /// to its left. Used when a file is loaded (Single/Batch).
 fn two_pill_row(
     border_color: ratatui::style::Color,
     width: usize,
     primary_label: &'static str,
+    theme: super::theme::Theme,
 ) -> Line<'static> {
     let pill_style = Style::default()
-        .fg(theme::PILL_ACTIVE_FG)
-        .bg(theme::PILL_ACTIVE_BG)
+        .fg(theme.pill_active_fg)
+        .bg(theme.pill_active_bg)
         .add_modifier(ratatui::style::Modifier::BOLD);
     let analyze_style = Style::default()
-        .fg(theme::PILL_ACTIVE_FG)
-        .bg(theme::PURPLE)
+        .fg(theme.pill_active_fg)
+        .bg(theme.purple)
         .add_modifier(ratatui::style::Modifier::BOLD);
 
     let primary_w = primary_label.chars().count();
@@ -724,13 +715,13 @@ fn two_pill_row(
     let left_pad = inner_w.saturating_sub(total_pills + right_margin);
 
     Line::from(vec![
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
         Span::raw(" ".repeat(left_pad)),
         Span::styled(ANALYZE_PILL_LABEL, analyze_style),
         Span::raw(" ".repeat(gap)),
         Span::styled(primary_label, pill_style),
         Span::raw(" ".repeat(right_margin)),
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
     ])
 }
 
@@ -739,10 +730,11 @@ fn pill_row(
     border_color: ratatui::style::Color,
     width: usize,
     label: &'static str,
+    theme: super::theme::Theme,
 ) -> Line<'static> {
     let pill_style = Style::default()
-        .fg(theme::PILL_ACTIVE_FG)
-        .bg(theme::PILL_ACTIVE_BG)
+        .fg(theme.pill_active_fg)
+        .bg(theme.pill_active_bg)
         .add_modifier(ratatui::style::Modifier::BOLD);
 
     let pill_w = label.chars().count();
@@ -751,11 +743,11 @@ fn pill_row(
     let left_pad = inner_w.saturating_sub(pill_w + right_margin);
 
     Line::from(vec![
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
         Span::raw(" ".repeat(left_pad)),
         Span::styled(label, pill_style),
         Span::raw(" ".repeat(right_margin)),
-        Span::styled("│", theme::border(border_color)),
+        Span::styled("│", theme.border(border_color)),
     ])
 }
 
@@ -764,14 +756,15 @@ fn bordered_line<'a>(
     border_color: ratatui::style::Color,
     width: usize,
     content: Vec<Span<'a>>,
+    theme: super::theme::Theme,
 ) -> Line<'a> {
     let content_width: usize = content.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(2 + content_width);
 
-    let mut spans = vec![Span::styled("│", theme::border(border_color))];
+    let mut spans = vec![Span::styled("│", theme.border(border_color))];
     spans.extend(content);
     spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", theme::border(border_color)));
+    spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
 }
 
@@ -794,6 +787,7 @@ fn render_multi_track<'a>(
     pane_height: u16,
     disc_contents: Option<&crate::disc::DiscContents>,
     selected_presentation_id: Option<&crate::disc::PresentationId>,
+    theme: super::theme::Theme,
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -803,7 +797,7 @@ fn render_multi_track<'a>(
         Span::styled("   ", Style::default()),
         Span::styled(
             truncate_to(&name, w.saturating_sub(6)),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text_bright),
         ),
     ];
     let has_stream_pill = disc_contents
@@ -826,17 +820,17 @@ fn render_multi_track<'a>(
         header_spans.push(Span::styled(
             format!("  [◀ {} ▶]", current_label),
             Style::default()
-                .fg(super::theme::PILL_ACTIVE_FG)
-                .bg(Color::Cyan)
+                .fg(theme.pill_active_fg)
+                .bg(theme.cyan)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ));
     } else if let Some(area) = area_label {
         header_spans.push(Span::styled(
             format!("  [{}]", area),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.cyan),
         ));
     }
-    lines.push(bordered_line(border_color, w, header_spans));
+    lines.push(bordered_line(border_color, w, header_spans, theme));
 
     // Album info
     if let Some(title) = album_title {
@@ -849,9 +843,8 @@ fn render_multi_track<'a>(
             w,
             vec![Span::styled(
                 truncate_to(&info, w.saturating_sub(4)),
-                Style::default().fg(Color::DarkGray),
-            )],
-        ));
+                Style::default().fg(theme.text_dim),
+            )], theme));
     }
 
     if let Some(info) = info {
@@ -859,25 +852,23 @@ fn render_multi_track<'a>(
             border_color,
             w,
             vec![
-                Span::styled("   source    ", theme::muted()),
+                Span::styled("   source    ", theme.muted()),
                 Span::styled(
                     truncate_to(&batch_cursor_audio_summary(info), w.saturating_sub(15)),
-                    theme::text(),
+                    theme.text_style(),
                 ),
-            ],
-        ));
+            ], theme));
     } else if let Some(notice) = probe_notice {
         lines.push(bordered_line(
             border_color,
             w,
             vec![
-                Span::styled("   source    ", theme::muted()),
+                Span::styled("   source    ", theme.muted()),
                 Span::styled(
                     truncate_to(notice, w.saturating_sub(15)),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme.amber),
                 ),
-            ],
-        ));
+            ], theme));
     }
 
     // Track count
@@ -886,12 +877,11 @@ fn render_multi_track<'a>(
         w,
         vec![Span::styled(
             format!("   {} tracks", tracks.len()),
-            Style::default().fg(Color::Gray),
-        )],
-    ));
+            Style::default().fg(theme.text_muted),
+        )], theme));
 
     // Derive max visible tracks from pane height.
-    // pane_height = borders(2) + header_rows + track_rows + pill(1) [+ overflow(1)]
+    // pane_height = borders(2) + header_rows + track_rows + pill(1, theme) [+ overflow(1)]
     let header_rows: u16 = lines.len() as u16;
     let tracks_per_row: usize = if w >= 100 { 2 } else { 1 };
     let mut track_area = pane_height.saturating_sub(2 + header_rows + 1) as usize; // -borders -header -pill
@@ -932,17 +922,17 @@ fn render_multi_track<'a>(
                 format!("{} {:2}. {} [{}]", check, t.number, title_str, dur_str)
             };
             let fg = if abs == cursor {
-                Color::Cyan
+                theme.cyan
             } else if checked {
-                Color::White
+                theme.text_bright
             } else {
-                Color::DarkGray
+                theme.text_dim
             };
             let truncated = truncate_to(&entry, col_width.saturating_sub(1));
             let padded = format!("   {:<width$}", truncated, width = col_width.saturating_sub(3));
             row_spans.push(Span::styled(padded, Style::default().fg(fg)));
         }
-        lines.push(bordered_line(border_color, w, row_spans));
+        lines.push(bordered_line(border_color, w, row_spans, theme));
     }
 
     if end < tracks.len() {
@@ -951,13 +941,12 @@ fn render_multi_track<'a>(
             w,
             vec![Span::styled(
                 format!("   ... and {} more", tracks.len() - end),
-                Style::default().fg(Color::DarkGray),
-            )],
-        ));
+                Style::default().fg(theme.text_dim),
+            )], theme));
     }
 
     // Expand + analyze pill row
-    lines.push(two_pill_row(border_color, w, EXPAND_PILL_LABEL));
+    lines.push(two_pill_row(border_color, w, EXPAND_PILL_LABEL, theme));
 
     lines
 }
@@ -1021,13 +1010,13 @@ mod tests {
 
     #[test]
     fn render_single_without_info_shows_persistent_probe_notice() {
+        let theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
         let lines = render_single(
-            Color::White,
+            theme.text_bright,
             96,
             Path::new("/tmp/empty.cue"),
             None,
-            Some("CUE sheet has no audio tracks"),
-        );
+            Some("CUE sheet has no audio tracks"), theme);
         let rendered = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -1065,9 +1054,10 @@ mod tests {
 
     #[test]
     fn render_batch_includes_persistent_probe_notice() {
+        let theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
         let paths = vec![PathBuf::from("/tmp/a.cue"), PathBuf::from("/tmp/b.flac")];
         let lines = render_batch(
-            Color::White,
+            theme.text_bright,
             96,
             &paths,
             0,
@@ -1076,8 +1066,7 @@ mod tests {
             0,
             1,
             &[],
-            10,
-        );
+            10, theme);
         let rendered = lines
             .iter()
             .flat_map(|line| line.spans.iter())

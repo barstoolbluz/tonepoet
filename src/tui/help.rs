@@ -9,7 +9,6 @@ use ratatui::{
 };
 
 use super::app::AppScreen;
-use super::theme;
 
 /// A section in the help content (e.g., "Navigation", "Commands").
 pub struct HelpSection {
@@ -204,7 +203,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
 }
 
 /// Flatten help sections into renderable lines (title lines + entry lines).
-fn flatten_to_lines(sections: &[HelpSection]) -> Vec<Line<'static>> {
+fn flatten_to_lines(sections: &[HelpSection], theme: super::theme::Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     for (i, section) in sections.iter().enumerate() {
@@ -214,7 +213,7 @@ fn flatten_to_lines(sections: &[HelpSection]) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled(
             format!("  {}", section.title),
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         )));
 
@@ -222,8 +221,8 @@ fn flatten_to_lines(sections: &[HelpSection]) -> Vec<Line<'static>> {
             let key_w = 22;
             let padded_key = format!("    {:<width$}", key, width = key_w);
             lines.push(Line::from(vec![
-                Span::styled(padded_key, Style::default().fg(theme::BLUE)),
-                Span::styled(desc.to_string(), Style::default().fg(theme::TEXT)),
+                Span::styled(padded_key, Style::default().fg(theme.blue)),
+                Span::styled(desc.to_string(), Style::default().fg(theme.text)),
             ]));
         }
     }
@@ -232,7 +231,7 @@ fn flatten_to_lines(sections: &[HelpSection]) -> Vec<Line<'static>> {
 }
 
 /// Draw the help overlay.
-pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize) {
+pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize, theme: super::theme::Theme) {
     let area = f.size();
     let w = (area.width * 80 / 100)
         .max(50)
@@ -249,11 +248,11 @@ pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize) {
     let title = format!(" Help -- {} ", screen.tab_label());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::AMBER))
+        .border_style(Style::default().fg(theme.amber))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(theme::AMBER)
+                .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -270,7 +269,7 @@ pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize) {
         .split(inner);
 
     let sections = help_content(screen);
-    let all_lines = flatten_to_lines(&sections);
+    let all_lines = flatten_to_lines(&sections, theme);
     let total = all_lines.len();
     let visible = chunks[0].height as usize;
 
@@ -284,8 +283,7 @@ pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize) {
     // Footer pill.
     let footer = Line::from(super::draw_overlays::footer_pill_pub(
         "Esc close",
-        theme::PURPLE,
-    ));
+        theme.purple, theme));
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],

@@ -4729,7 +4729,7 @@ pub(super) fn open_file_picker_for_copy_move(
         start_dir,
         filter: tui_file_picker::FilePickerFilter::All,
         title: title.clone(),
-        theme: super::keybindings::file_picker_theme_from_tonepoet_theme(),
+        theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
         selection_mode: tui_file_picker::FilePickerSelectionMode::Directories,
         // Destination pickers always start in explicit "Ask" mode. Even `:cp!`
         // / `:mv!` force commands should not silently pre-select overwrite after

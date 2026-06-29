@@ -9,11 +9,10 @@ use ratatui::{
 };
 
 use super::bookmarks::{BookmarkNaming, BookmarksState};
-use super::theme;
 
 /// Draw the bookmarks overlay as a centered floating panel.
 /// Takes `&mut BookmarksState` so the renderer can publish `overlay_visible_rows`.
-pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
+pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState, theme: super::theme::Theme) {
     let area = f.size();
     let width: u16 = 64.min(area.width.saturating_sub(4));
     let list_height = state.entries.len() as u16;
@@ -27,11 +26,11 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::GREEN))
+        .border_style(Style::default().fg(theme.green))
         .title(Span::styled(
             " BOOKMARKS ",
             Style::default()
-                .fg(theme::GREEN)
+                .fg(theme.green)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay_area);
@@ -39,7 +38,7 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
 
     // Branch on naming mode first — it replaces the list entirely.
     if let Some(naming) = &state.naming {
-        draw_naming_mode(f, inner, naming);
+        draw_naming_mode(f, inner, naming, theme);
         return;
     }
 
@@ -49,9 +48,9 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
     if state.entries.is_empty() {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("(no bookmarks yet — press ", theme::muted()),
-            Span::styled("a", Style::default().fg(theme::BLUE)),
-            Span::styled(" to add the current directory)", theme::muted()),
+            Span::styled("(no bookmarks yet — press ", theme.muted()),
+            Span::styled("a", Style::default().fg(theme.blue)),
+            Span::styled(" to add the current directory)", theme.muted()),
         ]));
     } else {
         let inner_w = inner.width as usize;
@@ -82,9 +81,9 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
 
             let marker = if is_selected { "▸ " } else { "  " };
             let marker_style = if is_selected {
-                Style::default().fg(theme::BLUE)
+                Style::default().fg(theme.blue)
             } else {
-                Style::default().fg(theme::TEXT_DIM)
+                Style::default().fg(theme.text_dim)
             };
 
             let name_display = truncate_right(&entry.name, name_col_w);
@@ -107,17 +106,17 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
 
             let name_style = if is_selected {
                 Style::default()
-                    .fg(theme::TEXT_BRIGHT)
+                    .fg(theme.text_bright)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::TEXT)
+                Style::default().fg(theme.text)
             };
 
             lines.push(Line::from(vec![
                 Span::styled(marker, marker_style),
                 Span::styled(name_display, name_style),
                 Span::raw(" ".repeat(name_pad + 1)),
-                Span::styled(path_display, theme::muted()),
+                Span::styled(path_display, theme.muted()),
             ]));
         }
     }
@@ -125,15 +124,15 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
     use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        pill("Enter cd", theme::GREEN),
+        pill("Enter cd", theme.green, theme),
         gap(),
-        pill("a add", theme::CYAN),
+        pill("a add", theme.cyan, theme),
         gap(),
-        pill("d delete", theme::RED),
+        pill("d delete", theme.destructive, theme),
         gap(),
-        pill("e rename", theme::AMBER),
+        pill("e rename", theme.amber, theme),
         gap(),
-        pill("Esc close", theme::PURPLE),
+        pill("Esc close", theme.purple, theme),
     ]));
 
     let paragraph = Paragraph::new(lines);
@@ -143,7 +142,7 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState) {
 /// Draw the naming sub-mode: either adding or renaming. Replaces the list
 /// with a single-line input labeled appropriately, plus a help line below.
 /// Compact layout (5-6 rows) fits inside the minimum overlay inner height.
-fn draw_naming_mode(f: &mut Frame, inner: Rect, naming: &BookmarkNaming) {
+fn draw_naming_mode(f: &mut Frame, inner: Rect, naming: &BookmarkNaming, theme: super::theme::Theme) {
     let (label, input, subtitle) = match naming {
         BookmarkNaming::Add { input, path } => {
             let path_display = {
@@ -168,14 +167,14 @@ fn draw_naming_mode(f: &mut Frame, inner: Rect, naming: &BookmarkNaming) {
     // Line 0: label
     lines.push(Line::from(Span::styled(
         format!("  {}", label),
-        theme::muted(),
+        theme.muted(),
     )));
 
     // Line 1 (add only): subtitle showing the captured path
     if let Some(sub) = &subtitle {
         lines.push(Line::from(vec![
-            Span::styled("    → ", theme::muted()),
-            Span::styled(sub.clone(), Style::default().fg(theme::CYAN)),
+            Span::styled("    → ", theme.muted()),
+            Span::styled(sub.clone(), Style::default().fg(theme.cyan)),
         ]));
     }
 
@@ -189,7 +188,7 @@ fn draw_naming_mode(f: &mut Frame, inner: Rect, naming: &BookmarkNaming) {
         Span::raw("  "),
         Span::styled(
             format!(" {} ", view),
-            Style::default().fg(theme::TEXT_BRIGHT).bg(theme::SURFACE),
+            Style::default().fg(theme.text_bright).bg(theme.surface),
         ),
     ]));
 
@@ -197,9 +196,9 @@ fn draw_naming_mode(f: &mut Frame, inner: Rect, naming: &BookmarkNaming) {
     use super::draw_overlays::{footer_pill_pub as pill, pill_gap_pub as gap};
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        pill("Enter save", theme::GREEN),
+        pill("Enter save", theme.green, theme),
         gap(),
-        pill("Esc cancel", theme::PURPLE),
+        pill("Esc cancel", theme.purple, theme),
     ]));
 
     let paragraph = Paragraph::new(lines);

@@ -24,6 +24,9 @@ pub struct UiConfig {
     /// false (default) = auto-clear; true = persist until manually cleared.
     #[serde(default)]
     pub compare_keep_reference: bool,
+    /// Runtime-selectable TUI theme slug. Unknown values fall back to Tokyo Night.
+    #[serde(default = "crate::tui::theme::default_theme_name")]
+    pub theme: String,
 }
 
 fn default_initial_screen() -> String {
@@ -40,6 +43,7 @@ impl Default for UiConfig {
             default_screen: default_initial_screen(),
             convert_default_action: default_convert_action(),
             compare_keep_reference: false,
+            theme: crate::tui::theme::default_theme_name(),
         }
     }
 }
@@ -139,4 +143,54 @@ impl TonepoetConfig {
             .join("tonepoet")
             .join("config.toml")
     }
+}
+
+#[cfg(test)]
+mod theme_config_tests {
+    use super::*;
+
+    #[test]
+    fn ui_theme_defaults_to_tokyo_night_when_missing_from_toml() {
+        let config: TonepoetConfig = toml::from_str(
+            r#"
+[conversion]
+preferred_backend = "ffmpeg"
+worker_count = 2
+process_priority = 0
+calculate_replaygain = true
+generate_cue_files = false
+cue_generation_mode = "IfMerging"
+write_log_file = false
+persist_queue = true
+append_lineage_to_comment = false
+
+[ui]
+default_screen = "browse"
+convert_default_action = "start"
+compare_keep_reference = false
+"#,
+        )
+        .expect("config parses without theme");
+
+        assert_eq!(config.ui.theme, crate::tui::theme::default_theme_slug());
+    }
+
+    #[test]
+    fn ui_theme_round_trips_through_toml() {
+        for palette in crate::tui::theme::palettes() {
+            let mut config = TonepoetConfig::default();
+            config.ui.theme = palette.slug.to_string();
+
+            let encoded = toml::to_string_pretty(&config).expect("encode config");
+            assert!(
+                encoded.contains(&format!("theme = \"{}\"", palette.slug)),
+                "serialized config must contain theme slug {}",
+                palette.slug
+            );
+
+            let decoded: TonepoetConfig = toml::from_str(&encoded).expect("decode config");
+            assert_eq!(decoded.ui.theme, palette.slug);
+        }
+    }
+
 }

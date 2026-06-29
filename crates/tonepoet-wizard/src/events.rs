@@ -6,22 +6,9 @@ use super::types::{
 use super::ui::ButtonId;
 use crate::presets::{ConversionPreset, PresetManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use std::fs::OpenOptions;
-use std::io::Write;
 
 impl SimpleWizard {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        // Debug logging
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_keys.log")
-        {
-            let _ = writeln!(file, "\nKey event: {:?}, current_step: {}, selected_format: {:?}, in_quality_area: {}, quality_index: {}", 
-                           key.code, self.current_step, self.selected_format, self.in_quality_area, self.quality_index);
-        }
 
         // Handle help navigation if any help is showing
         if self.show_help_for.is_some()
@@ -76,20 +63,6 @@ impl SimpleWizard {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent, button_id: Option<ButtonId>) -> bool {
-        // Debug logging
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_areas.log")
-        {
-            let _ = writeln!(
-                file,
-                "handle_mouse called: mouse.kind={:?}, button_id={:?}",
-                mouse.kind, button_id
-            );
-        }
 
         // Handle mouse move for hover highlighting
         if mouse.kind == MouseEventKind::Moved {
@@ -145,13 +118,6 @@ impl SimpleWizard {
                 true
             }
             Some(ButtonId::Cancel) => {
-                if let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("wizard_areas.log")
-                {
-                    let _ = writeln!(file, "CANCEL BUTTON CLICKED - Setting should_exit flag");
-                }
                 self.should_exit = true; // Set flag to exit wizard
                 true // Button was handled
             }
@@ -222,25 +188,11 @@ impl SimpleWizard {
                                     });
                                 }
                             }
-                            Err(e) => {
-                                if let Ok(mut file) = OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open("wizard_areas.log")
-                                {
-                                    let _ = writeln!(file, "Failed to list presets: {}", e);
-                                }
+                            Err(_e) => {
                             }
                         }
                     }
-                    Err(e) => {
-                        if let Ok(mut file) = OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("wizard_areas.log")
-                        {
-                            let _ = writeln!(file, "Failed to create PresetManager: {}", e);
-                        }
+                    Err(_e) => {
                     }
                 }
                 true
@@ -272,42 +224,12 @@ impl SimpleWizard {
 
                                     match manager.save_preset(&preset) {
                                         Ok(_) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ = writeln!(
-                                                    file,
-                                                    "Successfully saved preset: {}",
-                                                    preset.name
-                                                );
-                                            }
                                         }
-                                        Err(e) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ =
-                                                    writeln!(file, "Failed to save preset: {}", e);
-                                            }
+                                        Err(_e) => {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    if let Ok(mut file) = OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("wizard_areas.log")
-                                    {
-                                        let _ = writeln!(
-                                            file,
-                                            "Failed to create preset manager: {}",
-                                            e
-                                        );
-                                    }
+                                Err(_e) => {
                                 }
                             }
                         }
@@ -320,45 +242,12 @@ impl SimpleWizard {
 
                                     match manager.save_preset(&preset) {
                                         Ok(_) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ = writeln!(
-                                                    file,
-                                                    "Successfully overwrote preset: {}",
-                                                    preset_name
-                                                );
-                                            }
                                         }
-                                        Err(e) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ = writeln!(
-                                                    file,
-                                                    "Failed to overwrite preset: {}",
-                                                    e
-                                                );
-                                            }
+                                        Err(_e) => {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    if let Ok(mut file) = OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("wizard_areas.log")
-                                    {
-                                        let _ = writeln!(
-                                            file,
-                                            "Failed to create preset manager: {}",
-                                            e
-                                        );
-                                    }
+                                Err(_e) => {
                                 }
                             }
                         }
@@ -461,47 +350,12 @@ impl SimpleWizard {
                                 match PresetManager::new() {
                                     Ok(manager) => match manager.load_preset(preset_name) {
                                         Ok(preset) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ = writeln!(
-                                                    file,
-                                                    "Successfully loaded preset: {}",
-                                                    preset_name
-                                                );
-                                                let _ = writeln!(
-                                                    file,
-                                                    "Preset format: {:?}",
-                                                    preset.selected_format
-                                                );
-                                            }
                                             self.load_preset(&preset);
                                         }
-                                        Err(e) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ =
-                                                    writeln!(file, "Failed to load preset: {}", e);
-                                            }
+                                        Err(_e) => {
                                         }
                                     },
-                                    Err(e) => {
-                                        if let Ok(mut file) = OpenOptions::new()
-                                            .create(true)
-                                            .append(true)
-                                            .open("wizard_areas.log")
-                                        {
-                                            let _ = writeln!(
-                                                file,
-                                                "Failed to create preset manager: {}",
-                                                e
-                                            );
-                                        }
+                                    Err(_e) => {
                                     }
                                 }
                             }
@@ -713,20 +567,6 @@ impl SimpleWizard {
                 true
             }
             Some(ButtonId::InfoIcon(section)) => {
-                // Debug logging - log before any conditions
-                use std::fs::OpenOptions;
-                use std::io::Write;
-                if let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("wizard_areas.log")
-                {
-                    let _ = writeln!(file, "\nInfoIcon handler called:");
-                    let _ = writeln!(file, "  section: {:?}", section);
-                    let _ = writeln!(file, "  current_step: {}", self.current_step);
-                    let _ = writeln!(file, "  selected_format: {:?}", self.selected_format);
-                    let _ = writeln!(file, "  show_help_for before: {:?}", self.show_help_for);
-                }
 
                 if (self.current_step == 0
                     && (self.selected_format == Some(AudioFormat::Flac)
@@ -742,13 +582,6 @@ impl SimpleWizard {
                         self.help_page = 0;
                     }
 
-                    if let Ok(mut file) = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("wizard_areas.log")
-                    {
-                        let _ = writeln!(file, "  show_help_for after: {:?}", self.show_help_for);
-                    }
                 }
                 true
             }
@@ -821,29 +654,10 @@ impl SimpleWizard {
                                             self.popup_state = None;
                                             self.last_click_field = None;
                                         }
-                                        Err(e) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ =
-                                                    writeln!(file, "Failed to load preset: {}", e);
-                                            }
+                                        Err(_e) => {
                                         }
                                     },
-                                    Err(e) => {
-                                        if let Ok(mut file) = OpenOptions::new()
-                                            .create(true)
-                                            .append(true)
-                                            .open("wizard_areas.log")
-                                        {
-                                            let _ = writeln!(
-                                                file,
-                                                "Failed to create preset manager: {}",
-                                                e
-                                            );
-                                        }
+                                    Err(_e) => {
                                     }
                                 }
                             }
@@ -955,16 +769,6 @@ impl SimpleWizard {
 
     fn handle_format_selection_key(&mut self, key: KeyEvent) -> bool {
         // Debug which path we're taking
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_keys.log")
-        {
-            let _ = writeln!(file, "  handle_format_selection_key: is_in_quality_options()={}, focused_nav_button={:?}", 
-                           self.is_in_quality_options(), self.focused_nav_button);
-        }
 
         // First check if Esc is pressed and we have help showing
         if key.code == KeyCode::Esc
@@ -1090,14 +894,6 @@ impl SimpleWizard {
                 _ => self.handle_format_list_navigation(key),
             }
         } else if self.selected_format.is_some() && self.is_in_quality_options() {
-            // Debug logging
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("wizard_keys.log")
-            {
-                let _ = writeln!(file, "  --> In quality options handler!");
-            }
             // Handle navigation within quality options for formats that show them on the right
             match key.code {
                 KeyCode::Tab => {
@@ -1130,61 +926,11 @@ impl SimpleWizard {
                         _ => 0,
                     };
 
-                    // Debug logging
-                    use std::fs::OpenOptions;
-                    use std::io::Write;
-                    if let Ok(mut file) = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("wizard_keys.log")
-                    {
-                        let _ = writeln!(file, "Down key in quality options: format={:?}, quality_index={}, max_index={}", 
-                                       self.selected_format, self.quality_index, max_index);
-                    }
-
-                    if let Ok(mut file) = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("wizard_keys.log")
-                    {
-                        let _ = writeln!(
-                            file,
-                            "  BEFORE INCREMENT: quality_index={}, max_index={}, can increment={}",
-                            self.quality_index,
-                            max_index,
-                            self.quality_index < max_index
-                        );
-                    }
 
                     if self.quality_index < max_index {
-                        let old_index = self.quality_index;
                         self.quality_index += 1;
 
-                        if let Ok(mut file) = OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("wizard_keys.log")
-                        {
-                            let _ = writeln!(
-                                file,
-                                "  AFTER INCREMENT: {} -> {}",
-                                old_index, self.quality_index
-                            );
-                            if old_index == 3 && self.quality_index == 4 {
-                                let _ = writeln!(
-                                    file,
-                                    "  *** SUCCESSFULLY MOVED FROM VERY HIGH TO INSANE ***"
-                                );
-                            }
-                        }
                     } else {
-                        if let Ok(mut file) = OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("wizard_keys.log")
-                        {
-                            let _ = writeln!(file, "  AT MAX, NOT INCREMENTING");
-                        }
                     }
                     true
                 }
@@ -1288,34 +1034,12 @@ impl SimpleWizard {
                 _ => false, // Don't handle other keys when in quality options
             }
         } else {
-            // Debug logging
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("wizard_keys.log")
-            {
-                let _ = writeln!(file, "  --> Falling through to format list navigation");
-            }
             // Handle format list navigation
             self.handle_format_list_navigation(key)
         }
     }
 
     fn handle_format_list_navigation(&mut self, key: KeyEvent) -> bool {
-        // Debug logging
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_keys.log")
-        {
-            let _ = writeln!(
-                file,
-                "  --> handle_format_list_navigation called with key: {:?}",
-                key.code
-            );
-        }
 
         match key.code {
             KeyCode::Tab => {
@@ -1454,20 +1178,6 @@ impl SimpleWizard {
     }
 
     fn handle_resampling_page_key(&mut self, key: KeyEvent) -> bool {
-        // Debug logging
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("wizard_keys.log")
-        {
-            let _ = writeln!(
-                file,
-                "  handle_resampling_page_key called: key={:?}, section={:?}, index={}",
-                key.code, self.resampling_page_section, self.selected_index
-            );
-        }
 
         match key.code {
             KeyCode::Tab => {
@@ -2302,28 +2012,10 @@ impl SimpleWizard {
                                         self.load_preset(&preset);
                                         self.popup_state = None;
                                     }
-                                    Err(e) => {
-                                        if let Ok(mut file) = OpenOptions::new()
-                                            .create(true)
-                                            .append(true)
-                                            .open("wizard_areas.log")
-                                        {
-                                            let _ = writeln!(file, "Failed to load preset: {}", e);
-                                        }
+                                    Err(_e) => {
                                     }
                                 },
-                                Err(e) => {
-                                    if let Ok(mut file) = OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("wizard_areas.log")
-                                    {
-                                        let _ = writeln!(
-                                            file,
-                                            "Failed to create preset manager: {}",
-                                            e
-                                        );
-                                    }
+                                Err(_e) => {
                                 }
                             }
                         }
@@ -2382,42 +2074,12 @@ impl SimpleWizard {
 
                                     match manager.save_preset(&preset) {
                                         Ok(_) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ = writeln!(
-                                                    file,
-                                                    "Successfully saved preset: {}",
-                                                    preset.name
-                                                );
-                                            }
                                         }
-                                        Err(e) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ =
-                                                    writeln!(file, "Failed to save preset: {}", e);
-                                            }
+                                        Err(_e) => {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    if let Ok(mut file) = OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("wizard_areas.log")
-                                    {
-                                        let _ = writeln!(
-                                            file,
-                                            "Failed to create preset manager: {}",
-                                            e
-                                        );
-                                    }
+                                Err(_e) => {
                                 }
                             }
                         }
@@ -2430,45 +2092,12 @@ impl SimpleWizard {
 
                                     match manager.save_preset(&preset) {
                                         Ok(_) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ = writeln!(
-                                                    file,
-                                                    "Successfully overwrote preset: {}",
-                                                    preset_name
-                                                );
-                                            }
                                         }
-                                        Err(e) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ = writeln!(
-                                                    file,
-                                                    "Failed to overwrite preset: {}",
-                                                    e
-                                                );
-                                            }
+                                        Err(_e) => {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    if let Ok(mut file) = OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("wizard_areas.log")
-                                    {
-                                        let _ = writeln!(
-                                            file,
-                                            "Failed to create preset manager: {}",
-                                            e
-                                        );
-                                    }
+                                Err(_e) => {
                                 }
                             }
                         }
@@ -2573,29 +2202,10 @@ impl SimpleWizard {
                                         Ok(preset) => {
                                             self.load_preset(&preset);
                                         }
-                                        Err(e) => {
-                                            if let Ok(mut file) = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open("wizard_areas.log")
-                                            {
-                                                let _ =
-                                                    writeln!(file, "Failed to load preset: {}", e);
-                                            }
+                                        Err(_e) => {
                                         }
                                     },
-                                    Err(e) => {
-                                        if let Ok(mut file) = OpenOptions::new()
-                                            .create(true)
-                                            .append(true)
-                                            .open("wizard_areas.log")
-                                        {
-                                            let _ = writeln!(
-                                                file,
-                                                "Failed to create preset manager: {}",
-                                                e
-                                            );
-                                        }
+                                    Err(_e) => {
                                     }
                                 }
                             }
