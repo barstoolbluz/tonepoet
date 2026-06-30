@@ -1,5 +1,7 @@
 //! Shared text input state with UTF-8 safe cursor movement and horizontal scrolling
 
+use std::path::{Path, PathBuf};
+
 use crossterm::event::{KeyCode, KeyEvent};
 
 /// State for a single-line text input field.
@@ -16,6 +18,39 @@ pub struct TextInputState {
     /// replaces all text; navigation keys clear the selection.
     pub select_all: bool,
 }
+
+/// Completion strategy for an inline text field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionMode {
+    None,
+    /// Complete filesystem paths in the current process working directory.
+    Path,
+    /// Complete Tonepoet filename/folder-template variables such as `%ARTIST%`.
+    TemplateVariable,
+}
+
+const TEMPLATE_VARIABLES: &[&str] = &[
+    "%NN%",
+    "%TRACKNN%",
+    "%N%",
+    "%TRACKN%",
+    "%TRACK%",
+    "%TITLE%",
+    "%ARTIST%",
+    "%ALBUM_ARTIST%",
+    "%ALBUM%",
+    "%TITLE_EXTRA%",
+    "%DISC%",
+    "%FORMAT%",
+    "%YEAR%",
+    "%GENRE%",
+    "%COMPOSER%",
+    "%CATALOG%",
+    "%SAMPLERATE%",
+    "%BITDEPTH%",
+    "%ISRC%",
+    "%EXT%",
+];
 
 impl TextInputState {
     /// Create a new input with the given initial text, cursor at end.
@@ -53,6 +88,33 @@ impl TextInputState {
     pub fn insert_string(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
+    }
+
+
+    /// Replace a UTF-8-boundary byte range and move the cursor to the end of
+    /// the replacement. Invalid ranges are ignored rather than panicking so
+    /// completion helpers remain best-effort UI affordances.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        self.select_all = false;
+    }
+
+    /// Replace the full text and clamp the cursor to a valid char boundary.
+    pub fn set_text_and_cursor(&mut self, text: String, cursor: usize) {
+        self.text = text;
+        self.cursor = cursor.min(self.text.len());
+        while self.cursor > 0 && !self.text.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
+        self.select_all = false;
     }
 
     /// Delete the character before the cursor (Backspace behavior).
@@ -347,6 +409,173 @@ pub fn handle_text_input_key(input: &mut TextInputState, key: &KeyEvent) -> bool
         }
         _ => false,
     }
+}
+
+/// Apply tab completion according to `mode`. Returns true when the Tab key was
+/// consumed, even if no candidate could be inserted.
+pub fn apply_tab_completion(input: &mut TextInputState, mode: CompletionMode) -> bool {
+    match mode {
+        CompletionMode::None => false,
+        CompletionMode::Path => apply_path_completion(input, None, true),
+        CompletionMode::TemplateVariable => apply_template_variable_completion(input),
+    }
+}
+
+/// Complete a filesystem path. `base_dir` lets callers complete a bare filename
+/// against a known directory (used by inline browse renames) without inserting
+/// the directory prefix into the field. When `append_dir_separator` is false,
+/// directory candidates are inserted as plain names rather than `name/`.
+pub fn apply_path_completion(
+    input: &mut TextInputState,
+    base_dir: Option<&Path>,
+    append_dir_separator: bool,
+) -> bool {
+    if let Some((text, cursor)) = complete_path_text(
+        &input.text,
+        input.cursor,
+        base_dir,
+        append_dir_separator,
+    ) {
+        input.set_text_and_cursor(text, cursor);
+    }
+    true
+}
+
+/// Complete a `%VARIABLE%` template token at the cursor.
+pub fn apply_template_variable_completion(input: &mut TextInputState) -> bool {
+    if let Some((text, cursor)) = complete_template_variable_text(&input.text, input.cursor) {
+        input.set_text_and_cursor(text, cursor);
+    }
+    true
+}
+
+fn complete_template_variable_text(text: &str, cursor: usize) -> Option<(String, usize)> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let before = &text[..cursor];
+    let percent = before.rfind('%')?;
+    let partial = &before[percent + 1..];
+    if partial.contains('%') {
+        return None;
+    }
+    let wanted = partial.to_ascii_uppercase();
+    let mut matches: Vec<&str> = TEMPLATE_VARIABLES
+        .iter()
+        .copied()
+        .filter(|v| v.trim_matches('%').starts_with(&wanted))
+        .collect();
+    matches.sort_unstable();
+    matches.dedup();
+    if matches.is_empty() {
+        return None;
+    }
+
+    let replacement = if matches.len() == 1 {
+        matches[0].to_string()
+    } else {
+        let names: Vec<&str> = matches.iter().map(|m| m.trim_matches('%')).collect();
+        let common = common_prefix(&names);
+        format!("%{}", common)
+    };
+
+    let mut out = String::with_capacity(text.len() + replacement.len());
+    out.push_str(&text[..percent]);
+    out.push_str(&replacement);
+    out.push_str(&text[cursor..]);
+    let new_cursor = percent + replacement.len();
+    Some((out, new_cursor))
+}
+
+fn complete_path_text(
+    text: &str,
+    cursor: usize,
+    base_dir: Option<&Path>,
+    append_dir_separator: bool,
+) -> Option<(String, usize)> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let before = &text[..cursor];
+    let component_start = before
+        .char_indices()
+        .rev()
+        .find_map(|(idx, ch)| if ch == '/' || ch == std::path::MAIN_SEPARATOR { Some(idx + ch.len_utf8()) } else { None })
+        .unwrap_or(0);
+    let typed = &before[component_start..];
+    let prefix_path = &before[..component_start];
+
+    let (scan_dir, visible_prefix) = if let Some(base) = base_dir {
+        (base.to_path_buf(), prefix_path.to_string())
+    } else {
+        let prefix = if prefix_path.is_empty() { "." } else { prefix_path };
+        let expanded = expand_tilde(prefix);
+        (PathBuf::from(expanded), prefix_path.to_string())
+    };
+
+    let mut candidates = Vec::new();
+    let read_dir = std::fs::read_dir(&scan_dir).ok()?;
+    for entry in read_dir.take(4096).flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(typed) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        candidates.push((name, is_dir));
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.dedup_by(|a, b| a.0 == b.0);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let names: Vec<&str> = candidates.iter().map(|(name, _)| name.as_str()).collect();
+    let completed_name = if candidates.len() == 1 {
+        let (name, is_dir) = &candidates[0];
+        if *is_dir && append_dir_separator {
+            format!("{}{}", name, std::path::MAIN_SEPARATOR)
+        } else {
+            name.clone()
+        }
+    } else {
+        common_prefix(&names)
+    };
+    if completed_name == typed {
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len() + completed_name.len());
+    out.push_str(&visible_prefix);
+    out.push_str(&completed_name);
+    out.push_str(&text[cursor..]);
+    let new_cursor = visible_prefix.len() + completed_name.len();
+    Some((out, new_cursor))
+}
+
+fn common_prefix(parts: &[&str]) -> String {
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut prefix = String::new();
+    for (idx, ch) in parts[0].char_indices() {
+        let next = idx + ch.len_utf8();
+        let candidate = &parts[0][..next];
+        if parts.iter().all(|part| part.starts_with(candidate)) {
+            prefix.push(ch);
+        } else {
+            break;
+        }
+    }
+    prefix
+}
+
+fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}{}", home, &path[1..]);
+        }
+    }
+    path.to_string()
 }
 
 #[cfg(test)]
@@ -650,4 +879,73 @@ mod tests {
         );
         assert_eq!(s.cursor, 0);
     }
+
+    #[test]
+    fn template_completion_unique_variable() {
+        let mut s = TextInputState::new("%ART".to_string());
+        assert!(apply_tab_completion(&mut s, CompletionMode::TemplateVariable));
+        assert_eq!(s.text, "%ARTIST%");
+        assert_eq!(s.cursor, "%ARTIST%".len());
+    }
+
+    #[test]
+    fn template_completion_ambiguous_keeps_common_prefix() {
+        let mut s = TextInputState::new("%AL".to_string());
+        assert!(apply_tab_completion(&mut s, CompletionMode::TemplateVariable));
+        assert_eq!(s.text, "%ALBUM");
+    }
+
+    #[test]
+    fn path_completion_unique_file_against_temp_filesystem() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("track-one.flac"), b"audio").expect("fixture");
+        std::fs::write(temp.path().join("other.flac"), b"audio").expect("fixture");
+
+        let mut input = TextInputState::new(temp.path().join("tra").display().to_string());
+        assert!(apply_tab_completion(&mut input, CompletionMode::Path));
+        assert_eq!(input.text, temp.path().join("track-one.flac").display().to_string());
+        assert_eq!(input.cursor, input.text.len());
+    }
+
+    #[test]
+    fn path_completion_appends_separator_for_unique_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(temp.path().join("Album One")).expect("fixture");
+
+        let mut input = TextInputState::new(temp.path().join("Alb").display().to_string());
+        assert!(apply_tab_completion(&mut input, CompletionMode::Path));
+        assert_eq!(
+            input.text,
+            format!(
+                "{}{}",
+                temp.path().join("Album One").display(),
+                std::path::MAIN_SEPARATOR
+            )
+        );
+        assert_eq!(input.cursor, input.text.len());
+    }
+
+    #[test]
+    fn path_completion_common_prefix_for_multiple_matches() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("cover-front.jpg"), b"image").expect("fixture");
+        std::fs::write(temp.path().join("cover-back.jpg"), b"image").expect("fixture");
+
+        let mut input = TextInputState::new(temp.path().join("co").display().to_string());
+        assert!(apply_tab_completion(&mut input, CompletionMode::Path));
+        assert_eq!(input.text, temp.path().join("cover-").display().to_string());
+        assert_eq!(input.cursor, input.text.len());
+    }
+
+    #[test]
+    fn browse_rename_completion_uses_base_dir_without_inserting_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("track-one.flac"), b"audio").expect("fixture");
+
+        let mut input = TextInputState::new("tra".to_string());
+        assert!(apply_path_completion(&mut input, Some(temp.path()), false));
+        assert_eq!(input.text, "track-one.flac");
+        assert_eq!(input.cursor, "track-one.flac".len());
+    }
+
 }

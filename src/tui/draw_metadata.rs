@@ -8,7 +8,11 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{MetadataState, SourceMode};
+use super::app::{ConvertMetadataField, MetadataState, SourceMode};
+use super::inline_edit::{inline_cursor_col, render_inline_value};
+
+/// Action pill label that opens the full metadata editor overlay from the compact metadata pane.
+pub const EDIT_TAGS_PILL_LABEL: &str = " edit tags ";
 
 /// Draw the metadata pane with purple border.
 pub fn draw_metadata_pane(
@@ -36,6 +40,13 @@ pub fn draw_metadata_pane(
         theme.border(border_color),
     ));
 
+    let show_edit_tags_pill = edit_tags_pill_visible(area.height);
+    let reserved_pill_rows = if show_edit_tags_pill { 1 } else { 0 };
+    let list_visible_rows = area
+        .height
+        .saturating_sub(2)
+        .saturating_sub(reserved_pill_rows as u16) as usize;
+
     let mut lines = vec![top_line];
     match source_mode {
         SourceMode::Batch { paths, cursor, .. } => {
@@ -45,7 +56,7 @@ pub fn draw_metadata_pane(
                 paths,
                 *cursor,
                 metadata.file_scroll,
-                area.height.saturating_sub(2) as usize,
+                list_visible_rows,
                 focused,
                 metadata, theme));
         }
@@ -56,22 +67,123 @@ pub fn draw_metadata_pane(
                 tracks,
                 *cursor,
                 metadata.file_scroll,
-                area.height.saturating_sub(2) as usize,
+                list_visible_rows,
                 focused,
                 metadata, theme));
         }
         _ => {
-            lines.extend(render_single_metadata(border_color, w, metadata, theme));
+            lines.extend(render_single_metadata(border_color, w, metadata, focused, theme));
         }
     }
 
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
+    if show_edit_tags_pill {
+        let pill_line_index = target_len_before_bottom.saturating_sub(1);
+        while lines.len() < pill_line_index {
+            lines.push(bordered_line(border_color, w, vec![], theme));
+        }
+        if lines.len() == pill_line_index {
+            lines.push(edit_tags_pill_row(border_color, w, theme));
+        }
+    }
     while lines.len() < target_len_before_bottom {
         lines.push(bordered_line(border_color, w, vec![], theme));
     }
     lines.push(bot_line);
 
     f.render_widget(Paragraph::new(lines), area);
+
+    if focused {
+        if let Some((row, label_w, value_w)) = metadata_edit_cursor(metadata, source_mode, w) {
+            let col = inline_cursor_col(&metadata.edit_input, value_w);
+            let cursor_x = area.x + 1 + label_w as u16 + col;
+            let cursor_y = area.y + row as u16;
+            if cursor_y < area.y + area.height && cursor_x < area.x + area.width.saturating_sub(1) {
+                f.set_cursor(cursor_x, cursor_y);
+            }
+        }
+    }
+}
+
+
+pub fn edit_tags_pill_visible(height: u16) -> bool {
+    height >= 6
+}
+
+pub fn edit_tags_pill_rect(area: Rect) -> Option<Rect> {
+    if !edit_tags_pill_visible(area.height) {
+        return None;
+    }
+    let inner_w = area.width.saturating_sub(2);
+    let pill_w = EDIT_TAGS_PILL_LABEL.chars().count() as u16;
+    let right_margin = 3u16;
+    if inner_w < pill_w.saturating_add(right_margin) {
+        return None;
+    }
+    let x = area.x + 1 + inner_w - pill_w - right_margin;
+    let y = area.y + area.height.saturating_sub(2);
+    Some(Rect::new(x, y, pill_w, 1))
+}
+
+fn edit_tags_pill_row<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    theme: super::theme::Theme,
+) -> Line<'a> {
+    let content_width = width.saturating_sub(2);
+    let pill_w = EDIT_TAGS_PILL_LABEL.chars().count();
+    let right_margin = 3usize;
+    let pad = content_width.saturating_sub(pill_w + right_margin);
+    bordered_line(
+        border_color,
+        width,
+        vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(
+                EDIT_TAGS_PILL_LABEL,
+                Style::default()
+                    .fg(theme.pill_active_fg)
+                    .bg(theme.purple)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ],
+        theme,
+    )
+}
+
+fn metadata_edit_cursor(
+    metadata: &MetadataState,
+    source_mode: &SourceMode,
+    pane_width: usize,
+) -> Option<(usize, usize, usize)> {
+    if !matches!(source_mode, SourceMode::Empty | SourceMode::Single { .. }) {
+        return None;
+    }
+    let field = metadata.editing?;
+    let content_w = pane_width.saturating_sub(2);
+    let half_w = content_w / 2;
+    match field {
+        ConvertMetadataField::Title => {
+            let label_w = "   title   ".len();
+            Some((1, label_w, pane_width.saturating_sub(2 + label_w)))
+        }
+        ConvertMetadataField::Artist => {
+            let label_w = "   artist  ".len();
+            Some((2, label_w, half_w.saturating_sub(label_w)))
+        }
+        ConvertMetadataField::Album => {
+            let label_w = half_w + "album  ".len();
+            Some((2, label_w, content_w.saturating_sub(label_w).max(1)))
+        }
+        ConvertMetadataField::Genre => {
+            let label_w = "   genre   ".len();
+            Some((3, label_w, half_w.saturating_sub(label_w)))
+        }
+        ConvertMetadataField::Year => {
+            let label_w = half_w + "year   ".len();
+            Some((3, label_w, content_w.saturating_sub(label_w).max(1)))
+        }
+    }
 }
 
 /// Draw the collapsed metadata title bar.
@@ -124,54 +236,114 @@ fn render_single_metadata<'a>(
     border_color: ratatui::style::Color,
     w: usize,
     metadata: &'a MetadataState,
+    pane_focused: bool,
     theme: super::theme::Theme,
 ) -> Vec<Line<'a>> {
-    let dash = Span::styled("—", Style::default().fg(theme.text_dim));
-    let field_or_dash = |val: &'a Option<String>| -> Span<'a> {
-        match val {
-            Some(v) if !v.is_empty() => Span::styled(v.clone(), theme.text_style()),
-            _ => dash.clone(),
-        }
-    };
+    let is_focused = |field| pane_focused && metadata.field_focus == field;
+    let is_editing = |field| metadata.editing == Some(field);
+    let value = |val: &'a Option<String>| -> &'a str { val.as_deref().unwrap_or("") };
 
+    let title_label = "   title   ";
+    let title_value_w = w.saturating_sub(2 + title_label.len());
     let title_row = bordered_line(
         border_color,
         w,
         vec![
-            Span::styled("   title   ", theme.muted()),
-            field_or_dash(&metadata.title),
-        ], theme);
+            Span::styled(
+                title_label,
+                if is_focused(ConvertMetadataField::Title) { theme.bright() } else { theme.muted() },
+            ),
+            render_inline_value(
+                value(&metadata.title),
+                is_editing(ConvertMetadataField::Title),
+                &metadata.edit_input,
+                is_focused(ConvertMetadataField::Title),
+                title_value_w,
+                theme,
+            ),
+        ],
+        theme,
+    );
 
-    let half_w = w.saturating_sub(8) / 2;
-    let artist_val = field_or_dash(&metadata.artist);
-    let album_val = field_or_dash(&metadata.album);
-    let artist_width = 11 + artist_val.width();
-    let gap = half_w.saturating_sub(artist_width);
+    let content_w = w.saturating_sub(2);
+    let half_w = content_w / 2;
+    let artist_label = "   artist  ";
+    let album_label = "album  ";
+    let artist_value_w = half_w.saturating_sub(artist_label.len());
+    let album_value_w = content_w
+        .saturating_sub(half_w + album_label.len())
+        .max(1);
     let row2 = bordered_line(
         border_color,
         w,
         vec![
-            Span::styled("   artist  ", theme.muted()),
-            artist_val,
-            Span::raw(" ".repeat(gap)),
-            Span::styled("album  ", theme.muted()),
-            album_val,
-        ], theme);
+            Span::styled(
+                artist_label,
+                if is_focused(ConvertMetadataField::Artist) { theme.bright() } else { theme.muted() },
+            ),
+            render_inline_value(
+                value(&metadata.artist),
+                is_editing(ConvertMetadataField::Artist),
+                &metadata.edit_input,
+                is_focused(ConvertMetadataField::Artist),
+                artist_value_w,
+                theme,
+            ),
+            Span::raw(" ".repeat(content_w.saturating_sub(half_w + artist_label.len() + artist_value_w))),
+            Span::styled(
+                album_label,
+                if is_focused(ConvertMetadataField::Album) { theme.bright() } else { theme.muted() },
+            ),
+            render_inline_value(
+                value(&metadata.album),
+                is_editing(ConvertMetadataField::Album),
+                &metadata.edit_input,
+                is_focused(ConvertMetadataField::Album),
+                album_value_w,
+                theme,
+            ),
+        ],
+        theme,
+    );
 
-    let genre_val = field_or_dash(&metadata.genre);
-    let year_val = field_or_dash(&metadata.year);
-    let genre_width = 11 + genre_val.width();
-    let gap2 = half_w.saturating_sub(genre_width);
+    let genre_label = "   genre   ";
+    let year_label = "year   ";
+    let genre_value_w = half_w.saturating_sub(genre_label.len());
+    let year_value_w = content_w
+        .saturating_sub(half_w + year_label.len())
+        .max(1);
     let row3 = bordered_line(
         border_color,
         w,
         vec![
-            Span::styled("   genre   ", theme.muted()),
-            genre_val,
-            Span::raw(" ".repeat(gap2)),
-            Span::styled("year   ", theme.muted()),
-            year_val,
-        ], theme);
+            Span::styled(
+                genre_label,
+                if is_focused(ConvertMetadataField::Genre) { theme.bright() } else { theme.muted() },
+            ),
+            render_inline_value(
+                value(&metadata.genre),
+                is_editing(ConvertMetadataField::Genre),
+                &metadata.edit_input,
+                is_focused(ConvertMetadataField::Genre),
+                genre_value_w,
+                theme,
+            ),
+            Span::raw(" ".repeat(content_w.saturating_sub(half_w + genre_label.len() + genre_value_w))),
+            Span::styled(
+                year_label,
+                if is_focused(ConvertMetadataField::Year) { theme.bright() } else { theme.muted() },
+            ),
+            render_inline_value(
+                value(&metadata.year),
+                is_editing(ConvertMetadataField::Year),
+                &metadata.edit_input,
+                is_focused(ConvertMetadataField::Year),
+                year_value_w,
+                theme,
+            ),
+        ],
+        theme,
+    );
 
     vec![title_row, row2, row3]
 }

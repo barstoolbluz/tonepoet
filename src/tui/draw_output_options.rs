@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use super::app::{FormatState, OutputOptionsField, OutputOptionsState};
+use super::inline_edit::{inline_cursor_col, render_inline_value};
 use super::pill::render_pill_spans;
 use super::probe::SourceInfo;
 use crate::convert::formats::AudioFormat;
@@ -50,33 +51,37 @@ pub fn draw_output_options_pane(
     let is_merge_focused = focused && opts.field_focus == OutputOptionsField::MergeMode;
     let is_extensions_focused = focused && opts.field_focus == OutputOptionsField::CompanionExtensions;
     let is_folders_focused = focused && opts.field_focus == OutputOptionsField::CompanionFolders;
+    let is_write_log_focused = focused && opts.field_focus == OutputOptionsField::WriteLog;
+
+    let is_editing = |field| opts.editing == Some(field);
 
     // Destination path
     let dest_display = opts
         .dest_path
         .as_ref()
-        .map(shorten_path_for_display)
-        .unwrap_or_else(|| "—".to_string());
-
-    let dest_label_style = if is_dest_focused {
-        theme.bright()
-    } else {
-        theme.muted()
-    };
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let dest_label_style = if is_dest_focused { theme.bright() } else { theme.muted() };
+    let dest_value_w = w.saturating_sub(2 + "   dest        ".len());
     let dest_row = bordered_line(
         border_color,
         w,
         vec![
             Span::styled("   dest        ", dest_label_style),
-            Span::styled(dest_display, theme.bright()),
-        ], theme);
+            render_inline_value(
+                &dest_display,
+                is_editing(OutputOptionsField::DestPath),
+                &opts.edit_input,
+                is_dest_focused,
+                dest_value_w,
+                theme,
+            ),
+        ],
+        theme,
+    );
 
     // Folder template
-    let folder_label_style = if is_folder_focused {
-        theme.bright()
-    } else {
-        theme.muted()
-    };
+    let folder_label_style = if is_folder_focused { theme.bright() } else { theme.muted() };
     let load_pill = Span::styled(
         " load ",
         Style::default()
@@ -93,31 +98,43 @@ pub fn draw_output_options_pane(
     );
     let pill_width = 6 + 1 + 8; // " load " + gap + " custom "
     let folder_tmpl_max = w.saturating_sub(15 + pill_width + 4); // label + pills + borders + gap
-    let folder_display = truncate_to(&opts.folder_template, folder_tmpl_max);
-    let folder_row = template_row_with_pills(
+    let folder_row = template_row_with_value_span(
         border_color,
         w,
         "   folder      ",
-        &folder_display,
+        render_inline_value(
+            &opts.folder_template,
+            is_editing(OutputOptionsField::FolderTemplate),
+            &opts.edit_input,
+            is_folder_focused,
+            folder_tmpl_max,
+            theme,
+        ),
         folder_label_style,
         load_pill.clone(),
-        build_pill.clone(), theme);
+        build_pill.clone(),
+        theme,
+    );
 
     // Filename template
-    let file_label_style = if is_file_focused {
-        theme.bright()
-    } else {
-        theme.muted()
-    };
-    let file_display = truncate_to(&opts.filename_template, folder_tmpl_max);
-    let file_row = template_row_with_pills(
+    let file_label_style = if is_file_focused { theme.bright() } else { theme.muted() };
+    let file_row = template_row_with_value_span(
         border_color,
         w,
         "   filename    ",
-        &file_display,
+        render_inline_value(
+            &opts.filename_template,
+            is_editing(OutputOptionsField::FilenameTemplate),
+            &opts.edit_input,
+            is_file_focused,
+            folder_tmpl_max,
+            theme,
+        ),
         file_label_style,
         load_pill,
-        build_pill, theme);
+        build_pill,
+        theme,
+    );
 
     // Merge mode pills
     let merge_row = pill_row(
@@ -126,7 +143,9 @@ pub fn draw_output_options_pane(
         "merge      ",
         "",
         &render_pill_spans(&opts.merge, is_merge_focused, theme),
-        is_merge_focused, theme);
+        is_merge_focused,
+        theme,
+    );
 
     // Estimated size
     let est_display = estimate_output_size(source_info, total_source_size, format)
@@ -137,7 +156,9 @@ pub fn draw_output_options_pane(
         vec![
             Span::styled("   est. size   ", theme.muted()),
             Span::styled(est_display, theme.accent()),
-        ], theme);
+        ],
+        theme,
+    );
 
     let mut lines = vec![top_line];
     lines.push(dest_row);
@@ -159,6 +180,8 @@ pub fn draw_output_options_pane(
             w,
             "   extensions  ",
             &opts.companion_extensions,
+            is_editing(OutputOptionsField::CompanionExtensions),
+            &opts.edit_input,
             is_extensions_focused,
             theme,
         ));
@@ -167,7 +190,28 @@ pub fn draw_output_options_pane(
             w,
             "   folders     ",
             &opts.companion_folders,
+            is_editing(OutputOptionsField::CompanionFolders),
+            &opts.edit_input,
             is_folders_focused,
+            theme,
+        ));
+    }
+
+    if maximized && area.height >= 14 {
+        lines.push(bordered_line(border_color, w, vec![], theme));
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![Span::styled("   Conversion log", output_options_section_header_style(theme))],
+            theme,
+        ));
+        lines.push(pill_row(
+            border_color,
+            w,
+            "write log  ",
+            "",
+            &render_pill_spans(&opts.write_log, is_write_log_focused, theme),
+            is_write_log_focused,
             theme,
         ));
     }
@@ -180,6 +224,17 @@ pub fn draw_output_options_pane(
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+
+    if focused {
+        if let Some((row, label_w, value_w)) = output_options_edit_cursor(opts, maximized, area.height as usize, w) {
+            let col = inline_cursor_col(&opts.edit_input, value_w);
+            let cursor_x = area.x + 1 + label_w as u16 + col;
+            let cursor_y = area.y + row as u16;
+            if cursor_y < area.y + area.height && cursor_x < area.x + area.width.saturating_sub(1) {
+                f.set_cursor(cursor_x, cursor_y);
+            }
+        }
+    }
 }
 
 
@@ -192,7 +247,7 @@ pub fn draw_output_options_pane(
 /// value styling.
 fn output_options_section_header_style(theme: super::theme::Theme) -> Style {
     Style::default()
-        .fg(theme.text_dim)
+        .fg(theme.header)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -202,26 +257,50 @@ fn field_row<'a>(
     width: usize,
     label: &'a str,
     value: &str,
+    editing: bool,
+    input: &super::text_input::TextInputState,
     focused: bool,
     theme: super::theme::Theme,
 ) -> Line<'a> {
-    let label_style = if focused {
-        theme.bright()
-    } else {
-        theme.muted()
-    };
-    let value_style = if focused {
-        theme.bright()
-    } else {
-        theme.muted()
-    };
-    let display = truncate_to(value, width.saturating_sub(label.len() + 4));
+    let label_style = if focused { theme.bright() } else { theme.muted() };
+    let value_w = width.saturating_sub(2 + label.len());
     bordered_line(
         border_color,
         width,
-        vec![Span::styled(label, label_style), Span::styled(display, value_style)],
+        vec![
+            Span::styled(label, label_style),
+            render_inline_value(value, editing, input, focused, value_w, theme),
+        ],
         theme,
     )
+}
+
+fn output_options_edit_cursor(
+    opts: &OutputOptionsState,
+    maximized: bool,
+    area_height: usize,
+    pane_width: usize,
+) -> Option<(usize, usize, usize)> {
+    let field = opts.editing?;
+    let label_w = 15usize;
+    match field {
+        OutputOptionsField::DestPath => Some((1, label_w, pane_width.saturating_sub(2 + label_w))),
+        OutputOptionsField::FolderTemplate => {
+            let pill_width = 6 + 1 + 8;
+            Some((2, label_w, pane_width.saturating_sub(15 + pill_width + 4)))
+        }
+        OutputOptionsField::FilenameTemplate => {
+            let pill_width = 6 + 1 + 8;
+            Some((3, label_w, pane_width.saturating_sub(15 + pill_width + 4)))
+        }
+        OutputOptionsField::CompanionExtensions if maximized && area_height >= 11 => {
+            Some((8, label_w, pane_width.saturating_sub(2 + label_w)))
+        }
+        OutputOptionsField::CompanionFolders if maximized && area_height >= 11 => {
+            Some((9, label_w, pane_width.saturating_sub(2 + label_w)))
+        }
+        _ => None,
+    }
 }
 
 /// Draw the collapsed output-options title bar.
@@ -321,12 +400,12 @@ fn bordered_line<'a>(
     Line::from(spans)
 }
 
-/// Build a template row with trailing [load] [build] pills.
-fn template_row_with_pills<'a>(
+/// Build a template row with trailing [load] [custom] pills.
+fn template_row_with_value_span<'a>(
     border_color: ratatui::style::Color,
     width: usize,
     label: &'a str,
-    template_display: &str,
+    value_span: Span<'static>,
     label_style: Style,
     load_pill: Span<'a>,
     build_pill: Span<'a>,
@@ -338,7 +417,7 @@ fn template_row_with_pills<'a>(
     let mut spans = vec![
         Span::styled("│", theme.border(border_color)),
         Span::styled(label, label_style),
-        Span::styled(template_display.to_string(), theme.text_style()),
+        value_span,
     ];
 
     let content_width: usize = spans.iter().map(|s| s.width()).sum();
@@ -440,58 +519,6 @@ fn format_size_estimate(bytes: u64) -> String {
     }
 }
 
-fn shorten_path_for_display(path: &std::path::PathBuf) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = std::path::Path::new(&home);
-        if let Ok(rest) = path.strip_prefix(home_path) {
-            let rest = rest.display().to_string();
-            if rest.is_empty() {
-                return "~".to_string();
-            }
-            return format!("~/{}", rest);
-        }
-    }
-    path.display().to_string()
-}
-
-fn text_width(s: &str) -> usize {
-    Line::from(s).width()
-}
-
-/// Truncate a string to at most `max_width` terminal cells, adding "..." if
-/// truncated, without slicing the input at byte offsets.
-fn truncate_to(s: &str, max_width: usize) -> String {
-    if text_width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-
-    let ellipsis = "...";
-    let ellipsis_width = text_width(ellipsis);
-    if max_width <= ellipsis_width {
-        let mut out = String::new();
-        for ch in s.chars() {
-            let candidate = format!("{}{}", out, ch);
-            if text_width(&candidate) > max_width {
-                break;
-            }
-            out = candidate;
-        }
-        return out;
-    }
-
-    let mut out = String::new();
-    for ch in s.chars() {
-        let candidate = format!("{}{}", out, ch);
-        if text_width(&candidate) + ellipsis_width > max_width {
-            break;
-        }
-        out = candidate;
-    }
-    format!("{}{}", out, ellipsis)
-}
 
 
 #[cfg(test)]
@@ -529,7 +556,7 @@ mod output_options_companion_render_tests {
         // The 'C' in "   Companion files" starts at x=4 inside the border.
         let cell = terminal.backend().buffer().get(4, 7);
         assert_eq!(cell.symbol(), "C");
-        assert_eq!(cell.fg, theme.text_dim, "section header must use the header color token");
+        assert_eq!(cell.fg, theme.header, "section header must use the theme.header color token");
         assert_ne!(cell.fg, theme.accent().fg.unwrap_or(theme.text_dim), "section header must not use accent/value styling");
         assert!(cell.modifier.contains(Modifier::BOLD), "section header must be bold like theme.header");
     }

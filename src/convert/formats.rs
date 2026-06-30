@@ -253,9 +253,13 @@ impl std::fmt::Display for AudioFormat {
 }
 
 
-/// Standard loose companion-file extensions copied with conversions by default.
-pub const DEFAULT_COMPANION_EXTENSIONS: &str =
-    ".png, .jpg, .jpeg, .gif, .tiff, .webp, .bmp, .txt, .log, .nfo, .cue";
+/// Default loose companion-file extensions copied with conversions.
+///
+/// The product default is intentionally empty: companion copying is opt-in
+/// through the TUI, presets, or explicit `ConversionOptions` values. Keeping
+/// this constant empty prevents non-UI call paths from silently resurrecting
+/// the pre-inline-editing companion-copy behavior.
+pub const DEFAULT_COMPANION_EXTENSIONS: &str = "";
 
 /// Parse a comma-separated extension list into normalized, de-duplicated values.
 ///
@@ -311,7 +315,7 @@ pub fn parse_companion_folders(input: &str) -> Vec<String> {
 }
 
 pub fn default_companion_extensions() -> Vec<String> {
-    parse_companion_extensions(DEFAULT_COMPANION_EXTENSIONS)
+    Vec::new()
 }
 
 /// Options for audio conversion
@@ -838,6 +842,16 @@ mod tests {
             parse_companion_extensions("png, .JPG, jpg, ./bad, Scans/foo, .cue"),
             vec![".png", ".jpg", ".cue"]
         );
+    }
+
+    #[test]
+    fn companion_extension_defaults_are_empty_and_opt_in() {
+        assert_eq!(super::DEFAULT_COMPANION_EXTENSIONS, "");
+        assert!(super::default_companion_extensions().is_empty());
+
+        let options = super::ConversionOptions::default();
+        assert!(options.companion_extensions.is_empty());
+        assert!(options.effective_companion_extensions().is_empty());
     }
 
     #[test]

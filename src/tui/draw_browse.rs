@@ -8,12 +8,14 @@ use ratatui::{
     Frame,
 };
 
-use super::app::AppState;
+use super::app::{AppState, BrowseInfoFocus, BrowseInlineEditState, BrowseInlineEditTarget};
 use super::browse::{BrowseEntry, BrowseState, EntryKind, SortBy, SortDir};
 use super::button_map::{ButtonRenderMap, ColumnKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
+use super::inline_edit::{inline_cursor_col, render_inline_value};
 use super::probe::MetadataField;
+use super::text_input::TextInputState;
 
 /// Fixed column widths (inside the list border). Name is flexible.
 const COL_SIZE_W: usize = 9;
@@ -50,11 +52,14 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
 
     let list_area = content_chunks[0];
     let hover = app.hover_target;
-    draw_browse_list(f, list_area, &mut app.browse, hover, theme);
+    let inline_edit = app.browse_inline_edit.clone();
+    draw_browse_list(f, list_area, &mut app.browse, inline_edit.as_ref(), hover, theme);
     draw_browse_info(
         f,
         content_chunks[1],
         &app.browse,
+        inline_edit.as_ref(),
+        app.browse_info_focus,
         &mut app.button_map,
         hover, theme);
 
@@ -331,6 +336,7 @@ fn draw_browse_list(
     f: &mut Frame,
     area: Rect,
     browse: &mut BrowseState,
+    inline_edit: Option<&BrowseInlineEditState>,
     hover: Option<super::button_map::TuiButton>,
     theme: super::theme::Theme,
 ) {
@@ -481,6 +487,8 @@ fn draw_browse_list(
         ]));
     }
 
+    let mut rename_cursor: Option<(usize, u16)> = None;
+
     if let Some(err) = &browse.error {
         lines.push(bordered_line(
             border_color,
@@ -515,11 +523,19 @@ fn draw_browse_list(
             let is_checked = browse.is_multi_selected(&entry.path);
             let is_hovered =
                 !is_selected && hover == Some(super::button_map::TuiButton::BrowseEntry(i));
+            let inline_rename_input = inline_edit.and_then(|state| match &state.target {
+                BrowseInlineEditTarget::Rename { path } if path == &entry.path => Some(&state.input),
+                _ => None,
+            });
+            if let Some(input) = inline_rename_input {
+                rename_cursor = Some((i - start, inline_cursor_col(input, name_w)));
+            }
             lines.push(render_entry_line(
                 border_color,
                 w,
                 name_w,
                 entry,
+                inline_rename_input,
                 is_selected,
                 is_checked,
                 is_hovered, theme));
@@ -568,6 +584,11 @@ fn draw_browse_list(
     } else if let Some(col_in_view) = filter_cursor {
         let cursor_x = area.x + 1 + 3 + col_in_view;
         let cursor_y = area.y + area.height - 2;
+        f.set_cursor(cursor_x, cursor_y);
+    } else if let Some((row, col_in_view)) = rename_cursor {
+        let search_rows = if browse.search.active { 2u16 } else { 0u16 };
+        let cursor_x = area.x + 1 + ROW_PREFIX as u16 + col_in_view;
+        let cursor_y = area.y + 2 + search_rows + row as u16;
         f.set_cursor(cursor_x, cursor_y);
     }
 }
@@ -644,6 +665,7 @@ fn render_entry_line(
     width: usize,
     name_w: usize,
     entry: &BrowseEntry,
+    inline_rename_input: Option<&TextInputState>,
     is_selected: bool,
     is_checked: bool,
     is_hovered: bool,
@@ -693,8 +715,13 @@ fn render_entry_line(
         }
     };
 
-    // Name (truncated to name_w)
-    let name_display = pad_or_truncate(&entry.name, name_w, false);
+    // Name (truncated to name_w), or inline rename editor.
+    let name_span = if let Some(input) = inline_rename_input {
+        render_inline_value("", true, input, true, name_w, theme)
+    } else {
+        let name_display = pad_or_truncate(&entry.name, name_w, false);
+        Span::styled(name_display, name_style)
+    };
 
     // Size (right-aligned, hidden for dirs/parent)
     let size_text = match &entry.kind {
@@ -714,7 +741,7 @@ fn render_entry_line(
         Span::styled(cursor, cursor_style),
         Span::styled(check, check_style),
         Span::raw(" "),
-        Span::styled(name_display, name_style),
+        name_span,
         Span::raw(" "),
         Span::styled(size_display, theme.muted()),
         Span::raw(" "),
@@ -791,12 +818,16 @@ struct InfoContent {
     edit_tags_pill_row: Option<usize>,
     /// Line index of the Audio Streams pill (if present).
     audio_streams_pill_row: Option<usize>,
+    /// Cursor position for an active inline metadata editor: (line, column).
+    inline_cursor: Option<(usize, u16)>,
 }
 
 fn draw_browse_info(
     f: &mut Frame,
     area: Rect,
     browse: &BrowseState,
+    inline_edit: Option<&BrowseInlineEditState>,
+    info_focus: Option<BrowseInfoFocus>,
     buttons: &mut ButtonRenderMap,
     hover: Option<super::button_map::TuiButton>,
     theme: super::theme::Theme,
@@ -840,7 +871,10 @@ fn draw_browse_info(
             content_width,
             analyze_hovered,
             edit_tags_hovered,
-            audio_streams_hovered, theme)
+            audio_streams_hovered,
+            inline_edit,
+            info_focus,
+            theme)
     } else {
         InfoContent {
             lines: vec![vec![Span::styled("   (no selection)", theme.muted())]],
@@ -848,6 +882,7 @@ fn draw_browse_info(
             analyze_pill_row: None,
             edit_tags_pill_row: None,
             audio_streams_pill_row: None,
+            inline_cursor: None,
         }
     };
 
@@ -866,6 +901,12 @@ fn draw_browse_info(
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+
+    if let Some((line_idx, col)) = info.inline_cursor {
+        if line_idx < content_height {
+            f.set_cursor(area.x + 1 + col, area.y + 1 + line_idx as u16);
+        }
+    }
 
     // Register clickable metadata fields in the info pane. Only for
     // lines that fit within the visible content area.
@@ -935,6 +976,8 @@ fn entry_info_lines(
     analyze_hovered: bool,
     edit_tags_hovered: bool,
     audio_streams_hovered: bool,
+    inline_edit: Option<&BrowseInlineEditState>,
+    info_focus: Option<BrowseInfoFocus>,
     theme: super::theme::Theme,
 ) -> InfoContent {
     // Maximum width for free-form text values: subtract the 3-space indent
@@ -942,12 +985,52 @@ fn entry_info_lines(
 
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let mut meta_field_rows: Vec<(MetadataField, usize)> = Vec::new();
+    let mut inline_cursor: Option<(usize, u16)> = None;
     // Pill rows set by branches that emit them after their content.
     // SacdIso is the only branch using this besides AudioFile (which
     // returns early), but the pattern generalises if more arms grow
     // pill rendering.
     let mut sacd_edit_tags_row: Option<usize> = None;
     let mut audio_streams_pill_row: Option<usize> = None;
+
+    let inline_metadata_input = |field: MetadataField| -> Option<&TextInputState> {
+        inline_edit.and_then(|state| match &state.target {
+            BrowseInlineEditTarget::Metadata { path, field: active_field }
+                if path == &entry.path && *active_field == field => Some(&state.input),
+            _ => None,
+        })
+    };
+    let metadata_focused = |field: MetadataField| -> bool {
+        matches!(info_focus, Some(BrowseInfoFocus::Metadata(active)) if active == field)
+    };
+    let metadata_label_style = |field: MetadataField| {
+        if metadata_focused(field) {
+            Style::default()
+                .fg(theme.text_bright)
+                .bg(theme.input_unfocused_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme.muted()
+        }
+    };
+    let metadata_value_style = |field: MetadataField| {
+        if metadata_focused(field) {
+            Style::default()
+                .fg(theme.text_bright)
+                .bg(theme.input_unfocused_bg)
+        } else {
+            theme.text_style()
+        }
+    };
+    let metadata_placeholder_style = |field: MetadataField| {
+        if metadata_focused(field) {
+            Style::default()
+                .fg(theme.text_bright)
+                .bg(theme.input_unfocused_bg)
+        } else {
+            Style::default().fg(theme.text_dim)
+        }
+    };
 
     // Blank
     lines.push(vec![]);
@@ -1161,77 +1244,139 @@ fn entry_info_lines(
                     lines.push(vec![]);
 
                     // Title: 2-line layout (label + value). Clickable on value row.
-                    lines.push(vec![Span::styled("   title", theme.muted())]);
+                    lines.push(vec![Span::styled("   title", metadata_label_style(MetadataField::Title))]);
                     let title_value_row = lines.len();
-                    if let Some(title) = &meta.title {
+                    if let Some(input) = inline_metadata_input(MetadataField::Title) {
                         lines.push(vec![
                             Span::raw("   "),
-                            Span::styled(truncate_to(title, max_value_chars), theme.bright()),
+                            render_inline_value("", true, input, true, max_value_chars, theme),
+                        ]);
+                        inline_cursor = Some((title_value_row, 3 + inline_cursor_col(input, max_value_chars)));
+                    } else if let Some(title) = &meta.title {
+                        lines.push(vec![
+                            Span::raw("   "),
+                            Span::styled(truncate_to(title, max_value_chars), metadata_value_style(MetadataField::Title)),
                         ]);
                     } else {
                         lines.push(vec![Span::styled(
-                            "   (click to add)",
-                            Style::default().fg(theme.text_dim),
+                            if metadata_focused(MetadataField::Title) {
+                                "   (type to add)"
+                            } else {
+                                "   (click to add)"
+                            },
+                            metadata_placeholder_style(MetadataField::Title),
                         )]);
                     }
                     meta_field_rows.push((MetadataField::Title, title_value_row));
 
                     // Artist: inline label + value. Clickable on the whole line.
                     let artist_row = lines.len();
-                    if let Some(artist) = &meta.artist {
+                    if let Some(input) = inline_metadata_input(MetadataField::Artist) {
                         lines.push(vec![
-                            Span::styled("   artist  ", theme.muted()),
-                            Span::styled(truncate_to(artist, inline_max), theme.text_style()),
+                            Span::styled("   artist  ", metadata_label_style(MetadataField::Artist)),
+                            render_inline_value("", true, input, true, inline_max, theme),
+                        ]);
+                        inline_cursor = Some((artist_row, 11 + inline_cursor_col(input, inline_max)));
+                    } else if let Some(artist) = &meta.artist {
+                        lines.push(vec![
+                            Span::styled("   artist  ", metadata_label_style(MetadataField::Artist)),
+                            Span::styled(truncate_to(artist, inline_max), metadata_value_style(MetadataField::Artist)),
                         ]);
                     } else {
                         lines.push(vec![
-                            Span::styled("   artist  ", theme.muted()),
-                            Span::styled("(click to add)", Style::default().fg(theme.text_dim)),
+                            Span::styled("   artist  ", metadata_label_style(MetadataField::Artist)),
+                            Span::styled(
+                                if metadata_focused(MetadataField::Artist) {
+                                    "(type to add)"
+                                } else {
+                                    "(click to add)"
+                                },
+                                metadata_placeholder_style(MetadataField::Artist),
+                            ),
                         ]);
                     }
                     meta_field_rows.push((MetadataField::Artist, artist_row));
 
                     // Album
                     let album_row = lines.len();
-                    if let Some(album) = &meta.album {
+                    if let Some(input) = inline_metadata_input(MetadataField::Album) {
                         lines.push(vec![
-                            Span::styled("   album   ", theme.muted()),
-                            Span::styled(truncate_to(album, inline_max), theme.text_style()),
+                            Span::styled("   album   ", metadata_label_style(MetadataField::Album)),
+                            render_inline_value("", true, input, true, inline_max, theme),
+                        ]);
+                        inline_cursor = Some((album_row, 11 + inline_cursor_col(input, inline_max)));
+                    } else if let Some(album) = &meta.album {
+                        lines.push(vec![
+                            Span::styled("   album   ", metadata_label_style(MetadataField::Album)),
+                            Span::styled(truncate_to(album, inline_max), metadata_value_style(MetadataField::Album)),
                         ]);
                     } else {
                         lines.push(vec![
-                            Span::styled("   album   ", theme.muted()),
-                            Span::styled("(click to add)", Style::default().fg(theme.text_dim)),
+                            Span::styled("   album   ", metadata_label_style(MetadataField::Album)),
+                            Span::styled(
+                                if metadata_focused(MetadataField::Album) {
+                                    "(type to add)"
+                                } else {
+                                    "(click to add)"
+                                },
+                                metadata_placeholder_style(MetadataField::Album),
+                            ),
                         ]);
                     }
                     meta_field_rows.push((MetadataField::Album, album_row));
 
                     // Genre
                     let genre_row = lines.len();
-                    if let Some(genre) = &meta.genre {
+                    if let Some(input) = inline_metadata_input(MetadataField::Genre) {
                         lines.push(vec![
-                            Span::styled("   genre   ", theme.muted()),
-                            Span::styled(truncate_to(genre, inline_max), theme.text_style()),
+                            Span::styled("   genre   ", metadata_label_style(MetadataField::Genre)),
+                            render_inline_value("", true, input, true, inline_max, theme),
+                        ]);
+                        inline_cursor = Some((genre_row, 11 + inline_cursor_col(input, inline_max)));
+                    } else if let Some(genre) = &meta.genre {
+                        lines.push(vec![
+                            Span::styled("   genre   ", metadata_label_style(MetadataField::Genre)),
+                            Span::styled(truncate_to(genre, inline_max), metadata_value_style(MetadataField::Genre)),
                         ]);
                     } else {
                         lines.push(vec![
-                            Span::styled("   genre   ", theme.muted()),
-                            Span::styled("(click to add)", Style::default().fg(theme.text_dim)),
+                            Span::styled("   genre   ", metadata_label_style(MetadataField::Genre)),
+                            Span::styled(
+                                if metadata_focused(MetadataField::Genre) {
+                                    "(type to add)"
+                                } else {
+                                    "(click to add)"
+                                },
+                                metadata_placeholder_style(MetadataField::Genre),
+                            ),
                         ]);
                     }
                     meta_field_rows.push((MetadataField::Genre, genre_row));
 
                     // Year
                     let year_row = lines.len();
-                    if let Some(year) = &meta.year {
+                    if let Some(input) = inline_metadata_input(MetadataField::Year) {
                         lines.push(vec![
-                            Span::styled("   year    ", theme.muted()),
-                            Span::styled(truncate_to(year, inline_max), theme.text_style()),
+                            Span::styled("   year    ", metadata_label_style(MetadataField::Year)),
+                            render_inline_value("", true, input, true, inline_max, theme),
+                        ]);
+                        inline_cursor = Some((year_row, 11 + inline_cursor_col(input, inline_max)));
+                    } else if let Some(year) = &meta.year {
+                        lines.push(vec![
+                            Span::styled("   year    ", metadata_label_style(MetadataField::Year)),
+                            Span::styled(truncate_to(year, inline_max), metadata_value_style(MetadataField::Year)),
                         ]);
                     } else {
                         lines.push(vec![
-                            Span::styled("   year    ", theme.muted()),
-                            Span::styled("(click to add)", Style::default().fg(theme.text_dim)),
+                            Span::styled("   year    ", metadata_label_style(MetadataField::Year)),
+                            Span::styled(
+                                if metadata_focused(MetadataField::Year) {
+                                    "(type to add)"
+                                } else {
+                                    "(click to add)"
+                                },
+                                metadata_placeholder_style(MetadataField::Year),
+                            ),
                         ]);
                     }
                     meta_field_rows.push((MetadataField::Year, year_row));
@@ -1295,6 +1440,7 @@ fn entry_info_lines(
                     analyze_pill_row: Some(analyze_row_unprobed),
                     edit_tags_pill_row: Some(et_row),
                     audio_streams_pill_row,
+                    inline_cursor,
                 };
             }
 
@@ -1325,6 +1471,7 @@ fn entry_info_lines(
                 analyze_pill_row: Some(analyze_row),
                 edit_tags_pill_row: Some(edit_tags_row),
                 audio_streams_pill_row,
+                inline_cursor,
             };
         }
         EntryKind::DvdAudioIso
@@ -1476,25 +1623,25 @@ fn entry_info_lines(
                     lines.push(vec![]);
                     if let Some(s) = &meta.artist {
                         lines.push(vec![
-                            Span::styled("   artist  ", theme.muted()),
+                            Span::styled("   artist  ", metadata_label_style(MetadataField::Artist)),
                             Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(s) = &meta.album {
                         lines.push(vec![
-                            Span::styled("   album   ", theme.muted()),
+                            Span::styled("   album   ", metadata_label_style(MetadataField::Album)),
                             Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(s) = &meta.genre {
                         lines.push(vec![
-                            Span::styled("   genre   ", theme.muted()),
+                            Span::styled("   genre   ", metadata_label_style(MetadataField::Genre)),
                             Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
                     if let Some(s) = &meta.year {
                         lines.push(vec![
-                            Span::styled("   year    ", theme.muted()),
+                            Span::styled("   year    ", metadata_label_style(MetadataField::Year)),
                             Span::styled(truncate_to(s, inline_max), theme.text_style()),
                         ]);
                     }
@@ -1621,6 +1768,7 @@ fn entry_info_lines(
         analyze_pill_row: None,
         edit_tags_pill_row: sacd_edit_tags_row,
         audio_streams_pill_row,
+        inline_cursor,
     }
 }
 

@@ -1335,6 +1335,7 @@ pub enum OutputOptionsField {
     MergeMode,
     CompanionExtensions,
     CompanionFolders,
+    WriteLog,
 }
 
 impl OutputOptionsField {
@@ -1344,13 +1345,14 @@ impl OutputOptionsField {
         Self::FilenameTemplate,
         Self::MergeMode,
     ];
-    const MAXIMIZED_FIELDS: [Self; 6] = [
+    const MAXIMIZED_FIELDS: [Self; 7] = [
         Self::DestPath,
         Self::FolderTemplate,
         Self::FilenameTemplate,
         Self::MergeMode,
         Self::CompanionExtensions,
         Self::CompanionFolders,
+        Self::WriteLog,
     ];
 
     fn visible_fields(maximized: bool) -> &'static [Self] {
@@ -1386,6 +1388,33 @@ impl OutputOptionsField {
             self
         } else {
             Self::MergeMode
+        }
+    }
+
+    pub fn is_text_field(self) -> bool {
+        matches!(
+            self,
+            Self::DestPath
+                | Self::FolderTemplate
+                | Self::FilenameTemplate
+                | Self::CompanionExtensions
+                | Self::CompanionFolders
+        )
+    }
+
+    pub fn completion_mode(self) -> crate::tui::text_input::CompletionMode {
+        match self {
+            Self::DestPath => crate::tui::text_input::CompletionMode::Path,
+            Self::FolderTemplate | Self::FilenameTemplate => {
+                crate::tui::text_input::CompletionMode::TemplateVariable
+            }
+            // Companion folders are logical source-relative names, not an
+            // editable absolute/relative filesystem path from the current CWD.
+            // Leave completion off rather than suggesting misleading paths.
+            Self::CompanionFolders | Self::CompanionExtensions => {
+                crate::tui::text_input::CompletionMode::None
+            }
+            _ => crate::tui::text_input::CompletionMode::None,
         }
     }
 }
@@ -2300,18 +2329,79 @@ impl FocusedPill<'_> {
     }
 }
 
+/// Which single-file metadata field in the Convert metadata pane is focused
+/// or being edited inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertMetadataField {
+    Title,
+    Artist,
+    Album,
+    Genre,
+    Year,
+}
+
+impl ConvertMetadataField {
+    const FIELDS: [Self; 5] = [Self::Title, Self::Artist, Self::Album, Self::Genre, Self::Year];
+
+    pub fn next(self) -> Self {
+        let idx = Self::FIELDS
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        Self::FIELDS[(idx + 1) % Self::FIELDS.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let idx = Self::FIELDS
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        Self::FIELDS[(idx + Self::FIELDS.len() - 1) % Self::FIELDS.len()]
+    }
+
+    pub fn from_button_kind(kind: crate::tui::button_map::MetadataFieldKind) -> Self {
+        match kind {
+            crate::tui::button_map::MetadataFieldKind::Title => Self::Title,
+            crate::tui::button_map::MetadataFieldKind::Artist => Self::Artist,
+            crate::tui::button_map::MetadataFieldKind::Album => Self::Album,
+            crate::tui::button_map::MetadataFieldKind::Genre => Self::Genre,
+            crate::tui::button_map::MetadataFieldKind::Year => Self::Year,
+        }
+    }
+}
+
 /// State for the metadata pane
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MetadataState {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
     pub genre: Option<String>,
     pub year: Option<String>,
+    pub field_focus: ConvertMetadataField,
+    pub editing: Option<ConvertMetadataField>,
+    pub edit_input: crate::tui::text_input::TextInputState,
     pub advanced_open: bool,
     /// Scroll offset for the convert-screen metadata file list. The cursor
     /// itself lives on SourceMode::Batch / SourceMode::MultiTrack.
     pub file_scroll: usize,
+}
+
+impl Default for MetadataState {
+    fn default() -> Self {
+        Self {
+            title: None,
+            artist: None,
+            album: None,
+            genre: None,
+            year: None,
+            field_focus: ConvertMetadataField::Title,
+            editing: None,
+            edit_input: crate::tui::text_input::TextInputState::empty(),
+            advanced_open: false,
+            file_scroll: 0,
+        }
+    }
 }
 
 /// State for the output options pane
@@ -2323,7 +2413,10 @@ pub struct OutputOptionsState {
     pub merge: PillState<MergeMode>,
     pub companion_extensions: String,
     pub companion_folders: String,
+    pub write_log: PillState<bool>,
     pub field_focus: OutputOptionsField,
+    pub editing: Option<OutputOptionsField>,
+    pub edit_input: crate::tui::text_input::TextInputState,
     pub advanced_open: bool,
 }
 
@@ -2333,15 +2426,20 @@ impl OutputOptionsState {
             (MergeMode::MultiFile, "multi-file"),
             (MergeMode::SingleImage, "single image"),
         ]);
+        let mut write_log = PillState::new(vec![(true, "yes"), (false, "no")]);
+        write_log.select_value(&false);
 
         Self {
             dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
             merge,
-            companion_extensions: crate::convert::formats::DEFAULT_COMPANION_EXTENSIONS.to_string(),
+            companion_extensions: String::new(),
             companion_folders: String::new(),
+            write_log,
             field_focus: OutputOptionsField::DestPath,
+            editing: None,
+            edit_input: crate::tui::text_input::TextInputState::empty(),
             advanced_open: false,
         }
     }
@@ -2382,6 +2480,7 @@ impl OutputOptionsState {
         options.copy_subdirectories = !folders.is_empty();
         options.companion_extensions = extensions;
         options.companion_folders = folders;
+        options.write_log_file = *self.write_log.selected_value();
     }
 }
 
@@ -2404,6 +2503,7 @@ mod output_options_companion_projection_tests {
         assert_eq!(options.companion_folders, vec!["Scans", "Artwork"]);
         assert_eq!(options.effective_companion_extensions(), vec![".jpg", ".pdf"]);
         assert_eq!(options.effective_companion_folders(), vec!["Scans", "Artwork"]);
+        assert!(!options.write_log_file);
     }
 
     #[test]
@@ -2411,6 +2511,7 @@ mod output_options_companion_projection_tests {
         let mut state = OutputOptionsState::new();
         state.companion_extensions.clear();
         state.companion_folders.clear();
+        state.write_log.select_value(&true);
         let mut options = crate::convert::ConversionOptions::default();
 
         state.apply_companion_copying_to_conversion_options(&mut options);
@@ -2421,6 +2522,7 @@ mod output_options_companion_projection_tests {
         assert!(options.companion_folders.is_empty());
         assert!(options.effective_companion_extensions().is_empty());
         assert!(options.effective_companion_folders().is_empty());
+        assert!(options.write_log_file);
     }
 
     #[test]
@@ -2442,9 +2544,10 @@ mod output_options_companion_projection_tests {
 
         assert_eq!(MergeMode.next_for(true), CompanionExtensions);
         assert_eq!(CompanionExtensions.next_for(true), CompanionFolders);
-        assert_eq!(CompanionFolders.next_for(true), DestPath);
-        assert_eq!(DestPath.prev_for(true), CompanionFolders);
-        assert_eq!(CompanionFolders.prev_for(true), CompanionExtensions);
+        assert_eq!(CompanionFolders.next_for(true), WriteLog);
+        assert_eq!(WriteLog.next_for(true), DestPath);
+        assert_eq!(DestPath.prev_for(true), WriteLog);
+        assert_eq!(WriteLog.prev_for(true), CompanionFolders);
         assert_eq!(CompanionExtensions.clamp_for(true), CompanionExtensions);
     }
 }
@@ -5915,6 +6018,33 @@ pub struct CompletionState {
     pub prefix_start: usize,
 }
 
+/// Which browse-surface field is being edited inline.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowseInlineEditTarget {
+    Rename { path: std::path::PathBuf },
+    Metadata {
+        path: std::path::PathBuf,
+        field: crate::tui::probe::MetadataField,
+    },
+}
+
+/// Active inline editor for the Browse screen.
+#[derive(Debug, Clone)]
+pub struct BrowseInlineEditState {
+    pub target: BrowseInlineEditTarget,
+    pub input: crate::tui::text_input::TextInputState,
+}
+
+/// Keyboard focus inside the Browse info pane.
+///
+/// The browse list keeps its existing type-ahead navigation until the user
+/// explicitly moves focus into the metadata rows. Once focused, Enter or any
+/// printable key starts the same reusable inline editor used by mouse clicks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BrowseInfoFocus {
+    Metadata(crate::tui::probe::MetadataField),
+}
+
 /// Which field a TextEdit overlay is editing
 #[derive(Debug, Clone, PartialEq)]
 pub enum TextEditTarget {
@@ -5923,11 +6053,6 @@ pub enum TextEditTarget {
     FilenameTemplate,
     CompanionExtensions,
     CompanionFolders,
-    MetaTitle,
-    MetaArtist,
-    MetaAlbum,
-    MetaGenre,
-    MetaYear,
     /// Rename a browse entry. Carries the original path (not index) so a
     /// directory refresh between open and commit can't corrupt the target.
     BrowseRename(std::path::PathBuf),
@@ -6269,6 +6394,14 @@ pub struct AppState {
     /// click-after-pause, but double-click-to-open preempts" semantics.
     pub pending_browse_rename: Option<(std::path::PathBuf, std::time::Instant)>,
 
+    /// Active inline editor in the Browse screen (file-list rename or info-pane metadata).
+    pub browse_inline_edit: Option<BrowseInlineEditState>,
+
+    /// Keyboard focus in the Browse info pane. This is deliberately separate
+    /// from `browse_inline_edit`: focus may sit on a metadata row before the
+    /// user presses Enter or starts typing.
+    pub browse_info_focus: Option<BrowseInfoFocus>,
+
     /// Recent files list + overlay state (persisted to ~/.cache/tonepoet/recent.json).
     pub recent: crate::tui::recent_files::RecentFilesState,
 
@@ -6591,6 +6724,8 @@ impl AppState {
             last_browse_click: None,
             last_disc_browser_stream_click: None,
             pending_browse_rename: None,
+            browse_inline_edit: None,
+            browse_info_focus: None,
             recent,
             bookmarks,
             config_focus: ConfigFocus::default(),

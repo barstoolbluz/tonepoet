@@ -43,6 +43,7 @@ pub enum TuiButton {
     ConversionPresetPill(usize),
     DsdGainPill(usize),
     MergePill(usize),
+    WriteLogPill(usize),
     ContainerPill(usize),
     /// ⚙ pill on the container row (below-the-fold) to open format-specific settings overlay.
     FormatSettingsButton,
@@ -99,6 +100,8 @@ pub enum TuiButton {
     CompanionExtensionsField,
     CompanionFoldersField,
     MetadataField(MetadataFieldKind),
+    /// Convert metadata-pane action pill that opens the full metadata editor overlay.
+    MetadataEditTagsButton,
     /// Convert metadata file-list row (absolute source index).
     MetadataFileRow(usize),
 
@@ -395,6 +398,7 @@ impl TuiButton {
             | Self::ConversionPresetPill(_)
             | Self::DsdGainPill(_)
             | Self::MergePill(_)
+            | Self::WriteLogPill(_)
             | Self::ContainerPill(_)
             | Self::FormatSettingsButton
             | Self::ResampleQualityPill(_)
@@ -409,6 +413,7 @@ impl TuiButton {
             | Self::CompanionExtensionsField
             | Self::CompanionFoldersField
             | Self::MetadataField(_)
+            | Self::MetadataEditTagsButton
             | Self::MetadataFileRow(_)
             | Self::SourceBrowseButton
             | Self::SourceExpandButton
@@ -518,5 +523,19 @@ impl ButtonRenderMap {
 impl Default for ButtonRenderMap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TuiButton;
+    use crate::tui::app::AppScreen;
+
+    #[test]
+    fn metadata_edit_tags_button_belongs_to_convert_screen() {
+        assert_eq!(
+            TuiButton::MetadataEditTagsButton.screen(),
+            Some(AppScreen::Convert)
+        );
     }
 }

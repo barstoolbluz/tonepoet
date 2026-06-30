@@ -16,7 +16,7 @@ fn default_resampler() -> String {
 }
 
 fn default_companion_extensions() -> String {
-    crate::convert::formats::DEFAULT_COMPANION_EXTENSIONS.to_string()
+    String::new()
 }
 
 /// A TUI-native preset that stores pill values directly
@@ -51,6 +51,8 @@ pub struct TuiPreset {
     pub companion_extensions: String,
     #[serde(default)]
     pub companion_folders: String,
+    #[serde(default)]
+    pub write_log: bool,
 }
 
 impl TuiPreset {
@@ -85,6 +87,7 @@ impl TuiPreset {
             },
             companion_extensions: output_opts.companion_extensions.clone(),
             companion_folders: output_opts.companion_folders.clone(),
+            write_log: *output_opts.write_log.selected_value(),
         }
     }
 
@@ -143,6 +146,7 @@ impl TuiPreset {
         output_opts.filename_template = self.filename_template.clone();
         output_opts.companion_extensions = self.companion_extensions.clone();
         output_opts.companion_folders = self.companion_folders.clone();
+        output_opts.write_log.select_value(&self.write_log);
 
         if let Some(mm) = parse_merge(&self.merge) {
             output_opts.merge.select_value(&mm);
@@ -228,6 +232,7 @@ impl TuiPreset {
             merge: merge.to_string(),
             companion_extensions: default_companion_extensions(),
             companion_folders: String::new(),
+            write_log: false,
         }
     }
 }
@@ -586,11 +591,9 @@ merge = "multi-file"
         )
         .expect("preset without companion fields should deserialize");
 
-        assert_eq!(
-            preset.companion_extensions,
-            crate::convert::formats::DEFAULT_COMPANION_EXTENSIONS
-        );
+        assert!(preset.companion_extensions.is_empty());
         assert!(preset.companion_folders.is_empty());
+        assert!(!preset.write_log);
     }
 
     #[test]
@@ -599,6 +602,7 @@ merge = "multi-file"
         let mut output = OutputOptionsState::new();
         output.companion_extensions = ".jpg, .pdf".to_string();
         output.companion_folders = "Scans, Artwork".to_string();
+        output.write_log.select_value(&true);
 
         let preset = TuiPreset::from_pill_state("companions", &format, &output);
         let mut restored_format = FormatState::new();
@@ -610,5 +614,6 @@ merge = "multi-file"
 
         assert_eq!(restored_output.companion_extensions, ".jpg, .pdf");
         assert_eq!(restored_output.companion_folders, "Scans, Artwork");
+        assert!(*restored_output.write_log.selected_value());
     }
 }

@@ -4264,33 +4264,17 @@ fn draw_metadata_editor(
                 }
 
                 // ── Single-line inline edit for short values ─────
-                // Replace newlines with ↵ so they don't cause terminal line breaks.
-                let (visible, cursor_col) = input.view(val_max);
-                let cp = cursor_col as usize;
-                let chars: Vec<char> = visible
-                    .chars()
-                    .map(|c| if c == '\n' || c == '\r' { '↵' } else { c })
-                    .collect();
-                let before: String = chars[..cp.min(chars.len())].iter().collect();
-                let cursor_ch: String = if cp < chars.len() {
-                    chars[cp].to_string()
-                } else {
-                    " ".to_string()
-                };
-                let after: String = if cp + 1 < chars.len() {
-                    chars[cp + 1..].iter().collect()
-                } else {
-                    String::new()
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(key_display, key_style),
-                    Span::styled(before, Style::default().fg(theme.text_bright)),
-                    Span::styled(
-                        cursor_ch,
-                        Style::default().fg(theme.bg).bg(theme.text_bright),
-                    ),
-                    Span::styled(after, Style::default().fg(theme.text_bright)),
-                ]));
+                // Use the shared inline renderer so the metadata editor keeps
+                // the same scrolled view, newline sanitization, focused input
+                // background, and cursor-cell semantics as output options and
+                // Browse inline edits.
+                lines.push(super::inline_edit::render_inline_text_line_with_embedded_cursor(
+                    key_display,
+                    key_style,
+                    input,
+                    val_max,
+                    theme,
+                ));
                 continue;
             }
             entry.value.replace('\n', "↵").replace('\r', "")
@@ -4416,34 +4400,15 @@ fn draw_metadata_editor(
     let is_cursor_add = state.cursor == add_row;
     if state.phase == MetadataEditorPhase::AddingKey {
         if let Some(ref input) = state.add_key_input {
-            let (visible, cursor_col) = input.view(inner_w.saturating_sub(4));
-            let cp = cursor_col as usize;
-            let chars: Vec<char> = visible.chars().collect();
-            let before: String = chars[..cp.min(chars.len())].iter().collect();
-            let cursor_ch: String = if cp < chars.len() {
-                chars[cp].to_string()
-            } else {
-                " ".to_string()
-            };
-            let after: String = if cp + 1 < chars.len() {
-                chars[cp + 1..].iter().collect()
-            } else {
-                String::new()
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    " + ",
-                    Style::default()
-                        .fg(theme.green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(before, Style::default().fg(theme.text_bright)),
-                Span::styled(
-                    cursor_ch,
-                    Style::default().fg(theme.bg).bg(theme.text_bright),
-                ),
-                Span::styled(after, Style::default().fg(theme.text_bright)),
-            ]));
+            lines.push(super::inline_edit::render_inline_text_line_with_embedded_cursor(
+                " + ",
+                Style::default()
+                    .fg(theme.green)
+                    .add_modifier(Modifier::BOLD),
+                input,
+                inner_w.saturating_sub(4),
+                theme,
+            ));
         }
     } else {
         let add_style = if is_cursor_add {
@@ -5383,33 +5348,13 @@ fn draw_metadata_detail(
 
         if is_cursor && state.detail_edit.is_some() {
             if let Some(ref input) = state.detail_edit {
-                let (visible, cursor_col) = input.view(detail_val_max);
-                let cp = cursor_col as usize;
-                // Replace newlines with ↵ to prevent terminal line breaks.
-                let chars: Vec<char> = visible
-                    .chars()
-                    .map(|c| if c == '\n' || c == '\r' { '↵' } else { c })
-                    .collect();
-                let before: String = chars[..cp.min(chars.len())].iter().collect();
-                let cursor_ch: String = if cp < chars.len() {
-                    chars[cp].to_string()
-                } else {
-                    " ".to_string()
-                };
-                let after: String = if cp + 1 < chars.len() {
-                    chars[cp + 1..].iter().collect()
-                } else {
-                    String::new()
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(label_display.clone(), label_style),
-                    Span::styled(before, Style::default().fg(theme.text_bright)),
-                    Span::styled(
-                        cursor_ch,
-                        Style::default().fg(theme.bg).bg(theme.text_bright),
-                    ),
-                    Span::styled(after, Style::default().fg(theme.text_bright)),
-                ]));
+                lines.push(super::inline_edit::render_inline_text_line_with_embedded_cursor(
+                    label_display.clone(),
+                    label_style,
+                    input,
+                    detail_val_max,
+                    theme,
+                ));
                 continue;
             }
         }
@@ -6237,32 +6182,13 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme:
                 if is_editing {
                     if let Some(ref input) = state.edit_input {
                         let val_max = inner_w.saturating_sub(label_w + 1);
-                        let (visible, cursor_col) = input.view(val_max);
-                        let cp = cursor_col as usize;
-                        let chars: Vec<char> = visible.chars().collect();
-                        let before: String = chars[..cp.min(chars.len())].iter().collect();
-                        let cur_ch: String = if cp < chars.len() {
-                            chars[cp].to_string()
-                        } else {
-                            " ".to_string()
-                        };
-                        let after: String = if cp + 1 < chars.len() {
-                            chars[cp + 1..].iter().collect()
-                        } else {
-                            String::new()
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("    {:<w$}", field, w = label_w - 4),
-                                label_style,
-                            ),
-                            Span::styled(before, Style::default().fg(theme.text_bright)),
-                            Span::styled(
-                                cur_ch,
-                                Style::default().fg(theme.bg).bg(theme.text_bright),
-                            ),
-                            Span::styled(after, Style::default().fg(theme.text_bright)),
-                        ]));
+                        lines.push(super::inline_edit::render_inline_text_line_with_embedded_cursor(
+                            format!("    {:<w$}", field, w = label_w - 4),
+                            label_style,
+                            input,
+                            val_max,
+                            theme,
+                        ));
                         continue;
                     }
                 }
@@ -6301,32 +6227,13 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme:
                 if is_editing {
                     if let Some(ref input) = state.edit_input {
                         let val_max = inner_w.saturating_sub(label_w + 1);
-                        let (visible, cursor_col) = input.view(val_max);
-                        let cp = cursor_col as usize;
-                        let chars: Vec<char> = visible.chars().collect();
-                        let before: String = chars[..cp.min(chars.len())].iter().collect();
-                        let cur_ch: String = if cp < chars.len() {
-                            chars[cp].to_string()
-                        } else {
-                            " ".to_string()
-                        };
-                        let after: String = if cp + 1 < chars.len() {
-                            chars[cp + 1..].iter().collect()
-                        } else {
-                            String::new()
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("    {:<w$}", field, w = label_w - 4),
-                                label_style,
-                            ),
-                            Span::styled(before, Style::default().fg(theme.text_bright)),
-                            Span::styled(
-                                cur_ch,
-                                Style::default().fg(theme.bg).bg(theme.text_bright),
-                            ),
-                            Span::styled(after, Style::default().fg(theme.text_bright)),
-                        ]));
+                        lines.push(super::inline_edit::render_inline_text_line_with_embedded_cursor(
+                            format!("    {:<w$}", field, w = label_w - 4),
+                            label_style,
+                            input,
+                            val_max,
+                            theme,
+                        ));
                         continue;
                     }
                 }

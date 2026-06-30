@@ -1,6 +1,8 @@
 //! Key event dispatch by screen/focus
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
@@ -35,6 +37,44 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
     // Handle other overlay inputs
     if !matches!(app.active_overlay, ActiveOverlay::None) {
         handle_overlay_key(app, key, tx);
+        return;
+    }
+
+    // A defensive stale-state guard: if an inline editor somehow survived a
+    // screen/focus/layout transition, finish it before routing this key. Mouse
+    // and explicit focus-changing paths call the same policy proactively, but
+    // this keeps programmatic transitions from leaving hidden editors behind.
+    finish_hidden_inline_edits(app, tx);
+
+    // Inline edits are part of the base screen, not modal overlays. They must
+    // preempt global/screen shortcuts so text entry cannot accidentally switch
+    // screens, launch commands, or leave stale edit state behind.
+    if app.current_screen == AppScreen::Convert
+        && app.convert.focus == ConvertFocus::OutputOptions
+        && app.convert.output_options.editing.is_some()
+    {
+        handle_output_options_inline_edit_key(app, key);
+        return;
+    }
+
+    if app.current_screen == AppScreen::Convert
+        && app.convert.focus == ConvertFocus::Metadata
+        && app.convert.metadata.editing.is_some()
+    {
+        handle_convert_metadata_inline_edit_key(app, key);
+        return;
+    }
+
+    if app.current_screen == AppScreen::Browse && app.browse_inline_edit.is_some() {
+        handle_browse_inline_edit_key(app, key, tx);
+        return;
+    }
+
+    // Browse info-pane metadata focus is not yet an editor, but printable
+    // keys are still semantically field input. Let Browse handle them before
+    // global 1-5 tab shortcuts or command-mode keys can steal the keystroke.
+    if app.current_screen == AppScreen::Browse && app.browse_info_focus.is_some() {
+        handle_browse_key(app, key, tx);
         return;
     }
 
@@ -516,6 +556,48 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
         }
 
+        // Compact Convert metadata pane inline editing. Batch/multitrack use
+        // the file-list + full metadata editor; single/empty surfaces expose
+        // the visible title/artist/album/genre/year fields in-place.
+        (KeyCode::Char('e'), KeyModifiers::CONTROL)
+            if app.convert.focus == ConvertFocus::Metadata
+                && !app.convert.is_collapsed(ConvertFocus::Metadata) =>
+        {
+            finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
+            open_convert_cursor_metadata_editor(app);
+        }
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Metadata
+                && !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && convert_metadata_inline_fields_visible(app) =>
+        {
+            app.convert.metadata.field_focus = app.convert.metadata.field_focus.prev();
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Metadata
+                && !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && convert_metadata_inline_fields_visible(app) =>
+        {
+            app.convert.metadata.field_focus = app.convert.metadata.field_focus.next();
+        }
+        (KeyCode::Char(c), modifiers)
+            if app.convert.focus == ConvertFocus::Metadata
+                && !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && convert_metadata_inline_fields_visible(app)
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT)
+                && c != 'e' =>
+        {
+            begin_convert_metadata_inline_edit(app, app.convert.metadata.field_focus, Some(key));
+        }
+        (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Metadata
+                && !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && convert_metadata_inline_fields_visible(app) =>
+        {
+            begin_convert_metadata_inline_edit(app, app.convert.metadata.field_focus, None);
+        }
+
         // Metadata pane file-list navigation. Batch mode reuses the source batch cursor.
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Metadata
@@ -614,6 +696,37 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             app.convert.output_options.merge.select_next();
             app.preset.mark_modified();
         }
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::WriteLog =>
+        {
+            app.convert.output_options.write_log.select_prev();
+            app.preset.mark_modified();
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::WriteLog =>
+        {
+            app.convert.output_options.write_log.select_next();
+            app.preset.mark_modified();
+        }
+
+        // Output options inline edit: printable characters begin editing in place.
+        // Keep the legacy `e` shortcut as a non-destructive edit action; any
+        // other printable character replaces the selected value just like a
+        // focused text input.
+        (KeyCode::Char(c), modifiers)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT)
+                && c != 'e'
+                && app.convert.output_options.field_focus.is_text_field() =>
+        {
+            begin_output_options_inline_edit(app, app.convert.output_options.field_focus, Some(key));
+        }
 
         // Output options default action.
         (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE)
@@ -679,54 +792,852 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineEditResolution {
+    Commit,
+    Cancel,
+}
+
+fn has_active_inline_edit(app: &AppState) -> bool {
+    app.convert.output_options.editing.is_some()
+        || app.convert.metadata.editing.is_some()
+        || app.browse_inline_edit.is_some()
+}
+
+fn finish_hidden_inline_edits(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let output_visible = app.current_screen == AppScreen::Convert
+        && app.convert.focus == ConvertFocus::OutputOptions
+        && !app.convert.is_collapsed(ConvertFocus::OutputOptions);
+    if app.convert.output_options.editing.is_some() && !output_visible {
+        commit_output_options_inline_edit(app);
+    }
+
+    let metadata_visible = app.current_screen == AppScreen::Convert
+        && app.convert.focus == ConvertFocus::Metadata
+        && !app.convert.is_collapsed(ConvertFocus::Metadata)
+        && convert_metadata_inline_fields_visible(app);
+    if app.convert.metadata.editing.is_some() && !metadata_visible {
+        commit_convert_metadata_inline_edit(app);
+    }
+
+    if app.browse_inline_edit.is_some() && app.current_screen != AppScreen::Browse {
+        commit_browse_inline_edit(app, tx);
+    }
+    if app.current_screen != AppScreen::Browse {
+        clear_browse_info_focus(app);
+    }
+}
+
+fn finish_active_inline_edit(
+    app: &mut AppState,
+    resolution: InlineEditResolution,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match resolution {
+        InlineEditResolution::Commit => {
+            commit_output_options_inline_edit(app);
+            commit_convert_metadata_inline_edit(app);
+            commit_browse_inline_edit(app, tx);
+        }
+        InlineEditResolution::Cancel => {
+            app.convert.output_options.editing = None;
+            app.convert.metadata.editing = None;
+            app.browse_inline_edit = None;
+        }
+    }
+}
+
+fn active_inline_edit_matches_button(app: &AppState, button: Option<&TuiButton>) -> bool {
+    let Some(button) = button else {
+        return false;
+    };
+
+    let output_field = match button {
+        TuiButton::DestPathField => Some(OutputOptionsField::DestPath),
+        TuiButton::FolderTemplateField => Some(OutputOptionsField::FolderTemplate),
+        TuiButton::FilenameTemplateField => Some(OutputOptionsField::FilenameTemplate),
+        TuiButton::CompanionExtensionsField => Some(OutputOptionsField::CompanionExtensions),
+        TuiButton::CompanionFoldersField => Some(OutputOptionsField::CompanionFolders),
+        _ => None,
+    };
+    if output_field.is_some() && app.convert.output_options.editing == output_field {
+        return true;
+    }
+
+    if let TuiButton::MetadataField(kind) = button {
+        let field = ConvertMetadataField::from_button_kind(*kind);
+        if app.convert.metadata.editing == Some(field) {
+            return true;
+        }
+    }
+
+    match (&app.browse_inline_edit, button) {
+        (
+            Some(BrowseInlineEditState {
+                target: BrowseInlineEditTarget::Rename { path },
+                ..
+            }),
+            TuiButton::BrowseEntry(idx),
+        ) => app
+            .browse
+            .entries
+            .get(*idx)
+            .map(|entry| entry.path == *path)
+            .unwrap_or(false),
+        (
+            Some(BrowseInlineEditState {
+                target: BrowseInlineEditTarget::Metadata { path, field },
+                ..
+            }),
+            TuiButton::BrowseInfoMeta(clicked_field),
+        ) => {
+            *field == *clicked_field
+                && app
+                    .browse
+                    .selected_entry()
+                    .map(|entry| entry.path == *path)
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn finish_inline_edit_before_focus_change(
+    app: &mut AppState,
+    button: Option<&TuiButton>,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    if !has_active_inline_edit(app) {
+        return false;
+    }
+
+    if active_inline_edit_matches_button(app, button) {
+        // A click on the field currently being edited is a focus-preserving
+        // click. The inline editor owns it; don't let the outer button handler
+        // re-run selection/open logic or recreate the editor from the old value.
+        return true;
+    }
+
+    // Text-input convention: blur commits. Esc is the explicit cancel path.
+    // This keeps user edits from being silently discarded while ensuring no
+    // hidden inline editor can keep intercepting keyboard input after the user
+    // changes focus, panes, screens, or mouse targets.
+    finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
+    false
+}
+
+fn browse_metadata_fields() -> [crate::tui::probe::MetadataField; 5] {
+    use crate::tui::probe::MetadataField;
+    [
+        MetadataField::Title,
+        MetadataField::Artist,
+        MetadataField::Album,
+        MetadataField::Genre,
+        MetadataField::Year,
+    ]
+}
+
+fn browse_metadata_focus_field(app: &AppState) -> Option<crate::tui::probe::MetadataField> {
+    match app.browse_info_focus {
+        Some(BrowseInfoFocus::Metadata(field)) => Some(field),
+        None => None,
+    }
+}
+
+fn set_browse_metadata_focus(app: &mut AppState, field: crate::tui::probe::MetadataField) {
+    app.browse_info_focus = Some(BrowseInfoFocus::Metadata(field));
+}
+
+fn clear_browse_info_focus(app: &mut AppState) {
+    app.browse_info_focus = None;
+}
+
+fn convert_metadata_inline_fields_visible(app: &AppState) -> bool {
+    matches!(&app.convert.source.mode, SourceMode::Empty | SourceMode::Single { .. })
+}
+
+fn convert_metadata_field_value(app: &AppState, field: ConvertMetadataField) -> String {
+    match field {
+        ConvertMetadataField::Title => app.convert.metadata.title.clone().unwrap_or_default(),
+        ConvertMetadataField::Artist => app.convert.metadata.artist.clone().unwrap_or_default(),
+        ConvertMetadataField::Album => app.convert.metadata.album.clone().unwrap_or_default(),
+        ConvertMetadataField::Genre => app.convert.metadata.genre.clone().unwrap_or_default(),
+        ConvertMetadataField::Year => app.convert.metadata.year.clone().unwrap_or_default(),
+    }
+}
+
+fn set_convert_metadata_field_value(app: &mut AppState, field: ConvertMetadataField, value: &str) {
+    let trimmed = value.trim();
+    let value_opt = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+
+    match field {
+        ConvertMetadataField::Title => app.convert.metadata.title = value_opt,
+        ConvertMetadataField::Artist => app.convert.metadata.artist = value_opt,
+        ConvertMetadataField::Album => app.convert.metadata.album = value_opt,
+        ConvertMetadataField::Genre => app.convert.metadata.genre = value_opt,
+        ConvertMetadataField::Year => app.convert.metadata.year = value_opt,
+    }
+}
+
+fn begin_convert_metadata_inline_edit(
+    app: &mut AppState,
+    field: ConvertMetadataField,
+    first_key: Option<KeyEvent>,
+) {
+    if !convert_metadata_inline_fields_visible(app) {
+        return;
+    }
+    let initial = convert_metadata_field_value(app, field);
+    app.convert.focus = ConvertFocus::Metadata;
+    app.convert.metadata.field_focus = field;
+    app.convert.metadata.editing = Some(field);
+    app.convert.metadata.edit_input = super::text_input::TextInputState::new_selected(initial);
+
+    if let Some(key) = first_key {
+        let _ = super::text_input::handle_text_input_key(&mut app.convert.metadata.edit_input, &key);
+    }
+}
+
+fn commit_convert_metadata_inline_edit(app: &mut AppState) {
+    let Some(field) = app.convert.metadata.editing.take() else {
+        return;
+    };
+    let value = app.convert.metadata.edit_input.text.clone();
+    set_convert_metadata_field_value(app, field, &value);
+}
+
+fn handle_convert_metadata_inline_edit_key(app: &mut AppState, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, KeyModifiers::NONE) => commit_convert_metadata_inline_edit(app),
+        (KeyCode::Esc, _) => {
+            app.convert.metadata.editing = None;
+        }
+        _ => {
+            let _ = super::text_input::handle_text_input_key(
+                &mut app.convert.metadata.edit_input,
+                &key,
+            );
+        }
+    }
+}
+
+fn browse_metadata_focus_available(app: &AppState) -> bool {
+    app.browse.current_cached_info().is_some()
+}
+
+fn cycle_browse_metadata_focus(app: &mut AppState, forward: bool) {
+    if !browse_metadata_focus_available(app) {
+        app.set_status("metadata: no probed audio selection");
+        return;
+    }
+
+    let fields = browse_metadata_fields();
+    let current = browse_metadata_focus_field(app);
+    let idx = current
+        .and_then(|field| fields.iter().position(|candidate| *candidate == field))
+        .unwrap_or_else(|| if forward { fields.len().saturating_sub(1) } else { 0 });
+    let next = if forward {
+        fields[(idx + 1) % fields.len()]
+    } else {
+        fields[(idx + fields.len() - 1) % fields.len()]
+    };
+    set_browse_metadata_focus(app, next);
+    app.set_status("Browse metadata focus — Enter or type to edit, Esc returns to the file list");
+}
+
 fn open_output_options_text_edit(app: &mut AppState) {
     let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
-    app.convert.output_options.field_focus = app.convert.output_options.field_focus.clamp_for(maximized);
+    let field = app.convert.output_options.field_focus.clamp_for(maximized);
+    app.convert.output_options.field_focus = field;
 
-    let (initial, target, label) = match app.convert.output_options.field_focus {
-        OutputOptionsField::DestPath => {
-            let initial = app
-                .convert
-                .output_options
-                .dest_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            (initial, TextEditTarget::DestPath, "destination path")
-        }
-        OutputOptionsField::FolderTemplate => (
-            app.convert.output_options.folder_template.clone(),
-            TextEditTarget::FolderTemplate,
-            "folder template",
-        ),
-        OutputOptionsField::FilenameTemplate => (
-            app.convert.output_options.filename_template.clone(),
-            TextEditTarget::FilenameTemplate,
-            "filename template",
-        ),
+    match field {
         OutputOptionsField::MergeMode => {
             app.convert.output_options.merge.select_next();
             app.preset.mark_modified();
-            return;
         }
-        OutputOptionsField::CompanionExtensions => (
-            app.convert.output_options.companion_extensions.clone(),
-            TextEditTarget::CompanionExtensions,
-            "companion extensions",
-        ),
-        OutputOptionsField::CompanionFolders => (
-            app.convert.output_options.companion_folders.clone(),
-            TextEditTarget::CompanionFolders,
-            "companion folders",
-        ),
-    };
-
-    app.active_overlay = ActiveOverlay::TextEdit {
-        input: super::text_input::TextInputState::new(initial),
-        target,
-        label: label.to_string(),
-    };
+        OutputOptionsField::WriteLog => {
+            app.convert.output_options.write_log.select_next();
+            app.preset.mark_modified();
+        }
+        _ if field.is_text_field() => begin_output_options_inline_edit(app, field, None),
+        _ => {}
+    }
 }
+
+fn output_options_field_value(app: &AppState, field: OutputOptionsField) -> String {
+    match field {
+        OutputOptionsField::DestPath => app
+            .convert
+            .output_options
+            .dest_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        OutputOptionsField::FolderTemplate => app.convert.output_options.folder_template.clone(),
+        OutputOptionsField::FilenameTemplate => app.convert.output_options.filename_template.clone(),
+        OutputOptionsField::CompanionExtensions => app.convert.output_options.companion_extensions.clone(),
+        OutputOptionsField::CompanionFolders => app.convert.output_options.companion_folders.clone(),
+        OutputOptionsField::MergeMode | OutputOptionsField::WriteLog => String::new(),
+    }
+}
+
+fn begin_output_options_inline_edit(
+    app: &mut AppState,
+    field: OutputOptionsField,
+    first_key: Option<KeyEvent>,
+) {
+    if !field.is_text_field() {
+        return;
+    }
+
+    let initial = output_options_field_value(app, field);
+    app.convert.output_options.field_focus = field;
+    app.convert.output_options.editing = Some(field);
+    app.convert.output_options.edit_input = super::text_input::TextInputState::new_selected(initial);
+
+    if let Some(key) = first_key {
+        let _ = super::text_input::handle_text_input_key(
+            &mut app.convert.output_options.edit_input,
+            &key,
+        );
+    }
+}
+
+fn commit_output_options_inline_edit(app: &mut AppState) {
+    let Some(field) = app.convert.output_options.editing.take() else {
+        return;
+    };
+    let value = app.convert.output_options.edit_input.text.clone();
+    let trimmed = value.trim();
+
+    match field {
+        OutputOptionsField::DestPath => {
+            app.convert.output_options.dest_path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(trimmed))
+            };
+            app.preset.mark_modified();
+        }
+        OutputOptionsField::FolderTemplate => {
+            app.convert.output_options.folder_template = trimmed.to_string();
+            app.preset.mark_modified();
+        }
+        OutputOptionsField::FilenameTemplate => {
+            app.convert.output_options.filename_template = trimmed.to_string();
+            app.preset.mark_modified();
+        }
+        OutputOptionsField::CompanionExtensions => {
+            app.convert.output_options.companion_extensions = trimmed.to_string();
+            app.preset.mark_modified();
+        }
+        OutputOptionsField::CompanionFolders => {
+            app.convert.output_options.companion_folders = trimmed.to_string();
+            app.preset.mark_modified();
+        }
+        OutputOptionsField::MergeMode | OutputOptionsField::WriteLog => {}
+    }
+}
+
+fn handle_output_options_inline_edit_key(app: &mut AppState, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, KeyModifiers::NONE) => commit_output_options_inline_edit(app),
+        (KeyCode::Esc, _) => {
+            app.convert.output_options.editing = None;
+        }
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            if let Some(field) = app.convert.output_options.editing {
+                let _ = super::text_input::apply_tab_completion(
+                    &mut app.convert.output_options.edit_input,
+                    field.completion_mode(),
+                );
+            }
+        }
+        _ => {
+            let _ = super::text_input::handle_text_input_key(
+                &mut app.convert.output_options.edit_input,
+                &key,
+            );
+        }
+    }
+}
+
+fn begin_browse_inline_rename(app: &mut AppState, path: std::path::PathBuf) {
+    let initial = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if initial.is_empty() {
+        app.set_status("rename: cannot rename filesystem root");
+        return;
+    }
+    app.browse_inline_edit = Some(BrowseInlineEditState {
+        target: BrowseInlineEditTarget::Rename { path },
+        input: super::text_input::TextInputState::new_selected(initial),
+    });
+}
+
+fn begin_selected_browse_inline_rename(app: &mut AppState) {
+    let Some((path, is_parent)) = app
+        .browse
+        .selected_entry()
+        .map(|entry| (entry.path.clone(), matches!(entry.kind, super::browse::EntryKind::ParentDir)))
+    else {
+        return;
+    };
+    if is_parent {
+        app.set_status("rename: cannot rename parent entry");
+        return;
+    }
+    begin_browse_inline_rename(app, path);
+}
+
+fn current_browse_metadata_value(app: &AppState, field: crate::tui::probe::MetadataField) -> String {
+    let Some(cached) = app.browse.current_cached_info() else {
+        return String::new();
+    };
+    let meta = &cached.metadata;
+    match field {
+        crate::tui::probe::MetadataField::Title => meta.title.clone(),
+        crate::tui::probe::MetadataField::Artist => meta.artist.clone(),
+        crate::tui::probe::MetadataField::Album => meta.album.clone(),
+        crate::tui::probe::MetadataField::Genre => meta.genre.clone(),
+        crate::tui::probe::MetadataField::Year => meta.year.clone(),
+    }
+    .unwrap_or_default()
+}
+
+fn begin_browse_metadata_inline_edit(
+    app: &mut AppState,
+    field: crate::tui::probe::MetadataField,
+    first_key: Option<KeyEvent>,
+) {
+    if !browse_metadata_focus_available(app) {
+        app.set_status("metadata: no probed audio selection");
+        return;
+    }
+    let Some(path) = app.browse.selected_entry().map(|entry| entry.path.clone()) else {
+        return;
+    };
+    let initial = current_browse_metadata_value(app, field);
+    set_browse_metadata_focus(app, field);
+    app.browse_inline_edit = Some(BrowseInlineEditState {
+        target: BrowseInlineEditTarget::Metadata { path, field },
+        input: super::text_input::TextInputState::new_selected(initial),
+    });
+
+    if let Some(key) = first_key {
+        if let Some(state) = app.browse_inline_edit.as_mut() {
+            let _ = super::text_input::handle_text_input_key(&mut state.input, &key);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum BrowseInlineCommit {
+    Rename {
+        path: std::path::PathBuf,
+        value: String,
+    },
+    Metadata {
+        path: std::path::PathBuf,
+        field: crate::tui::probe::MetadataField,
+        value: String,
+    },
+}
+
+fn browse_inline_commit_from_state(state: BrowseInlineEditState) -> BrowseInlineCommit {
+    let value = state.input.text;
+    match state.target {
+        BrowseInlineEditTarget::Rename { path } => BrowseInlineCommit::Rename { path, value },
+        BrowseInlineEditTarget::Metadata { path, field } => {
+            BrowseInlineCommit::Metadata { path, field, value }
+        }
+    }
+}
+
+fn commit_browse_inline_edit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let Some(state) = app.browse_inline_edit.take() else {
+        return;
+    };
+    match browse_inline_commit_from_state(state) {
+        BrowseInlineCommit::Rename { path, value } => {
+            commit_browse_rename(app, path, value.trim(), tx);
+        }
+        BrowseInlineCommit::Metadata { path, field, value } => {
+            apply_text_edit(
+                app,
+                TextEditTarget::BrowseMetadata { path, field },
+                &value,
+                tx,
+            );
+        }
+    }
+}
+
+fn handle_browse_inline_edit_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            commit_browse_inline_edit(app, tx);
+        }
+        (KeyCode::Esc, _) => {
+            finish_active_inline_edit(app, InlineEditResolution::Cancel, tx);
+        }
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            let base_dir = app.browse_inline_edit.as_ref().and_then(|state| match &state.target {
+                BrowseInlineEditTarget::Rename { path } => path.parent().map(|p| p.to_path_buf()),
+                BrowseInlineEditTarget::Metadata { .. } => None,
+            });
+            if let Some(state) = app.browse_inline_edit.as_mut() {
+                match &state.target {
+                    BrowseInlineEditTarget::Rename { .. } => {
+                        let _ = super::text_input::apply_path_completion(
+                            &mut state.input,
+                            base_dir.as_deref(),
+                            false,
+                        );
+                    }
+                    BrowseInlineEditTarget::Metadata { .. } => {}
+                }
+            }
+        }
+        _ => {
+            if let Some(state) = app.browse_inline_edit.as_mut() {
+                let _ = super::text_input::handle_text_input_key(&mut state.input, &key);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_edit_behavior_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::layout::Rect;
+    use tokio::sync::mpsc;
+
+    fn channel() -> (mpsc::Sender<AppMessage>, mpsc::Receiver<AppMessage>) {
+        mpsc::channel(8)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn convert_output_app() -> AppState {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::OutputOptions;
+        app
+    }
+
+    #[test]
+    fn output_inline_printable_key_starts_edit_and_enter_commits() {
+        let (tx, _rx) = channel();
+        let mut app = convert_output_app();
+        app.convert.output_options.field_focus = OutputOptionsField::FilenameTemplate;
+        app.convert.output_options.filename_template = "%ARTIST%/%TITLE%".to_string();
+
+        handle_key(&mut app, key(KeyCode::Char('x')), &tx);
+        assert_eq!(app.convert.output_options.editing, Some(OutputOptionsField::FilenameTemplate));
+        assert_eq!(app.convert.output_options.edit_input.text, "x");
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+        assert_eq!(app.convert.output_options.editing, None);
+        assert_eq!(app.convert.output_options.filename_template, "x");
+    }
+
+    #[test]
+    fn output_inline_escape_cancels_without_mutating_value() {
+        let (tx, _rx) = channel();
+        let mut app = convert_output_app();
+        app.convert.output_options.folder_template = "original".to_string();
+        begin_output_options_inline_edit(&mut app, OutputOptionsField::FolderTemplate, None);
+        app.convert.output_options.edit_input.set_text_and_cursor("edited".to_string(), "edited".len());
+
+        handle_key(&mut app, key(KeyCode::Esc), &tx);
+
+        assert_eq!(app.convert.output_options.editing, None);
+        assert_eq!(app.convert.output_options.folder_template, "original");
+    }
+
+    #[test]
+    fn output_inline_mouse_blur_commits_before_focus_change() {
+        let (tx, _rx) = channel();
+        let mut app = convert_output_app();
+        app.convert.output_options.filename_template = "before".to_string();
+        begin_output_options_inline_edit(&mut app, OutputOptionsField::FilenameTemplate, None);
+        app.convert.output_options.edit_input.set_text_and_cursor("after".to_string(), "after".len());
+        app.button_map.record_button(TuiButton::Pane(ConvertFocus::Source), Rect::new(2, 2, 12, 1));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.convert.output_options.editing, None);
+        assert_eq!(app.convert.output_options.filename_template, "after");
+        assert_eq!(app.convert.focus, ConvertFocus::Source);
+    }
+
+    #[test]
+    fn output_inline_clicking_same_field_preserves_active_editor() {
+        let (tx, _rx) = channel();
+        let mut app = convert_output_app();
+        begin_output_options_inline_edit(&mut app, OutputOptionsField::FilenameTemplate, None);
+        app.convert.output_options.edit_input.set_text_and_cursor("draft".to_string(), "draft".len());
+
+        let consumed = finish_inline_edit_before_focus_change(
+            &mut app,
+            Some(&TuiButton::FilenameTemplateField),
+            &tx,
+        );
+
+        assert!(consumed);
+        assert_eq!(app.convert.output_options.editing, Some(OutputOptionsField::FilenameTemplate));
+        assert_eq!(app.convert.output_options.edit_input.text, "draft");
+    }
+
+    #[test]
+    fn convert_metadata_click_starts_inline_edit_without_textedit_overlay() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Source;
+        app.convert.metadata.title = Some("Old Title".to_string());
+        app.button_map.record_button(
+            TuiButton::MetadataField(super::super::button_map::MetadataFieldKind::Title),
+            Rect::new(10, 10, 40, 1),
+        );
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 11,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(app.convert.focus, ConvertFocus::Metadata);
+        assert_eq!(app.convert.metadata.editing, Some(ConvertMetadataField::Title));
+        assert_eq!(app.convert.metadata.edit_input.text, "Old Title");
+        assert!(app.convert.metadata.edit_input.select_all);
+    }
+
+    #[test]
+    fn convert_metadata_inline_printable_key_starts_edit_and_enter_commits() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Metadata;
+        app.convert.metadata.field_focus = ConvertMetadataField::Artist;
+        app.convert.metadata.artist = Some("Before".to_string());
+
+        handle_key(&mut app, key(KeyCode::Char('A')), &tx);
+        assert_eq!(app.convert.metadata.editing, Some(ConvertMetadataField::Artist));
+        assert_eq!(app.convert.metadata.edit_input.text, "A");
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+        assert_eq!(app.convert.metadata.editing, None);
+        assert_eq!(app.convert.metadata.artist.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn convert_metadata_inline_escape_cancels_without_mutating_value() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Metadata;
+        app.convert.metadata.album = Some("Original".to_string());
+        begin_convert_metadata_inline_edit(&mut app, ConvertMetadataField::Album, None);
+        app.convert.metadata.edit_input.set_text_and_cursor("Edited".to_string(), "Edited".len());
+
+        handle_key(&mut app, key(KeyCode::Esc), &tx);
+
+        assert_eq!(app.convert.metadata.editing, None);
+        assert_eq!(app.convert.metadata.album.as_deref(), Some("Original"));
+    }
+
+    #[test]
+    fn convert_metadata_inline_mouse_blur_commits_before_focus_change() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Metadata;
+        app.convert.metadata.genre = Some("Before".to_string());
+        begin_convert_metadata_inline_edit(&mut app, ConvertMetadataField::Genre, None);
+        app.convert.metadata.edit_input.set_text_and_cursor("After".to_string(), "After".len());
+        app.button_map.record_button(TuiButton::Pane(ConvertFocus::Format), Rect::new(2, 2, 12, 1));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.convert.metadata.editing, None);
+        assert_eq!(app.convert.metadata.genre.as_deref(), Some("After"));
+        assert_eq!(app.convert.focus, ConvertFocus::Format);
+    }
+
+    #[test]
+    fn convert_metadata_same_field_click_preserves_active_editor() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        begin_convert_metadata_inline_edit(&mut app, ConvertMetadataField::Year, None);
+        app.convert.metadata.edit_input.set_text_and_cursor("1999".to_string(), "1999".len());
+
+        let consumed = finish_inline_edit_before_focus_change(
+            &mut app,
+            Some(&TuiButton::MetadataField(super::super::button_map::MetadataFieldKind::Year)),
+            &tx,
+        );
+
+        assert!(consumed);
+        assert_eq!(app.convert.metadata.editing, Some(ConvertMetadataField::Year));
+        assert_eq!(app.convert.metadata.edit_input.text, "1999");
+    }
+
+    #[test]
+    fn convert_metadata_edit_tags_pill_commits_inline_edit_then_opens_overlay_path() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Metadata;
+        app.convert.metadata.title = Some("Before".to_string());
+        begin_convert_metadata_inline_edit(&mut app, ConvertMetadataField::Title, None);
+        app.convert.metadata.edit_input.set_text_and_cursor("After".to_string(), "After".len());
+        app.button_map.record_button(TuiButton::MetadataEditTagsButton, Rect::new(4, 4, 11, 1));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.convert.focus, ConvertFocus::Metadata);
+        assert_eq!(app.convert.metadata.editing, None);
+        assert_eq!(app.convert.metadata.title.as_deref(), Some("After"));
+        // This minimal test app has no source path, so the click reaches the
+        // overlay-open path but reports the expected no-source status rather
+        // than falling back to inline editing or TextEdit.
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.contains("no source file selected"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn convert_metadata_ctrl_e_opens_full_editor_escape_hatch_without_inline_editing() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Metadata;
+        app.convert.metadata.field_focus = ConvertMetadataField::Artist;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &tx);
+
+        assert_eq!(app.convert.metadata.editing, None);
+        assert!(app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.contains("no source file selected"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn browse_rename_tab_completion_uses_entry_parent_directory() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("track-one.flac"), b"audio").expect("fixture");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename { path: temp.path().join("old.flac") },
+            input: super::super::text_input::TextInputState::new("tra".to_string()),
+        });
+
+        handle_browse_inline_edit_key(&mut app, key(KeyCode::Tab), &tx);
+
+        assert_eq!(
+            app.browse_inline_edit.as_ref().unwrap().input.text,
+            "track-one.flac"
+        );
+    }
+
+    #[test]
+    fn browse_inline_commit_resolves_metadata_target_and_value() {
+        let path = std::path::PathBuf::from("/tmp/track.flac");
+        let state = BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Metadata {
+                path: path.clone(),
+                field: crate::tui::probe::MetadataField::Artist,
+            },
+            input: super::super::text_input::TextInputState::new("New Artist".to_string()),
+        };
+
+        assert_eq!(
+            browse_inline_commit_from_state(state),
+            BrowseInlineCommit::Metadata {
+                path,
+                field: crate::tui::probe::MetadataField::Artist,
+                value: "New Artist".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn browse_inline_commit_resolves_rename_target_and_trimmed_commit_value() {
+        let path = std::path::PathBuf::from("/tmp/old.flac");
+        let state = BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename { path: path.clone() },
+            input: super::super::text_input::TextInputState::new(" new.flac ".to_string()),
+        };
+
+        match browse_inline_commit_from_state(state) {
+            BrowseInlineCommit::Rename { path: actual_path, value } => {
+                assert_eq!(actual_path, path);
+                assert_eq!(value.trim(), "new.flac");
+            }
+            other => panic!("expected rename commit, got {other:?}"),
+        }
+    }
+}
+
 
 // ── Preset overlay keybindings ────────────────────────────────────────
 
@@ -883,6 +1794,39 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     let mut selection_may_have_changed = false;
 
     match (key.code, key.modifiers) {
+        // Keyboard access for Browse info-pane metadata rows. The file list
+        // remains the default focus; Tab explicitly enters/cycles metadata
+        // focus, and Enter or any printable key begins inline editing there.
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            cycle_browse_metadata_focus(app, true);
+        }
+        (KeyCode::BackTab, _) => {
+            cycle_browse_metadata_focus(app, false);
+        }
+        (KeyCode::Up, KeyModifiers::NONE) if browse_metadata_focus_field(app).is_some() => {
+            cycle_browse_metadata_focus(app, false);
+        }
+        (KeyCode::Down, KeyModifiers::NONE) if browse_metadata_focus_field(app).is_some() => {
+            cycle_browse_metadata_focus(app, true);
+        }
+        (KeyCode::Left, KeyModifiers::NONE) if browse_metadata_focus_field(app).is_some() => {
+            clear_browse_info_focus(app);
+            app.set_status("Browse file-list focus");
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) if browse_metadata_focus_field(app).is_some() => {
+            if let Some(field) = browse_metadata_focus_field(app) {
+                begin_browse_metadata_inline_edit(app, field, None);
+            }
+        }
+        (KeyCode::Char(_), mods)
+            if browse_metadata_focus_field(app).is_some()
+                && (mods.is_empty() || mods == KeyModifiers::SHIFT) =>
+        {
+            if let Some(field) = browse_metadata_focus_field(app) {
+                begin_browse_metadata_inline_edit(app, field, Some(key));
+            }
+        }
+
         // Navigation (extends visual selection if V-mode is active)
         (KeyCode::Up, KeyModifiers::NONE) => {
             app.browse.move_up();
@@ -960,6 +1904,12 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         // Delete: move selected file(s) to trash (with confirmation)
         (KeyCode::Delete, KeyModifiers::NONE) => {
             super::command::execute_command(app, super::command::Command::Delete, tx);
+        }
+
+        // Rename the selected file/folder inline in the list.
+        (KeyCode::F(2), KeyModifiers::NONE) => {
+            clear_browse_info_focus(app);
+            begin_selected_browse_inline_rename(app);
         }
 
         // Enter directory/archive or select file
@@ -1156,6 +2106,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             } else if app.browse.visual_mode {
                 app.browse.visual_mode = false;
                 app.set_status("Visual select off");
+            } else if app.browse_info_focus.is_some() {
+                clear_browse_info_focus(app);
+                app.set_status("Browse file-list focus");
             } else if !app.browse.multi_selected.is_empty() {
                 app.browse.clear_multi_selection();
             } else if !app.browse.filter_text.is_empty() {
@@ -1173,6 +2126,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 
         // Ctrl+E = open metadata editor for selected audio file(s)
         (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+            clear_browse_info_focus(app);
             open_metadata_editor(app);
         }
 
@@ -14577,12 +15531,6 @@ fn apply_text_edit(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let trimmed = value.trim();
-    let value_opt = if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    };
-
     match target {
         TextEditTarget::DestPath => {
             // dest_path is not in the preset, don't mark modified
@@ -14607,21 +15555,6 @@ fn apply_text_edit(
         TextEditTarget::CompanionFolders => {
             app.convert.output_options.companion_folders = trimmed.to_string();
             app.preset.mark_modified();
-        }
-        TextEditTarget::MetaTitle => {
-            app.convert.metadata.title = value_opt;
-        }
-        TextEditTarget::MetaArtist => {
-            app.convert.metadata.artist = value_opt;
-        }
-        TextEditTarget::MetaAlbum => {
-            app.convert.metadata.album = value_opt;
-        }
-        TextEditTarget::MetaGenre => {
-            app.convert.metadata.genre = value_opt;
-        }
-        TextEditTarget::MetaYear => {
-            app.convert.metadata.year = value_opt;
         }
         TextEditTarget::BrowseRename(original_path) => {
             commit_browse_rename(app, original_path, trimmed, tx);
@@ -18546,7 +19479,6 @@ fn execute_confirm_action(
 fn conversion_options_from_current_convert_output(app: &AppState) -> ConversionOptions {
     let mut options = ConversionOptions::default();
     options.append_lineage_to_comment = app.config.conversion.append_lineage_to_comment;
-    options.write_log_file = app.config.conversion.write_log_file;
     options.generate_cue_files = app.config.conversion.generate_cue_files;
     options.cue_generation_mode = app.config.conversion.cue_generation_mode.clone();
     app.convert
@@ -18786,6 +19718,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         mouse.kind,
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
     ) {
+        if has_active_inline_edit(app) {
+            finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
+        }
         if app.current_screen == AppScreen::Convert {
             clear_convert_double_click_state_for_button(app, None);
         }
@@ -18891,6 +19826,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
         clear_convert_double_click_state_for_button(app, None);
         if matches!(app.active_overlay, ActiveOverlay::None) {
+            finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
+            clear_browse_info_focus(app);
             let x = mouse.column;
             let y = mouse.row;
 
@@ -18934,6 +19871,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         None
     };
     clear_convert_double_click_state_for_button(app, double_click_candidate);
+
+    if matches!(app.active_overlay, ActiveOverlay::None)
+        && finish_inline_edit_before_focus_change(app, clicked_button.as_ref(), tx)
+    {
+        return;
+    }
 
     // If wizard is active, forward to wizard
     if app.current_screen == AppScreen::Wizard {
@@ -19067,18 +20010,21 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
 
             // ── Convert screen: tab bar ──
-            TuiButton::Tab(n) => match n {
-                1 => {
-                    app.current_screen = AppScreen::Browse;
-                    app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            TuiButton::Tab(n) => {
+                clear_browse_info_focus(app);
+                match n {
+                    1 => {
+                        app.current_screen = AppScreen::Browse;
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                        super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                    }
+                    2 => app.current_screen = AppScreen::Library,
+                    3 => app.current_screen = AppScreen::Convert,
+                    4 => app.current_screen = AppScreen::Queue,
+                    5 => app.current_screen = AppScreen::Config,
+                    _ => {}
                 }
-                2 => app.current_screen = AppScreen::Library,
-                3 => app.current_screen = AppScreen::Convert,
-                4 => app.current_screen = AppScreen::Queue,
-                5 => app.current_screen = AppScreen::Config,
-                _ => {}
-            },
+            }
 
             // ── Convert screen: preset bar ──
             TuiButton::PresetsButton => {
@@ -19112,60 +20058,24 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
             // ── Convert screen: editable text fields ──
             TuiButton::DestPathField => {
-                let initial = app
-                    .convert
-                    .output_options
-                    .dest_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
                 app.convert.focus = ConvertFocus::OutputOptions;
-                app.convert.output_options.field_focus = OutputOptionsField::DestPath;
-                app.active_overlay = ActiveOverlay::TextEdit {
-                    input: super::text_input::TextInputState::new(initial),
-                    target: TextEditTarget::DestPath,
-                    label: "destination path".to_string(),
-                };
+                begin_output_options_inline_edit(app, OutputOptionsField::DestPath, None);
             }
             TuiButton::FolderTemplateField => {
-                let initial = app.convert.output_options.folder_template.clone();
                 app.convert.focus = ConvertFocus::OutputOptions;
-                app.convert.output_options.field_focus = OutputOptionsField::FolderTemplate;
-                app.active_overlay = ActiveOverlay::TextEdit {
-                    input: super::text_input::TextInputState::new(initial),
-                    target: TextEditTarget::FolderTemplate,
-                    label: "folder template".to_string(),
-                };
+                begin_output_options_inline_edit(app, OutputOptionsField::FolderTemplate, None);
             }
             TuiButton::FilenameTemplateField => {
-                let initial = app.convert.output_options.filename_template.clone();
                 app.convert.focus = ConvertFocus::OutputOptions;
-                app.convert.output_options.field_focus = OutputOptionsField::FilenameTemplate;
-                app.active_overlay = ActiveOverlay::TextEdit {
-                    input: super::text_input::TextInputState::new(initial),
-                    target: TextEditTarget::FilenameTemplate,
-                    label: "filename template".to_string(),
-                };
+                begin_output_options_inline_edit(app, OutputOptionsField::FilenameTemplate, None);
             }
             TuiButton::CompanionExtensionsField => {
-                let initial = app.convert.output_options.companion_extensions.clone();
                 app.convert.focus = ConvertFocus::OutputOptions;
-                app.convert.output_options.field_focus = OutputOptionsField::CompanionExtensions;
-                app.active_overlay = ActiveOverlay::TextEdit {
-                    input: super::text_input::TextInputState::new(initial),
-                    target: TextEditTarget::CompanionExtensions,
-                    label: "companion extensions".to_string(),
-                };
+                begin_output_options_inline_edit(app, OutputOptionsField::CompanionExtensions, None);
             }
             TuiButton::CompanionFoldersField => {
-                let initial = app.convert.output_options.companion_folders.clone();
                 app.convert.focus = ConvertFocus::OutputOptions;
-                app.convert.output_options.field_focus = OutputOptionsField::CompanionFolders;
-                app.active_overlay = ActiveOverlay::TextEdit {
-                    input: super::text_input::TextInputState::new(initial),
-                    target: TextEditTarget::CompanionFolders,
-                    label: "companion folders".to_string(),
-                };
+                begin_output_options_inline_edit(app, OutputOptionsField::CompanionFolders, None);
             }
             TuiButton::SourceBrowseButton => {
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
@@ -19196,40 +20106,16 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 super::command::execute_commit_with_disc_selection_bridge(app, true, tx);
             }
             TuiButton::MetadataField(field) => {
-                use super::button_map::MetadataFieldKind::*;
-                let (initial, target, label) = match field {
-                    Title => (
-                        app.convert.metadata.title.clone().unwrap_or_default(),
-                        TextEditTarget::MetaTitle,
-                        "title",
-                    ),
-                    Artist => (
-                        app.convert.metadata.artist.clone().unwrap_or_default(),
-                        TextEditTarget::MetaArtist,
-                        "artist",
-                    ),
-                    Album => (
-                        app.convert.metadata.album.clone().unwrap_or_default(),
-                        TextEditTarget::MetaAlbum,
-                        "album",
-                    ),
-                    Genre => (
-                        app.convert.metadata.genre.clone().unwrap_or_default(),
-                        TextEditTarget::MetaGenre,
-                        "genre",
-                    ),
-                    Year => (
-                        app.convert.metadata.year.clone().unwrap_or_default(),
-                        TextEditTarget::MetaYear,
-                        "year",
-                    ),
-                };
                 app.convert.focus = ConvertFocus::Metadata;
-                app.active_overlay = ActiveOverlay::TextEdit {
-                    input: super::text_input::TextInputState::new(initial),
-                    target,
-                    label: label.to_string(),
-                };
+                begin_convert_metadata_inline_edit(
+                    app,
+                    ConvertMetadataField::from_button_kind(field),
+                    None,
+                );
+            }
+            TuiButton::MetadataEditTagsButton => {
+                app.convert.focus = ConvertFocus::Metadata;
+                open_convert_cursor_metadata_editor(app);
             }
             TuiButton::MetadataFileRow(index) => {
                 app.convert.focus = ConvertFocus::Metadata;
@@ -19444,6 +20330,16 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.preset.mark_modified();
                 }
             }
+            TuiButton::WriteLogPill(i) => {
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::WriteLog;
+                if i < app.convert.output_options.write_log.options.len()
+                    && app.convert.output_options.write_log.options[i].enabled
+                {
+                    app.convert.output_options.write_log.selected = i;
+                    app.preset.mark_modified();
+                }
+            }
 
             // ── Queue screen buttons ──
             TuiButton::QueueItem(idx) => {
@@ -19521,6 +20417,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             // ── Browse screen ──
             TuiButton::BrowseEntry(idx) => {
                 use super::browse::EntryKind;
+                clear_browse_info_focus(app);
 
                 if idx >= app.browse.entries.len() {
                     return;
@@ -19631,10 +20528,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                             // click within that window will cancel it (→ open).
                             // Don't schedule for ParentDir.
                             if !matches!(app.browse.entries[idx].kind, EntryKind::ParentDir) {
-                                app.pending_browse_rename = Some((
-                                    clicked_path.clone(),
-                                    now + std::time::Duration::from_millis(OPEN_MS),
-                                ));
+                                begin_browse_inline_rename(app, clicked_path.clone());
                             }
                         }
 
@@ -19647,6 +20541,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             TuiButton::BrowseColumn(col) => {
+                clear_browse_info_focus(app);
                 use super::browse::{SortBy, SortDir};
                 use super::button_map::ColumnKind;
                 let target = match col {
@@ -19662,20 +20557,24 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             TuiButton::BrowseInfoMeta(field) => {
-                // Click a metadata field in the info pane → open tag editor.
-                super::command::execute_edit_metadata_pub(app, field);
+                set_browse_metadata_focus(app, field);
+                begin_browse_metadata_inline_edit(app, field, None);
             }
             TuiButton::BrowseInfoAnalyze => {
+                clear_browse_info_focus(app);
                 let cmd = super::command::Command::Analyze { force: false };
                 super::command::execute_command(app, cmd, tx);
             }
             TuiButton::BrowseInfoEditTags => {
+                clear_browse_info_focus(app);
                 open_metadata_editor(app);
             }
             TuiButton::BrowseInfoAudioStreams => {
+                clear_browse_info_focus(app);
                 super::disc_browser_actions::open_selected_disc_browser(app, tx);
             }
             TuiButton::BrowseSearchToggle => {
+                clear_browse_info_focus(app);
                 if app.browse.search.active {
                     app.browse.close_search();
                 } else {
@@ -19683,10 +20582,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             TuiButton::BrowseSearchRecursive => {
+                clear_browse_info_focus(app);
                 app.browse.search.recursive = !app.browse.search.recursive;
                 app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
             TuiButton::BrowseSearchMode => {
+                clear_browse_info_focus(app);
                 app.browse.search.mode = app.browse.search.mode.cycle();
                 if app.browse.search.mode == super::browse::SearchMode::Filename
                     && app.browse.search.sort.is_tag_sort()
@@ -19697,6 +20598,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
             TuiButton::BrowseSearchSort => {
+                clear_browse_info_focus(app);
                 let tag_mode = matches!(
                     app.browse.search.mode,
                     super::browse::SearchMode::Tags | super::browse::SearchMode::Both
@@ -19709,10 +20611,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
             TuiButton::BrowseSearchAudioOnly => {
+                clear_browse_info_focus(app);
                 app.browse.search.audio_only = !app.browse.search.audio_only;
                 app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
             TuiButton::BrowseList => {
+                clear_browse_info_focus(app);
                 // Catch-all for scroll routing only; ignore on left click.
             }
             TuiButton::BrowseBreadcrumb => {
