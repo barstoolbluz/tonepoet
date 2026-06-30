@@ -13068,11 +13068,15 @@ enum CompanionSourceRefRole {
 /// 2. Single-file jobs use the request source path: a directory request copies
 ///    from that directory, and a file request copies from that file's parent.
 ///    This avoids accidentally copying from a staged per-track work directory.
-/// 3. Multi-track/materialized sources use the prepared track source roots.
+/// 3. CUE-image jobs use the request/container parent rather than the staged
+///    per-track carrier directory. The source-image path remains available for
+///    source-file skipping, but companion loose files such as the input CUE are
+///    expected beside the user-selected CUE/image source.
+/// 4. Other multi-track/materialized sources use the prepared track source roots.
 ///    File-backed refs contribute their parent directory; directory-backed refs
 ///    (DVD-Audio, DVD-Video, Blu-ray folder sources, staged AUDIO_TS trees) are
 ///    the root themselves. This is the key no-parent-for-directories rule.
-/// 4. If materialized track refs cannot produce an existing common root, fall
+/// 5. If materialized track refs cannot produce an existing common root, fall
 ///    back to `PreparedSource::container`, then to `PipelineRequest::container`.
 ///
 /// This keeps the brief's single-file, batch, materialization-scratch, and
@@ -13088,17 +13092,14 @@ fn companion_source_dir(req: &PipelineRequest, source: &PreparedSource) -> Optio
     let track_root = companion_prepared_track_common_source_root(source);
 
     match source.kind {
-        SourceKind::SingleFile => request_root
-            .or(prepared_container_root)
-            .or(track_root),
+        SourceKind::SingleFile | SourceKind::CueImage => {
+            request_root.or(prepared_container_root).or(track_root)
+        }
         SourceKind::SevenZip
-        | SourceKind::CueImage
         | SourceKind::SacdIso
         | SourceKind::DvdAudio
         | SourceKind::DvdVideo
-        | SourceKind::BluRay => track_root
-            .or(prepared_container_root)
-            .or(request_root),
+        | SourceKind::BluRay => track_root.or(prepared_container_root).or(request_root),
     }
 }
 
@@ -13136,8 +13137,8 @@ fn companion_track_source_path_and_role(
 ) -> Option<(&Path, CompanionSourceRefRole)> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some((path.as_path(), CompanionSourceRefRole::File)),
-        TrackSourceRef::CueSegmentCarrier { path, .. } => {
-            Some((path.as_path(), CompanionSourceRefRole::File))
+        TrackSourceRef::CueSegmentCarrier { source_image, .. } => {
+            Some((source_image.as_path(), CompanionSourceRefRole::File))
         }
         TrackSourceRef::ImageSegment { image, .. } => {
             Some((image.as_path(), CompanionSourceRefRole::File))
@@ -13188,16 +13189,31 @@ fn common_existing_dir_root(paths: &[PathBuf]) -> Option<PathBuf> {
     if common.is_dir() { Some(common) } else { None }
 }
 
-fn companion_source_file_skip_set(req: &PipelineRequest, source: &PreparedSource) -> BTreeSet<PathBuf> {
+fn companion_source_file_skip_set(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
-    insert_companion_skip_path(&mut paths, &req.container);
-    insert_companion_skip_path(&mut paths, &source.container);
+    insert_companion_container_skip_path(&mut paths, &req.container);
+    insert_companion_container_skip_path(&mut paths, &source.container);
     for track in &source.tracks {
         if let Some(path) = companion_track_source_path(&track.source_ref) {
             insert_companion_skip_path(&mut paths, path);
         }
     }
     paths
+}
+
+fn insert_companion_container_skip_path(paths: &mut BTreeSet<PathBuf>, path: &Path) {
+    if !is_companion_copyable_index_container(path) {
+        insert_companion_skip_path(paths, path);
+    }
+}
+
+fn is_companion_copyable_index_container(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cue"))
 }
 
 fn insert_companion_skip_path(paths: &mut BTreeSet<PathBuf>, path: &Path) {
@@ -13952,6 +13968,178 @@ mod companion_copy_hardening_tests {
         );
 
         assert_eq!(companion_source_dir(&req, &prepared), Some(dvd_root));
+    }
+
+    fn cue_segment_track(staged: PathBuf, source_image: PathBuf) -> PreparedTrack {
+        test_prepared_track(TrackSourceRef::CueSegmentCarrier {
+            path: staged,
+            source_image,
+            start_sample: 0,
+            samples: 44_100,
+            carrier: CueSegmentCarrier::PcmS32LeWav,
+        })
+    }
+
+    #[test]
+    fn source_dir_for_cue_image_prefers_original_cue_parent_over_staged_carrier() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let staging_dir = temp.path().join("staging").join("cue-segments");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::create_dir_all(&staging_dir).expect("staging dir");
+        let cue = source_dir.join("album.cue");
+        let image = source_dir.join("album.flac");
+        let staged = staging_dir.join("01.wav");
+        std::fs::write(&cue, b"cue").expect("cue");
+        std::fs::write(&image, b"flac").expect("image");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        let req = test_request(temp.path(), cue.clone());
+        let prepared = test_prepared_source(
+            SourceKind::CueImage,
+            cue,
+            vec![cue_segment_track(staged, image)],
+        );
+
+        assert_eq!(companion_source_dir(&req, &prepared), Some(source_dir));
+    }
+
+    #[test]
+    fn cue_segment_companion_source_path_is_original_image_not_staged_carrier() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let staged = temp.path().join("staging").join("cue-segments").join("01.wav");
+        std::fs::create_dir_all(staged.parent().expect("staged parent")).expect("staged parent");
+        std::fs::write(&image, b"flac").expect("image");
+        std::fs::write(&staged, b"wav").expect("staged");
+        let source_ref = TrackSourceRef::CueSegmentCarrier {
+            path: staged.clone(),
+            source_image: image.clone(),
+            start_sample: 0,
+            samples: 44_100,
+            carrier: CueSegmentCarrier::PcmS32LeWav,
+        };
+
+        assert_eq!(companion_track_source_path(&source_ref), Some(image.as_path()));
+        assert_ne!(companion_track_source_path(&source_ref), Some(staged.as_path()));
+    }
+
+    #[test]
+    fn direct_cue_input_skip_set_keeps_cue_copyable_and_skips_audio_image() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let staging_dir = temp.path().join("staging").join("cue-segments");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::create_dir_all(&staging_dir).expect("staging dir");
+        let cue = source_dir.join("album.CUE");
+        let image = source_dir.join("album.FLAC");
+        let staged = staging_dir.join("01.wav");
+        std::fs::write(&cue, b"cue").expect("cue");
+        std::fs::write(&image, b"flac").expect("image");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        let req = test_request(temp.path(), cue.clone());
+        let prepared = test_prepared_source(
+            SourceKind::CueImage,
+            cue.clone(),
+            vec![cue_segment_track(staged.clone(), image.clone())],
+        );
+        let skip_set = companion_source_file_skip_set(&req, &prepared);
+
+        assert!(
+            !skip_set.contains(&normalize_path(&cue)),
+            "direct CUE containers are metadata/index files and must remain eligible companions"
+        );
+        assert!(
+            skip_set.contains(&normalize_path(&image)),
+            "the CUE source image is the audio input and must not be copied as a companion"
+        );
+        assert!(
+            !skip_set.contains(&normalize_path(&staged)),
+            "staged CUE carriers are internal scratch artifacts, not source-directory companions"
+        );
+    }
+
+    #[test]
+    fn direct_cue_input_copies_cue_companion_but_not_audio_image() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let staging_dir = temp.path().join("staging").join("cue-segments");
+        let dst = temp.path().join("published");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::create_dir_all(&staging_dir).expect("staging dir");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let cue = source_dir.join("album.cue");
+        let image = source_dir.join("album.flac");
+        let staged = staging_dir.join("01.wav");
+        std::fs::write(&cue, b"cue").expect("cue");
+        std::fs::write(&image, b"flac").expect("image");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        let mut req = test_request(temp.path(), cue.clone());
+        req.companion.extensions = vec![".cue".to_string(), ".flac".to_string()];
+        let prepared = test_prepared_source(
+            SourceKind::CueImage,
+            cue,
+            vec![cue_segment_track(staged, image)],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        copy_companion_artifacts_best_effort(&req, &prepared, &published);
+
+        assert_eq!(
+            std::fs::read(dst.join("album.cue")).expect("copied cue"),
+            b"cue"
+        );
+        assert!(
+            !dst.join("album.flac").exists(),
+            "audio images must stay skipped even when their extension is explicitly requested"
+        );
+    }
+
+    #[test]
+    fn image_input_with_sidecar_cue_copies_cue_companion_but_not_audio_image() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let staging_dir = temp.path().join("staging").join("cue-segments");
+        let dst = temp.path().join("published");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::create_dir_all(&staging_dir).expect("staging dir");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let image = source_dir.join("album.flac");
+        let cue = source_dir.join("album.cue");
+        let staged = staging_dir.join("01.wav");
+        std::fs::write(&image, b"flac").expect("image");
+        std::fs::write(&cue, b"cue").expect("cue");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        let mut req = test_request(temp.path(), image.clone());
+        req.companion.extensions = vec!["cue".to_string(), "flac".to_string()];
+        let prepared = test_prepared_source(
+            SourceKind::CueImage,
+            image.clone(),
+            vec![cue_segment_track(staged, image)],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        copy_companion_artifacts_best_effort(&req, &prepared, &published);
+
+        assert_eq!(
+            std::fs::read(dst.join("album.cue")).expect("copied cue"),
+            b"cue"
+        );
+        assert!(
+            !dst.join("album.flac").exists(),
+            "sidecar CUE copying must not accidentally copy the source image"
+        );
     }
 
     #[test]
