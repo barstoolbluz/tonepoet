@@ -252,6 +252,68 @@ impl std::fmt::Display for AudioFormat {
     }
 }
 
+
+/// Standard loose companion-file extensions copied with conversions by default.
+pub const DEFAULT_COMPANION_EXTENSIONS: &str =
+    ".png, .jpg, .jpeg, .gif, .tiff, .webp, .bmp, .txt, .log, .nfo, .cue";
+
+/// Parse a comma-separated extension list into normalized, de-duplicated values.
+///
+/// Empty tokens are ignored, leading dots are optional, and all extensions are
+/// lowercased because extension matching is case-insensitive across supported
+/// filesystems. Path-like tokens are ignored rather than interpreted, because
+/// companion-file matching is intentionally limited to top-level loose files.
+pub fn parse_companion_extensions(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in input.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() || trimmed == "." || trimmed.contains('/') || trimmed.contains('\\') {
+            continue;
+        }
+
+        let without_dot = trimmed.trim_start_matches('.');
+        if without_dot.is_empty() {
+            continue;
+        }
+
+        let normalized = format!(".{}", without_dot.to_ascii_lowercase());
+        if !out.iter().any(|existing| existing == &normalized) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+/// Parse a comma-separated list of bare folder names into a de-duplicated list.
+///
+/// Folder matching is always relative to the source directory. Tokens that look
+/// like paths or traversal components are dropped defensively so UI/preset input
+/// cannot escape the source root. Case folding is deliberately not applied here;
+/// the copy stage applies platform-appropriate matching when it sees the actual
+/// filesystem entries.
+pub fn parse_companion_folders(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in input.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+        {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+pub fn default_companion_extensions() -> Vec<String> {
+    parse_companion_extensions(DEFAULT_COMPANION_EXTENSIONS)
+}
+
 /// Options for audio conversion
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionOptions {
@@ -301,11 +363,25 @@ pub struct ConversionOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_bit_depth: Option<u32>,
 
-    /// Copy auxiliary files (txt, cue, log, etc.) - defaults to true
+    /// Legacy master toggle for loose companion files. New callers should
+    /// prefer `companion_extensions`; this remains for backwards compatibility.
+    #[serde(default = "default_true")]
     pub copy_auxiliary_files: bool,
 
-    /// Copy subdirectories from source - defaults to true
+    /// Legacy master toggle for companion folders. New callers should prefer
+    /// `companion_folders`; this remains for backwards compatibility.
+    #[serde(default = "default_true")]
     pub copy_subdirectories: bool,
+
+    /// Normalized loose companion-file extensions to copy from the source
+    /// directory after publish. Empty means copy no loose files.
+    #[serde(default = "default_companion_extensions")]
+    pub companion_extensions: Vec<String>,
+
+    /// Bare companion-folder names to copy recursively from the source directory
+    /// after publish. Empty means copy no folders.
+    #[serde(default)]
+    pub companion_folders: Vec<String>,
 
     /// Force FLAC re-encoding instead of copying - defaults to false
     pub reencode_flac: bool,
@@ -378,8 +454,10 @@ impl Default for ConversionOptions {
             dither_type: None,
             target_sample_rate: None,
             target_bit_depth: None,
-            copy_auxiliary_files: true, // Match wizard default
-            copy_subdirectories: true,  // Match wizard default
+            copy_auxiliary_files: true,
+            copy_subdirectories: true,
+            companion_extensions: default_companion_extensions(),
+            companion_folders: Vec::new(),
             reencode_flac: false,       // Match wizard default (don't re-encode, copy is default)
             merge_to_single: false,
             preferred_backend: None,
@@ -393,6 +471,26 @@ impl Default for ConversionOptions {
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
+    }
+}
+
+impl ConversionOptions {
+    /// Effective, normalized loose companion-file extensions for pipeline use.
+    #[must_use]
+    pub fn effective_companion_extensions(&self) -> Vec<String> {
+        if !self.copy_auxiliary_files {
+            return Vec::new();
+        }
+        parse_companion_extensions(&self.companion_extensions.join(","))
+    }
+
+    /// Effective, validated companion-folder names for pipeline use.
+    #[must_use]
+    pub fn effective_companion_folders(&self) -> Vec<String> {
+        if !self.copy_subdirectories {
+            return Vec::new();
+        }
+        parse_companion_folders(&self.companion_folders.join(","))
     }
 }
 
@@ -646,6 +744,10 @@ impl AudioFormat {
 }
 
 /// Default CUE generation mode for backward compatibility
+fn default_true() -> bool {
+    true
+}
+
 fn default_cue_generation_mode() -> String {
     "IfMerging".to_string()
 }
@@ -653,7 +755,7 @@ fn default_cue_generation_mode() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioFormat, FileFormat, FormatDetector};
+    use super::{parse_companion_extensions, parse_companion_folders, AudioFormat, FileFormat, FormatDetector};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -727,6 +829,22 @@ mod tests {
         assert!(
             err.contains("No file extension found for"),
             "unexpected detector error: {err}"
+        );
+    }
+
+    #[test]
+    fn companion_extension_parser_normalizes_and_deduplicates() {
+        assert_eq!(
+            parse_companion_extensions("png, .JPG, jpg, ./bad, Scans/foo, .cue"),
+            vec![".png", ".jpg", ".cue"]
+        );
+    }
+
+    #[test]
+    fn companion_folder_parser_accepts_only_bare_names() {
+        assert_eq!(
+            parse_companion_folders("Scans, Artwork, ../escape, foo/bar, Scans, .., ."),
+            vec!["Scans", "Artwork"]
         );
     }
 

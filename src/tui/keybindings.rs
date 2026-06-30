@@ -452,7 +452,22 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
 
 fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     match (key.code, key.modifiers) {
-        // Tab between panes. This remains unconditional in both Default and Maximized modes.
+        // Tab cycles fields within output options, and panes elsewhere. Companion
+        // rows are included only in maximized output-options mode.
+        (KeyCode::Tab, KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
+        {
+            let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
+            app.convert.output_options.field_focus = app.convert.output_options.field_focus.next_for(maximized);
+        }
+        (KeyCode::BackTab, KeyModifiers::SHIFT)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
+        {
+            let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
+            app.convert.output_options.field_focus = app.convert.output_options.field_focus.prev_for(maximized);
+        }
         (KeyCode::Tab, KeyModifiers::NONE) => {
             app.convert.focus = app.convert.focus.next();
         }
@@ -573,13 +588,15 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             if app.convert.focus == ConvertFocus::OutputOptions
                 && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
         {
-            app.convert.output_options.field_focus = app.convert.output_options.field_focus.prev();
+            let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
+            app.convert.output_options.field_focus = app.convert.output_options.field_focus.prev_for(maximized);
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
                 && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
         {
-            app.convert.output_options.field_focus = app.convert.output_options.field_focus.next();
+            let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
+            app.convert.output_options.field_focus = app.convert.output_options.field_focus.next_for(maximized);
         }
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
@@ -596,6 +613,14 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         {
             app.convert.output_options.merge.select_next();
             app.preset.mark_modified();
+        }
+
+        // Output options default action.
+        (KeyCode::Char('e'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
+        {
+            open_output_options_text_edit(app);
         }
 
         // Source pane default action.
@@ -652,6 +677,55 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
 
         _ => {}
     }
+}
+
+fn open_output_options_text_edit(app: &mut AppState) {
+    let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
+    app.convert.output_options.field_focus = app.convert.output_options.field_focus.clamp_for(maximized);
+
+    let (initial, target, label) = match app.convert.output_options.field_focus {
+        OutputOptionsField::DestPath => {
+            let initial = app
+                .convert
+                .output_options
+                .dest_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            (initial, TextEditTarget::DestPath, "destination path")
+        }
+        OutputOptionsField::FolderTemplate => (
+            app.convert.output_options.folder_template.clone(),
+            TextEditTarget::FolderTemplate,
+            "folder template",
+        ),
+        OutputOptionsField::FilenameTemplate => (
+            app.convert.output_options.filename_template.clone(),
+            TextEditTarget::FilenameTemplate,
+            "filename template",
+        ),
+        OutputOptionsField::MergeMode => {
+            app.convert.output_options.merge.select_next();
+            app.preset.mark_modified();
+            return;
+        }
+        OutputOptionsField::CompanionExtensions => (
+            app.convert.output_options.companion_extensions.clone(),
+            TextEditTarget::CompanionExtensions,
+            "companion extensions",
+        ),
+        OutputOptionsField::CompanionFolders => (
+            app.convert.output_options.companion_folders.clone(),
+            TextEditTarget::CompanionFolders,
+            "companion folders",
+        ),
+    };
+
+    app.active_overlay = ActiveOverlay::TextEdit {
+        input: super::text_input::TextInputState::new(initial),
+        target,
+        label: label.to_string(),
+    };
 }
 
 // ── Preset overlay keybindings ────────────────────────────────────────
@@ -1427,7 +1501,7 @@ fn load_browse_selection(
                 paths_to_add.push(path);
             }
             let mut count = 0;
-            let options = crate::convert::ConversionOptions::default();
+            let options = conversion_options_from_current_convert_output(app);
             for p in paths_to_add {
                 // Resolve archive password:
                 // session override → keychain MRU → config → None.
@@ -14526,6 +14600,14 @@ fn apply_text_edit(
             app.convert.output_options.filename_template = trimmed.to_string();
             app.preset.mark_modified();
         }
+        TextEditTarget::CompanionExtensions => {
+            app.convert.output_options.companion_extensions = trimmed.to_string();
+            app.preset.mark_modified();
+        }
+        TextEditTarget::CompanionFolders => {
+            app.convert.output_options.companion_folders = trimmed.to_string();
+            app.preset.mark_modified();
+        }
         TextEditTarget::MetaTitle => {
             app.convert.metadata.title = value_opt;
         }
@@ -18461,17 +18543,25 @@ fn execute_confirm_action(
     }
 }
 
+fn conversion_options_from_current_convert_output(app: &AppState) -> ConversionOptions {
+    let mut options = ConversionOptions::default();
+    options.append_lineage_to_comment = app.config.conversion.append_lineage_to_comment;
+    options.write_log_file = app.config.conversion.write_log_file;
+    options.generate_cue_files = app.config.conversion.generate_cue_files;
+    options.cue_generation_mode = app.config.conversion.cue_generation_mode.clone();
+    app.convert
+        .output_options
+        .apply_companion_copying_to_conversion_options(&mut options);
+    options
+}
+
 fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
     if !path.exists() {
         app.set_status(format!("Path not found: {}", path.display()));
         return;
     }
 
-    let mut options = ConversionOptions::default();
-    options.append_lineage_to_comment = app.config.conversion.append_lineage_to_comment;
-    options.write_log_file = app.config.conversion.write_log_file;
-    options.generate_cue_files = app.config.conversion.generate_cue_files;
-    options.cue_generation_mode = app.config.conversion.cue_generation_mode.clone();
+    let options = conversion_options_from_current_convert_output(app);
 
     if path.is_dir() {
         let mut count = 0;
@@ -19030,6 +19120,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
                 app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::DestPath;
                 app.active_overlay = ActiveOverlay::TextEdit {
                     input: super::text_input::TextInputState::new(initial),
                     target: TextEditTarget::DestPath,
@@ -19039,6 +19130,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::FolderTemplateField => {
                 let initial = app.convert.output_options.folder_template.clone();
                 app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::FolderTemplate;
                 app.active_overlay = ActiveOverlay::TextEdit {
                     input: super::text_input::TextInputState::new(initial),
                     target: TextEditTarget::FolderTemplate,
@@ -19048,10 +19140,31 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::FilenameTemplateField => {
                 let initial = app.convert.output_options.filename_template.clone();
                 app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::FilenameTemplate;
                 app.active_overlay = ActiveOverlay::TextEdit {
                     input: super::text_input::TextInputState::new(initial),
                     target: TextEditTarget::FilenameTemplate,
                     label: "filename template".to_string(),
+                };
+            }
+            TuiButton::CompanionExtensionsField => {
+                let initial = app.convert.output_options.companion_extensions.clone();
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::CompanionExtensions;
+                app.active_overlay = ActiveOverlay::TextEdit {
+                    input: super::text_input::TextInputState::new(initial),
+                    target: TextEditTarget::CompanionExtensions,
+                    label: "companion extensions".to_string(),
+                };
+            }
+            TuiButton::CompanionFoldersField => {
+                let initial = app.convert.output_options.companion_folders.clone();
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::CompanionFolders;
+                app.active_overlay = ActiveOverlay::TextEdit {
+                    input: super::text_input::TextInputState::new(initial),
+                    target: TextEditTarget::CompanionFolders,
+                    label: "companion folders".to_string(),
                 };
             }
             TuiButton::SourceBrowseButton => {

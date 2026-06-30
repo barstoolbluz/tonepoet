@@ -1105,6 +1105,10 @@ fn build_pipeline_request_template(
         container_ffmpeg_flags: Vec::new(),
         album_batch: None,
         album_batch_track: None,
+        companion: tonepoet::convert::pipeline::CompanionCopyPolicy {
+            extensions: options.effective_companion_extensions(),
+            folders: options.effective_companion_folders(),
+        },
         expected_album_track_count: None,
         suppress_incremental_conversion_log_append: false,
     })

@@ -4249,6 +4249,21 @@ fn apply_queue_item_cue_sidecar_override_to_source_options(
     }
 }
 
+/// Build the post-publish companion-copy policy from the already-projected
+/// conversion options that this commit path enqueues.  This keeps manually
+/// patched/prebuilt PipelineRequest values consistent with ConversionItem
+/// options, including explicit empty strings that disable loose files or
+/// folders via the legacy boolean gates.
+#[must_use]
+fn companion_copy_policy_from_conversion_options(
+    options: &crate::convert::formats::ConversionOptions,
+) -> crate::convert::pipeline::CompanionCopyPolicy {
+    crate::convert::pipeline::CompanionCopyPolicy {
+        extensions: options.effective_companion_extensions(),
+        folders: options.effective_companion_folders(),
+    }
+}
+
 /// Apply the selected disc presentation stored in the Convert source mode to
 /// freshly-built pipeline source options.
 pub fn apply_convert_source_disc_selection_to_source_options(
@@ -4369,12 +4384,20 @@ fn execute_commit_with_source_options_transform(
         }
     }
 
-    // Build options from the current pill state.
-    let options = super::convert_actions::pills_to_options(
+    // Build options from the current pill state, then project the editable
+    // Output Options companion fields into the ConversionOptions that are
+    // actually enqueued.  The post-publish copy stage reads
+    // ConversionOptions::effective_companion_*(), so this command path must
+    // share the same canonical projection helper used by the direct queue-add
+    // paths instead of relying on ConversionOptions::default() semantics.
+    let mut options = super::convert_actions::pills_to_options(
         &app.convert.format,
         &app.convert.output_options,
         &app.config,
     );
+    app.convert
+        .output_options
+        .apply_companion_copying_to_conversion_options(&mut options);
     let format_name = options.output_format.name();
 
     // Enqueue the whole batch via the shared helper. CUE sidecar override
@@ -4471,6 +4494,7 @@ fn execute_commit_with_source_options_transform(
         }
 
         let rg_enabled = options.calculate_replaygain;
+        let companion_policy = companion_copy_policy_from_conversion_options(&options);
         let pipeline_settings = options.pipeline_settings.clone().unwrap_or_else(|| {
             crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
         });
@@ -4497,6 +4521,7 @@ fn execute_commit_with_source_options_transform(
                     existing_req.item_id = item.id.clone();
                     existing_req.job_id = format!("job-{}", item.id);
                     existing_req.source = item_source;
+                    existing_req.companion = companion_policy.clone();
                 } else {
                     let output_root = options.output_dir.clone()
                         .map(|p| crate::convert::pipeline::unified_request::expand_tilde(&p))
@@ -4555,6 +4580,7 @@ fn execute_commit_with_source_options_transform(
                         album_batch_track: None,
                         expected_album_track_count: None,
                         suppress_incremental_conversion_log_append: false,
+                        companion: companion_policy.clone(),
                     });
                 }
             }
@@ -12347,6 +12373,61 @@ mod execute_queue_state_consistency_tests {
             !before_source_mode_publish.contains("app.convert.source.cue_artifact_audio ="),
             "execute_queue must not assign Convert CUE metadata before source mode publication"
         );
+    }
+}
+
+#[cfg(test)]
+mod command_companion_policy_tests {
+    use super::*;
+
+    #[test]
+    fn command_companion_policy_uses_projected_custom_values() {
+        let mut options = crate::convert::formats::ConversionOptions::default();
+        options.copy_auxiliary_files = true;
+        options.copy_subdirectories = true;
+        options.companion_extensions = vec!["jpg".to_string(), ".PDF".to_string()];
+        options.companion_folders = vec!["Scans".to_string(), "Artwork".to_string()];
+
+        let policy = companion_copy_policy_from_conversion_options(&options);
+
+        assert_eq!(policy.extensions, vec![".jpg", ".pdf"]);
+        assert_eq!(policy.folders, vec!["Scans", "Artwork"]);
+    }
+
+    #[test]
+    fn command_companion_policy_preserves_explicit_disabled_values() {
+        let mut options = crate::convert::formats::ConversionOptions::default();
+        options.copy_auxiliary_files = false;
+        options.copy_subdirectories = false;
+        options.companion_extensions = vec!["jpg".to_string()];
+        options.companion_folders = vec!["Scans".to_string()];
+
+        let policy = companion_copy_policy_from_conversion_options(&options);
+
+        assert!(policy.extensions.is_empty());
+        assert!(policy.folders.is_empty());
+    }
+
+    #[test]
+    fn command_request_patch_paths_assign_companion_policy() {
+        let source = include_str!("command.rs");
+        let command_path = source
+            .find("fn execute_commit_with_source_options_transform(")
+            .expect("command commit path should exist");
+        let command_body = &source[command_path..];
+
+        let policy_build = command_body
+            .find("let companion_policy = companion_copy_policy_from_conversion_options(&options);")
+            .expect("commit path must build companion policy from projected options");
+        let existing_assignment = command_body
+            .find("existing_req.companion = companion_policy.clone();")
+            .expect("prebuilt PipelineRequest branch must refresh companion policy");
+        let new_request_assignment = command_body
+            .find("companion: companion_policy.clone(),")
+            .expect("manual PipelineRequest initializer must carry companion policy");
+
+        assert!(policy_build < existing_assignment);
+        assert!(policy_build < new_request_assignment);
     }
 }
 

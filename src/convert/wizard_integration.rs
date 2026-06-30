@@ -237,6 +237,12 @@ pub fn extract_wizard_settings(
         target_bit_depth: wizard.bit_depth, // Extract bit depth for ALL formats (FLAC/WavPack need this)
         copy_auxiliary_files: wizard.copy_files_enabled,
         copy_subdirectories: wizard.copy_subdirectories_enabled,
+        companion_extensions: if wizard.copy_files_enabled {
+            crate::convert::formats::default_companion_extensions()
+        } else {
+            Vec::new()
+        },
+        companion_folders: Vec::new(),
         reencode_flac: wizard.get_effective_reencode_flac(),
         merge_to_single: wizard.merge_to_single.unwrap_or(false),
         preferred_backend: None, // Old wizard doesn't support backend selection
@@ -588,6 +594,12 @@ pub fn preset_to_conversion_options(
         target_bit_depth: settings.bit_depth, // Extract bit depth from preset
         copy_auxiliary_files: settings.copy_files_enabled.unwrap_or(true),
         copy_subdirectories: settings.copy_subdirectories_enabled.unwrap_or(true),
+        companion_extensions: if settings.copy_files_enabled.unwrap_or(true) {
+            crate::convert::formats::default_companion_extensions()
+        } else {
+            Vec::new()
+        },
+        companion_folders: Vec::new(),
         reencode_flac: settings.reencode_flac.unwrap_or(false),
         merge_to_single: false,
         preferred_backend: None, // Presets don't store backend selection - that's a runtime config

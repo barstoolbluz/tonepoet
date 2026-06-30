@@ -240,6 +240,27 @@ impl AlbumBatchTrackContext {
     }
 }
 
+
+/// User-configurable companion artifacts copied after successful publish.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionCopyPolicy {
+    /// Normalized loose-file extensions, including leading dots. Empty means
+    /// copy no loose files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// Bare folder names, always interpreted relative to the source directory.
+    /// Empty means copy no folders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<String>,
+}
+
+impl CompanionCopyPolicy {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.extensions.is_empty() && self.folders.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineRequest {
     pub job_id: String,
@@ -291,6 +312,9 @@ pub struct PipelineRequest {
     /// by the folder/album dispatcher, may define the completion threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_album_track_count: Option<usize>,
+    /// Companion files/folders copied best-effort after publish.
+    #[serde(default, skip_serializing_if = "CompanionCopyPolicy::is_empty")]
+    pub companion: CompanionCopyPolicy,
     /// Container extension override. `None` = codec default extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_extension: Option<String>,
@@ -650,6 +674,7 @@ pub struct RedactedPipelineRequest {
     pub album_batch_track: Option<AlbumBatchTrackContext>,
     pub suppress_incremental_conversion_log_append: bool,
     pub expected_album_track_count: Option<usize>,
+    pub companion: CompanionCopyPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,6 +753,7 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
             album_batch_track: req.album_batch_track.clone(),
             suppress_incremental_conversion_log_append: req.suppress_incremental_conversion_log_append,
             expected_album_track_count: req.expected_album_track_count,
+            companion: req.companion.clone(),
         }
     }
 }

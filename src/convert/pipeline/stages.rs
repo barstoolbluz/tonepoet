@@ -68,6 +68,7 @@ const CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR: &str = ".tonepoet-log-fragments.qu
 const CONVERSION_LOG_FRAGMENT_SIDE_KIND: &str = "tonepoet-conversion-log-fragment";
 const CONVERSION_LOG_BATCH_ID_PREFIX: &str = "tonepoet-log-batch-v1";
 static CONVERSION_LOG_BATCH_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static COMPANION_COPY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ===========================================================================
 // Materializer trait
@@ -4793,6 +4794,7 @@ FILE "album.flac" WAVE
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
+            companion: CompanionCopyPolicy::default(),
         }
     }
 
@@ -12192,6 +12194,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             current_outcome = push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
+            copy_companion_artifacts_best_effort(&req, &source_value, &album);
             published = Some(album);
         }
         Err(err) => {
@@ -12877,6 +12880,9 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
+            if let Some(source_ref) = source.as_ref() {
+                copy_companion_artifacts_best_effort(&req, source_ref, &album);
+            }
             published = Some(album);
         }
         Err(err) => {
@@ -12917,6 +12923,1135 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     )
     .await
 }
+
+#[derive(Debug, Default)]
+struct CompanionCopyStats {
+    copied: usize,
+    skipped: usize,
+    warnings: usize,
+}
+
+impl CompanionCopyStats {
+    fn copied(&mut self) {
+        self.copied += 1;
+    }
+
+    fn skipped(&mut self) {
+        self.skipped += 1;
+    }
+
+    fn warning(&mut self) {
+        self.warnings += 1;
+    }
+}
+
+fn copy_companion_artifacts_best_effort(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    published: &PublishedAlbum,
+) {
+    if req.companion.is_empty() {
+        return;
+    }
+
+    let Some(source_dir) = companion_source_dir(req, source) else {
+        log::warn!(
+            "companion copy skipped for {}: unable to resolve source directory",
+            req.item_id
+        );
+        return;
+    };
+
+    if !source_dir.is_dir() {
+        log::warn!(
+            "companion copy skipped for {}: source directory is not readable: {}",
+            req.item_id,
+            source_dir.display()
+        );
+        return;
+    }
+
+    if !published.album_dir.is_dir() {
+        log::warn!(
+            "companion copy skipped for {}: published album directory is not readable: {}",
+            req.item_id,
+            published.album_dir.display()
+        );
+        return;
+    }
+
+    if normalize_path(&source_dir) == normalize_path(&published.album_dir) {
+        log::info!(
+            "companion copy skipped for {}: source and destination directories are identical ({})",
+            req.item_id,
+            source_dir.display()
+        );
+        return;
+    }
+
+    let extensions = normalized_companion_extension_set(&req.companion.extensions);
+    let folders = normalized_companion_folder_set(&req.companion.folders);
+    if extensions.is_empty() && folders.is_empty() {
+        return;
+    }
+
+    let source_file_skip_set = companion_source_file_skip_set(req, source);
+    let mut stats = CompanionCopyStats::default();
+
+    if !extensions.is_empty() {
+        copy_loose_companion_files(
+            &source_dir,
+            &published.album_dir,
+            &extensions,
+            &source_file_skip_set,
+            &mut stats,
+        );
+    }
+
+    if !folders.is_empty() {
+        copy_companion_folders(&source_dir, &published.album_dir, &folders, &mut stats);
+    }
+
+    if stats.copied > 0 || stats.skipped > 0 || stats.warnings > 0 {
+        log::info!(
+            "companion copy for {} complete: copied={}, skipped={}, warnings={}",
+            req.item_id,
+            stats.copied,
+            stats.skipped,
+            stats.warnings
+        );
+    }
+}
+
+fn normalized_companion_extension_set(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .flat_map(|value| crate::convert::formats::parse_companion_extensions(value))
+        .collect()
+}
+
+fn normalized_companion_folder_set(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .flat_map(|value| crate::convert::formats::parse_companion_folders(value))
+        .map(|name| companion_folder_match_key(&name))
+        .collect()
+}
+
+fn companion_folder_match_key(name: &str) -> String {
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompanionSourceRefRole {
+    /// A regular source artifact; the companion root is its parent directory.
+    File,
+    /// A directory-backed source artifact; the companion root is the directory
+    /// itself, not its parent.
+    Directory,
+    /// A source whose role is only known at runtime; use filesystem metadata
+    /// to decide between the path and its parent.
+    ExistingPath,
+}
+
+/// Resolve the directory from which companion artifacts should be copied.
+///
+/// Decision table, in priority order:
+///
+/// 1. Independent folder/batch jobs use the dispatcher-computed common source
+///    root (`album_batch.source_grouping_root`). This is the authoritative
+///    common parent for all files in the album batch.
+/// 2. Single-file jobs use the request source path: a directory request copies
+///    from that directory, and a file request copies from that file's parent.
+///    This avoids accidentally copying from a staged per-track work directory.
+/// 3. Multi-track/materialized sources use the prepared track source roots.
+///    File-backed refs contribute their parent directory; directory-backed refs
+///    (DVD-Audio, DVD-Video, Blu-ray folder sources, staged AUDIO_TS trees) are
+///    the root themselves. This is the key no-parent-for-directories rule.
+/// 4. If materialized track refs cannot produce an existing common root, fall
+///    back to `PreparedSource::container`, then to `PipelineRequest::container`.
+///
+/// This keeps the brief's single-file, batch, materialization-scratch, and
+/// direct pipeline-item cases explicit instead of applying `parent()` to every
+/// source ref indiscriminately.
+fn companion_source_dir(req: &PipelineRequest, source: &PreparedSource) -> Option<PathBuf> {
+    if let Some(batch_root) = companion_batch_source_root(req) {
+        return Some(batch_root);
+    }
+
+    let request_root = companion_root_for_existing_path(&req.container);
+    let prepared_container_root = companion_root_for_existing_path(&source.container);
+    let track_root = companion_prepared_track_common_source_root(source);
+
+    match source.kind {
+        SourceKind::SingleFile => request_root
+            .or(prepared_container_root)
+            .or(track_root),
+        SourceKind::SevenZip
+        | SourceKind::CueImage
+        | SourceKind::SacdIso
+        | SourceKind::DvdAudio
+        | SourceKind::DvdVideo
+        | SourceKind::BluRay => track_root
+            .or(prepared_container_root)
+            .or(request_root),
+    }
+}
+
+fn companion_batch_source_root(req: &PipelineRequest) -> Option<PathBuf> {
+    req.album_batch
+        .as_ref()
+        .map(|batch| batch.source_grouping_root.clone())
+        .filter(|root| root.is_dir())
+}
+
+fn companion_prepared_track_common_source_root(source: &PreparedSource) -> Option<PathBuf> {
+    let roots = source
+        .tracks
+        .iter()
+        .filter_map(|track| companion_track_source_root(&track.source_ref))
+        .collect::<Vec<_>>();
+    common_existing_dir_root(&roots)
+}
+
+fn companion_track_source_root(source_ref: &TrackSourceRef) -> Option<PathBuf> {
+    let (path, role) = companion_track_source_path_and_role(source_ref)?;
+    match role {
+        CompanionSourceRefRole::File => path.parent().and_then(companion_existing_dir),
+        CompanionSourceRefRole::Directory => companion_existing_dir(path),
+        CompanionSourceRefRole::ExistingPath => companion_root_for_existing_path(path),
+    }
+}
+
+fn companion_track_source_path(source_ref: &TrackSourceRef) -> Option<&Path> {
+    companion_track_source_path_and_role(source_ref).map(|(path, _)| path)
+}
+
+fn companion_track_source_path_and_role(
+    source_ref: &TrackSourceRef,
+) -> Option<(&Path, CompanionSourceRefRole)> {
+    match source_ref {
+        TrackSourceRef::StagedFile(path) => Some((path.as_path(), CompanionSourceRefRole::File)),
+        TrackSourceRef::CueSegmentCarrier { path, .. } => {
+            Some((path.as_path(), CompanionSourceRefRole::File))
+        }
+        TrackSourceRef::ImageSegment { image, .. } => {
+            Some((image.as_path(), CompanionSourceRefRole::File))
+        }
+        TrackSourceRef::SacdTrack { iso, .. } => Some((iso.as_path(), CompanionSourceRefRole::File)),
+        TrackSourceRef::DvdaTrack { volume_source, .. } => match volume_source {
+            DvdaVolumeSourceRef::Directory { root } => {
+                Some((root.as_path(), CompanionSourceRefRole::Directory))
+            }
+            DvdaVolumeSourceRef::Iso { path, .. } => {
+                Some((path.as_path(), CompanionSourceRefRole::File))
+            }
+            DvdaVolumeSourceRef::StagedAudioTs { root, .. } => {
+                Some((root.as_path(), CompanionSourceRefRole::Directory))
+            }
+        },
+        TrackSourceRef::DvdVideoTrack { source, .. }
+        | TrackSourceRef::BluRayTrack { source, .. } => {
+            Some((source.as_path(), CompanionSourceRefRole::ExistingPath))
+        }
+    }
+}
+
+fn companion_root_for_existing_path(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        path.parent().and_then(companion_existing_dir)
+    }
+}
+
+fn companion_existing_dir(path: &Path) -> Option<PathBuf> {
+    path.is_dir().then(|| path.to_path_buf())
+}
+
+fn common_existing_dir_root(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut iter = paths.iter().filter(|path| path.is_dir());
+    let first = iter.next()?.clone();
+    let mut common = normalize_path(&first);
+    for path in iter {
+        let path = normalize_path(path);
+        while !path_is_under_root(&path, &common) && path != common {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+    if common.is_dir() { Some(common) } else { None }
+}
+
+fn companion_source_file_skip_set(req: &PipelineRequest, source: &PreparedSource) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    insert_companion_skip_path(&mut paths, &req.container);
+    insert_companion_skip_path(&mut paths, &source.container);
+    for track in &source.tracks {
+        if let Some(path) = companion_track_source_path(&track.source_ref) {
+            insert_companion_skip_path(&mut paths, path);
+        }
+    }
+    paths
+}
+
+fn insert_companion_skip_path(paths: &mut BTreeSet<PathBuf>, path: &Path) {
+    if path.is_file() {
+        paths.insert(normalize_path(path));
+    }
+}
+
+fn copy_loose_companion_files(
+    source_dir: &Path,
+    dest_dir: &Path,
+    extensions: &BTreeSet<String>,
+    source_file_skip_set: &BTreeSet<PathBuf>,
+    stats: &mut CompanionCopyStats,
+) {
+    let entries = match fs::read_dir(source_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            stats.warning();
+            log::warn!(
+                "companion loose-file copy skipped: cannot read source directory {}: {err}",
+                source_dir.display()
+            );
+            return;
+        }
+    };
+
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                stats.warning();
+                log::warn!("companion loose-file copy skipped unreadable directory entry: {err}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                stats.warning();
+                log::warn!("companion loose-file copy skipped {}: cannot inspect file type: {err}", path.display());
+                continue;
+            }
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        if source_file_skip_set.contains(&normalize_path(&path)) {
+            stats.skipped();
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        let key = format!(".{}", ext.to_ascii_lowercase());
+        if !extensions.contains(&key) {
+            continue;
+        }
+        let dest = dest_dir.join(entry.file_name());
+        copy_regular_companion_file(&path, &dest, stats);
+    }
+}
+
+fn copy_companion_folders(
+    source_dir: &Path,
+    dest_dir: &Path,
+    folders: &BTreeSet<String>,
+    stats: &mut CompanionCopyStats,
+) {
+    let entries = match fs::read_dir(source_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            stats.warning();
+            log::warn!(
+                "companion folder copy skipped: cannot read source directory {}: {err}",
+                source_dir.display()
+            );
+            return;
+        }
+    };
+
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                stats.warning();
+                log::warn!("companion folder copy skipped unreadable directory entry: {err}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                stats.warning();
+                log::warn!("companion folder copy skipped {}: cannot inspect file type: {err}", path.display());
+                continue;
+            }
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(companion_folder_match_key) else {
+            continue;
+        };
+        if !folders.contains(&name) {
+            continue;
+        }
+        let dest = dest_dir.join(entry.file_name());
+        copy_companion_directory_recursive(&path, &dest, stats);
+    }
+}
+
+fn copy_companion_directory_recursive(src: &Path, dst: &Path, stats: &mut CompanionCopyStats) {
+    let src_norm = normalize_path(src);
+    let dst_norm = normalize_path(dst);
+    if src_norm == dst_norm || path_is_under_root(&dst_norm, &src_norm) {
+        stats.warning();
+        log::warn!(
+            "companion folder copy skipped {} -> {}: destination is inside source",
+            src.display(),
+            dst.display()
+        );
+        return;
+    }
+
+    match fs::symlink_metadata(src) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            stats.warning();
+            log::warn!("companion folder copy skipped symlinked directory {}", src.display());
+            return;
+        }
+        Ok(metadata) if !metadata.is_dir() => return,
+        Ok(_) => {}
+        Err(err) => {
+            stats.warning();
+            log::warn!("companion folder copy skipped {}: cannot inspect metadata: {err}", src.display());
+            return;
+        }
+    }
+
+    if let Err(err) = fs::create_dir_all(dst) {
+        stats.warning();
+        log::warn!("companion folder copy skipped {} -> {}: cannot create destination: {err}", src.display(), dst.display());
+        return;
+    }
+
+    let entries = match fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(err) => {
+            stats.warning();
+            log::warn!("companion folder copy skipped {}: cannot read directory: {err}", src.display());
+            return;
+        }
+    };
+
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                stats.warning();
+                log::warn!("companion folder copy skipped unreadable entry under {}: {err}", src.display());
+                continue;
+            }
+        };
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                stats.warning();
+                log::warn!("companion folder copy skipped {}: cannot inspect file type: {err}", src_path.display());
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            stats.warning();
+            log::warn!("companion folder copy skipped symlink {}", src_path.display());
+        } else if file_type.is_dir() {
+            copy_companion_directory_recursive(&src_path, &dst_path, stats);
+        } else if file_type.is_file() {
+            copy_regular_companion_file(&src_path, &dst_path, stats);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompanionFileCopyOutcome {
+    Copied,
+    /// The file was copied, but one or more metadata-preservation operations
+    /// failed. Companion copying is best-effort, so the conversion must not
+    /// fail merely because permissions or mtimes could not be preserved.
+    CopiedWithMetadataWarning,
+    /// The destination already existed with the same size and mtime, either
+    /// before copying began or because a concurrent writer won the race.
+    SkippedExistingSameMetadata,
+    /// The destination already existed with different metadata. No-clobber
+    /// semantics require us to leave it untouched and record a warning.
+    SkippedExistingDifferentMetadata,
+}
+
+fn copy_regular_companion_file(src: &Path, dst: &Path, stats: &mut CompanionCopyStats) {
+    if normalize_path(src) == normalize_path(dst) {
+        stats.skipped();
+        return;
+    }
+
+    let src_meta = match fs::symlink_metadata(src) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            stats.warning();
+            log::warn!("companion file copy skipped symlink {}", src.display());
+            return;
+        }
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return,
+        Err(err) => {
+            stats.warning();
+            log::warn!("companion file copy skipped {}: cannot read metadata: {err}", src.display());
+            return;
+        }
+    };
+
+    match existing_companion_destination_outcome(&src_meta, dst) {
+        Ok(Some(CompanionFileCopyOutcome::SkippedExistingSameMetadata)) => {
+            stats.skipped();
+            return;
+        }
+        Ok(Some(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata)) => {
+            stats.warning();
+            log_companion_destination_conflict(src, dst, "destination already exists with different metadata");
+            return;
+        }
+        Ok(None) => {}
+        Ok(Some(CompanionFileCopyOutcome::Copied | CompanionFileCopyOutcome::CopiedWithMetadataWarning)) => {
+            unreachable!("destination inspection cannot report copied outcomes")
+        }
+        Err(err) => {
+            stats.warning();
+            log::warn!("companion file copy skipped {} -> {}: cannot inspect destination: {err}", src.display(), dst.display());
+            return;
+        }
+    }
+
+    match copy_regular_companion_file_noclobber(src, dst, &src_meta) {
+        Ok(CompanionFileCopyOutcome::Copied) => stats.copied(),
+        Ok(CompanionFileCopyOutcome::CopiedWithMetadataWarning) => {
+            stats.copied();
+            stats.warning();
+        }
+        Ok(CompanionFileCopyOutcome::SkippedExistingSameMetadata) => stats.skipped(),
+        Ok(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata) => {
+            stats.warning();
+            log_companion_destination_conflict(
+                src,
+                dst,
+                "destination appeared during copy with different metadata",
+            );
+        }
+        Err(err) => {
+            stats.warning();
+            log::warn!("companion file copy failed {} -> {}: {err}", src.display(), dst.display());
+        }
+    }
+}
+
+fn log_companion_destination_conflict(src: &Path, dst: &Path, reason: &str) {
+    log::warn!(
+        "companion file copy skipped {} -> {}: {reason}",
+        src.display(),
+        dst.display()
+    );
+}
+
+fn existing_companion_destination_outcome(
+    src_meta: &fs::Metadata,
+    dst: &Path,
+) -> io::Result<Option<CompanionFileCopyOutcome>> {
+    match fs::symlink_metadata(dst) {
+        Ok(dst_meta) if same_size_and_mtime(src_meta, &dst_meta) => {
+            Ok(Some(CompanionFileCopyOutcome::SkippedExistingSameMetadata))
+        }
+        Ok(_) => Ok(Some(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn same_size_and_mtime(src_meta: &fs::Metadata, dst_meta: &fs::Metadata) -> bool {
+    if !dst_meta.is_file() || src_meta.len() != dst_meta.len() {
+        return false;
+    }
+    match (src_meta.modified(), dst_meta.modified()) {
+        (Ok(src), Ok(dst)) => system_time_abs_diff(src, dst) <= Duration::from_secs(1),
+        _ => false,
+    }
+}
+
+fn system_time_abs_diff(a: SystemTime, b: SystemTime) -> Duration {
+    match a.duration_since(b) {
+        Ok(diff) => diff,
+        Err(_) => b.duration_since(a).unwrap_or(Duration::ZERO),
+    }
+}
+
+fn copy_regular_companion_file_noclobber(
+    src: &Path,
+    dst: &Path,
+    src_meta: &fs::Metadata,
+) -> io::Result<CompanionFileCopyOutcome> {
+    let parent = dst.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("destination has no parent: {}", dst.display()),
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+
+    if let Some(outcome) = existing_companion_destination_outcome(src_meta, dst)? {
+        return Ok(outcome);
+    }
+
+    // Temp names include a process-local counter. Still, crashed previous runs
+    // or concurrent processes may leave matching temp names behind, so create
+    // with O_EXCL and retry a bounded number of times rather than overwriting
+    // or deleting a temp file we did not create.
+    for _ in 0..16 {
+        let temp_path = companion_temp_path(dst);
+        match copy_regular_companion_file_to_temp(src, &temp_path) {
+            Ok(_) => return finalize_companion_temp_file(src, dst, &temp_path, src_meta),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "unable to allocate a unique temporary companion copy path for {}",
+            dst.display()
+        ),
+    ))
+}
+
+fn finalize_companion_temp_file(
+    src: &Path,
+    dst: &Path,
+    temp_path: &Path,
+    src_meta: &fs::Metadata,
+) -> io::Result<CompanionFileCopyOutcome> {
+    let result = (|| -> io::Result<CompanionFileCopyOutcome> {
+        let metadata_warning = preserve_companion_file_metadata_best_effort(src, dst, temp_path, src_meta);
+
+        // Install atomically without clobbering. `rename` would overwrite an
+        // existing destination on Unix, so use a same-directory hard link from
+        // the prepared temp file to the destination and then remove the temp
+        // name. If another process creates the destination first, classify that
+        // destination honestly instead of returning success and counting a copy.
+        match fs::hard_link(temp_path, dst) {
+            Ok(()) => {
+                let _ = fs::remove_file(temp_path);
+                sync_parent_dir_best_effort(dst);
+                if metadata_warning {
+                    Ok(CompanionFileCopyOutcome::CopiedWithMetadataWarning)
+                } else {
+                    Ok(CompanionFileCopyOutcome::Copied)
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                existing_companion_destination_outcome(src_meta, dst).map(|outcome| {
+                    outcome.unwrap_or(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata)
+                })
+            }
+            Err(err) => install_companion_temp_by_copy_no_clobber(
+                src,
+                dst,
+                temp_path,
+                src_meta,
+                metadata_warning,
+                err,
+            ),
+        }
+    })();
+
+    let _ = fs::remove_file(temp_path);
+    result
+}
+
+fn install_companion_temp_by_copy_no_clobber(
+    src: &Path,
+    dst: &Path,
+    temp_path: &Path,
+    src_meta: &fs::Metadata,
+    prior_metadata_warning: bool,
+    hard_link_error: io::Error,
+) -> io::Result<CompanionFileCopyOutcome> {
+    let mut input = fs::File::open(temp_path)?;
+    let mut output = match fs::OpenOptions::new().write(true).create_new(true).open(dst) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return existing_companion_destination_outcome(src_meta, dst).map(|outcome| {
+                outcome.unwrap_or(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata)
+            });
+        }
+        Err(err) => {
+            return Err(io::Error::new(
+                err.kind(),
+                format!(
+                    "hard-link no-clobber install failed ({hard_link_error}); fallback create-new copy failed ({err})"
+                ),
+            ));
+        }
+    };
+
+    if let Err(err) = io::copy(&mut input, &mut output) {
+        let _ = fs::remove_file(dst);
+        return Err(err);
+    }
+    drop(output);
+
+    sync_parent_dir_best_effort(dst);
+    let metadata_warning = prior_metadata_warning
+        || preserve_companion_file_metadata_best_effort(src, dst, dst, src_meta);
+    if metadata_warning {
+        Ok(CompanionFileCopyOutcome::CopiedWithMetadataWarning)
+    } else {
+        Ok(CompanionFileCopyOutcome::Copied)
+    }
+}
+
+fn copy_regular_companion_file_to_temp(src: &Path, temp_path: &Path) -> io::Result<u64> {
+    let mut input = fs::File::open(src)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)?;
+    io::copy(&mut input, &mut output)
+}
+
+fn preserve_companion_file_metadata_best_effort(
+    src: &Path,
+    dst: &Path,
+    temp_path: &Path,
+    src_meta: &fs::Metadata,
+) -> bool {
+    let mut warned = false;
+
+    if let Err(err) = fs::set_permissions(temp_path, src_meta.permissions()) {
+        warned = true;
+        log::warn!(
+            "companion file copied {} -> {} but permissions could not be preserved on copy target {}: {err}",
+            src.display(),
+            dst.display(),
+            temp_path.display()
+        );
+    }
+
+    match src_meta.modified() {
+        Ok(modified) => {
+            if let Err(err) = set_file_mtime_best_effort(temp_path, modified) {
+                warned = true;
+                log::warn!(
+                    "companion file copied {} -> {} but modification time could not be preserved on copy target {}: {err}",
+                    src.display(),
+                    dst.display(),
+                    temp_path.display()
+                );
+            }
+        }
+        Err(err) => {
+            warned = true;
+            log::warn!(
+                "companion file copied {} -> {} but source modification time could not be read: {err}",
+                src.display(),
+                dst.display()
+            );
+        }
+    }
+
+    warned
+}
+
+fn set_file_mtime_best_effort(path: &Path, modified: SystemTime) -> io::Result<()> {
+    let file = std::fs::File::options().write(true).open(path)?;
+    let times = std::fs::FileTimes::new().set_modified(modified);
+    file.set_times(times)?;
+    Ok(())
+}
+
+
+fn companion_temp_path(dst: &Path) -> PathBuf {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dst
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("companion");
+    let n = COMPANION_COPY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    parent.join(format!(".{file_name}.tonepoet-copy.{pid}.{n}.tmp"))
+}
+
+
+#[cfg(test)]
+mod companion_copy_hardening_tests {
+    use super::*;
+
+    #[test]
+    fn existing_directory_source_root_is_not_promoted_to_parent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let disc_root = temp.path().join("BluRayDisc");
+        std::fs::create_dir_all(&disc_root).expect("disc root");
+
+        assert_eq!(
+            companion_root_for_existing_path(&disc_root),
+            Some(disc_root.clone()),
+            "directory-backed source refs must copy companions from the directory itself, not its parent"
+        );
+    }
+
+    #[test]
+    fn existing_file_source_root_is_parent_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_file = temp.path().join("album.iso");
+        std::fs::write(&source_file, b"iso").expect("source file");
+
+        assert_eq!(
+            companion_root_for_existing_path(&source_file),
+            Some(temp.path().to_path_buf()),
+            "file-backed source refs copy companions from the file parent"
+        );
+    }
+
+    #[test]
+    fn common_root_preserves_nested_directory_ref() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join("DiscRoot");
+        let video_ts = root.join("VIDEO_TS");
+        std::fs::create_dir_all(&video_ts).expect("nested source root");
+
+        assert_eq!(
+            common_existing_dir_root(&[video_ts.clone()]),
+            Some(video_ts),
+            "a single directory-backed source root must not collapse upward to the source parent"
+        );
+    }
+
+    #[test]
+    fn preexisting_different_destination_is_warning_not_copied() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("cover.jpg");
+        let dst = temp.path().join("out").join("cover.jpg");
+        std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("dst parent");
+        std::fs::write(&src, b"new-cover-data").expect("src");
+        std::fs::write(&dst, b"old").expect("dst");
+
+        let mut stats = CompanionCopyStats::default();
+        copy_regular_companion_file(&src, &dst, &mut stats);
+
+        assert_eq!(stats.copied, 0, "no-clobber conflict must not be counted as copied");
+        assert_eq!(stats.skipped, 0, "different existing metadata is a warning, not a clean skip");
+        assert_eq!(stats.warnings, 1);
+        assert_eq!(std::fs::read(&dst).expect("dst content"), b"old");
+    }
+
+    fn test_request(root: &Path, container: PathBuf) -> PipelineRequest {
+        PipelineRequest {
+            job_id: "companion-test-job".to_string(),
+            item_id: "companion-test-item".to_string(),
+            container,
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_group: None,
+                dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
+                bluray_playlist: None,
+                bluray_audio_pid: None,
+                bluray_audio_stream: None,
+                bluray_angle: None,
+                cue_sidecar: CueSidecarPolicy::PreferSidecar,
+                track_selection: TrackSelection::All,
+            },
+            settings: tonepoet_pipeline::PipelineSettings::default(),
+            worker_count: Some(1),
+            merge: false,
+            output_root: root.join("out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+                write_manifest: false,
+            },
+            log: LogPolicy {
+                root: root.join("logs"),
+                write_for_blocked: true,
+                write_json_log: false,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Disabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Disabled,
+                generate_cue: false,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
+            companion: CompanionCopyPolicy::default(),
+        }
+    }
+
+    fn test_prepared_track(source_ref: TrackSourceRef) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 0,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref,
+            metadata: TrackMetadata::default(),
+            expected_samples: None,
+            sample_rate: Some(44_100),
+            source_audio: SourceAudioDescriptor::default(),
+            bit_depth: Some(16),
+        }
+    }
+
+    fn test_prepared_source(kind: SourceKind, container: PathBuf, tracks: Vec<PreparedTrack>) -> PreparedSource {
+        PreparedSource {
+            container,
+            kind,
+            tracks,
+            album_metadata: AlbumMetadata::default(),
+            provenance: ExtractionProvenance {
+                source_kind: kind,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        }
+    }
+
+    #[test]
+    fn source_dir_for_single_file_prefers_direct_request_source_parent_over_staging() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::create_dir_all(&staging_dir).expect("staging dir");
+        let input = source_dir.join("01.flac");
+        let staged = staging_dir.join("01.wav");
+        std::fs::write(&input, b"flac").expect("input");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        let req = test_request(temp.path(), input);
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            staged.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(staged))],
+        );
+
+        assert_eq!(companion_source_dir(&req, &prepared), Some(source_dir));
+    }
+
+    #[test]
+    fn source_dir_for_batch_uses_dispatcher_common_source_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&album_root).expect("album root");
+        std::fs::create_dir_all(&staging_dir).expect("staging dir");
+        let input = album_root.join("01.flac");
+        let staged = staging_dir.join("01.wav");
+        std::fs::write(&input, b"flac").expect("input");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        let mut req = test_request(temp.path(), input);
+        req.album_batch = Some(AlbumBatchContext::new(
+            "batch-id",
+            1,
+            temp.path().join("out").join("Album"),
+            album_root.clone(),
+        ));
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            staged.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(staged))],
+        );
+
+        assert_eq!(companion_source_dir(&req, &prepared), Some(album_root));
+    }
+
+    #[test]
+    fn source_dir_for_materialized_source_uses_track_scratch_root_before_request_container() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let archive_dir = temp.path().join("archive-src");
+        let scratch_album = temp.path().join("scratch").join("album");
+        std::fs::create_dir_all(&archive_dir).expect("archive dir");
+        std::fs::create_dir_all(&scratch_album).expect("scratch album");
+        let archive = archive_dir.join("album.7z");
+        let staged = scratch_album.join("01.wav");
+        std::fs::write(&archive, b"archive").expect("archive");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        let req = test_request(temp.path(), archive);
+        let prepared = test_prepared_source(
+            SourceKind::SevenZip,
+            temp.path().join("scratch"),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(staged))],
+        );
+
+        assert_eq!(companion_source_dir(&req, &prepared), Some(scratch_album));
+    }
+
+    #[test]
+    fn source_dir_for_directory_backed_disc_ref_is_the_directory_itself() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dvd_root = temp.path().join("VIDEO_DISC");
+        std::fs::create_dir_all(&dvd_root).expect("dvd root");
+
+        let req = test_request(temp.path(), dvd_root.clone());
+        let prepared = test_prepared_source(
+            SourceKind::DvdVideo,
+            dvd_root.clone(),
+            vec![test_prepared_track(TrackSourceRef::DvdVideoTrack {
+                source: dvd_root.clone(),
+                vts_number: 1,
+                title_number: 1,
+                angle_number: 1,
+                chapter_number: 1,
+                audio_stream_index: 0,
+                audio_coding: DvdVideoAudioCoding::Lpcm,
+                cell_sectors: Vec::new(),
+                vob_files: Vec::new(),
+                sample_rate: Some(48_000),
+                bit_depth: Some(16),
+                channels: Some(2),
+            })],
+        );
+
+        assert_eq!(companion_source_dir(&req, &prepared), Some(dvd_root));
+    }
+
+    #[test]
+    fn loose_companion_file_copy_is_top_level_only_and_skips_source_audio() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(src.join("nested")).expect("nested");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = src.join("01.flac");
+        std::fs::write(&src.join("cover.JPG"), b"cover").expect("cover");
+        std::fs::write(&src.join("notes.txt"), b"notes").expect("notes");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(src.join("nested").join("inside.jpg"), b"nested").expect("nested jpg");
+
+        let extensions = [".jpg".to_string(), ".txt".to_string(), ".flac".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut skip_set = BTreeSet::new();
+        skip_set.insert(normalize_path(&audio));
+        let mut stats = CompanionCopyStats::default();
+
+        copy_loose_companion_files(&src, &dst, &extensions, &skip_set, &mut stats);
+
+        assert_eq!(stats.copied, 2);
+        assert!(dst.join("cover.JPG").is_file());
+        assert!(dst.join("notes.txt").is_file());
+        assert!(!dst.join("01.flac").exists(), "source audio file must not be copied as a companion");
+        assert!(!dst.join("nested").join("inside.jpg").exists(), "loose-file copy must not recurse");
+    }
+
+    #[test]
+    fn recursive_companion_folder_copy_copies_nested_regular_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let scans = src.join("Scans");
+        std::fs::create_dir_all(scans.join("Booklet")).expect("scans");
+        std::fs::create_dir_all(&dst).expect("dst");
+        std::fs::write(scans.join("front.jpg"), b"front").expect("front");
+        std::fs::write(scans.join("Booklet").join("page01.png"), b"page").expect("page");
+
+        let folders = [companion_folder_match_key("Scans")].into_iter().collect::<BTreeSet<_>>();
+        let mut stats = CompanionCopyStats::default();
+
+        copy_companion_folders(&src, &dst, &folders, &mut stats);
+
+        assert_eq!(stats.copied, 2);
+        assert_eq!(std::fs::read(dst.join("Scans").join("front.jpg")).expect("front"), b"front");
+        assert_eq!(
+            std::fs::read(dst.join("Scans").join("Booklet").join("page01.png")).expect("page"),
+            b"page"
+        );
+    }
+
+    #[test]
+    fn repeated_copy_of_same_file_is_idempotent_skip_not_copy() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("cover.jpg");
+        let dst = temp.path().join("out").join("cover.jpg");
+        std::fs::write(&src, b"cover").expect("src");
+
+        let mut first = CompanionCopyStats::default();
+        copy_regular_companion_file(&src, &dst, &mut first);
+        assert_eq!(std::fs::read(&dst).expect("dst"), b"cover");
+
+        let mut second = CompanionCopyStats::default();
+        copy_regular_companion_file(&src, &dst, &mut second);
+
+        assert_eq!(second.copied, 0, "idempotent second copy must not be counted as copied");
+        assert_eq!(second.skipped, 1, "idempotent second copy should be a clean skip");
+        assert_eq!(std::fs::read(&dst).expect("dst unchanged"), b"cover");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_companion_folder_copy_skips_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let scans = src.join("Scans");
+        std::fs::create_dir_all(&scans).expect("scans");
+        std::fs::create_dir_all(&dst).expect("dst");
+        std::fs::write(temp.path().join("outside.txt"), b"outside").expect("outside");
+        symlink(temp.path().join("outside.txt"), scans.join("outside-link.txt")).expect("symlink");
+
+        let folders = [companion_folder_match_key("Scans")].into_iter().collect::<BTreeSet<_>>();
+        let mut stats = CompanionCopyStats::default();
+
+        copy_companion_folders(&src, &dst, &folders, &mut stats);
+
+        assert_eq!(stats.copied, 0);
+        assert_eq!(stats.warnings, 1, "symlink skip should be visible as a warning");
+        assert!(!dst.join("Scans").join("outside-link.txt").exists());
+    }
+
+}
+
 
 fn pipeline_report_manifest_path(published: &Option<PublishedAlbum>) -> Option<std::path::PathBuf> {
     published
@@ -15278,6 +16413,7 @@ mod pipeline_test_helpers {
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
+            companion: CompanionCopyPolicy::default(),
         }
     }
 
@@ -16341,6 +17477,7 @@ mod naming_template_tests {
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
+            companion: CompanionCopyPolicy::default(),
         }
     }
 
@@ -17090,6 +18227,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
+            companion: CompanionCopyPolicy::default(),
         }
     }
 

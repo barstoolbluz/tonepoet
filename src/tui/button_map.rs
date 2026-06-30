@@ -96,6 +96,8 @@ pub enum TuiButton {
     DestPathField,
     FolderTemplateField,
     FilenameTemplateField,
+    CompanionExtensionsField,
+    CompanionFoldersField,
     MetadataField(MetadataFieldKind),
     /// Convert metadata file-list row (absolute source index).
     MetadataFileRow(usize),
@@ -404,6 +406,8 @@ impl TuiButton {
             | Self::DestPathField
             | Self::FolderTemplateField
             | Self::FilenameTemplateField
+            | Self::CompanionExtensionsField
+            | Self::CompanionFoldersField
             | Self::MetadataField(_)
             | Self::MetadataFileRow(_)
             | Self::SourceBrowseButton

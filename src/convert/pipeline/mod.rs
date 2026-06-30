@@ -135,6 +135,7 @@ mod tests {
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
+            companion: CompanionCopyPolicy::default(),
         }
     }
 

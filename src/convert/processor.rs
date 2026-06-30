@@ -28,7 +28,7 @@ use crate::convert::pipeline::{
     prepare_pipeline_item_for_scheduler, realize_track_for_scheduler_with_tool_limits_and_version_cache,
     run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_worker_failure_output,
     AlbumBatchTrackContext, AlbumCompletionTracker,
-    AlbumReadiness, BroadcastReporter, PipelineRequest, PoolLimits,
+    AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, PipelineRequest, PoolLimits,
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
     SharedWorkerPool, SourceKind, ToolBinary, ToolConcurrencyLimits,
@@ -151,6 +151,18 @@ struct IndependentSingleFileBatchCandidate {
     request: PipelineRequest,
 }
 
+
+fn companion_policy_from_item(item: &ConversionItem) -> CompanionCopyPolicy {
+    CompanionCopyPolicy {
+        extensions: item.options.effective_companion_extensions(),
+        folders: item.options.effective_companion_folders(),
+    }
+}
+
+fn apply_companion_policy_from_item(request: &mut PipelineRequest, item: &ConversionItem) {
+    request.companion = companion_policy_from_item(item);
+}
+
 /// Attach the conversion-log album-batch contract at the real queue dispatch
 /// boundary, before `build_initial_work()` submits independent single-file jobs
 /// to the shared scheduler. This is the production call site that turns a
@@ -162,7 +174,10 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
 
     for (item_index, item) in items.iter().enumerate() {
         let request = match build_pipeline_request(item) {
-            Ok(request) => request,
+            Ok(mut request) => {
+                apply_companion_policy_from_item(&mut request, item);
+                request
+            },
             Err(err) => {
                 log::warn!(
                     "skipping album-batch preparation for {} because request construction failed: {err}",
@@ -186,10 +201,11 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
             source_grouping_root_key: normalized_path_key(&source_grouping_root),
             provisional_album_output_dir_key: normalized_path_key(&album_output_dir),
             target_format_key: format!(
-                "{:?}|{:?}|{:?}",
+                "{:?}|{:?}|{:?}|{:?}",
                 request.settings.target_format,
                 request.container_extension,
-                request.container_ffmpeg_flags
+                request.container_ffmpeg_flags,
+                request.companion
             ),
             naming_key: format!(
                 "{}|{:?}|{}",
@@ -347,7 +363,10 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
                         let mut request = match item.pipeline_request.clone() {
                             Some(request) => request,
                             None => match build_pipeline_request(item) {
-                                Ok(request) => request,
+                                Ok(mut request) => {
+                                    apply_companion_policy_from_item(&mut request, item);
+                                    request
+                                },
                                 Err(err) => {
                                     log::warn!(
                                         "could not attach ordered-log suppression to {} after dispatch preparation failed: {err}",
@@ -1755,6 +1774,7 @@ fn build_initial_work(
 
     let request = match build_pipeline_request(&item) {
         Ok(mut req) => {
+            apply_companion_policy_from_item(&mut req, &item);
             req.worker_count = Some(worker_count.max(1));
             req
         }
@@ -2270,6 +2290,7 @@ pub async fn process_item_with_pipeline_settings(
     item.options.pipeline_settings = Some(settings.clone());
     item.pipeline_settings = Some(settings.clone());
     let mut request = build_pipeline_request_from_settings(&item, settings)?;
+    apply_companion_policy_from_item(&mut request, &item);
     request.worker_count = Some(worker_count.max(1));
     item.pipeline_request = Some(request);
     process_item(item, progress_tx, tool_paths, _file_semaphore, worker_count, _scratch_directory).await
@@ -2464,6 +2485,7 @@ mod tests {
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
+            companion: CompanionCopyPolicy::default(),
         }
     }
 

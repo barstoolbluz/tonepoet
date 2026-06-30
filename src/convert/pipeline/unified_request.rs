@@ -172,6 +172,10 @@ pub fn build_pipeline_request_from_settings(
         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
         container_extension: item.options.container_extension.clone(),
         container_ffmpeg_flags: item.options.container_ffmpeg_flags.clone(),
+        companion: super::types::CompanionCopyPolicy {
+            extensions: item.options.effective_companion_extensions(),
+            folders: item.options.effective_companion_folders(),
+        },
         album_batch: None,
         album_batch_track: None,
         expected_album_track_count: None,

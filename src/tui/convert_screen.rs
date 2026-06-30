@@ -376,6 +376,17 @@ fn register_output_options_buttons(app: &mut AppState, area: Rect) {
     buttons.record_button(TuiButton::TemplateBuildFolderButton, Rect::new(load_x + 7, area.y + 2, 8, 1));
     buttons.record_button(TuiButton::TemplateLoadFilenameButton, Rect::new(load_x, area.y + 3, 6, 1));
     buttons.record_button(TuiButton::TemplateBuildFilenameButton, Rect::new(load_x + 7, area.y + 3, 8, 1));
+
+    if app.convert.is_maximized(ConvertFocus::OutputOptions) && area.height >= 11 {
+        buttons.record_button(
+            TuiButton::CompanionExtensionsField,
+            Rect::new(inner_x, area.y + 8, inner_w, 1),
+        );
+        buttons.record_button(
+            TuiButton::CompanionFoldersField,
+            Rect::new(inner_x, area.y + 9, inner_w, 1),
+        );
+    }
 }
 
 fn register_metadata_fields(buttons: &mut ButtonRenderMap, area: Rect) {

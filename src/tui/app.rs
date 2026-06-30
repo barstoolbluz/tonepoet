@@ -1333,24 +1333,59 @@ pub enum OutputOptionsField {
     FolderTemplate,
     FilenameTemplate,
     MergeMode,
+    CompanionExtensions,
+    CompanionFolders,
 }
 
 impl OutputOptionsField {
-    pub fn next(&self) -> Self {
-        match self {
-            Self::DestPath => Self::FolderTemplate,
-            Self::FolderTemplate => Self::FilenameTemplate,
-            Self::FilenameTemplate => Self::MergeMode,
-            Self::MergeMode => Self::DestPath,
+    const COLLAPSED_FIELDS: [Self; 4] = [
+        Self::DestPath,
+        Self::FolderTemplate,
+        Self::FilenameTemplate,
+        Self::MergeMode,
+    ];
+    const MAXIMIZED_FIELDS: [Self; 6] = [
+        Self::DestPath,
+        Self::FolderTemplate,
+        Self::FilenameTemplate,
+        Self::MergeMode,
+        Self::CompanionExtensions,
+        Self::CompanionFolders,
+    ];
+
+    fn visible_fields(maximized: bool) -> &'static [Self] {
+        if maximized {
+            &Self::MAXIMIZED_FIELDS
+        } else {
+            &Self::COLLAPSED_FIELDS
         }
     }
 
+    pub fn next(&self) -> Self {
+        (*self).next_for(true)
+    }
+
     pub fn prev(&self) -> Self {
-        match self {
-            Self::DestPath => Self::MergeMode,
-            Self::FolderTemplate => Self::DestPath,
-            Self::FilenameTemplate => Self::FolderTemplate,
-            Self::MergeMode => Self::FilenameTemplate,
+        (*self).prev_for(true)
+    }
+
+    pub fn next_for(self, maximized: bool) -> Self {
+        let fields = Self::visible_fields(maximized);
+        let idx = fields.iter().position(|field| *field == self).unwrap_or(0);
+        fields[(idx + 1) % fields.len()]
+    }
+
+    pub fn prev_for(self, maximized: bool) -> Self {
+        let fields = Self::visible_fields(maximized);
+        let idx = fields.iter().position(|field| *field == self).unwrap_or(0);
+        fields[(idx + fields.len() - 1) % fields.len()]
+    }
+
+    pub fn clamp_for(self, maximized: bool) -> Self {
+        if Self::visible_fields(maximized).contains(&self) {
+            self
+        } else {
+            Self::MergeMode
         }
     }
 }
@@ -2286,6 +2321,8 @@ pub struct OutputOptionsState {
     pub folder_template: String,
     pub filename_template: String,
     pub merge: PillState<MergeMode>,
+    pub companion_extensions: String,
+    pub companion_folders: String,
     pub field_focus: OutputOptionsField,
     pub advanced_open: bool,
 }
@@ -2302,9 +2339,113 @@ impl OutputOptionsState {
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
             merge,
+            companion_extensions: crate::convert::formats::DEFAULT_COMPANION_EXTENSIONS.to_string(),
+            companion_folders: String::new(),
             field_focus: OutputOptionsField::DestPath,
             advanced_open: false,
         }
+    }
+
+    /// Return the normalized loose companion-file extensions represented by the
+    /// editable TUI field. Empty input intentionally means "copy no loose
+    /// companion files" and must be preserved when queuing conversions.
+    #[must_use]
+    pub fn parsed_companion_extensions(&self) -> Vec<String> {
+        crate::convert::formats::parse_companion_extensions(&self.companion_extensions)
+    }
+
+    /// Return the validated bare companion-folder names represented by the
+    /// editable TUI field. Empty input intentionally means "copy no folders".
+    #[must_use]
+    pub fn parsed_companion_folders(&self) -> Vec<String> {
+        crate::convert::formats::parse_companion_folders(&self.companion_folders)
+    }
+
+    /// Apply the output-options companion-copy fields to a queued conversion.
+    ///
+    /// The copy stage reads `ConversionOptions::effective_companion_*()`, so the
+    /// editable TUI strings must be projected into both the new list fields and
+    /// the legacy boolean gates. Keeping this projection in one helper prevents
+    /// add-to-queue, browse-return, and command-commit paths from silently
+    /// falling back to `ConversionOptions::default()` companion behavior.
+    pub fn apply_companion_copying_to_conversion_options(
+        &self,
+        options: &mut crate::convert::ConversionOptions,
+    ) {
+        let extensions = self.parsed_companion_extensions();
+        let folders = self.parsed_companion_folders();
+
+        // Empty strings are a real user choice, not "missing config". Mirror
+        // that choice into the backwards-compatible gates so effective_*()
+        // cannot resurrect defaults later in the processor/pipeline bridge.
+        options.copy_auxiliary_files = !extensions.is_empty();
+        options.copy_subdirectories = !folders.is_empty();
+        options.companion_extensions = extensions;
+        options.companion_folders = folders;
+    }
+}
+
+#[cfg(test)]
+mod output_options_companion_projection_tests {
+    use super::OutputOptionsState;
+
+    #[test]
+    fn output_options_project_custom_companion_values_into_conversion_options() {
+        let mut state = OutputOptionsState::new();
+        state.companion_extensions = "jpg, .PDF, .jpg".to_string();
+        state.companion_folders = "Scans, Artwork, ../escape".to_string();
+        let mut options = crate::convert::ConversionOptions::default();
+
+        state.apply_companion_copying_to_conversion_options(&mut options);
+
+        assert!(options.copy_auxiliary_files);
+        assert!(options.copy_subdirectories);
+        assert_eq!(options.companion_extensions, vec![".jpg", ".pdf"]);
+        assert_eq!(options.companion_folders, vec!["Scans", "Artwork"]);
+        assert_eq!(options.effective_companion_extensions(), vec![".jpg", ".pdf"]);
+        assert_eq!(options.effective_companion_folders(), vec!["Scans", "Artwork"]);
+    }
+
+    #[test]
+    fn output_options_project_empty_companion_values_as_explicit_disable() {
+        let mut state = OutputOptionsState::new();
+        state.companion_extensions.clear();
+        state.companion_folders.clear();
+        let mut options = crate::convert::ConversionOptions::default();
+
+        state.apply_companion_copying_to_conversion_options(&mut options);
+
+        assert!(!options.copy_auxiliary_files);
+        assert!(!options.copy_subdirectories);
+        assert!(options.companion_extensions.is_empty());
+        assert!(options.companion_folders.is_empty());
+        assert!(options.effective_companion_extensions().is_empty());
+        assert!(options.effective_companion_folders().is_empty());
+    }
+
+    #[test]
+    fn output_options_field_cycle_skips_below_fold_fields_when_collapsed() {
+        use super::OutputOptionsField::*;
+
+        assert_eq!(DestPath.next_for(false), FolderTemplate);
+        assert_eq!(FolderTemplate.next_for(false), FilenameTemplate);
+        assert_eq!(FilenameTemplate.next_for(false), MergeMode);
+        assert_eq!(MergeMode.next_for(false), DestPath);
+        assert_eq!(DestPath.prev_for(false), MergeMode);
+        assert_eq!(CompanionExtensions.clamp_for(false), MergeMode);
+        assert_eq!(CompanionFolders.clamp_for(false), MergeMode);
+    }
+
+    #[test]
+    fn output_options_field_cycle_includes_companion_fields_when_maximized() {
+        use super::OutputOptionsField::*;
+
+        assert_eq!(MergeMode.next_for(true), CompanionExtensions);
+        assert_eq!(CompanionExtensions.next_for(true), CompanionFolders);
+        assert_eq!(CompanionFolders.next_for(true), DestPath);
+        assert_eq!(DestPath.prev_for(true), CompanionFolders);
+        assert_eq!(CompanionFolders.prev_for(true), CompanionExtensions);
+        assert_eq!(CompanionExtensions.clamp_for(true), CompanionExtensions);
     }
 }
 
@@ -5780,6 +5921,8 @@ pub enum TextEditTarget {
     DestPath,
     FolderTemplate,
     FilenameTemplate,
+    CompanionExtensions,
+    CompanionFolders,
     MetaTitle,
     MetaArtist,
     MetaAlbum,

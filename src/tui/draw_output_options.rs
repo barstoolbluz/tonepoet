@@ -48,6 +48,8 @@ pub fn draw_output_options_pane(
     let is_folder_focused = focused && opts.field_focus == OutputOptionsField::FolderTemplate;
     let is_file_focused = focused && opts.field_focus == OutputOptionsField::FilenameTemplate;
     let is_merge_focused = focused && opts.field_focus == OutputOptionsField::MergeMode;
+    let is_extensions_focused = focused && opts.field_focus == OutputOptionsField::CompanionExtensions;
+    let is_folders_focused = focused && opts.field_focus == OutputOptionsField::CompanionFolders;
 
     // Destination path
     let dest_display = opts
@@ -143,6 +145,33 @@ pub fn draw_output_options_pane(
     lines.push(file_row);
     lines.push(merge_row);
     lines.push(est_row);
+
+    if maximized && area.height >= 11 {
+        lines.push(bordered_line(border_color, w, vec![], theme));
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![Span::styled("   Companion files", output_options_section_header_style(theme))],
+            theme,
+        ));
+        lines.push(field_row(
+            border_color,
+            w,
+            "   extensions  ",
+            &opts.companion_extensions,
+            is_extensions_focused,
+            theme,
+        ));
+        lines.push(field_row(
+            border_color,
+            w,
+            "   folders     ",
+            &opts.companion_folders,
+            is_folders_focused,
+            theme,
+        ));
+    }
+
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
     while lines.len() < target_len_before_bottom {
         lines.push(bordered_line(border_color, w, vec![], theme));
@@ -153,6 +182,47 @@ pub fn draw_output_options_pane(
     f.render_widget(paragraph, area);
 }
 
+
+
+/// Section header styling for the Output Options pane.
+///
+/// This intentionally mirrors the app-wide `theme.header` token used for
+/// section labels: dim text with bold emphasis. Keep this separate from
+/// `theme.accent()` so informational section headers do not inherit cyan/amber
+/// value styling.
+fn output_options_section_header_style(theme: super::theme::Theme) -> Style {
+    Style::default()
+        .fg(theme.text_dim)
+        .add_modifier(Modifier::BOLD)
+}
+
+
+fn field_row<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    label: &'a str,
+    value: &str,
+    focused: bool,
+    theme: super::theme::Theme,
+) -> Line<'a> {
+    let label_style = if focused {
+        theme.bright()
+    } else {
+        theme.muted()
+    };
+    let value_style = if focused {
+        theme.bright()
+    } else {
+        theme.muted()
+    };
+    let display = truncate_to(value, width.saturating_sub(label.len() + 4));
+    bordered_line(
+        border_color,
+        width,
+        vec![Span::styled(label, label_style), Span::styled(display, value_style)],
+        theme,
+    )
+}
 
 /// Draw the collapsed output-options title bar.
 pub fn draw_output_options_title_bar(f: &mut Frame, area: Rect, focused: bool, theme: super::theme::Theme) {
@@ -421,4 +491,46 @@ fn truncate_to(s: &str, max_width: usize) -> String {
         out = candidate;
     }
     format!("{}{}", out, ellipsis)
+}
+
+
+#[cfg(test)]
+mod output_options_companion_render_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn maximized_companion_header_uses_header_style_not_accent_style() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let opts = OutputOptionsState::new();
+        let format = FormatState::new();
+        let backend = TestBackend::new(60, 11);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                draw_output_options_pane(
+                    frame,
+                    Rect::new(0, 0, 60, 11),
+                    &opts,
+                    None,
+                    0,
+                    &format,
+                    true,
+                    true,
+                    theme,
+                )
+            })
+            .expect("draw output options");
+
+        // Rows: top, dest, folder, filename, merge, estimate, blank, header.
+        // The 'C' in "   Companion files" starts at x=4 inside the border.
+        let cell = terminal.backend().buffer().get(4, 7);
+        assert_eq!(cell.symbol(), "C");
+        assert_eq!(cell.fg, theme.text_dim, "section header must use the header color token");
+        assert_ne!(cell.fg, theme.accent().fg.unwrap_or(theme.text_dim), "section header must not use accent/value styling");
+        assert!(cell.modifier.contains(Modifier::BOLD), "section header must be bold like theme.header");
+    }
 }

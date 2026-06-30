@@ -1370,6 +1370,7 @@ mod bluray_queue_admission_tests {
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
+            companion: Default::default(),
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),

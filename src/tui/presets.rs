@@ -15,6 +15,10 @@ fn default_resampler() -> String {
     "sox".to_string()
 }
 
+fn default_companion_extensions() -> String {
+    crate::convert::formats::DEFAULT_COMPANION_EXTENSIONS.to_string()
+}
+
 /// A TUI-native preset that stores pill values directly
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiPreset {
@@ -43,6 +47,10 @@ pub struct TuiPreset {
     pub folder_template: String,
     pub filename_template: String,
     pub merge: String, // "multi-file", "single-image"
+    #[serde(default = "default_companion_extensions")]
+    pub companion_extensions: String,
+    #[serde(default)]
+    pub companion_folders: String,
 }
 
 impl TuiPreset {
@@ -75,6 +83,8 @@ impl TuiPreset {
                 MergeMode::MultiFile => "multi-file".to_string(),
                 MergeMode::SingleImage => "single-image".to_string(),
             },
+            companion_extensions: output_opts.companion_extensions.clone(),
+            companion_folders: output_opts.companion_folders.clone(),
         }
     }
 
@@ -131,6 +141,8 @@ impl TuiPreset {
         }
         output_opts.folder_template = self.folder_template.clone();
         output_opts.filename_template = self.filename_template.clone();
+        output_opts.companion_extensions = self.companion_extensions.clone();
+        output_opts.companion_folders = self.companion_folders.clone();
 
         if let Some(mm) = parse_merge(&self.merge) {
             output_opts.merge.select_value(&mm);
@@ -214,6 +226,8 @@ impl TuiPreset {
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
             merge: merge.to_string(),
+            companion_extensions: default_companion_extensions(),
+            companion_folders: String::new(),
         }
     }
 }
@@ -546,5 +560,55 @@ fn parse_merge(s: &str) -> Option<MergeMode> {
         "multi-file" => Some(MergeMode::MultiFile),
         "single-image" => Some(MergeMode::SingleImage),
         _ => None,
+    }
+}
+
+
+#[cfg(test)]
+mod companion_preset_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_presets_without_companion_fields_get_backward_compatible_defaults() {
+        let preset: TuiPreset = toml::from_str(
+            r#"
+name = "legacy"
+version = 3
+format = "flac"
+sample_rate = 44100
+bit_depth = "24"
+dither = "tpdf"
+replaygain = "off"
+folder_template = "%ARTIST%/%ALBUM%"
+filename_template = "%TRACKNN% - %TITLE%.%EXT%"
+merge = "multi-file"
+"#,
+        )
+        .expect("preset without companion fields should deserialize");
+
+        assert_eq!(
+            preset.companion_extensions,
+            crate::convert::formats::DEFAULT_COMPANION_EXTENSIONS
+        );
+        assert!(preset.companion_folders.is_empty());
+    }
+
+    #[test]
+    fn companion_fields_round_trip_through_preset_capture_and_apply() {
+        let format = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        output.companion_extensions = ".jpg, .pdf".to_string();
+        output.companion_folders = "Scans, Artwork".to_string();
+
+        let preset = TuiPreset::from_pill_state("companions", &format, &output);
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        restored_output.companion_extensions.clear();
+        restored_output.companion_folders.clear();
+
+        preset.apply_to_pills(&mut restored_format, &mut restored_output);
+
+        assert_eq!(restored_output.companion_extensions, ".jpg, .pdf");
+        assert_eq!(restored_output.companion_folders, "Scans, Artwork");
     }
 }
