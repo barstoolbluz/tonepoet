@@ -2565,6 +2565,10 @@ pub struct ConvertState {
     pub pane_title_last_click: Option<(ConvertFocus, std::time::Instant)>,
     /// Last metadata file-row click used for double-click edit.
     pub metadata_file_last_click: Option<(usize, std::time::Instant)>,
+    /// Last compact metadata field click used for double-click full-editor entry.
+    pub metadata_field_last_click: Option<(ConvertMetadataField, std::time::Instant)>,
+    /// Last destination-path field click used for double-click directory picking.
+    pub dest_path_last_click: Option<std::time::Instant>,
 }
 
 impl ConvertState {
@@ -2578,6 +2582,8 @@ impl ConvertState {
             layout: ConvertLayout::Default,
             pane_title_last_click: None,
             metadata_file_last_click: None,
+            metadata_field_last_click: None,
+            dest_path_last_click: None,
         }
     }
 
@@ -2608,6 +2614,8 @@ impl ConvertState {
     pub fn reset_metadata_file_list_state(&mut self) {
         self.metadata.file_scroll = 0;
         self.metadata_file_last_click = None;
+        self.metadata_field_last_click = None;
+        self.dest_path_last_click = None;
     }
 
     /// Replace the convert source mode and reset metadata list state in one
@@ -2670,6 +2678,9 @@ impl ConvertState {
 #[derive(Debug, Clone)]
 pub struct PresetState {
     pub active_preset: Option<String>,
+    /// Full path that owns the active preset. This keeps picker-based load/save
+    /// flows honest when the user navigates outside the default presets directory.
+    pub active_preset_path: Option<PathBuf>,
     pub modified: bool,
     pub overlay_open: bool,
     pub overlay_list: Vec<String>,
@@ -2687,12 +2698,36 @@ impl PresetState {
             self.modified = true;
         }
     }
+
+    /// Record both the display name and the owning path for the active preset.
+    pub fn set_active_preset_path(&mut self, name: impl Into<String>, path: PathBuf) {
+        self.active_preset = Some(name.into());
+        self.active_preset_path = Some(path);
+    }
+
+    /// Clear the active preset identity and its owning path together.
+    pub fn clear_active_preset(&mut self) {
+        self.active_preset = None;
+        self.active_preset_path = None;
+        self.modified = false;
+    }
+
+    /// Return the path to use for an overwrite of the active preset.
+    pub fn active_preset_save_path(&self) -> Option<PathBuf> {
+        let name = self.active_preset.as_deref()?;
+        Some(
+            self.active_preset_path
+                .clone()
+                .unwrap_or_else(|| crate::tui::presets::preset_file_path(name)),
+        )
+    }
 }
 
 impl Default for PresetState {
     fn default() -> Self {
         Self {
             active_preset: None,
+            active_preset_path: None,
             modified: false,
             overlay_open: false,
             overlay_list: Vec::new(),
@@ -3233,6 +3268,12 @@ pub enum FilePickerPurpose {
     },
     SelectFile,
     SelectDirectory,
+    /// Convert output-options destination picker.
+    SelectDestination,
+    /// Convert preset loader; selects an existing TOML preset.
+    SelectPreset,
+    /// Convert preset save-as picker; returns the composed target preset path.
+    SavePreset,
     /// Browse-screen destination picker for copy operations.
     ///
     /// `sources` is captured before the picker opens so later cursor or
@@ -6204,6 +6245,8 @@ pub enum ConfirmAction {
     ClearAll,
     StopAll,
     ClearQueue,
+    /// Overwrite the currently active preset after user confirmation.
+    SavePresetOverwrite { name: String, path: PathBuf },
     /// Move the given paths to the system trash (XDG Trash / Finder Trash).
     TrashSelection(Vec<PathBuf>),
     /// Apply AccurateRip offset correction to a set of tracks.
@@ -6697,6 +6740,8 @@ impl AppState {
                 layout: ConvertLayout::Default,
                 pane_title_last_click: None,
                 metadata_file_last_click: None,
+                dest_path_last_click: None,
+                metadata_field_last_click: None,
             },
             preset: PresetState::default(),
             browse: crate::tui::browse::BrowseState::new(),

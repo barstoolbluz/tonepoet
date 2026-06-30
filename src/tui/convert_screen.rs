@@ -12,7 +12,7 @@ use super::app::{AppState, ConvertFocus, ConvertLayout, ResamplerChoice, SourceM
 use super::button_map::{ButtonRenderMap, MetadataFieldKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
-use super::draw_metadata::{draw_metadata_pane, draw_metadata_title_bar, edit_tags_pill_rect};
+use super::draw_metadata::{draw_metadata_pane, draw_metadata_title_bar};
 use super::draw_output::{draw_format_pane, draw_format_title_bar};
 use super::draw_output_options::{draw_output_options_pane, draw_output_options_title_bar};
 use super::draw_preset_bar::draw_preset_bar;
@@ -208,14 +208,7 @@ fn register_metadata_buttons(app: &mut AppState, area: Rect) {
         return;
     }
 
-    let edit_tags_pill = edit_tags_pill_rect(area);
-    let reserved_pill_rows = if edit_tags_pill.is_some() { 1 } else { 0 };
-    let list_area = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(reserved_pill_rows),
-    );
+    let list_area = area;
     let visible_rows = list_area.height.saturating_sub(2) as usize;
     app.button_map
         .record_metadata_file_list_visible_rows(visible_rows);
@@ -242,9 +235,6 @@ fn register_metadata_buttons(app: &mut AppState, area: Rect) {
         _ => register_metadata_fields(&mut app.button_map, list_area),
     }
 
-    if let Some(rect) = edit_tags_pill {
-        app.button_map.record_button(TuiButton::MetadataEditTagsButton, rect);
-    }
 }
 
 fn register_format_buttons(app: &mut AppState, area: Rect) {

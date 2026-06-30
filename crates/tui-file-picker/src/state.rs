@@ -50,6 +50,8 @@ pub enum FilePickerFocus {
     Properties,
     DeleteConfirm,
     CreateName,
+    SaveName,
+    SaveOverwriteConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +106,20 @@ pub enum FilePickerAction {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveModeStyle {
+    Inline,
+    Modal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveModeConfig {
+    pub default_name: String,
+    pub confirm_overwrite: bool,
+    pub hide_extension: Option<String>,
+    pub style: SaveModeStyle,
+}
+
 /// Caller-visible policy for handling destination-name conflicts in copy/move
 /// destination pickers. `Ask` preserves the interactive prompt, while
 /// `Overwrite` and `Skip` let the host apply a whole-job policy before the
@@ -128,6 +144,9 @@ pub enum ToolbarAction {
     Up,
     FileOperations,
     Properties,
+    Rename,
+    Duplicate,
+    Delete,
     /// Accept the current picker result. In directory-selection mode this
     /// confirms the current directory rather than the highlighted child.
     AcceptSelection,
@@ -157,6 +176,10 @@ pub enum FilePickerHitAction {
     PropertiesClose,
     DeleteConfirm,
     DeleteCancel,
+    SaveName,
+    SaveCancel,
+    SaveOverwriteConfirm,
+    SaveOverwriteCancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +213,13 @@ impl DeleteConfirmButton {
 pub enum FilePickerCreateKind {
     File,
     Folder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilePickerNameAction {
+    Create(FilePickerCreateKind),
+    Rename,
+    Duplicate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +413,10 @@ pub struct FilePickerConfig {
     /// default.
     pub conflict_policy: Option<ConflictPolicyPreset>,
     pub operation_policy: FileOperationPolicy,
+    /// Strip this extension from displayed file names and append it in save mode.
+    pub hide_extension: Option<String>,
+    /// Optional reusable save-as mode.
+    pub save_mode: Option<SaveModeConfig>,
 }
 
 impl Default for FilePickerConfig {
@@ -397,6 +431,8 @@ impl Default for FilePickerConfig {
             show_preview: false,
             conflict_policy: None,
             operation_policy: FileOperationPolicy::default(),
+            hide_extension: None,
+            save_mode: None,
         }
     }
 }
@@ -554,8 +590,14 @@ pub struct FilePickerState {
     pub(crate) free_space_bytes: Option<u64>,
     pub(crate) operation_policy: FileOperationPolicy,
     pub(crate) pending_create: Option<FilePickerCreateKind>,
+    pub(crate) pending_name_action: Option<FilePickerNameAction>,
     pub(crate) create_name_buffer: String,
     pub(crate) create_name_cursor: usize,
+    pub(crate) hide_extension: Option<String>,
+    pub(crate) save_mode: Option<SaveModeConfig>,
+    pub(crate) save_name_buffer: String,
+    pub(crate) save_name_cursor: usize,
+    pub(crate) pending_save_path: Option<PathBuf>,
 }
 
 impl FilePickerState {
@@ -608,11 +650,30 @@ impl FilePickerState {
             free_space_bytes: None,
             operation_policy: config.operation_policy,
             pending_create: None,
+            pending_name_action: None,
             create_name_buffer: String::new(),
             create_name_cursor: 0,
+            hide_extension: config.hide_extension.clone().or_else(|| {
+                config.save_mode.as_ref().and_then(|save_mode| save_mode.hide_extension.clone())
+            }),
+            save_mode: config.save_mode.clone(),
+            save_name_buffer: config
+                .save_mode
+                .as_ref()
+                .map(|save_mode| strip_configured_extension(&save_mode.default_name, save_mode.hide_extension.as_deref()))
+                .unwrap_or_default(),
+            save_name_cursor: config
+                .save_mode
+                .as_ref()
+                .map(|save_mode| strip_configured_extension(&save_mode.default_name, save_mode.hide_extension.as_deref()).len())
+                .unwrap_or(0),
+            pending_save_path: None,
         };
         state.refresh();
         state.select_tree_node_for_current_dir();
+        if state.save_mode.is_some() {
+            state.focus = FilePickerFocus::SaveName;
+        }
         state
     }
 
@@ -1054,10 +1115,11 @@ impl FilePickerState {
                 continue;
             };
             let path = item.path();
-            let name = path
+            let raw_name = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
+            let name = strip_configured_extension(&raw_name, self.hide_extension.as_deref());
             if !self.show_hidden && name.starts_with('.') {
                 continue;
             }
@@ -1442,6 +1504,7 @@ impl FilePickerState {
             _ => {}
         }
         self.pending_create = Some(kind);
+        self.pending_name_action = Some(FilePickerNameAction::Create(kind));
         self.create_name_buffer = match kind {
             FilePickerCreateKind::File => unique_path(&self.current_dir.join("untitled.txt"))
                 .file_name()
@@ -1464,6 +1527,7 @@ impl FilePickerState {
 
     pub(crate) fn cancel_create_name(&mut self) {
         self.pending_create = None;
+        self.pending_name_action = None;
         self.create_name_buffer.clear();
         self.create_name_cursor = 0;
         self.focus = FilePickerFocus::Files;
@@ -1471,14 +1535,20 @@ impl FilePickerState {
     }
 
     pub(crate) fn commit_create_name(&mut self) -> bool {
-        let Some(kind) = self.pending_create else {
-            self.set_error(FilePickerError::InvalidNewItemName("no pending item type".to_string()));
+        let Some(action) = self.pending_name_action else {
+            self.set_error(FilePickerError::InvalidNewItemName("no pending item action".to_string()));
             return false;
         };
         let name = self.create_name_buffer.trim().to_string();
-        match self.try_create_named_item(kind, &name) {
+        let result = match action {
+            FilePickerNameAction::Create(kind) => self.try_create_named_item(kind, &name),
+            FilePickerNameAction::Rename => self.try_rename_current(&name),
+            FilePickerNameAction::Duplicate => self.try_duplicate_current(&name),
+        };
+        match result {
             Ok(()) => {
                 self.pending_create = None;
+                self.pending_name_action = None;
                 self.create_name_buffer.clear();
                 self.create_name_cursor = 0;
                 self.focus = FilePickerFocus::Files;
@@ -1488,6 +1558,146 @@ impl FilePickerState {
                 self.set_error(err);
                 false
             }
+        }
+    }
+
+
+    pub(crate) fn begin_rename_current(&mut self) -> bool {
+        let Some(entry) = self.entries.get(self.file_cursor).cloned() else {
+            self.set_error(FilePickerError::NoSelection);
+            return false;
+        };
+        self.pending_create = None;
+        self.pending_name_action = Some(FilePickerNameAction::Rename);
+        self.create_name_buffer = entry.name;
+        self.create_name_cursor = self.create_name_buffer.len();
+        self.menu_open = false;
+        self.submenu_open = false;
+        self.previous_focus = self.focus;
+        self.focus = FilePickerFocus::CreateName;
+        self.clear_error();
+        true
+    }
+
+    pub(crate) fn begin_duplicate_current(&mut self) -> bool {
+        let Some(entry) = self.entries.get(self.file_cursor).cloned() else {
+            self.set_error(FilePickerError::NoSelection);
+            return false;
+        };
+        if entry.is_dir {
+            self.set_error(FilePickerError::WrongSelectionMode("Duplicate supports files only"));
+            return false;
+        }
+        self.pending_create = None;
+        self.pending_name_action = Some(FilePickerNameAction::Duplicate);
+        let source_name = entry.path.file_name().and_then(OsStr::to_str).unwrap_or(&entry.name);
+        let stem = strip_configured_extension(source_name, self.hide_extension.as_deref());
+        let candidate = append_configured_extension(format!("{}-copy", stem), self.hide_extension.as_deref());
+        self.create_name_buffer = strip_configured_extension(
+            unique_path(&self.current_dir.join(candidate))
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("copy"),
+            self.hide_extension.as_deref(),
+        );
+        self.create_name_cursor = self.create_name_buffer.len();
+        self.menu_open = false;
+        self.submenu_open = false;
+        self.previous_focus = self.focus;
+        self.focus = FilePickerFocus::CreateName;
+        self.clear_error();
+        true
+    }
+
+    pub(crate) fn try_rename_current(&mut self, display_name: &str) -> Result<(), FilePickerError> {
+        validate_new_item_name(display_name)?;
+        let entry = self.entries.get(self.file_cursor).cloned().ok_or(FilePickerError::NoSelection)?;
+        let file_name = append_configured_extension(display_name.trim().to_string(), self.hide_extension.as_deref());
+        let destination = self.current_dir.join(file_name);
+        if destination.exists() && destination != entry.path {
+            return Err(FilePickerError::DestinationExists(destination));
+        }
+        fs::rename(&entry.path, &destination).map_err(|err| io_error("rename", &entry.path, err))?;
+        self.selected = Some(destination.clone());
+        self.refresh();
+        self.select_path_in_entries(&destination);
+        Ok(())
+    }
+
+    pub(crate) fn try_duplicate_current(&mut self, display_name: &str) -> Result<(), FilePickerError> {
+        validate_new_item_name(display_name)?;
+        let entry = self.entries.get(self.file_cursor).cloned().ok_or(FilePickerError::NoSelection)?;
+        if entry.is_dir {
+            return Err(FilePickerError::WrongSelectionMode("Duplicate supports files only"));
+        }
+        let file_name = append_configured_extension(display_name.trim().to_string(), self.hide_extension.as_deref());
+        let destination = self.current_dir.join(file_name);
+        if destination.exists() {
+            return Err(FilePickerError::DestinationExists(destination));
+        }
+        fs::copy(&entry.path, &destination)
+            .map(|_| ())
+            .map_err(|err| io_error("duplicate", &entry.path, err))?;
+        self.selected = Some(destination.clone());
+        self.refresh();
+        self.select_path_in_entries(&destination);
+        Ok(())
+    }
+
+    pub(crate) fn commit_save_name(&mut self) -> FilePickerAction {
+        let Some(save_mode) = self.save_mode.clone() else {
+            return self.accept_current_selection();
+        };
+        let name = self.save_name_buffer.trim();
+        if name.is_empty() {
+            self.set_error(FilePickerError::InvalidNewItemName("empty save name".to_string()));
+            return FilePickerAction::None;
+        }
+        if let Err(err) = validate_new_item_name(name) {
+            self.set_error(err);
+            return FilePickerAction::None;
+        }
+        let file_name = append_configured_extension(name.to_string(), save_mode.hide_extension.as_deref());
+        let path = self.current_dir.join(file_name);
+        if path.exists() {
+            if save_mode.confirm_overwrite {
+                self.pending_save_path = Some(path);
+                self.previous_focus = self.focus;
+                self.focus = FilePickerFocus::SaveOverwriteConfirm;
+                return FilePickerAction::None;
+            }
+            self.set_error(FilePickerError::DestinationExists(path));
+            return FilePickerAction::None;
+        }
+        FilePickerAction::Selected(path)
+    }
+
+
+    pub(crate) fn confirm_save_overwrite(&mut self) -> FilePickerAction {
+        let Some(path) = self.pending_save_path.take() else {
+            self.focus = FilePickerFocus::SaveName;
+            return FilePickerAction::None;
+        };
+        FilePickerAction::Selected(path)
+    }
+
+    pub(crate) fn cancel_save_overwrite(&mut self) {
+        self.pending_save_path = None;
+        self.focus = FilePickerFocus::SaveName;
+    }
+
+    pub(crate) fn complete_save_name_from_entries(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let prefix = self.save_name_buffer[..self.save_name_cursor.min(self.save_name_buffer.len())].to_string();
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| !entry.is_dir && entry.name.starts_with(&prefix))
+        {
+            self.save_name_buffer = entry.name.clone();
+            self.save_name_cursor = self.save_name_buffer.len();
         }
     }
 
@@ -1768,6 +1978,23 @@ pub(crate) fn expand_user_path(input: &str) -> PathBuf {
         }
     }
     PathBuf::from(input)
+}
+
+fn strip_configured_extension(name: &str, extension: Option<&str>) -> String {
+    let Some(extension) = extension.filter(|extension| !extension.is_empty()) else {
+        return name.to_string();
+    };
+    name.strip_suffix(extension).unwrap_or(name).to_string()
+}
+
+fn append_configured_extension(mut name: String, extension: Option<&str>) -> String {
+    let Some(extension) = extension.filter(|extension| !extension.is_empty()) else {
+        return name;
+    };
+    if !name.ends_with(extension) {
+        name.push_str(extension);
+    }
+    name
 }
 
 pub(crate) fn home_dir() -> Option<PathBuf> {

@@ -759,32 +759,24 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
 
         // Open presets overlay.
         (KeyCode::Char('p'), KeyModifiers::NONE) => {
-            app.preset.overlay_list = super::presets::list_presets();
-            app.preset.overlay_selected = 0;
-            app.preset.naming_input = None;
-            app.preset.overlay_open = true;
+            app.preset.overlay_open = false;
+            super::command::open_file_picker_for_preset_load(app);
         }
 
         // Save preset.
         (KeyCode::Char('s'), KeyModifiers::NONE) => {
-            if let Some(name) = &app.preset.active_preset.clone() {
-                let preset = super::presets::TuiPreset::from_pill_state(
-                    name,
-                    &app.convert.format,
-                    &app.convert.output_options,
-                );
-                match super::presets::save_preset_with_db(&preset, &app.db) {
-                    Ok(_) => {
-                        app.preset.modified = false;
-                        app.set_status(format!("Saved preset: {}", name));
-                    }
-                    Err(e) => app.set_status(format!("Save failed: {}", e)),
-                }
+            if let Some(name) = app.preset.active_preset.clone() {
+                let path = app
+                    .preset
+                    .active_preset_save_path()
+                    .unwrap_or_else(|| super::presets::preset_file_path(&name));
+                app.active_overlay = ActiveOverlay::Confirmation {
+                    message: format!("Overwrite preset '{}'?", name),
+                    action: ConfirmAction::SavePresetOverwrite { name, path },
+                };
             } else {
-                app.preset.overlay_list = super::presets::list_presets();
-                app.preset.overlay_selected = 0;
-                app.preset.naming_input = Some(super::text_input::TextInputState::empty());
-                app.preset.overlay_open = true;
+                app.preset.overlay_open = false;
+                super::command::open_file_picker_for_preset_save_as(app);
             }
         }
 
@@ -1526,33 +1518,38 @@ mod inline_edit_behavior_tests {
     }
 
     #[test]
-    fn convert_metadata_edit_tags_pill_commits_inline_edit_then_opens_overlay_path() {
+    fn convert_metadata_field_double_click_commits_inline_edit_then_opens_overlay_path() {
         let (tx, _rx) = channel();
         let mut app = AppState::new(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::Metadata;
         app.convert.metadata.title = Some("Before".to_string());
-        begin_convert_metadata_inline_edit(&mut app, ConvertMetadataField::Title, None);
-        app.convert.metadata.edit_input.set_text_and_cursor("After".to_string(), "After".len());
-        app.button_map.record_button(TuiButton::MetadataEditTagsButton, Rect::new(4, 4, 11, 1));
-
-        handle_mouse(
-            &mut app,
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 5,
-                row: 4,
-                modifiers: KeyModifiers::NONE,
-            },
-            &tx,
+        app.button_map.record_button(
+            TuiButton::MetadataField(super::super::button_map::MetadataFieldKind::Title),
+            Rect::new(4, 4, 20, 1),
         );
+
+        let click = |app: &mut AppState| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 5,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &tx,
+            );
+        };
+
+        click(&mut app);
+        assert_eq!(app.convert.metadata.editing, Some(ConvertMetadataField::Title));
+        app.convert.metadata.edit_input.set_text_and_cursor("After".to_string(), "After".len());
+        click(&mut app);
 
         assert_eq!(app.convert.focus, ConvertFocus::Metadata);
         assert_eq!(app.convert.metadata.editing, None);
         assert_eq!(app.convert.metadata.title.as_deref(), Some("After"));
-        // This minimal test app has no source path, so the click reaches the
-        // overlay-open path but reports the expected no-source status rather
-        // than falling back to inline editing or TextEdit.
         assert!(matches!(app.active_overlay, ActiveOverlay::None));
         assert!(app
             .status_message
@@ -1658,7 +1655,8 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                 );
                 match super::presets::save_preset_with_db(&preset, &app.db) {
                     Ok(_) => {
-                        app.preset.active_preset = Some(name.clone());
+                        app.preset
+                            .set_active_preset_path(name.clone(), super::presets::preset_file_path(&name));
                         app.preset.modified = false;
                         app.preset.naming_input = None;
                         app.preset.overlay_open = false;
@@ -1709,7 +1707,8 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                             &mut app.convert.format,
                             &mut app.convert.output_options,
                         );
-                        app.preset.active_preset = Some(name.clone());
+                        app.preset
+                            .set_active_preset_path(name.clone(), super::presets::preset_file_path(&name));
                         app.preset.modified = false;
                         app.preset.overlay_open = false;
                         app.set_status(format!("Loaded preset: {}", name));
@@ -1765,8 +1764,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                     Ok(_) => {
                         // If we deleted the active preset, clear it
                         if app.preset.active_preset.as_deref() == Some(&name) {
-                            app.preset.active_preset = None;
-                            app.preset.modified = false;
+                            app.preset.clear_active_preset();
                         }
                         app.preset.overlay_list = super::presets::list_presets();
                         // Clamp selection
@@ -15290,13 +15288,29 @@ fn clear_convert_double_click_state_for_button(app: &mut AppState, button: Optio
     match button {
         Some(TuiButton::Pane(_)) => {
             app.convert.metadata_file_last_click = None;
+            app.convert.metadata_field_last_click = None;
+            app.convert.dest_path_last_click = None;
         }
         Some(TuiButton::MetadataFileRow(_)) => {
             app.convert.pane_title_last_click = None;
+            app.convert.metadata_field_last_click = None;
+            app.convert.dest_path_last_click = None;
+        }
+        Some(TuiButton::MetadataField(_)) => {
+            app.convert.pane_title_last_click = None;
+            app.convert.metadata_file_last_click = None;
+            app.convert.dest_path_last_click = None;
+        }
+        Some(TuiButton::DestPathField) => {
+            app.convert.pane_title_last_click = None;
+            app.convert.metadata_file_last_click = None;
+            app.convert.metadata_field_last_click = None;
         }
         _ => {
             app.convert.pane_title_last_click = None;
             app.convert.metadata_file_last_click = None;
+            app.convert.metadata_field_last_click = None;
+            app.convert.dest_path_last_click = None;
         }
     }
 }
@@ -19384,6 +19398,25 @@ fn execute_confirm_action(
             app.manager.clear_queue();
             app.set_status("Cleared queue");
         }
+        ConfirmAction::SavePresetOverwrite { name, path } => {
+            let preset = super::presets::TuiPreset::from_pill_state(
+                name,
+                &app.convert.format,
+                &app.convert.output_options,
+            );
+            match super::presets::save_preset_to_path_with_db(&preset, path, &app.db) {
+                Ok(()) => {
+                    app.preset.set_active_preset_path(name.clone(), path.clone());
+                    app.preset.modified = false;
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status(format!("Saved preset: {}", path.display()));
+                }
+                Err(e) => {
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status(format!("Save failed: {}", e));
+                }
+            }
+        }
         ConfirmAction::TrashSelection(paths) => {
             let mut trashed = 0usize;
             let mut errors = 0usize;
@@ -19872,10 +19905,30 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     };
     clear_convert_double_click_state_for_button(app, double_click_candidate);
 
-    if matches!(app.active_overlay, ActiveOverlay::None)
-        && finish_inline_edit_before_focus_change(app, clicked_button.as_ref(), tx)
-    {
-        return;
+    if matches!(app.active_overlay, ActiveOverlay::None) {
+        let now = std::time::Instant::now();
+        let preserve_outer_click_for_double_click = match clicked_button.as_ref() {
+            Some(TuiButton::DestPathField) => app
+                .convert
+                .dest_path_last_click
+                .map(|prev_time| now.duration_since(prev_time).as_millis() < 300)
+                .unwrap_or(false),
+            Some(TuiButton::MetadataField(kind)) => {
+                let field = ConvertMetadataField::from_button_kind(*kind);
+                app.convert
+                    .metadata_field_last_click
+                    .map(|(prev_field, prev_time)| {
+                        prev_field == field && now.duration_since(prev_time).as_millis() < 300
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !preserve_outer_click_for_double_click
+            && finish_inline_edit_before_focus_change(app, clicked_button.as_ref(), tx)
+        {
+            return;
+        }
     }
 
     // If wizard is active, forward to wizard
@@ -20028,38 +20081,42 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
             // ── Convert screen: preset bar ──
             TuiButton::PresetsButton => {
-                app.preset.overlay_list = super::presets::list_presets();
-                app.preset.overlay_selected = 0;
-                app.preset.naming_input = None;
-                app.preset.overlay_open = true;
+                app.preset.overlay_open = false;
+                super::command::open_file_picker_for_preset_load(app);
             }
             TuiButton::SaveButton => {
-                if let Some(name) = &app.preset.active_preset.clone() {
-                    let preset = super::presets::TuiPreset::from_pill_state(
-                        name,
-                        &app.convert.format,
-                        &app.convert.output_options,
-                    );
-                    match super::presets::save_preset_with_db(&preset, &app.db) {
-                        Ok(_) => {
-                            app.preset.modified = false;
-                            app.set_status(format!("Saved preset: {}", name));
-                        }
-                        Err(e) => app.set_status(format!("Save failed: {}", e)),
-                    }
+                if let Some(name) = app.preset.active_preset.clone() {
+                    let path = app
+                        .preset
+                        .active_preset_save_path()
+                        .unwrap_or_else(|| super::presets::preset_file_path(&name));
+                    app.active_overlay = ActiveOverlay::Confirmation {
+                        message: format!("Overwrite preset '{}'?", name),
+                        action: ConfirmAction::SavePresetOverwrite { name, path },
+                    };
                 } else {
-                    // No active preset — open overlay in naming mode
-                    app.preset.overlay_list = super::presets::list_presets();
-                    app.preset.overlay_selected = 0;
-                    app.preset.naming_input = Some(super::text_input::TextInputState::empty());
-                    app.preset.overlay_open = true;
+                    app.preset.overlay_open = false;
+                    super::command::open_file_picker_for_preset_save_as(app);
                 }
             }
 
             // ── Convert screen: editable text fields ──
             TuiButton::DestPathField => {
                 app.convert.focus = ConvertFocus::OutputOptions;
-                begin_output_options_inline_edit(app, OutputOptionsField::DestPath, None);
+                let now = std::time::Instant::now();
+                let is_double = app
+                    .convert
+                    .dest_path_last_click
+                    .map(|prev_time| now.duration_since(prev_time).as_millis() < 300)
+                    .unwrap_or(false);
+                if is_double {
+                    app.convert.dest_path_last_click = None;
+                    finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
+                    super::command::open_file_picker_for_convert_destination(app);
+                } else {
+                    app.convert.dest_path_last_click = Some(now);
+                    begin_output_options_inline_edit(app, OutputOptionsField::DestPath, None);
+                }
             }
             TuiButton::FolderTemplateField => {
                 app.convert.focus = ConvertFocus::OutputOptions;
@@ -20107,15 +20164,23 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::MetadataField(field) => {
                 app.convert.focus = ConvertFocus::Metadata;
-                begin_convert_metadata_inline_edit(
-                    app,
-                    ConvertMetadataField::from_button_kind(field),
-                    None,
-                );
-            }
-            TuiButton::MetadataEditTagsButton => {
-                app.convert.focus = ConvertFocus::Metadata;
-                open_convert_cursor_metadata_editor(app);
+                let field = ConvertMetadataField::from_button_kind(field);
+                let now = std::time::Instant::now();
+                let is_double = app
+                    .convert
+                    .metadata_field_last_click
+                    .map(|(prev_field, prev_time)| {
+                        prev_field == field && now.duration_since(prev_time).as_millis() < 300
+                    })
+                    .unwrap_or(false);
+                if is_double {
+                    app.convert.metadata_field_last_click = None;
+                    finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
+                    open_convert_cursor_metadata_editor(app);
+                } else {
+                    app.convert.metadata_field_last_click = Some((field, now));
+                    begin_convert_metadata_inline_edit(app, field, None);
+                }
             }
             TuiButton::MetadataFileRow(index) => {
                 app.convert.focus = ConvertFocus::Metadata;

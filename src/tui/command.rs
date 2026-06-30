@@ -1154,16 +1154,21 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 }
                 return;
             }
-            if let Some(name) = &app.preset.active_preset.clone() {
+            if let Some(name) = app.preset.active_preset.clone() {
+                let path = app
+                    .preset
+                    .active_preset_save_path()
+                    .unwrap_or_else(|| super::presets::preset_file_path(&name));
                 let preset = super::presets::TuiPreset::from_pill_state(
-                    name,
+                    &name,
                     &app.convert.format,
                     &app.convert.output_options,
                 );
-                match super::presets::save_preset_with_db(&preset, &app.db) {
+                match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
                     Ok(_) => {
+                        app.preset.set_active_preset_path(name.clone(), path.clone());
                         app.preset.modified = false;
-                        app.set_status(format!("Saved preset: {}", name));
+                        app.set_status(format!("Saved preset: {}", path.display()));
                     }
                     Err(e) => app.set_status(format!("Save failed: {}", e)),
                 }
@@ -1200,13 +1205,20 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 }
                 return;
             }
-            if let Some(name) = &app.preset.active_preset.clone() {
+            if let Some(name) = app.preset.active_preset.clone() {
+                let path = app
+                    .preset
+                    .active_preset_save_path()
+                    .unwrap_or_else(|| super::presets::preset_file_path(&name));
                 let preset = super::presets::TuiPreset::from_pill_state(
-                    name,
+                    &name,
                     &app.convert.format,
                     &app.convert.output_options,
                 );
-                super::presets::save_preset_with_db(&preset, &app.db).ok();
+                if super::presets::save_preset_to_path_with_db(&preset, &path, &app.db).is_ok() {
+                    app.preset.set_active_preset_path(name, path);
+                    app.preset.modified = false;
+                }
             }
             app.should_quit = true;
         }
@@ -1383,7 +1395,8 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             &mut app.convert.format,
                             &mut app.convert.output_options,
                         );
-                        app.preset.active_preset = Some(name.clone());
+                        app.preset
+                            .set_active_preset_path(name.clone(), super::presets::preset_file_path(&name));
                         app.preset.modified = false;
                         app.set_status(format!("Loaded preset: {}", name));
                     }
@@ -1400,11 +1413,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &app.convert.format,
                     &app.convert.output_options,
                 );
-                match super::presets::save_preset_with_db(&preset, &app.db) {
+                let path = super::presets::preset_file_path(&name);
+                match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
                     Ok(_) => {
-                        app.preset.active_preset = Some(name.clone());
+                        app.preset.set_active_preset_path(name.clone(), path.clone());
                         app.preset.modified = false;
-                        app.set_status(format!("Saved preset: {}", name));
+                        app.set_status(format!("Saved preset: {}", path.display()));
                     }
                     Err(e) => app.set_status(format!("Save failed: {}", e)),
                 }
@@ -4021,10 +4035,11 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
     // Helper: load a named preset into the format/output-options pills.
     // Returns Ok(()) on success, Err(status_message) on failure.
     let load_preset_into_pills = |app: &mut AppState, name: &str| -> Result<(), String> {
-        match super::presets::load_preset(name) {
+        let path = super::presets::preset_file_path(name);
+        match super::presets::load_preset_from_path(&path) {
             Ok(p) => {
                 p.apply_to_pills(&mut app.convert.format, &mut app.convert.output_options);
-                app.preset.active_preset = Some(name.to_string());
+                app.preset.set_active_preset_path(name.to_string(), path);
                 app.preset.modified = false;
                 Ok(())
             }
@@ -4782,6 +4797,99 @@ fn directory_destination_picker_policy() -> tui_file_picker::FileOperationPolicy
         allow_copy: false,
         allow_paste: false,
         allow_delete: false,
+        symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
+        cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
+        delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+    }
+}
+
+/// Open the Convert output-options destination picker. The picker starts in the
+/// currently configured destination directory when possible, otherwise in the
+/// user's home directory/current directory fallback.
+pub(super) fn open_file_picker_for_convert_destination(app: &mut AppState) {
+    let start_dir = app
+        .convert
+        .output_options
+        .dest_path
+        .as_ref()
+        .filter(|path| path.is_dir())
+        .cloned()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+        start_dir,
+        filter: tui_file_picker::FilePickerFilter::All,
+        title: "Select destination folder".to_string(),
+        theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
+        selection_mode: tui_file_picker::FilePickerSelectionMode::Directories,
+        operation_policy: directory_destination_picker_policy(),
+        ..tui_file_picker::FilePickerConfig::default()
+    });
+    app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+        FilePickerPurpose::SelectDestination,
+        picker,
+    ));
+    app.set_status("choose a destination folder");
+}
+
+/// Open the Convert preset picker in load mode.
+pub(super) fn open_file_picker_for_preset_load(app: &mut AppState) {
+    let start_dir = super::presets::presets_dir();
+    let _ = fs::create_dir_all(&start_dir);
+    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+        start_dir,
+        filter: tui_file_picker::FilePickerFilter::Custom { label: "Presets".to_string(), extensions: vec!["toml".to_string()] },
+        title: "Load preset".to_string(),
+        theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
+        selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
+        hide_extension: Some(".toml".to_string()),
+        operation_policy: preset_picker_policy(),
+        ..tui_file_picker::FilePickerConfig::default()
+    });
+    app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+        FilePickerPurpose::SelectPreset,
+        picker,
+    ));
+    app.set_status("choose a preset");
+}
+
+/// Open the Convert preset picker in reusable save-as mode.
+pub(super) fn open_file_picker_for_preset_save_as(app: &mut AppState) {
+    let start_dir = super::presets::presets_dir();
+    let _ = fs::create_dir_all(&start_dir);
+    let default_name = app.preset.active_preset.clone().unwrap_or_default();
+    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+        start_dir,
+        filter: tui_file_picker::FilePickerFilter::Custom { label: "Presets".to_string(), extensions: vec!["toml".to_string()] },
+        title: "Save preset".to_string(),
+        theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
+        selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
+        hide_extension: Some(".toml".to_string()),
+        save_mode: Some(tui_file_picker::SaveModeConfig {
+            default_name,
+            confirm_overwrite: true,
+            hide_extension: Some(".toml".to_string()),
+            style: tui_file_picker::SaveModeStyle::Inline,
+        }),
+        operation_policy: preset_picker_policy(),
+        ..tui_file_picker::FilePickerConfig::default()
+    });
+    app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+        FilePickerPurpose::SavePreset,
+        picker,
+    ));
+    app.set_status("enter a preset name and press Enter to save");
+}
+
+fn preset_picker_policy() -> tui_file_picker::FileOperationPolicy {
+    tui_file_picker::FileOperationPolicy {
+        allow_new_file: false,
+        allow_new_folder: false,
+        allow_cut: false,
+        allow_copy: false,
+        allow_paste: false,
+        allow_delete: true,
         symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
         cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
         delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,

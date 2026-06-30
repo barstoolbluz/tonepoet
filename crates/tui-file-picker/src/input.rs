@@ -19,6 +19,8 @@ impl FilePickerState {
             FilePickerFocus::Properties => self.handle_properties_key(key),
             FilePickerFocus::DeleteConfirm => self.handle_delete_confirm_key(key),
             FilePickerFocus::CreateName => self.handle_create_name_key(key),
+            FilePickerFocus::SaveName => self.handle_save_name_key(key),
+            FilePickerFocus::SaveOverwriteConfirm => self.handle_save_overwrite_confirm_key(key),
         }
     }
 
@@ -319,6 +321,36 @@ impl FilePickerState {
         FilePickerAction::None
     }
 
+
+    fn handle_save_name_key(&mut self, key: KeyEvent) -> FilePickerAction {
+        match key.code {
+            KeyCode::Esc => FilePickerAction::Cancelled,
+            KeyCode::Tab => {
+                self.complete_save_name_from_entries();
+                FilePickerAction::None
+            }
+            KeyCode::Enter => self.commit_save_name(),
+            _ => {
+                edit_text(&mut self.save_name_buffer, &mut self.save_name_cursor, key);
+                FilePickerAction::None
+            }
+        }
+    }
+
+
+    fn handle_save_overwrite_confirm_key(&mut self, key: KeyEvent) -> FilePickerAction {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.cancel_save_overwrite();
+                FilePickerAction::None
+            }
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.confirm_save_overwrite()
+            }
+            _ => FilePickerAction::None,
+        }
+    }
+
     fn apply_click_action(&mut self, action: FilePickerHitAction) -> FilePickerAction {
         let now = Instant::now();
         let is_double_click = self
@@ -386,6 +418,13 @@ impl FilePickerState {
                 self.cancel_delete();
                 FilePickerAction::None
             }
+            FilePickerHitAction::SaveName => self.commit_save_name(),
+            FilePickerHitAction::SaveCancel => FilePickerAction::Cancelled,
+            FilePickerHitAction::SaveOverwriteConfirm => self.confirm_save_overwrite(),
+            FilePickerHitAction::SaveOverwriteCancel => {
+                self.cancel_save_overwrite();
+                FilePickerAction::None
+            }
         }
     }
 
@@ -418,6 +457,15 @@ impl FilePickerState {
                 }
                 FilePickerAction::None
             }
+            ToolbarAction::Rename => {
+                self.begin_rename_current();
+                FilePickerAction::None
+            }
+            ToolbarAction::Duplicate => {
+                self.begin_duplicate_current();
+                FilePickerAction::None
+            }
+            ToolbarAction::Delete => self.apply_menu_action_if_enabled(FilePickerMenuAction::Delete),
             ToolbarAction::AcceptSelection => self.accept_current_selection(),
             ToolbarAction::Go => self.commit_address(),
         }

@@ -11,9 +11,6 @@ use ratatui::{
 use super::app::{ConvertMetadataField, MetadataState, SourceMode};
 use super::inline_edit::{inline_cursor_col, render_inline_value};
 
-/// Action pill label that opens the full metadata editor overlay from the compact metadata pane.
-pub const EDIT_TAGS_PILL_LABEL: &str = " edit tags ";
-
 /// Draw the metadata pane with purple border.
 pub fn draw_metadata_pane(
     f: &mut Frame,
@@ -40,12 +37,7 @@ pub fn draw_metadata_pane(
         theme.border(border_color),
     ));
 
-    let show_edit_tags_pill = edit_tags_pill_visible(area.height);
-    let reserved_pill_rows = if show_edit_tags_pill { 1 } else { 0 };
-    let list_visible_rows = area
-        .height
-        .saturating_sub(2)
-        .saturating_sub(reserved_pill_rows as u16) as usize;
+    let list_visible_rows = area.height.saturating_sub(2) as usize;
 
     let mut lines = vec![top_line];
     match source_mode {
@@ -77,15 +69,6 @@ pub fn draw_metadata_pane(
     }
 
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
-    if show_edit_tags_pill {
-        let pill_line_index = target_len_before_bottom.saturating_sub(1);
-        while lines.len() < pill_line_index {
-            lines.push(bordered_line(border_color, w, vec![], theme));
-        }
-        if lines.len() == pill_line_index {
-            lines.push(edit_tags_pill_row(border_color, w, theme));
-        }
-    }
     while lines.len() < target_len_before_bottom {
         lines.push(bordered_line(border_color, w, vec![], theme));
     }
@@ -105,51 +88,6 @@ pub fn draw_metadata_pane(
     }
 }
 
-
-pub fn edit_tags_pill_visible(height: u16) -> bool {
-    height >= 6
-}
-
-pub fn edit_tags_pill_rect(area: Rect) -> Option<Rect> {
-    if !edit_tags_pill_visible(area.height) {
-        return None;
-    }
-    let inner_w = area.width.saturating_sub(2);
-    let pill_w = EDIT_TAGS_PILL_LABEL.chars().count() as u16;
-    let right_margin = 3u16;
-    if inner_w < pill_w.saturating_add(right_margin) {
-        return None;
-    }
-    let x = area.x + 1 + inner_w - pill_w - right_margin;
-    let y = area.y + area.height.saturating_sub(2);
-    Some(Rect::new(x, y, pill_w, 1))
-}
-
-fn edit_tags_pill_row<'a>(
-    border_color: ratatui::style::Color,
-    width: usize,
-    theme: super::theme::Theme,
-) -> Line<'a> {
-    let content_width = width.saturating_sub(2);
-    let pill_w = EDIT_TAGS_PILL_LABEL.chars().count();
-    let right_margin = 3usize;
-    let pad = content_width.saturating_sub(pill_w + right_margin);
-    bordered_line(
-        border_color,
-        width,
-        vec![
-            Span::raw(" ".repeat(pad)),
-            Span::styled(
-                EDIT_TAGS_PILL_LABEL,
-                Style::default()
-                    .fg(theme.pill_active_fg)
-                    .bg(theme.purple)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ],
-        theme,
-    )
-}
 
 fn metadata_edit_cursor(
     metadata: &MetadataState,

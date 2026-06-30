@@ -1,7 +1,7 @@
 //! TUI preset management: save/load pill state to TOML files
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -318,37 +318,58 @@ pub fn list_presets_by_format() -> Vec<(Option<AudioFormat>, Vec<String>)> {
     result
 }
 
-/// Load a preset by name
+/// Return the canonical file path for a named preset in the configured presets directory.
+pub fn preset_file_path(name: &str) -> PathBuf {
+    presets_dir().join(format!("{}.toml", name))
+}
+
+/// Load a preset by name from the configured presets directory.
 pub fn load_preset(name: &str) -> Result<TuiPreset, String> {
-    let dir = presets_dir();
-    let path = dir.join(format!("{}.toml", name));
+    let path = preset_file_path(name);
+    load_preset_from_path(&path)
+}
 
-    let contents = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read preset '{}': {}", name, e))?;
+/// Load a preset from an explicit path returned by a file picker.
+pub fn load_preset_from_path(path: &Path) -> Result<TuiPreset, String> {
+    let display_name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("preset");
+    let contents = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read preset '{}': {}", path.display(), e))?;
 
-    // Try parsing as TuiPreset (version 2) first
-    if let Ok(preset) = toml::from_str::<TuiPreset>(&contents) {
+    // Try parsing as TuiPreset (version 2) first.
+    if let Ok(mut preset) = toml::from_str::<TuiPreset>(&contents) {
+        preset.name = display_name.to_string();
         return Ok(preset);
     }
 
-    // Fall back to legacy wizard preset
-    let legacy: tonepoet_wizard::ConversionPreset = toml::from_str(&contents)
-        .map_err(|e| format!("Failed to parse preset '{}': {}", name, e))?;
-
-    Ok(TuiPreset::from_legacy(&legacy))
+    // Fall back to legacy wizard preset.
+    let mut preset = TuiPreset::from_legacy(
+        &toml::from_str::<tonepoet_wizard::ConversionPreset>(&contents)
+            .map_err(|e| format!("Failed to parse preset '{}': {}", path.display(), e))?,
+    );
+    preset.name = display_name.to_string();
+    Ok(preset)
 }
 
-/// Save a preset to disk
+/// Save a preset to disk in the configured presets directory.
 pub fn save_preset(preset: &TuiPreset) -> Result<(), String> {
-    let dir = presets_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create presets directory: {}", e))?;
+    let path = preset_file_path(&preset.name);
+    save_preset_to_path(preset, &path)
+}
 
-    let path = dir.join(format!("{}.toml", preset.name));
+/// Save a preset to an explicit path returned by a file picker.
+pub fn save_preset_to_path(preset: &TuiPreset, path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create preset directory '{}': {}", parent.display(), e))?;
+    }
     let contents =
         toml::to_string_pretty(preset).map_err(|e| format!("Failed to serialize preset: {}", e))?;
 
-    fs::write(&path, contents)
-        .map_err(|e| format!("Failed to write preset '{}': {}", preset.name, e))?;
+    fs::write(path, contents)
+        .map_err(|e| format!("Failed to write preset '{}': {}", path.display(), e))?;
 
     Ok(())
 }
@@ -382,6 +403,22 @@ pub fn delete_preset(name: &str) -> Result<(), String> {
 /// Save a preset to both TOML and SQLite.
 pub fn save_preset_with_db(preset: &TuiPreset, db: &crate::db::Database) -> Result<(), String> {
     save_preset(preset)?;
+    store_preset_in_db(preset, db);
+    Ok(())
+}
+
+/// Save a preset to an explicit path and index it in SQLite under the file stem.
+pub fn save_preset_to_path_with_db(
+    preset: &TuiPreset,
+    path: &Path,
+    db: &crate::db::Database,
+) -> Result<(), String> {
+    save_preset_to_path(preset, path)?;
+    store_preset_in_db(preset, db);
+    Ok(())
+}
+
+fn store_preset_in_db(preset: &TuiPreset, db: &crate::db::Database) {
     let _ = db.store_preset(
         &preset.name,
         &preset.format,
@@ -394,7 +431,6 @@ pub fn save_preset_with_db(preset: &TuiPreset, db: &crate::db::Database) -> Resu
         Some(&preset.filename_template),
         Some(&preset.merge),
     );
-    Ok(())
 }
 
 /// Delete a preset from both TOML and SQLite.

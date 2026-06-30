@@ -429,6 +429,73 @@ fn reduce_file_picker_complete(
                 conflict_policy,
             );
         }
+        super::app::FilePickerPurpose::SelectDestination => {
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status("file picker: ignored stale destination completion");
+                return;
+            }
+            match path {
+                Some(path) if path.is_dir() => {
+                    app.convert.output_options.dest_path = Some(path.clone());
+                    app.preset.mark_modified();
+                    app.set_status(format!("destination: {}", path.display()));
+                }
+                Some(path) => {
+                    app.set_status(format!("destination is not a directory: {}", path.display()));
+                }
+                None => app.set_status("destination picker cancelled"),
+            }
+        }
+        super::app::FilePickerPurpose::SelectPreset => {
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status("file picker: ignored stale preset completion");
+                return;
+            }
+            let Some(path) = path else {
+                app.set_status("preset load cancelled");
+                return;
+            };
+            let Some(name) = path.file_stem().and_then(|name| name.to_str()).map(str::to_string) else {
+                app.set_status(format!("invalid preset path: {}", path.display()));
+                return;
+            };
+            match super::presets::load_preset_from_path(&path) {
+                Ok(preset) => {
+                    preset.apply_to_pills(&mut app.convert.format, &mut app.convert.output_options);
+                    app.preset.set_active_preset_path(name.clone(), path.clone());
+                    app.preset.modified = false;
+                    app.set_status(format!("Loaded preset: {}", path.display()));
+                }
+                Err(e) => app.set_status(format!("Load failed: {}", e)),
+            }
+        }
+        super::app::FilePickerPurpose::SavePreset => {
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status("file picker: ignored stale preset-save completion");
+                return;
+            }
+            let Some(path) = path else {
+                app.set_status("preset save cancelled");
+                return;
+            };
+            let Some(name) = path.file_stem().and_then(|name| name.to_str()).map(str::to_string) else {
+                app.set_status(format!("invalid preset path: {}", path.display()));
+                return;
+            };
+            let preset = super::presets::TuiPreset::from_pill_state(
+                &name,
+                &app.convert.format,
+                &app.convert.output_options,
+            );
+            match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
+                Ok(()) => {
+                    app.preset.set_active_preset_path(name.clone(), path.clone());
+                    app.preset.modified = false;
+                    app.set_status(format!("Saved preset: {}", path.display()));
+                }
+                Err(e) => app.set_status(format!("Save failed: {}", e)),
+            }
+        }
         super::app::FilePickerPurpose::Generic { id } => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status(format!("file picker purpose '{id}': ignored stale completion"));

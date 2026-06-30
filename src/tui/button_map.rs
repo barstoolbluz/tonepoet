@@ -100,8 +100,6 @@ pub enum TuiButton {
     CompanionExtensionsField,
     CompanionFoldersField,
     MetadataField(MetadataFieldKind),
-    /// Convert metadata-pane action pill that opens the full metadata editor overlay.
-    MetadataEditTagsButton,
     /// Convert metadata file-list row (absolute source index).
     MetadataFileRow(usize),
 
@@ -413,7 +411,6 @@ impl TuiButton {
             | Self::CompanionExtensionsField
             | Self::CompanionFoldersField
             | Self::MetadataField(_)
-            | Self::MetadataEditTagsButton
             | Self::MetadataFileRow(_)
             | Self::SourceBrowseButton
             | Self::SourceExpandButton
@@ -526,16 +523,3 @@ impl Default for ButtonRenderMap {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::TuiButton;
-    use crate::tui::app::AppScreen;
-
-    #[test]
-    fn metadata_edit_tags_button_belongs_to_convert_screen() {
-        assert_eq!(
-            TuiButton::MetadataEditTagsButton.screen(),
-            Some(AppScreen::Convert)
-        );
-    }
-}

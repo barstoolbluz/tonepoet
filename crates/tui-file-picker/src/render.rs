@@ -1,7 +1,7 @@
 use crate::state::{
     intersect_rect, ConflictPolicyPreset, DeleteConfirmButton, FilePickerCreateKind, FilePickerFocus,
     FilePickerHitAction, FilePickerMenuAction, FilePickerSelectionMode, FilePickerState, HitRegion,
-    ToolbarAction,
+    SaveModeStyle, ToolbarAction,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -122,7 +122,27 @@ impl FilePickerState {
         frame.render_widget(block, area);
 
         let toolbar_area;
-        if self.conflict_policy.is_some() {
+        if self.save_mode_style() == Some(SaveModeStyle::Inline) {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            toolbar_area = rows[0];
+            self.render_toolbar(frame, rows[0]);
+            self.render_address(frame, rows[1]);
+            self.render_split_pane(frame, rows[2], &mut image_ctx);
+            self.render_save_name_row(frame, rows[3]);
+            self.render_save_path_row(frame, rows[4]);
+            self.render_status(frame, rows[5]);
+        } else if self.conflict_policy.is_some() {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -170,6 +190,18 @@ impl FilePickerState {
         if self.focus == FilePickerFocus::CreateName {
             self.render_create_name_popup(frame, area);
         }
+        if self.save_mode_style() == Some(SaveModeStyle::Modal)
+            && self.focus == FilePickerFocus::SaveName
+        {
+            self.render_save_name_modal(frame, area);
+        }
+        if self.focus == FilePickerFocus::SaveOverwriteConfirm {
+            self.render_save_overwrite_confirm_popup(frame, area);
+        }
+    }
+
+    fn save_mode_style(&self) -> Option<SaveModeStyle> {
+        self.save_mode.as_ref().map(|save_mode| save_mode.style)
     }
 
     fn render_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -181,13 +213,20 @@ impl FilePickerState {
             ("› Forward".to_string(), Some(ToolbarAction::Forward), self.history_forward.is_empty()),
             ("↑ Up".to_string(), Some(ToolbarAction::Up), self.current_dir.parent().is_none()),
             ("│".to_string(), None, true),
-            (
+        ];
+        if self.hide_extension.as_deref() == Some(".toml") {
+            let no_selection = self.current_selection().is_none();
+            buttons.push(("Rename".to_string(), Some(ToolbarAction::Rename), no_selection));
+            buttons.push(("Duplicate".to_string(), Some(ToolbarAction::Duplicate), no_selection));
+            buttons.push(("Delete".to_string(), Some(ToolbarAction::Delete), no_selection || !self.operation_policy.allow_delete));
+        } else {
+            buttons.push((
                 (if self.menu_open { "File Operations ▴" } else { "File Operations ▾" }).to_string(),
                 Some(ToolbarAction::FileOperations),
                 false,
-            ),
-            ("Properties".to_string(), Some(ToolbarAction::Properties), self.current_selection().is_none()),
-        ];
+            ));
+            buttons.push(("Properties".to_string(), Some(ToolbarAction::Properties), self.current_selection().is_none()));
+        }
         if self.selection_mode == FilePickerSelectionMode::Directories {
             buttons.push(("Select Folder".to_string(), Some(ToolbarAction::AcceptSelection), false));
         }
@@ -504,6 +543,68 @@ impl FilePickerState {
     }
 
 
+
+    fn render_save_name_row(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let label = "Save as:";
+        let extension = self
+            .save_mode
+            .as_ref()
+            .and_then(|save_mode| save_mode.hide_extension.as_deref())
+            .unwrap_or("");
+        let extension_badge = if extension.is_empty() {
+            String::new()
+        } else {
+            format!(" ({extension})")
+        };
+        let input_width = area
+            .width
+            .saturating_sub(label.chars().count() as u16)
+            .saturating_sub(extension_badge.chars().count() as u16)
+            .saturating_sub(3) as usize;
+        let input = text_with_caret(&self.save_name_buffer, self.save_name_cursor, input_width);
+        let line = Line::from(vec![
+            Span::styled(label.to_string(), self.theme.label),
+            Span::raw(" "),
+            Span::styled(input, self.theme.text),
+            Span::styled(extension_badge, self.theme.text_dim),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        let input_x = area.x.saturating_add(label.chars().count() as u16 + 1);
+        let _ = self.record_hit_region_clipped(
+            Rect::new(input_x, area.y, input_width as u16, 1),
+            area,
+            FilePickerHitAction::SaveName,
+        );
+    }
+
+    fn render_save_path_row(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let extension = self
+            .save_mode
+            .as_ref()
+            .and_then(|save_mode| save_mode.hide_extension.as_deref());
+        let file_name = append_display_extension(&self.save_name_buffer, extension);
+        let path = self.current_dir.join(file_name);
+        let save_label = "↵ Save";
+        let save_width = button_width(save_label);
+        let hint = "[Tab] list";
+        let available = area.width.saturating_sub(save_width).saturating_sub(hint.chars().count() as u16).saturating_sub(4) as usize;
+        let path_text = fit_text_right(&format!("→ {}", path.display()), available);
+        let line = Line::from(vec![
+            Span::styled(path_text, self.theme.text_dim),
+            Span::raw("  "),
+            Span::styled(hint.to_string(), self.theme.text_dim),
+            Span::raw("  "),
+            button_span(save_label, self.theme.button_focused),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        let save_x = area.x.saturating_add(area.width.saturating_sub(save_width));
+        let _ = self.record_hit_region_clipped(
+            Rect::new(save_x, area.y, save_width, 1),
+            area,
+            FilePickerHitAction::SaveName,
+        );
+    }
+
     fn render_conflict_policy_row(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let Some(selected_policy) = self.conflict_policy else {
             return;
@@ -765,13 +866,113 @@ impl FilePickerState {
         );
     }
 
+
+
+    fn render_save_name_modal(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let popup = centered_rect(area, 62, 34);
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border)
+            .title(" Save As ");
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let extension = self
+            .save_mode
+            .as_ref()
+            .and_then(|save_mode| save_mode.hide_extension.as_deref())
+            .unwrap_or("");
+        let input_width = inner.width.saturating_sub(8) as usize;
+        let input = text_with_caret(&self.save_name_buffer, self.save_name_cursor, input_width);
+        let into = fit_text_right(&self.current_dir.display().to_string(), inner.width.saturating_sub(8) as usize);
+        let ext = if extension.is_empty() { "(none)" } else { extension };
+
+        let save_label = "Save";
+        let cancel_label = "Cancel";
+        let save_width = button_width(save_label);
+        let cancel_width = button_width(cancel_label);
+        let gap = 4u16;
+        let total_width = cancel_width.saturating_add(gap).saturating_add(save_width);
+        let button_x = inner.x.saturating_add(inner.width.saturating_sub(total_width) / 2);
+        let button_y = inner.y.saturating_add(inner.height.saturating_sub(1));
+
+        let lines = vec![
+            Line::from(vec![Span::styled("Name: ", self.theme.label), Span::styled(input, self.theme.text)]),
+            Line::from(vec![Span::styled("Into: ", self.theme.label), Span::styled(into, self.theme.text_dim)]),
+            Line::from(vec![Span::styled("Ext:  ", self.theme.label), Span::styled(ext.to_string(), self.theme.text_dim)]),
+            Line::from(""),
+            Line::from(Span::styled("Enter saves; Esc cancels", self.theme.text_dim)),
+        ];
+        let text_height = button_y.saturating_sub(inner.y);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), Rect::new(inner.x, inner.y, inner.width, text_height));
+
+        let line = Line::from(vec![
+            button_span(cancel_label, self.theme.button),
+            Span::raw(" ".repeat(gap as usize)),
+            button_span(save_label, self.theme.button_focused),
+        ]);
+        frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, total_width, 1));
+        self.record_hit_region(Rect::new(button_x, button_y, cancel_width, 1), FilePickerHitAction::SaveCancel);
+        self.record_hit_region(
+            Rect::new(button_x.saturating_add(cancel_width).saturating_add(gap), button_y, save_width, 1),
+            FilePickerHitAction::SaveName,
+        );
+    }
+
+    fn render_save_overwrite_confirm_popup(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let popup = centered_rect(area, 58, 26);
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border)
+            .title(" Confirm overwrite ");
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let target = self
+            .pending_save_path
+            .as_ref()
+            .map(|path| clean_display_text(&path.display().to_string()))
+            .unwrap_or_else(|| "selected preset".to_string());
+        let text_width = inner.width.saturating_sub(4) as usize;
+        let message = indent_text("Overwrite existing file?", 2, text_width);
+        let path_line = format!("  {}", fit_text_right(&target, text_width.saturating_sub(2)));
+        let yes_label = "Overwrite";
+        let no_label = "Cancel";
+        let yes_width = button_width(yes_label);
+        let no_width = button_width(no_label);
+        let gap = 4u16;
+        let total_width = yes_width.saturating_add(gap).saturating_add(no_width);
+        let button_x = inner.x.saturating_add(inner.width.saturating_sub(total_width) / 2);
+        let button_y = inner.y.saturating_add(inner.height.saturating_sub(1));
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(message, self.theme.text)),
+            Line::from(""),
+            Line::from(Span::styled(path_line, self.theme.text_dim)),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), Rect::new(inner.x, inner.y, inner.width, button_y.saturating_sub(inner.y)));
+        let line = Line::from(vec![
+            button_span(yes_label, self.theme.button_focused),
+            Span::raw(" ".repeat(gap as usize)),
+            button_span(no_label, self.theme.button),
+        ]);
+        frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, total_width, 1));
+        self.record_hit_region(Rect::new(button_x, button_y, yes_width, 1), FilePickerHitAction::SaveOverwriteConfirm);
+        self.record_hit_region(
+            Rect::new(button_x.saturating_add(yes_width).saturating_add(gap), button_y, no_width, 1),
+            FilePickerHitAction::SaveOverwriteCancel,
+        );
+    }
+
     fn render_create_name_popup(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let popup = centered_rect(area, 58, 26);
         frame.render_widget(Clear, popup);
-        let kind = self.pending_create.unwrap_or(FilePickerCreateKind::File);
-        let title = match kind {
-            FilePickerCreateKind::File => "New file",
-            FilePickerCreateKind::Folder => "New folder",
+        let title = match self.pending_name_action {
+            Some(crate::state::FilePickerNameAction::Rename) => "Rename",
+            Some(crate::state::FilePickerNameAction::Duplicate) => "Duplicate",
+            Some(crate::state::FilePickerNameAction::Create(FilePickerCreateKind::Folder)) => "New folder",
+            _ => "New file",
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -784,7 +985,7 @@ impl FilePickerState {
         let lines = vec![
             Line::from(vec![Span::styled("Name: ", self.theme.label), Span::styled(input, self.theme.text)]),
             Line::from(""),
-            Line::from(Span::styled("Enter creates; Esc cancels", self.theme.text_dim)),
+            Line::from(Span::styled("Enter confirms; Esc cancels", self.theme.text_dim)),
         ];
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
@@ -828,6 +1029,17 @@ fn button_width(label: &str) -> u16 {
 
 fn button_span(label: &str, style: ratatui::style::Style) -> Span<'static> {
     Span::styled(format!(" {label} "), style)
+}
+
+
+fn append_display_extension(name: &str, extension: Option<&str>) -> String {
+    let mut out = name.trim().to_string();
+    if let Some(extension) = extension.filter(|extension| !extension.is_empty()) {
+        if !out.ends_with(extension) {
+            out.push_str(extension);
+        }
+    }
+    out
 }
 
 fn clean_display_text(text: &str) -> String {
