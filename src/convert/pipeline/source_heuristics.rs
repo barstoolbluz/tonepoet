@@ -403,7 +403,7 @@ mod tests {
 
         let mut source = PreparedSource {
             container: PathBuf::from("archive.7z"),
-            kind: SourceKind::SevenZip,
+            kind: SourceKind::Archive,
             tracks: vec![PreparedTrack {
                 id: TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
                 source_ref: TrackSourceRef::StagedFile(PathBuf::from("01.flac")),
@@ -428,7 +428,7 @@ mod tests {
                 ..AlbumMetadata::default()
             },
             provenance: ExtractionProvenance {
-                source_kind: SourceKind::SevenZip,
+                source_kind: SourceKind::Archive,
                 source_sha256: None,
                 tool_versions: BTreeMap::new(),
                 extracted_at: chrono::Utc::now(),
@@ -501,7 +501,7 @@ mod tests {
 
         let mut source = PreparedSource {
             container: PathBuf::from("archive.7z"),
-            kind: SourceKind::SevenZip,
+            kind: SourceKind::Archive,
             tracks: vec![PreparedTrack {
                 id: TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
                 source_ref: TrackSourceRef::StagedFile(PathBuf::from("01.flac")),
@@ -526,7 +526,7 @@ mod tests {
                 ..AlbumMetadata::default()
             },
             provenance: ExtractionProvenance {
-                source_kind: SourceKind::SevenZip,
+                source_kind: SourceKind::Archive,
                 source_sha256: None,
                 tool_versions: BTreeMap::new(),
                 extracted_at: chrono::Utc::now(),

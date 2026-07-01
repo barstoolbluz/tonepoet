@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 /// Supported file formats (archives and audio)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileFormat {
-    /// 7-Zip archive (may contain audio files)
-    SevenZip,
+    /// Archive container handled by the external 7z/7zz extractor.
+    #[serde(alias = "SevenZip")]
+    Archive,
     /// CUE sheet control file. The CUE materializer resolves referenced audio
     /// image(s); the `.cue` file itself is not probed as audio and is not an
     /// archive surrogate.
@@ -598,17 +599,17 @@ impl FormatDetector {
             || name_lower.ends_with(".tar.lz")
             || name_lower.ends_with(".tar.lzma")
         {
-            return Ok(FileFormat::SevenZip);
+            return Ok(FileFormat::Archive);
         }
 
         // Structured disc directories do not necessarily have filename
         // extensions. Admit recognized Blu-ray roots/BDMV directories before
         // extension-based detection so the pipeline source-kind detector can
         // route them to BlurayMaterializer later. FileFormat has no dedicated
-        // Blu-ray arm today; SevenZip is the existing container admission class
+        // Blu-ray arm today; Archive is the existing container admission class
         // used for ISOs and other non-audio inputs.
         if path.is_dir() && crate::disc::bluray_utils::is_bluray_source(path) {
-            return Ok(FileFormat::SevenZip);
+            return Ok(FileFormat::Archive);
         }
 
         let Some(extension) = path
@@ -620,7 +621,7 @@ impl FormatDetector {
             // Keep this check after the cheap directory fast path so normal
             // extension-bearing file scans do not pay an ISO probe cost.
             if path.is_file() && crate::disc::bluray_utils::is_bluray_source(path) {
-                return Ok(FileFormat::SevenZip);
+                return Ok(FileFormat::Archive);
             }
             return Err(super::ConversionError::UnsupportedFormat(format!(
                 "No file extension found for: {}",
@@ -631,10 +632,10 @@ impl FormatDetector {
         match extension.as_str() {
             // Archives — all handled by 7zz/7z extraction pipeline.
             "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "dmg" | "tgz" | "tbz2" | "txz" => {
-                Ok(FileFormat::SevenZip)
+                Ok(FileFormat::Archive)
             }
             // Control files that route to the CUE materializer. These are
-            // deliberately distinct from SevenZip: treating `.cue` as an
+            // deliberately distinct from Archive: treating `.cue` as an
             // archive lets it pass the detector but sends the wrong signal to
             // downstream code and hides probe/routing mistakes.
             "cue" => Ok(FileFormat::CueSheet),
@@ -688,7 +689,7 @@ impl FormatDetector {
     pub fn detect_audio(path: &Path) -> Result<AudioFormat, super::ConversionError> {
         match Self::detect(path)? {
             FileFormat::Audio(format) => Ok(format),
-            FileFormat::SevenZip => Err(super::ConversionError::UnsupportedFormat(
+            FileFormat::Archive => Err(super::ConversionError::UnsupportedFormat(
                 "Expected audio file, found archive".to_string(),
             )),
             FileFormat::CueSheet => Err(super::ConversionError::UnsupportedFormat(
@@ -801,13 +802,41 @@ mod tests {
     }
 
     #[test]
+    fn detect_archive_extensions_as_generic_archive_format() {
+        for name in [
+            "album.7z",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.iso",
+            "album.cab",
+            "album.dmg",
+            "album.tgz",
+            "album.tbz2",
+            "album.txz",
+            "album.tar.gz",
+            "album.tar.bz2",
+            "album.tar.xz",
+            "album.tar.zst",
+            "album.tar.lz",
+            "album.tar.lzma",
+        ] {
+            assert_eq!(
+                FormatDetector::detect(Path::new(name)).expect("archive format"),
+                FileFormat::Archive,
+                "{name} should be admitted as a generic archive"
+            );
+        }
+    }
+
+    #[test]
     fn detect_accepts_bluray_disc_root_without_extension() {
         let temp = TempDir::new("bluray-root");
         write_minimal_bluray_layout(&temp.path);
 
         assert_eq!(
             FormatDetector::detect(&temp.path).expect("Blu-ray root is queue-admissible"),
-            FileFormat::SevenZip
+            FileFormat::Archive
         );
     }
 
@@ -819,7 +848,7 @@ mod tests {
         assert_eq!(
             FormatDetector::detect(&temp.path.join("BDMV"))
                 .expect("BDMV directory is queue-admissible"),
-            FileFormat::SevenZip
+            FileFormat::Archive
         );
     }
 

@@ -970,7 +970,7 @@ mod cue_sidecar_commit_metadata_tests {
     fn active_item(path: PathBuf) -> ConversionItem {
         let mut options = ConversionOptions::default();
         options.pipeline_settings = Some(PipelineSettings::default());
-        let mut item = ConversionItem::new(path, crate::convert::FileFormat::SevenZip, options);
+        let mut item = ConversionItem::new(path, crate::convert::FileFormat::Archive, options);
         item.status = ConversionStatus::Queued;
         item
     }

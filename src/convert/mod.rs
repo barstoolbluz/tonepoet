@@ -133,7 +133,7 @@ impl DirectoryQueuePlan {
         match format {
             FileFormat::CueSheet => push_unique_path(&mut self.cue_sheets, path),
             FileFormat::Audio(_) => push_unique_path(&mut self.audio_files, path),
-            FileFormat::SevenZip => push_unique_path(&mut self.other_queueable, path),
+            FileFormat::Archive => push_unique_path(&mut self.other_queueable, path),
         }
     }
 
@@ -1410,7 +1410,7 @@ mod bluray_queue_admission_tests {
 
         let item = queued_item(&manager, &item_id);
         assert_eq!(item.input_path.as_path(), temp.path.as_path());
-        assert_eq!(item.input_format, FileFormat::SevenZip);
+        assert_eq!(item.input_format, FileFormat::Archive);
         assert!(matches!(&item.status, ConversionStatus::Queued));
         assert!(item.pipeline_settings.is_some());
         assert!(item.options.pipeline_settings.is_some());
@@ -1429,7 +1429,7 @@ mod bluray_queue_admission_tests {
 
         let item = queued_item(&manager, &item_id);
         assert_eq!(item.input_path.as_path(), bdmv.as_path());
-        assert_eq!(item.input_format, FileFormat::SevenZip);
+        assert_eq!(item.input_format, FileFormat::Archive);
         assert!(matches!(&item.status, ConversionStatus::Queued));
         assert!(item.pipeline_settings.is_some());
         assert!(item.options.pipeline_settings.is_some());
@@ -1669,7 +1669,7 @@ mod bluray_queue_admission_tests {
 
         let item = queued_item(&manager, &item_id);
         assert_eq!(item.input_path.as_path(), iso.as_path());
-        assert_eq!(item.input_format, FileFormat::SevenZip);
+        assert_eq!(item.input_format, FileFormat::Archive);
         assert!(matches!(&item.status, ConversionStatus::Queued));
         assert!(item.pipeline_settings.is_some());
         assert!(item.options.pipeline_settings.is_some());

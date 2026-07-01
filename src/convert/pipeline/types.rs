@@ -1301,7 +1301,8 @@ pub enum SacdArea {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceKind {
     SingleFile,
-    SevenZip,
+    #[serde(alias = "SevenZip")]
+    Archive,
     CueImage,
     SacdIso,
     DvdAudio,

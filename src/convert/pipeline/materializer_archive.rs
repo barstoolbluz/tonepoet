@@ -1,0 +1,1828 @@
+//! PR 3 — `ArchiveMaterializer` implementation.
+//!
+//! Extracts generic archives via the 7z/7zz `ToolRunner` backend, discovers audio files,
+//! probes them with ffprobe, reads metadata with lofty, and returns
+//! a `PreparedSource` with `TrackSourceRef::StagedFile` entries.
+//!
+//! Does not convert, tag, merge, run ReplayGain, generate feature
+//! files, publish, write durable logs, or emit terminal events.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
+
+use super::errors::{MaterializeError, ToolRunnerError};
+use super::progress::{heartbeat, OperationProgressTracker};
+use super::reporter::PipelineReporter;
+use super::tool::{ToolBinary, ToolCommand, ToolRunner};
+use super::types::*;
+
+// =========================================================================
+// Audio file extensions accepted from extracted archives
+// =========================================================================
+
+const AUDIO_EXTENSIONS: &[&str] = &[
+    "flac", "wav", "aiff", "aif", "wv", "mp3", "m4a", "aac", "opus", "ogg", "ape", "dsf", "dff",
+    "w64", "rf64",
+];
+
+fn is_audio_extension(ext: &str) -> bool {
+    AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+}
+
+// =========================================================================
+// ArchiveMaterializer
+// =========================================================================
+
+pub struct ArchiveMaterializer;
+
+#[async_trait]
+impl super::stages::Materializer for ArchiveMaterializer {
+    async fn materialize(
+        &self,
+        req: &PipelineRequest,
+        staging: &StagingDir,
+        runner: &dyn ToolRunner,
+        reporter: Option<&dyn PipelineReporter>,
+        tool_paths: &HashMap<String, PathBuf>,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedSource, MaterializeError> {
+        // Ensure the staging directory exists.
+        std::fs::create_dir_all(&staging.root)?;
+
+        // 1. Extract the archive.
+        extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
+
+        // Check cancellation between major steps.
+        if cancel.is_cancelled() {
+            return Err(MaterializeError::Cancelled);
+        }
+
+        // 2. Discover audio files in the extraction tree.
+        let audio_files = discover_audio_files(&staging.root)?;
+        if audio_files.is_empty() {
+            return Err(MaterializeError::Extraction(
+                "no audio files found in archive".into(),
+            ));
+        }
+
+        // 3. Probe each audio file and read metadata.
+        let mut tracks = Vec::with_capacity(audio_files.len());
+        for (idx, path) in audio_files.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(MaterializeError::Cancelled);
+            }
+
+            let probe = probe_audio_file(path, runner, cancel).await?;
+            let metadata = read_track_metadata(path);
+
+            let ordinal = (idx + 1) as u32;
+            tracks.push(PreparedTrack {
+                id: TrackId {
+                    source_ordinal: ordinal,
+                    disc_number: metadata.disc_number,
+                    track_number: metadata.track_number.unwrap_or(ordinal),
+                },
+                source_ref: TrackSourceRef::StagedFile(path.clone()),
+                metadata,
+                expected_samples: probe.expected_samples,
+                sample_rate: Some(probe.sample_rate),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(probe.sample_rate),
+                    probe.bit_depth,
+                    probe.coding,
+                ),
+                bit_depth: probe.bit_depth,
+            });
+        }
+
+        // 4. Apply track selection filter.
+        let tracks = apply_track_selection(tracks, &req.source.track_selection)?;
+
+        // 5. Derive album-level metadata from the tracks.
+        let album_metadata = derive_album_metadata(&tracks);
+
+        // 6. Build provenance.
+        let tool_versions = archive_tool_versions(runner);
+        let provenance = ExtractionProvenance {
+            source_kind: SourceKind::Archive,
+            source_sha256: None,
+            tool_versions,
+            extracted_at: chrono::Utc::now(),
+        };
+
+        Ok(PreparedSource {
+            container: req.container.clone(),
+            kind: SourceKind::Archive,
+            tracks,
+            album_metadata,
+            provenance,
+        })
+    }
+}
+
+
+fn archive_tool_versions(runner: &dyn ToolRunner) -> BTreeMap<String, String> {
+    let mut tool_versions = BTreeMap::new();
+    if let Some(version) = runner.tool_version(ToolBinary::SevenZip) {
+        tool_versions.insert("7z".to_string(), version);
+    }
+    tool_versions
+}
+
+// =========================================================================
+// Archive extraction
+// =========================================================================
+
+/// Extract the source archive with 7z/7zz and, when needed, expand the
+/// intermediate TAR payload produced by compressed TAR containers.
+async fn extract_archive(
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    _tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    run_archive_extract_command(
+        req,
+        &req.container,
+        &staging.root,
+        runner,
+        reporter,
+        cancel,
+        "archive-extraction",
+        "Extracting archive...",
+    )
+    .await?;
+
+    if cancel.is_cancelled() {
+        return Err(MaterializeError::Cancelled);
+    }
+
+    extract_compressed_tar_payloads(req, staging, runner, reporter, cancel).await
+}
+
+async fn extract_compressed_tar_payloads(
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    let tar_files = intermediate_tar_files_for_compressed_tar(&req.container, &staging.root)?;
+    if tar_files.is_empty() {
+        return Ok(());
+    }
+
+    for tar_path in tar_files {
+        if cancel.is_cancelled() {
+            return Err(MaterializeError::Cancelled);
+        }
+
+        run_archive_extract_command(
+            req,
+            &tar_path,
+            &staging.root,
+            runner,
+            reporter,
+            cancel,
+            "archive-tar-expansion",
+            "Expanding compressed tar payload...",
+        )
+        .await?;
+
+        match fs::remove_file(&tar_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(MaterializeError::Io(err)),
+        }
+    }
+
+    Ok(())
+}
+
+/// Build and run one 7z extraction command through `ToolRunner`.
+async fn run_archive_extract_command(
+    req: &PipelineRequest,
+    source_path: &Path,
+    output_root: &Path,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    cancel: &CancellationToken,
+    heartbeat_key: &'static str,
+    heartbeat_message: &'static str,
+) -> Result<(), MaterializeError> {
+    let mut args = vec![
+        "x".to_string(),
+        source_path.display().to_string(),
+        "-mmt=on".to_string(),
+    ];
+    let mut secret_args = Vec::new();
+
+    // Passwords are exposed only at the process-argument boundary and marked
+    // for transcript redaction.
+    if let Some(ref pw) = req.source.archive_password {
+        let pw_arg = format!("-p{}", pw.expose());
+        secret_args.push(args.len());
+        args.push(pw_arg);
+    }
+
+    args.push(format!("-o{}", output_root.display()));
+    args.push("-y".to_string());
+
+    let cmd = ToolCommand {
+        binary: ToolBinary::SevenZip,
+        args,
+        secret_args,
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(3600),
+    };
+
+    let result = match reporter {
+        Some(rpt) => {
+            let mut tracker = OperationProgressTracker::new(
+                req.item_id.clone(),
+                PipelineStage::Materialize,
+                Some(rpt),
+            );
+            heartbeat::run_with_heartbeat(
+                runner.run(cmd, cancel),
+                &mut tracker,
+                heartbeat_key,
+                heartbeat_message,
+                Duration::from_secs(5),
+            )
+            .await
+        }
+        None => runner.run(cmd, cancel).await,
+    };
+
+    match result {
+        Ok(_output) => Ok(()),
+        Err(ToolRunnerError::Cancelled { .. }) => Err(MaterializeError::Cancelled),
+        Err(ToolRunnerError::NonZeroExit { stderr_tail, .. }) => {
+            let lower = stderr_tail.to_lowercase();
+            if lower.contains("wrong password")
+                || lower.contains("encrypted")
+                || lower.contains("can not open encrypted")
+            {
+                Err(MaterializeError::Encrypted)
+            } else {
+                Err(MaterializeError::Extraction(stderr_tail))
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn intermediate_tar_files_for_compressed_tar(
+    container: &Path,
+    staging_root: &Path,
+) -> Result<Vec<PathBuf>, MaterializeError> {
+    if !is_compressed_tar_source(container) {
+        return Ok(Vec::new());
+    }
+
+    let canonical_staging_root = fs::canonicalize(staging_root).map_err(MaterializeError::Io)?;
+    let mut tar_files = Vec::new();
+    for path in compressed_tar_intermediate_candidates(container, staging_root) {
+        if is_regular_file_entry_within_staging(&path, &canonical_staging_root)? {
+            tar_files.push(path);
+        }
+    }
+    tar_files.sort();
+    tar_files.dedup();
+
+    if !tar_files.is_empty() {
+        return Ok(tar_files);
+    }
+
+    let mut top_level_tars = Vec::new();
+    for entry in fs::read_dir(&canonical_staging_root).map_err(MaterializeError::Io)? {
+        let path = entry.map_err(MaterializeError::Io)?.path();
+        if is_regular_file_entry_within_staging(&path, &canonical_staging_root)?
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
+        {
+            top_level_tars.push(path);
+        }
+    }
+    top_level_tars.sort();
+
+    if top_level_tars.len() == 1 {
+        Ok(top_level_tars)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn is_compressed_tar_source(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".tar.gz")
+        || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".tar.xz")
+        || lower.ends_with(".tar.zst")
+        || lower.ends_with(".tar.lz")
+        || lower.ends_with(".tar.lzma")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tbz2")
+        || lower.ends_with(".txz")
+}
+
+fn compressed_tar_intermediate_candidates(container: &Path, staging_root: &Path) -> Vec<PathBuf> {
+    let Some(file_name) = container.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let lower = file_name.to_ascii_lowercase();
+
+    for suffix in [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz", ".tar.lzma"] {
+        if lower.ends_with(suffix) {
+            let base = &file_name[..file_name.len() - suffix.len()];
+            return vec![staging_root.join(format!("{base}.tar"))];
+        }
+    }
+
+    for suffix in [".tgz", ".tbz2", ".txz"] {
+        if lower.ends_with(suffix) {
+            let base = &file_name[..file_name.len() - suffix.len()];
+            return vec![staging_root.join(format!("{base}.tar"))];
+        }
+    }
+
+    Vec::new()
+}
+
+// =========================================================================
+// Audio file discovery
+// =========================================================================
+
+/// Recursively walk `dir`, collect regular audio files, and return them
+/// sorted by path for deterministic ordering. The walker never follows
+/// symlinked directories or files. Symlinks that resolve outside the staging
+/// root are rejected so archive extraction cannot smuggle traversal through a
+/// later decode step.
+fn discover_audio_files(dir: &Path) -> Result<Vec<PathBuf>, MaterializeError> {
+    let staging_root = fs::canonicalize(dir).map_err(MaterializeError::Io)?;
+    let mut files = Vec::new();
+    walk_audio_files(&staging_root, &staging_root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn walk_audio_files(
+    dir: &Path,
+    staging_root: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), MaterializeError> {
+    let raw_entries = fs::read_dir(dir).map_err(MaterializeError::Io)?;
+    // Collect and sort directory entries for deterministic traversal. Propagate
+    // read errors instead of silently losing archive entries.
+    let mut entries = Vec::new();
+    for entry in raw_entries {
+        entries.push(entry.map_err(MaterializeError::Io)?);
+    }
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(MaterializeError::Io)?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            reject_external_symlink_target(&path, staging_root)?;
+            continue;
+        }
+
+        let canonical = canonical_entry_within_staging(&path, staging_root)?;
+        if file_type.is_dir() {
+            walk_audio_files(&canonical, staging_root, out)?;
+        } else if file_type.is_file() {
+            if let Some(ext) = canonical.extension().and_then(|e| e.to_str()) {
+                if is_audio_extension(ext) {
+                    out.push(canonical);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_entry_within_staging(
+    path: &Path,
+    staging_root: &Path,
+) -> Result<PathBuf, MaterializeError> {
+    let canonical = fs::canonicalize(path).map_err(MaterializeError::Io)?;
+    if canonical.starts_with(staging_root) {
+        Ok(canonical)
+    } else {
+        Err(MaterializeError::Extraction(format!(
+            "archive entry resolves outside staging root: {}",
+            path.display()
+        )))
+    }
+}
+
+fn reject_external_symlink_target(
+    path: &Path,
+    staging_root: &Path,
+) -> Result<(), MaterializeError> {
+    match fs::canonicalize(path) {
+        Ok(canonical) if canonical.starts_with(staging_root) => Ok(()),
+        Ok(_) => Err(MaterializeError::Extraction(format!(
+            "archive symlink resolves outside staging root: {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(MaterializeError::Io(err)),
+    }
+}
+
+fn is_regular_file_entry_within_staging(
+    path: &Path,
+    staging_root: &Path,
+) -> Result<bool, MaterializeError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(MaterializeError::Io(err)),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        reject_external_symlink_target(path, staging_root)?;
+        return Ok(false);
+    }
+    if file_type.is_file() {
+        canonical_entry_within_staging(path, staging_root)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+// =========================================================================
+// ffprobe probing through ToolRunner
+// =========================================================================
+
+/// Probed audio properties for one file.
+pub(crate) struct ProbeResult {
+    pub sample_rate: u32,
+    pub expected_samples: Option<u64>,
+    pub bit_depth: Option<u32>,
+    pub coding: Option<SourceAudioCoding>,
+}
+
+/// Probe a single audio file via ffprobe through `ToolRunner`.
+async fn probe_audio_file(
+    path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<ProbeResult, MaterializeError> {
+    let cmd = ToolCommand {
+        binary: ToolBinary::Ffprobe,
+        args: vec![
+            "-v".into(),
+            "error".into(),
+            "-select_streams".into(),
+            "a:0".into(),
+            "-show_entries".into(),
+            "stream=codec_name,sample_rate,duration,bits_per_raw_sample,bits_per_sample".into(),
+            "-show_entries".into(),
+            "format=duration".into(),
+            "-of".into(),
+            "json".into(),
+            path.display().to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(30),
+    };
+
+    let output = match runner.run(cmd, cancel).await {
+        Ok(o) => o,
+        Err(ToolRunnerError::Cancelled { .. }) => return Err(MaterializeError::Cancelled),
+        Err(e) => return Err(e.into()),
+    };
+
+    parse_ffprobe_json(&output.stdout_tail)
+}
+
+/// Parse the JSON output of ffprobe to extract sample_rate and duration,
+/// then compute expected_samples.
+fn parse_ffprobe_json(json_str: &str) -> Result<ProbeResult, MaterializeError> {
+    let val: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| MaterializeError::Parse(format!("ffprobe JSON parse failed: {e}")))?;
+
+    // Sample rate: streams[0].sample_rate (string in ffprobe JSON).
+    let sample_rate = val
+        .pointer("/streams/0/sample_rate")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    if sample_rate == 0 {
+        return Err(MaterializeError::Parse(
+            "ffprobe returned no valid sample_rate".into(),
+        ));
+    }
+
+    // Duration: prefer stream duration, fall back to format duration.
+    let duration_secs: Option<f64> = val
+        .pointer("/streams/0/duration")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| {
+            val.pointer("/format/duration")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+
+    let expected_samples = duration_secs.map(|d| (d * sample_rate as f64).round() as u64);
+    let bit_depth = val
+        .pointer("/streams/0/bits_per_raw_sample")
+        .or_else(|| val.pointer("/streams/0/bits_per_sample"))
+        .and_then(json_u32);
+    let coding = val
+        .pointer("/streams/0/codec_name")
+        .and_then(|v| v.as_str())
+        .map(source_audio_coding_from_codec_name);
+
+    Ok(ProbeResult {
+        sample_rate,
+        expected_samples,
+        bit_depth,
+        coding,
+    })
+}
+
+fn source_audio_coding_from_codec_name(codec_name: &str) -> SourceAudioCoding {
+    let codec_name = codec_name.to_ascii_lowercase();
+    if codec_name.starts_with("dsd") {
+        SourceAudioCoding::Dsd
+    } else if codec_name.starts_with("pcm_")
+        || matches!(
+            codec_name.as_str(),
+            "flac" | "alac" | "wavpack" | "tta" | "shorten"
+        )
+    {
+        SourceAudioCoding::Pcm
+    } else {
+        SourceAudioCoding::Unknown
+    }
+}
+
+fn json_u32(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
+}
+
+// =========================================================================
+// Metadata reading via lofty (in-process, no ToolRunner)
+// =========================================================================
+
+/// Read tags from an audio file. Returns default metadata on failure
+/// (e.g. empty or unrecognised files).
+fn read_track_metadata(path: &Path) -> TrackMetadata {
+    use lofty::prelude::*;
+
+    let tagged = match lofty::read_from_path(path) {
+        Ok(t) => t,
+        Err(_) => return TrackMetadata::default(),
+    };
+
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None => return TrackMetadata::default(),
+    };
+
+    // Store album name in `extra` — TrackMetadata has no dedicated
+    // album field, but we need it for AlbumMetadata derivation.
+    let mut extra = BTreeMap::new();
+    if let Some(album) = tag.album() {
+        extra.insert("album".to_string(), album.to_string());
+    }
+
+    // Enumerate all text tag items into `extra` so naming templates can use
+    // arbitrary format-specific fields such as CATALOGNUMBER, BARCODE,
+    // MUSICBRAINZ_ALBUMID, and RELEASECOUNTRY. Keys are lowercased to match
+    // the template engine's fallthrough lookup.
+    let tag_type = tag.tag_type();
+    for item in tag.items() {
+        if let lofty::tag::ItemValue::Text(text) = item.value() {
+            let key = item_key_to_extra_key(item.key(), tag_type);
+            if !key.is_empty() {
+                extra.entry(key).or_insert_with(|| text.clone());
+            }
+        }
+    }
+
+    TrackMetadata {
+        title: tag.title().map(|s| s.to_string()),
+        artist: tag.artist().map(|s| s.to_string()),
+        album_artist: tag
+            .get_string(&lofty::tag::ItemKey::AlbumArtist)
+            .map(|s| s.to_string()),
+        composer: tag
+            .get_string(&lofty::tag::ItemKey::Composer)
+            .map(|s| s.to_string()),
+        performer: tag
+            .get_string(&lofty::tag::ItemKey::Performer)
+            .map(|s| s.to_string()),
+        genre: tag.genre().map(|s| s.to_string()),
+        date: tag.year().map(|y| y.to_string()),
+        track_number: tag.track().map(|t| t as u32),
+        disc_number: tag.disk().map(|d| d as u32),
+        isrc: tag
+            .get_string(&lofty::tag::ItemKey::Isrc)
+            .map(|s| s.to_string()),
+        publisher: tag
+            .get_string(&lofty::tag::ItemKey::Publisher)
+            .map(|s| s.to_string()),
+        copyright: tag
+            .get_string(&lofty::tag::ItemKey::CopyrightMessage)
+            .map(|s| s.to_string()),
+        comment: tag.comment().map(|s| s.to_string()),
+        pre_emphasis: false,
+        extra,
+    }
+}
+
+fn item_key_to_extra_key(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) -> String {
+    if let Some(mapped) = key.map_key(tag_type, true) {
+        return mapped.to_lowercase();
+    }
+
+    match key {
+        lofty::tag::ItemKey::Unknown(value) => value.to_lowercase(),
+        _ => format!("{key:?}").to_lowercase(),
+    }
+}
+
+// =========================================================================
+// Track selection
+// =========================================================================
+
+/// Filter `tracks` according to `selection`. Operates on
+/// `source_ordinal` (1-based position), not `track_number`.
+fn apply_track_selection(
+    tracks: Vec<PreparedTrack>,
+    selection: &TrackSelection,
+) -> Result<Vec<PreparedTrack>, MaterializeError> {
+    match selection {
+        TrackSelection::All => Ok(tracks),
+        TrackSelection::Range { start, end } => {
+            if *start == 0 || *end == 0 || start > end {
+                return Err(MaterializeError::InvalidTrackSelection(format!(
+                    "invalid range {start}-{end}"
+                )));
+            }
+            let max_ordinal = tracks.len() as u32;
+            if *start > max_ordinal {
+                return Err(MaterializeError::InvalidTrackSelection(format!(
+                    "range start {start} exceeds track count {max_ordinal}"
+                )));
+            }
+            Ok(tracks
+                .into_iter()
+                .filter(|t| t.id.source_ordinal >= *start && t.id.source_ordinal <= *end)
+                .collect())
+        }
+        TrackSelection::Set(indices) => {
+            if indices.is_empty() {
+                return Err(MaterializeError::InvalidTrackSelection(
+                    "empty track set".into(),
+                ));
+            }
+            let max_ordinal = tracks.len() as u32;
+            for &idx in indices {
+                if idx == 0 || idx > max_ordinal {
+                    return Err(MaterializeError::InvalidTrackSelection(format!(
+                        "track {idx} outside valid range 1-{max_ordinal}"
+                    )));
+                }
+            }
+            Ok(tracks
+                .into_iter()
+                .filter(|t| indices.contains(&t.id.source_ordinal))
+                .collect())
+        }
+    }
+}
+
+// =========================================================================
+// Album metadata derivation
+// =========================================================================
+
+/// Derive `AlbumMetadata` from common tag values across all tracks.
+fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
+    if tracks.is_empty() {
+        return AlbumMetadata::default();
+    }
+
+    // Helper: if all tracks agree on a field, return it.
+    fn common<F>(tracks: &[PreparedTrack], f: F) -> Option<String>
+    where
+        F: Fn(&TrackMetadata) -> &Option<String>,
+    {
+        let first = f(&tracks[0].metadata).as_ref()?;
+        if tracks
+            .iter()
+            .all(|t| f(&t.metadata).as_deref() == Some(first))
+        {
+            Some(first.clone())
+        } else {
+            None
+        }
+    }
+
+    let total_tracks = tracks.len() as u32;
+    let total_discs = tracks.iter().filter_map(|t| t.id.disc_number).max();
+
+    // Album name lives in extra["album"] (TrackMetadata has no
+    // dedicated album field). Extract if all tracks agree.
+    let album = {
+        let first = tracks[0].metadata.extra.get("album");
+        if let Some(a) = first {
+            if tracks
+                .iter()
+                .all(|t| t.metadata.extra.get("album") == Some(a))
+            {
+                Some(a.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // Promote album-wide extra tags so folder templates can use custom
+    // variables from archive-contained audio files. A tag is album-wide only when
+    // every prepared track that carries the key agrees on the same value.
+    // This keeps per-track-only values out of folder paths while enabling
+    // common release fields such as CATALOGNUMBER, BARCODE,
+    // MUSICBRAINZ_ALBUMID, and RELEASECOUNTRY.
+    let mut extra = BTreeMap::new();
+    for key in tracks.iter().flat_map(|track| track.metadata.extra.keys()) {
+        if extra.contains_key(key) {
+            continue;
+        }
+        let Some(first) = tracks[0].metadata.extra.get(key) else {
+            continue;
+        };
+        if tracks
+            .iter()
+            .all(|track| track.metadata.extra.get(key) == Some(first))
+        {
+            extra.insert(key.clone(), first.clone());
+        }
+    }
+
+    AlbumMetadata {
+        album,
+        album_artist: common(tracks, |m| &m.album_artist).or_else(|| common(tracks, |m| &m.artist)),
+        genre: common(tracks, |m| &m.genre),
+        date: common(tracks, |m| &m.date),
+        total_tracks,
+        total_discs,
+        disc_number: if total_discs.is_some() {
+            tracks[0].id.disc_number
+        } else {
+            None
+        },
+        extra,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::stages::Materializer;
+    use super::super::tool::{CommandRecord, ProcessExit, ToolOutput};
+    use std::ffi::OsStr;
+    use std::io::Write;
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    struct VersionOnlyRunner(HashMap<ToolBinary, String>);
+
+    #[async_trait::async_trait]
+    impl ToolRunner for VersionOnlyRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<super::super::tool::ToolOutput, ToolRunnerError> {
+            panic!("VersionOnlyRunner must not execute commands")
+        }
+
+        fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+            self.0.get(&binary).cloned()
+        }
+    }
+
+    struct ArchiveMaterializationFixture {
+        _temp: tempfile::TempDir,
+        prepared: PreparedSource,
+        runner: SimulatedArchiveRunner,
+        staging_root: PathBuf,
+    }
+
+    struct SimulatedArchiveRunner {
+        staging_root: PathBuf,
+        commands: Mutex<Vec<(ToolBinary, Vec<String>)>>,
+    }
+
+    impl SimulatedArchiveRunner {
+        fn new(staging_root: PathBuf) -> Self {
+            Self {
+                staging_root,
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn command_args_for(&self, binary: ToolBinary) -> Vec<Vec<String>> {
+            self.commands
+                .lock()
+                .expect("command transcript")
+                .iter()
+                .filter(|(cmd_binary, _)| cmd_binary == &binary)
+                .map(|(_, args)| args.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolRunner for SimulatedArchiveRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            let binary = cmd.binary.clone();
+            let args = cmd.args.clone();
+            self.commands
+                .lock()
+                .expect("command transcript")
+                .push((binary.clone(), args.clone()));
+
+            match binary {
+                ToolBinary::SevenZip => {
+                    let source = args
+                        .get(1)
+                        .map(|arg| PathBuf::from(arg.as_str()))
+                        .expect("7z extraction source argument");
+                    if is_compressed_tar_source(&source) {
+                        let tar_path = compressed_tar_intermediate_candidates(
+                            &source,
+                            &self.staging_root,
+                        )
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| self.staging_root.join("payload.tar"));
+                        fs::write(tar_path, b"tar payload").expect("write intermediate tar");
+                    } else {
+                        let track = self.staging_root.join("Disc 1").join("01.flac");
+                        fs::create_dir_all(track.parent().expect("track parent"))
+                            .expect("track parent");
+                        fs::write(track, b"fake extracted audio").expect("write extracted audio");
+                    }
+                    Ok(ok_tool_output(ToolBinary::SevenZip, args, String::new()))
+                }
+                ToolBinary::Ffprobe => Ok(ok_tool_output(
+                    ToolBinary::Ffprobe,
+                    args,
+                    r#"{"streams":[{"codec_name":"flac","sample_rate":"96000","duration":"1.25","bits_per_raw_sample":"24"}],"format":{"duration":"1.25"}}"#
+                        .to_string(),
+                )),
+                _ => panic!("unexpected tool in archive materializer test"),
+            }
+        }
+
+        fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+            match binary {
+                ToolBinary::SevenZip => Some("25.01".to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    fn ok_tool_output(binary: ToolBinary, args: Vec<String>, stdout: String) -> ToolOutput {
+        ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: stdout,
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(10),
+            command: CommandRecord {
+                description: None,
+                binary,
+                sanitized_args: args,
+                cwd: None,
+                env_keys: Vec::new(),
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(10),
+            },
+        }
+    }
+
+    fn archive_materializer_test_request(root: &Path, archive_name: &str) -> PipelineRequest {
+        let container = root.join(archive_name);
+        fs::write(&container, b"archive fixture").expect("archive fixture");
+        PipelineRequest {
+            job_id: format!("job-{archive_name}"),
+            item_id: format!("item-{archive_name}"),
+            container,
+            source: SourceOptions {
+                archive_password: None,
+                sacd_area: None,
+                dvda_group_selection: DvdaGroupSelection::Default,
+                dvda_group: None,
+                dvda_assume_decrypted: false,
+                dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+                dvdv_vts: None,
+                dvdv_title: None,
+                dvdv_audio_stream: None,
+                dvdv_angle: None,
+                bluray_playlist: None,
+                bluray_audio_pid: None,
+                bluray_audio_stream: None,
+                bluray_angle: None,
+                cue_sidecar: CueSidecarPolicy::IgnoreCue,
+                track_selection: TrackSelection::All,
+            },
+            settings: tonepoet_pipeline::PipelineSettings::default(),
+            worker_count: Some(1),
+            merge: false,
+            output_root: root.join("out"),
+            naming: NamingPolicy {
+                template: "%NN% - %TITLE%".to_string(),
+                folder_template: None,
+                per_album_subdir: true,
+                collision_policy: NamingCollisionPolicy::Fail,
+            },
+            publish: PublishPolicy {
+                overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false,
+                write_manifest: false,
+            },
+            log: LogPolicy {
+                root: root.join("logs"),
+                write_for_blocked: true,
+                write_json_log: false,
+            },
+            stages: StagePolicy {
+                metadata: StageRequirement::Enabled,
+                replaygain: StageRequirement::Disabled,
+                features: StageRequirement::Disabled,
+                generate_cue: false,
+            },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None,
+            album_batch_track: None,
+            suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None,
+            companion: CompanionCopyPolicy::default(),
+            container_extension: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    async fn materialize_archive_fixture(archive_name: &str) -> ArchiveMaterializationFixture {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let req = archive_materializer_test_request(temp.path(), archive_name);
+        let staging_root = temp.path().join("stage");
+        let staging = StagingDir::borrowed(staging_root.clone(), req.job_id.clone());
+        let runner = SimulatedArchiveRunner::new(staging_root.clone());
+        let cancel = CancellationToken::new();
+        let tool_paths = HashMap::new();
+
+        let prepared = ArchiveMaterializer
+            .materialize(&req, &staging, &runner, None, &tool_paths, &cancel)
+            .await
+            .expect("archive materialization succeeds");
+
+        ArchiveMaterializationFixture {
+            _temp: temp,
+            prepared,
+            runner,
+            staging_root,
+        }
+    }
+
+    fn assert_single_archive_track(prepared: &PreparedSource, staging_root: &Path) {
+        assert_eq!(prepared.kind, SourceKind::Archive);
+        assert_eq!(prepared.tracks.len(), 1);
+        let track = &prepared.tracks[0];
+        assert_eq!(track.expected_samples, Some(120_000));
+        assert_eq!(track.sample_rate, Some(96_000));
+        assert_eq!(track.bit_depth, Some(24));
+        assert_eq!(
+            track.source_audio,
+            SourceAudioDescriptor::from_scalar(
+                Some(96_000),
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            )
+        );
+        let TrackSourceRef::StagedFile(path) = &track.source_ref else {
+            panic!("archive materializer must stage extracted files");
+        };
+        let canonical_staging = fs::canonicalize(staging_root).expect("canonical staging root");
+        assert!(
+            path.starts_with(&canonical_staging),
+            "staged track must remain under staging root: {}",
+            path.display()
+        );
+    }
+
+
+    fn assert_single_real_archive_track(prepared: &PreparedSource, staging_root: &Path) {
+        assert_eq!(prepared.kind, SourceKind::Archive);
+        assert_eq!(prepared.tracks.len(), 1);
+        let track = &prepared.tracks[0];
+        assert_eq!(track.sample_rate, Some(44_100));
+        assert_eq!(track.bit_depth, Some(16));
+        assert_eq!(
+            track.source_audio,
+            SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(16),
+                Some(SourceAudioCoding::Pcm),
+            )
+        );
+        assert_eq!(track.expected_samples, Some(2_205));
+        let TrackSourceRef::StagedFile(path) = &track.source_ref else {
+            panic!("archive materializer must stage extracted files");
+        };
+        let canonical_staging = fs::canonicalize(staging_root).expect("canonical staging root");
+        assert!(
+            path.starts_with(&canonical_staging),
+            "staged track must remain under staging root: {}",
+            path.display()
+        );
+        assert_eq!(
+            path.file_name().and_then(OsStr::to_str),
+            Some("01.wav"),
+            "real archive extraction should discover the extracted WAV fixture"
+        );
+    }
+
+    struct RealArchiveIntegrationRunner {
+        seven_zip: PathBuf,
+        ffprobe: PathBuf,
+        commands: Mutex<Vec<(ToolBinary, Vec<String>)>>,
+    }
+
+    impl RealArchiveIntegrationRunner {
+        fn new(seven_zip: PathBuf, ffprobe: PathBuf) -> Self {
+            Self {
+                seven_zip,
+                ffprobe,
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn command_args_for(&self, binary: ToolBinary) -> Vec<Vec<String>> {
+            self.commands
+                .lock()
+                .expect("command transcript")
+                .iter()
+                .filter(|(cmd_binary, _)| cmd_binary == &binary)
+                .map(|(_, args)| args.clone())
+                .collect()
+        }
+
+        fn path_for(&self, binary: &ToolBinary) -> Option<&Path> {
+            match binary {
+                ToolBinary::SevenZip => Some(&self.seven_zip),
+                ToolBinary::Ffprobe => Some(&self.ffprobe),
+                _ => None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolRunner for RealArchiveIntegrationRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            if cancel.is_cancelled() {
+                return Err(ToolRunnerError::Cancelled {
+                    command: CommandRecord {
+                        description: None,
+                        binary: cmd.binary,
+                        sanitized_args: cmd.args,
+                        cwd: cmd.cwd,
+                        env_keys: cmd.env.into_iter().map(|env| env.key).collect(),
+                        exit: None,
+                        stdout_tail: String::new(),
+                        stderr_tail: String::new(),
+                        elapsed: Duration::from_millis(0),
+                    },
+                });
+            }
+
+            let binary = cmd.binary.clone();
+            let args = cmd.args.clone();
+            self.commands
+                .lock()
+                .expect("command transcript")
+                .push((binary.clone(), args.clone()));
+
+            let Some(binary_path) = self.path_for(&binary) else {
+                return Err(ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no integration-test binary for {binary:?}"),
+                )));
+            };
+
+            let started = std::time::Instant::now();
+            let mut command = Command::new(binary_path);
+            command.args(&args);
+            if let Some(cwd) = &cmd.cwd {
+                command.current_dir(cwd);
+            }
+            for env in &cmd.env {
+                command.env(&env.key, env.value.expose());
+            }
+
+            let output = command.output().map_err(ToolRunnerError::Io)?;
+            let elapsed = started.elapsed();
+            let code = output.status.code().unwrap_or(-1);
+            let exit = ProcessExit::Code(code);
+            let record_exit = ProcessExit::Code(code);
+            let stdout_tail = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr_tail = String::from_utf8_lossy(&output.stderr).into_owned();
+            let record = CommandRecord {
+                description: None,
+                binary: binary.clone(),
+                sanitized_args: args.clone(),
+                cwd: cmd.cwd,
+                env_keys: cmd.env.into_iter().map(|env| env.key).collect(),
+                exit: Some(record_exit),
+                stdout_tail: stdout_tail.clone(),
+                stderr_tail: stderr_tail.clone(),
+                elapsed,
+            };
+
+            if output.status.success() {
+                Ok(ToolOutput {
+                    exit,
+                    stdout_tail,
+                    stderr_tail,
+                    elapsed,
+                    command: record,
+                })
+            } else {
+                Err(ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "integration command failed: {:?} {:?}: {}",
+                        binary_path, args, stderr_tail
+                    ),
+                )))
+            }
+        }
+
+        fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+            match binary {
+                ToolBinary::SevenZip => Some("integration-test-7z".to_string()),
+                ToolBinary::Ffprobe => Some("integration-test-ffprobe".to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    fn find_executable(candidates: &[&str]) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        let exe_suffix = std::env::consts::EXE_SUFFIX;
+        for dir in std::env::split_paths(&path) {
+            for candidate in candidates {
+                let direct = dir.join(candidate);
+                if direct.is_file() {
+                    return Some(direct);
+                }
+                if !exe_suffix.is_empty() && !candidate.ends_with(exe_suffix) {
+                    let with_suffix = dir.join(format!("{candidate}{exe_suffix}"));
+                    if with_suffix.is_file() {
+                        return Some(with_suffix);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn required_archive_integration_tools() -> Option<(PathBuf, PathBuf)> {
+        let seven_zip = find_executable(&["7zz", "7z"]);
+        let ffprobe = find_executable(&["ffprobe"]);
+        match (seven_zip, ffprobe) {
+            (Some(seven_zip), Some(ffprobe)) => Some((seven_zip, ffprobe)),
+            _ => None,
+        }
+    }
+
+    fn run_fixture_command(
+        program: &Path,
+        args: &[&OsStr],
+        cwd: Option<&Path>,
+    ) -> std::io::Result<()> {
+        let mut command = Command::new(program);
+        command.args(args);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let output = command.output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "fixture command failed: {:?} {:?}: {}",
+                    program,
+                    args,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ))
+        }
+    }
+
+    fn write_pcm_wav(path: &Path) -> std::io::Result<()> {
+        let sample_rate = 44_100u32;
+        let samples = 2_205u32;
+        let channels = 1u16;
+        let bits_per_sample = 16u16;
+        let bytes_per_sample = u32::from(bits_per_sample / 8);
+        let data_len = samples * u32::from(channels) * bytes_per_sample;
+        let byte_rate = sample_rate * u32::from(channels) * bytes_per_sample;
+        let block_align = channels * (bits_per_sample / 8);
+
+        let mut file = fs::File::create(path)?;
+        file.write_all(b"RIFF")?;
+        file.write_all(&(36 + data_len).to_le_bytes())?;
+        file.write_all(b"WAVE")?;
+        file.write_all(b"fmt ")?;
+        file.write_all(&16u32.to_le_bytes())?;
+        file.write_all(&1u16.to_le_bytes())?;
+        file.write_all(&channels.to_le_bytes())?;
+        file.write_all(&sample_rate.to_le_bytes())?;
+        file.write_all(&byte_rate.to_le_bytes())?;
+        file.write_all(&block_align.to_le_bytes())?;
+        file.write_all(&bits_per_sample.to_le_bytes())?;
+        file.write_all(b"data")?;
+        file.write_all(&data_len.to_le_bytes())?;
+        for _ in 0..samples {
+            file.write_all(&0i16.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn create_real_zip_fixture(seven_zip: &Path, root: &Path) -> std::io::Result<PathBuf> {
+        let archive = root.join("Album.zip");
+        let source_dir = root.join("zip-src");
+        fs::create_dir_all(source_dir.join("Disc 1"))?;
+        write_pcm_wav(&source_dir.join("Disc 1").join("01.wav"))?;
+        run_fixture_command(
+            seven_zip,
+            &[
+                OsStr::new("a"),
+                OsStr::new("-tzip"),
+                archive.as_os_str(),
+                OsStr::new("Disc 1/01.wav"),
+            ],
+            Some(&source_dir),
+        )?;
+        Ok(archive)
+    }
+
+    fn create_real_tar_fixture(seven_zip: &Path, root: &Path) -> std::io::Result<PathBuf> {
+        let archive = root.join("Album.tar");
+        let source_dir = root.join("tar-src");
+        fs::create_dir_all(source_dir.join("Disc 1"))?;
+        write_pcm_wav(&source_dir.join("Disc 1").join("01.wav"))?;
+        run_fixture_command(
+            seven_zip,
+            &[
+                OsStr::new("a"),
+                OsStr::new("-ttar"),
+                archive.as_os_str(),
+                OsStr::new("Disc 1/01.wav"),
+            ],
+            Some(&source_dir),
+        )?;
+        Ok(archive)
+    }
+
+    fn create_real_targz_fixture(seven_zip: &Path, root: &Path) -> std::io::Result<PathBuf> {
+        let tar = create_real_tar_fixture(seven_zip, root)?;
+        let targz = root.join("Album.tar.gz");
+        run_fixture_command(
+            seven_zip,
+            &[
+                OsStr::new("a"),
+                OsStr::new("-tgzip"),
+                targz.as_os_str(),
+                tar.file_name().expect("tar fixture file name"),
+            ],
+            tar.parent(),
+        )?;
+        fs::remove_file(tar)?;
+        Ok(targz)
+    }
+
+    fn create_real_rar_fixture(root: &Path) -> std::io::Result<Option<PathBuf>> {
+        let archive = root.join("Album.rar");
+        if let Some(fixture) = std::env::var_os("TONEPOET_TEST_RAR_FIXTURE") {
+            fs::copy(PathBuf::from(fixture), &archive)?;
+            return Ok(Some(archive));
+        }
+
+        let Some(rar) = find_executable(&["rar"]) else {
+            return Ok(None);
+        };
+
+        let source_dir = root.join("rar-src");
+        fs::create_dir_all(source_dir.join("Disc 1"))?;
+        write_pcm_wav(&source_dir.join("Disc 1").join("01.wav"))?;
+        run_fixture_command(
+            &rar,
+            &[
+                OsStr::new("a"),
+                OsStr::new("-idq"),
+                archive.as_os_str(),
+                OsStr::new("Disc 1/01.wav"),
+            ],
+            Some(&source_dir),
+        )?;
+        Ok(Some(archive))
+    }
+
+    struct RealArchiveMaterializationFixture {
+        _temp: tempfile::TempDir,
+        prepared: PreparedSource,
+        runner: RealArchiveIntegrationRunner,
+        staging_root: PathBuf,
+    }
+
+    async fn materialize_real_archive_fixture(
+        archive: PathBuf,
+        seven_zip: PathBuf,
+        ffprobe: PathBuf,
+    ) -> RealArchiveMaterializationFixture {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let archive_name = archive
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("archive name")
+            .to_string();
+        let req = archive_materializer_test_request(temp.path(), &archive_name);
+        fs::copy(&archive, &req.container).expect("copy archive fixture into request root");
+        let staging_root = temp.path().join("stage");
+        let staging = StagingDir::borrowed(staging_root.clone(), req.job_id.clone());
+        let runner = RealArchiveIntegrationRunner::new(seven_zip, ffprobe);
+        let cancel = CancellationToken::new();
+        let tool_paths = HashMap::new();
+
+        let prepared = ArchiveMaterializer
+            .materialize(&req, &staging, &runner, None, &tool_paths, &cancel)
+            .await
+            .expect("real archive materialization succeeds");
+
+        RealArchiveMaterializationFixture {
+            _temp: temp,
+            prepared,
+            runner,
+            staging_root,
+        }
+    }
+
+    // These integration tests create real archive fixtures and exercise the
+    // same 7z/7zz extraction command path used by production. They return
+    // early when the required local tools are not installed.
+    #[tokio::test]
+    async fn archive_materializer_extracts_real_zip_tar_and_targz_with_real_7z_when_available() {
+        let Some((seven_zip, ffprobe)) = required_archive_integration_tools() else {
+            eprintln!(
+                "skipping real archive extraction integration test: 7z/7zz and ffprobe are required"
+            );
+            return;
+        };
+
+        for (archive_label, make_fixture, expected_archive_commands) in [
+            (
+                "zip",
+                create_real_zip_fixture as fn(&Path, &Path) -> std::io::Result<PathBuf>,
+                1usize,
+            ),
+            (
+                "tar",
+                create_real_tar_fixture as fn(&Path, &Path) -> std::io::Result<PathBuf>,
+                1usize,
+            ),
+            (
+                "tar.gz",
+                create_real_targz_fixture as fn(&Path, &Path) -> std::io::Result<PathBuf>,
+                2usize,
+            ),
+        ] {
+            let fixture_root = tempfile::tempdir().expect("fixture temp dir");
+            let archive = make_fixture(&seven_zip, fixture_root.path())
+                .unwrap_or_else(|err| panic!("create real {archive_label} fixture: {err}"));
+            let materialized = materialize_real_archive_fixture(
+                archive,
+                seven_zip.clone(),
+                ffprobe.clone(),
+            )
+            .await;
+
+            assert_single_real_archive_track(&materialized.prepared, &materialized.staging_root);
+            assert_eq!(
+                materialized
+                    .runner
+                    .command_args_for(ToolBinary::SevenZip)
+                    .len(),
+                expected_archive_commands,
+                "real {archive_label} materialization should use the expected extractor passes"
+            );
+            assert_eq!(
+                materialized
+                    .runner
+                    .command_args_for(ToolBinary::Ffprobe)
+                    .len(),
+                1,
+                "real {archive_label} materialization should probe the extracted audio once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_materializer_extracts_real_rar_fixture_when_available() {
+        let Some((seven_zip, ffprobe)) = required_archive_integration_tools() else {
+            eprintln!(
+                "skipping real RAR extraction integration test: 7z/7zz and ffprobe are required"
+            );
+            return;
+        };
+
+        let fixture_root = tempfile::tempdir().expect("fixture temp dir");
+        let Some(archive) = create_real_rar_fixture(fixture_root.path())
+            .expect("create or load real RAR fixture")
+        else {
+            eprintln!(
+                "skipping real RAR extraction integration test: provide TONEPOET_TEST_RAR_FIXTURE or install rar to create the fixture"
+            );
+            return;
+        };
+
+        let materialized = materialize_real_archive_fixture(archive, seven_zip, ffprobe).await;
+        assert_single_real_archive_track(&materialized.prepared, &materialized.staging_root);
+        assert_eq!(
+            materialized
+                .runner
+                .command_args_for(ToolBinary::SevenZip)
+                .len(),
+            1,
+            "real RAR materialization should require one archive extraction pass"
+        );
+        assert_eq!(
+            materialized
+                .runner
+                .command_args_for(ToolBinary::Ffprobe)
+                .len(),
+            1,
+            "real RAR materialization should probe the extracted audio once"
+        );
+    }
+
+    // These deterministic tests use a simulated runner. They validate
+    // orchestration, staging discovery, ffprobe parsing, metadata plumbing,
+    // and compressed-TAR second-pass behavior without external tools.
+    #[tokio::test]
+    async fn archive_materializer_orchestrates_zip_rar_and_plain_tar_extraction_with_simulated_runner() {
+        for archive_name in ["Album.zip", "Album.rar", "Album.tar"] {
+            let fixture = materialize_archive_fixture(archive_name).await;
+            assert_single_archive_track(&fixture.prepared, &fixture.staging_root);
+
+            let archive_extracts = fixture.runner.command_args_for(ToolBinary::SevenZip);
+            assert_eq!(
+                archive_extracts.len(),
+                1,
+                "{archive_name} should require one generic archive extraction command"
+            );
+            assert!(
+                archive_extracts[0][1].ends_with(archive_name),
+                "first 7z source should be the requested archive: {:?}",
+                archive_extracts[0]
+            );
+            assert_eq!(fixture.runner.command_args_for(ToolBinary::Ffprobe).len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_materializer_orchestrates_compressed_tar_second_pass_with_simulated_runner() {
+        for archive_name in ["Album.tar.gz", "Album.tar.bz2", "Album.tar.xz", "Album.tar.zst"] {
+            let fixture = materialize_archive_fixture(archive_name).await;
+            assert_single_archive_track(&fixture.prepared, &fixture.staging_root);
+
+            let archive_extracts = fixture.runner.command_args_for(ToolBinary::SevenZip);
+            assert_eq!(
+                archive_extracts.len(),
+                2,
+                "{archive_name} must expand the wrapper and then the tar payload"
+            );
+            assert!(archive_extracts[0][1].ends_with(archive_name));
+            assert!(archive_extracts[1][1].ends_with("Album.tar"));
+            assert!(
+                !fixture.staging_root.join("Album.tar").exists(),
+                "intermediate tar payload should be removed after expansion"
+            );
+            assert_eq!(fixture.runner.command_args_for(ToolBinary::Ffprobe).len(), 1);
+        }
+    }
+
+    #[test]
+    fn archive_materializer_provenance_records_detected_7z_version() {
+        let runner = VersionOnlyRunner(HashMap::from([
+            (ToolBinary::SevenZip, "25.01".to_string()),
+        ]));
+        let versions = archive_tool_versions(&runner);
+
+        assert_eq!(versions.get("7z").map(String::as_str), Some("25.01"));
+    }
+
+    #[test]
+    fn archive_materializer_provenance_omits_missing_external_version() {
+        let runner = VersionOnlyRunner(HashMap::new());
+        let versions = archive_tool_versions(&runner);
+
+        assert!(versions.is_empty(), "missing external versions must not be mislabeled as in-process");
+    }
+
+    #[test]
+    fn compressed_tar_candidate_names_preserve_archive_stem() {
+        let staging = Path::new("/stage");
+
+        assert_eq!(
+            compressed_tar_intermediate_candidates(Path::new("Album.tar.gz"), staging),
+            vec![PathBuf::from("/stage/Album.tar")]
+        );
+        assert_eq!(
+            compressed_tar_intermediate_candidates(Path::new("Album.TGZ"), staging),
+            vec![PathBuf::from("/stage/Album.tar")]
+        );
+        assert!(compressed_tar_intermediate_candidates(Path::new("Album.zip"), staging).is_empty());
+    }
+
+    #[test]
+    fn compressed_tar_intermediate_prefers_expected_tar_payload() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let expected = temp.path().join("Album.tar");
+        let unrelated = temp.path().join("Unrelated.tar");
+        fs::write(&expected, b"tar").expect("expected tar");
+        fs::write(&unrelated, b"tar").expect("unrelated tar");
+
+        assert_eq!(
+            intermediate_tar_files_for_compressed_tar(Path::new("Album.tar.gz"), temp.path())
+                .expect("intermediate tar lookup"),
+            vec![expected]
+        );
+    }
+
+    #[test]
+    fn compressed_tar_intermediate_uses_single_top_level_tar_fallback() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let fallback = temp.path().join("payload.tar");
+        fs::write(&fallback, b"tar").expect("fallback tar");
+
+        assert_eq!(
+            intermediate_tar_files_for_compressed_tar(Path::new("Album.tar.zst"), temp.path())
+                .expect("intermediate tar lookup"),
+            vec![fallback]
+        );
+    }
+
+    #[test]
+    fn compressed_tar_intermediate_ignores_ambiguous_fallbacks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::write(temp.path().join("one.tar"), b"tar").expect("one tar");
+        fs::write(temp.path().join("two.tar"), b"tar").expect("two tar");
+
+        assert!(
+            intermediate_tar_files_for_compressed_tar(Path::new("Album.tar.xz"), temp.path())
+                .expect("intermediate tar lookup")
+                .is_empty()
+        );
+        assert!(
+            intermediate_tar_files_for_compressed_tar(Path::new("Album.zip"), temp.path())
+                .expect("non-compressed archive lookup")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compressed_tar_intermediate_rejects_tar_symlink_escape() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("stage");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&staging).expect("staging dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let outside_tar = outside.join("Album.tar");
+        fs::write(&outside_tar, b"outside tar").expect("outside tar");
+        std::os::unix::fs::symlink(&outside_tar, staging.join("Album.tar"))
+            .expect("tar symlink");
+
+        let err = intermediate_tar_files_for_compressed_tar(
+            Path::new("Album.tar.gz"),
+            &staging,
+        )
+        .expect_err("tar symlink escape rejected");
+        assert!(
+            matches!(&err, MaterializeError::Extraction(message) if message.contains("outside staging root")),
+            "unexpected error for tar symlink escape: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_audio_files_skips_directory_symlinks_without_duplication() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("stage");
+        let real_dir = staging.join("real");
+        fs::create_dir_all(&real_dir).expect("real dir");
+        fs::write(real_dir.join("01.flac"), b"audio").expect("audio file");
+        std::os::unix::fs::symlink(&real_dir, staging.join("linked-real"))
+            .expect("directory symlink");
+
+        let files = discover_audio_files(&staging).expect("discover audio files");
+        assert_eq!(
+            files.len(),
+            1,
+            "directory symlinks must not be followed and duplicate extracted tracks"
+        );
+        assert!(files[0].ends_with("01.flac"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_audio_files_rejects_symlink_escape_from_staging_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("stage");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&staging).expect("staging dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let outside_audio = outside.join("evil.flac");
+        fs::write(&outside_audio, b"outside audio").expect("outside audio");
+        std::os::unix::fs::symlink(&outside_audio, staging.join("evil.flac"))
+            .expect("file symlink");
+
+        let err = discover_audio_files(&staging).expect_err("symlink escape rejected");
+        assert!(
+            matches!(&err, MaterializeError::Extraction(message) if message.contains("outside staging root")),
+            "unexpected error for symlink escape: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ffprobe_json_extracts_bit_depth_from_raw_sample_field() {
+        let json = r#"{
+            "streams": [{
+                "sample_rate": "96000",
+                "duration": "1.5",
+                "bits_per_raw_sample": "24"
+            }]
+        }"#;
+        let probe = parse_ffprobe_json(json).unwrap();
+        assert_eq!(probe.sample_rate, 96_000);
+        assert_eq!(probe.expected_samples, Some(144_000));
+        assert_eq!(probe.bit_depth, Some(24));
+    }
+
+    #[test]
+    fn parse_ffprobe_json_falls_back_to_bits_per_sample() {
+        let json = r#"{
+            "streams": [{
+                "sample_rate": "44100",
+                "duration": "2.0",
+                "bits_per_sample": 16
+            }]
+        }"#;
+        let probe = parse_ffprobe_json(json).unwrap();
+        assert_eq!(probe.sample_rate, 44_100);
+        assert_eq!(probe.expected_samples, Some(88_200));
+        assert_eq!(probe.bit_depth, Some(16));
+    }
+
+    #[test]
+    fn derive_album_metadata_promotes_common_extra_tags_for_folder_templates() {
+        let make_track = |ordinal: u32, catalog: &str, barcode: &str| PreparedTrack {
+            id: TrackId {
+                source_ordinal: ordinal,
+                disc_number: Some(1),
+                track_number: ordinal,
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "/stage/{ordinal:02}.flac"
+            ))),
+            metadata: TrackMetadata {
+                title: Some(format!("Track {ordinal}")),
+                artist: Some("Miles Davis".to_string()),
+                album_artist: Some("Miles Davis".to_string()),
+                genre: Some("Jazz".to_string()),
+                date: Some("1971".to_string()),
+                track_number: Some(ordinal),
+                disc_number: Some(1),
+                extra: BTreeMap::from([
+                    ("album".to_string(), "A Tribute to Jack Johnson".to_string()),
+                    ("catalognumber".to_string(), catalog.to_string()),
+                    ("barcode".to_string(), barcode.to_string()),
+                ]),
+                ..TrackMetadata::default()
+            },
+            expected_samples: None,
+            sample_rate: Some(44_100),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            ),
+            bit_depth: Some(24),
+        };
+
+        let tracks = vec![
+            make_track(1, "CK-1234", "074646123426"),
+            make_track(2, "CK-1234", "074646123426"),
+        ];
+        let album = derive_album_metadata(&tracks);
+
+        assert_eq!(
+            album.extra.get("catalognumber").map(String::as_str),
+            Some("CK-1234")
+        );
+        assert_eq!(
+            album.extra.get("barcode").map(String::as_str),
+            Some("074646123426")
+        );
+        assert_eq!(album.album.as_deref(), Some("A Tribute to Jack Johnson"));
+    }
+
+    #[test]
+    fn derive_album_metadata_does_not_promote_track_specific_extra_tags() {
+        let make_track = |ordinal: u32, isrc: &str| PreparedTrack {
+            id: TrackId {
+                source_ordinal: ordinal,
+                disc_number: Some(1),
+                track_number: ordinal,
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "/stage/{ordinal:02}.flac"
+            ))),
+            metadata: TrackMetadata {
+                title: Some(format!("Track {ordinal}")),
+                artist: Some("Miles Davis".to_string()),
+                album_artist: Some("Miles Davis".to_string()),
+                extra: BTreeMap::from([
+                    ("album".to_string(), "A Tribute to Jack Johnson".to_string()),
+                    ("isrc".to_string(), isrc.to_string()),
+                ]),
+                ..TrackMetadata::default()
+            },
+            expected_samples: None,
+            sample_rate: Some(44_100),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            ),
+            bit_depth: Some(24),
+        };
+
+        let tracks = vec![make_track(1, "USSM17100001"), make_track(2, "USSM17100002")];
+        let album = derive_album_metadata(&tracks);
+
+        assert!(!album.extra.contains_key("isrc"));
+        assert_eq!(
+            album.extra.get("album").map(String::as_str),
+            Some("A Tribute to Jack Johnson")
+        );
+    }
+}

@@ -1806,7 +1806,7 @@ fn build_initial_work(
     }
 
     let materialize_kind = match source_kind {
-        Some(SourceKind::SevenZip) => WorkKind::ArchiveExtract,
+        Some(SourceKind::Archive) => WorkKind::ArchiveExtract,
         Some(SourceKind::CueImage) => WorkKind::MaterializeItem,
         Some(SourceKind::SacdIso) => WorkKind::MaterializeItem,
         Some(SourceKind::DvdAudio) => WorkKind::MaterializeItem,
@@ -1816,7 +1816,7 @@ fn build_initial_work(
         None => WorkKind::MaterializeItem,
     };
     let unit_prefix = match source_kind {
-        Some(SourceKind::SevenZip) => "archive-extract",
+        Some(SourceKind::Archive) => "archive-extract",
         Some(SourceKind::CueImage) => "cue-materialize",
         Some(SourceKind::SacdIso) => "sacd-materialize",
         Some(SourceKind::DvdAudio) => "dvda-materialize",

@@ -24,7 +24,7 @@ use super::errors::{
     PublishError, ReplayGainError, RequestValidationError, SourceDetectError, SourceDispatchError,
     ToolRunnerError,
 };
-use super::materializer_7z::SevenZipMaterializer;
+use super::materializer_archive::ArchiveMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
 use super::materializer_dvda::{is_dvda_candidate, DvdaAudioMaterializer};
@@ -241,7 +241,7 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
         || name.ends_with(".tar.lz")
         || name.ends_with(".tar.lzma")
     {
-        return Ok(SourceKind::SevenZip);
+        return Ok(SourceKind::Archive);
     }
     if is_single_audio_extension(&ext) {
         return Ok(SourceKind::SingleFile);
@@ -421,7 +421,7 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
 pub fn materializer_for(kind: SourceKind) -> Result<Box<dyn Materializer>, SourceDispatchError> {
     match kind {
         SourceKind::SingleFile => Ok(Box::new(SingleFileMaterializer)),
-        SourceKind::SevenZip => Ok(Box::new(SevenZipMaterializer)),
+        SourceKind::Archive => Ok(Box::new(ArchiveMaterializer)),
         SourceKind::CueImage => Ok(Box::new(CueImageMaterializer)),
         SourceKind::SacdIso => Ok(Box::new(SacdIsoMaterializer)),
         SourceKind::DvdAudio => Ok(Box::new(DvdaAudioMaterializer)),
@@ -9730,7 +9730,7 @@ fn stage_requirement_label(requirement: StageRequirement) -> &'static str {
 fn source_kind_label(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::SingleFile => "SingleFile",
-        SourceKind::SevenZip => "SevenZip",
+        SourceKind::Archive => "Archive",
         SourceKind::CueImage => "CueImage",
         SourceKind::SacdIso => "SacdIso",
         SourceKind::DvdAudio => "DvdAudio",
@@ -13095,7 +13095,7 @@ fn companion_source_dir(req: &PipelineRequest, source: &PreparedSource) -> Optio
         SourceKind::SingleFile | SourceKind::CueImage => {
             request_root.or(prepared_container_root).or(track_root)
         }
-        SourceKind::SevenZip
+        SourceKind::Archive
         | SourceKind::SacdIso
         | SourceKind::DvdAudio
         | SourceKind::DvdVideo
@@ -13933,7 +13933,7 @@ mod companion_copy_hardening_tests {
 
         let req = test_request(temp.path(), archive);
         let prepared = test_prepared_source(
-            SourceKind::SevenZip,
+            SourceKind::Archive,
             temp.path().join("scratch"),
             vec![test_prepared_track(TrackSourceRef::StagedFile(staged))],
         );
@@ -16478,7 +16478,7 @@ mod pipeline_test_helpers {
         album_extra.insert("catalog_number".to_string(), "CAT-123".to_string());
         PreparedSource {
             container: PathBuf::from("/tmp/input.7z"),
-            kind: SourceKind::SevenZip,
+            kind: SourceKind::Archive,
             tracks: vec![
                 PreparedTrack {
                     id: TrackId {
@@ -16537,7 +16537,7 @@ mod pipeline_test_helpers {
                 ..AlbumMetadata::default()
             },
             provenance: ExtractionProvenance {
-                source_kind: SourceKind::SevenZip,
+                source_kind: SourceKind::Archive,
                 source_sha256: None,
                 tool_versions: BTreeMap::new(),
                 extracted_at: chrono::Utc::now(),
@@ -16739,6 +16739,48 @@ mod bluray_routing_tests {
         req.source.bluray_angle = Some(1);
 
         assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::BluRay);
+    }
+
+    #[test]
+    fn pipeline_archive_extensions_route_to_archive_materializer() {
+        for name in [
+            "album.7z",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.cab",
+            "album.dmg",
+            "album.tgz",
+            "album.tbz2",
+            "album.txz",
+            "album.tar.gz",
+            "album.tar.bz2",
+            "album.tar.xz",
+            "album.tar.zst",
+            "album.tar.lz",
+            "album.tar.lzma",
+        ] {
+            let mut req = log_test_request();
+            req.container = PathBuf::from("/tmp").join(name);
+
+            assert_eq!(
+                detect_source_kind(&req).unwrap(),
+                SourceKind::Archive,
+                "{name} should route as a generic archive"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_plain_iso_falls_back_to_archive_after_disc_detection() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let iso = temp.path().join("plain-data.iso");
+        std::fs::write(&iso, b"not a SACD, DVD, or Blu-ray image").expect("iso fixture");
+
+        let mut req = log_test_request();
+        req.container = iso;
+
+        assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::Archive);
     }
 }
 
@@ -17563,7 +17605,7 @@ mod naming_template_tests {
         album_extra.insert("catalog".to_string(), "CK-1234".to_string());
         PreparedSource {
             container: PathBuf::from("/tmp/container.7z"),
-            kind: SourceKind::SevenZip,
+            kind: SourceKind::Archive,
             tracks: vec![PreparedTrack {
                 id: TrackId {
                     source_ordinal: 1,
@@ -17601,7 +17643,7 @@ mod naming_template_tests {
                 ..AlbumMetadata::default()
             },
             provenance: ExtractionProvenance {
-                source_kind: SourceKind::SevenZip,
+                source_kind: SourceKind::Archive,
                 source_sha256: None,
                 tool_versions: BTreeMap::new(),
                 extracted_at: chrono::Utc::now(),

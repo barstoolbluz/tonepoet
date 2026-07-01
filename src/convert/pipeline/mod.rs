@@ -29,7 +29,7 @@ pub mod errors;
 pub mod label_resolver;
 pub mod manifest;
 pub mod manifest_builder;
-pub mod materializer_7z;
+pub mod materializer_archive;
 pub mod materializer_cue;
 pub mod materializer_dvda;
 pub mod materializer_dvdv;
