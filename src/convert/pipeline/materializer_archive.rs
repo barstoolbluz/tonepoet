@@ -258,7 +258,11 @@ fn archive_relative_path(path: &Path, extraction_root: &Path) -> Option<PathBuf>
     }
 
     let canonical_root = fs::canonicalize(extraction_root).ok()?;
-    path.strip_prefix(canonical_root).ok().map(Path::to_path_buf)
+    let canonical_path = fs::canonicalize(path).ok()?;
+    canonical_path
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 fn apply_archive_metadata_override(
@@ -272,6 +276,373 @@ fn apply_archive_metadata_override(
     override_set
         .album
         .apply_to_extra_key(&mut metadata.extra, "album");
+}
+
+// =========================================================================
+// Archive repackaging
+// =========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepackageArchiveFormat {
+    SevenZip,
+    Zip,
+    Tar,
+    TarGz,
+    Rar,
+}
+
+/// Non-fatal details from a successful archive repackage. The most important
+/// case is backup cleanup: once the temp archive has been renamed into place,
+/// failure to delete the old backup is not a failed edit. Surface it as a
+/// warning so users know what happened without misreporting success as failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveRepackageReport {
+    pub backup_cleanup_warning: Option<String>,
+}
+
+impl ArchiveRepackageReport {
+    pub fn has_warnings(&self) -> bool {
+        self.backup_cleanup_warning.is_some()
+    }
+}
+
+/// Re-create an archive from an extracted staging tree and atomically replace
+/// the original archive only after the new container is successfully created
+/// and verified.
+pub async fn repackage_archive(
+    staging_dir: &Path,
+    original_archive: &Path,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<(), String> {
+    repackage_archive_with_progress(staging_dir, original_archive, tool_paths, |_| {})
+        .await
+        .map(|_| ())
+}
+
+/// Repackage an archive while reporting durable milestones to the caller.
+/// The callback is intentionally synchronous so TUI callers can use
+/// non-blocking channel sends and conversion callers can pass a no-op.
+pub async fn repackage_archive_with_progress<F>(
+    staging_dir: &Path,
+    original_archive: &Path,
+    tool_paths: &HashMap<String, PathBuf>,
+    mut progress: F,
+) -> Result<ArchiveRepackageReport, String>
+where
+    F: FnMut(&'static str) + Send,
+{
+    progress("Validating archive staging tree...");
+    validate_repackage_staging_tree(staging_dir)?;
+
+    let format = repackage_archive_format(original_archive)?;
+    let parent = original_archive
+        .parent()
+        .ok_or_else(|| format!("archive has no parent directory: {}", original_archive.display()))?;
+    if !parent.is_dir() {
+        return Err(format!("archive parent is not a directory: {}", parent.display()));
+    }
+
+    let file_name = original_archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("archive name is not valid Unicode: {}", original_archive.display()))?;
+    let nonce = uuid::Uuid::new_v4();
+    let temp_archive = parent.join(format!(
+        ".{file_name}.tonepoet-repack-{nonce}{}",
+        repackage_format_suffix(format)
+    ));
+    let backup_archive = parent.join(format!(".{file_name}.tonepoet-backup-{nonce}"));
+
+    let result = async {
+        progress("Creating repackaged archive...");
+        create_repackaged_archive(format, staging_dir, &temp_archive, tool_paths).await?;
+
+        progress("Verifying repackaged archive...");
+        verify_repackaged_archive(format, &temp_archive, tool_paths).await?;
+        let size = fs::metadata(&temp_archive)
+            .map_err(|err| format!("repackaged archive metadata failed: {err}"))?
+            .len();
+        if size == 0 {
+            return Err("repackaged archive is empty".to_string());
+        }
+
+        progress("Installing repackaged archive...");
+        let report = replace_archive_atomically(original_archive, &temp_archive, &backup_archive)?;
+        if report.has_warnings() {
+            progress("Archive installed; backup cleanup needs attention.");
+        }
+        Ok(report)
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_archive);
+        if backup_archive.exists() && !original_archive.exists() {
+            let _ = fs::rename(&backup_archive, original_archive);
+        }
+    }
+
+    result
+}
+
+fn repackage_archive_format(path: &Path) -> Result<RepackageArchiveFormat, String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
+        return Ok(RepackageArchiveFormat::TarGz);
+    }
+    if file_name.ends_with(".tar") {
+        return Ok(RepackageArchiveFormat::Tar);
+    }
+    match path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()) {
+        Some(ext) if ext == "7z" => Ok(RepackageArchiveFormat::SevenZip),
+        Some(ext) if ext == "zip" => Ok(RepackageArchiveFormat::Zip),
+        Some(ext) if ext == "rar" => Ok(RepackageArchiveFormat::Rar),
+        _ => Err(format!(
+            "unsupported archive repackage format: {}",
+            path.display()
+        )),
+    }
+}
+
+fn repackage_format_suffix(format: RepackageArchiveFormat) -> &'static str {
+    match format {
+        RepackageArchiveFormat::SevenZip => ".7z",
+        RepackageArchiveFormat::Zip => ".zip",
+        RepackageArchiveFormat::Tar => ".tar",
+        RepackageArchiveFormat::TarGz => ".tar.gz",
+        RepackageArchiveFormat::Rar => ".rar",
+    }
+}
+
+async fn create_repackaged_archive(
+    format: RepackageArchiveFormat,
+    staging_dir: &Path,
+    temp_archive: &Path,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<(), String> {
+    match format {
+        RepackageArchiveFormat::SevenZip => {
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+            let mut command = tokio::process::Command::new(seven_zip);
+            command
+                .arg("a")
+                .arg("-t7z")
+                .arg(temp_archive)
+                .arg("-mmt=on")
+                .arg(".")
+                .current_dir(staging_dir);
+            run_repackage_command(command, "create 7z archive").await
+        }
+        RepackageArchiveFormat::Zip => {
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+            let mut command = tokio::process::Command::new(seven_zip);
+            command
+                .arg("a")
+                .arg("-tzip")
+                .arg(temp_archive)
+                .arg(".")
+                .current_dir(staging_dir);
+            run_repackage_command(command, "create zip archive").await
+        }
+        RepackageArchiveFormat::Tar => {
+            let tar = repackage_tool_path(tool_paths, &["tar"]);
+            let mut command = tokio::process::Command::new(tar);
+            command
+                .arg("cf")
+                .arg(temp_archive)
+                .arg("-C")
+                .arg(staging_dir)
+                .arg(".");
+            run_repackage_command(command, "create tar archive").await
+        }
+        RepackageArchiveFormat::TarGz => {
+            let tar = repackage_tool_path(tool_paths, &["tar"]);
+            let mut command = tokio::process::Command::new(tar);
+            command
+                .arg("czf")
+                .arg(temp_archive)
+                .arg("-C")
+                .arg(staging_dir)
+                .arg(".");
+            run_repackage_command(command, "create tar.gz archive").await
+        }
+        RepackageArchiveFormat::Rar => {
+            let rar = repackage_tool_path(tool_paths, &["rar"]);
+            let mut command = tokio::process::Command::new(rar);
+            command
+                .arg("a")
+                .arg("-r")
+                .arg(temp_archive)
+                .arg(".")
+                .current_dir(staging_dir);
+            run_repackage_command(command, "create rar archive")
+                .await
+                .map_err(|err| {
+                    if err.contains("not found") || err.contains("No such file") {
+                        "RAR archive creation requires the `rar` executable; install rar or convert the archive to 7z before editing metadata".to_string()
+                    } else {
+                        err
+                    }
+                })
+        }
+    }
+}
+
+async fn verify_repackaged_archive(
+    format: RepackageArchiveFormat,
+    temp_archive: &Path,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<(), String> {
+    match format {
+        RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+            let mut command = tokio::process::Command::new(seven_zip);
+            command.arg("t").arg(temp_archive);
+            run_repackage_command(command, "verify repackaged archive").await
+        }
+        RepackageArchiveFormat::Tar | RepackageArchiveFormat::TarGz => {
+            let tar = repackage_tool_path(tool_paths, &["tar"]);
+            let mut command = tokio::process::Command::new(tar);
+            command.arg("tf").arg(temp_archive);
+            run_repackage_command(command, "verify repackaged tar archive").await
+        }
+        RepackageArchiveFormat::Rar => {
+            let rar = repackage_tool_path(tool_paths, &["rar"]);
+            let mut command = tokio::process::Command::new(rar);
+            command.arg("t").arg(temp_archive);
+            run_repackage_command(command, "verify repackaged rar archive").await
+        }
+    }
+}
+
+fn repackage_tool_path(tool_paths: &HashMap<String, PathBuf>, names: &[&str]) -> PathBuf {
+    for name in names {
+        if let Some(path) = tool_paths.get(*name) {
+            return path.clone();
+        }
+        if let Some((_, path)) = tool_paths
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            return path.clone();
+        }
+    }
+    PathBuf::from(names.first().copied().unwrap_or_default())
+}
+
+async fn run_repackage_command(
+    mut command: tokio::process::Command,
+    label: &str,
+) -> Result<(), String> {
+    let output = command
+        .output()
+        .await
+        .map_err(|err| format!("{label}: command not found or failed to start: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        stdout.trim().to_string()
+    };
+    if detail.is_empty() {
+        Err(format!("{label}: command exited with status {}", output.status))
+    } else {
+        Err(format!("{label}: {detail}"))
+    }
+}
+
+fn validate_repackage_staging_tree(staging_dir: &Path) -> Result<(), String> {
+    let root = fs::canonicalize(staging_dir)
+        .map_err(|err| format!("repackage staging directory is unavailable: {err}"))?;
+    if !root.is_dir() {
+        return Err(format!("repackage staging path is not a directory: {}", root.display()));
+    }
+
+    let mut stack = vec![root.clone()];
+    let mut regular_files = 0usize;
+    while let Some(dir) = stack.pop() {
+        let mut entries = fs::read_dir(&dir)
+            .map_err(|err| format!("failed to read staging directory '{}': {err}", dir.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("failed to read staging entry: {err}"))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|err| format!("failed to inspect staging entry '{}': {err}", path.display()))?;
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "refusing to repackage archive staging tree with symlink entry: {}",
+                    path.display()
+                ));
+            }
+            let canonical = fs::canonicalize(&path)
+                .map_err(|err| format!("failed to canonicalize staging entry '{}': {err}", path.display()))?;
+            if !canonical.starts_with(&root) {
+                return Err(format!(
+                    "refusing to repackage entry outside staging root: {}",
+                    path.display()
+                ));
+            }
+            if file_type.is_dir() {
+                stack.push(canonical);
+            } else if file_type.is_file() {
+                regular_files = regular_files.saturating_add(1);
+            }
+        }
+    }
+
+    if regular_files == 0 {
+        return Err("cannot repackage archive: staging tree contains no regular files".to_string());
+    }
+    Ok(())
+}
+
+fn replace_archive_atomically(
+    original_archive: &Path,
+    temp_archive: &Path,
+    backup_archive: &Path,
+) -> Result<ArchiveRepackageReport, String> {
+    fs::rename(original_archive, backup_archive).map_err(|err| {
+        format!(
+            "failed to move original archive '{}' to backup '{}': {err}",
+            original_archive.display(),
+            backup_archive.display()
+        )
+    })?;
+
+    if let Err(err) = fs::rename(temp_archive, original_archive) {
+        let restore = fs::rename(backup_archive, original_archive);
+        return Err(match restore {
+            Ok(()) => format!(
+                "failed to install repackaged archive; restored original: {err}"
+            ),
+            Err(restore_err) => format!(
+                "failed to install repackaged archive ({err}) and failed to restore original from backup '{}' ({restore_err})",
+                backup_archive.display()
+            ),
+        });
+    }
+
+    let backup_cleanup_warning = match fs::remove_file(backup_archive) {
+        Ok(()) => None,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => Some(format!(
+            "repackaged archive installed, but backup cleanup failed for '{}': {err}",
+            backup_archive.display()
+        )),
+    };
+
+    Ok(ArchiveRepackageReport { backup_cleanup_warning })
 }
 
 // =========================================================================
@@ -1795,6 +2166,195 @@ mod tests {
                 .len(),
             1,
             "real RAR materialization should probe the extracted audio once"
+        );
+    }
+
+    fn write_repackage_staging(root: &Path, content: &str) -> std::io::Result<PathBuf> {
+        let staging = root.join("stage");
+        let track_dir = staging.join("Disc 1");
+        fs::create_dir_all(&track_dir)?;
+        fs::write(track_dir.join("01.txt"), content)?;
+        fs::write(staging.join("manifest.txt"), "manifest")?;
+        Ok(staging)
+    }
+
+    fn extract_tar_archive(tar: &Path, archive: &Path, out_dir: &Path, gz: bool) -> std::io::Result<()> {
+        fs::create_dir_all(out_dir)?;
+        if gz {
+            run_fixture_command(
+                tar,
+                &[
+                    OsStr::new("xzf"),
+                    archive.as_os_str(),
+                    OsStr::new("-C"),
+                    out_dir.as_os_str(),
+                ],
+                None,
+            )
+        } else {
+            run_fixture_command(
+                tar,
+                &[
+                    OsStr::new("xf"),
+                    archive.as_os_str(),
+                    OsStr::new("-C"),
+                    out_dir.as_os_str(),
+                ],
+                None,
+            )
+        }
+    }
+
+    fn extract_seven_zip_archive(seven_zip: &Path, archive: &Path, out_dir: &Path) -> std::io::Result<()> {
+        fs::create_dir_all(out_dir)?;
+        let output_arg = format!("-o{}", out_dir.display());
+        run_fixture_command(
+            seven_zip,
+            &[
+                OsStr::new("x"),
+                OsStr::new("-y"),
+                OsStr::new(&output_arg),
+                archive.as_os_str(),
+            ],
+            None,
+        )
+    }
+
+    fn assert_repackaged_content(out_dir: &Path, expected: &str) {
+        let nested = fs::read_to_string(out_dir.join("Disc 1").join("01.txt"))
+            .expect("repackaged nested file");
+        let manifest = fs::read_to_string(out_dir.join("manifest.txt"))
+            .expect("repackaged top-level file");
+        assert_eq!(nested, expected);
+        assert_eq!(manifest, "manifest");
+    }
+
+    #[tokio::test]
+    async fn repackage_archive_recreates_real_tar_and_targz_and_replaces_original_atomically() {
+        let Some(tar) = find_executable(&["tar"]) else {
+            eprintln!("skipping real tar repackage integration test: tar is required");
+            return;
+        };
+
+        for (archive_name, gz) in [("Album.tar", false), ("Album.tar.gz", true)] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let original = temp.path().join(archive_name);
+            fs::write(&original, b"old archive bytes").expect("original archive placeholder");
+            let expected = format!("edited payload for {archive_name}");
+            let staging = write_repackage_staging(temp.path(), &expected)
+                .expect("write repackage staging");
+            let tool_paths = HashMap::from([("tar".to_string(), tar.clone())]);
+
+            let mut progress = Vec::new();
+            let report = repackage_archive_with_progress(&staging, &original, &tool_paths, |message| {
+                progress.push(message.to_string());
+            })
+            .await
+            .unwrap_or_else(|err| panic!("repackage {archive_name}: {err}"));
+
+            assert!(
+                report.backup_cleanup_warning.is_none(),
+                "successful fixture repackage should not report cleanup warnings"
+            );
+            assert!(
+                progress.iter().any(|message| message.contains("Validating"))
+                    && progress.iter().any(|message| message.contains("Creating"))
+                    && progress.iter().any(|message| message.contains("Verifying"))
+                    && progress.iter().any(|message| message.contains("Installing")),
+                "repackage should emit hand-off-grade progress milestones: {progress:?}"
+            );
+            assert!(original.exists(), "original archive path must be restored after replacement");
+            assert!(
+                fs::read_dir(temp.path())
+                    .expect("temp dir entries")
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry.file_name().to_string_lossy().contains("tonepoet-backup")),
+                "successful repackage must remove backup files"
+            );
+            let out = temp.path().join("extract");
+            extract_tar_archive(&tar, &original, &out, gz)
+                .unwrap_or_else(|err| panic!("extract repackaged {archive_name}: {err}"));
+            assert_repackaged_content(&out, &expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn repackage_archive_recreates_real_zip_and_7z_when_7z_is_available() {
+        let Some(seven_zip) = find_executable(&["7zz", "7z"]) else {
+            eprintln!("skipping real zip/7z repackage integration test: 7z/7zz is required");
+            return;
+        };
+
+        for archive_name in ["Album.zip", "Album.7z"] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let original = temp.path().join(archive_name);
+            fs::write(&original, b"old archive bytes").expect("original archive placeholder");
+            let expected = format!("edited payload for {archive_name}");
+            let staging = write_repackage_staging(temp.path(), &expected)
+                .expect("write repackage staging");
+            let tool_paths = HashMap::from([
+                ("7zz".to_string(), seven_zip.clone()),
+                ("7z".to_string(), seven_zip.clone()),
+            ]);
+
+            repackage_archive(&staging, &original, &tool_paths)
+                .await
+                .unwrap_or_else(|err| panic!("repackage {archive_name}: {err}"));
+
+            let out = temp.path().join("extract");
+            extract_seven_zip_archive(&seven_zip, &original, &out)
+                .unwrap_or_else(|err| panic!("extract repackaged {archive_name}: {err}"));
+            assert_repackaged_content(&out, &expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn repackage_archive_reports_missing_rar_creator_without_replacing_original() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.rar");
+        fs::write(&original, b"original rar placeholder").expect("original archive placeholder");
+        let staging = write_repackage_staging(temp.path(), "edited rar payload")
+            .expect("write repackage staging");
+        let missing_rar = temp.path().join("definitely-missing-rar-binary");
+        let tool_paths = HashMap::from([("rar".to_string(), missing_rar)]);
+
+        let err = repackage_archive(&staging, &original, &tool_paths)
+            .await
+            .expect_err("missing rar tool should fail");
+
+        assert!(
+            err.contains("RAR archive creation requires the `rar` executable"),
+            "missing rar error should be actionable: {err}"
+        );
+        assert_eq!(
+            fs::read(&original).expect("original archive after failed rar repackage"),
+            b"original rar placeholder",
+            "failed rar creation must not replace the original archive"
+        );
+    }
+
+    #[test]
+    fn replace_archive_atomically_restores_original_when_temp_install_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.zip");
+        let missing_temp = temp.path().join("missing-new-archive.zip");
+        let backup = temp.path().join("Album.zip.backup");
+        fs::write(&original, b"original archive").expect("original archive");
+
+        let err = replace_archive_atomically(&original, &missing_temp, &backup)
+            .expect_err("missing temp archive should fail install");
+
+        assert!(
+            err.contains("restored original"),
+            "install failure should report successful restoration: {err}"
+        );
+        assert_eq!(
+            fs::read(&original).expect("restored original archive"),
+            b"original archive"
+        );
+        assert!(
+            !backup.exists(),
+            "backup path should be consumed by restoration after failed install"
         );
     }
 

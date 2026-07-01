@@ -440,6 +440,28 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
             app.active_overlay = ActiveOverlay::ThemeBuilder(Box::new(state));
             return;
         }
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Performance => {
+            cycle_archive_listing_mode(app, false);
+            return;
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Performance => {
+            cycle_archive_listing_mode(app, true);
+            return;
+        }
+        (KeyCode::Char('-'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Performance => {
+            adjust_archive_listing_timeout(app, -5);
+            return;
+        }
+        (KeyCode::Char('+') | KeyCode::Char('='), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Performance => {
+            adjust_archive_listing_timeout(app, 5);
+            return;
+        }
+        (KeyCode::Char('0'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Performance => {
+            app.config.performance.browsing.archive_listing_timeout = 0;
+            let _ = app.config.save();
+            app.set_status("archive listing timeout disabled");
+            return;
+        }
         _ => {}
     }
 
@@ -1834,6 +1856,34 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
     }
 }
 
+
+fn cycle_archive_listing_mode(app: &mut AppState, forward: bool) {
+    let current = super::archive_listing::ArchiveListingMode::from_config(
+        &app.config.performance.browsing.archive_listing,
+    );
+    let next = if forward { current.next() } else { current.previous() };
+    app.config.performance.browsing.archive_listing = next.config_value().to_string();
+    match app.config.save() {
+        Ok(()) => app.set_status(format!("archive listing: {}", next.display_label())),
+        Err(err) => app.set_status(format!("archive listing updated but config save failed: {}", err)),
+    }
+}
+
+fn adjust_archive_listing_timeout(app: &mut AppState, delta: i64) {
+    let current = app.config.performance.browsing.archive_listing_timeout as i64;
+    let next = (current + delta).clamp(0, 600) as u64;
+    app.config.performance.browsing.archive_listing_timeout = next;
+    let label = if next == 0 {
+        "disabled".to_string()
+    } else {
+        format!("{}s", next)
+    };
+    match app.config.save() {
+        Ok(()) => app.set_status(format!("archive listing timeout: {}", label)),
+        Err(err) => app.set_status(format!("archive listing timeout updated but config save failed: {}", err)),
+    }
+}
+
 // ── Browse screen keybindings ────────────────────────────────────────
 
 fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
@@ -1955,6 +2005,18 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             super::command::execute_command(app, super::command::Command::Delete, tx);
         }
 
+        // Force archive listing even when Performance > Browsing would normally skip it.
+        (KeyCode::Char('l'), KeyModifiers::NONE) => {
+            if let Some(entry) = app.browse.selected_entry() {
+                if matches!(entry.kind, EntryKind::Archive) && !app.browse.is_in_archive() {
+                    start_browse_archive_listing(app, entry.path.clone(), tx, true);
+                } else {
+                    app.browse.type_ahead_push('l');
+                    selection_may_have_changed = true;
+                }
+            }
+        }
+
         // Rename the selected file/folder inline in the list.
         (KeyCode::F(2), KeyModifiers::NONE) => {
             clear_browse_info_focus(app);
@@ -2021,31 +2083,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                         selection_may_have_changed = true;
                     }
                     EntryKind::Archive if !app.browse.is_in_archive() => {
-                        // Open archive for browsing: async list contents.
-                        let path = entry.path.clone();
-                        let password = app
-                            .archive_passwords
-                            .get(&path)
-                            .cloned()
-                            .or_else(|| {
-                                app.keychain.ensure_loaded();
-                                app.keychain.passwords.first().cloned()
-                            })
-                            .or_else(|| app.config.conversion.archive_password.clone());
-                        let tx = tx.clone();
-                        app.set_status("Loading archive...");
-                        tokio::spawn(async move {
-                            let result =
-                                super::archive_listing::list_archive(&path, password.as_deref())
-                                    .await;
-                            let _ = tx
-                                .send(AppMessage::ArchiveListingComplete {
-                                    archive_path: path,
-                                    result: Box::new(result),
-                                    password,
-                                })
-                                .await;
-                        });
+                        start_browse_archive_listing(app, entry.path.clone(), tx, false);
                     }
                     EntryKind::AudioFile(_) if app.browse.is_in_archive() => {
                         // Inside an archive: extract selected files to temp before loading.
@@ -2148,7 +2186,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 
         // Esc escalation: type-ahead → search → visual mode → multi-selection → text filter → archive
         (KeyCode::Esc, _) => {
-            if app.browse.type_ahead_active() {
+            if app.cancel_archive_listing() {
+                app.set_status("archive listing cancelled");
+            } else if app.browse.type_ahead_active() {
                 app.browse.clear_type_ahead();
             } else if app.browse.search.active {
                 app.browse.close_search();
@@ -2193,6 +2233,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     }
 
     if selection_may_have_changed {
+        if app.cancel_archive_listing() {
+            app.set_status("archive listing cancelled: browse navigation changed");
+        }
         app.browse.probe_current_with_db(tx, Some(&app.db));
                                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
     }
@@ -2400,6 +2443,108 @@ pub fn load_browse_selection_pub(
     load_browse_selection(app, path, target);
 }
 
+
+fn archive_listing_password_for_path(app: &mut AppState, path: &std::path::Path) -> Option<String> {
+    app.archive_passwords
+        .get(path)
+        .cloned()
+        .or_else(|| {
+            app.keychain.ensure_loaded();
+            app.keychain.passwords.first().cloned()
+        })
+        .or_else(|| app.config.conversion.archive_password.clone())
+}
+
+fn archive_listing_timeout_from_config(app: &AppState) -> Option<std::time::Duration> {
+    match app.config.performance.browsing.archive_listing_timeout {
+        0 => None,
+        seconds => Some(std::time::Duration::from_secs(seconds)),
+    }
+}
+
+fn start_browse_archive_listing(
+    app: &mut AppState,
+    path: std::path::PathBuf,
+    tx: &mpsc::Sender<AppMessage>,
+    force: bool,
+) {
+    let mode = super::archive_listing::ArchiveListingMode::from_config(
+        &app.config.performance.browsing.archive_listing,
+    );
+
+    if !force && matches!(mode, super::archive_listing::ArchiveListingMode::Never) {
+        app.set_status("archive listing is disabled; press l to list this archive");
+        return;
+    }
+
+    if !force
+        && matches!(mode, super::archive_listing::ArchiveListingMode::Auto)
+        && super::archive_listing::is_remote_filesystem(&path)
+    {
+        app.set_status("archive is on a network mount; press l to list contents");
+        return;
+    }
+
+    let cache_key = match super::archive_listing::ArchiveListingCacheKey::for_path(&path) {
+        Ok(key) => key,
+        Err(err) => {
+            app.set_status(format!("Archive error: cannot stat archive: {}", err));
+            return;
+        }
+    };
+
+    if let Some(listing) = app.cached_archive_listing(&cache_key) {
+        let count = listing.entries.len();
+        let password = archive_listing_password_for_path(app, &path);
+        app.browse.enter_archive(listing, password);
+        app.set_status(format!("Opened from cache ({} entries)", count));
+        return;
+    }
+
+    let password = archive_listing_password_for_path(app, &path);
+    let timeout = archive_listing_timeout_from_config(app);
+    let (id, cancel) = app.begin_archive_listing(path.clone());
+    let tx = tx.clone();
+    let path_for_worker = path.clone();
+    let cache_key_for_result = Some(cache_key.clone());
+
+    app.set_status(match timeout {
+        Some(timeout) => format!(
+            "Loading archive... Esc cancels; timeout {}s",
+            timeout.as_secs()
+        ),
+        None => "Loading archive... Esc cancels; no timeout".to_string(),
+    });
+
+    tokio::spawn(async move {
+        let _ = tx
+            .send(AppMessage::ArchiveListingProgress {
+                id,
+                archive_path: path_for_worker.clone(),
+                message: "Listing archive contents... Esc cancels".to_string(),
+            })
+            .await;
+
+        let result = super::archive_listing::list_archive_with_options(
+            &path_for_worker,
+            password.as_deref(),
+            super::archive_listing::ArchiveListingOptions { timeout },
+            cancel,
+        )
+        .await;
+
+        let _ = tx
+            .send(AppMessage::ArchiveListingComplete {
+                id,
+                archive_path: path_for_worker,
+                cache_key: cache_key_for_result,
+                result: Box::new(result),
+                password,
+            })
+            .await;
+    });
+}
+
 /// Extract a specific file from an archive to a scratch/temp directory.
 /// Returns the path to the extracted file on success.
 async fn extract_from_archive(
@@ -2435,7 +2580,8 @@ async fn extract_from_archive(
     if let Some(pw) = password {
         cmd.arg(format!("-p{}", pw));
     }
-    cmd.stdout(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
 
     let output = cmd
@@ -4621,10 +4767,19 @@ pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
 fn request_metadata_editor_close(
     app: &mut AppState,
     state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
 ) {
     if state.phase == super::app::MetadataEditorPhase::Saving {
         app.active_overlay = ActiveOverlay::MetadataEditor(state.clone());
         app.set_status("metadata editor: save in progress — wait for completion before closing".to_string());
+        return;
+    }
+    if state.replaygain_scan.is_some() || state.artwork_write.is_some() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state.clone());
+        app.set_status(
+            "metadata editor: metadata file write in progress — wait for completion before closing"
+                .to_string(),
+        );
         return;
     }
     metadata_editor_cancel_details_probe(state);
@@ -4635,7 +4790,16 @@ fn request_metadata_editor_close(
             action: ConfirmAction::DiscardMetadataEditorChanges,
         };
         app.set_status("metadata editor: unsaved changes — confirm discard or press Esc/N to return".to_string());
+    } else if state.has_browse_archive_staged_changes() {
+        if let Some(context) = state.archive_edit_context.clone() {
+            app.active_overlay = ActiveOverlay::None;
+            super::event_loop::start_browse_archive_repackage(app, context, tx);
+        } else {
+            app.active_overlay = ActiveOverlay::None;
+            app.set_status("metadata editor: archive changes had no repackage context".to_string());
+        }
     } else {
+        cleanup_metadata_editor_archive_context(state);
         app.active_overlay = ActiveOverlay::None;
     }
 }
@@ -5147,17 +5311,46 @@ mod progress_dialog_theme_tests {
         assert!(!app.keychain.focused);
 
         handle_config_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.config_focus, ConfigFocus::Performance);
+        assert!(!app.keychain.focused);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.config_focus, ConfigFocus::Keychain);
         assert!(app.keychain.focused);
 
         handle_config_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(app.config_focus, ConfigFocus::Conversion);
+        assert_eq!(app.config_focus, ConfigFocus::Performance);
         assert!(!app.keychain.focused);
 
         app.set_config_focus(ConfigFocus::Keychain);
         handle_config_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.config_focus, ConfigFocus::Appearance);
         assert!(!app.keychain.focused);
+    }
+
+
+    #[test]
+    fn performance_config_keys_update_archive_listing_settings() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{AppScreen, AppState, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-performance-config-test");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.set_config_focus(ConfigFocus::Performance);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.config.performance.browsing.archive_listing, "always");
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.config.performance.browsing.archive_listing, "auto");
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(app.config.performance.browsing.archive_listing_timeout, 35);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert_eq!(app.config.performance.browsing.archive_listing_timeout, 0);
     }
 
     #[test]
@@ -5176,6 +5369,12 @@ mod progress_dialog_theme_tests {
 
         app.set_config_focus(ConfigFocus::Conversion);
         handle_config_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.config.ui.theme, "tokyo-night");
+        assert_eq!(app.theme.slug, "tokyo-night");
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+
+        app.set_config_focus(ConfigFocus::Performance);
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         assert_eq!(app.config.ui.theme, "tokyo-night");
         assert_eq!(app.theme.slug, "tokyo-night");
         assert!(matches!(app.active_overlay, ActiveOverlay::None));
@@ -5703,7 +5902,7 @@ fn handle_metadata_editor_key(
                     return;
                 }
                 KeyCode::Esc => {
-                    request_metadata_editor_close(app, state);
+                    request_metadata_editor_close(app, state, tx);
                 }
                 KeyCode::Tab => {
                     let was_details = state.content_tab == crate::tui::app::ContentTab::Details;
@@ -6203,7 +6402,7 @@ fn handle_metadata_editor_key(
             // failed/skipped write issues by closing while the write is
             // still in flight.
             if key.code == KeyCode::Esc {
-                request_metadata_editor_close(app, state);
+                request_metadata_editor_close(app, state, tx);
             }
         }
     }
@@ -7105,7 +7304,9 @@ fn metadata_editor_request_details_probe(
     true
 }
 
-fn metadata_editor_cancel_details_probe(state: &mut crate::tui::app::MetadataEditorState) {
+pub(super) fn metadata_editor_cancel_details_probe(
+    state: &mut crate::tui::app::MetadataEditorState,
+) {
     state.active_surface_mut().technical_details.cancel_details_probe();
 }
 
@@ -7569,10 +7770,446 @@ fn sacd_technical_details(
     })
 }
 
+fn open_browse_archive_metadata_editor(app: &mut AppState, archive_path: std::path::PathBuf) {
+    if app.browse_archive_repackage.is_some() {
+        app.set_status("metadata: wait for the current archive repackage to finish before editing another archive");
+        return;
+    }
+
+    let Some(tx) = app.tui_tx.clone() else {
+        app.set_status("metadata: cannot edit archive before TUI message channel is ready");
+        return;
+    };
+
+    if let Some(pending) = app.pending_browse_archive_metadata.take() {
+        pending.cancel_and_cleanup();
+    }
+
+    let pending = PendingBrowseArchiveMetadataEdit::new(archive_path.clone());
+    let staging_dir = pending.staging_dir.clone();
+    let cancel = pending.cancel.clone();
+    let password = super::app::archive_preview_password_for_path(app, &archive_path);
+    let tool_paths = app.manager.config.tool_paths.clone();
+    app.pending_browse_archive_metadata = Some(pending);
+    app.set_status(format!(
+        "Extracting archive for metadata editing: {}",
+        archive_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| archive_path.display().to_string())
+    ));
+
+    tokio::spawn(async move {
+        let archive_for_result = archive_path.clone();
+        let staging_for_result = staging_dir.clone();
+        let result: Result<ArchiveMetadataEditorPayload, String> = async {
+            if cancel.is_cancelled() {
+                return Err("archive metadata edit cancelled".to_string());
+            }
+            let _ = tx.send(AppMessage::ArchiveMetadataEditorProgress {
+                archive_path: archive_path.clone(),
+                staging_dir: staging_dir.clone(),
+                message: "Preparing archive metadata staging directory...".to_string(),
+            }).await;
+            std::fs::create_dir_all(&staging_dir)
+                .map_err(|err| format!("create archive metadata staging failed: {err}"))?;
+            let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
+            let _ = tx.send(AppMessage::ArchiveMetadataEditorProgress {
+                archive_path: archive_path.clone(),
+                staging_dir: staging_dir.clone(),
+                message: "Extracting archive for metadata editing...".to_string(),
+            }).await;
+            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+                &archive_path,
+                &staging_dir,
+                "browse-archive-metadata-edit",
+                password.as_deref(),
+                &runner,
+                None,
+                &cancel,
+            )
+            .await
+            .map_err(|err| format!("archive extraction failed: {err}"))?;
+
+            if cancel.is_cancelled() {
+                return Err("archive metadata edit cancelled".to_string());
+            }
+
+            let _ = tx.send(AppMessage::ArchiveMetadataEditorProgress {
+                archive_path: archive_path.clone(),
+                staging_dir: staging_dir.clone(),
+                message: "Discovering archive audio files...".to_string(),
+            }).await;
+            let staging_for_read = staging_dir.clone();
+            let paths = tokio::task::spawn_blocking(move || {
+                crate::convert::pipeline::materializer_archive::discover_archive_audio_files(&staging_for_read)
+                    .map_err(|err| format!("audio discovery failed: {err}"))
+            })
+            .await
+            .map_err(|err| format!("archive audio discovery worker failed: {err}"))??;
+            if paths.is_empty() {
+                return Err("no audio files found in archive".to_string());
+            }
+
+            let _ = tx.send(AppMessage::ArchiveMetadataEditorProgress {
+                archive_path: archive_path.clone(),
+                staging_dir: staging_dir.clone(),
+                message: format!(
+                    "Reading metadata from {} archive track{}...",
+                    paths.len(),
+                    if paths.len() == 1 { "" } else { "s" }
+                ),
+            }).await;
+            tokio::task::spawn_blocking(move || {
+                let merged = crate::tui::probe::read_all_tags_merged_with_metadata(&paths)?;
+                Ok(ArchiveMetadataEditorPayload {
+                    paths,
+                    entries: merged.entries,
+                    metadata: merged.metadata,
+                    metadata_errors: merged.metadata_errors,
+                })
+            })
+            .await
+            .map_err(|err| format!("archive metadata worker failed: {err}"))?
+        }
+        .await;
+
+        if result.is_err() {
+            super::app::cleanup_archive_metadata_staging_dir(&staging_for_result);
+        }
+
+        let _ = tx
+            .send(AppMessage::ArchiveMetadataEditorPrepared {
+                archive_path: archive_for_result,
+                staging_dir: staging_for_result,
+                result,
+            })
+            .await;
+    });
+}
+
+pub(super) fn install_archive_metadata_editor_payload(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    payload: ArchiveMetadataEditorPayload,
+) {
+    let context = ArchiveMetadataEditContext::browse(archive_path.clone(), staging_dir);
+    let mut state = metadata_editor_state_from_loaded_files(
+        app,
+        payload.paths,
+        payload.entries,
+        payload.metadata,
+        payload.metadata_errors,
+    );
+    state.archive_edit_context = Some(context);
+    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+    app.set_status(format!(
+        "Archive metadata editor opened: {}",
+        archive_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| archive_path.display().to_string())
+    ));
+}
+
+fn metadata_editor_state_from_loaded_files(
+    app: &AppState,
+    mut paths: Vec<std::path::PathBuf>,
+    mut entries: Vec<crate::tui::probe::TagEntry>,
+    mut source_metadata: Vec<crate::tui::probe::SourceMetadata>,
+    mut source_metadata_errors: Vec<Option<crate::tui::probe::MetadataReadIssue>>,
+) -> super::app::MetadataEditorState {
+    super::probe::sort_paths_entries_metadata_and_errors_by_track(
+        &mut paths,
+        &mut entries,
+        &mut source_metadata,
+        &mut source_metadata_errors,
+    );
+
+    let technical_details = metadata_technical_details_for_paths_with_analysis(
+        &paths,
+        &source_metadata,
+        &source_metadata_errors,
+        Some(&app.db),
+        &app.preemph_results,
+    );
+
+    let mut did_auto_populate = false;
+    {
+        let n = paths.len();
+        let tn_idx = entries
+            .iter()
+            .position(|e| e.display_key.eq_ignore_ascii_case("TRACKNUMBER"));
+        let title_idx = entries
+            .iter()
+            .position(|e| e.display_key.eq_ignore_ascii_case("TITLE"));
+
+        let tn_idx = match tn_idx {
+            Some(i) => i,
+            None => {
+                entries.push(crate::tui::probe::TagEntry {
+                    display_key: "TRACKNUMBER".to_string(),
+                    item_key: lofty::tag::ItemKey::TrackNumber,
+                    value: String::new(),
+                    original: String::new(),
+                    is_binary: false,
+                    is_mixed: false,
+                    per_file_values: vec![String::new(); n],
+                    per_file_originals: vec![String::new(); n],
+                    mb_proposed_value: None,
+                    mb_proposed_per_file: None,
+                });
+                entries.len() - 1
+            }
+        };
+        let title_idx = match title_idx {
+            Some(i) => i,
+            None => {
+                entries.push(crate::tui::probe::TagEntry {
+                    display_key: "TITLE".to_string(),
+                    item_key: lofty::tag::ItemKey::TrackTitle,
+                    value: String::new(),
+                    original: String::new(),
+                    is_binary: false,
+                    is_mixed: false,
+                    per_file_values: vec![String::new(); n],
+                    per_file_originals: vec![String::new(); n],
+                    mb_proposed_value: None,
+                    mb_proposed_per_file: None,
+                });
+                entries.len() - 1
+            }
+        };
+
+        let auto_populate_allowed: Vec<bool> = technical_details
+            .files
+            .iter()
+            .map(|file| file.file_facts.write_eligibility.is_writable())
+            .collect();
+        for i in 0..n {
+            if !auto_populate_allowed.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let stem = paths[i].file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let (parsed_track, parsed_title) = super::probe::parse_title_from_filename(stem);
+            if entries[tn_idx].per_file_values[i].is_empty() {
+                if let Some(t) = parsed_track {
+                    entries[tn_idx].per_file_values[i] = t.to_string();
+                    did_auto_populate = true;
+                }
+            }
+            if entries[title_idx].per_file_values[i].is_empty() {
+                if let Some(ref t) = parsed_title {
+                    entries[title_idx].per_file_values[i] = t.clone();
+                    did_auto_populate = true;
+                }
+            }
+        }
+
+        for idx in [tn_idx, title_idx] {
+            let all_same = entries[idx]
+                .per_file_values
+                .windows(2)
+                .all(|w| w[0] == w[1]);
+            entries[idx].is_mixed = !all_same;
+            entries[idx].value = if !all_same {
+                "<multiple values>".to_string()
+            } else {
+                entries[idx].per_file_values.first().cloned().unwrap_or_default()
+            };
+        }
+    }
+
+    let file_labels = metadata_editor_file_labels(&paths, &entries);
+    let mut state = super::app::MetadataEditorState::for_files(
+        paths,
+        entries,
+        file_labels,
+        technical_details,
+    );
+    state.active_surface_mut().dirty = did_auto_populate;
+    state
+}
+
+fn metadata_editor_file_labels(
+    paths: &[std::path::PathBuf],
+    entries: &[crate::tui::probe::TagEntry],
+) -> Vec<String> {
+    let track_entry = entries
+        .iter()
+        .find(|e| e.display_key.eq_ignore_ascii_case("TRACKNUMBER"));
+    let disc_entry = entries
+        .iter()
+        .find(|e| e.display_key.eq_ignore_ascii_case("DISCNUMBER"));
+    let has_multi_disc = disc_entry
+        .map(|e| {
+            let unique: std::collections::HashSet<&str> = e
+                .per_file_values
+                .iter()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.as_str())
+                .collect();
+            unique.len() > 1
+        })
+        .unwrap_or(false);
+
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let tn = track_entry
+                .and_then(|e| e.per_file_values.get(i))
+                .filter(|v| !v.is_empty());
+            let dn = if has_multi_disc {
+                disc_entry
+                    .and_then(|e| e.per_file_values.get(i))
+                    .filter(|v| !v.is_empty())
+            } else {
+                None
+            };
+            match (dn, tn) {
+                (Some(d), Some(t)) => format!("D{}.{:>02}", d, t),
+                (None, Some(t)) => format!("{:>02}", t),
+                _ => p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            }
+        })
+        .collect()
+}
+
+pub(super) fn cleanup_metadata_editor_archive_context(state: &super::app::MetadataEditorState) {
+    if let Some(context) = &state.archive_edit_context {
+        if context.owner == ArchiveMetadataEditOwner::Browse {
+            context.cleanup_staging();
+        }
+    }
+}
+
+pub(super) fn sync_convert_archive_preview_metadata_from_editor(
+    app: &mut AppState,
+    state: &super::app::MetadataEditorState,
+) -> usize {
+    let Some(context) = state.archive_edit_context.as_ref() else {
+        return 0;
+    };
+    if context.owner != ArchiveMetadataEditOwner::Convert {
+        return 0;
+    }
+
+    let surface = state.active_surface();
+    let SourceMode::MultiTrack {
+        metadata: source_metadata,
+        tracks: visible_tracks,
+        album_title,
+        album_artist,
+        archive_preview: Some(preview),
+        ..
+    } = &mut app.convert.source.mode else {
+        return 0;
+    };
+
+    if preview.archive_path != context.archive_path || preview.staging_dir != context.staging_dir {
+        return 0;
+    }
+
+    let mut updated = 0usize;
+    for (file_idx, path) in surface.paths.iter().enumerate() {
+        let Some(track_idx) = preview
+            .tracks
+            .iter()
+            .position(|track| archive_editor_paths_match(&track.path, path))
+        else {
+            continue;
+        };
+        let mut metadata = preview.tracks[track_idx].metadata.clone();
+        if let Some(value) = editor_metadata_value(surface, file_idx, &["TITLE"]) {
+            metadata.title = value;
+        }
+        if let Some(value) = editor_metadata_value(surface, file_idx, &["ARTIST", "PERFORMER"]) {
+            metadata.artist = value;
+        }
+        if let Some(value) = editor_metadata_value(surface, file_idx, &["ALBUM"]) {
+            metadata.album = value;
+        }
+        if let Some(value) = editor_metadata_value(surface, file_idx, &["GENRE"]) {
+            metadata.genre = value;
+        }
+        if let Some(value) = editor_metadata_value(surface, file_idx, &["DATE", "YEAR"]) {
+            metadata.year = value;
+        }
+        preview.tracks[track_idx].metadata = metadata;
+        updated = updated.saturating_add(1);
+    }
+
+    if updated > 0 {
+        preview.album_metadata = super::app::archive_preview_album_metadata(&preview.tracks);
+        *source_metadata = preview.album_metadata.clone();
+        *album_title = source_metadata.album.clone();
+        *album_artist = source_metadata.artist.clone();
+        for (idx, track) in preview.tracks.iter().enumerate() {
+            if let Some(visible) = visible_tracks.get_mut(idx) {
+                visible.title = track
+                    .metadata
+                    .title
+                    .clone()
+                    .or_else(|| Some(track.original_name.clone()));
+                visible.performer = track.metadata.artist.clone();
+            }
+        }
+    }
+
+    updated
+}
+
+fn archive_editor_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn editor_metadata_value(
+    surface: &super::app::PresentationTab,
+    file_idx: usize,
+    keys: &[&str],
+) -> Option<Option<String>> {
+    for (entry_idx, entry) in surface.entries.iter().enumerate() {
+        if !keys.iter().any(|key| entry.display_key.eq_ignore_ascii_case(key)) {
+            continue;
+        }
+        if surface.deleted.contains(&entry_idx) {
+            return Some(None);
+        }
+        let value = entry
+            .per_file_values
+            .get(file_idx)
+            .map(String::as_str)
+            .unwrap_or(entry.value.as_str())
+            .trim();
+        return Some((!value.is_empty() && value != "<multiple values>").then(|| value.to_string()));
+    }
+    None
+}
+
 pub fn open_metadata_editor(app: &mut AppState) {
     // Collect paths — expand directories recursively to find nested
     // audio files (e.g., disc 01/disc 02 folders).
     let sel = super::command::collect_selection_for_file_ops(app);
+
+    if sel.len() == 1
+        && !app.browse.is_in_archive()
+        && matches!(super::browse::classify_file(&sel[0]), super::browse::EntryKind::Archive)
+    {
+        open_browse_archive_metadata_editor(app, sel[0].clone());
+        return;
+    }
 
     // SACD ISO short-circuit: if the selection is exactly one SACD ISO
     // file, surface ScarletBook metadata (album-level + per-track
@@ -13503,7 +14140,7 @@ fn handle_metadata_editor_mouse(
                         // Right-click outside content area uses the
                         // same close gate as Esc/footer/outside-click so
                         // dirty edits cannot be discarded silently.
-                        request_metadata_editor_close(app, &mut state);
+                        request_metadata_editor_close(app, &mut state, tx);
                     }
                 }
             }
@@ -13935,7 +14572,7 @@ fn handle_metadata_editor_mouse(
                                     return;
                                 }
                                 "esc" => {
-                                    request_metadata_editor_close(app, &mut state);
+                                    request_metadata_editor_close(app, &mut state, tx);
                                     return;
                                 }
                                 _ => {}
@@ -13981,7 +14618,7 @@ fn handle_metadata_editor_mouse(
                         }
                         match action {
                             "esc" => {
-                                request_metadata_editor_close(app, &mut state);
+                                request_metadata_editor_close(app, &mut state, tx);
                                 return;
                             }
                             _ => {}
@@ -14125,7 +14762,7 @@ fn handle_metadata_editor_mouse(
             // as Esc/footer close so dirty edits cannot be discarded
             // silently.
             MouseEventKind::Down(MouseButton::Left) if !in_popup => {
-                request_metadata_editor_close(app, &mut state);
+                request_metadata_editor_close(app, &mut state, tx);
             }
 
             // Left click inside popup but outside content/footer: ignore.
@@ -15405,6 +16042,15 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         _ => None,
     };
 
+    let archive_preview_context = match &app.convert.source.mode {
+        SourceMode::MultiTrack { archive_preview: Some(preview), .. } => Some(
+            ArchiveMetadataEditContext::convert(
+                preview.archive_path.clone(),
+                preview.staging_dir.clone(),
+            ),
+        ),
+        _ => None,
+    };
     let archive_preview_paths = match &app.convert.source.mode {
         SourceMode::MultiTrack { archive_preview: Some(preview), .. } => Some(
             preview
@@ -15493,6 +16139,9 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         file_labels,
         technical_details,
     );
+    if let Some(context) = archive_preview_context {
+        state.archive_edit_context = Some(context);
+    }
     if let Some(track_index) = initial_track {
         focus_metadata_editor_on_track(&mut state, track_index);
     }
@@ -15808,6 +16457,7 @@ fn apply_text_edit(
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 app.set_status(&format!("Password set for {} (saved to keychain)", name));
+                start_browse_archive_listing(app, archive_path, tx, true);
             }
         }
     }
@@ -19384,6 +20034,7 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
             app.set_status(":tags-mb: kept MusicBrainz values on active presentation".to_string());
         }
         Some(ConfirmAction::DiscardMetadataEditorChanges) => {
+            app.quit_after_browse_archive_metadata_resolution = false;
             app.set_status("metadata editor: discard cancelled".to_string());
         }
         _ => {}
@@ -19425,9 +20076,39 @@ fn execute_confirm_action(
             ));
         }
         ConfirmAction::DiscardMetadataEditorChanges => {
-            app.pending_metadata_editor = None;
-            app.active_overlay = ActiveOverlay::None;
-            app.set_status("metadata editor: discarded unsaved changes".to_string());
+            let quit_after_resolution = app.quit_after_browse_archive_metadata_resolution;
+            app.quit_after_browse_archive_metadata_resolution = false;
+            let parked = app.pending_metadata_editor.take();
+            if let Some(parked) = parked.as_ref() {
+                if parked.has_browse_archive_staged_changes() {
+                    if let Some(context) = parked.archive_edit_context.clone() {
+                        app.active_overlay = ActiveOverlay::None;
+                        app.quit_after_browse_archive_repackage |= quit_after_resolution;
+                        super::event_loop::start_browse_archive_repackage(app, context, tx);
+                    } else {
+                        app.active_overlay = ActiveOverlay::MetadataEditor(parked.clone());
+                        app.should_quit = false;
+                        app.set_status("metadata editor: discarded unsaved changes; archive changes had no repackage context".to_string());
+                    }
+                } else {
+                    cleanup_metadata_editor_archive_context(parked);
+                    app.active_overlay = ActiveOverlay::None;
+                    if quit_after_resolution {
+                        app.should_quit = true;
+                        app.set_status("metadata editor: discarded unsaved changes; quitting".to_string());
+                    } else {
+                        app.set_status("metadata editor: discarded unsaved changes".to_string());
+                    }
+                }
+            } else {
+                app.active_overlay = ActiveOverlay::None;
+                if quit_after_resolution {
+                    app.should_quit = true;
+                    app.set_status("metadata editor: discarded unsaved changes; quitting".to_string());
+                } else {
+                    app.set_status("metadata editor: discarded unsaved changes".to_string());
+                }
+            }
         }
         ConfirmAction::RemoveSelected => {
             let removed = app.manager.remove_selected();

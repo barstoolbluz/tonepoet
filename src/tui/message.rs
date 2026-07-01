@@ -109,6 +109,36 @@ pub enum AppMessage {
         result: Result<crate::tui::app::ArchivePreview, String>,
         baseline: crate::tui::app::ConvertProbeBaseline,
     },
+    /// Milestone from Browse-screen archive metadata extraction/tag-read.
+    /// The event loop displays it only while the matching pending edit is
+    /// still current and the user remains on Browse.
+    ArchiveMetadataEditorProgress {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        message: String,
+    },
+    /// Completed Browse-screen archive metadata extraction/tag-read. The event
+    /// loop opens the editor only when this still matches the pending app-state
+    /// handle; stale completions clean their staging directory.
+    ArchiveMetadataEditorPrepared {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        result: Result<crate::tui::app::ArchiveMetadataEditorPayload, String>,
+    },
+    /// Milestone from Browse-screen archive repackage after staged metadata
+    /// writes. Displayed only while it matches the active repackage context.
+    ArchiveRepackageProgress {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        message: String,
+    },
+    /// Completed Browse-screen archive repackage after staged metadata writes.
+    /// Staging is cleaned up by the event-loop reducer in every outcome.
+    ArchiveRepackageResult {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String>,
+    },
     /// Result of an asynchronous audio probe (lofty + ffmpeg) launched by
     /// `BrowseState::probe_current`. The main loop updates `probe_cache` and
     /// removes the path from `probe_pending`. Reducers must not perform
@@ -256,9 +286,17 @@ pub enum AppMessage {
         paths: Vec<std::path::PathBuf>,
         result: Result<Vec<crate::tui::probe::SourceMetadata>, String>,
     },
+    /// Progress for an async archive listing (`7zz l -slt`).
+    ArchiveListingProgress {
+        id: u64,
+        archive_path: std::path::PathBuf,
+        message: String,
+    },
     /// Result of an async archive listing (`7zz l -slt`).
     ArchiveListingComplete {
+        id: u64,
         archive_path: std::path::PathBuf,
+        cache_key: Option<crate::tui::archive_listing::ArchiveListingCacheKey>,
         result: Box<Result<crate::tui::archive_listing::ArchiveListing, String>>,
         password: Option<String>,
     },

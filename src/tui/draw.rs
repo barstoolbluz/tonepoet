@@ -118,12 +118,13 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
     // Ensure keychain is loaded on first visit.
     app.keychain.ensure_loaded();
 
-    // Top-level: appearance pane + settings pane + keychain pane + footer
+    // Top-level: appearance pane + conversion pane + performance pane + keychain pane + footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(12), // appearance settings
-            Constraint::Length(12), // conversion settings
+            Constraint::Length(10), // conversion settings
+            Constraint::Length(6),  // browsing performance
             Constraint::Min(6),     // keychain
             Constraint::Length(2),  // footer
         ])
@@ -260,6 +261,52 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
 
     f.render_widget(Paragraph::new(settings_lines), settings_inner);
 
+    // ── Performance pane ──────────────────────────────────────────
+    let perf_border = if app.config_focus == ConfigFocus::Performance {
+        theme.cyan
+    } else {
+        theme.text_dim
+    };
+    let perf_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(perf_border))
+        .title(Span::styled(
+            " Performance ",
+            Style::default()
+                .fg(theme.cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let perf_inner = perf_block.inner(chunks[2]);
+    f.render_widget(perf_block, chunks[2]);
+
+    let browsing_cfg = &app.config.performance.browsing;
+    let listing_mode = crate::tui::archive_listing::ArchiveListingMode::from_config(
+        &browsing_cfg.archive_listing,
+    );
+    let timeout_label = if browsing_cfg.archive_listing_timeout == 0 {
+        "Disabled".to_string()
+    } else {
+        format!("{}s", browsing_cfg.archive_listing_timeout)
+    };
+    let performance_lines = vec![
+        Line::from(Span::styled("  Browsing", theme.muted())),
+        Line::from(vec![
+            Span::styled("  Archive listing:      ", theme.muted()),
+            Span::styled("◂ ", theme.muted()),
+            Span::styled(listing_mode.display_label(), theme.bright()),
+            Span::styled(" ▸", theme.muted()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Listing timeout:      ", theme.muted()),
+            Span::styled(timeout_label, theme.bright()),
+        ]),
+        Line::from(Span::styled(
+            "  h/l changes mode, +/- changes timeout, 0 disables",
+            theme.muted(),
+        )),
+    ];
+    f.render_widget(Paragraph::new(performance_lines), perf_inner);
+
     // ── Password keychain pane ───────────────────────────────────
     let kc_border = if app.config_focus == ConfigFocus::Keychain {
         theme.amber
@@ -275,8 +322,8 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
                 .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         ));
-    let kc_inner = kc_block.inner(chunks[2]);
-    f.render_widget(kc_block, chunks[2]);
+    let kc_inner = kc_block.inner(chunks[3]);
+    f.render_widget(kc_block, chunks[3]);
 
     if kc_inner.height < 2 {
         // Too small to render anything.
@@ -334,7 +381,7 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     super::draw_footer::draw_footer(
         f,
-        chunks[3],
+        chunks[4],
         app.current_screen,
         &mut app.button_map,
         status_msg,

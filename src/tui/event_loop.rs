@@ -38,6 +38,15 @@ pub async fn run_app(
         if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
             app.bookmarks.close_overlay();
         }
+        if app.current_screen != AppScreen::Browse && app.cancel_archive_listing() {
+            app.set_status("archive listing cancelled: Browse screen changed");
+        }
+        if app.current_screen != AppScreen::Browse {
+            if let Some(pending) = app.pending_browse_archive_metadata.take() {
+                pending.cancel_and_cleanup();
+                app.set_status("archive metadata editor cancelled: Browse screen changed before extraction finished");
+            }
+        }
         if app.current_screen != AppScreen::Convert {
             let archive_preview_owned_or_pending = app.convert.pending_archive_preview.is_some()
                 || matches!(
@@ -73,8 +82,22 @@ pub async fn run_app(
 
         // 3. Check quit
         if app.should_quit {
+            if defer_quit_for_browse_archive_metadata(app, &tx) {
+                continue;
+            }
+            app.cancel_archive_listing();
             app.convert.clear_pending_archive_preview();
             app.convert.source.mode.cleanup_archive_preview_staging();
+            if let Some(pending) = app.pending_browse_archive_metadata.take() {
+                pending.cancel_and_cleanup();
+            }
+            // An active Browse archive repackage is handled by
+            // `defer_quit_for_browse_archive_metadata()` above. If this is ever
+            // still populated here, preserve the existing conservative cleanup
+            // behavior rather than leaking temp state.
+            if let Some(context) = app.browse_archive_repackage.take() {
+                context.cleanup_staging();
+            }
             // Save queue before exiting
             app.save_queue();
             break;
@@ -98,6 +121,117 @@ pub async fn run_app(
     }
 
     Ok(())
+}
+
+
+fn defer_quit_for_browse_archive_metadata(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    if app.browse_archive_repackage.is_some() {
+        app.should_quit = false;
+        app.quit_after_browse_archive_repackage = true;
+        app.set_status(
+            "quit deferred: waiting for archive metadata repackage to finish".to_string(),
+        );
+        return true;
+    }
+
+    let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    match overlay {
+        ActiveOverlay::MetadataEditor(state) => {
+            return reconcile_browse_archive_metadata_editor_for_quit(app, state, tx);
+        }
+        other => {
+            app.active_overlay = other;
+        }
+    }
+
+    if app
+        .pending_metadata_editor
+        .as_ref()
+        .and_then(|state| state.archive_edit_context.as_ref())
+        .is_some_and(|context| context.owner == super::app::ArchiveMetadataEditOwner::Browse)
+    {
+        app.should_quit = false;
+        app.quit_after_browse_archive_metadata_resolution = true;
+        app.set_status(
+            "quit deferred: resolve the Browse archive metadata editor prompt first"
+                .to_string(),
+        );
+        return true;
+    }
+
+    false
+}
+
+fn reconcile_browse_archive_metadata_editor_for_quit(
+    app: &mut AppState,
+    mut state: Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    let is_browse_archive_editor = state
+        .archive_edit_context
+        .as_ref()
+        .is_some_and(|context| context.owner == super::app::ArchiveMetadataEditOwner::Browse);
+
+    if !is_browse_archive_editor {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        return false;
+    }
+
+    if state.phase == super::app::MetadataEditorPhase::Saving
+        || state.replaygain_scan.is_some()
+        || state.artwork_write.is_some()
+    {
+        app.should_quit = false;
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        app.set_status(
+            "quit deferred: metadata editor file write is still in progress".to_string(),
+        );
+        return true;
+    }
+
+    super::keybindings::metadata_editor_cancel_details_probe(&mut state);
+
+    if state.any_presentation_dirty() {
+        app.should_quit = false;
+        app.quit_after_browse_archive_metadata_resolution = true;
+        app.pending_metadata_editor = Some(state);
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: concat!(
+                "Discard unsaved metadata changes before quitting? ",
+                "Y discards them; N/Esc returns to the editor."
+            )
+            .to_string(),
+            action: super::app::ConfirmAction::DiscardMetadataEditorChanges,
+        };
+        app.set_status(
+            "quit deferred: confirm unsaved Browse archive metadata changes".to_string(),
+        );
+        return true;
+    }
+
+    if state.has_browse_archive_staged_changes() {
+        if let Some(context) = state.archive_edit_context.clone() {
+            app.should_quit = false;
+            app.quit_after_browse_archive_repackage = true;
+            app.active_overlay = ActiveOverlay::None;
+            start_browse_archive_repackage(app, context, tx);
+        } else {
+            app.should_quit = false;
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            app.set_status(
+                "quit cancelled: Browse archive staged changes have no repackage context"
+                    .to_string(),
+            );
+        }
+        return true;
+    }
+
+    super::keybindings::cleanup_metadata_editor_archive_context(&state);
+    app.active_overlay = ActiveOverlay::None;
+    false
 }
 
 /// Check the pending-browse-rename timer. If the deadline has passed and we're
@@ -875,6 +1009,203 @@ fn handle_archive_preview_result(
     }
 }
 
+
+fn handle_archive_metadata_editor_progress(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    message: String,
+) {
+    let pending_matches = app
+        .pending_browse_archive_metadata
+        .as_ref()
+        .is_some_and(|pending| pending.matches(&archive_path, &staging_dir));
+    if pending_matches && app.current_screen == AppScreen::Browse {
+        app.set_status(message);
+    }
+}
+
+fn handle_archive_metadata_editor_prepared(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    result: Result<super::app::ArchiveMetadataEditorPayload, String>,
+) {
+    let pending_matches = app
+        .pending_browse_archive_metadata
+        .as_ref()
+        .is_some_and(|pending| pending.matches(&archive_path, &staging_dir));
+    if !pending_matches {
+        super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+        app.set_status("archive metadata editor: ignored stale extraction result");
+        return;
+    }
+
+    if app.current_screen != AppScreen::Browse {
+        let _pending = app.pending_browse_archive_metadata.take();
+        super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+        app.set_status("archive metadata editor cancelled: Browse screen changed before extraction finished");
+        return;
+    }
+
+    if !matches!(app.active_overlay, ActiveOverlay::None) {
+        let _pending = app.pending_browse_archive_metadata.take();
+        super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+        app.set_status("archive metadata editor cancelled: another overlay opened before extraction finished");
+        return;
+    }
+
+    let _pending = app.pending_browse_archive_metadata.take();
+    match result {
+        Ok(payload) => {
+            super::keybindings::install_archive_metadata_editor_payload(
+                app,
+                archive_path,
+                staging_dir,
+                payload,
+            );
+        }
+        Err(err) => {
+            super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+            app.set_status(format!("archive metadata editor failed: {err}"));
+        }
+    }
+}
+
+pub(super) fn start_browse_archive_repackage(
+    app: &mut AppState,
+    context: super::app::ArchiveMetadataEditContext,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if app.browse_archive_repackage.is_some() {
+        context.cleanup_staging();
+        app.set_status("archive metadata editor: another archive repackage is already running");
+        return;
+    }
+
+    let archive_path = context.archive_path.clone();
+    let staging_dir = context.staging_dir.clone();
+    let tool_paths = app.manager.config.tool_paths.clone();
+    let tx = tx.clone();
+    app.browse_archive_repackage = Some(context);
+    app.set_status(format!(
+        "Repackaging archive after metadata edits: {}",
+        archive_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| archive_path.display().to_string())
+    ));
+
+    tokio::spawn(async move {
+        let progress_tx = tx.clone();
+        let archive_for_progress = archive_path.clone();
+        let staging_for_progress = staging_dir.clone();
+        let result = crate::convert::pipeline::materializer_archive::repackage_archive_with_progress(
+            &staging_dir,
+            &archive_path,
+            &tool_paths,
+            move |message| {
+                let _ = progress_tx.try_send(AppMessage::ArchiveRepackageProgress {
+                    archive_path: archive_for_progress.clone(),
+                    staging_dir: staging_for_progress.clone(),
+                    message: message.to_string(),
+                });
+            },
+        )
+        .await;
+        let _ = tx
+            .send(AppMessage::ArchiveRepackageResult {
+                archive_path,
+                staging_dir,
+                result,
+            })
+            .await;
+    });
+}
+
+fn handle_archive_repackage_progress(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    message: String,
+) {
+    let pending_matches = app
+        .browse_archive_repackage
+        .as_ref()
+        .is_some_and(|context| {
+            context.archive_path == archive_path && context.staging_dir == staging_dir
+        });
+    if pending_matches {
+        app.set_status(message);
+    }
+}
+
+fn handle_archive_repackage_result(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let pending_matches = app
+        .browse_archive_repackage
+        .as_ref()
+        .is_some_and(|context| {
+            context.archive_path == archive_path && context.staging_dir == staging_dir
+        });
+    if !pending_matches {
+        super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+        app.set_status("archive metadata editor: ignored stale repackage result");
+        return;
+    }
+
+    let context = app.browse_archive_repackage.take();
+    if let Some(context) = context.as_ref() {
+        context.cleanup_staging();
+    } else {
+        super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+    }
+    let quit_after_repackage = app.quit_after_browse_archive_repackage;
+    app.quit_after_browse_archive_repackage = false;
+
+    match result {
+        Ok(report) => {
+            let path_str = archive_path.display().to_string();
+            app.browse.probe_cache.remove(&archive_path);
+            app.browse.probe_pending.remove(&archive_path);
+            let _ = app.db.invalidate_probe(&path_str);
+            app.browse.probe_current_with_db(tx, Some(&app.db));
+            let archive_label = archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive_path.display().to_string());
+            if let Some(warning) = report.backup_cleanup_warning {
+                app.set_status(format!(
+                    "Archive metadata saved and repackaged: {archive_label}; warning: {warning}"
+                ));
+            } else {
+                app.set_status(format!(
+                    "Archive metadata saved and repackaged: {archive_label}"
+                ));
+            }
+            if quit_after_repackage {
+                app.should_quit = true;
+            }
+        }
+        Err(err) => {
+            if quit_after_repackage {
+                app.should_quit = false;
+                app.set_status(format!(
+                    "archive metadata repackage failed for {}; quit cancelled: {err}",
+                    archive_path.display()
+                ));
+            } else {
+                app.set_status(format!("archive repackage did not complete cleanly: {err}"));
+            }
+        }
+    }
+}
+
 fn handle_convert_audio_probe_complete(
     app: &mut AppState,
     generation: u64,
@@ -1087,6 +1418,34 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             baseline,
         } => {
             handle_archive_preview_result(app, generation, archive_path, result, baseline);
+        }
+        AppMessage::ArchiveMetadataEditorProgress {
+            archive_path,
+            staging_dir,
+            message,
+        } => {
+            handle_archive_metadata_editor_progress(app, archive_path, staging_dir, message);
+        }
+        AppMessage::ArchiveMetadataEditorPrepared {
+            archive_path,
+            staging_dir,
+            result,
+        } => {
+            handle_archive_metadata_editor_prepared(app, archive_path, staging_dir, result);
+        }
+        AppMessage::ArchiveRepackageProgress {
+            archive_path,
+            staging_dir,
+            message,
+        } => {
+            handle_archive_repackage_progress(app, archive_path, staging_dir, message);
+        }
+        AppMessage::ArchiveRepackageResult {
+            archive_path,
+            staging_dir,
+            result,
+        } => {
+            handle_archive_repackage_result(app, archive_path, staging_dir, result, tx);
         }
         AppMessage::ConvertAudioProbeComplete {
             generation,
@@ -1528,25 +1887,54 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         }
-        AppMessage::ArchiveListingComplete {
+        AppMessage::ArchiveListingProgress {
+            id,
             archive_path,
+            message,
+        } => {
+            if app.archive_listing_pending_for(id, &archive_path) {
+                app.set_status(message);
+            }
+        }
+        AppMessage::ArchiveListingComplete {
+            id,
+            archive_path,
+            cache_key,
             result,
             password,
-        } => match *result {
-            Ok(listing) => {
-                let count = listing.entries.len();
-                app.browse.enter_archive(listing, password);
-                app.set_status(&format!(
-                    "Opened {} ({} entries)",
-                    archive_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                    count,
-                ));
+        } => {
+            if !app.complete_archive_listing(id, &archive_path) {
+                return;
             }
-            Err(e) => {
-                app.set_status(&format!("Archive error: {}", e));
+            match *result {
+                Ok(listing) => {
+                    let count = listing.entries.len();
+                    if let Some(key) = cache_key {
+                        let _ = app.insert_archive_listing_cache(key, listing.clone());
+                    }
+                    app.browse.enter_archive(listing, password);
+                    app.set_status(format!(
+                        "Opened {} ({} entries)",
+                        archive_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        count,
+                    ));
+                }
+                Err(e) => {
+                    let lower = e.to_ascii_lowercase();
+                    if lower.contains("password") {
+                        app.active_overlay = ActiveOverlay::TextEdit {
+                            input: TextInputState::empty(),
+                            target: TextEditTarget::ArchivePassword(archive_path.clone()),
+                            label: "archive password".to_string(),
+                        };
+                        app.set_status(format!("Archive error: {}; enter password", e));
+                    } else {
+                        app.set_status(format!("Archive error: {}", e));
+                    }
+                }
             }
         },
         AppMessage::SearchComplete { results } => {
@@ -1724,6 +2112,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         Ok(metadata) => {
                             if let Some(surface) = state.surface_mut_for_session(session_id) {
                                 metadata_editor_apply_replaygain_metadata(surface, &paths, &metadata);
+                                state.mark_archive_staging_dirty();
                                 for path in &paths {
                                     app.browse.probe_cache.remove(path);
                                     let _ = app.db.invalidate_probe(&path.display().to_string());
@@ -1767,6 +2156,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         Ok(metadata) => {
                             if let Some(surface) = state.surface_mut_for_session(session_id) {
                                 metadata_editor_apply_artwork_metadata(surface, &paths, &metadata);
+                                state.mark_archive_staging_dirty();
                                 for path in &paths {
                                     app.browse.probe_cache.remove(path);
                                     let _ = app.db.invalidate_probe(&path.display().to_string());
@@ -1816,10 +2206,35 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         app.browse.probe_cache.remove(path);
                         let _ = app.db.invalidate_probe(&path.display().to_string());
                     }
-                    app.set_status(summary.status_line());
+                    if !summary.saved_paths.is_empty() {
+                        state.mark_archive_staging_dirty();
+                    }
                     if close_editor {
-                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                        let archive_context = state.archive_edit_context.clone();
+                        match archive_context.as_ref().map(|context| context.owner) {
+                            Some(super::app::ArchiveMetadataEditOwner::Convert) => {
+                                let updated = super::keybindings::sync_convert_archive_preview_metadata_from_editor(app, &state);
+                                app.browse.probe_current_with_db(tx, Some(&app.db));
+                                app.set_status(format!(
+                                    "metadata editor: saved staged archive tags; {} track{} synced to conversion overrides",
+                                    updated,
+                                    if updated == 1 { "" } else { "s" }
+                                ));
+                            }
+                            Some(super::app::ArchiveMetadataEditOwner::Browse) => {
+                                if let Some(context) = archive_context {
+                                    start_browse_archive_repackage(app, context, tx);
+                                } else {
+                                    app.set_status(summary.status_line());
+                                }
+                            }
+                            None => {
+                                app.browse.probe_current_with_db(tx, Some(&app.db));
+                                app.set_status(summary.status_line());
+                            }
+                        }
                     } else {
+                        app.set_status(summary.status_line());
                         state.phase = super::app::MetadataEditorPhase::Editing;
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     }
@@ -3280,6 +3695,163 @@ fn handle_cue_fill_complete(
     app.set_status(summary);
 }
 
+
+#[cfg(test)]
+mod browse_archive_quit_lifecycle_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::convert::pipeline::materializer_archive::ArchiveRepackageReport;
+    use crate::tui::app::{
+        ArchiveMetadataEditContext, MetadataEditorState, MetadataTechnicalDetails,
+    };
+    use std::fs;
+
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(8);
+        tx
+    }
+
+    fn clean_browse_archive_editor(
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+    ) -> Box<MetadataEditorState> {
+        let mut state = MetadataEditorState::for_files(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MetadataTechnicalDetails::default(),
+        );
+        state.archive_edit_context = Some(ArchiveMetadataEditContext::browse(
+            archive_path,
+            staging_dir,
+        ));
+        Box::new(state)
+    }
+
+    #[test]
+    fn quit_reconciliation_cleans_clean_browse_archive_editor_staging() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let staging = temp.path().join("staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.should_quit = true;
+
+        let deferred = reconcile_browse_archive_metadata_editor_for_quit(
+            &mut app,
+            clean_browse_archive_editor(archive, staging.clone()),
+            &tx(),
+        );
+
+        assert!(!deferred, "clean Browse archive editor should not block quit");
+        assert!(
+            !staging.exists(),
+            "clean Browse archive metadata staging must be removed on quit"
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+
+    #[test]
+    fn quit_defers_instead_of_cleaning_active_browse_archive_repackage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.tar");
+        let staging = temp.path().join("staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.should_quit = true;
+        app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
+            archive,
+            staging.clone(),
+        ));
+
+        assert!(defer_quit_for_browse_archive_metadata(&mut app, &tx()));
+        assert!(!app.should_quit, "quit must wait for repackage completion");
+        assert!(app.quit_after_browse_archive_repackage);
+        assert!(
+            app.browse_archive_repackage.is_some(),
+            "active repackage context must remain owned until completion"
+        );
+        assert!(
+            staging.exists(),
+            "active repackage staging must not be removed by global quit"
+        );
+    }
+
+    #[test]
+    fn successful_repackage_completion_resumes_deferred_quit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.tar");
+        let staging = temp.path().join("staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
+            archive.clone(),
+            staging.clone(),
+        ));
+        app.quit_after_browse_archive_repackage = true;
+
+        handle_archive_repackage_result(
+            &mut app,
+            archive,
+            staging.clone(),
+            Ok(ArchiveRepackageReport::default()),
+            &tx(),
+        );
+
+        assert!(app.should_quit, "successful repackage should resume quit");
+        assert!(!app.quit_after_browse_archive_repackage);
+        assert!(app.browse_archive_repackage.is_none());
+        assert!(
+            !staging.exists(),
+            "completed repackage must clean Browse archive staging"
+        );
+    }
+
+    #[test]
+    fn failed_repackage_completion_cancels_deferred_quit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.tar");
+        let staging = temp.path().join("staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
+            archive.clone(),
+            staging.clone(),
+        ));
+        app.quit_after_browse_archive_repackage = true;
+
+        handle_archive_repackage_result(
+            &mut app,
+            archive,
+            staging,
+            Err("simulated failure".to_string()),
+            &tx(),
+        );
+
+        assert!(
+            !app.should_quit,
+            "failed repackage should keep the app open so the error is visible"
+        );
+        assert!(!app.quit_after_browse_archive_repackage);
+        let status = app.status_message.as_ref().map(|(message, _)| message.as_str());
+        assert!(
+            status.unwrap_or_default().contains("quit cancelled"),
+            "unexpected status: {status:?}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod musicbrainz_completion_dispatch_tests {

@@ -17,6 +17,15 @@ use crate::tui::button_map::ButtonRenderMap;
 use crate::tui::pill::PillState;
 use crate::tui::probe::{SourceInfo, SourceMetadata};
 
+/// Upper bound for retained Browse archive listings. Listing large archives can
+/// allocate substantial path metadata, so the cache is deliberately small and
+/// session-scoped.
+const ARCHIVE_LISTING_CACHE_MAX_ENTRIES: usize = 32;
+
+/// Soft heap budget for retained Browse archive listings. Entries larger than
+/// this are still usable, but they are not retained after the first open.
+const ARCHIVE_LISTING_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 // ── Screen / tab navigation ──────────────────────────────────────────
 
 /// Which screen is currently displayed
@@ -1271,6 +1280,96 @@ impl PendingArchivePreview {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {}
         }
+    }
+}
+
+/// Lifecycle handle for Browse-screen archive metadata editing while extraction
+/// and tag reads are still running. The staging directory remains owned by this
+/// handle until the editor opens or the worker reports failure/staleness.
+#[derive(Clone)]
+pub struct PendingBrowseArchiveMetadataEdit {
+    pub archive_path: PathBuf,
+    pub staging_dir: PathBuf,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+impl fmt::Debug for PendingBrowseArchiveMetadataEdit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingBrowseArchiveMetadataEdit")
+            .field("archive_path", &self.archive_path)
+            .field("staging_dir", &self.staging_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingBrowseArchiveMetadataEdit {
+    pub fn new(archive_path: PathBuf) -> Self {
+        Self {
+            archive_path,
+            staging_dir: std::env::temp_dir().join(format!(
+                "tonepoet-archive-metadata-{}",
+                uuid::Uuid::new_v4()
+            )),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn matches(&self, archive_path: &Path, staging_dir: &Path) -> bool {
+        self.archive_path.as_path() == archive_path && self.staging_dir.as_path() == staging_dir
+    }
+
+    pub fn cancel_and_cleanup(self) {
+        self.cancel.cancel();
+        cleanup_archive_metadata_staging_dir(&self.staging_dir);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveMetadataEditOwner {
+    Browse,
+    Convert,
+}
+
+/// Archive metadata editor ownership context. Browse-owned sessions must
+/// repackage the archive after the staged audio files save successfully;
+/// Convert-owned sessions only update the Convert preview model and queue-time
+/// override payload, leaving the original archive untouched.
+#[derive(Debug, Clone)]
+pub struct ArchiveMetadataEditContext {
+    pub owner: ArchiveMetadataEditOwner,
+    pub archive_path: PathBuf,
+    pub staging_dir: PathBuf,
+}
+
+impl ArchiveMetadataEditContext {
+    pub fn browse(archive_path: PathBuf, staging_dir: PathBuf) -> Self {
+        Self { owner: ArchiveMetadataEditOwner::Browse, archive_path, staging_dir }
+    }
+
+    pub fn convert(archive_path: PathBuf, staging_dir: PathBuf) -> Self {
+        Self { owner: ArchiveMetadataEditOwner::Convert, archive_path, staging_dir }
+    }
+
+    pub fn cleanup_staging(&self) {
+        cleanup_archive_metadata_staging_dir(&self.staging_dir);
+    }
+}
+
+/// Payload returned by the Browse archive metadata worker after extraction,
+/// audio discovery, and the single tag-read pass used to seed the editor.
+#[derive(Debug, Clone)]
+pub struct ArchiveMetadataEditorPayload {
+    pub paths: Vec<PathBuf>,
+    pub entries: Vec<crate::tui::probe::TagEntry>,
+    pub metadata: Vec<crate::tui::probe::SourceMetadata>,
+    pub metadata_errors: Vec<Option<crate::tui::probe::MetadataReadIssue>>,
+}
+
+pub fn cleanup_archive_metadata_staging_dir(staging_dir: &Path) {
+    match std::fs::remove_dir_all(staging_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
     }
 }
 
@@ -5348,6 +5447,18 @@ impl std::ops::DerefMut for MetadataEditorState {
 /// - read-only tab scroll values are clamped before storage.
 #[derive(Debug, Clone)]
 pub struct MetadataEditorState {
+    /// Archive-edit ownership context when the editor is working against
+    /// extracted archive staging instead of ordinary source files.
+    pub archive_edit_context: Option<ArchiveMetadataEditContext>,
+
+    /// True after an operation has already written to archive staging files.
+    /// Browse-owned archive editors must repackage when this is set even if
+    /// the ordinary tag grid has no unsaved edits left. Artwork writes and
+    /// ReplayGain scans write through immediately, so the dirty bit is the
+    /// durable close-time signal that prevents cleanup from discarding those
+    /// staged edits.
+    pub archive_staging_dirty: bool,
+
     /// Authoritative metadata editor model.
     ///
     /// All active editable rows, selected presentation state, source facts,
@@ -5368,7 +5479,25 @@ fn read_only_max_scroll(total_lines: usize, visible_rows: usize) -> usize {
 
 impl MetadataEditorState {
     pub fn from_model(model: MetadataEditorModel) -> Self {
-        Self { model }
+        Self {
+            archive_edit_context: None,
+            archive_staging_dirty: false,
+            model,
+        }
+    }
+
+    pub fn mark_archive_staging_dirty(&mut self) {
+        if self.archive_edit_context.is_some() {
+            self.archive_staging_dirty = true;
+        }
+    }
+
+    pub fn has_browse_archive_staged_changes(&self) -> bool {
+        self.archive_staging_dirty
+            && self
+                .archive_edit_context
+                .as_ref()
+                .is_some_and(|context| context.owner == ArchiveMetadataEditOwner::Browse)
     }
 
     pub fn for_files(
@@ -6874,6 +7003,7 @@ pub enum TextEditTarget {
 pub enum ConfigFocus {
     Appearance,
     Conversion,
+    Performance,
     Keychain,
 }
 
@@ -6887,7 +7017,8 @@ impl ConfigFocus {
     pub fn next(self) -> Self {
         match self {
             Self::Appearance => Self::Conversion,
-            Self::Conversion => Self::Keychain,
+            Self::Conversion => Self::Performance,
+            Self::Performance => Self::Keychain,
             Self::Keychain => Self::Appearance,
         }
     }
@@ -6896,7 +7027,8 @@ impl ConfigFocus {
         match self {
             Self::Appearance => Self::Keychain,
             Self::Conversion => Self::Appearance,
-            Self::Keychain => Self::Conversion,
+            Self::Performance => Self::Conversion,
+            Self::Keychain => Self::Performance,
         }
     }
 
@@ -6933,6 +7065,19 @@ impl Default for KeychainState {
         }
     }
 }
+
+/// In-flight Browse archive listing request.
+///
+/// The generation id lets late completions from cancelled/stale workers be
+/// ignored without comparing result payloads. The cancellation token owns the
+/// child-process cancellation path inside `archive_listing`.
+pub struct PendingArchiveListing {
+    pub id: u64,
+    pub archive_path: std::path::PathBuf,
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub started_at: std::time::Instant,
+}
+
 
 impl KeychainState {
     /// Load passwords from disk if not already loaded.
@@ -7121,6 +7266,27 @@ pub struct AppState {
     /// restored after the command executes or review completes.
     pub pending_metadata_editor: Option<Box<MetadataEditorState>>,
 
+    /// Browse-screen archive metadata extraction currently in flight. This owns
+    /// the temporary staging directory until a matching completion opens the
+    /// editor or an error/stale result cleans it up.
+    pub pending_browse_archive_metadata: Option<PendingBrowseArchiveMetadataEdit>,
+
+    /// Browse-screen archive repackage currently in flight after staged tag
+    /// writes have succeeded. The event-loop completion clears this and removes
+    /// staging regardless of success or failure.
+    pub browse_archive_repackage: Option<ArchiveMetadataEditContext>,
+
+    /// True when global quit has been requested while a Browse archive metadata
+    /// editor still needs close-time reconciliation. The event loop defers the
+    /// actual exit until dirty staging has been repackaged or the user resolves
+    /// the unsaved-editor confirmation.
+    pub quit_after_browse_archive_metadata_resolution: bool,
+
+    /// True when quit is waiting for an already-started Browse archive repackage
+    /// to finish. Successful completion resumes shutdown; failure keeps the app
+    /// open long enough for the user to see the error.
+    pub quit_after_browse_archive_repackage: bool,
+
     /// Parked CuePreviewState while command mode is open. Set when `:`
     /// is pressed in the CUE preview overlay; consumed by `:w` (writes
     /// the CUE) and `:q` (cancels), or restored unchanged if neither.
@@ -7199,6 +7365,30 @@ pub struct AppState {
     /// Set via the `:password` command or interactive prompt. Takes
     /// priority over keychain MRU when committing archives.
     pub archive_passwords: std::collections::HashMap<std::path::PathBuf, String>,
+
+    /// In-flight Browse archive listing, if any. Esc, a new listing, or screen
+    /// changes cancel this token and stale completions are ignored by id.
+    pub pending_archive_listing: Option<PendingArchiveListing>,
+
+    /// Monotonic generation for Browse archive listing workers.
+    pub archive_listing_generation: u64,
+
+    /// In-memory archive listing cache keyed by path + size + mtime.
+    /// Access is intentionally funneled through helper methods so LRU order and
+    /// byte-budget invariants cannot be bypassed by other TUI modules.
+    archive_listing_cache: std::collections::HashMap<
+        crate::tui::archive_listing::ArchiveListingCacheKey,
+        crate::tui::archive_listing::ArchiveListing,
+    >,
+
+    /// Least-recently-used order for `archive_listing_cache`. The newest key is
+    /// at the back.
+    archive_listing_cache_lru: std::collections::VecDeque<
+        crate::tui::archive_listing::ArchiveListingCacheKey,
+    >,
+
+    /// Approximate retained heap footprint for archive listings.
+    archive_listing_cache_bytes: usize,
 
     /// Last directory visited by the Artwork-tab file picker.
     ///
@@ -7498,6 +7688,10 @@ impl AppState {
             active_overlay: ActiveOverlay::None,
             pending_bulk_rename: None,
             pending_metadata_editor: None,
+            pending_browse_archive_metadata: None,
+            browse_archive_repackage: None,
+            quit_after_browse_archive_metadata_resolution: false,
+            quit_after_browse_archive_repackage: false,
             pending_cue_preview: None,
             pending_mb_select: None,
             status_message: theme_startup_status.map(|message| (message, std::time::Instant::now())),
@@ -7517,6 +7711,11 @@ impl AppState {
             config_focus: ConfigFocus::default(),
             keychain: KeychainState::default(),
             archive_passwords: std::collections::HashMap::new(),
+            pending_archive_listing: None,
+            archive_listing_generation: 0,
+            archive_listing_cache: std::collections::HashMap::new(),
+            archive_listing_cache_lru: std::collections::VecDeque::new(),
+            archive_listing_cache_bytes: 0,
             last_artwork_picker_dir: None,
             image_picker: new_terminal_image_picker(),
             image_picker_generation: 0,
@@ -7550,6 +7749,135 @@ impl AppState {
             self.config_focus.previous()
         };
         self.set_config_focus(next);
+    }
+
+
+    pub fn begin_archive_listing(
+        &mut self,
+        archive_path: std::path::PathBuf,
+    ) -> (u64, tokio_util::sync::CancellationToken) {
+        self.cancel_archive_listing();
+        self.archive_listing_generation = self.archive_listing_generation.saturating_add(1);
+        let id = self.archive_listing_generation;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.pending_archive_listing = Some(PendingArchiveListing {
+            id,
+            archive_path,
+            cancel: cancel.clone(),
+            started_at: std::time::Instant::now(),
+        });
+        (id, cancel)
+    }
+
+    pub fn archive_listing_pending_for(&self, id: u64, archive_path: &std::path::Path) -> bool {
+        self.pending_archive_listing
+            .as_ref()
+            .map(|pending| pending.id == id && pending.archive_path == archive_path)
+            .unwrap_or(false)
+    }
+
+    pub fn complete_archive_listing(&mut self, id: u64, archive_path: &std::path::Path) -> bool {
+        if self.archive_listing_pending_for(id, archive_path) {
+            self.pending_archive_listing = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cancel_archive_listing(&mut self) -> bool {
+        if let Some(pending) = self.pending_archive_listing.take() {
+            pending.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cached_archive_listing(
+        &mut self,
+        key: &crate::tui::archive_listing::ArchiveListingCacheKey,
+    ) -> Option<crate::tui::archive_listing::ArchiveListing> {
+        let listing = self.archive_listing_cache.get(key).cloned();
+        if listing.is_some() {
+            self.touch_archive_listing_cache_key(key);
+        }
+        listing
+    }
+
+    pub fn insert_archive_listing_cache(
+        &mut self,
+        key: crate::tui::archive_listing::ArchiveListingCacheKey,
+        listing: crate::tui::archive_listing::ArchiveListing,
+    ) -> bool {
+        let bytes = listing.estimated_cache_bytes();
+
+        // A single enormous archive listing is useful once, but retaining it
+        // would defeat the cache's memory bound. Remove any stale copy and
+        // decline to cache the replacement.
+        if bytes > ARCHIVE_LISTING_CACHE_MAX_BYTES {
+            self.remove_archive_listing_cache_key(&key);
+            return false;
+        }
+
+        if let Some(old) = self.archive_listing_cache.insert(key.clone(), listing) {
+            self.archive_listing_cache_bytes = self
+                .archive_listing_cache_bytes
+                .saturating_sub(old.estimated_cache_bytes());
+        }
+        self.archive_listing_cache_bytes = self.archive_listing_cache_bytes.saturating_add(bytes);
+        self.touch_archive_listing_cache_key(&key);
+        self.evict_archive_listing_cache_over_budget();
+        true
+    }
+
+    #[cfg(test)]
+    fn archive_listing_cache_debug_state(&self) -> (usize, usize, usize) {
+        (
+            self.archive_listing_cache.len(),
+            self.archive_listing_cache_lru.len(),
+            self.archive_listing_cache_bytes,
+        )
+    }
+
+    fn touch_archive_listing_cache_key(
+        &mut self,
+        key: &crate::tui::archive_listing::ArchiveListingCacheKey,
+    ) {
+        self.archive_listing_cache_lru.retain(|candidate| candidate != key);
+        self.archive_listing_cache_lru.push_back(key.clone());
+    }
+
+    fn remove_archive_listing_cache_key(
+        &mut self,
+        key: &crate::tui::archive_listing::ArchiveListingCacheKey,
+    ) -> bool {
+        self.archive_listing_cache_lru.retain(|candidate| candidate != key);
+        if let Some(old) = self.archive_listing_cache.remove(key) {
+            self.archive_listing_cache_bytes = self
+                .archive_listing_cache_bytes
+                .saturating_sub(old.estimated_cache_bytes());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn evict_archive_listing_cache_over_budget(&mut self) {
+        while self.archive_listing_cache.len() > ARCHIVE_LISTING_CACHE_MAX_ENTRIES
+            || self.archive_listing_cache_bytes > ARCHIVE_LISTING_CACHE_MAX_BYTES
+        {
+            let Some(oldest_key) = self.archive_listing_cache_lru.pop_front() else {
+                self.archive_listing_cache.clear();
+                self.archive_listing_cache_bytes = 0;
+                break;
+            };
+            if let Some(old) = self.archive_listing_cache.remove(&oldest_key) {
+                self.archive_listing_cache_bytes = self
+                    .archive_listing_cache_bytes
+                    .saturating_sub(old.estimated_cache_bytes());
+            }
+        }
     }
 
     pub fn refresh_theme_library(&mut self) {
@@ -7818,6 +8146,19 @@ impl AppState {
             let done = self.preemph_results.len();
             self.status_message = Some((
                 format!("Detecting pre-emphasis... ({}/{})", done, done + pending),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        if let Some(pending) = &self.pending_archive_listing {
+            let elapsed = pending.started_at.elapsed().as_secs();
+            let name = pending
+                .archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| pending.archive_path.display().to_string());
+            self.status_message = Some((
+                format!("Listing archive {}... {}s elapsed; Esc cancels", name, elapsed),
                 std::time::Instant::now(),
             ));
             return;
@@ -9207,6 +9548,72 @@ mod dsd_gain_format_state_tests {
         s.dsd_gain_db = DSD_TO_PCM_GAIN_DB_MIN;
         s.select_focused_prev(None, None);
         assert_eq!(s.dsd_gain_db, DSD_TO_PCM_GAIN_DB_MIN);
+    }
+}
+
+#[cfg(test)]
+mod archive_listing_cache_tests {
+    use super::*;
+    use crate::tui::archive_listing::{ArchiveEntry, ArchiveListing, ArchiveListingCacheKey};
+    use std::path::PathBuf;
+
+    fn cache_key(idx: usize) -> ArchiveListingCacheKey {
+        ArchiveListingCacheKey {
+            path: PathBuf::from(format!("/tmp/archive-{idx}.zip")),
+            size: idx as u64,
+            modified_secs: idx as u64,
+            modified_nanos: idx as u32,
+        }
+    }
+
+    fn listing(idx: usize) -> ArchiveListing {
+        ArchiveListing {
+            archive_path: PathBuf::from(format!("/tmp/archive-{idx}.zip")),
+            format: "zip".to_string(),
+            physical_size: 0,
+            entries: vec![ArchiveEntry {
+                path: format!("track-{idx}.flac"),
+                size: 1,
+                packed_size: 1,
+                is_dir: false,
+                encrypted: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn archive_listing_cache_evicts_lru_entry() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        for idx in 0..ARCHIVE_LISTING_CACHE_MAX_ENTRIES {
+            assert!(app.insert_archive_listing_cache(cache_key(idx), listing(idx)));
+        }
+
+        let refreshed = cache_key(0);
+        assert!(app.cached_archive_listing(&refreshed).is_some());
+        assert!(app.insert_archive_listing_cache(
+            cache_key(ARCHIVE_LISTING_CACHE_MAX_ENTRIES),
+            listing(ARCHIVE_LISTING_CACHE_MAX_ENTRIES),
+        ));
+
+        assert!(app.cached_archive_listing(&refreshed).is_some());
+        assert!(app.cached_archive_listing(&cache_key(1)).is_none());
+        let (cache_len, lru_len, _) = app.archive_listing_cache_debug_state();
+        assert_eq!(cache_len, ARCHIVE_LISTING_CACHE_MAX_ENTRIES);
+        assert_eq!(lru_len, ARCHIVE_LISTING_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn archive_listing_cache_replaces_without_duplicate_lru_keys() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let key = cache_key(7);
+        assert!(app.insert_archive_listing_cache(key.clone(), listing(7)));
+        assert!(app.insert_archive_listing_cache(key.clone(), listing(8)));
+
+        let (cache_len, lru_len, cache_bytes) = app.archive_listing_cache_debug_state();
+        assert_eq!(cache_len, 1);
+        assert_eq!(lru_len, 1);
+        assert!(cache_bytes > 0);
+        assert!(app.cached_archive_listing(&key).is_some());
     }
 }
 

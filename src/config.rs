@@ -6,6 +6,51 @@ pub struct TonepoetConfig {
     pub conversion: ConversionSettings,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub performance: PerformanceConfig,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceConfig {
+    #[serde(default)]
+    pub browsing: BrowsingPerformanceConfig,
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            browsing: BrowsingPerformanceConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowsingPerformanceConfig {
+    /// Controls automatic archive content listing in Browse.
+    /// Valid values: "auto", "always", "never". Unknown values behave as "auto".
+    #[serde(default = "default_archive_listing_mode")]
+    pub archive_listing: String,
+    /// Archive listing timeout in seconds. 0 disables the timeout.
+    #[serde(default = "default_archive_listing_timeout")]
+    pub archive_listing_timeout: u64,
+}
+
+impl Default for BrowsingPerformanceConfig {
+    fn default() -> Self {
+        Self {
+            archive_listing: default_archive_listing_mode(),
+            archive_listing_timeout: default_archive_listing_timeout(),
+        }
+    }
+}
+
+fn default_archive_listing_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_archive_listing_timeout() -> u64 {
+    30
 }
 
 /// UI-related configuration.
@@ -108,6 +153,7 @@ impl Default for TonepoetConfig {
         Self {
             conversion: ConversionSettings::default(),
             ui: UiConfig::default(),
+            performance: PerformanceConfig::default(),
         }
     }
 }
@@ -173,6 +219,50 @@ compare_keep_reference = false
         .expect("config parses without theme");
 
         assert_eq!(config.ui.theme, crate::tui::theme::default_theme_slug());
+    }
+
+
+    #[test]
+    fn performance_browsing_defaults_when_missing_from_toml() {
+        let config: TonepoetConfig = toml::from_str(
+            r#"
+[conversion]
+preferred_backend = "ffmpeg"
+worker_count = 2
+process_priority = 0
+calculate_replaygain = true
+generate_cue_files = false
+cue_generation_mode = "IfMerging"
+write_log_file = false
+persist_queue = true
+append_lineage_to_comment = false
+
+[ui]
+default_screen = "browse"
+convert_default_action = "start"
+compare_keep_reference = false
+"#,
+        )
+        .expect("config parses without performance");
+
+        assert_eq!(config.performance.browsing.archive_listing, "auto");
+        assert_eq!(config.performance.browsing.archive_listing_timeout, 30);
+    }
+
+    #[test]
+    fn performance_browsing_round_trips_through_toml() {
+        let mut config = TonepoetConfig::default();
+        config.performance.browsing.archive_listing = "always".to_string();
+        config.performance.browsing.archive_listing_timeout = 45;
+
+        let encoded = toml::to_string_pretty(&config).expect("encode config");
+        assert!(encoded.contains("[performance.browsing]"));
+        assert!(encoded.contains("archive_listing = \"always\""));
+        assert!(encoded.contains("archive_listing_timeout = 45"));
+
+        let decoded: TonepoetConfig = toml::from_str(&encoded).expect("decode config");
+        assert_eq!(decoded.performance.browsing.archive_listing, "always");
+        assert_eq!(decoded.performance.browsing.archive_listing_timeout, 45);
     }
 
     #[test]
