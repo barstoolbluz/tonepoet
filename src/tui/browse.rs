@@ -2040,31 +2040,13 @@ impl BrowseState {
                     if let Some(row) =
                         db.get_cached_probe(&path.display().to_string(), mtime_unix, entry.size)
                     {
-                        if let Some(mut info) = row.to_cached_info(entry.size) {
-                            // PE metadata check not stored in DB — run it now.
-                            info.metadata.preemphasis_metadata =
-                                super::probe::preemphasis_metadata_check_pub(&path);
-                            // HDCD info from analysis cache (if previously analyzed).
-                            let path_key = path.display().to_string();
-                            if let Some(analysis) = db.get_cached_analysis(
-                                &path_key,
-                                mtime_unix,
-                                entry.size,
-                            ) {
-                                if analysis.hdcd_detected == Some(true) {
-                                    info.metadata.hdcd_detail = analysis.hdcd_detail;
-                                }
-                            } else if let Some(facts) = db.get_cached_metadata_analysis_facts(
-                                &path_key,
-                                mtime_unix,
-                                entry.size,
-                            ) {
-                                if facts.hdcd_detected == Some(true) {
-                                    info.metadata.hdcd_detail = facts.hdcd_detail;
-                                }
-                            }
-                            self.probe_cache
-                                .insert(path, Some(std::sync::Arc::new(info)));
+                        if let Some(info) = row.to_cached_info(entry.size) {
+                            // The probe row itself is cached, but PE metadata may
+                            // require tag/CUE/catalog file reads. Keep that work
+                            // on the browse probe worker path so cursor movement
+                            // never runs media/tag I/O in the TUI reducer.
+                            self.probe_pending.insert(path.clone());
+                            spawn_cached_audio_probe_metadata_completion(path, info, tx.clone());
                             return;
                         }
                     }
@@ -2102,10 +2084,43 @@ impl BrowseState {
     }
 }
 
+/// Spawn a background tokio task for a valid SQLite probe-cache hit that
+/// still needs worker-side metadata enrichment. This preserves the cache fast
+/// path without letting tag/CUE/catalog PE checks run from cursor movement or
+/// message reducers on the TUI thread.
+fn spawn_cached_audio_probe_metadata_completion(
+    path: PathBuf,
+    mut info: CachedInfo,
+    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let path_for_task = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if info.metadata.preemphasis_metadata.is_none() {
+                info.metadata.preemphasis_metadata =
+                    crate::tui::probe::preemphasis_metadata_check_blocking(&path_for_task);
+            }
+            Ok(info)
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(format!("cached probe metadata task panicked: {}", join_err)));
+
+        let _ = tx
+            .send(super::message::AppMessage::AudioProbeComplete {
+                path,
+                result: Box::new(result),
+            })
+            .await;
+    });
+}
+
 /// Spawn a background tokio task that probes the audio file at `path` and
 /// sends the result back to the main loop via `AudioProbeComplete`. The
 /// blocking probe (`probe_audio` + `read_metadata`) runs on `spawn_blocking`
-/// so it doesn't tie up an async worker thread.
+/// so it doesn't tie up an async worker thread. `read_metadata()` already
+/// performs external pre-emphasis metadata enrichment; only failed metadata
+/// reads get a single fallback PE check so successful fresh probes do not
+/// duplicate tag/CUE/catalog work.
 pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::message::AppMessage>) {
     if is_cue_sheet_path(&path) {
         // Defense in depth: callers should route CUE preview through
@@ -2120,7 +2135,12 @@ pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::mes
         let result: Result<CachedInfo, String> = tokio::task::spawn_blocking(move || {
             let source =
                 crate::tui::probe::probe_audio(&path_for_task).map_err(|e| format!("{}", e))?;
-            let metadata = crate::tui::probe::read_metadata(&path_for_task).unwrap_or_default();
+            let metadata = crate::tui::probe::read_metadata(&path_for_task).unwrap_or_else(|_| {
+                let mut metadata = SourceMetadata::default();
+                metadata.preemphasis_metadata =
+                    crate::tui::probe::preemphasis_metadata_check_blocking(&path_for_task);
+                metadata
+            });
             Ok(CachedInfo { source, metadata })
         })
         .await
@@ -4621,6 +4641,46 @@ FILE "10 - Live Version.wav" WAVE
         assert_eq!(expanded.len(), 1);
         assert!(path_list_contains(&expanded, &cue));
         assert!(!path_list_contains(&expanded, &image));
+    }
+
+    #[test]
+    fn browse_preemphasis_checks_are_worker_side_only() {
+        let source = include_str!("browse.rs");
+        let public_wrapper_name = format!(
+            "{}{}",
+            "preemphasis_metadata_check_",
+            "pub"
+        );
+
+        assert!(
+            !source.contains(&public_wrapper_name),
+            "browse code must not use the compatibility PE wrapper; use the explicit blocking API only from worker closures"
+        );
+        assert!(
+            source.contains("spawn_cached_audio_probe_metadata_completion"),
+            "SQLite probe-cache hits must use the same worker-side metadata completion path"
+        );
+        assert!(
+            source.matches("preemphasis_metadata_check_blocking").count() >= 1,
+            "probe-cache hits and failed fresh metadata reads should enrich PE metadata only on blocking workers"
+        );
+        assert!(
+            !source.contains("read_metadata(&path_for_task).unwrap_or_default()"),
+            "fresh browse probes must not drop read_metadata errors and then repeat PE checks unconditionally"
+        );
+
+        let fresh_probe_start = source
+            .find("pub fn spawn_audio_probe")
+            .expect("spawn_audio_probe source");
+        let fresh_probe_tail = &source[fresh_probe_start..];
+        let fresh_probe_end = fresh_probe_tail
+            .find("/// Spawn a background tokio task that probes the audio image")
+            .expect("end of spawn_audio_probe source");
+        let fresh_probe = &fresh_probe_tail[..fresh_probe_end];
+        assert!(
+            !fresh_probe.contains("metadata.preemphasis_metadata.is_none()"),
+            "successful fresh browse metadata reads already perform PE enrichment and must not repeat it"
+        );
     }
 
 }

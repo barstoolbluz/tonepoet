@@ -83,13 +83,38 @@ pub enum AppMessage {
     StatusMessage(String),
     /// Force a redraw
     Redraw,
+    /// Result of an asynchronous Convert-source probe launched from command
+    /// handlers or picker returns. `generation` is captured at dispatch time;
+    /// the event-loop reducer drops stale completions when the source has
+    /// changed since launch. `source_mode` is the fully discovered mode built
+    /// on a blocking worker; `baseline` protects in-flight user edits.
+    ProbeResult {
+        generation: u64,
+        path: std::path::PathBuf,
+        source_mode: crate::tui::app::SourceMode,
+        baseline: crate::tui::app::ConvertProbeBaseline,
+    },
     /// Result of an asynchronous audio probe (lofty + ffmpeg) launched by
     /// `BrowseState::probe_current`. The main loop updates `probe_cache` and
-    /// removes the path from `probe_pending`.
+    /// removes the path from `probe_pending`. Reducers must not perform
+    /// follow-up media/tag reads here; worker-side probe code must enrich
+    /// optional metadata before sending this message.
     AudioProbeComplete {
         path: std::path::PathBuf,
         /// Owned cached-info on success; error string on failure.
         result: Box<Result<crate::tui::browse::CachedInfo, String>>,
+    },
+    /// Convert-owned batch/cursor probe completion. Unlike generic browse
+    /// probes, this carries the Convert source generation plus editable-state
+    /// baseline captured when the worker was launched, so late completions can
+    /// update source facts without overwriting user format or metadata edits.
+    ConvertAudioProbeComplete {
+        generation: u64,
+        path: std::path::PathBuf,
+        info: Option<crate::tui::probe::SourceInfo>,
+        metadata: crate::tui::probe::SourceMetadata,
+        probe_notice: Option<String>,
+        baseline: crate::tui::app::ConvertProbeBaseline,
     },
     /// Result of an asynchronous optical-disc probe launched by the Browse
     /// info pane or the Audio Streams action. The payload uses the unified
@@ -272,6 +297,32 @@ pub enum AppMessage {
         single_image: bool,
         toc_string: String,
     },
+    /// Result of async CUE writing work. The event loop owns the status bar
+    /// and Browse refresh, while heavyweight probing/writing runs off-thread.
+    CueWriteComplete {
+        result: Result<String, String>,
+        refresh_browse: bool,
+    },
+    /// Result of async CUE preview construction. Used by MB-enriched CUE
+    /// generation so probe/tag reads do not block message handling.
+    CuePreviewComplete {
+        result: Result<(String, std::path::PathBuf, String), String>,
+    },
+    /// Result of async `:cue-fill` preparation. Carries probe-derived album,
+    /// track, layout, and TOC-sector data back to the event loop so DB cache
+    /// lookup still happens on the main thread before the MB request is spawned.
+    CueFillPrepComplete {
+        cue_path: std::path::PathBuf,
+        result: Result<
+            (
+                Box<crate::tui::cue_generate::CueAlbumInfo>,
+                Vec<crate::tui::cue_generate::CueTrackInfo>,
+                CueFillLayout,
+                Vec<u32>,
+            ),
+            String,
+        >,
+    },
     /// Result of an async MusicBrainz lookup driving `:cue-fill`. Carries
     /// the path of the original `.cue` and the pre-built album/tracks
     /// (with parsed pregaps and durations applied) ready for fill+write.
@@ -292,6 +343,16 @@ pub enum AppMessage {
     TagsFromMbComplete {
         outcome: MbOutcome,
         ctx: TagsMbContext,
+    },
+    /// Result of the blocking single-image MusicBrainz guard checks used
+    /// before applying a selected release to the metadata editor. The guard
+    /// may read tags and probe sample counts, so it must complete on a
+    /// blocking worker before the event-loop reducer mutates UI state.
+    TagsMbApplyReady {
+        releases: Vec<crate::tui::musicbrainz::MbRelease>,
+        selected: usize,
+        paths: Vec<std::path::PathBuf>,
+        decision: crate::tui::musicbrainz::PerTrackDecision,
     },
     /// Result of an MbSelect prefetch: the detail fetch
     /// (`/ws/2/release/{mbid}?inc=…`) for a candidate currently visible

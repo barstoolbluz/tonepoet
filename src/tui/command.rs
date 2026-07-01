@@ -1036,49 +1036,6 @@ where
     }
 }
 
-/// Check whether a path is a non-ISO archive that cannot be audio-probed.
-/// Returns true for .7z, .zip, .rar, .tar, etc. but NOT .iso (which might
-/// be an SACD that `probe_audio` handles via magic-byte detection).
-fn is_nonprobeable_archive(path: &std::path::Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.to_lowercase())
-        .unwrap_or_default();
-    if name.ends_with(".tar.gz")
-        || name.ends_with(".tar.bz2")
-        || name.ends_with(".tar.xz")
-        || name.ends_with(".tar.zst")
-        || name.ends_with(".tar.lz")
-        || name.ends_with(".tar.lzma")
-    {
-        return true;
-    }
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            matches!(
-                e.to_lowercase().as_str(),
-                "7z" | "zip" | "rar" | "tar" | "cab" | "dmg" | "tgz" | "tbz2" | "txz"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn is_cue_sheet_path(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("cue"))
-        .unwrap_or(false)
-}
-
-/// Sources that enter the conversion pipeline without an immediate audio
-/// probe in the browse/queue handoff. CUE sheets are handled separately by
-/// probing their referenced image file(s), never the CUE text itself.
-fn is_nonprobeable_queue_source(path: &std::path::Path) -> bool {
-    is_nonprobeable_archive(path)
-}
-
 fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
     if app.convert.is_collapsed(focus) {
         app.convert.layout = ConvertLayout::Maximized(focus);
@@ -1253,57 +1210,36 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(format!("Path not found: {}", expanded));
                 return;
             }
-            // Archives (7z, zip, rar, etc.) cannot be probed as audio.
-            // CUE sheets are a special case: keep the CUE as the logical
-            // source, but probe its referenced image file(s) for properties.
-            let (info, metadata, cue_probe_notice) = if is_cue_sheet_path(&p) {
-                match probe_cue_proxy_source(&p) {
-                    Ok(result) => (result.info, result.metadata, result.probe_notice),
-                    Err(e) => (
-                        None,
-                        crate::tui::probe::SourceMetadata::default(),
-                        Some(format!("CUE proxy probe failed: {}; set format manually", e)),
-                    ),
-                }
-            } else if is_nonprobeable_queue_source(&p) {
-                (None, crate::tui::probe::SourceMetadata::default(), None)
-            } else {
-                let info = match crate::tui::probe::probe_audio(&p) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        app.convert.set_source_mode(SourceMode::Empty);
-                        app.convert.source.cue_artifact_audio.clear();
-                        app.set_status(format!("Probe error: {}", e));
-                        return;
-                    }
-                };
-                let metadata = crate::tui::probe::read_metadata(&p).unwrap_or_default();
-                (Some(info), metadata, None)
-            };
-            // Populate the editable metadata pane from the source tags.
-            app.convert.metadata.title = metadata.title.clone();
-            app.convert.metadata.artist = metadata.artist.clone();
-            app.convert.metadata.album = metadata.album.clone();
-            app.convert.metadata.genre = metadata.genre.clone();
-            app.convert.metadata.year = metadata.year.clone();
+            // Install the source immediately and complete the heavyweight
+            // ffmpeg/lofty/CUE proxy probe on a blocking worker. This keeps the
+            // crossterm event loop responsive while the source pane shows the
+            // in-flight probe state.
+            app.probe_generation = app.probe_generation.saturating_add(1);
+            let generation = app.probe_generation;
+            let probe_notice = source_probe_initial_notice(&p);
 
-            app.convert.set_source_mode(SourceMode::from_single_with_probe_notice(
+            clear_source_metadata_in_convert(&mut app.convert);
+            app.convert.set_source_mode(SourceMode::from_single_pending_probe(
                 p.clone(),
-                info,
-                metadata,
-                cue_probe_notice.clone(),
+                probe_notice.clone(),
             ));
             app.convert.apply_source_defaults();
-            if let Some(notice) = cue_probe_notice {
-                app.set_status(format!("Loaded CUE with warning: {}", notice));
+            let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
+            app.current_screen = AppScreen::Convert;
+            app.recent.record_use_with_db(&p, &app.db);
+
+            if probe_notice.is_some() {
+                spawn_convert_source_probe(generation, p.clone(), probe_baseline, tx.clone());
+                app.set_status(format!(
+                    "Probing: {}",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                ));
             } else {
                 app.set_status(format!(
                     "Loaded: {}",
                     p.file_name().unwrap_or_default().to_string_lossy()
                 ));
             }
-            app.current_screen = AppScreen::Convert;
-            app.recent.record_use_with_db(&p, &app.db);
         }
         Command::Output(path) => {
             if path.is_empty() {
@@ -1954,13 +1890,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         .to_path_buf()
                 };
 
-                match super::cue_generate::gather_cue_info(&paths, &output_dir) {
-                    Ok((album, tracks)) => {
-                        let pregap_count =
-                            tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
+                let refresh_browse = app.current_screen == AppScreen::Browse;
+                let tx = tx.clone();
+                app.set_status("CUE generation: probing selected files…".to_string());
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                        let (album, tracks) = super::cue_generate::gather_cue_info_blocking(&paths, &output_dir)?;
+                        let pregap_count = tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
                         let cue_content = if single_image {
-                            let image_name =
-                                super::cue_generate::derive_image_filename(&album, &paths[0]);
+                            let image_name = super::cue_generate::derive_image_filename(&album, &paths[0]);
                             let ext = paths[0]
                                 .extension()
                                 .and_then(|e| e.to_str())
@@ -1978,42 +1916,38 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
 
                         let cue_filename = super::cue_generate::cue_output_filename(&album);
                         let cue_path = output_dir.join(&cue_filename);
+                        std::fs::write(&cue_path, &cue_content)
+                            .map_err(|e| format!("CUE write failed: {}", e))?;
 
-                        match std::fs::write(&cue_path, &cue_content) {
-                            Ok(()) => {
-                                let mode = if single_image {
-                                    "single image"
-                                } else {
-                                    "multi-file"
-                                };
-                                let pregap_note = if pregap_count > 0 {
-                                    format!(
-                                        ", with {} EAC pregap{}",
-                                        pregap_count,
-                                        if pregap_count == 1 { "" } else { "s" }
-                                    )
-                                } else {
-                                    String::new()
-                                };
-                                app.set_status(format!(
-                                    "CUE sheet ({}{}) written: {}",
-                                    mode, pregap_note, cue_filename,
-                                ));
-                                // Refresh browse to show the new file.
-                                if app.current_screen == AppScreen::Browse {
-                                    app.browse.refresh();
-                                    app.browse.probe_current_with_db(tx, Some(&app.db));
-                                }
-                            }
-                            Err(e) => {
-                                app.set_status(format!("CUE write failed: {}", e));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        app.set_status(format!("CUE generation failed: {}", e));
-                    }
-                }
+                        let mode = if single_image {
+                            "single image"
+                        } else {
+                            "multi-file"
+                        };
+                        let pregap_note = if pregap_count > 0 {
+                            format!(
+                                ", with {} EAC pregap{}",
+                                pregap_count,
+                                if pregap_count == 1 { "" } else { "s" }
+                            )
+                        } else {
+                            String::new()
+                        };
+                        Ok(format!(
+                            "CUE sheet ({}{}) written: {}",
+                            mode, pregap_note, cue_filename,
+                        ))
+                    })
+                    .await
+                    .unwrap_or_else(|err| Err(format!("CUE generation failed: {}", err)));
+
+                    let _ = tx
+                        .send(AppMessage::CueWriteComplete {
+                            result,
+                            refresh_browse,
+                        })
+                        .await;
+                });
             }
         }
         Command::GenerateCueMb { single_image } => {
@@ -2764,77 +2698,43 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 super::message::CueFillLayout::MultiFile
             };
 
-            let (album, tracks) = match super::cue_generate::cue_sheet_to_track_info(
-                &sheet,
-                &bridge_paths,
-                &output_dir,
-            ) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    app.set_status(format!(":cue-fill: {}", e));
-                    return;
-                }
-            };
-
-            // TOC for MB lookup. Reuse find_toc_offsets first; fall back
-            // to deriving from sample counts of the audio paths.
             let toc_paths: Vec<std::path::PathBuf> = if single_image {
                 vec![bridge_paths[0].clone()]
             } else {
                 paths.clone()
             };
-            let sectors: Vec<u32> = match super::accuraterip::find_toc_offsets(&output_dir) {
-                Some(s) => s,
-                None => match super::accuraterip::collect_sample_counts(&toc_paths) {
-                    Ok((sample_counts, sample_rate)) => {
-                        let samples_per_frame = (sample_rate / 75) as u64;
-                        let mut sectors = Vec::with_capacity(sample_counts.len() + 1);
-                        let mut frame: u64 = 150;
-                        for &count in &sample_counts {
-                            sectors.push(frame as u32);
-                            frame += count / samples_per_frame;
-                        }
-                        sectors.push(frame as u32);
-                        sectors
-                    }
-                    Err(e) => {
-                        app.set_status(format!(":cue-fill: {}", e));
-                        return;
-                    }
-                },
-            };
-            let toc_string = match super::musicbrainz::build_mb_toc(&sectors) {
-                Some(s) => s,
-                None => {
-                    app.set_status(":cue-fill: TOC too short".to_string());
-                    return;
-                }
-            };
-            let cached = app.db.get_cached_mb_response(&toc_string);
-            let n_cached = if cached.is_some() {
-                "cached"
-            } else {
-                "fetching"
-            };
-            app.set_status(format!(
-                ":cue-fill: {} disc TOC ({} tracks)…",
-                n_cached,
-                sectors.len() - 1,
-            ));
-
             let tx = tx.clone();
-            let toc_for_msg = toc_string.clone();
+            app.set_status(":cue-fill: probing selected files…".to_string());
             tokio::spawn(async move {
-                let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await;
+                let result = tokio::task::spawn_blocking(move || {
+                    let (album, tracks) = super::cue_generate::cue_sheet_to_track_info_blocking(
+                        &sheet,
+                        &bridge_paths,
+                        &output_dir,
+                    )?;
+                    let sectors: Vec<u32> = match super::accuraterip::find_toc_offsets(&output_dir) {
+                        Some(s) => s,
+                        None => {
+                            let (sample_counts, sample_rate) =
+                                super::accuraterip::collect_sample_counts(&toc_paths)?;
+                            let samples_per_frame = (sample_rate / 75) as u64;
+                            let mut sectors = Vec::with_capacity(sample_counts.len() + 1);
+                            let mut frame: u64 = 150;
+                            for &count in &sample_counts {
+                                sectors.push(frame as u32);
+                                frame += count / samples_per_frame;
+                            }
+                            sectors.push(frame as u32);
+                            sectors
+                        }
+                    };
+                    Ok((Box::new(album), tracks, layout, sectors))
+                })
+                .await
+                .unwrap_or_else(|err| Err(format!("cue-fill preparation task failed: {}", err)));
+
                 let _ = tx
-                    .send(AppMessage::CueFillComplete {
-                        outcome,
-                        cue_path,
-                        album: Box::new(album),
-                        tracks,
-                        layout,
-                        toc_string: toc_for_msg,
-                    })
+                    .send(AppMessage::CueFillPrepComplete { cue_path, result })
                     .await;
             });
         }
@@ -4031,7 +3931,7 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
 /// Phase 6b limitation: multi-file selections are rejected with a message
 /// directing the user to deselect extras. Real batch support (summary +
 /// expand overlay + bulk commit) arrives in Phase 6c/6d.
-fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Option<String>) {
+fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Option<String>) {
     // Helper: load a named preset into the format/output-options pills.
     // Returns Ok(()) on success, Err(status_message) on failure.
     let load_preset_into_pills = |app: &mut AppState, name: &str| -> Result<(), String> {
@@ -4050,7 +3950,8 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
     match app.current_screen {
         AppScreen::Browse => {
             let expansion = app.browse.collect_selection_for_queue();
-            let paths = expansion.paths.clone();
+            let mut paths = expansion.paths.clone();
+            paths.sort();
 
             if paths.is_empty() {
                 app.set_status("queue: no selection");
@@ -4066,101 +3967,51 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
             let first = paths[0].clone();
             let path_count = paths.len();
 
-            // Probe the first file before touching any state so preset
-            // application stays atomic with a successful load. Archives cannot
-            // be probed as audio. CUE sheets are probed through their resolved
-            // image file(s), never through ffmpeg on the CUE text.
-            let (info, metadata, cue_probe_notice) = if is_cue_sheet_path(&first) {
-                match probe_cue_proxy_source(&first) {
-                    Ok(result) => (result.info, result.metadata, result.probe_notice),
-                    Err(e) => (
-                        None,
-                        crate::tui::probe::SourceMetadata::default(),
-                        Some(format!("CUE proxy probe failed: {}; set format manually", e)),
-                    ),
-                }
-            } else if is_nonprobeable_queue_source(&first) {
-                (None, crate::tui::probe::SourceMetadata::default(), None)
-            } else {
-                match crate::tui::probe::probe_audio(&first) {
-                    Ok(i) => (
-                        Some(i),
-                        crate::tui::probe::read_metadata(&first).unwrap_or_default(),
-                        None,
-                    ),
-                    Err(e) => {
-                        app.set_status(format!("probe error: {}", e));
-                        return;
-                    }
-                }
-            };
-
-            // Load preset (if any) after a successful probe.
+            // Load preset (if any) before publishing the new source. If preset
+            // loading fails, leave the previous Convert state untouched.
             if let Some(name) = &preset {
                 if let Err(msg) = load_preset_into_pills(app, name) {
                     app.set_status(msg);
                     return;
                 }
+            } else {
+                app.convert.format = super::app::FormatState::new();
+                app.convert.output_options = super::app::OutputOptionsState::new();
+                app.preset.clear_active_preset();
             }
 
-            // Populate the editable metadata pane from the first file's
-            // tags (same for single-file and batch modes — batch edits
-            // only affect the cursor file when the user drills in).
-            app.convert.metadata.title = metadata.title.clone();
-            app.convert.metadata.artist = metadata.artist.clone();
-            app.convert.metadata.album = metadata.album.clone();
-            app.convert.metadata.genre = metadata.genre.clone();
-            app.convert.metadata.year = metadata.year.clone();
+            app.probe_generation = app.probe_generation.saturating_add(1);
+            let generation = app.probe_generation;
+            let probe_notice = source_probe_initial_notice(&first);
+            clear_source_metadata_in_convert(&mut app.convert);
 
-            // Build the SourceMode (computes batch summary synchronously
-            // for multi-file batches).
+            // Publish a cheap source placeholder immediately. Single-source
+            // SACD/DVD/Blu-ray/CUE/Lofty discovery is deliberately deferred to
+            // the blocking probe worker; batch setup only computes its cheap
+            // filesystem summary here.
             let mut mode = if path_count == 1 {
-                SourceMode::from_single_with_probe_notice(
-                    first.clone(),
-                    None,
-                    crate::tui::probe::SourceMetadata::default(),
-                    cue_probe_notice.clone(),
-                )
+                SourceMode::from_single_pending_probe(first.clone(), probe_notice.clone())
             } else {
                 SourceMode::from_paths(paths)
             };
-            // Populate the first-file probe result into the appropriate
-            // variant so the user sees immediate info on landing.
             match &mut mode {
-                SourceMode::Single {
-                    info: slot,
-                    metadata: meta_slot,
-                    probe_notice: single_probe_notice,
-                    ..
-                } => {
-                    *slot = info;
-                    *meta_slot = metadata;
-                    *single_probe_notice = cue_probe_notice.clone();
+                SourceMode::Single { probe_notice: notice_slot, .. }
+                | SourceMode::MultiTrack { probe_notice: notice_slot, .. } => {
+                    if notice_slot.is_none() {
+                        *notice_slot = probe_notice.clone();
+                    }
                 }
                 SourceMode::Batch {
-                    cursor_info,
-                    cursor_metadata,
                     probe_notice: batch_probe_notice,
                     cursor_probe_notice,
                     ..
                 } => {
-                    *cursor_info = info;
-                    *cursor_metadata = metadata;
-                    *batch_probe_notice = cue_probe_notice.clone();
+                    *batch_probe_notice = probe_notice.clone();
                     *cursor_probe_notice = None;
                 }
-                SourceMode::MultiTrack {
-                    info: slot,
-                    metadata: meta_slot,
-                    ..
-                } => {
-                    *slot = info;
-                    *meta_slot = metadata;
-                }
-                SourceMode::Empty => {
-                    // Unreachable given paths.is_empty() check above.
-                }
+                SourceMode::Empty => {}
             }
+
             // Publish the source mode and its queue-expansion metadata at the
             // same success boundary. This keeps aborted Browse -> Convert flows
             // from leaving CUE sidecar override metadata attached to an older
@@ -4168,7 +4019,12 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
             app.convert.set_source_mode(mode);
             app.convert.source.cue_artifact_audio = cue_artifact_audio;
             app.convert.apply_source_defaults();
+            let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
             app.recent.record_use_with_db(&first, &app.db);
+
+            if probe_notice.is_some() {
+                spawn_convert_source_probe(generation, first.clone(), probe_baseline, tx.clone());
+            }
 
             // Persist batch state for crash recovery.
             let batch_paths = app.convert.source.mode.all_paths();
@@ -4180,10 +4036,10 @@ fn execute_queue(app: &mut AppState, _tx: &mpsc::Sender<AppMessage>, preset: Opt
             app.previous_screen = Some(AppScreen::Browse);
             app.current_screen = AppScreen::Convert;
 
-            if let Some(notice) = app.convert.source.mode.persistent_probe_notice() {
+            if probe_notice.is_some() {
                 app.set_status(format!(
-                    "CUE warning: {} — review settings, then :commit or :Commit",
-                    notice
+                    "Probing: {} — review settings, then :commit or :Commit",
+                    first.file_name().unwrap_or_default().to_string_lossy()
                 ));
             } else if path_count == 1 {
                 app.set_status("review settings, then :commit or :Commit");

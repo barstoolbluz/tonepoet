@@ -713,8 +713,11 @@ pub fn find_cue_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
     cues.into_iter().next()
 }
 
-/// Collect track durations for audio files. Checks the probe cache first,
-/// falls back to direct ffmpeg probe for files not yet cached.
+/// Collect track durations for audio files. Checks the asynchronous browse
+/// probe cache first, then falls back to a sample-count probe for uncached
+/// files. This deliberately does not call `probe_audio()`: GNUDB lookup paths
+/// can run from the TUI reducer, so the heavyweight ffmpeg/lofty probe must not
+/// re-enter the event-loop thread.
 pub fn collect_durations(
     paths: &[PathBuf],
     probe_cache: &std::collections::HashMap<
@@ -726,22 +729,14 @@ pub fn collect_durations(
     for path in paths {
         if let Some(Some(cached)) = probe_cache.get(path) {
             durations.push(cached.source.duration_secs);
-        } else {
-            // Not in cache — probe directly (synchronous, but fast).
-            // Try ffmpeg first, fall back to format-specific tools
-            // (e.g., wvunpack for older WavPack files ffmpeg can't read).
-            match super::probe::probe_audio(path) {
-                Ok(info) => durations.push(info.duration_secs),
-                Err(_) => {
-                    // Fallback: use probe_sample_count which has
-                    // format-specific fallbacks (wvunpack, etc.).
-                    if let Ok((samples, sr)) = super::accuraterip::probe_sample_count(path) {
-                        durations.push(samples as f64 / sr as f64);
-                    }
-                    // If both fail, skip — durations vec will be short,
-                    // triggering the "some durations missing" error.
-                }
-            }
+            continue;
+        }
+
+        // Fallback: use probe_sample_count, which has format-specific
+        // fallbacks (wvunpack, etc.). If it fails, skip the file; callers
+        // already treat a short durations vector as "some durations missing".
+        if let Ok((samples, sr)) = super::accuraterip::probe_sample_count(path) {
+            durations.push(samples as f64 / sr as f64);
         }
     }
     durations

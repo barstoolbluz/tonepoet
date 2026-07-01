@@ -2405,6 +2405,58 @@ async fn extract_from_archive(
     }
 }
 
+fn install_convert_source_with_async_probe(app: &mut AppState, path: std::path::PathBuf) {
+    app.probe_generation = app.probe_generation.saturating_add(1);
+    let generation = app.probe_generation;
+    let probe_notice = source_probe_initial_notice(&path);
+
+    clear_source_metadata_in_convert(&mut app.convert);
+
+    // Single-file source replacements abandon pending batch metadata from any
+    // previous browse/queue handoff. Install only a cheap placeholder here;
+    // SACD/DVD/Blu-ray/CUE/Lofty discovery runs on the blocking probe worker.
+    let mut mode = SourceMode::from_single_pending_probe(path.clone(), probe_notice.clone());
+    match &mut mode {
+        SourceMode::Single { probe_notice: notice_slot, .. }
+        | SourceMode::MultiTrack { probe_notice: notice_slot, .. } => {
+            if notice_slot.is_none() {
+                *notice_slot = probe_notice.clone();
+            }
+        }
+        SourceMode::Batch {
+            probe_notice: batch_probe_notice,
+            cursor_probe_notice,
+            ..
+        } => {
+            *batch_probe_notice = probe_notice.clone();
+            *cursor_probe_notice = None;
+        }
+        SourceMode::Empty => {}
+    }
+
+    app.convert.set_source_mode(mode);
+    app.convert.source.cue_artifact_audio.clear();
+    app.convert.apply_source_defaults();
+    let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
+    app.current_screen = AppScreen::Convert;
+    app.recent.record_use_with_db(&path, &app.db);
+
+    if probe_notice.is_some() {
+        if let Some(tx) = app.tui_tx.clone() {
+            spawn_convert_source_probe(generation, path.clone(), probe_baseline, tx);
+        }
+        app.set_status(format!(
+            "Probing: {}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    } else {
+        app.set_status(format!(
+            "Loaded: {}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+}
+
 fn load_browse_selection(
     app: &mut AppState,
     path: std::path::PathBuf,
@@ -2414,37 +2466,10 @@ fn load_browse_selection(
 
     match target {
         BrowseReturnTarget::ConvertSource | BrowseReturnTarget::None => {
-            // Probe and load into source pane
-            match crate::tui::probe::probe_audio(&path) {
-                Ok(info) => {
-                    let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
-                    app.convert.metadata.title = metadata.title.clone();
-                    app.convert.metadata.artist = metadata.artist.clone();
-                    app.convert.metadata.album = metadata.album.clone();
-                    app.convert.metadata.genre = metadata.genre.clone();
-                    app.convert.metadata.year = metadata.year.clone();
-                    // Browse Enter loads a single file — abandon any
-                    // pending batch from a previous :queue.
-                    app.convert.set_source_mode(SourceMode::from_single(
-                        path.clone(),
-                        Some(info),
-                        metadata,
-                    ));
-                    app.set_status(format!(
-                        "Loaded: {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                    app.current_screen = AppScreen::Convert;
-                    // Clear the return target so subsequent browse visits don't
-                    // auto-load into the source pane.
-                    app.browse.return_target = BrowseReturnTarget::None;
-                    // Record this file in the recent-files history.
-                    app.recent.record_use_with_db(&path, &app.db);
-                }
-                Err(e) => {
-                    app.set_status(format!("Probe error: {}", e));
-                }
-            }
+            install_convert_source_with_async_probe(app, path);
+            // Clear the return target so subsequent browse visits don't
+            // auto-load into the source pane.
+            app.browse.return_target = BrowseReturnTarget::None;
         }
         BrowseReturnTarget::ConvertQueue => {
             // Add all multi-selected files (or just this one) to the queue
@@ -15149,7 +15174,7 @@ fn handle_batch_list_key(
 /// Move the Batch cursor to `new_cursor` and spawn a background probe
 /// for the new file. The `cursor_info`/`cursor_metadata` fields are
 /// cleared immediately so the pane preview shows "probing…" until the
-/// `AudioProbeComplete` message arrives and refreshes them.
+/// `ConvertAudioProbeComplete` message arrives and refreshes them.
 fn move_batch_cursor(app: &mut AppState, new_cursor: usize, _tx: &mpsc::Sender<AppMessage>) {
     let new_path = match &app.convert.source.mode {
         SourceMode::Batch { paths, .. } => paths.get(new_cursor).cloned(),
@@ -15167,7 +15192,7 @@ fn move_batch_cursor(app: &mut AppState, new_cursor: usize, _tx: &mpsc::Sender<A
     } = &mut app.convert.source.mode
     {
         *cursor = new_cursor;
-        // Clear stale info; AudioProbeComplete will repopulate.
+        // Clear stale info; ConvertAudioProbeComplete will repopulate.
         *cursor_info = None;
         *cursor_metadata = crate::tui::probe::SourceMetadata::default();
     }
@@ -15487,16 +15512,25 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         // If this is the same file we already had info for, carry it over.
         if old_cursor_path.as_ref() == Some(&path) {
             if let Some((info, metadata)) = old_cursor_info {
-                app.convert.set_source_mode(SourceMode::from_single(path, Some(info), metadata));
+                app.convert.set_source_mode(SourceMode::Single {
+                    path,
+                    info: Some(info),
+                    metadata,
+                    probe_notice: None,
+                });
                 return;
             }
         }
-        app.convert.set_source_mode(SourceMode::from_single(
-            path.clone(),
-            None,
-            crate::tui::probe::SourceMetadata::default(),
-        ));
-        super::browse::spawn_audio_probe(path, tx.clone());
+        app.probe_generation = app.probe_generation.saturating_add(1);
+        let generation = app.probe_generation;
+        let probe_notice = source_probe_initial_notice(&path);
+        app.convert
+            .set_source_mode(SourceMode::from_single_pending_probe(path.clone(), probe_notice.clone()));
+        app.convert.apply_source_defaults();
+        let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
+        if probe_notice.is_some() {
+            spawn_convert_source_probe(generation, path, probe_baseline, tx.clone());
+        }
         return;
     }
 
@@ -15532,7 +15566,12 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
 
     if need_probe {
         if let Some(p) = new_cursor_path {
-            super::browse::spawn_audio_probe(p, tx.clone());
+            if !is_nonprobeable_source_for_probe(&p) {
+                app.convert.source.batch_probe_pending = Some(p.clone());
+                let generation = app.probe_generation;
+                let baseline = ConvertProbeBaseline::capture(&app.convert);
+                spawn_convert_batch_cursor_probe(generation, p, baseline, tx.clone());
+            }
         }
     }
 }
@@ -19229,33 +19268,7 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Se
 
 /// Load a file from the recent list as the current source and switch to convert.
 fn load_recent_as_source(app: &mut AppState, path: &std::path::Path) {
-    match crate::tui::probe::probe_audio(path) {
-        Ok(info) => {
-            let metadata = crate::tui::probe::read_metadata(path).unwrap_or_default();
-            app.convert.metadata.title = metadata.title.clone();
-            app.convert.metadata.artist = metadata.artist.clone();
-            app.convert.metadata.album = metadata.album.clone();
-            app.convert.metadata.genre = metadata.genre.clone();
-            app.convert.metadata.year = metadata.year.clone();
-            // Loading from recent replaces the source — abandon any
-            // pending batch from a previous :queue.
-            app.convert.set_source_mode(SourceMode::from_single(
-                path.to_path_buf(),
-                Some(info),
-                metadata,
-            ));
-            app.set_status(format!(
-                "Loaded: {}",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
-            app.current_screen = AppScreen::Convert;
-            // Bump to top of recent list.
-            app.recent.record_use_with_db(path, &app.db);
-        }
-        Err(e) => {
-            app.set_status(format!("Probe error: {}", e));
-        }
-    }
+    install_convert_source_with_async_probe(app, path.to_path_buf());
 }
 
 /// Handle file input completion — either set source file (convert screen) or add to queue
@@ -19267,35 +19280,7 @@ fn handle_file_input(app: &mut AppState, path: &std::path::Path) {
 
     match app.current_screen {
         AppScreen::Convert => {
-            // Probe the file first
-            let info = match crate::tui::probe::probe_audio(path) {
-                Ok(i) => i,
-                Err(e) => {
-                    // Reset to Empty on probe failure.
-                    app.convert.set_source_mode(SourceMode::Empty);
-                    app.set_status(format!("Probe error: {}", e));
-                    return;
-                }
-            };
-            // Read metadata (best-effort).
-            let metadata = crate::tui::probe::read_metadata(path).unwrap_or_default();
-            app.convert.metadata.title = metadata.title.clone();
-            app.convert.metadata.artist = metadata.artist.clone();
-            app.convert.metadata.album = metadata.album.clone();
-            app.convert.metadata.genre = metadata.genre.clone();
-            app.convert.metadata.year = metadata.year.clone();
-            // FileInput replaces the source — abandon any pending batch.
-            app.convert.set_source_mode(SourceMode::from_single(
-                path.to_path_buf(),
-                Some(info),
-                metadata,
-            ));
-            app.set_status(format!(
-                "Loaded: {}",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
-            // Record in the recent-files history.
-            app.recent.record_use_with_db(path, &app.db);
+            install_convert_source_with_async_probe(app, path.to_path_buf());
         }
         _ => {
             // Add to queue (existing behavior)

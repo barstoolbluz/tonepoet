@@ -378,11 +378,16 @@ fn duration_to_frames(d: &Duration) -> u32 {
     (d.as_secs_f64() * 75.0).round() as u32
 }
 
-/// Build album + track info by probing files and reading tags.
-/// Falls back to filename parsing when tags are missing.
-/// `cue_dir` is the directory where the CUE file will be written;
-/// FILE references are made relative to it.
-pub fn gather_cue_info(
+/// Blocking worker helper: build album + track info by probing files and reading tags.
+///
+/// This calls `read_metadata()` and `probe_audio()` for each input file. Do not
+/// call it from TUI reducers or key handlers; wrap it in `spawn_blocking` and
+/// send the result back through `AppMessage`.
+///
+/// Falls back to filename parsing when tags are missing. `cue_dir` is the
+/// directory where the CUE file will be written; FILE references are made
+/// relative to it.
+pub(crate) fn gather_cue_info_blocking(
     paths: &[std::path::PathBuf],
     cue_dir: &Path,
 ) -> Result<(CueAlbumInfo, Vec<CueTrackInfo>), String> {
@@ -525,17 +530,19 @@ pub fn derive_image_filename(album: &CueAlbumInfo, first_path: &Path) -> String 
     format!("{}.{}", sanitised, ext)
 }
 
-/// Bridge a parsed CueSheet + colocated audio paths into the (album, tracks)
-/// shape used by the generators, with pregaps reconstructed from `INDEX 00`
-/// and durations probed from the audio files.
+/// Blocking worker helper: bridge a parsed CueSheet + colocated audio paths
+/// into the (album, tracks) shape used by the generators, with pregaps
+/// reconstructed from `INDEX 00` and durations probed from the audio files.
+///
+/// This calls `probe_audio()` for the referenced audio files. Do not call it
+/// from TUI reducers or key handlers; wrap it in `spawn_blocking` and send the
+/// result back through `AppMessage`.
 ///
 /// Used by `:cue-fill` so re-emission preserves the user's track boundaries
-/// without depending on a separate EAC log.
-///
-/// `audio_paths` must be sorted by track order and have the same length as
-/// `sheet.tracks` (multi-file) or len == 1 (single-image). Returns `Err` on
-/// length mismatch.
-pub fn cue_sheet_to_track_info(
+/// without depending on a separate EAC log. `audio_paths` must be sorted by
+/// track order and have the same length as `sheet.tracks` (multi-file) or len
+/// == 1 (single-image). Returns `Err` on length mismatch.
+pub(crate) fn cue_sheet_to_track_info_blocking(
     sheet: &super::cue_parser::CueSheet,
     audio_paths: &[std::path::PathBuf],
     cue_dir: &std::path::Path,

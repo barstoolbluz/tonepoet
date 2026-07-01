@@ -24,6 +24,7 @@ pub async fn run_app(
     // Set the message channel on BrowseState so navigation methods can
     // spawn async scans. Must happen before the event loop starts.
     app.browse.set_tx(tx.clone());
+    app.tui_tx = Some(tx.clone());
 
     loop {
         // 1. Refresh items from the manager
@@ -107,32 +108,24 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
     };
 
     if still_current {
-        // Skip if already in flight (dedup guard).
+        if super::app::is_nonprobeable_source_for_probe(&path) {
+            return;
+        }
+
+        // Skip if already in flight (dedup guard). Capture the Convert source
+        // generation and editable-state baseline at dispatch time so late
+        // completions can update preview facts without resetting user choices.
         if app.convert.source.batch_probe_pending.as_ref() != Some(&path) {
             app.convert.source.batch_probe_pending = Some(path.clone());
-            spawn_batch_cursor_probe(path, tx.clone());
+            let generation = app.probe_generation;
+            let baseline = super::app::ConvertProbeBaseline::capture(&app.convert);
+            super::app::spawn_convert_batch_cursor_probe(
+                generation,
+                path,
+                baseline,
+                tx.clone(),
+            );
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BatchCursorProbeKind {
-    Audio,
-    CueProxy,
-}
-
-fn batch_cursor_probe_kind(path: &std::path::Path) -> BatchCursorProbeKind {
-    if super::browse::is_cue_sheet_path(path) {
-        BatchCursorProbeKind::CueProxy
-    } else {
-        BatchCursorProbeKind::Audio
-    }
-}
-
-fn spawn_batch_cursor_probe(path: std::path::PathBuf, tx: mpsc::Sender<AppMessage>) {
-    match batch_cursor_probe_kind(&path) {
-        BatchCursorProbeKind::Audio => super::browse::spawn_audio_probe(path, tx),
-        BatchCursorProbeKind::CueProxy => super::browse::spawn_cue_proxy_audio_probe(path, tx),
     }
 }
 
@@ -643,6 +636,173 @@ fn close_matching_file_picker(
     matched
 }
 
+fn handle_convert_source_probe_result(
+    app: &mut AppState,
+    generation: u64,
+    path: std::path::PathBuf,
+    source_mode: super::app::SourceMode,
+    baseline: super::app::ConvertProbeBaseline,
+) {
+    if generation != app.probe_generation {
+        return;
+    }
+
+    let metadata_unchanged = app.convert.metadata.editing.is_none()
+        && super::app::ConvertProbeMetadataSnapshot::capture(&app.convert.metadata)
+            == baseline.metadata;
+    let format_unchanged =
+        super::app::ConvertProbeFormatSnapshot::capture(&app.convert.format) == baseline.format;
+
+    let detected_info_for_defaults = source_mode.current_info().cloned();
+    let detected_metadata = source_mode.current_metadata();
+    let probe_notice = source_mode
+        .persistent_probe_notice()
+        .map(std::borrow::ToOwned::to_owned);
+
+    let mut applied = false;
+    let is_batch_first = matches!(
+        &app.convert.source.mode,
+        super::app::SourceMode::Batch { paths, .. } if paths.first() == Some(&path)
+    );
+
+    if is_batch_first {
+        if let super::app::SourceMode::Batch {
+            paths,
+            cursor,
+            cursor_info,
+            cursor_metadata,
+            probe_notice: batch_notice,
+            cursor_probe_notice,
+            ..
+        } = &mut app.convert.source.mode
+        {
+            // Batch format detection probes the first queued path. Cursor
+            // movement during the worker is not stale: generation proves the
+            // batch is still current. Only cursor-scoped preview fields update
+            // when the cursor still points at the probed path.
+            *batch_notice = probe_notice.clone();
+            if paths.get(*cursor) == Some(&path) {
+                *cursor_info = detected_info_for_defaults.clone();
+                *cursor_metadata = detected_metadata.clone();
+                *cursor_probe_notice = None;
+            }
+            applied = true;
+        }
+    } else if app.convert.source.mode.current_path() == Some(&path) {
+        // The event loop installed only a cheap Single placeholder. The worker
+        // may now have discovered that the source is actually a CUE/SACD/DVD/
+        // Blu-ray multi-track source, so replace the whole mode with the fully
+        // realized result rather than just filling info/metadata slots.
+        if format_unchanged {
+            app.convert.set_source_mode(source_mode);
+        } else {
+            app.convert
+                .set_source_mode_preserving_format_selection(source_mode);
+        }
+        applied = true;
+    }
+
+    if !applied {
+        return;
+    }
+
+    if metadata_unchanged {
+        super::app::apply_source_metadata_to_convert(&mut app.convert, &detected_metadata);
+    }
+
+    if format_unchanged {
+        if let Some(info) = detected_info_for_defaults.as_ref() {
+            app.convert.apply_source_info_defaults(info);
+        } else {
+            app.convert.format.clear_source_derived_defaults();
+        }
+    } else if let Some(info) = detected_info_for_defaults.as_ref() {
+        app.convert
+            .refresh_source_info_constraints_preserving_format_selection(info);
+    } else {
+        app.convert
+            .refresh_source_constraints_preserving_format_selection();
+    }
+
+    app.force_redraw = true;
+
+    if let Some(notice) = probe_notice {
+        app.set_status(format!("Probe warning: {}", notice));
+    } else {
+        app.set_status(format!(
+            "Loaded: {}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+}
+
+fn handle_convert_audio_probe_complete(
+    app: &mut AppState,
+    generation: u64,
+    path: std::path::PathBuf,
+    info: Option<super::probe::SourceInfo>,
+    metadata: super::probe::SourceMetadata,
+    probe_notice: Option<String>,
+    baseline: super::app::ConvertProbeBaseline,
+) {
+    if generation != app.probe_generation {
+        return;
+    }
+
+    let format_unchanged =
+        super::app::ConvertProbeFormatSnapshot::capture(&app.convert.format) == baseline.format;
+
+    if app.convert.source.batch_probe_pending.as_ref() == Some(&path) {
+        app.convert.source.batch_probe_pending = None;
+    }
+
+    let mut applied = false;
+    if let super::app::SourceMode::Batch {
+        paths,
+        cursor,
+        cursor_info,
+        cursor_metadata,
+        cursor_probe_notice,
+        ..
+    } = &mut app.convert.source.mode
+    {
+        if paths.get(*cursor) == Some(&path) {
+            *cursor_info = info.clone();
+            *cursor_metadata = if info.is_some() {
+                metadata
+            } else {
+                super::probe::SourceMetadata::default()
+            };
+            *cursor_probe_notice = probe_notice.clone().map(|notice| (path.clone(), notice));
+            applied = true;
+        }
+    }
+
+    if !applied {
+        return;
+    }
+
+    if format_unchanged {
+        if let Some(info) = info.as_ref() {
+            app.convert.apply_source_info_defaults(info);
+        } else {
+            app.convert.format.clear_source_derived_defaults();
+        }
+    } else if let Some(info) = info.as_ref() {
+        app.convert
+            .refresh_source_info_constraints_preserving_format_selection(info);
+    } else {
+        app.convert
+            .refresh_source_constraints_preserving_format_selection();
+    }
+
+    app.force_redraw = true;
+
+    if let Some(notice) = probe_notice {
+        app.set_status(format!("Probe warning: {}", notice));
+    }
+}
+
 fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::ClearTrackProgress {
@@ -766,19 +926,43 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.set_status(msg);
         }
         AppMessage::Redraw => {} // Just triggers a redraw via the loop
+        AppMessage::ProbeResult {
+            generation,
+            path,
+            source_mode,
+            baseline,
+        } => {
+            handle_convert_source_probe_result(app, generation, path, source_mode, baseline);
+        }
+        AppMessage::ConvertAudioProbeComplete {
+            generation,
+            path,
+            info,
+            metadata,
+            probe_notice,
+            baseline,
+        } => {
+            handle_convert_audio_probe_complete(
+                app,
+                generation,
+                path,
+                info,
+                metadata,
+                probe_notice,
+                baseline,
+            );
+        }
         AppMessage::AudioProbeComplete { path, result } => {
             app.browse.probe_pending.remove(&path);
             match *result {
                 Ok(mut info) => {
                     let is_cue_proxy_result = super::browse::is_cue_sheet_path(&path);
                     if !is_cue_proxy_result {
-                        // Check analysis cache for HDCD / PE info that should
-                        // be surfaced in the info pane. CUE proxy results are
-                        // keyed by the `.cue` path but describe referenced audio
-                        // images, so do not run image-analysis lookups or persist
-                        // them as ordinary file probes under the text-file path.
-                        info.metadata.preemphasis_metadata =
-                            super::probe::preemphasis_metadata_check_pub(&path);
+                        // Generic browse probes own only browse/cache state.
+                        // Convert-affecting probes use ConvertAudioProbeComplete,
+                        // which carries generation and baseline guards. Keeping
+                        // this reducer browse-only prevents late navigation probes
+                        // from resetting Convert metadata or output settings.
                         if let Ok(meta) = std::fs::metadata(&path) {
                             let mtime = meta
                                 .modified()
@@ -804,12 +988,10 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                             }
                         }
 
-                        // Clone for the browse cache (shared via Arc).
                         app.browse
                             .probe_cache
                             .insert(path.clone(), Some(std::sync::Arc::new(info.clone())));
 
-                        // Persist to SQLite probe cache for cross-session reuse.
                         if let Ok(meta) = std::fs::metadata(&path) {
                             let mtime = meta
                                 .modified()
@@ -823,100 +1005,18 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                                 &row,
                             );
                         }
-                    }
 
-                    // Phase 6g: route to the Convert source pane if
-                    // we're in Batch mode and this path matches the
-                    // current cursor, or in Single mode and this path
-                    // matches the loaded file. This completes the
-                    // async-probe pipeline for `move_batch_cursor` and
-                    // `remove_batch_at_cursor`.
-                    let super::browse::CachedInfo {
-                        source: probed_info,
-                        metadata: probed_metadata,
-                    } = info;
-                    // Clear the batch probe pending flag if this result matches.
-                    if app.convert.source.batch_probe_pending.as_ref() == Some(&path) {
-                        app.convert.source.batch_probe_pending = None;
                     }
-
-                    match &mut app.convert.source.mode {
-                        super::app::SourceMode::Batch {
-                            paths,
-                            cursor,
-                            cursor_info,
-                            cursor_metadata,
-                            cursor_probe_notice,
-                            ..
-                        } => {
-                            if paths.get(*cursor).map(|p| p == &path).unwrap_or(false) {
-                                *cursor_info = Some(probed_info);
-                                *cursor_metadata = probed_metadata;
-                                *cursor_probe_notice = None;
-                            }
-                        }
-                        super::app::SourceMode::Single {
-                            path: single_path,
-                            info: info_slot,
-                            metadata: metadata_slot,
-                            probe_notice,
-                        } => {
-                            if single_path == &path {
-                                *info_slot = Some(probed_info);
-                                *metadata_slot = probed_metadata;
-                                *probe_notice = None;
-                            }
-                        }
-                        super::app::SourceMode::MultiTrack {
-                            path: mt_path,
-                            info: info_slot,
-                            metadata: metadata_slot,
-                            ..
-                        } => {
-                            if mt_path == &path {
-                                *info_slot = Some(probed_info);
-                                *metadata_slot = probed_metadata;
-                            }
-                        }
-                        super::app::SourceMode::Empty => {}
-                    }
-
-                    // Apply source-aware format defaults now that probe info is available.
-                    app.convert.apply_source_defaults();
                 }
-                Err(err) => {
-                    let is_cue_proxy_result = super::browse::is_cue_sheet_path(&path);
-                    if app.convert.source.batch_probe_pending.as_ref() == Some(&path) {
-                        app.convert.source.batch_probe_pending = None;
-                    }
-
-                    if is_cue_proxy_result {
-                        let notice = if err.trim().is_empty() {
-                            "CUE proxy probe failed; set format manually".to_string()
-                        } else {
-                            err
-                        };
-                        if let super::app::SourceMode::Batch {
-                            paths,
-                            cursor,
-                            cursor_info,
-                            cursor_metadata,
-                            cursor_probe_notice,
-                            ..
-                        } = &mut app.convert.source.mode
-                        {
-                            if paths.get(*cursor).map(|p| p == &path).unwrap_or(false) {
-                                *cursor_info = None;
-                                *cursor_metadata = super::probe::SourceMetadata::default();
-                                *cursor_probe_notice = Some((path.clone(), notice));
-                                app.convert.apply_source_defaults();
-                            }
-                        }
-                    } else {
-                        // Cache the failure so we don't retry; renderer falls back
-                        // to basic info (path + size) when the value is None.
-                        app.browse.probe_cache.insert(path, None);
-                    }
+                Err(_) if super::browse::is_cue_sheet_path(&path) => {
+                    // CUE proxy failures are Convert-source facts only when
+                    // launched through ConvertAudioProbeComplete. Generic browse
+                    // cache entries remain untouched for text CUE paths.
+                }
+                Err(_) => {
+                    // Cache the failure so browse does not retry; renderers can
+                    // fall back to basic path/size information.
+                    app.browse.probe_cache.insert(path, None);
                 }
             }
         }
@@ -1781,6 +1881,68 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 app.set_status(format!("CTDB repair failed: {}", e));
             }
         },
+        AppMessage::CueWriteComplete { result, refresh_browse } => {
+            match result {
+                Ok(message) => {
+                    app.set_status(message);
+                    if refresh_browse && app.current_screen == AppScreen::Browse {
+                        app.browse.refresh();
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                    }
+                }
+                Err(message) => app.set_status(message),
+            }
+        }
+        AppMessage::CuePreviewComplete { result } => {
+            match result {
+                Ok((cue_content, cue_path, summary)) => {
+                    app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+                        super::app::CuePreviewState::new(cue_content, cue_path, summary.clone()),
+                    ));
+                    app.set_status(summary);
+                }
+                Err(err) => app.set_status(format!("MusicBrainz CUE: {}", err)),
+            }
+        }
+        AppMessage::CueFillPrepComplete { cue_path, result } => {
+            let (album, tracks, layout, sectors) = match result {
+                Ok(prep) => prep,
+                Err(err) => {
+                    app.set_status(format!(":cue-fill: {}", err));
+                    return;
+                }
+            };
+            let toc_string = match super::musicbrainz::build_mb_toc(&sectors) {
+                Some(s) => s,
+                None => {
+                    app.set_status(":cue-fill: TOC too short".to_string());
+                    return;
+                }
+            };
+            let cached = app.db.get_cached_mb_response(&toc_string);
+            let n_cached = if cached.is_some() { "cached" } else { "fetching" };
+            app.set_status(format!(
+                ":cue-fill: {} disc TOC ({} tracks)…",
+                n_cached,
+                sectors.len().saturating_sub(1),
+            ));
+
+            let tx = tx.clone();
+            let toc_for_msg = toc_string.clone();
+            tokio::spawn(async move {
+                let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await;
+                let _ = tx
+                    .send(AppMessage::CueFillComplete {
+                        outcome,
+                        cue_path,
+                        album,
+                        tracks,
+                        layout,
+                        toc_string: toc_for_msg,
+                    })
+                    .await;
+            });
+        }
         AppMessage::CueMbComplete {
             outcome,
             paths,
@@ -1812,6 +1974,14 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         }
         AppMessage::TagsFromMbComplete { outcome, ctx } => {
             dispatch_tags_from_mb_complete(app, tx, outcome, ctx);
+        }
+        AppMessage::TagsMbApplyReady {
+            releases,
+            selected,
+            paths,
+            decision,
+        } => {
+            apply_editor_with_mb_release_decision(app, releases, selected, paths, decision);
         }
         AppMessage::MbDetailPrefetchComplete { release_id, result } => {
             // Stamp the in-memory cache if the picker is still open,
@@ -2222,57 +2392,57 @@ fn handle_cue_mb_complete(
         }
     };
 
-    let (mut album, mut tracks) = match super::cue_generate::gather_cue_info(&paths, &output_dir) {
-        Ok(pair) => pair,
-        Err(e) => {
-            app.set_status(format!("MusicBrainz CUE: {}", e));
-            return;
-        }
-    };
+    app.set_status("MusicBrainz CUE: building preview…".to_string());
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let (mut album, mut tracks) = super::cue_generate::gather_cue_info_blocking(&paths, &output_dir)
+                .map_err(|e| e.to_string())?;
 
-    super::cue_generate::apply_mb_overrides(&mut album, &mut tracks, &release);
+            super::cue_generate::apply_mb_overrides(&mut album, &mut tracks, &release);
 
-    let cue_content = if single_image {
-        let image_name = super::cue_generate::derive_image_filename(&album, &paths[0]);
-        let ext = paths[0]
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("flac");
-        let fmt = super::cue_generate::cue_format_tag(ext);
-        super::cue_generate::generate_single_image_cue(&album, &tracks, &image_name, fmt)
-    } else {
-        super::cue_generate::generate_multifile_cue(&album, &tracks)
-    };
+            let cue_content = if single_image {
+                let image_name = super::cue_generate::derive_image_filename(&album, &paths[0]);
+                let ext = paths[0]
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("flac");
+                let fmt = super::cue_generate::cue_format_tag(ext);
+                super::cue_generate::generate_single_image_cue(&album, &tracks, &image_name, fmt)
+            } else {
+                super::cue_generate::generate_multifile_cue(&album, &tracks)
+            };
 
-    let cue_filename = super::cue_generate::cue_output_filename(&album);
-    let cue_path = output_dir.join(&cue_filename);
+            let cue_filename = super::cue_generate::cue_output_filename(&album);
+            let cue_path = output_dir.join(&cue_filename);
 
-    let mode = if single_image {
-        "single image"
-    } else {
-        "multi-file"
-    };
-    let pregaps = tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
-    let pregap_note = if pregaps > 0 {
-        format!(
-            ", {} pregap{}",
-            pregaps,
-            if pregaps == 1 { "" } else { "s" }
-        )
-    } else {
-        String::new()
-    };
-    let summary = format!(
-        "MusicBrainz CUE ({}, MB-enriched: \"{}\"{})",
-        mode, album.title, pregap_note,
-    );
-    let _ = tx; // overlay handles save; nothing to dispatch here.
-    app.active_overlay = ActiveOverlay::CuePreview(Box::new(super::app::CuePreviewState::new(
-        cue_content,
-        cue_path,
-        summary.clone(),
-    )));
-    app.set_status(summary);
+            let mode = if single_image {
+                "single image"
+            } else {
+                "multi-file"
+            };
+            let pregaps = tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
+            let pregap_note = if pregaps > 0 {
+                format!(
+                    ", {} pregap{}",
+                    pregaps,
+                    if pregaps == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            };
+            let summary = format!(
+                "MusicBrainz CUE ({}, MB-enriched: \"{}\"{})",
+                mode, album.title, pregap_note,
+            );
+
+            Ok((cue_content, cue_path, summary))
+        })
+        .await
+        .unwrap_or_else(|err| Err(format!("preview task failed: {}", err)));
+
+        let _ = tx.send(AppMessage::CuePreviewComplete { result }).await;
+    });
 }
 
 /// Dispatch the `AppMessage::TagsFromMbComplete` arm from the real event-loop
@@ -2687,6 +2857,86 @@ pub(super) fn open_editor_with_mb_release(
         return;
     };
 
+    // The single-image guard may read tags and probe sample counts. Run it
+    // outside the reducer before mutating the editor; otherwise a completed
+    // MB lookup can still freeze the TUI while the message handler verifies
+    // the file.
+    if paths.len() == 1 && release.tracks.len() > 1 {
+        if let Some(tx) = app.tui_tx.clone() {
+            let release_for_decision = release.clone();
+            let paths_for_decision = paths.clone();
+            app.set_status(":tags-mb: verifying selected release against file…".to_string());
+            tokio::spawn(async move {
+                let worker_paths = paths_for_decision.clone();
+                let worker_release = release_for_decision.clone();
+                let decision = tokio::task::spawn_blocking(move || {
+                    super::musicbrainz::compute_per_track_decision_blocking(
+                        &worker_paths,
+                        &worker_release,
+                    )
+                })
+                .await
+                .unwrap_or_else(|err| super::musicbrainz::PerTrackDecision {
+                    per_track_populate: false,
+                    skip_reason: Some(format!(
+                        "single-image verification task failed: {}; album-level tags only",
+                        err
+                    )),
+                });
+                let _ = tx
+                    .send(AppMessage::TagsMbApplyReady {
+                        releases,
+                        selected,
+                        paths,
+                        decision,
+                    })
+                    .await;
+            });
+            return;
+        }
+
+        // Defensive fallback for tests or non-standard harnesses that did not
+        // install `tui_tx`. Do not run blocking media verification here; apply
+        // album-level tags rather than freezing the caller.
+        app.set_status(
+            ":tags-mb: async verifier unavailable; applying album-level tags only".to_string(),
+        );
+        apply_editor_with_mb_release_decision(
+            app,
+            releases,
+            selected,
+            paths,
+            super::musicbrainz::PerTrackDecision {
+                per_track_populate: false,
+                skip_reason: Some(
+                    "async verifier unavailable — album-level tags only".to_string(),
+                ),
+            },
+        );
+        return;
+    }
+
+    apply_editor_with_mb_release_decision(
+        app,
+        releases,
+        selected,
+        paths,
+        super::musicbrainz::PerTrackDecision::default(),
+    );
+}
+
+pub(super) fn apply_editor_with_mb_release_decision(
+    app: &mut AppState,
+    releases: Vec<super::musicbrainz::MbRelease>,
+    selected: usize,
+    paths: Vec<std::path::PathBuf>,
+    decision: super::musicbrainz::PerTrackDecision,
+) {
+    let Some(release) = releases.get(selected) else {
+        app.set_status(":tags-mb: invalid release index".to_string());
+        return;
+    };
+
     // Three arrival modes, checked via `take_metadata_editor`:
     // - Browse → MbSelect: no editor was open before `:tags-mb`,
     //   neither slot holds one; `open_metadata_editor` builds fresh
@@ -2716,10 +2966,10 @@ pub(super) fn open_editor_with_mb_release(
         app.active_overlay = ActiveOverlay::MetadataEditor(state);
         return;
     }
-    // Compute the skip reason BEFORE populate so we can surface
-    // it on the status line — populate itself runs the same
-    // checks internally for the gate but only logs to env_logger.
-    let skip_reason = super::musicbrainz::per_track_skip_reason(&state.active_surface().paths, release);
+    // The potentially blocking per-track guard was computed before this
+    // reducer ran. Reuse it for status text and population so the event loop
+    // never performs media/tag inspection here.
+    let skip_reason = decision.skip_reason.clone();
     // Phase C item 3: surface track-count divergence as a non-fatal
     // warning. MB releases sometimes carry bonus/hidden tracks not
     // present on the SACD area being tagged, or the reverse —
@@ -2732,7 +2982,11 @@ pub(super) fn open_editor_with_mb_release(
     // multi-presentation editors this preserves per-tab state and lets the
     // apply-to-all confirmation copy only the MB-populated values from the
     // active presentation into matching sibling presentations.
-    super::musicbrainz::populate_editor_from_mb(&mut state, release);
+    super::musicbrainz::populate_editor_from_mb_with_per_track_decision(
+        &mut state,
+        release,
+        &decision,
+    );
     let dvdv_duration_warning =
         super::musicbrainz::apply_dvdv_duration_warnings(&mut state, release);
     state.phase = super::app::MetadataEditorPhase::Editing;
@@ -2870,24 +3124,6 @@ fn handle_cue_fill_complete(
         summary.clone(),
     )));
     app.set_status(summary);
-}
-
-#[cfg(test)]
-mod cue_proxy_batch_cursor_tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn batch_cursor_probe_routes_cue_to_proxy_probe() {
-        assert_eq!(
-            batch_cursor_probe_kind(Path::new("/music/disc.cue")),
-            BatchCursorProbeKind::CueProxy
-        );
-        assert_eq!(
-            batch_cursor_probe_kind(Path::new("/music/track.flac")),
-            BatchCursorProbeKind::Audio
-        );
-    }
 }
 
 

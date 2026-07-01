@@ -908,6 +908,18 @@ pub fn populate_editor_mb_supplemental(
     state: &mut crate::tui::app::MetadataEditorState,
     release: &MbRelease,
 ) {
+    let decision = compute_per_track_decision_blocking(&state.active_surface().paths, release);
+    populate_editor_mb_supplemental_with_per_track_decision(state, release, &decision);
+}
+
+/// Populate MusicBrainz-only metadata fields using a precomputed per-track
+/// decision. This variant performs no media/tag probing and is safe for the
+/// event-loop thread.
+pub fn populate_editor_mb_supplemental_with_per_track_decision(
+    state: &mut crate::tui::app::MetadataEditorState,
+    release: &MbRelease,
+    decision: &PerTrackDecision,
+) {
     use lofty::tag::ItemKey;
 
     let n = state.active_surface().paths.len();
@@ -917,7 +929,7 @@ pub fn populate_editor_mb_supplemental(
     // populate-time CUESHEET embed pre-Phase-5. When false on a
     // single_image rip we fall back to album-only writes for the
     // legacy MB-only IDs that have no per-track home.
-    let per_track_populate = single_image && is_per_track_eligible(&state.active_surface().paths, release, false);
+    let per_track_populate = single_image && decision.per_track_populate;
 
     fn find_or_create(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
@@ -1433,20 +1445,38 @@ fn format_duration_ms(ms: u64) -> String {
     format!("{}:{:02}", minutes, seconds)
 }
 
-/// release) — no per-track expectation in those cases, no message
-/// needed.
-pub(super) fn per_track_skip_reason(
+/// Result of the single-image MusicBrainz per-track gate.
+///
+/// Computing this can read the file's tags with `lofty` and probe the audio
+/// sample count. Event-loop reducers must therefore compute it on a blocking
+/// worker and pass the value into `populate_editor_from_mb_with_per_track_decision`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PerTrackDecision {
+    pub per_track_populate: bool,
+    pub skip_reason: Option<String>,
+}
+
+/// Blocking guard used by `:tags-mb` before per-track single-image population.
+///
+/// This function may call `lofty::read_from_path()` and
+/// `accuraterip::probe_sample_count()`. Call it only from tests, CLI-style
+/// synchronous code, or a `spawn_blocking` worker. TUI message handlers should
+/// use the precomputed `PerTrackDecision` carried by `AppMessage::TagsMbApplyReady`.
+pub fn compute_per_track_decision_blocking(
     paths: &[std::path::PathBuf],
     release: &MbRelease,
-) -> Option<String> {
+) -> PerTrackDecision {
     if paths.len() != 1 || release.tracks.len() <= 1 {
-        return None;
+        return PerTrackDecision::default();
     }
     if release.disc_count > 1 {
-        return Some(format!(
-            "multi-disc release ({} discs) — album-level tags only",
-            release.disc_count,
-        ));
+        return PerTrackDecision {
+            per_track_populate: false,
+            skip_reason: Some(format!(
+                "multi-disc release ({} discs) — album-level tags only",
+                release.disc_count,
+            )),
+        };
     }
     // Note: a sidecar .cue is no longer a guard. The editor's
     // open-time inject_sidecar_cuesheet_if_present surfaces the
@@ -1458,7 +1488,10 @@ pub(super) fn per_track_skip_reason(
         .first()
         .and_then(|p| verify_single_image_matches_release(p, release))
     {
-        return Some(format!("{} — album-level tags only", reason));
+        return PerTrackDecision {
+            per_track_populate: false,
+            skip_reason: Some(format!("{} — album-level tags only", reason)),
+        };
     }
     // Even with identity (MUSICBRAINZ_ALBUMID match) or duration
     // verification passing, we need MB track lengths to generate a
@@ -1467,35 +1500,38 @@ pub(super) fn per_track_skip_reason(
     // forcing Phase 4 to refuse saves. Tighten here so the user
     // gets the album-level fallback in this corner instead.
     if release.tracks.iter().any(|t| t.length_ms.is_none()) {
-        return Some("MB release missing track lengths — album-level tags only".to_string());
+        return PerTrackDecision {
+            per_track_populate: false,
+            skip_reason: Some("MB release missing track lengths — album-level tags only".to_string()),
+        };
     }
-    None
+    PerTrackDecision {
+        per_track_populate: true,
+        skip_reason: None,
+    }
 }
 
-/// Boolean wrapper around `per_track_skip_reason`. The `verbose` flag
-/// emits the skip reason to the log when true; the caller in
-/// event_loop.rs prefers `per_track_skip_reason` directly so the
-/// reason can be surfaced in TUI status as well.
-///
-/// `per_track_skip_reason` returns None for both "eligible" AND "not
-/// per-track-applicable" cases (multi-file, single-track release) —
-/// distinguishing those would just produce noisy status messages.
-/// This wrapper adds the not-applicable filter so the boolean stays
-/// faithful to its original semantics ("can per-track populate run?",
-/// not "is the situation eligible-or-irrelevant?").
+/// Blocking compatibility wrapper around `compute_per_track_decision_blocking`.
+/// Event-loop reducers must not call this directly.
+#[cfg(test)]
+pub(super) fn per_track_skip_reason(
+    paths: &[std::path::PathBuf],
+    release: &MbRelease,
+) -> Option<String> {
+    compute_per_track_decision_blocking(paths, release).skip_reason
+}
+
+/// Boolean wrapper around the blocking per-track gate. Kept for synchronous
+/// callers and tests; event-loop reducers pass a precomputed decision instead.
+#[cfg(test)]
 fn is_per_track_eligible(paths: &[std::path::PathBuf], release: &MbRelease, verbose: bool) -> bool {
-    if paths.len() != 1 || release.tracks.len() <= 1 {
-        return false;
-    }
-    match per_track_skip_reason(paths, release) {
-        None => true,
-        Some(reason) => {
-            if verbose {
-                log::info!(":tags-mb: per-track populate skipped ({})", reason);
-            }
-            false
+    let decision = compute_per_track_decision_blocking(paths, release);
+    if let Some(reason) = decision.skip_reason.as_deref() {
+        if verbose {
+            log::info!(":tags-mb: per-track populate skipped ({})", reason);
         }
     }
+    decision.per_track_populate
 }
 
 // `ensure_dim_replicate` moved to probe.rs so gnudb can share it.
@@ -1516,27 +1552,37 @@ fn recompute_and_stamp_mb_proposed(entry: &mut crate::tui::probe::TagEntry, _n: 
     }
 }
 
-/// Populate a metadata editor state with values from a MusicBrainz release.
-/// Track-level fields (TITLE, ARTIST, TRACKNUMBER, ISRC) come from the
-/// matching `MbTrack.position`; album-level fields (ALBUM, DATE,
-/// CATALOGNUMBER) apply to every track. Existing per-file tag values are
-/// only overwritten when the MB value is non-empty — empty MB fields
-/// preserve whatever the file currently has.
+/// Blocking compatibility wrapper for MusicBrainz editor population.
 ///
-/// Calls `populate_editor_mb_supplemental` for the MB-only fields
-/// (IDs, country, original date, composer, lyricist, etc.) and then
-/// writes the review-equivalent fields (TITLE/ARTIST/ALBUM/TRACKNUMBER/
-/// DATE) on top.
-///
-/// Mirrors `super::gnudb::populate_editor_from_review` (the production
-/// gnudb populate path).
+/// This computes the single-image guard in place, which may touch media files.
+/// TUI event-loop reducers must use
+/// `populate_editor_from_mb_with_per_track_decision` with a worker-computed
+/// `PerTrackDecision` instead.
 pub fn populate_editor_from_mb(
     state: &mut crate::tui::app::MetadataEditorState,
     release: &MbRelease,
 ) {
+    let decision = compute_per_track_decision_blocking(&state.active_surface().paths, release);
+    populate_editor_from_mb_with_per_track_decision(state, release, &decision);
+}
+
+/// Populate a metadata editor state with values from a MusicBrainz release
+/// using a precomputed single-image per-track decision.
+///
+/// Track-level fields (TITLE, ARTIST, TRACKNUMBER, ISRC) come from the
+/// matching `MbTrack.position`; album-level fields (ALBUM, DATE,
+/// CATALOGNUMBER) apply to every track. Existing per-file tag values are only
+/// overwritten when the MB value is non-empty. This reducer does not perform
+/// media/tag probing, so it is safe to call from the event-loop thread as long
+/// as `decision` was computed on a blocking worker.
+pub fn populate_editor_from_mb_with_per_track_decision(
+    state: &mut crate::tui::app::MetadataEditorState,
+    release: &MbRelease,
+    decision: &PerTrackDecision,
+) {
     use lofty::tag::ItemKey;
 
-    populate_editor_mb_supplemental(state, release);
+    populate_editor_mb_supplemental_with_per_track_decision(state, release, decision);
 
     let n = state.active_surface().paths.len();
 
@@ -1572,7 +1618,12 @@ pub fn populate_editor_from_mb(
     // is_per_track_eligible — multi-disc / sidecar .cue / unverifiable
     // identity all fall back to album-level).
     let single_image = n == 1 && release.tracks.len() > 1;
-    let per_track_populate = single_image && is_per_track_eligible(&state.active_surface().paths, release, true);
+    let per_track_populate = single_image && decision.per_track_populate;
+    if single_image && !per_track_populate {
+        if let Some(reason) = decision.skip_reason.as_deref() {
+            log::info!(":tags-mb: per-track populate skipped ({})", reason);
+        }
+    }
     let track_dim = if per_track_populate {
         release.tracks.len()
     } else {
@@ -1845,14 +1896,14 @@ fn check_file_duration(audio_path: &std::path::Path, release: &MbRelease) -> Dur
     else {
         return DurationCheck::Unverifiable;
     };
-    let info = match super::probe::probe_audio(audio_path) {
-        Ok(i) => i,
+    let (samples, sample_rate) = match super::accuraterip::probe_sample_count(audio_path) {
+        Ok(values) => values,
         Err(_) => return DurationCheck::Unverifiable,
     };
-    if info.duration_secs <= 0.0 {
+    if samples == 0 || sample_rate == 0 {
         return DurationCheck::Unverifiable;
     }
-    let file_ms = (info.duration_secs * 1000.0).round() as u64;
+    let file_ms = ((samples as f64 / sample_rate as f64) * 1000.0).round() as u64;
     if durations_consistent(file_ms, release_total_ms, DURATION_MISMATCH_TOLERANCE_MS) {
         DurationCheck::Match
     } else {

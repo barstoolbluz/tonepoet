@@ -362,7 +362,7 @@ fn read_embedded_cuesheet_for_preview(path: &Path) -> Option<crate::tui::cue_par
 }
 
 
-fn is_cue_sheet_path_for_preview(path: &Path) -> bool {
+pub(crate) fn is_cue_sheet_path_for_preview(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("cue"))
@@ -634,6 +634,244 @@ pub(crate) fn probe_cue_proxy_source(cue_path: &Path) -> Result<CueProxyProbeRes
     })
 }
 
+/// Durable source-pane text used while a Convert-source probe is in flight.
+pub(crate) const PROBE_IN_PROGRESS_NOTICE: &str = "Probing...";
+
+/// Archives enter the queue as containers and cannot be interrogated as audio
+/// at source-selection time. Keep `.iso` probeable because SACD/DVD/Blu-ray
+/// detection uses it as a real disc source.
+pub(crate) fn is_nonprobeable_source_for_probe(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if name.ends_with(".tar.gz")
+        || name.ends_with(".tar.bz2")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".tar.zst")
+        || name.ends_with(".tar.lz")
+        || name.ends_with(".tar.lzma")
+    {
+        return true;
+    }
+
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "7z" | "zip" | "rar" | "tar" | "cab" | "dmg" | "tgz" | "tbz2" | "txz"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn source_probe_initial_notice(path: &Path) -> Option<String> {
+    if is_nonprobeable_source_for_probe(path) {
+        None
+    } else {
+        Some(PROBE_IN_PROGRESS_NOTICE.to_string())
+    }
+}
+
+/// Editable Convert metadata fields captured when an async source probe starts.
+/// Probe completion applies discovered tags only if these fields are still
+/// unchanged, preventing late Lofty results from overwriting user edits made
+/// while the UI stayed responsive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvertProbeMetadataSnapshot {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub year: Option<String>,
+}
+
+impl ConvertProbeMetadataSnapshot {
+    pub fn capture(metadata: &MetadataState) -> Self {
+        Self {
+            title: metadata.title.clone(),
+            artist: metadata.artist.clone(),
+            album: metadata.album.clone(),
+            genre: metadata.genre.clone(),
+            year: metadata.year.clone(),
+        }
+    }
+}
+
+/// Output-format fields that source probing is allowed to auto-default. The
+/// completion reducer compares this snapshot before applying source-derived
+/// defaults so user choices made during a probe are not reset on completion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvertProbeFormatSnapshot {
+    pub format: AudioFormat,
+    pub sample_rate: u32,
+    pub bit_depth: BitDepthChoice,
+    pub resampler: ResamplerChoice,
+    pub dither: DitherType,
+    pub source_is_dsd: bool,
+    pub dither_overridden: bool,
+    pub resampler_overridden: bool,
+}
+
+impl ConvertProbeFormatSnapshot {
+    pub fn capture(format: &FormatState) -> Self {
+        Self {
+            format: *format.format.selected_value(),
+            sample_rate: *format.sample_rate.selected_value(),
+            bit_depth: *format.bit_depth.selected_value(),
+            resampler: *format.resampler.selected_value(),
+            dither: *format.dither.selected_value(),
+            source_is_dsd: format.source_is_dsd,
+            dither_overridden: format.dither_overridden,
+            resampler_overridden: format.resampler_overridden,
+        }
+    }
+}
+
+/// User-edit snapshot captured at async source-probe dispatch time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvertProbeBaseline {
+    pub metadata: ConvertProbeMetadataSnapshot,
+    pub format: ConvertProbeFormatSnapshot,
+}
+
+impl ConvertProbeBaseline {
+    pub fn capture(convert: &ConvertState) -> Self {
+        Self {
+            metadata: ConvertProbeMetadataSnapshot::capture(&convert.metadata),
+            format: ConvertProbeFormatSnapshot::capture(&convert.format),
+        }
+    }
+}
+
+pub(crate) fn apply_source_metadata_to_convert(
+    convert: &mut ConvertState,
+    metadata: &SourceMetadata,
+) {
+    convert.metadata.title = metadata.title.clone();
+    convert.metadata.artist = metadata.artist.clone();
+    convert.metadata.album = metadata.album.clone();
+    convert.metadata.genre = metadata.genre.clone();
+    convert.metadata.year = metadata.year.clone();
+}
+
+pub(crate) fn clear_source_metadata_in_convert(convert: &mut ConvertState) {
+    apply_source_metadata_to_convert(convert, &SourceMetadata::default());
+}
+
+fn probe_convert_source_for_message(
+    path: &Path,
+) -> (Option<SourceInfo>, SourceMetadata, Option<String>) {
+    if is_cue_sheet_path_for_preview(path) {
+        return match probe_cue_proxy_source(path) {
+            Ok(result) => (result.info, result.metadata, result.probe_notice),
+            Err(err) => (
+                None,
+                SourceMetadata::default(),
+                Some(format!(
+                    "CUE proxy probe failed: {}; set format manually",
+                    err
+                )),
+            ),
+        };
+    }
+
+    match crate::tui::probe::probe_audio(path) {
+        Ok(info) => {
+            let metadata = crate::tui::probe::read_metadata(path).unwrap_or_default();
+            (Some(info), metadata, None)
+        }
+        Err(err) => (
+            None,
+            SourceMetadata::default(),
+            Some(format!("Probe failed: {}; set format manually", err)),
+        ),
+    }
+}
+
+pub(crate) fn spawn_convert_source_probe(
+    generation: u64,
+    path: PathBuf,
+    baseline: ConvertProbeBaseline,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
+    if is_nonprobeable_source_for_probe(&path) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let result_path = path.clone();
+        let source_mode = tokio::task::spawn_blocking(move || {
+            let (info, metadata, probe_notice) = probe_convert_source_for_message(&path);
+            SourceMode::from_single_with_probe_notice(path, info, metadata, probe_notice)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            SourceMode::Single {
+                path: result_path.clone(),
+                info: None,
+                metadata: SourceMetadata::default(),
+                probe_notice: Some(format!(
+                    "Probe task failed: {}; set format manually",
+                    err
+                )),
+            }
+        });
+
+        let _ = tx
+            .send(crate::tui::message::AppMessage::ProbeResult {
+                generation,
+                path: result_path,
+                source_mode,
+                baseline,
+            })
+            .await;
+    });
+}
+
+/// Spawn a Convert-owned cursor probe for a batch preview path. Generic browse
+/// probes intentionally do not mutate Convert state; this message carries the
+/// source generation and user-edit baseline needed to merge late results safely.
+pub(crate) fn spawn_convert_batch_cursor_probe(
+    generation: u64,
+    path: PathBuf,
+    baseline: ConvertProbeBaseline,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
+    if is_nonprobeable_source_for_probe(&path) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let result_path = path.clone();
+        let (info, metadata, probe_notice) = tokio::task::spawn_blocking(move || {
+            probe_convert_source_for_message(&path)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            (
+                None,
+                SourceMetadata::default(),
+                Some(format!("Probe task failed: {}; set format manually", err)),
+            )
+        });
+
+        let _ = tx
+            .send(crate::tui::message::AppMessage::ConvertAudioProbeComplete {
+                generation,
+                path: result_path,
+                info,
+                metadata,
+                probe_notice,
+                baseline,
+            })
+            .await;
+    });
+}
+
 fn cue_sheet_metadata(
     sheet: &crate::tui::cue_parser::CueSheet,
     mut metadata: SourceMetadata,
@@ -761,7 +999,7 @@ pub enum SourceMode {
     /// A multi-file batch loaded for review. The cursor indexes into
     /// `paths` for the "currently previewed" file, whose probe result
     /// lives in `cursor_info` / `cursor_metadata` (lazily filled in by
-    /// `AudioProbeComplete` when the cursor moves).
+    /// `ConvertAudioProbeComplete` when the cursor moves).
     Batch {
         paths: Vec<PathBuf>,
         cursor: usize,
@@ -792,8 +1030,10 @@ impl SourceMode {
     /// from `fs::metadata` and file extensions, no ffmpeg probes.
     ///
     /// - `paths.len() == 0` → `Empty`
-    /// - `paths.len() == 1` → `Single` with info/metadata empty (caller
-    ///   populates via probe + read_metadata)
+    /// - `paths.len() == 1` → `Single` with info/metadata empty and an
+    ///   explicit pending-probe notice when the source is probeable. This
+    ///   keeps the state model from conflating an in-flight probe with a
+    ///   deliberately unprobed/nonprobeable source.
     /// - `paths.len() > 1` → `Batch` with precomputed summary
     pub fn from_paths(paths: Vec<PathBuf>) -> Self {
         match paths.len() {
@@ -803,7 +1043,8 @@ impl SourceMode {
                     .into_iter()
                     .next()
                     .expect("len == 1 means one element");
-                Self::from_single(path, None, SourceMetadata::default())
+                let probe_notice = source_probe_initial_notice(&path);
+                Self::from_single_pending_probe(path, probe_notice)
             }
             _ => {
                 let mut paths = paths;
@@ -922,6 +1163,13 @@ impl SourceMode {
         }
     }
 
+    /// True when the source is explicitly waiting on the background probe
+    /// worker. `info == None` by itself is not a pending-probe signal: it may
+    /// also mean the source is nonprobeable or probing has failed.
+    pub fn probe_in_progress(&self) -> bool {
+        self.persistent_probe_notice() == Some(PROBE_IN_PROGRESS_NOTICE)
+    }
+
     /// Number of files (0/1/N for Empty/Single/Batch; 1 for MultiTrack).
     pub fn len(&self) -> usize {
         match self {
@@ -931,8 +1179,23 @@ impl SourceMode {
         }
     }
 
+    /// Cheap placeholder for a single path whose expensive source discovery is
+    /// still running on a blocking worker. This constructor must remain free of
+    /// FFmpeg, Lofty, CUE, SACD, DVD, or Blu-ray work so event-loop callers can
+    /// publish a responsive Convert source immediately.
+    pub fn from_single_pending_probe(path: PathBuf, probe_notice: Option<String>) -> Self {
+        Self::Single {
+            path,
+            info: None,
+            metadata: SourceMetadata::default(),
+            probe_notice,
+        }
+    }
+
     /// Build a SourceMode for a single path. Detects SACD ISOs and CUE
-    /// pairs and returns MultiTrack when a track listing is available.
+    /// pairs and returns MultiTrack when a track listing is available. This is
+    /// intentionally heavyweight; event-loop code should install
+    /// `from_single_pending_probe` and run this on a blocking worker.
     pub fn from_single(path: PathBuf, info: Option<SourceInfo>, metadata: SourceMetadata) -> Self {
         Self::from_single_with_probe_notice(path, info, metadata, None)
     }
@@ -1165,7 +1428,7 @@ impl SourceMode {
             path,
             info,
             metadata,
-            probe_notice: if source_is_cue_path { probe_notice } else { None },
+            probe_notice,
         }
     }
 }
@@ -2618,19 +2881,54 @@ impl ConvertState {
         self.dest_path_last_click = None;
     }
 
+    fn current_source_is_dsd(&self) -> bool {
+        self.source
+            .mode
+            .current_info()
+            .map(source_info_is_dsd)
+            .or_else(|| self.source.mode.current_path().map(|path| source_path_is_dsd(path)))
+            .unwrap_or(false)
+    }
+
+    /// Recompute source-dependent format constraints without selecting source
+    /// defaults. This is the safe path for late async probe completions when
+    /// the user has already changed output controls: facts such as "source is
+    /// DSD" still affect enabled/disabled state, but sample-rate, bit-depth,
+    /// dither, and resampler selections are not cascaded from the source.
+    pub fn refresh_source_constraints_preserving_format_selection(&mut self) {
+        let source_is_dsd = self.current_source_is_dsd();
+        self.format.set_source_is_dsd(source_is_dsd);
+        self.format.apply_format_constraints();
+    }
+
+    /// Recompute constraints from a newly probed source without selecting
+    /// source-derived defaults. Batch first-file probes use this when the
+    /// preview cursor has moved away from the file that defines batch output
+    /// defaults, so DSD/PCM source facts still come from the completed probe.
+    pub fn refresh_source_info_constraints_preserving_format_selection(
+        &mut self,
+        info: &SourceInfo,
+    ) {
+        self.format.set_source_is_dsd(source_info_is_dsd(info));
+        self.format.apply_format_constraints();
+    }
+
     /// Replace the convert source mode and reset metadata list state in one
     /// place so source changes cannot leave stale scroll or double-click state.
     pub fn set_source_mode(&mut self, mode: SourceMode) {
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
-        let source_is_dsd = self
-            .source
-            .mode
-            .current_info()
-            .map(source_info_is_dsd)
-            .or_else(|| self.source.mode.current_path().map(|path| source_path_is_dsd(path)))
-            .unwrap_or(false);
-        self.format.set_source_is_dsd(source_is_dsd);
+        self.refresh_source_constraints_preserving_format_selection();
+    }
+
+    /// Replace the source mode after an async probe while preserving every
+    /// output-format selection. Used when the user changed format controls
+    /// during the probe: source facts should update, but constraint/default
+    /// cascades must not rewrite the user's choices.
+    pub fn set_source_mode_preserving_format_selection(&mut self, mode: SourceMode) {
+        self.reset_metadata_file_list_state();
+        self.source.mode = mode;
+        self.refresh_source_constraints_preserving_format_selection();
     }
 
     /// Source bit depth for format-pane side effects such as auto-dither.
@@ -2642,16 +2940,10 @@ impl ConvertState {
         self.source.mode.current_info().map(|info| info.sample_rate)
     }
 
-    /// Apply source-aware format pane defaults after a probe completes.
-    /// For PCM sources: matches sample rate and bit depth to source.
-    /// For DSD sources with PCM output: sets recommended target rate and 24-bit.
-    /// For sources without reliable probe info, clears source-derived controls
-    /// so stale defaults from a previous source cannot survive the source swap.
-    pub fn apply_source_defaults(&mut self) {
-        let Some(info) = self.source.mode.current_info() else {
-            self.format.clear_source_derived_defaults();
-            return;
-        };
+    /// Apply source-aware format pane defaults from an already-known probe
+    /// result. Batch-level first-file probes use this directly so moving the
+    /// batch preview cursor cannot make a valid probe completion look absent.
+    pub fn apply_source_info_defaults(&mut self, info: &SourceInfo) {
         let source_rate = info.sample_rate;
         let source_bits = info.bit_depth;
         let source_is_float = info.codec.contains("Float");
@@ -2669,6 +2961,20 @@ impl ConvertState {
         self.format.apply_auto_dither(source_bits);
         self.format.resampler_overridden = false;
         self.format.apply_auto_resampler(Some(source_rate));
+        self.format.apply_format_constraints();
+    }
+
+    /// Apply source-aware format pane defaults after a probe completes.
+    /// For PCM sources: matches sample rate and bit depth to source.
+    /// For DSD sources with PCM output: sets recommended target rate and 24-bit.
+    /// For sources without reliable probe info, clears source-derived controls
+    /// so stale defaults from a previous source cannot survive the source swap.
+    pub fn apply_source_defaults(&mut self) {
+        let Some(info) = self.source.mode.current_info().cloned() else {
+            self.format.clear_source_derived_defaults();
+            return;
+        };
+        self.apply_source_info_defaults(&info);
     }
 }
 
@@ -6352,6 +6658,12 @@ pub struct AppState {
 
     // Convert screen
     pub convert: ConvertState,
+    /// Monotonic Convert-source probe generation. Increment before installing
+    /// any new source so late background completions cannot mutate it.
+    pub probe_generation: u64,
+    /// Main TUI message sender, installed by the event loop. Helper paths that
+    /// are not passed `tx` directly use this to launch async source probes.
+    pub tui_tx: Option<tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
     pub preset: PresetState,
 
     // Browse screen state
@@ -6743,6 +7055,8 @@ impl AppState {
                 dest_path_last_click: None,
                 metadata_field_last_click: None,
             },
+            probe_generation: 0,
+            tui_tx: None,
             preset: PresetState::default(),
             browse: crate::tui::browse::BrowseState::new(),
             queue_focus: QueueFocus::FileList,
@@ -8660,6 +8974,86 @@ mod cue_proxy_probe_tests {
 
     fn write_test_file(path: &Path, contents: &str) {
         std::fs::write(path, contents).expect("test file should be writable");
+    }
+
+
+    #[test]
+    fn single_pending_probe_has_explicit_state() {
+        let path = PathBuf::from("/tmp/pending.flac");
+        let mode = SourceMode::from_single_pending_probe(
+            path.clone(),
+            source_probe_initial_notice(&path),
+        );
+
+        match &mode {
+            SourceMode::Single {
+                path: stored_path,
+                info,
+                probe_notice,
+                ..
+            } => {
+                assert_eq!(stored_path, &path);
+                assert!(info.is_none());
+                assert_eq!(probe_notice.as_deref(), Some(PROBE_IN_PROGRESS_NOTICE));
+            }
+            other => panic!("expected pending single source, got {:?}", other),
+        }
+        assert!(mode.probe_in_progress());
+        assert_eq!(mode.persistent_probe_notice(), Some(PROBE_IN_PROGRESS_NOTICE));
+    }
+
+    #[test]
+    fn from_paths_single_probeable_source_has_pending_notice() {
+        let path = PathBuf::from("/tmp/from_paths.flac");
+        let mode = SourceMode::from_paths(vec![path.clone()]);
+
+        match &mode {
+            SourceMode::Single {
+                path: stored_path,
+                info,
+                probe_notice,
+                ..
+            } => {
+                assert_eq!(stored_path, &path);
+                assert!(info.is_none());
+                assert_eq!(probe_notice.as_deref(), Some(PROBE_IN_PROGRESS_NOTICE));
+            }
+            other => panic!("expected single pending-probe source, got {:?}", other),
+        }
+        assert!(mode.probe_in_progress());
+    }
+
+    #[test]
+    fn ordinary_single_preserves_probe_notice_after_worker_completion_failure() {
+        let dir = temp_test_dir("ordinary_notice");
+        let path = dir.join("broken.flac");
+        write_test_file(&path, "not real flac");
+        let notice = "Probe failed: not an audio stream; set format manually".to_string();
+
+        let mode = SourceMode::from_single_with_probe_notice(
+            path.clone(),
+            None,
+            SourceMetadata::default(),
+            Some(notice.clone()),
+        );
+
+        match &mode {
+            SourceMode::Single {
+                path: stored_path,
+                info,
+                probe_notice,
+                ..
+            } => {
+                assert_eq!(stored_path, &path);
+                assert!(info.is_none());
+                assert_eq!(probe_notice.as_deref(), Some(notice.as_str()));
+            }
+            other => panic!("expected ordinary single source to preserve notice, got {:?}", other),
+        }
+        assert_eq!(mode.persistent_probe_notice(), Some(notice.as_str()));
+        assert!(!mode.probe_in_progress());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

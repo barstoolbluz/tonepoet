@@ -684,9 +684,21 @@ fn read_metadata_sacd(path: &Path) -> Result<SourceMetadata, String> {
     Ok(meta)
 }
 
-/// Public wrapper for PE metadata check (used by browse DB cache path).
-pub fn preemphasis_metadata_check_pub(path: &Path) -> Option<String> {
+/// Blocking PE metadata check (tags + CUE sidecars + catalog evidence).
+///
+/// This can perform file/tag I/O and must not run from TUI reducers or other
+/// event-loop code. Call it from a worker, `spawn_blocking`, or an already
+/// blocking metadata/probe path only.
+pub fn preemphasis_metadata_check_blocking(path: &Path) -> Option<String> {
     preemphasis_metadata_check(path)
+}
+
+/// Backward-compatible wrapper for existing worker-side callers. New code
+/// should use `preemphasis_metadata_check_blocking()` so the blocking boundary
+/// is visible at the call site.
+#[allow(dead_code)]
+pub fn preemphasis_metadata_check_pub(path: &Path) -> Option<String> {
+    preemphasis_metadata_check_blocking(path)
 }
 
 /// Lightweight Phase 2 pre-emphasis check using PRE flags and catalog evidence

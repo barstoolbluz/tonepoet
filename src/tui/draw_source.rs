@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{SourceMode, SourceState};
+use super::app::{SourceMode, SourceState, PROBE_IN_PROGRESS_NOTICE};
 use super::probe::SourceInfo;
 use crate::convert::formats::AudioFormat;
 
@@ -291,11 +291,16 @@ fn render_single<'a>(
         // source carries a durable notice (notably a malformed/empty direct
         // `.cue`), show that warning instead of an indefinite probing state.
         let status_line = if let Some(notice) = probe_notice {
+            let label = if notice == PROBE_IN_PROGRESS_NOTICE {
+                "   status    "
+            } else {
+                "   warning   "
+            };
             bordered_line(
                 border_color,
                 w,
                 vec![
-                    Span::styled("   warning   ", theme.muted()),
+                    Span::styled(label, theme.muted()),
                     Span::styled(
                         truncate_to(notice, w.saturating_sub(15)),
                         Style::default().fg(theme.amber),
@@ -305,7 +310,10 @@ fn render_single<'a>(
             bordered_line(
                 border_color,
                 w,
-                vec![Span::styled("   probing…", theme.muted())], theme)
+                vec![
+                    Span::styled("   status    ", theme.muted()),
+                    Span::styled("source info unavailable", theme.muted()),
+                ], theme)
         };
         return vec![
             bordered_line(
@@ -451,11 +459,16 @@ fn render_batch<'a>(
     // intentionally separate from the status bar so warnings remain visible
     // until the source changes.
     let header_rows: u16 = if let Some(notice) = probe_notice {
+        let label = if notice == PROBE_IN_PROGRESS_NOTICE {
+            "   status    "
+        } else {
+            "   warning   "
+        };
         lines.push(bordered_line(
             border_color,
             w,
             vec![
-                Span::styled("   warning   ", theme.muted()),
+                Span::styled(label, theme.muted()),
                 Span::styled(
                     truncate_to(notice, w.saturating_sub(15)),
                     Style::default().fg(theme.amber),
@@ -1027,6 +1040,30 @@ mod tests {
         assert!(rendered.contains("warning"));
         assert!(rendered.contains("CUE sheet has no audio tracks"));
         assert!(!rendered.contains("probing"));
+    }
+
+
+    #[test]
+    fn render_single_without_info_and_without_notice_is_not_probing() {
+        let theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
+        let lines = render_single(
+            theme.text_bright,
+            96,
+            Path::new("/tmp/unprobed.flac"),
+            None,
+            None,
+            theme,
+        );
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("source info unavailable"));
+        assert!(!rendered.contains("probing"));
+        assert!(!rendered.contains("Probing"));
     }
 
     #[test]
