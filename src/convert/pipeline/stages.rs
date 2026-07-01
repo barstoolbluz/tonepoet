@@ -159,6 +159,33 @@ pub fn validate_request(req: &PipelineRequest) -> Result<(), RequestValidationEr
         }
     }
 
+    for override_set in &req.archive_metadata_overrides {
+        if override_set.source_ordinal == 0 {
+            return Err(RequestValidationError::InvalidStagePolicy(
+                "archive metadata override source_ordinal must be positive".to_string(),
+            ));
+        }
+        if override_set.relative_path.as_os_str().is_empty()
+            || override_set.relative_path.is_absolute()
+            || override_set.relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::Prefix(_) | Component::RootDir | Component::ParentDir
+                )
+            })
+        {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "archive metadata override path must be a safe relative path: {}",
+                override_set.relative_path.display()
+            )));
+        }
+        if !override_set.has_changes() {
+            return Err(RequestValidationError::InvalidStagePolicy(
+                "archive metadata override must contain at least one changed field".to_string(),
+            ));
+        }
+    }
+
     if let Some(album_batch) = &req.album_batch {
         validate_album_batch_context(album_batch)
             .map_err(RequestValidationError::InvalidStagePolicy)?;
@@ -3180,7 +3207,11 @@ fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> V
     if let Some(v) = meta.album_artist.as_ref().or(album.album_artist.as_ref()) {
         push_tag_value(&mut tags, "ALBUMARTIST", v);
     }
-    let album_tag = album.extra.get("album_tag_override").or(album.album.as_ref());
+    let album_tag = album
+        .extra
+        .get("album_tag_override")
+        .or_else(|| meta.extra.get("album"))
+        .or(album.album.as_ref());
     if let Some(v) = album_tag {
         push_tag_value(&mut tags, "ALBUM", v);
     }
@@ -3878,6 +3909,21 @@ mod metadata_writer_command_tests {
         assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_ALBUM_TAG_OVERRIDE"));
         assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_PATH"));
         assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_MIME"));
+    }
+
+    #[test]
+    fn authoritative_tags_prefer_track_album_extra_when_no_album_override_exists() {
+        let (mut track, mut album) = sample_metadata();
+        album.extra.remove("album_tag_override");
+        album.album = Some("Common Album".to_string());
+        track
+            .extra
+            .insert("album".to_string(), "Per-Track Album".to_string());
+
+        let tags = authoritative_metadata_tags(&track, &album);
+
+        assert!(tags.contains(&("ALBUM".to_string(), "Per-Track Album".to_string())));
+        assert!(!tags.contains(&("ALBUM".to_string(), "Common Album".to_string())));
     }
 
     #[test]
@@ -4788,6 +4834,8 @@ FILE "album.flac" WAVE
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -13828,6 +13876,8 @@ mod companion_copy_hardening_tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -16595,6 +16645,8 @@ mod pipeline_test_helpers {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::AllowPartialAlbum,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -17701,6 +17753,8 @@ mod naming_template_tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -18451,6 +18505,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             },
             stages,
             failure_policy: policy,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,

@@ -1210,10 +1210,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(format!("Path not found: {}", expanded));
                 return;
             }
-            // Install the source immediately and complete the heavyweight
-            // ffmpeg/lofty/CUE proxy probe on a blocking worker. This keeps the
-            // crossterm event loop responsive while the source pane shows the
-            // in-flight probe state.
+            // Install the source immediately and complete heavyweight source
+            // discovery on a background worker. Archives use the Phase 3
+            // extract+discover+probe preview path; ordinary audio/disc sources
+            // use the existing async probe path.
+            if is_nonprobeable_source_for_probe(&p) {
+                install_archive_preview_convert_source(app, p, tx.clone());
+                return;
+            }
+
             app.probe_generation = app.probe_generation.saturating_add(1);
             let generation = app.probe_generation;
             let probe_notice = source_probe_initial_notice(&p);
@@ -3980,15 +3985,21 @@ fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Opti
                 app.preset.clear_active_preset();
             }
 
+            let archive_preview_single = path_count == 1 && is_nonprobeable_source_for_probe(&first);
             app.probe_generation = app.probe_generation.saturating_add(1);
             let generation = app.probe_generation;
-            let probe_notice = source_probe_initial_notice(&first);
+            let probe_notice = if archive_preview_single {
+                Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE.to_string())
+            } else {
+                source_probe_initial_notice(&first)
+            };
             clear_source_metadata_in_convert(&mut app.convert);
 
             // Publish a cheap source placeholder immediately. Single-source
-            // SACD/DVD/Blu-ray/CUE/Lofty discovery is deliberately deferred to
-            // the blocking probe worker; batch setup only computes its cheap
-            // filesystem summary here.
+            // archives use the Phase 3 extract+discover+probe preview worker;
+            // ordinary SACD/DVD/Blu-ray/CUE/Lofty discovery remains deferred to
+            // the blocking probe worker, and batch setup only computes its
+            // cheap filesystem summary here.
             let mut mode = if path_count == 1 {
                 SourceMode::from_single_pending_probe(first.clone(), probe_notice.clone())
             } else {
@@ -4022,7 +4033,24 @@ fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Opti
             let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
             app.recent.record_use_with_db(&first, &app.db);
 
-            if probe_notice.is_some() {
+            if archive_preview_single {
+                let pending = create_pending_archive_preview(generation, first.clone());
+                let staging_dir = pending.staging_dir.clone();
+                let cancel = pending.cancel.clone();
+                app.convert.install_pending_archive_preview(pending);
+                let password = archive_preview_password_for_path(app, &first);
+                let tool_paths = app.manager.config.tool_paths.clone();
+                spawn_archive_preview(
+                    generation,
+                    first.clone(),
+                    probe_baseline,
+                    staging_dir,
+                    cancel,
+                    password,
+                    tool_paths,
+                    tx.clone(),
+                );
+            } else if probe_notice.is_some() {
                 spawn_convert_source_probe(generation, first.clone(), probe_baseline, tx.clone());
             }
 
@@ -4036,7 +4064,12 @@ fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Opti
             app.previous_screen = Some(AppScreen::Browse);
             app.current_screen = AppScreen::Convert;
 
-            if probe_notice.is_some() {
+            if archive_preview_single {
+                app.set_status(format!(
+                    "Extracting archive: {} — review settings, then :commit or :Commit",
+                    first.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            } else if probe_notice.is_some() {
                 app.set_status(format!(
                     "Probing: {} — review settings, then :commit or :Commit",
                     first.file_name().unwrap_or_default().to_string_lossy()
@@ -4133,6 +4166,74 @@ fn companion_copy_policy_from_conversion_options(
         extensions: options.effective_companion_extensions(),
         folders: options.effective_companion_folders(),
     }
+}
+
+
+fn archive_preview_track_relative_path(
+    preview: &ArchivePreview,
+    track: &PreviewTrack,
+) -> PathBuf {
+    if let Ok(relative) = track.path.strip_prefix(&preview.staging_dir) {
+        return relative.to_path_buf();
+    }
+    if let Ok(canonical_staging) = std::fs::canonicalize(&preview.staging_dir) {
+        if let Ok(relative) = track.path.strip_prefix(&canonical_staging) {
+            return relative.to_path_buf();
+        }
+    }
+    track
+        .path
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("track-{}", track.original_name)))
+}
+
+fn archive_metadata_overrides_from_source_mode(
+    mode: &SourceMode,
+) -> Vec<crate::convert::pipeline::ArchiveTrackMetadataOverride> {
+    let SourceMode::MultiTrack {
+        archive_preview: Some(preview),
+        ..
+    } = mode
+    else {
+        return Vec::new();
+    };
+
+    preview
+        .tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, track)| {
+            let relative_path = archive_preview_track_relative_path(preview, track);
+            let metadata = &track.metadata;
+            let original = &track.original_metadata;
+            let override_set = crate::convert::pipeline::ArchiveTrackMetadataOverride {
+                source_ordinal: (idx + 1) as u32,
+                relative_path,
+                title: crate::convert::pipeline::MetadataTextOverride::from_optional_change(
+                    &original.title,
+                    &metadata.title,
+                ),
+                artist: crate::convert::pipeline::MetadataTextOverride::from_optional_change(
+                    &original.artist,
+                    &metadata.artist,
+                ),
+                album: crate::convert::pipeline::MetadataTextOverride::from_optional_change(
+                    &original.album,
+                    &metadata.album,
+                ),
+                genre: crate::convert::pipeline::MetadataTextOverride::from_optional_change(
+                    &original.genre,
+                    &metadata.genre,
+                ),
+                date: crate::convert::pipeline::MetadataTextOverride::from_optional_change(
+                    &original.year,
+                    &metadata.year,
+                ),
+            };
+            override_set.has_changes().then_some(override_set)
+        })
+        .collect()
 }
 
 /// Apply the selected disc presentation stored in the Convert source mode to
@@ -4236,6 +4337,9 @@ fn execute_commit_with_source_options_transform(
 
     // Determine what to commit from the current source mode.
     let batch = app.convert.source.mode.all_paths();
+    let archive_preview_staging = app.convert.source.mode.archive_preview_staging_dir().cloned();
+    let archive_metadata_overrides =
+        archive_metadata_overrides_from_source_mode(&app.convert.source.mode);
     if batch.is_empty() {
         app.set_status("nothing to commit — no source file loaded");
         return;
@@ -4307,6 +4411,8 @@ fn execute_commit_with_source_options_transform(
     let has_source_options_transform = source_options_transform.is_some();
     let mut has_deselected_tracks = false;
     let mut has_disc_stream_selection = false;
+    let has_archive_preview_staging = archive_preview_staging.is_some();
+    let has_archive_metadata_overrides = !archive_metadata_overrides.is_empty();
     let mut selected_track_numbers = std::collections::BTreeSet::new();
 
     if let SourceMode::MultiTrack {
@@ -4326,7 +4432,12 @@ fn execute_commit_with_source_options_transform(
             .collect();
     }
 
-    if has_deselected_tracks || has_disc_stream_selection || has_source_options_transform {
+    if has_deselected_tracks
+        || has_disc_stream_selection
+        || has_source_options_transform
+        || has_archive_preview_staging
+        || has_archive_metadata_overrides
+    {
         use crate::convert::pipeline::*;
 
         let mut source = SourceOptions {
@@ -4376,6 +4487,11 @@ fn execute_commit_with_source_options_transform(
                     continue;
                 }
 
+                if item.input_path == batch[0] {
+                    item.pre_extracted_staging = archive_preview_staging.clone();
+                    item.archive_metadata_overrides = archive_metadata_overrides.clone();
+                }
+
                 let mut item_source = source.clone();
                 if let Some(ref pw) = item.archive_password {
                     item_source.archive_password = Some(SecretString::new(pw.clone()));
@@ -4392,6 +4508,9 @@ fn execute_commit_with_source_options_transform(
                     existing_req.item_id = item.id.clone();
                     existing_req.job_id = format!("job-{}", item.id);
                     existing_req.source = item_source;
+                    existing_req.pre_extracted_staging = item.pre_extracted_staging.clone();
+                    existing_req.archive_metadata_overrides =
+                        item.archive_metadata_overrides.clone();
                     existing_req.companion = companion_policy.clone();
                 } else {
                     let output_root = options.output_dir.clone()
@@ -4445,6 +4564,8 @@ fn execute_commit_with_source_options_transform(
                             generate_cue: false,
                         },
                         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+                        pre_extracted_staging: item.pre_extracted_staging.clone(),
+                        archive_metadata_overrides: item.archive_metadata_overrides.clone(),
                         container_extension: options.container_extension.clone(),
                         container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
                         album_batch: None,
@@ -4480,7 +4601,9 @@ fn execute_commit_with_source_options_transform(
         parts.join(", ")
     };
 
-    // Clear source pane so a subsequent `:queue` arrives fresh.
+    // Clear source pane so a subsequent `:queue` arrives fresh. Transfer any
+    // archive preview staging to the queued item before dropping the source.
+    let _ = app.convert.source.mode.disarm_archive_preview_cleanup();
     app.convert.set_source_mode(SourceMode::Empty);
     app.convert.source.cue_artifact_audio.clear();
     app.convert.metadata = MetadataState::default();
@@ -9376,6 +9499,7 @@ mod completion_tests {
             scroll: 0,
             cursor: 0,
             selected: vec![true],
+            archive_preview: None,
             disc_contents: None,
             selected_presentation_id: Some(crate::disc::PresentationId::DvdAudioGroup(group)),
         }

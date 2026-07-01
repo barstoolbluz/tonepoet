@@ -1109,6 +1109,8 @@ fn build_pipeline_request_template(
             extensions: options.effective_companion_extensions(),
             folders: options.effective_companion_folders(),
         },
+        pre_extracted_staging: None,
+        archive_metadata_overrides: Vec::new(),
         expected_album_track_count: None,
         suppress_incremental_conversion_log_append: false,
     })

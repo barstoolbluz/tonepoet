@@ -52,11 +52,19 @@ impl super::stages::Materializer for ArchiveMaterializer {
         tool_paths: &HashMap<String, PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<PreparedSource, MaterializeError> {
-        // Ensure the staging directory exists.
+        // Ensure the materializer-owned staging directory exists.
         std::fs::create_dir_all(&staging.root)?;
 
-        // 1. Extract the archive.
-        extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
+        // 1. Reuse a queue-time archive preview extraction when possible.
+        // If the preview directory was removed or is empty, fall back to the
+        // ordinary extraction path so persisted queue entries remain recoverable.
+        let extraction_root = reusable_pre_extracted_staging(req, &staging.root)
+            .transpose()?
+            .unwrap_or_else(|| staging.root.clone());
+
+        if extraction_root == staging.root {
+            extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
+        }
 
         // Check cancellation between major steps.
         if cancel.is_cancelled() {
@@ -64,7 +72,7 @@ impl super::stages::Materializer for ArchiveMaterializer {
         }
 
         // 2. Discover audio files in the extraction tree.
-        let audio_files = discover_audio_files(&staging.root)?;
+        let audio_files = discover_audio_files(&extraction_root)?;
         if audio_files.is_empty() {
             return Err(MaterializeError::Extraction(
                 "no audio files found in archive".into(),
@@ -79,9 +87,14 @@ impl super::stages::Materializer for ArchiveMaterializer {
             }
 
             let probe = probe_audio_file(path, runner, cancel).await?;
-            let metadata = read_track_metadata(path);
-
             let ordinal = (idx + 1) as u32;
+            let mut metadata = read_track_metadata(path);
+            if let Some(override_set) =
+                archive_metadata_override_for_track(req, ordinal, path, &extraction_root)
+            {
+                apply_archive_metadata_override(&mut metadata, override_set);
+            }
+
             tracks.push(PreparedTrack {
                 id: TrackId {
                     source_ordinal: ordinal,
@@ -127,12 +140,138 @@ impl super::stages::Materializer for ArchiveMaterializer {
 }
 
 
+fn reusable_pre_extracted_staging(
+    req: &PipelineRequest,
+    materializer_root: &Path,
+) -> Option<Result<PathBuf, MaterializeError>> {
+    let staging = req.pre_extracted_staging.as_ref()?;
+    let metadata = match fs::metadata(staging) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => return Some(Err(MaterializeError::Io(err))),
+    };
+    if !metadata.is_dir() {
+        return None;
+    }
+
+    match discover_audio_files(staging) {
+        Ok(files) if files.is_empty() => None,
+        Ok(_) => Some(adopt_pre_extracted_staging(staging, materializer_root)),
+        Err(err) => Some(Err(err)),
+    }
+}
+
+fn adopt_pre_extracted_staging(
+    staging: &Path,
+    materializer_root: &Path,
+) -> Result<PathBuf, MaterializeError> {
+    let source = fs::canonicalize(staging).map_err(MaterializeError::Io)?;
+    if let Ok(root) = fs::canonicalize(materializer_root) {
+        if root == source {
+            return Ok(root);
+        }
+    }
+
+    if let Some(parent) = materializer_root.parent() {
+        fs::create_dir_all(parent).map_err(MaterializeError::Io)?;
+    }
+    match fs::remove_dir_all(materializer_root) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(MaterializeError::Io(err)),
+    }
+
+    match fs::rename(&source, materializer_root) {
+        Ok(()) => fs::canonicalize(materializer_root).map_err(MaterializeError::Io),
+        Err(_) => {
+            copy_dir_recursive(&source, materializer_root)?;
+            match fs::remove_dir_all(&source) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+            fs::canonicalize(materializer_root).map_err(MaterializeError::Io)
+        }
+    }
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), MaterializeError> {
+    fs::create_dir_all(destination).map_err(MaterializeError::Io)?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(source).map_err(MaterializeError::Io)? {
+        entries.push(entry.map_err(MaterializeError::Io)?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&from).map_err(MaterializeError::Io)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        } else if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent).map_err(MaterializeError::Io)?;
+            }
+            fs::copy(&from, &to).map_err(MaterializeError::Io)?;
+        }
+    }
+    Ok(())
+}
+
 fn archive_tool_versions(runner: &dyn ToolRunner) -> BTreeMap<String, String> {
     let mut tool_versions = BTreeMap::new();
     if let Some(version) = runner.tool_version(ToolBinary::SevenZip) {
         tool_versions.insert("7z".to_string(), version);
     }
     tool_versions
+}
+
+fn archive_metadata_override_for_track<'a>(
+    req: &'a PipelineRequest,
+    source_ordinal: u32,
+    path: &Path,
+    extraction_root: &Path,
+) -> Option<&'a ArchiveTrackMetadataOverride> {
+    if req.archive_metadata_overrides.is_empty() {
+        return None;
+    }
+
+    if let Some(relative_path) = archive_relative_path(path, extraction_root) {
+        return req.archive_metadata_overrides.iter().find(|override_set| {
+            override_set.source_ordinal == source_ordinal
+                && override_set.relative_path.as_path() == relative_path.as_path()
+        });
+    }
+
+    req.archive_metadata_overrides
+        .iter()
+        .find(|override_set| override_set.source_ordinal == source_ordinal)
+}
+
+fn archive_relative_path(path: &Path, extraction_root: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(extraction_root) {
+        return Some(relative.to_path_buf());
+    }
+
+    let canonical_root = fs::canonicalize(extraction_root).ok()?;
+    path.strip_prefix(canonical_root).ok().map(Path::to_path_buf)
+}
+
+fn apply_archive_metadata_override(
+    metadata: &mut TrackMetadata,
+    override_set: &ArchiveTrackMetadataOverride,
+) {
+    override_set.title.apply_to(&mut metadata.title);
+    override_set.artist.apply_to(&mut metadata.artist);
+    override_set.genre.apply_to(&mut metadata.genre);
+    override_set.date.apply_to(&mut metadata.date);
+    override_set
+        .album
+        .apply_to_extra_key(&mut metadata.extra, "album");
 }
 
 // =========================================================================
@@ -149,10 +288,35 @@ async fn extract_archive(
     _tool_paths: &HashMap<String, PathBuf>,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
-    run_archive_extract_command(
-        req,
+    extract_archive_to_staging(
         &req.container,
         &staging.root,
+        req.item_id.as_str(),
+        req.source.archive_password.as_ref().map(|pw| pw.expose()),
+        runner,
+        reporter,
+        cancel,
+    )
+    .await
+}
+
+/// Shared archive extraction helper used by both queue-time preview and
+/// conversion-time materialization. It performs the same compressed-TAR second
+/// pass as materialization so previews and conversions see the same file tree.
+pub(crate) async fn extract_archive_to_staging(
+    archive_path: &Path,
+    staging_root: &Path,
+    item_id: &str,
+    archive_password: Option<&str>,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    run_archive_extract_command(
+        item_id,
+        archive_path,
+        staging_root,
+        archive_password,
         runner,
         reporter,
         cancel,
@@ -165,17 +329,28 @@ async fn extract_archive(
         return Err(MaterializeError::Cancelled);
     }
 
-    extract_compressed_tar_payloads(req, staging, runner, reporter, cancel).await
+    extract_compressed_tar_payloads(
+        archive_path,
+        staging_root,
+        item_id,
+        archive_password,
+        runner,
+        reporter,
+        cancel,
+    )
+    .await
 }
 
 async fn extract_compressed_tar_payloads(
-    req: &PipelineRequest,
-    staging: &StagingDir,
+    archive_path: &Path,
+    staging_root: &Path,
+    item_id: &str,
+    archive_password: Option<&str>,
     runner: &dyn ToolRunner,
     reporter: Option<&dyn PipelineReporter>,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
-    let tar_files = intermediate_tar_files_for_compressed_tar(&req.container, &staging.root)?;
+    let tar_files = intermediate_tar_files_for_compressed_tar(archive_path, staging_root)?;
     if tar_files.is_empty() {
         return Ok(());
     }
@@ -186,9 +361,10 @@ async fn extract_compressed_tar_payloads(
         }
 
         run_archive_extract_command(
-            req,
+            item_id,
             &tar_path,
-            &staging.root,
+            staging_root,
+            archive_password,
             runner,
             reporter,
             cancel,
@@ -209,9 +385,10 @@ async fn extract_compressed_tar_payloads(
 
 /// Build and run one 7z extraction command through `ToolRunner`.
 async fn run_archive_extract_command(
-    req: &PipelineRequest,
+    item_id: &str,
     source_path: &Path,
     output_root: &Path,
+    archive_password: Option<&str>,
     runner: &dyn ToolRunner,
     reporter: Option<&dyn PipelineReporter>,
     cancel: &CancellationToken,
@@ -227,8 +404,8 @@ async fn run_archive_extract_command(
 
     // Passwords are exposed only at the process-argument boundary and marked
     // for transcript redaction.
-    if let Some(ref pw) = req.source.archive_password {
-        let pw_arg = format!("-p{}", pw.expose());
+    if let Some(pw) = archive_password {
+        let pw_arg = format!("-p{}", pw);
         secret_args.push(args.len());
         args.push(pw_arg);
     }
@@ -248,7 +425,7 @@ async fn run_archive_extract_command(
     let result = match reporter {
         Some(rpt) => {
             let mut tracker = OperationProgressTracker::new(
-                req.item_id.clone(),
+                item_id.to_string(),
                 PipelineStage::Materialize,
                 Some(rpt),
             );
@@ -373,6 +550,10 @@ fn compressed_tar_intermediate_candidates(container: &Path, staging_root: &Path)
 /// symlinked directories or files. Symlinks that resolve outside the staging
 /// root are rejected so archive extraction cannot smuggle traversal through a
 /// later decode step.
+pub(crate) fn discover_archive_audio_files(dir: &Path) -> Result<Vec<PathBuf>, MaterializeError> {
+    discover_audio_files(dir)
+}
+
 fn discover_audio_files(dir: &Path) -> Result<Vec<PathBuf>, MaterializeError> {
     let staging_root = fs::canonicalize(dir).map_err(MaterializeError::Io)?;
     let mut files = Vec::new();
@@ -993,6 +1174,8 @@ mod tests {
                 generate_cue: false,
             },
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -1001,6 +1184,79 @@ mod tests {
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
+    }
+
+    fn archive_override(source_ordinal: u32, relative_path: &str) -> ArchiveTrackMetadataOverride {
+        ArchiveTrackMetadataOverride {
+            source_ordinal,
+            relative_path: PathBuf::from(relative_path),
+            title: MetadataTextOverride::Set("Edited Title".to_string()),
+            artist: MetadataTextOverride::Keep,
+            album: MetadataTextOverride::Keep,
+            genre: MetadataTextOverride::Keep,
+            date: MetadataTextOverride::Keep,
+        }
+    }
+
+    #[test]
+    fn archive_metadata_override_requires_matching_relative_path_when_available() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = archive_materializer_test_request(temp.path(), "source.zip");
+        req.archive_metadata_overrides = vec![archive_override(1, "Disc 1/02.flac")];
+
+        let extraction_root = temp.path().join("stage");
+        let track_path = extraction_root.join("Disc 1").join("01.flac");
+        let found =
+            archive_metadata_override_for_track(&req, 1, &track_path, &extraction_root);
+
+        assert!(
+            found.is_none(),
+            "a mismatched relative path must not fall back to source_ordinal alone"
+        );
+    }
+
+    #[test]
+    fn archive_metadata_override_falls_back_to_ordinal_when_relative_path_is_unavailable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = archive_materializer_test_request(temp.path(), "source.zip");
+        req.archive_metadata_overrides = vec![archive_override(1, "Disc 1/01.flac")];
+
+        let extraction_root = temp.path().join("stage");
+        let track_path = temp.path().join("external").join("01.flac");
+        let found =
+            archive_metadata_override_for_track(&req, 1, &track_path, &extraction_root);
+
+        assert!(
+            found.is_some(),
+            "source_ordinal fallback remains available when no relative path can be computed"
+        );
+    }
+
+    #[test]
+    fn archive_metadata_override_matches_after_extraction_root_canonicalization() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = archive_materializer_test_request(temp.path(), "source.zip");
+        req.archive_metadata_overrides = vec![archive_override(1, "Disc 1/01.flac")];
+
+        fs::create_dir_all(temp.path().join("scratch")).expect("scratch dir");
+        let extraction_root = temp.path().join("stage");
+        let track_path = extraction_root.join("Disc 1").join("01.flac");
+        fs::create_dir_all(track_path.parent().expect("track parent")).expect("track dir");
+        fs::write(&track_path, b"audio").expect("track fixture");
+
+        let noncanonical_root = temp.path().join("scratch").join("..").join("stage");
+        let canonical_track = fs::canonicalize(&track_path).expect("canonical track");
+        let found = archive_metadata_override_for_track(
+            &req,
+            1,
+            &canonical_track,
+            &noncanonical_root,
+        );
+
+        assert!(
+            found.is_some(),
+            "canonicalizing the extraction root should preserve exact path-guarded matches"
+        );
     }
 
     async fn materialize_archive_fixture(archive_name: &str) -> ArchiveMaterializationFixture {
@@ -1051,6 +1307,35 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn archive_metadata_override_applies_compact_edits_and_explicit_clears() {
+        let mut metadata = TrackMetadata {
+            title: Some("Original Title".to_string()),
+            artist: Some("Original Artist".to_string()),
+            genre: Some("Rock".to_string()),
+            date: Some("1984".to_string()),
+            extra: BTreeMap::from([("album".to_string(), "Original Album".to_string())]),
+            ..TrackMetadata::default()
+        };
+        let override_set = ArchiveTrackMetadataOverride {
+            source_ordinal: 1,
+            relative_path: PathBuf::from("Disc 1/01.flac"),
+            title: MetadataTextOverride::Set("Edited Title".to_string()),
+            artist: MetadataTextOverride::Clear,
+            album: MetadataTextOverride::Set("Edited Album".to_string()),
+            genre: MetadataTextOverride::Keep,
+            date: MetadataTextOverride::Set("2026".to_string()),
+        };
+
+        apply_archive_metadata_override(&mut metadata, &override_set);
+
+        assert_eq!(metadata.title.as_deref(), Some("Edited Title"));
+        assert_eq!(metadata.artist, None);
+        assert_eq!(metadata.extra.get("album").map(String::as_str), Some("Edited Album"));
+        assert_eq!(metadata.genre.as_deref(), Some("Rock"));
+        assert_eq!(metadata.date.as_deref(), Some("2026"));
+    }
 
     fn assert_single_real_archive_track(prepared: &PreparedSource, staging_root: &Path) {
         assert_eq!(prepared.kind, SourceKind::Archive);

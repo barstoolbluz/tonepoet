@@ -7600,6 +7600,8 @@ mod tests {
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
             companion: Default::default(),
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),

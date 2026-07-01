@@ -1,7 +1,7 @@
 //! Conversion queue management
 
 use super::formats::{AudioFormat, ConversionOptions, FileFormat};
-use super::pipeline::{CueSidecarPolicy, PipelineRequest};
+use super::pipeline::{ArchiveTrackMetadataOverride, CueSidecarPolicy, PipelineRequest};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -177,6 +177,15 @@ pub struct ConversionItem {
     /// again as a split-source sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cue_sidecar_override: Option<CueSidecarPolicy>,
+    /// Pre-extracted archive preview staging directory transferred from the
+    /// Convert source at commit time. The archive materializer reuses this when
+    /// it still exists and falls back to extraction when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_extracted_staging: Option<PathBuf>,
+    /// Compact archive-preview metadata edits transferred at commit time and
+    /// mirrored onto any attached pipeline request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_metadata_overrides: Vec<ArchiveTrackMetadataOverride>,
     /// New pipeline request (populated during migration; legacy fields
     /// remain until PR 10 finishes CLI/TUI surface).
     #[serde(default)]
@@ -211,6 +220,8 @@ impl Default for ConversionItem {
             archive_password: None,
             pipeline_settings: None,
             cue_sidecar_override: None,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             pipeline_request: None,
             active_tracks: BTreeMap::new(),
             closed_track_epochs: BTreeMap::new(),
@@ -244,6 +255,8 @@ impl ConversionItem {
             archive_password,
             pipeline_settings,
             cue_sidecar_override: None,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             pipeline_request: None,
             active_tracks: BTreeMap::new(),
             closed_track_epochs: BTreeMap::new(),
@@ -291,6 +304,8 @@ impl ConversionItem {
         item.id = request.item_id.clone();
         item.pipeline_settings = None;
         item.options.pipeline_settings = None;
+        item.pre_extracted_staging = request.pre_extracted_staging.clone();
+        item.archive_metadata_overrides = request.archive_metadata_overrides.clone();
         item.pipeline_request = Some(request);
         item
     }

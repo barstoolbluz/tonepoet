@@ -131,6 +131,8 @@ mod tests {
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
             album_batch: None,
             album_batch_track: None,
+            pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(),
             suppress_incremental_conversion_log_append: false,
             expected_album_track_count: None,
             container_extension: None,

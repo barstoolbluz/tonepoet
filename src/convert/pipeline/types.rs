@@ -261,6 +261,93 @@ impl CompanionCopyPolicy {
     }
 }
 
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataTextOverride {
+    /// Keep the materializer-read source tag value.
+    Keep,
+    /// Remove the destination tag even if the source file carries one.
+    Clear,
+    /// Write this exact non-empty value.
+    Set(String),
+}
+
+impl Default for MetadataTextOverride {
+    fn default() -> Self {
+        Self::Keep
+    }
+}
+
+impl MetadataTextOverride {
+    #[must_use]
+    pub fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+
+    #[must_use]
+    pub fn from_optional_change(original: &Option<String>, edited: &Option<String>) -> Self {
+        if original == edited {
+            Self::Keep
+        } else {
+            match edited {
+                Some(value) => Self::Set(value.clone()),
+                None => Self::Clear,
+            }
+        }
+    }
+
+    pub fn apply_to(&self, target: &mut Option<String>) {
+        match self {
+            Self::Keep => {}
+            Self::Clear => *target = None,
+            Self::Set(value) => *target = Some(value.clone()),
+        }
+    }
+
+    pub fn apply_to_extra_key(&self, extra: &mut BTreeMap<String, String>, key: &str) {
+        match self {
+            Self::Keep => {}
+            Self::Clear => {
+                extra.remove(key);
+            }
+            Self::Set(value) => {
+                extra.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveTrackMetadataOverride {
+    /// One-based ordinal in deterministic archive discovery order before track
+    /// selection is applied.
+    pub source_ordinal: u32,
+    /// Path relative to the archive extraction root. This guards against stale
+    /// ordinal-only matches if an archive preview tree is reused unexpectedly.
+    pub relative_path: PathBuf,
+    #[serde(default, skip_serializing_if = "MetadataTextOverride::is_keep")]
+    pub title: MetadataTextOverride,
+    #[serde(default, skip_serializing_if = "MetadataTextOverride::is_keep")]
+    pub artist: MetadataTextOverride,
+    #[serde(default, skip_serializing_if = "MetadataTextOverride::is_keep")]
+    pub album: MetadataTextOverride,
+    #[serde(default, skip_serializing_if = "MetadataTextOverride::is_keep")]
+    pub genre: MetadataTextOverride,
+    #[serde(default, skip_serializing_if = "MetadataTextOverride::is_keep")]
+    pub date: MetadataTextOverride,
+}
+
+impl ArchiveTrackMetadataOverride {
+    #[must_use]
+    pub fn has_changes(&self) -> bool {
+        !(self.title.is_keep()
+            && self.artist.is_keep()
+            && self.album.is_keep()
+            && self.genre.is_keep()
+            && self.date.is_keep())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineRequest {
     pub job_id: String,
@@ -277,6 +364,17 @@ pub struct PipelineRequest {
     pub log: LogPolicy,
     pub stages: StagePolicy,
     pub failure_policy: FailurePolicy,
+    /// Queue-time archive preview extraction to reuse during materialization.
+    /// When present and valid, ArchiveMaterializer skips re-extraction and
+    /// discovers audio from this staging tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_extracted_staging: Option<PathBuf>,
+    /// Compact metadata edits made on archive-preview tracks at queue time.
+    /// The archive materializer applies these after reading source tags from
+    /// the reused/extracted files so Convert-screen edits affect naming and
+    /// output metadata without mutating staged source audio opportunistically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_metadata_overrides: Vec<ArchiveTrackMetadataOverride>,
     /// Album/folder batch contract for independent single-file jobs. Production
     /// callers must obtain this through
     /// `prepare_independent_single_file_album_batch_for_dispatch(...)`; direct

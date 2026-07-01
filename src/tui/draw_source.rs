@@ -10,7 +10,9 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{SourceMode, SourceState, PROBE_IN_PROGRESS_NOTICE};
+use super::app::{
+    SourceMode, SourceState, ARCHIVE_PREVIEW_EXTRACTING_NOTICE, PROBE_IN_PROGRESS_NOTICE,
+};
 use super::probe::SourceInfo;
 use crate::convert::formats::AudioFormat;
 
@@ -67,6 +69,8 @@ pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
             tracks,
             album_title,
             info,
+            archive_preview,
+            cursor,
             probe_notice,
             ..
         } => {
@@ -74,11 +78,15 @@ pub fn source_pane_height(mode: &SourceMode, terminal_width: u16) -> u16 {
             if n == 0 {
                 return BASE;
             }
+            let displayed_info = archive_preview
+                .as_ref()
+                .and_then(|preview| preview.tracks.get(*cursor).map(|track| &track.info))
+                .or(info.as_ref());
             // Header: filename(1) + album info(1 if present) + source
             // properties/notice(1 if present) + track count(1).
             let header: u16 = 2
                 + if album_title.is_some() { 1 } else { 0 }
-                + if info.is_some() || probe_notice.is_some() { 1 } else { 0 };
+                + if displayed_info.is_some() || probe_notice.is_some() { 1 } else { 0 };
             let visible = n.min(10);
             let track_rows = ((visible + per_row - 1) / per_row) as u16;
             let overflow: u16 = if n > 10 { 1 } else { 0 };
@@ -139,7 +147,9 @@ pub fn draw_source_pane(
             w,
             path,
             info.as_ref(),
-            probe_notice.as_deref(), theme),
+            probe_notice.as_deref(),
+            theme,
+        ),
         SourceMode::MultiTrack {
             path,
             info,
@@ -151,25 +161,34 @@ pub fn draw_source_pane(
             scroll,
             cursor,
             selected,
+            archive_preview,
             disc_contents,
             selected_presentation_id,
             ..
-        } => render_multi_track(
-            border_color,
-            w,
-            path,
-            info.as_ref(),
-            tracks,
-            area_label.as_deref(),
-            album_title.as_deref(),
-            album_artist.as_deref(),
-            probe_notice.as_deref(),
-            *scroll,
-            *cursor,
-            selected,
-            area.height,
-            disc_contents.as_deref(),
-            selected_presentation_id.as_ref(), theme),
+        } => {
+            let displayed_info = archive_preview
+                .as_ref()
+                .and_then(|preview| preview.tracks.get(*cursor).map(|track| &track.info))
+                .or(info.as_ref());
+            render_multi_track(
+                border_color,
+                w,
+                path,
+                displayed_info,
+                tracks,
+                area_label.as_deref(),
+                album_title.as_deref(),
+                album_artist.as_deref(),
+                probe_notice.as_deref(),
+                *scroll,
+                *cursor,
+                selected,
+                area.height,
+                disc_contents.as_deref(),
+                selected_presentation_id.as_ref(),
+                theme,
+            )
+        }
         SourceMode::Batch {
             paths,
             cursor,
@@ -195,7 +214,9 @@ pub fn draw_source_pane(
             *total_size,
             *album_count,
             format_histogram,
-            area.height, theme),
+            area.height,
+            theme,
+        ),
     };
 
     let mut lines = vec![top_line];
@@ -278,6 +299,17 @@ fn render_empty<'a>(border_color: ratatui::style::Color, w: usize,
 }
 
 /// Render the single-file content (path, format info, duration, browse pill).
+fn probe_notice_label(notice: &str) -> &'static str {
+    if notice == PROBE_IN_PROGRESS_NOTICE
+        || notice == ARCHIVE_PREVIEW_EXTRACTING_NOTICE
+        || notice.starts_with("Probing ")
+    {
+        "   status    "
+    } else {
+        "   warning   "
+    }
+}
+
 fn render_single<'a>(
     border_color: ratatui::style::Color,
     w: usize,
@@ -291,11 +323,7 @@ fn render_single<'a>(
         // source carries a durable notice (notably a malformed/empty direct
         // `.cue`), show that warning instead of an indefinite probing state.
         let status_line = if let Some(notice) = probe_notice {
-            let label = if notice == PROBE_IN_PROGRESS_NOTICE {
-                "   status    "
-            } else {
-                "   warning   "
-            };
+            let label = probe_notice_label(notice);
             bordered_line(
                 border_color,
                 w,
@@ -459,11 +487,7 @@ fn render_batch<'a>(
     // intentionally separate from the status bar so warnings remain visible
     // until the source changes.
     let header_rows: u16 = if let Some(notice) = probe_notice {
-        let label = if notice == PROBE_IN_PROGRESS_NOTICE {
-            "   status    "
-        } else {
-            "   warning   "
-        };
+        let label = probe_notice_label(notice);
         lines.push(bordered_line(
             border_color,
             w,
@@ -1042,6 +1066,29 @@ mod tests {
         assert!(!rendered.contains("probing"));
     }
 
+
+    #[test]
+    fn render_single_archive_preview_progress_is_status_not_warning() {
+        let theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
+        let lines = render_single(
+            theme.text_bright,
+            96,
+            Path::new("/tmp/album.zip"),
+            None,
+            Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE),
+            theme,
+        );
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("status"));
+        assert!(rendered.contains(ARCHIVE_PREVIEW_EXTRACTING_NOTICE));
+        assert!(!rendered.contains("warning"));
+    }
 
     #[test]
     fn render_single_without_info_and_without_notice_is_not_probing() {

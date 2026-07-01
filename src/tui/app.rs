@@ -636,6 +636,8 @@ pub(crate) fn probe_cue_proxy_source(cue_path: &Path) -> Result<CueProxyProbeRes
 
 /// Durable source-pane text used while a Convert-source probe is in flight.
 pub(crate) const PROBE_IN_PROGRESS_NOTICE: &str = "Probing...";
+pub(crate) const ARCHIVE_PREVIEW_EXTRACTING_NOTICE: &str = "Extracting archive...";
+
 
 /// Archives enter the queue as containers and cannot be interrogated as audio
 /// at source-selection time. Keep `.iso` probeable because SACD/DVD/Blu-ray
@@ -832,6 +834,262 @@ pub(crate) fn spawn_convert_source_probe(
     });
 }
 
+pub(crate) fn source_mode_from_archive_preview(preview: ArchivePreview) -> SourceMode {
+    let track_count = preview.tracks.len();
+    let info = preview.tracks.first().map(|track| track.info.clone());
+    let metadata = preview.album_metadata.clone();
+    let tracks = preview
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(idx, track)| MultiTrackEntry {
+            number: (idx + 1) as u32,
+            title: track.metadata.title.clone().or_else(|| Some(track.original_name.clone())),
+            performer: track.metadata.artist.clone(),
+            duration_display: Some(track.info.duration_display()),
+        })
+        .collect();
+    let archive_path = preview.archive_path.clone();
+    let album_title = metadata.album.clone();
+    let album_artist = metadata.artist.clone();
+
+    SourceMode::MultiTrack {
+        path: archive_path,
+        info,
+        metadata,
+        tracks,
+        area_label: Some("Archive".to_string()),
+        album_title,
+        album_artist,
+        probe_notice: None,
+        scroll: 0,
+        cursor: 0,
+        selected: vec![true; track_count],
+        archive_preview: Some(preview),
+        disc_contents: None,
+        selected_presentation_id: None,
+    }
+}
+
+pub(crate) fn archive_preview_album_metadata(tracks: &[PreviewTrack]) -> SourceMetadata {
+    let mut metadata = tracks
+        .first()
+        .map(|track| track.metadata.clone())
+        .unwrap_or_default();
+    metadata.title = None;
+
+    let same_album = common_nonempty_metadata_value(tracks, |metadata| metadata.album.as_ref());
+    let same_artist = common_nonempty_metadata_value(tracks, |metadata| metadata.artist.as_ref());
+    let same_year = common_nonempty_metadata_value(tracks, |metadata| metadata.year.as_ref());
+    let same_genre = common_nonempty_metadata_value(tracks, |metadata| metadata.genre.as_ref());
+
+    metadata.album = same_album;
+    metadata.artist = same_artist;
+    metadata.year = same_year;
+    metadata.genre = same_genre;
+    metadata
+}
+
+fn common_nonempty_metadata_value<F>(tracks: &[PreviewTrack], f: F) -> Option<String>
+where
+    F: for<'a> Fn(&'a SourceMetadata) -> Option<&'a String>,
+{
+    let mut values = tracks
+        .iter()
+        .filter_map(|track| f(&track.metadata))
+        .filter(|value| !value.trim().is_empty());
+    let first = values.next()?.clone();
+    if values.all(|value| value == &first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn create_pending_archive_preview(
+    generation: u64,
+    archive_path: PathBuf,
+) -> PendingArchivePreview {
+    PendingArchivePreview {
+        generation,
+        archive_path,
+        staging_dir: std::env::temp_dir().join(format!(
+            "tonepoet-archive-preview-{}",
+            uuid::Uuid::new_v4()
+        )),
+        cancel: tokio_util::sync::CancellationToken::new(),
+    }
+}
+
+pub(crate) fn archive_preview_password_for_path(app: &mut AppState, path: &Path) -> Option<String> {
+    if let Some(password) = app.archive_passwords.get(path).cloned() {
+        return Some(password);
+    }
+
+    app.keychain.ensure_loaded();
+    if let Some(password) = app.keychain.passwords.first().cloned() {
+        return Some(password);
+    }
+
+    app.config.conversion.archive_password.clone()
+}
+
+pub(crate) fn install_archive_preview_convert_source(
+    app: &mut AppState,
+    path: PathBuf,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
+    app.probe_generation = app.probe_generation.saturating_add(1);
+    let generation = app.probe_generation;
+
+    clear_source_metadata_in_convert(&mut app.convert);
+    app.convert.set_source_mode(SourceMode::from_single_pending_probe(
+        path.clone(),
+        Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE.to_string()),
+    ));
+    app.convert.apply_source_defaults();
+    let baseline = ConvertProbeBaseline::capture(&app.convert);
+    app.current_screen = AppScreen::Convert;
+    app.recent.record_use_with_db(&path, &app.db);
+
+    let pending = create_pending_archive_preview(generation, path.clone());
+    let staging_dir = pending.staging_dir.clone();
+    let cancel = pending.cancel.clone();
+    app.convert.install_pending_archive_preview(pending);
+
+    let password = archive_preview_password_for_path(app, &path);
+    let tool_paths = app.manager.config.tool_paths.clone();
+    spawn_archive_preview(
+        generation,
+        path.clone(),
+        baseline,
+        staging_dir,
+        cancel,
+        password,
+        tool_paths,
+        tx,
+    );
+    app.set_status(format!(
+        "Extracting archive: {}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+}
+
+pub(crate) fn spawn_archive_preview(
+    generation: u64,
+    archive_path: PathBuf,
+    baseline: ConvertProbeBaseline,
+    staging_dir: PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+    archive_password: Option<String>,
+    tool_paths: std::collections::HashMap<String, PathBuf>,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let result_path = archive_path.clone();
+        let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
+        let item_id = format!("archive-preview-{}", generation);
+
+        let result: Result<ArchivePreview, String> = async {
+            if cancel.is_cancelled() {
+                return Err("archive preview cancelled".to_string());
+            }
+
+            std::fs::create_dir_all(&staging_dir)
+                .map_err(|err| format!("create preview staging failed: {err}"))?;
+
+            if cancel.is_cancelled() {
+                return Err("archive preview cancelled".to_string());
+            }
+
+            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+                &archive_path,
+                &staging_dir,
+                item_id.as_str(),
+                archive_password.as_deref(),
+                &runner,
+                None,
+                &cancel,
+            )
+            .await
+            .map_err(|err| format!("{err}"))?;
+
+            let audio_files = crate::convert::pipeline::materializer_archive::discover_archive_audio_files(&staging_dir)
+                .map_err(|err| format!("audio discovery failed: {err}"))?;
+            if audio_files.is_empty() {
+                return Err("no audio files found in archive".to_string());
+            }
+
+            let track_count = audio_files.len();
+            let _ = tx
+                .send(crate::tui::message::AppMessage::ArchivePreviewProgress {
+                    generation,
+                    archive_path: archive_path.clone(),
+                    message: format!(
+                        "Probing {} track{}...",
+                        track_count,
+                        if track_count == 1 { "" } else { "s" }
+                    ),
+                })
+                .await;
+
+            let cancel_for_probe = cancel.clone();
+            let tracks = tokio::task::spawn_blocking(move || {
+                let mut tracks = Vec::with_capacity(audio_files.len());
+                for path in audio_files {
+                    if cancel_for_probe.is_cancelled() {
+                        return Err("archive preview cancelled".to_string());
+                    }
+                    let info = crate::tui::probe::probe_audio(&path)
+                        .map_err(|err| format!("probe failed for {}: {err}", path.display()))?;
+                    let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
+                    let original_name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    tracks.push(PreviewTrack {
+                        path,
+                        original_name,
+                        info,
+                        original_metadata: metadata.clone(),
+                        metadata,
+                    });
+                }
+                Ok::<Vec<PreviewTrack>, String>(tracks)
+            })
+            .await
+            .map_err(|err| format!("archive preview task failed: {err}"))??;
+
+            if cancel.is_cancelled() {
+                return Err("archive preview cancelled".to_string());
+            }
+
+            let album_metadata = archive_preview_album_metadata(&tracks);
+            Ok(ArchivePreview {
+                staging_dir: staging_dir.clone(),
+                archive_path,
+                tracks,
+                album_metadata,
+            })
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+        }
+
+        let _ = tx
+            .send(crate::tui::message::AppMessage::ArchivePreviewResult {
+                generation,
+                archive_path: result_path,
+                result,
+                baseline,
+            })
+            .await;
+    });
+}
+
 /// Spawn a Convert-owned cursor probe for a batch preview path. Generic browse
 /// probes intentionally do not mutate Convert state; this message carries the
 /// source generation and user-edit baseline needed to merge late results safely.
@@ -955,6 +1213,67 @@ pub struct MultiTrackEntry {
     pub duration_display: Option<String>,
 }
 
+/// Queue-time preview of an archive extraction. The staging directory is owned
+/// by the Convert source until commit transfers ownership to the queue or a
+/// source change removes it.
+#[derive(Debug, Clone)]
+pub struct ArchivePreview {
+    pub staging_dir: PathBuf,
+    pub archive_path: PathBuf,
+    pub tracks: Vec<PreviewTrack>,
+    pub album_metadata: SourceMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewTrack {
+    pub path: PathBuf,
+    pub original_name: String,
+    pub info: SourceInfo,
+    /// Metadata exactly as read during preview. Compact inline edits compare
+    /// against this baseline so commit can carry only intentional overrides,
+    /// including explicit clears, without masking later materializer tag reads.
+    pub original_metadata: SourceMetadata,
+    pub metadata: SourceMetadata,
+}
+
+/// Convert-owned handle for an archive preview that is still extracting or
+/// probing. Unlike a completed `ArchivePreview`, this exists before the worker
+/// can return a populated track list, so it is the only app-state owner that
+/// can cancel extraction and remove the temporary staging directory on source
+/// replacement, navigation away, or shutdown.
+#[derive(Clone)]
+pub struct PendingArchivePreview {
+    pub generation: u64,
+    pub archive_path: PathBuf,
+    pub staging_dir: PathBuf,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+impl fmt::Debug for PendingArchivePreview {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingArchivePreview")
+            .field("generation", &self.generation)
+            .field("archive_path", &self.archive_path)
+            .field("staging_dir", &self.staging_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingArchivePreview {
+    pub fn matches(&self, generation: u64, archive_path: &Path) -> bool {
+        self.generation == generation && self.archive_path.as_path() == archive_path
+    }
+
+    pub fn cancel_and_cleanup(self) {
+        self.cancel.cancel();
+        match std::fs::remove_dir_all(&self.staging_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
 /// Source state: empty, a single reviewed file, or a multi-file batch.
 /// Phase 6d: replaces the flat `file_path / info / metadata / batch_queue`
 /// fields with a proper type-safe enum so callers must explicitly handle
@@ -991,6 +1310,9 @@ pub enum SourceMode {
         cursor: usize,
         /// Per-track selection (all true initially).
         selected: Vec<bool>,
+        /// Queue-time archive preview extraction, if this multi-track source came
+        /// from a generic archive rather than a CUE/SACD/DVD/Blu-ray model.
+        archive_preview: Option<ArchivePreview>,
         /// Full parsed disc model for selected disc-stream sources.
         disc_contents: Option<Box<crate::disc::DiscContents>>,
         /// Selected presentation id to bridge UI stream selection into pipeline source options.
@@ -1112,7 +1434,11 @@ impl SourceMode {
     pub fn current_info(&self) -> Option<&SourceInfo> {
         match self {
             Self::Empty => None,
-            Self::Single { info, .. } | Self::MultiTrack { info, .. } => info.as_ref(),
+            Self::Single { info, .. } => info.as_ref(),
+            Self::MultiTrack { info, archive_preview, cursor, .. } => archive_preview
+                .as_ref()
+                .and_then(|preview| preview.tracks.get(*cursor).map(|track| &track.info))
+                .or(info.as_ref()),
             Self::Batch { cursor_info, .. } => cursor_info.as_ref(),
         }
     }
@@ -1131,9 +1457,11 @@ impl SourceMode {
     pub fn total_source_size(&self) -> u64 {
         match self {
             Self::Empty => 0,
-            Self::Single { info, .. } | Self::MultiTrack { info, .. } => {
-                info.as_ref().map_or(0, |i| i.file_size)
-            }
+            Self::Single { info, .. } => info.as_ref().map_or(0, |i| i.file_size),
+            Self::MultiTrack { info, archive_preview, .. } => archive_preview
+                .as_ref()
+                .map(|preview| preview.tracks.iter().map(|track| track.info.file_size).sum())
+                .unwrap_or_else(|| info.as_ref().map_or(0, |i| i.file_size)),
             Self::Batch { total_size, .. } => *total_size,
         }
     }
@@ -1144,7 +1472,11 @@ impl SourceMode {
     pub fn current_metadata(&self) -> SourceMetadata {
         match self {
             Self::Empty => SourceMetadata::default(),
-            Self::Single { metadata, .. } | Self::MultiTrack { metadata, .. } => metadata.clone(),
+            Self::Single { metadata, .. } => metadata.clone(),
+            Self::MultiTrack { metadata, archive_preview, cursor, .. } => archive_preview
+                .as_ref()
+                .and_then(|preview| preview.tracks.get(*cursor).map(|track| track.metadata.clone()))
+                .unwrap_or_else(|| metadata.clone()),
             Self::Batch {
                 cursor_metadata, ..
             } => cursor_metadata.clone(),
@@ -1167,7 +1499,11 @@ impl SourceMode {
     /// worker. `info == None` by itself is not a pending-probe signal: it may
     /// also mean the source is nonprobeable or probing has failed.
     pub fn probe_in_progress(&self) -> bool {
-        self.persistent_probe_notice() == Some(PROBE_IN_PROGRESS_NOTICE)
+        self.persistent_probe_notice().is_some_and(|notice| {
+            notice == PROBE_IN_PROGRESS_NOTICE
+                || notice == ARCHIVE_PREVIEW_EXTRACTING_NOTICE
+                || notice.starts_with("Probing ")
+        })
     }
 
     /// Number of files (0/1/N for Empty/Single/Batch; 1 for MultiTrack).
@@ -1176,6 +1512,48 @@ impl SourceMode {
             Self::Empty => 0,
             Self::Single { .. } | Self::MultiTrack { .. } => 1,
             Self::Batch { paths, .. } => paths.len(),
+        }
+    }
+
+    pub fn archive_preview(&self) -> Option<&ArchivePreview> {
+        match self {
+            Self::MultiTrack { archive_preview: Some(preview), .. } => Some(preview),
+            _ => None,
+        }
+    }
+
+    pub fn archive_preview_staging_dir(&self) -> Option<&PathBuf> {
+        self.archive_preview().map(|preview| &preview.staging_dir)
+    }
+
+    pub fn disarm_archive_preview_cleanup(&mut self) -> Option<PathBuf> {
+        match self {
+            Self::MultiTrack { archive_preview, .. } => archive_preview
+                .take()
+                .map(|preview| preview.staging_dir),
+            _ => None,
+        }
+    }
+
+    pub fn cleanup_archive_preview_staging(&mut self) {
+        if let Some(staging_dir) = self.disarm_archive_preview_cleanup() {
+            match std::fs::remove_dir_all(&staging_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+    }
+
+    pub fn sync_archive_preview_cursor_state(&self) -> Option<(SourceInfo, SourceMetadata)> {
+        match self {
+            Self::MultiTrack { archive_preview: Some(preview), cursor, .. } => {
+                preview
+                    .tracks
+                    .get(*cursor)
+                    .map(|track| (track.info.clone(), track.metadata.clone()))
+            }
+            _ => None,
         }
     }
 
@@ -1360,6 +1738,7 @@ impl SourceMode {
                         scroll: 0,
                         cursor: 0,
                         selected: vec![true; track_count],
+                        archive_preview: None,
                         disc_contents: Some(Box::new(disc_model)),
                         selected_presentation_id: Some(crate::disc::PresentationId::SacdArea(
                             if area_label == "Stereo" {
@@ -1418,6 +1797,7 @@ impl SourceMode {
                     scroll: 0,
                     cursor: 0,
                     selected: vec![true; track_count],
+                    archive_preview: None,
                     disc_contents: None,
                     selected_presentation_id: None,
                 };
@@ -2832,6 +3212,10 @@ pub struct ConvertState {
     pub metadata_field_last_click: Option<(ConvertMetadataField, std::time::Instant)>,
     /// Last destination-path field click used for double-click directory picking.
     pub dest_path_last_click: Option<std::time::Instant>,
+    /// In-flight archive preview extraction/probe, if any. Completed previews
+    /// move into `SourceMode::MultiTrack::archive_preview`; pending previews
+    /// live here so source changes can cancel and clean staging immediately.
+    pub pending_archive_preview: Option<PendingArchivePreview>,
 }
 
 impl ConvertState {
@@ -2847,6 +3231,7 @@ impl ConvertState {
             metadata_file_last_click: None,
             metadata_field_last_click: None,
             dest_path_last_click: None,
+            pending_archive_preview: None,
         }
     }
 
@@ -2913,9 +3298,40 @@ impl ConvertState {
         self.format.apply_format_constraints();
     }
 
+    pub fn install_pending_archive_preview(&mut self, pending: PendingArchivePreview) {
+        self.clear_pending_archive_preview();
+        self.pending_archive_preview = Some(pending);
+    }
+
+    pub fn pending_archive_preview_matches(&self, generation: u64, archive_path: &Path) -> bool {
+        self.pending_archive_preview
+            .as_ref()
+            .is_some_and(|pending| pending.matches(generation, archive_path))
+    }
+
+    pub fn take_pending_archive_preview(
+        &mut self,
+        generation: u64,
+        archive_path: &Path,
+    ) -> Option<PendingArchivePreview> {
+        if self.pending_archive_preview_matches(generation, archive_path) {
+            self.pending_archive_preview.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn clear_pending_archive_preview(&mut self) {
+        if let Some(pending) = self.pending_archive_preview.take() {
+            pending.cancel_and_cleanup();
+        }
+    }
+
     /// Replace the convert source mode and reset metadata list state in one
     /// place so source changes cannot leave stale scroll or double-click state.
     pub fn set_source_mode(&mut self, mode: SourceMode) {
+        self.clear_pending_archive_preview();
+        self.source.mode.cleanup_archive_preview_staging();
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
         self.refresh_source_constraints_preserving_format_selection();
@@ -2926,9 +3342,19 @@ impl ConvertState {
     /// during the probe: source facts should update, but constraint/default
     /// cascades must not rewrite the user's choices.
     pub fn set_source_mode_preserving_format_selection(&mut self, mode: SourceMode) {
+        self.clear_pending_archive_preview();
+        self.source.mode.cleanup_archive_preview_staging();
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
         self.refresh_source_constraints_preserving_format_selection();
+    }
+
+    pub fn sync_archive_preview_cursor_metadata_and_defaults(&mut self) {
+        let Some((info, metadata)) = self.source.mode.sync_archive_preview_cursor_state() else {
+            return;
+        };
+        apply_source_metadata_to_convert(self, &metadata);
+        self.refresh_source_info_constraints_preserving_format_selection(&info);
     }
 
     /// Source bit depth for format-pane side effects such as auto-dither.
@@ -7054,6 +7480,7 @@ impl AppState {
                 metadata_file_last_click: None,
                 dest_path_last_click: None,
                 metadata_field_last_click: None,
+                pending_archive_preview: None,
             },
             probe_generation: 0,
             tui_tx: None,
@@ -9478,6 +9905,7 @@ mod source_default_reset_tests {
             scroll: 0,
             cursor: 0,
             selected: vec![true],
+            archive_preview: None,
             disc_contents: None,
             selected_presentation_id: None,
         });

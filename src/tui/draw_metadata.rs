@@ -52,6 +52,21 @@ pub fn draw_metadata_pane(
                 focused,
                 metadata, theme));
         }
+        SourceMode::MultiTrack {
+            archive_preview: Some(preview),
+            cursor,
+            ..
+        } => {
+            lines.extend(render_archive_preview_metadata(
+                border_color,
+                w,
+                preview,
+                *cursor,
+                metadata,
+                focused,
+                theme,
+            ));
+        }
         SourceMode::MultiTrack { tracks, cursor, .. } => {
             lines.extend(render_track_file_list(
                 border_color,
@@ -61,7 +76,9 @@ pub fn draw_metadata_pane(
                 metadata.file_scroll,
                 list_visible_rows,
                 focused,
-                metadata, theme));
+                metadata,
+                theme,
+            ));
         }
         _ => {
             lines.extend(render_single_metadata(border_color, w, metadata, focused, theme));
@@ -94,7 +111,15 @@ fn metadata_edit_cursor(
     source_mode: &SourceMode,
     pane_width: usize,
 ) -> Option<(usize, usize, usize)> {
-    if !matches!(source_mode, SourceMode::Empty | SourceMode::Single { .. }) {
+    if !matches!(
+        source_mode,
+        SourceMode::Empty
+            | SourceMode::Single { .. }
+            | SourceMode::MultiTrack {
+                archive_preview: Some(_),
+                ..
+            }
+    ) {
         return None;
     }
     let field = metadata.editing?;
@@ -284,6 +309,32 @@ fn render_single_metadata<'a>(
     );
 
     vec![title_row, row2, row3]
+}
+
+fn render_archive_preview_metadata<'a>(
+    border_color: ratatui::style::Color,
+    w: usize,
+    preview: &'a super::app::ArchivePreview,
+    cursor: usize,
+    metadata: &'a MetadataState,
+    pane_focused: bool,
+    theme: super::theme::Theme,
+) -> Vec<Line<'a>> {
+    let mut rows = render_single_metadata(border_color, w, metadata, pane_focused, theme);
+    if let Some(track) = preview.tracks.get(cursor) {
+        let label = format!("   track   {:>2}/{} ", cursor + 1, preview.tracks.len());
+        let value_width = w.saturating_sub(2 + text_width(&label));
+        rows.push(bordered_line(
+            border_color,
+            w,
+            vec![
+                Span::styled(label, theme.muted()),
+                Span::styled(truncate_to(&track.original_name, value_width), theme.text_style()),
+            ],
+            theme,
+        ));
+    }
+    rows
 }
 
 fn render_batch_file_list<'a>(

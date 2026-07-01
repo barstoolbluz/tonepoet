@@ -94,6 +94,21 @@ pub enum AppMessage {
         source_mode: crate::tui::app::SourceMode,
         baseline: crate::tui::app::ConvertProbeBaseline,
     },
+    /// Progress from queue-time archive extraction/probing on the Convert screen.
+    ArchivePreviewProgress {
+        generation: u64,
+        archive_path: std::path::PathBuf,
+        message: String,
+    },
+    /// Completed queue-time archive preview. Stale completions are discarded by
+    /// generation and current source path; successful stale previews clean their
+    /// staging directory before returning.
+    ArchivePreviewResult {
+        generation: u64,
+        archive_path: std::path::PathBuf,
+        result: Result<crate::tui::app::ArchivePreview, String>,
+        baseline: crate::tui::app::ConvertProbeBaseline,
+    },
     /// Result of an asynchronous audio probe (lofty + ffmpeg) launched by
     /// `BrowseState::probe_current`. The main loop updates `probe_cache` and
     /// removes the path from `probe_pending`. Reducers must not perform

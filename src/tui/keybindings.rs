@@ -529,6 +529,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     }
                 }
             }
+            app.convert.sync_archive_preview_cursor_metadata_and_defaults();
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source
@@ -543,6 +544,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     }
                 }
             }
+            app.convert.sync_archive_preview_cursor_metadata_and_defaults();
         }
         (KeyCode::Char(' '), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Source
@@ -556,9 +558,10 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
         }
 
-        // Compact Convert metadata pane inline editing. Batch/multitrack use
-        // the file-list + full metadata editor; single/empty surfaces expose
-        // the visible title/artist/album/genre/year fields in-place.
+        // Compact Convert metadata pane inline editing. Batch and disc-style
+        // multitrack sources use the file-list + full metadata editor;
+        // single/empty sources and archive-preview tracks expose the visible
+        // title/artist/album/genre/year fields in-place.
         (KeyCode::Char('e'), KeyModifiers::CONTROL)
             if app.convert.focus == ConvertFocus::Metadata
                 && !app.convert.is_collapsed(ConvertFocus::Metadata) =>
@@ -945,7 +948,15 @@ fn clear_browse_info_focus(app: &mut AppState) {
 }
 
 fn convert_metadata_inline_fields_visible(app: &AppState) -> bool {
-    matches!(&app.convert.source.mode, SourceMode::Empty | SourceMode::Single { .. })
+    matches!(
+        &app.convert.source.mode,
+        SourceMode::Empty
+            | SourceMode::Single { .. }
+            | SourceMode::MultiTrack {
+                archive_preview: Some(_),
+                ..
+            }
+    )
 }
 
 fn convert_metadata_field_value(app: &AppState, field: ConvertMetadataField) -> String {
@@ -1000,6 +1011,46 @@ fn commit_convert_metadata_inline_edit(app: &mut AppState) {
     };
     let value = app.convert.metadata.edit_input.text.clone();
     set_convert_metadata_field_value(app, field, &value);
+    sync_convert_metadata_to_current_archive_preview(app);
+}
+
+fn sync_convert_metadata_to_current_archive_preview(app: &mut AppState) {
+    let SourceMode::MultiTrack {
+        archive_preview: Some(preview),
+        tracks,
+        cursor,
+        metadata,
+        album_title,
+        album_artist,
+        ..
+    } = &mut app.convert.source.mode
+    else {
+        return;
+    };
+
+    let Some(track) = preview.tracks.get_mut(*cursor) else {
+        return;
+    };
+
+    track.metadata.title = app.convert.metadata.title.clone();
+    track.metadata.artist = app.convert.metadata.artist.clone();
+    track.metadata.album = app.convert.metadata.album.clone();
+    track.metadata.genre = app.convert.metadata.genre.clone();
+    track.metadata.year = app.convert.metadata.year.clone();
+
+    if let Some(entry) = tracks.get_mut(*cursor) {
+        entry.title = track
+            .metadata
+            .title
+            .clone()
+            .or_else(|| Some(track.original_name.clone()));
+        entry.performer = track.metadata.artist.clone();
+    }
+
+    let album = super::app::archive_preview_album_metadata(&preview.tracks);
+    *metadata = album.clone();
+    *album_title = album.album.clone();
+    *album_artist = album.artist.clone();
 }
 
 fn handle_convert_metadata_inline_edit_key(app: &mut AppState, key: KeyEvent) {
@@ -2406,6 +2457,13 @@ async fn extract_from_archive(
 }
 
 fn install_convert_source_with_async_probe(app: &mut AppState, path: std::path::PathBuf) {
+    if is_nonprobeable_source_for_probe(&path) {
+        if let Some(tx) = app.tui_tx.clone() {
+            install_archive_preview_convert_source(app, path, tx);
+            return;
+        }
+    }
+
     app.probe_generation = app.probe_generation.saturating_add(1);
     let generation = app.probe_generation;
     let probe_notice = source_probe_initial_notice(&path);
@@ -15250,6 +15308,7 @@ fn set_metadata_cursor(app: &mut AppState, index: usize, tx: &mpsc::Sender<AppMe
             }
         }
     }
+    app.convert.sync_archive_preview_cursor_metadata_and_defaults();
     ensure_metadata_cursor_visible(app, metadata_file_list_visible_rows(app));
 }
 
@@ -15346,6 +15405,17 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         _ => None,
     };
 
+    let archive_preview_paths = match &app.convert.source.mode {
+        SourceMode::MultiTrack { archive_preview: Some(preview), .. } => Some(
+            preview
+                .tracks
+                .iter()
+                .map(|track| track.path.clone())
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    };
+
     let Some(path) = app.convert.source.mode.current_path().cloned() else {
         app.set_status("metadata: no source file selected");
         return;
@@ -15376,7 +15446,7 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         return;
     }
 
-    let mut paths = vec![path];
+    let mut paths = archive_preview_paths.unwrap_or_else(|| vec![path]);
     let merged = match super::probe::read_all_tags_merged_with_metadata(&paths) {
         Ok(read) => read,
         Err(e) => {
@@ -15521,6 +15591,11 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
                 return;
             }
         }
+        if is_nonprobeable_source_for_probe(&path) {
+            install_archive_preview_convert_source(app, path, tx.clone());
+            return;
+        }
+
         app.probe_generation = app.probe_generation.saturating_add(1);
         let generation = app.probe_generation;
         let probe_notice = source_probe_initial_notice(&path);

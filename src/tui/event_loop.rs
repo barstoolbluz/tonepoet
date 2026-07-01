@@ -38,6 +38,21 @@ pub async fn run_app(
         if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
             app.bookmarks.close_overlay();
         }
+        if app.current_screen != AppScreen::Convert {
+            let archive_preview_owned_or_pending = app.convert.pending_archive_preview.is_some()
+                || matches!(
+                    &app.convert.source.mode,
+                    super::app::SourceMode::MultiTrack {
+                        archive_preview: Some(_),
+                        ..
+                    }
+                );
+            if archive_preview_owned_or_pending {
+                app.convert.set_source_mode(super::app::SourceMode::Empty);
+                app.convert.source.cue_artifact_audio.clear();
+                app.convert.metadata = super::app::MetadataState::default();
+            }
+        }
 
         // 2. Advance image-preview protocol state, then render.
         //
@@ -58,6 +73,8 @@ pub async fn run_app(
 
         // 3. Check quit
         if app.should_quit {
+            app.convert.clear_pending_archive_preview();
+            app.convert.source.mode.cleanup_archive_preview_staging();
             // Save queue before exiting
             app.save_queue();
             break;
@@ -736,6 +753,128 @@ fn handle_convert_source_probe_result(
     }
 }
 
+fn handle_archive_preview_progress(
+    app: &mut AppState,
+    generation: u64,
+    archive_path: std::path::PathBuf,
+    message: String,
+) {
+    if generation != app.probe_generation
+        || !app
+            .convert
+            .pending_archive_preview_matches(generation, &archive_path)
+    {
+        return;
+    }
+
+    if let super::app::SourceMode::Single {
+        path, probe_notice, ..
+    } = &mut app.convert.source.mode
+    {
+        if *path == archive_path {
+            *probe_notice = Some(message);
+            app.force_redraw = true;
+        }
+    }
+}
+
+fn handle_archive_preview_result(
+    app: &mut AppState,
+    generation: u64,
+    archive_path: std::path::PathBuf,
+    result: Result<super::app::ArchivePreview, String>,
+    baseline: super::app::ConvertProbeBaseline,
+) {
+    let pending_matches = app
+        .convert
+        .pending_archive_preview_matches(generation, &archive_path);
+    if generation != app.probe_generation
+        || app.convert.source.mode.current_path() != Some(&archive_path)
+        || !pending_matches
+    {
+        if let Ok(preview) = result {
+            let _ = std::fs::remove_dir_all(preview.staging_dir);
+        }
+        return;
+    }
+
+    // The completed preview now owns the staging directory. Disarm the pending
+    // handle before installing the completed SourceMode so set_source_mode()
+    // does not cancel or remove the same directory.
+    let _pending = app
+        .convert
+        .take_pending_archive_preview(generation, &archive_path);
+
+    let metadata_unchanged = app.convert.metadata.editing.is_none()
+        && super::app::ConvertProbeMetadataSnapshot::capture(&app.convert.metadata)
+            == baseline.metadata;
+    let format_unchanged =
+        super::app::ConvertProbeFormatSnapshot::capture(&app.convert.format) == baseline.format;
+
+    match result {
+        Ok(preview) => {
+            let track_count = preview.tracks.len();
+            let source_mode = super::app::source_mode_from_archive_preview(preview);
+            let detected_info_for_defaults = source_mode.current_info().cloned();
+            let detected_metadata = source_mode.current_metadata();
+
+            if format_unchanged {
+                app.convert.set_source_mode(source_mode);
+            } else {
+                app.convert
+                    .set_source_mode_preserving_format_selection(source_mode);
+            }
+
+            if metadata_unchanged {
+                super::app::apply_source_metadata_to_convert(&mut app.convert, &detected_metadata);
+            }
+
+            if format_unchanged {
+                if let Some(info) = detected_info_for_defaults.as_ref() {
+                    app.convert.apply_source_info_defaults(info);
+                } else {
+                    app.convert.format.clear_source_derived_defaults();
+                }
+            } else if let Some(info) = detected_info_for_defaults.as_ref() {
+                app.convert
+                    .refresh_source_info_constraints_preserving_format_selection(info);
+            } else {
+                app.convert
+                    .refresh_source_constraints_preserving_format_selection();
+            }
+
+            app.force_redraw = true;
+            app.set_status(format!(
+                "Archive preview loaded: {} track{}",
+                track_count,
+                if track_count == 1 { "" } else { "s" }
+            ));
+        }
+        Err(err) => {
+            let mut applied = false;
+            if let super::app::SourceMode::Single { path, probe_notice, .. } = &mut app.convert.source.mode {
+                if *path == archive_path {
+                    *probe_notice = Some(format!(
+                        "Archive preview failed: {}; set format manually",
+                        err
+                    ));
+                    applied = true;
+                }
+            }
+            if applied {
+                if format_unchanged {
+                    app.convert.format.clear_source_derived_defaults();
+                } else {
+                    app.convert
+                        .refresh_source_constraints_preserving_format_selection();
+                }
+                app.force_redraw = true;
+                app.set_status("Archive preview failed; set format manually");
+            }
+        }
+    }
+}
+
 fn handle_convert_audio_probe_complete(
     app: &mut AppState,
     generation: u64,
@@ -933,6 +1072,21 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             baseline,
         } => {
             handle_convert_source_probe_result(app, generation, path, source_mode, baseline);
+        }
+        AppMessage::ArchivePreviewProgress {
+            generation,
+            archive_path,
+            message,
+        } => {
+            handle_archive_preview_progress(app, generation, archive_path, message);
+        }
+        AppMessage::ArchivePreviewResult {
+            generation,
+            archive_path,
+            result,
+            baseline,
+        } => {
+            handle_archive_preview_result(app, generation, archive_path, result, baseline);
         }
         AppMessage::ConvertAudioProbeComplete {
             generation,

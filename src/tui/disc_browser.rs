@@ -555,6 +555,7 @@ pub fn source_mode_for_presentation(
         selected: vec![true; track_count],
         disc_contents: Some(Box::new(contents)),
         selected_presentation_id: Some(presentation.id),
+        archive_preview: None,
     })
 }
 

@@ -176,6 +176,8 @@ pub fn build_pipeline_request_from_settings(
             extensions: item.options.effective_companion_extensions(),
             folders: item.options.effective_companion_folders(),
         },
+        pre_extracted_staging: item.pre_extracted_staging.clone(),
+        archive_metadata_overrides: Vec::new(),
         album_batch: None,
         album_batch_track: None,
         expected_album_track_count: None,
