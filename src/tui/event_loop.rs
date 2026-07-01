@@ -85,6 +85,12 @@ pub async fn run_app(
             if defer_quit_for_browse_archive_metadata(app, &tx) {
                 continue;
             }
+            if app.pending_browse_archive_rename.is_some() {
+                app.should_quit = false;
+                app.quit_after_browse_archive_rename = true;
+                app.set_status("quit deferred: waiting for archive rename to finish".to_string());
+                continue;
+            }
             app.cancel_archive_listing();
             app.convert.clear_pending_archive_preview();
             app.convert.source.mode.cleanup_archive_preview_staging();
@@ -1087,6 +1093,11 @@ pub(super) fn start_browse_archive_repackage(
     let staging_dir = context.staging_dir.clone();
     let tool_paths = app.manager.config.tool_paths.clone();
     let tx = tx.clone();
+    // Mutation is now in progress. Bump the archive probe epoch immediately
+    // so any archive-entry probe that was launched against the pre-edit
+    // archive is rejected even if it completes before the final success path
+    // clears cache/pending state.
+    app.browse.bump_archive_probe_epoch_for(&archive_path);
     app.browse_archive_repackage = Some(context);
     app.set_status(format!(
         "Repackaging archive after metadata edits: {}",
@@ -1171,15 +1182,24 @@ fn handle_archive_repackage_result(
     match result {
         Ok(report) => {
             let path_str = archive_path.display().to_string();
-            app.browse.probe_cache.remove(&archive_path);
-            app.browse.probe_pending.remove(&archive_path);
+            let browse_holds_same_archive = app
+                .browse
+                .archive
+                .as_ref()
+                .is_some_and(|arc| arc.listing.archive_path == archive_path);
+            app.invalidate_archive_listing_cache_for_path(&archive_path);
+            app.browse.invalidate_archive_probe_cache_for(&archive_path);
             let _ = app.db.invalidate_probe(&path_str);
-            app.browse.probe_current_with_db(tx, Some(&app.db));
+            if browse_holds_same_archive && app.current_screen == AppScreen::Browse && !quit_after_repackage {
+                super::keybindings::start_browse_archive_listing(app, archive_path.clone(), tx, true);
+            } else {
+                app.browse.probe_current_with_db(tx, Some(&app.db));
+            }
             let archive_label = archive_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| archive_path.display().to_string());
-            if let Some(warning) = report.backup_cleanup_warning {
+            if let Some(warning) = report.warning_summary() {
                 app.set_status(format!(
                     "Archive metadata saved and repackaged: {archive_label}; warning: {warning}"
                 ));
@@ -1201,6 +1221,114 @@ fn handle_archive_repackage_result(
                 ));
             } else {
                 app.set_status(format!("archive repackage did not complete cleanly: {err}"));
+            }
+        }
+    }
+}
+
+
+fn handle_archive_entry_rename_progress(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    message: String,
+) {
+    let pending_matches = app
+        .pending_browse_archive_rename
+        .as_ref()
+        .is_some_and(|pending| pending.matches(&archive_path, &staging_dir));
+    if pending_matches && app.current_screen == AppScreen::Browse {
+        app.set_status(message);
+    }
+}
+
+fn handle_archive_entry_rename_result(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    old_inner_path: String,
+    new_inner_path: String,
+    result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String>,
+) {
+    let pending_matches = app
+        .pending_browse_archive_rename
+        .as_ref()
+        .is_some_and(|pending| {
+            pending.matches(&archive_path, &staging_dir)
+                && pending.old_inner_path == old_inner_path
+                && pending.new_inner_path == new_inner_path
+        });
+    if !pending_matches {
+        super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+        app.set_status("archive rename: ignored stale result");
+        return;
+    }
+
+    let pending = app.pending_browse_archive_rename.take();
+    if let Some(pending) = pending.as_ref() {
+        super::app::cleanup_archive_metadata_staging_dir(&pending.staging_dir);
+    } else {
+        super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+    }
+    let quit_after_rename = app.quit_after_browse_archive_rename;
+    app.quit_after_browse_archive_rename = false;
+
+    match result {
+        Ok(report) => {
+            app.invalidate_archive_listing_cache_for_path(&archive_path);
+            app.browse.invalidate_archive_probe_cache_for(&archive_path);
+            let archive_label = archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive_path.display().to_string());
+            let old_name = old_inner_path.rsplit('/').next().unwrap_or(old_inner_path.as_str());
+            let new_name = new_inner_path.rsplit('/').next().unwrap_or(new_inner_path.as_str());
+            let browse_holds_same_archive = app
+                .browse
+                .archive
+                .as_ref()
+                .is_some_and(|arc| arc.listing.archive_path == archive_path);
+            if browse_holds_same_archive && app.current_screen == AppScreen::Browse {
+                if let Some(arc) = app.browse.archive.as_mut() {
+                    if let Some(entry) = arc
+                        .listing
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.path == old_inner_path)
+                    {
+                        entry.path = new_inner_path.clone();
+                    }
+                }
+                app.browse.refresh();
+                let target_path = archive_path.join(&new_inner_path);
+                if let Some(idx) = app.browse.entries.iter().position(|entry| entry.path == target_path) {
+                    app.browse.selected_index = idx;
+                    app.browse.ensure_visible();
+                }
+                app.force_redraw = true;
+            } else if browse_holds_same_archive {
+                app.browse.exit_archive();
+            } else {
+                app.browse.refresh();
+            }
+            if let Some(warning) = report.warning_summary() {
+                app.set_status(format!(
+                    "renamed archive entry in {archive_label}: {old_name} -> {new_name}; warning: {warning}"
+                ));
+            } else {
+                app.set_status(format!(
+                    "renamed archive entry in {archive_label}: {old_name} -> {new_name}"
+                ));
+            }
+            if quit_after_rename {
+                app.should_quit = true;
+            }
+        }
+        Err(err) => {
+            if quit_after_rename {
+                app.set_status(format!("archive rename failed; quit cancelled: {err}"));
+            } else {
+                app.set_status(format!("archive rename failed: {err}"));
             }
         }
     }
@@ -1447,6 +1575,29 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
         } => {
             handle_archive_repackage_result(app, archive_path, staging_dir, result, tx);
         }
+        AppMessage::ArchiveEntryRenameProgress {
+            archive_path,
+            staging_dir,
+            message,
+        } => {
+            handle_archive_entry_rename_progress(app, archive_path, staging_dir, message);
+        }
+        AppMessage::ArchiveEntryRenameResult {
+            archive_path,
+            staging_dir,
+            old_inner_path,
+            new_inner_path,
+            result,
+        } => {
+            handle_archive_entry_rename_result(
+                app,
+                archive_path,
+                staging_dir,
+                old_inner_path,
+                new_inner_path,
+                result,
+            );
+        }
         AppMessage::ConvertAudioProbeComplete {
             generation,
             path,
@@ -1465,8 +1616,22 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 baseline,
             );
         }
-        AppMessage::AudioProbeComplete { path, result } => {
-            app.browse.probe_pending.remove(&path);
+        AppMessage::AudioProbeComplete { path, context, result } => {
+            let was_pending = app.browse.probe_pending.remove(&path);
+            if let super::message::AudioProbeContext::ArchiveEntry {
+                archive_path,
+                archive_probe_epoch,
+            } = &context
+            {
+                if !app.browse.accept_archive_entry_probe_completion(
+                    &path,
+                    archive_path,
+                    *archive_probe_epoch,
+                    was_pending,
+                ) {
+                    return;
+                }
+            }
             match *result {
                 Ok(mut info) => {
                     let is_cue_proxy_result = super::browse::is_cue_sheet_path(&path);
@@ -1912,7 +2077,18 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     if let Some(key) = cache_key {
                         let _ = app.insert_archive_listing_cache(key, listing.clone());
                     }
-                    app.browse.enter_archive(listing, password);
+                    if app
+                        .browse
+                        .archive
+                        .as_ref()
+                        .is_some_and(|arc| arc.listing.archive_path == archive_path)
+                    {
+                        app.browse.replace_active_archive_listing(listing, password);
+                    } else {
+                        app.browse.enter_archive(listing, password);
+                    }
+                    app.force_redraw = true;
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                     app.set_status(format!(
                         "Opened {} ({} entries)",
                         archive_path

@@ -908,7 +908,8 @@ fn active_inline_edit_matches_button(app: &AppState, button: Option<&TuiButton>)
             }),
             TuiButton::BrowseInfoMeta(clicked_field),
         ) => {
-            *field == *clicked_field
+            !app.browse.is_in_archive()
+                && *field == *clicked_field
                 && app
                     .browse
                     .selected_entry()
@@ -967,6 +968,30 @@ fn set_browse_metadata_focus(app: &mut AppState, field: crate::tui::probe::Metad
 
 fn clear_browse_info_focus(app: &mut AppState) {
     app.browse_info_focus = None;
+}
+
+
+fn activate_archive_browse_directory(app: &mut AppState, idx: usize) -> bool {
+    let Some(entry) = app.browse.entries.get(idx).cloned() else {
+        return false;
+    };
+    match entry.kind.clone() {
+        super::browse::EntryKind::ParentDir => {
+            if !app.browse.go_up_in_archive() {
+                app.browse.exit_archive();
+            }
+            true
+        }
+        super::browse::EntryKind::Directory => {
+            let Some(inner) = app.browse.archive_inner_path_for_entry(&entry) else {
+                app.set_status("archive: could not resolve directory entry");
+                return false;
+            };
+            app.browse.enter_archive_dir(&inner);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn convert_metadata_inline_fields_visible(app: &AppState) -> bool {
@@ -1090,11 +1115,21 @@ fn handle_convert_metadata_inline_edit_key(app: &mut AppState, key: KeyEvent) {
     }
 }
 
+fn browse_archive_inline_metadata_status(app: &mut AppState) {
+    clear_browse_info_focus(app);
+    app.browse_inline_edit = None;
+    app.set_status("archive metadata: use Edit Tags to stage changes and repackage the archive");
+}
+
 fn browse_metadata_focus_available(app: &AppState) -> bool {
-    app.browse.current_cached_info().is_some()
+    !app.browse.is_in_archive() && app.browse.current_cached_info().is_some()
 }
 
 fn cycle_browse_metadata_focus(app: &mut AppState, forward: bool) {
+    if app.browse.is_in_archive() {
+        browse_archive_inline_metadata_status(app);
+        return;
+    }
     if !browse_metadata_focus_available(app) {
         app.set_status("metadata: no probed audio selection");
         return;
@@ -1248,15 +1283,21 @@ fn begin_browse_inline_rename(app: &mut AppState, path: std::path::PathBuf) {
 }
 
 fn begin_selected_browse_inline_rename(app: &mut AppState) {
-    let Some((path, is_parent)) = app
+    let Some((path, kind)) = app
         .browse
         .selected_entry()
-        .map(|entry| (entry.path.clone(), matches!(entry.kind, super::browse::EntryKind::ParentDir)))
+        .map(|entry| (entry.path.clone(), entry.kind.clone()))
     else {
         return;
     };
-    if is_parent {
+    if matches!(kind, super::browse::EntryKind::ParentDir) {
         app.set_status("rename: cannot rename parent entry");
+        return;
+    }
+    if app.browse.is_in_archive() && matches!(kind, super::browse::EntryKind::Directory) {
+        app.set_status(
+            "rename: archive directory rename is unavailable; rename files with archive-aware Rename",
+        );
         return;
     }
     begin_browse_inline_rename(app, path);
@@ -1282,6 +1323,10 @@ fn begin_browse_metadata_inline_edit(
     field: crate::tui::probe::MetadataField,
     first_key: Option<KeyEvent>,
 ) {
+    if app.browse.is_in_archive() {
+        browse_archive_inline_metadata_status(app);
+        return;
+    }
     if !browse_metadata_focus_available(app) {
         app.set_status("metadata: no probed audio selection");
         return;
@@ -1335,6 +1380,10 @@ fn commit_browse_inline_edit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) 
             commit_browse_rename(app, path, value.trim(), tx);
         }
         BrowseInlineCommit::Metadata { path, field, value } => {
+            if app.browse.is_in_archive() {
+                browse_archive_inline_metadata_status(app);
+                return;
+            }
             apply_text_edit(
                 app,
                 TextEditTarget::BrowseMetadata { path, field },
@@ -1706,6 +1755,86 @@ mod inline_edit_behavior_tests {
             other => panic!("expected rename commit, got {other:?}"),
         }
     }
+
+    #[test]
+    fn browse_archive_info_metadata_inline_edit_is_disabled() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        let archive_path = std::path::PathBuf::from("/tmp/album.zip");
+        app.browse.enter_archive(
+            crate::tui::archive_listing::ArchiveListing {
+                archive_path: archive_path.clone(),
+                format: "zip".to_string(),
+                physical_size: 1024,
+                entries: vec![crate::tui::archive_listing::ArchiveEntry {
+                    path: "track.flac".to_string(),
+                    size: 4096,
+                    packed_size: 2048,
+                    is_dir: false,
+                    encrypted: false,
+                }],
+            },
+            None,
+        );
+        app.browse.selected_index = 1; // skip synthetic parent row
+        let synthetic_path = archive_path.join("track.flac");
+        app.browse.probe_cache.insert(
+            synthetic_path,
+            Some(std::sync::Arc::new(crate::tui::browse::CachedInfo {
+                source: crate::tui::probe::SourceInfo {
+                    format_name: "FLAC".to_string(),
+                    codec: "flac".to_string(),
+                    bit_depth: Some(16),
+                    sample_rate: 44_100,
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: 4096,
+                },
+                metadata: crate::tui::probe::SourceMetadata {
+                    title: Some("Old".to_string()),
+                    ..Default::default()
+                },
+            })),
+        );
+
+        begin_browse_metadata_inline_edit(
+            &mut app,
+            crate::tui::probe::MetadataField::Title,
+            None,
+        );
+
+        assert!(app.browse_inline_edit.is_none());
+        assert_eq!(app.browse_info_focus, None);
+        assert!(app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.contains("use Edit Tags"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn browse_metadata_text_edit_refuses_non_filesystem_paths() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        let synthetic_path = std::path::PathBuf::from("/tmp/album.zip/track.flac");
+
+        apply_text_edit(
+            &mut app,
+            TextEditTarget::BrowseMetadata {
+                path: synthetic_path,
+                field: crate::tui::probe::MetadataField::Title,
+            },
+            "New",
+            &tx,
+        );
+
+        assert!(app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.contains("not a writable filesystem file"))
+            .unwrap_or(false));
+    }
 }
 
 
@@ -2000,9 +2129,17 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Delete: move selected file(s) to trash (with confirmation)
+        // Delete: move selected file(s) to trash (with confirmation).
+        // Archive entries are synthetic paths; trash is a filesystem operation and
+        // must not run against archive/inner paths.
         (KeyCode::Delete, KeyModifiers::NONE) => {
-            super::command::execute_command(app, super::command::Command::Delete, tx);
+            if app.browse.is_in_archive() {
+                app.set_status(
+                    "archive: trash is unavailable inside archives; extract the file or edit the archive explicitly",
+                );
+            } else {
+                super::command::execute_command(app, super::command::Command::Delete, tx);
+            }
         }
 
         // Force archive listing even when Performance > Browsing would normally skip it.
@@ -2086,38 +2223,16 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                         start_browse_archive_listing(app, entry.path.clone(), tx, false);
                     }
                     EntryKind::AudioFile(_) if app.browse.is_in_archive() => {
-                        // Inside an archive: extract selected files to temp before loading.
-                        // The synthetic path is archive_path/inner_path — extract the inner part.
-                        if let Some(ref arc) = app.browse.archive {
-                            let archive_path = arc.listing.archive_path.clone();
-                            let password = arc.password.clone();
-                            // Derive inner path from the synthetic path.
-                            let inner = entry
-                                .path
-                                .strip_prefix(&archive_path)
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            if !inner.is_empty() {
-                                let tx = tx.clone();
-                                let scratch = app.config.conversion.scratch_directory.clone();
-                                app.set_status("Extracting from archive...");
-                                tokio::spawn(async move {
-                                    let result = extract_from_archive(
-                                        &archive_path,
-                                        &inner,
-                                        password.as_deref(),
-                                        scratch.as_deref(),
-                                    )
-                                    .await;
-                                    let _ = tx
-                                        .send(AppMessage::StatusMessage(match &result {
-                                            Ok(p) => format!("Extracted: {}", p.display()),
-                                            Err(e) => format!("Extract failed: {}", e),
-                                        }))
-                                        .await;
-                                });
-                            }
-                        }
+                        // Archive entries are represented by synthetic paths. Do not launch
+                        // unmanaged temp extraction from Enter: the previous helper extracted
+                        // into a deterministic directory, returned only a status message, and
+                        // left no ownership/cleanup model for the extracted file. Keep Enter as
+                        // selection-only; archive mutations must use explicit archive-aware flows
+                        // such as Rename or Edit Tags.
+                        app.browse.toggle_selection();
+                        app.set_status(
+                            "archive entry selected; use Edit Tags or Rename for archive-aware changes",
+                        );
                     }
                     EntryKind::AudioFile(_)
                     | EntryKind::Archive
@@ -2462,7 +2577,7 @@ fn archive_listing_timeout_from_config(app: &AppState) -> Option<std::time::Dura
     }
 }
 
-fn start_browse_archive_listing(
+pub(super) fn start_browse_archive_listing(
     app: &mut AppState,
     path: std::path::PathBuf,
     tx: &mpsc::Sender<AppMessage>,
@@ -2497,6 +2612,7 @@ fn start_browse_archive_listing(
         let count = listing.entries.len();
         let password = archive_listing_password_for_path(app, &path);
         app.browse.enter_archive(listing, password);
+        app.force_redraw = true;
         app.set_status(format!("Opened from cache ({} entries)", count));
         return;
     }
@@ -2543,63 +2659,6 @@ fn start_browse_archive_listing(
             })
             .await;
     });
-}
-
-/// Extract a specific file from an archive to a scratch/temp directory.
-/// Returns the path to the extracted file on success.
-async fn extract_from_archive(
-    archive: &std::path::Path,
-    inner_path: &str,
-    password: Option<&str>,
-    scratch: Option<&std::path::Path>,
-) -> Result<std::path::PathBuf, String> {
-    use tokio::process::Command;
-
-    let bin =
-        crate::detect_7z_binary().ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
-
-    // Extract to a temp directory under scratch or system temp.
-    let base = scratch
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(std::env::temp_dir);
-    let extract_dir = base.join(format!(
-        "tonepoet_extract_{}",
-        archive
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "archive".into())
-    ));
-    std::fs::create_dir_all(&extract_dir).map_err(|e| format!("mkdir: {}", e))?;
-
-    let mut cmd = Command::new(bin);
-    cmd.arg("x")
-        .arg(archive)
-        .arg(format!("-o{}", extract_dir.display()))
-        .arg("-y")
-        .arg(inner_path); // Extract only this specific file.
-    if let Some(pw) = password {
-        cmd.arg(format!("-p{}", pw));
-    }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("failed to run {}: {}", bin, e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("extraction failed: {}", stderr.trim()));
-    }
-
-    let extracted = extract_dir.join(inner_path);
-    if extracted.exists() {
-        Ok(extracted)
-    } else {
-        Err("extracted file not found (path mismatch)".into())
-    }
 }
 
 fn install_convert_source_with_async_probe(app: &mut AppState, path: std::path::PathBuf) {
@@ -7771,8 +7830,28 @@ fn sacd_technical_details(
 }
 
 fn open_browse_archive_metadata_editor(app: &mut AppState, archive_path: std::path::PathBuf) {
+    open_browse_archive_metadata_editor_for_entries(app, archive_path, None);
+}
+
+fn open_browse_archive_entry_metadata_editor(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    inner_paths: Vec<String>,
+) {
+    open_browse_archive_metadata_editor_for_entries(app, archive_path, Some(inner_paths));
+}
+
+fn open_browse_archive_metadata_editor_for_entries(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    target_inner_paths: Option<Vec<String>>,
+) {
     if app.browse_archive_repackage.is_some() {
         app.set_status("metadata: wait for the current archive repackage to finish before editing another archive");
+        return;
+    }
+    if app.pending_browse_archive_rename.is_some() {
+        app.set_status("metadata: wait for the current archive rename to finish before editing metadata");
         return;
     }
 
@@ -7781,6 +7860,15 @@ fn open_browse_archive_metadata_editor(app: &mut AppState, archive_path: std::pa
         return;
     };
 
+    let tool_paths = app.manager.config.tool_paths.clone();
+    if let Err(err) = crate::convert::pipeline::materializer_archive::preflight_archive_repackage_capability(
+        &archive_path,
+        &tool_paths,
+    ) {
+        app.set_status(format!("metadata: archive cannot be edited: {err}"));
+        return;
+    }
+
     if let Some(pending) = app.pending_browse_archive_metadata.take() {
         pending.cancel_and_cleanup();
     }
@@ -7788,16 +7876,38 @@ fn open_browse_archive_metadata_editor(app: &mut AppState, archive_path: std::pa
     let pending = PendingBrowseArchiveMetadataEdit::new(archive_path.clone());
     let staging_dir = pending.staging_dir.clone();
     let cancel = pending.cancel.clone();
-    let password = super::app::archive_preview_password_for_path(app, &archive_path);
-    let tool_paths = app.manager.config.tool_paths.clone();
+    let password = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|arc| arc.listing.archive_path == archive_path)
+        .and_then(|arc| arc.password.clone())
+        .or_else(|| super::app::archive_preview_password_for_path(app, &archive_path));
+    let target_count = target_inner_paths.as_ref().map(|paths| paths.len());
     app.pending_browse_archive_metadata = Some(pending);
-    app.set_status(format!(
-        "Extracting archive for metadata editing: {}",
-        archive_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| archive_path.display().to_string())
-    ));
+    app.set_status(match target_count {
+        Some(1) => format!(
+            "Extracting archive entry for metadata editing: {}",
+            archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive_path.display().to_string())
+        ),
+        Some(n) => format!(
+            "Extracting {n} archive entries for metadata editing: {}",
+            archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive_path.display().to_string())
+        ),
+        None => format!(
+            "Extracting archive for metadata editing: {}",
+            archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive_path.display().to_string())
+        ),
+    });
 
     tokio::spawn(async move {
         let archive_for_result = archive_path.clone();
@@ -7835,18 +7945,44 @@ fn open_browse_archive_metadata_editor(app: &mut AppState, archive_path: std::pa
                 return Err("archive metadata edit cancelled".to_string());
             }
 
-            let _ = tx.send(AppMessage::ArchiveMetadataEditorProgress {
-                archive_path: archive_path.clone(),
-                staging_dir: staging_dir.clone(),
-                message: "Discovering archive audio files...".to_string(),
-            }).await;
-            let staging_for_read = staging_dir.clone();
-            let paths = tokio::task::spawn_blocking(move || {
-                crate::convert::pipeline::materializer_archive::discover_archive_audio_files(&staging_for_read)
-                    .map_err(|err| format!("audio discovery failed: {err}"))
-            })
-            .await
-            .map_err(|err| format!("archive audio discovery worker failed: {err}"))??;
+            let paths = if let Some(inner_paths) = target_inner_paths {
+                let mut paths = Vec::with_capacity(inner_paths.len());
+                for inner_path in inner_paths {
+                    let path = staging_path_for_archive_inner(&staging_dir, &inner_path)?;
+                    if !path.is_file() {
+                        return Err(format!(
+                            "archive entry was not extracted as a file: {}",
+                            inner_path
+                        ));
+                    }
+                    if !matches!(
+                        super::browse::classify_file(&path),
+                        super::browse::EntryKind::AudioFile(_)
+                    ) {
+                        return Err(format!(
+                            "archive entry is not a supported audio file: {}",
+                            inner_path
+                        ));
+                    }
+                    paths.push(path);
+                }
+                paths.sort();
+                paths.dedup();
+                paths
+            } else {
+                let _ = tx.send(AppMessage::ArchiveMetadataEditorProgress {
+                    archive_path: archive_path.clone(),
+                    staging_dir: staging_dir.clone(),
+                    message: "Discovering archive audio files...".to_string(),
+                }).await;
+                let staging_for_read = staging_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::convert::pipeline::materializer_archive::discover_archive_audio_files(&staging_for_read)
+                        .map_err(|err| format!("audio discovery failed: {err}"))
+                })
+                .await
+                .map_err(|err| format!("archive audio discovery worker failed: {err}"))??
+            };
             if paths.is_empty() {
                 return Err("no audio files found in archive".to_string());
             }
@@ -7886,6 +8022,26 @@ fn open_browse_archive_metadata_editor(app: &mut AppState, archive_path: std::pa
             })
             .await;
     });
+}
+
+fn staging_path_for_archive_inner(
+    staging_dir: &std::path::Path,
+    inner_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let mut out = staging_dir.to_path_buf();
+    for component in std::path::Path::new(inner_path).components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "archive entry path is unsafe: {}",
+                    inner_path
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub(super) fn install_archive_metadata_editor_payload(
@@ -8202,6 +8358,59 @@ pub fn open_metadata_editor(app: &mut AppState) {
     // Collect paths — expand directories recursively to find nested
     // audio files (e.g., disc 01/disc 02 folders).
     let sel = super::command::collect_selection_for_file_ops(app);
+
+    if app.browse.is_in_archive() {
+        let Some(archive_path) = app
+            .browse
+            .archive
+            .as_ref()
+            .map(|arc| arc.listing.archive_path.clone())
+        else {
+            app.set_status("metadata: no archive is active");
+            return;
+        };
+
+        let mut inner_paths = Vec::new();
+        let candidate_paths: Vec<std::path::PathBuf> = if app.browse.multi_selected.is_empty() {
+            app.browse
+                .selected_entry()
+                .map(|entry| vec![entry.path.clone()])
+                .unwrap_or_default()
+        } else {
+            app.browse.multi_selected.clone()
+        };
+
+        for path in candidate_paths {
+            let Some(inner) = app.browse.archive_inner_path_for_path(&path) else {
+                continue;
+            };
+            let is_audio = app
+                .browse
+                .archive
+                .as_ref()
+                .and_then(|arc| arc.listing.entries.iter().find(|entry| entry.path == inner))
+                .is_some_and(|entry| {
+                    !entry.is_dir
+                        && matches!(
+                            super::browse::classify_file(std::path::Path::new(entry.file_name())),
+                            super::browse::EntryKind::AudioFile(_)
+                        )
+                });
+            if is_audio {
+                inner_paths.push(inner);
+            }
+        }
+        inner_paths.sort();
+        inner_paths.dedup();
+
+        if inner_paths.is_empty() {
+            app.set_status("metadata: select an audio file inside the archive");
+            return;
+        }
+
+        open_browse_archive_entry_metadata_editor(app, archive_path, inner_paths);
+        return;
+    }
 
     if sel.len() == 1
         && !app.browse.is_in_archive()
@@ -15669,6 +15878,12 @@ fn execute_bulk_rename(
 /// Open the bulk rename overlay with the given file paths. Pulls metadata
 /// from the browse probe cache where available, falling back to defaults.
 pub fn open_bulk_rename(app: &mut AppState, paths: Vec<std::path::PathBuf>) {
+    if app.browse.is_in_archive() {
+        app.set_status(
+            "archive: bulk rename is unavailable inside archives; use Rename on one archive file at a time",
+        );
+        return;
+    }
     if paths.is_empty() {
         app.set_status("No files selected for rename");
         return;
@@ -16343,6 +16558,15 @@ fn apply_text_edit(
             do_file_op(app, &sources, trimmed, force, true, tx, None);
         }
         TextEditTarget::BrowseMetadata { path, field } => {
+            if app.browse.is_in_archive() {
+                browse_archive_inline_metadata_status(app);
+                return;
+            }
+            if !path.is_file() {
+                app.set_status("metadata: selected path is not a writable filesystem file; use Edit Tags for archive entries");
+                return;
+            }
+
             // Race check: refuse if the file is currently being converted.
             let is_processing = app.items_snapshot.iter().any(|item| {
                 item.input_path == path
@@ -19770,6 +19994,173 @@ mod file_operation_safety_tests {
     }
 }
 
+
+fn start_browse_archive_entry_rename(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    old_inner_path: String,
+    new_name: &str,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if app.pending_browse_archive_rename.is_some() {
+        app.set_status("rename: wait for the current archive rename to finish");
+        return;
+    }
+    if app.pending_browse_archive_metadata.is_some() || app.browse_archive_repackage.is_some() {
+        app.set_status("rename: wait for the current archive metadata operation to finish");
+        return;
+    }
+
+    let old_name = old_inner_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(old_inner_path.as_str())
+        .to_string();
+    let parent_inner = old_inner_path.rsplit_once('/').map(|(parent, _)| parent.to_string());
+    let new_inner_path = match parent_inner.as_deref() {
+        Some(parent) if !parent.is_empty() => format!("{}/{}", parent, new_name),
+        _ => new_name.to_string(),
+    };
+
+    if app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|arc| arc.listing.archive_path == archive_path)
+        .is_some_and(|arc| arc.listing.entries.iter().any(|entry| entry.path == new_inner_path))
+    {
+        app.set_status(format!("rename: target already exists in archive: {new_name}"));
+        return;
+    }
+
+    let tool_paths = app.manager.config.tool_paths.clone();
+    if let Err(err) = crate::convert::pipeline::materializer_archive::preflight_archive_repackage_capability(
+        &archive_path,
+        &tool_paths,
+    ) {
+        app.set_status(format!("rename: archive cannot be edited: {err}"));
+        return;
+    }
+
+    let pending = PendingBrowseArchiveRename::new(
+        archive_path.clone(),
+        old_inner_path.clone(),
+        new_inner_path.clone(),
+    );
+    let staging_dir = pending.staging_dir.clone();
+    let cancel = pending.cancel.clone();
+    let password = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|arc| arc.listing.archive_path == archive_path)
+        .and_then(|arc| arc.password.clone())
+        .or_else(|| archive_listing_password_for_path(app, &archive_path));
+    let tx = tx.clone();
+
+    // Mutation is now in progress. Reject any archive-entry info-pane probe
+    // launched against the pre-rename archive, even if that worker finishes
+    // before the final rename result invalidates cache/pending state.
+    app.browse.bump_archive_probe_epoch_for(&archive_path);
+    app.pending_browse_archive_rename = Some(pending);
+    app.set_status(format!("Renaming archive entry: {old_name} -> {new_name}"));
+
+    tokio::spawn(async move {
+        let archive_for_result = archive_path.clone();
+        let staging_for_result = staging_dir.clone();
+        let old_for_result = old_inner_path.clone();
+        let new_for_result = new_inner_path.clone();
+        let result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String> = async {
+            let _ = tx.send(AppMessage::ArchiveEntryRenameProgress {
+                archive_path: archive_path.clone(),
+                staging_dir: staging_dir.clone(),
+                message: "Preparing archive rename staging directory...".to_string(),
+            }).await;
+            std::fs::create_dir_all(&staging_dir)
+                .map_err(|err| format!("create archive rename staging failed: {err}"))?;
+
+            let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths.clone());
+            let _ = tx.send(AppMessage::ArchiveEntryRenameProgress {
+                archive_path: archive_path.clone(),
+                staging_dir: staging_dir.clone(),
+                message: "Extracting archive for rename...".to_string(),
+            }).await;
+            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+                &archive_path,
+                &staging_dir,
+                "browse-archive-entry-rename",
+                password.as_deref(),
+                &runner,
+                None,
+                &cancel,
+            )
+            .await
+            .map_err(|err| format!("archive extraction failed: {err}"))?;
+
+            if cancel.is_cancelled() {
+                return Err("archive rename cancelled".to_string());
+            }
+
+            let old_staged = staging_path_for_archive_inner(&staging_dir, &old_inner_path)?;
+            let new_staged = staging_path_for_archive_inner(&staging_dir, &new_inner_path)?;
+            if !old_staged.is_file() {
+                return Err(format!(
+                    "archive entry was not extracted as a file: {}",
+                    old_inner_path
+                ));
+            }
+            if new_staged.exists() {
+                return Err(format!(
+                    "rename target already exists in staging: {}",
+                    new_inner_path
+                ));
+            }
+            if let Some(parent) = new_staged.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|err| format!("create renamed entry parent failed: {err}"))?;
+            }
+            std::fs::rename(&old_staged, &new_staged)
+                .map_err(|err| format!("rename in archive staging failed: {err}"))?;
+
+            let _ = tx.send(AppMessage::ArchiveEntryRenameProgress {
+                archive_path: archive_path.clone(),
+                staging_dir: staging_dir.clone(),
+                message: "Repackaging archive after rename...".to_string(),
+            }).await;
+            let progress_tx = tx.clone();
+            let archive_for_progress = archive_path.clone();
+            let staging_for_progress = staging_dir.clone();
+            crate::convert::pipeline::materializer_archive::repackage_archive_with_progress(
+                &staging_dir,
+                &archive_path,
+                &tool_paths,
+                move |message| {
+                    let _ = progress_tx.try_send(AppMessage::ArchiveEntryRenameProgress {
+                        archive_path: archive_for_progress.clone(),
+                        staging_dir: staging_for_progress.clone(),
+                        message: message.to_string(),
+                    });
+                },
+            )
+            .await
+            .map_err(|err| format!("archive repackage failed: {err}"))
+        }
+        .await;
+
+        if result.is_err() {
+            super::app::cleanup_archive_metadata_staging_dir(&staging_for_result);
+        }
+
+        let _ = tx.send(AppMessage::ArchiveEntryRenameResult {
+            archive_path: archive_for_result,
+            staging_dir: staging_for_result,
+            old_inner_path: old_for_result,
+            new_inner_path: new_for_result,
+            result,
+        }).await;
+    });
+}
+
 /// Commit a rename for a browse entry: validates the new name, constructs the
 /// target path from the original path's parent, calls fs::rename, refreshes the
 /// browse listing, and repositions the cursor on the renamed entry.
@@ -19797,6 +20188,37 @@ pub(super) fn commit_browse_rename(
     }
     // No-op if unchanged
     if new_name == old_name {
+        return;
+    }
+
+    if app.browse.is_in_archive() {
+        let Some(archive_path) = app
+            .browse
+            .archive
+            .as_ref()
+            .map(|arc| arc.listing.archive_path.clone())
+        else {
+            app.set_status("rename: no archive is active");
+            return;
+        };
+        let Some(inner_path) = app.browse.archive_inner_path_for_path(&original_path) else {
+            app.set_status("rename: could not resolve archive entry");
+            return;
+        };
+        if app
+            .browse
+            .archive
+            .as_ref()
+            .filter(|arc| arc.listing.archive_path == archive_path)
+            .and_then(|arc| arc.listing.entries.iter().find(|entry| entry.path == inner_path))
+            .is_some_and(|entry| entry.is_dir)
+        {
+            app.set_status(
+                "rename: archive directory rename is unavailable; rename files with archive-aware Rename",
+            );
+            return;
+        }
+        start_browse_archive_entry_rename(app, archive_path, inner_path, new_name, tx);
         return;
     }
 
@@ -21302,6 +21724,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         let entry_kind = app.browse.entries[idx].kind.clone();
                         match entry_kind {
                             // Directories: double-click navigates into them.
+                            EntryKind::Directory | EntryKind::ParentDir if app.browse.is_in_archive() => {
+                                app.browse.multi_selected.clear();
+                                if activate_archive_browse_directory(app, idx) {
+                                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                                }
+                            }
                             EntryKind::Directory | EntryKind::ParentDir => {
                                 app.browse.multi_selected.clear();
                                 app.browse.enter_selected();
@@ -21363,8 +21792,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             TuiButton::BrowseInfoMeta(field) => {
-                set_browse_metadata_focus(app, field);
-                begin_browse_metadata_inline_edit(app, field, None);
+                if app.browse.is_in_archive() {
+                    browse_archive_inline_metadata_status(app);
+                } else {
+                    set_browse_metadata_focus(app, field);
+                    begin_browse_metadata_inline_edit(app, field, None);
+                }
             }
             TuiButton::BrowseInfoAnalyze => {
                 clear_browse_info_focus(app);

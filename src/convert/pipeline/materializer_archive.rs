@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -298,11 +300,71 @@ enum RepackageArchiveFormat {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArchiveRepackageReport {
     pub backup_cleanup_warning: Option<String>,
+    pub install_metadata_warning: Option<String>,
 }
 
 impl ArchiveRepackageReport {
     pub fn has_warnings(&self) -> bool {
-        self.backup_cleanup_warning.is_some()
+        self.backup_cleanup_warning.is_some() || self.install_metadata_warning.is_some()
+    }
+
+    pub fn warning_summary(&self) -> Option<String> {
+        let mut warnings = Vec::new();
+        if let Some(warning) = self.install_metadata_warning.as_deref() {
+            warnings.push(warning);
+        }
+        if let Some(warning) = self.backup_cleanup_warning.as_deref() {
+            warnings.push(warning);
+        }
+        if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.join("; "))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveInstallMetadata {
+    permissions: fs::Permissions,
+    accessed: Option<SystemTime>,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+/// Verify that this archive format can be mutated before the caller performs
+/// expensive extraction and metadata reads. This is deliberately conservative:
+/// callers still validate the staging tree and verify the repackaged archive at
+/// commit time, but unsupported write formats and missing creator tools are
+/// reported before the UI starts an edit session.
+pub fn preflight_archive_repackage_capability(
+    original_archive: &Path,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<(), String> {
+    let format = repackage_archive_format(original_archive)?;
+    match format {
+        RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
+            require_repackage_tool_available(
+                tool_paths,
+                &["7zz", "7z"],
+                "archive creation requires `7zz` or `7z`",
+            )
+        }
+        RepackageArchiveFormat::Tar | RepackageArchiveFormat::TarGz => {
+            require_repackage_tool_available(
+                tool_paths,
+                &["tar"],
+                "tar archive creation requires the `tar` executable",
+            )
+        }
+        RepackageArchiveFormat::Rar => require_repackage_tool_available(
+            tool_paths,
+            &["rar"],
+            "RAR archive creation requires the `rar` executable; install rar or convert the archive to 7z before editing metadata",
+        ),
     }
 }
 
@@ -346,6 +408,7 @@ where
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("archive name is not valid Unicode: {}", original_archive.display()))?;
+    let install_metadata = capture_archive_install_metadata(original_archive)?;
     let nonce = uuid::Uuid::new_v4();
     let temp_archive = parent.join(format!(
         ".{file_name}.tonepoet-repack-{nonce}{}",
@@ -366,10 +429,19 @@ where
             return Err("repackaged archive is empty".to_string());
         }
 
+        progress("Preserving archive file metadata...");
+        let install_metadata_warning =
+            apply_archive_install_metadata(&temp_archive, &install_metadata);
+
         progress("Installing repackaged archive...");
-        let report = replace_archive_atomically(original_archive, &temp_archive, &backup_archive)?;
+        let report = replace_archive_atomically(
+            original_archive,
+            &temp_archive,
+            &backup_archive,
+            install_metadata_warning,
+        )?;
         if report.has_warnings() {
-            progress("Archive installed; backup cleanup needs attention.");
+            progress("Archive installed; preservation or backup cleanup needs attention.");
         }
         Ok(report)
     }
@@ -519,6 +591,51 @@ async fn verify_repackaged_archive(
     }
 }
 
+fn require_repackage_tool_available(
+    tool_paths: &HashMap<String, PathBuf>,
+    names: &[&str],
+    error_message: &str,
+) -> Result<(), String> {
+    let tool = repackage_tool_path(tool_paths, names);
+    command_path_available(&tool)
+        .then_some(())
+        .ok_or_else(|| error_message.to_string())
+}
+
+fn command_path_available(command: &Path) -> bool {
+    if command.as_os_str().is_empty() {
+        return false;
+    }
+    if command.is_absolute()
+        || command
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        return command.is_file();
+    }
+
+    let Some(command_name) = command.to_str() else {
+        return false;
+    };
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let exe_suffix = std::env::consts::EXE_SUFFIX;
+    for dir in std::env::split_paths(&path_var) {
+        let direct = dir.join(command_name);
+        if direct.is_file() {
+            return true;
+        }
+        if !exe_suffix.is_empty() && !command_name.ends_with(exe_suffix) {
+            let with_suffix = dir.join(format!("{command_name}{exe_suffix}"));
+            if with_suffix.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn repackage_tool_path(tool_paths: &HashMap<String, PathBuf>, names: &[&str]) -> PathBuf {
     for name in names {
         if let Some(path) = tool_paths.get(*name) {
@@ -556,6 +673,102 @@ async fn run_repackage_command(
         Err(format!("{label}: command exited with status {}", output.status))
     } else {
         Err(format!("{label}: {detail}"))
+    }
+}
+
+
+fn capture_archive_install_metadata(path: &Path) -> Result<ArchiveInstallMetadata, String> {
+    let metadata = fs::metadata(path).map_err(|err| {
+        format!(
+            "failed to inspect original archive metadata '{}': {err}",
+            path.display()
+        )
+    })?;
+    Ok(ArchiveInstallMetadata {
+        permissions: metadata.permissions(),
+        accessed: metadata.accessed().ok(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        uid: metadata.uid(),
+        #[cfg(unix)]
+        gid: metadata.gid(),
+    })
+}
+
+fn apply_archive_install_metadata(
+    temp_archive: &Path,
+    original: &ArchiveInstallMetadata,
+) -> Option<String> {
+    let mut warnings = Vec::new();
+
+    #[cfg(unix)]
+    if let Some(warning) = apply_archive_owner(temp_archive, original) {
+        warnings.push(warning);
+    }
+
+    if let Err(err) = fs::set_permissions(temp_archive, original.permissions.clone()) {
+        warnings.push(format!(
+            "could not preserve archive permissions on '{}': {err}",
+            temp_archive.display()
+        ));
+    }
+
+    if let Err(err) = apply_archive_file_times(temp_archive, original) {
+        warnings.push(format!(
+            "could not preserve archive timestamps on '{}': {err}",
+            temp_archive.display()
+        ));
+    }
+
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    }
+}
+
+fn apply_archive_file_times(
+    temp_archive: &Path,
+    original: &ArchiveInstallMetadata,
+) -> Result<(), io::Error> {
+    if original.accessed.is_none() && original.modified.is_none() {
+        return Ok(());
+    }
+
+    let file = fs::OpenOptions::new().read(true).open(temp_archive)?;
+    let mut times = fs::FileTimes::new();
+    if let Some(accessed) = original.accessed {
+        times = times.set_accessed(accessed);
+    }
+    if let Some(modified) = original.modified {
+        times = times.set_modified(modified);
+    }
+    file.set_times(times)
+}
+
+#[cfg(unix)]
+fn apply_archive_owner(temp_archive: &Path, original: &ArchiveInstallMetadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current = match fs::metadata(temp_archive) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return Some(format!(
+                "could not inspect repackaged archive ownership '{}': {err}",
+                temp_archive.display()
+            ));
+        }
+    };
+    if current.uid() == original.uid && current.gid() == original.gid {
+        return None;
+    }
+
+    match std::os::unix::fs::chown(temp_archive, Some(original.uid), Some(original.gid)) {
+        Ok(()) => None,
+        Err(err) => Some(format!(
+            "could not preserve archive owner/group on '{}': {err}",
+            temp_archive.display()
+        )),
     }
 }
 
@@ -611,6 +824,7 @@ fn replace_archive_atomically(
     original_archive: &Path,
     temp_archive: &Path,
     backup_archive: &Path,
+    install_metadata_warning: Option<String>,
 ) -> Result<ArchiveRepackageReport, String> {
     fs::rename(original_archive, backup_archive).map_err(|err| {
         format!(
@@ -642,7 +856,10 @@ fn replace_archive_atomically(
         )),
     };
 
-    Ok(ArchiveRepackageReport { backup_cleanup_warning })
+    Ok(ArchiveRepackageReport {
+        backup_cleanup_warning,
+        install_metadata_warning,
+    })
 }
 
 // =========================================================================
@@ -2308,6 +2525,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn preflight_reports_missing_rar_creator_before_extraction_work() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.rar");
+        fs::write(&original, b"rar placeholder").expect("archive placeholder");
+        let missing_rar = temp.path().join("definitely-missing-rar-binary");
+        let tool_paths = HashMap::from([("rar".to_string(), missing_rar)]);
+
+        let err = preflight_archive_repackage_capability(&original, &tool_paths)
+            .expect_err("missing rar creator must be reported before extraction");
+
+        assert!(
+            err.contains("RAR archive creation requires the `rar` executable"),
+            "missing rar preflight error should be actionable: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn repackage_archive_reports_missing_rar_creator_without_replacing_original() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2341,7 +2575,7 @@ mod tests {
         let backup = temp.path().join("Album.zip.backup");
         fs::write(&original, b"original archive").expect("original archive");
 
-        let err = replace_archive_atomically(&original, &missing_temp, &backup)
+        let err = replace_archive_atomically(&original, &missing_temp, &backup, None)
             .expect_err("missing temp archive should fail install");
 
         assert!(
@@ -2355,6 +2589,60 @@ mod tests {
         assert!(
             !backup.exists(),
             "backup path should be consumed by restoration after failed install"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_install_metadata_preserves_mode_and_modified_time() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::time::UNIX_EPOCH;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.zip");
+        let temp_archive = temp.path().join("new.zip");
+        let backup = temp.path().join("Album.zip.backup");
+        fs::write(&original, b"original archive").expect("original archive");
+        fs::write(&temp_archive, b"new archive").expect("new archive");
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o640))
+            .expect("set original permissions");
+
+        let timestamp = UNIX_EPOCH + Duration::from_secs(1_234_567);
+        fs::File::open(&original)
+            .expect("open original")
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(timestamp)
+                    .set_modified(timestamp),
+            )
+            .expect("set original timestamps");
+        let original_meta = fs::metadata(&original).expect("original metadata");
+        let expected_uid = original_meta.uid();
+        let expected_gid = original_meta.gid();
+
+        let install_metadata = capture_archive_install_metadata(&original)
+            .expect("capture original install metadata");
+        let warning = apply_archive_install_metadata(&temp_archive, &install_metadata);
+        let report = replace_archive_atomically(&original, &temp_archive, &backup, warning)
+            .expect("install archive");
+
+        assert!(
+            report.warning_summary().is_none(),
+            "same-owner metadata preservation should not warn: {:?}",
+            report.warning_summary()
+        );
+        let installed = fs::metadata(&original).expect("installed metadata");
+        assert_eq!(installed.permissions().mode() & 0o777, 0o640);
+        assert_eq!(installed.uid(), expected_uid);
+        assert_eq!(installed.gid(), expected_gid);
+        assert_eq!(
+            installed
+                .modified()
+                .expect("installed modified time")
+                .duration_since(UNIX_EPOCH)
+                .expect("mtime after epoch")
+                .as_secs(),
+            1_234_567
         );
     }
 

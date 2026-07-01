@@ -596,6 +596,25 @@ struct EntryBuilder {
     encrypted: bool,
 }
 
+fn normalize_archive_entry_path(raw: &str) -> Option<String> {
+    let normalized_slashes = raw.replace('\\', "/");
+    let trimmed = normalized_slashes.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for component in trimmed.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            part => parts.push(part),
+        }
+    }
+
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 impl EntryBuilder {
     fn set(&mut self, key: &str, value: &str) {
         match key {
@@ -620,13 +639,7 @@ impl EntryBuilder {
         if path.is_empty() {
             return None;
         }
-        // Normalise Windows backslashes to forward slashes.
-        let path = path.replace('\\', "/");
-        // Strip trailing slash from directories.
-        let path = path.trim_end_matches('/').to_string();
-        if path.is_empty() {
-            return None;
-        }
+        let path = normalize_archive_entry_path(&path)?;
         Some(ArchiveEntry {
             path,
             size: self.size,
@@ -746,6 +759,29 @@ Encrypted = -
         let output = "----------\nPath = Dir\\Sub\\file.txt\nSize = 100\n";
         let listing = parse_slt_output(output, Path::new("test.zip")).unwrap();
         assert_eq!(listing.entries[0].path, "Dir/Sub/file.txt");
+    }
+
+    #[test]
+    fn unsafe_archive_entry_paths_are_rejected() {
+        let output = r#"----------
+Path = good/track.flac
+Size = 100
+
+----------
+Path = ../escape.flac
+Size = 200
+
+----------
+Path = good/../escape.flac
+Size = 300
+
+----------
+Path = /absolute.flac
+Size = 400
+"#;
+        let listing = parse_slt_output(output, Path::new("test.zip")).unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].path, "good/track.flac");
     }
 
     #[test]

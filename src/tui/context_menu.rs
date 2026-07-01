@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use super::app::*;
-use super::browse::EntryKind;
+use super::browse::{BrowseEntry, EntryKind};
 use super::message::AppMessage;
 use crate::convert::ConversionStatus;
 
@@ -333,6 +333,81 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
     }
 }
 
+
+/// Archive browse entries use synthetic paths (`archive/inner`) that do not
+/// exist on the host filesystem. Only expose actions here that either navigate
+/// the in-memory archive listing or have an explicit archive-aware staging path.
+/// Generic file operations (bulk rename, copy/move, trash, text view/edit,
+/// tagging utilities, analysis) must stay hidden so they cannot feed synthetic
+/// paths into filesystem code.
+fn archive_entry_can_rename(entry: &BrowseEntry) -> bool {
+    !matches!(entry.kind, EntryKind::Directory | EntryKind::ParentDir)
+}
+
+fn archive_file_ops_submenu(entry: &BrowseEntry) -> Option<ContextMenuEntry> {
+    if !archive_entry_can_rename(entry) {
+        return None;
+    }
+    Some(ContextMenuEntry::Submenu {
+        label: "File operations".to_string(),
+        children: vec![item("Rename", ContextAction::RenameEntry)],
+    })
+}
+
+fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry> {
+    let mut items = Vec::new();
+
+    match &entry.kind {
+        EntryKind::AudioFile(_) => {
+            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
+            items.push(separator());
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            if let Some(file_ops) = archive_file_ops_submenu(entry) {
+                items.push(separator());
+                items.push(file_ops);
+            }
+            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+        }
+        EntryKind::Directory => {
+            items.push(item("Open", ContextAction::OpenEntry));
+            items.push(separator());
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+        }
+        EntryKind::ParentDir => {
+            items.push(item("Go up", ContextAction::OpenEntry));
+            items.push(separator());
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Deselect", ContextAction::Deselect));
+        }
+        _ => {
+            items.push(item("Select", ContextAction::Select));
+            items.push(item("Select All", ContextAction::SelectAll));
+            items.push(item("Select Inverse", ContextAction::SelectInverse));
+            items.push(item("Deselect", ContextAction::Deselect));
+            if let Some(file_ops) = archive_file_ops_submenu(entry) {
+                items.push(separator());
+                items.push(file_ops);
+            }
+            items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
+        }
+    }
+
+    items
+}
+
+fn archive_synthetic_file_op_status(app: &mut AppState, operation: &str) {
+    app.set_status(format!(
+        "archive: {operation} is unavailable inside archives; extract the file or use archive-aware metadata/rename"
+    ));
+}
+
 /// Build the "Tagging" submenu (MusicBrainz lookup, CUE import).
 /// `has_cue` controls whether the CUE import option is shown.
 ///
@@ -443,6 +518,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         None => return Vec::new(),
     };
 
+    if app.browse.is_in_archive() {
+        return build_archive_browse_entry_menu(entry);
+    }
+
     let mut items = Vec::new();
 
     match &entry.kind {
@@ -488,6 +567,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Select Inverse", ContextAction::SelectInverse));
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
+            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Set Password", ContextAction::SetArchivePassword));
             items.push(build_file_ops_submenu(false));
             items.push(item(
@@ -757,6 +837,41 @@ pub fn build_queue_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     items
 }
 
+
+fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<&'static str> {
+    match action {
+        ContextAction::ConvertCustom
+        | ContextAction::ConvertLastUsed
+        | ContextAction::ConvertWithPreset(_) => Some("conversion"),
+        ContextAction::EditMetadata(_) => Some("inline metadata editing"),
+        ContextAction::CopyTo | ContextAction::MoveTo => Some("copy/move"),
+        ContextAction::MoveToTrash => Some("trash"),
+        ContextAction::BulkRename => Some("bulk rename"),
+        ContextAction::Analyze => Some("analysis"),
+        ContextAction::SetArchivePassword => Some("archive password editing"),
+        ContextAction::Verify
+        | ContextAction::VerifyAccurateRip
+        | ContextAction::AccurateRipFullScan
+        | ContextAction::AccurateRipBatch
+        | ContextAction::AccurateRipFixOffset
+        | ContextAction::VerifyCtdb
+        | ContextAction::CtdbRepair => Some("verification"),
+        ContextAction::GenerateCueMultiFile
+        | ContextAction::GenerateCueSingleImage
+        | ContextAction::GenerateCueMbMultiFile
+        | ContextAction::GenerateCueMbSingleImage
+        | ContextAction::FillCueFromMb
+        | ContextAction::ImportCueFromBrowse => Some("CUE operations"),
+        ContextAction::MarkCompareReference | ContextAction::BitCompareWithReference => {
+            Some("bit comparison")
+        }
+        ContextAction::DetectPreemphasis => Some("pre-emphasis detection"),
+        ContextAction::QueryGnudb | ContextAction::TagsFromMb => Some("tag lookup"),
+        ContextAction::ViewFile(_) | ContextAction::EditFile(_) => Some("text file view/edit"),
+        _ => None,
+    }
+}
+
 // ── Action dispatch ─────────────────────────────────────────────────
 
 /// Execute a context action. Delegates to existing command/action
@@ -769,6 +884,12 @@ pub fn execute_context_action(
 ) {
     if super::disc_browser_actions::handle_disc_context_action(app, &action, tx) {
         return;
+    }
+    if app.current_screen == AppScreen::Browse && app.browse.is_in_archive() {
+        if let Some(operation) = archive_context_action_requires_real_paths(&action) {
+            archive_synthetic_file_op_status(app, operation);
+            return;
+        }
     }
     match action {
         // ── Browse: Convert actions ─────────────────────────────────
@@ -833,8 +954,21 @@ pub fn execute_context_action(
         ContextAction::OpenEntry => {
             // Simulate Enter on browse
             if app.current_screen == AppScreen::Browse {
-                if let Some(entry) = app.browse.selected_entry() {
-                    match &entry.kind {
+                if let Some(entry) = app.browse.selected_entry().cloned() {
+                    match entry.kind.clone() {
+                        EntryKind::Directory | EntryKind::ParentDir if app.browse.is_in_archive() => {
+                            if matches!(entry.kind.clone(), EntryKind::ParentDir) {
+                                if !app.browse.go_up_in_archive() {
+                                    app.browse.exit_archive();
+                                }
+                                app.browse.probe_current_with_db(tx, Some(&app.db));
+                            } else if let Some(inner) = app.browse.archive_inner_path_for_path(&entry.path) {
+                                app.browse.enter_archive_dir(&inner);
+                                app.browse.probe_current_with_db(tx, Some(&app.db));
+                            } else {
+                                app.set_status("archive: could not resolve directory entry");
+                            }
+                        }
                         EntryKind::Directory | EntryKind::ParentDir => {
                             app.browse.enter_selected();
                             app.browse.probe_current_with_db(tx, Some(&app.db));
@@ -849,6 +983,16 @@ pub fn execute_context_action(
             }
         }
         ContextAction::RenameEntry => {
+            if app.browse.is_in_archive() {
+                let can_rename = app
+                    .browse
+                    .selected_entry()
+                    .is_some_and(archive_entry_can_rename);
+                if !can_rename {
+                    archive_synthetic_file_op_status(app, "directory rename");
+                    return;
+                }
+            }
             let cmd = super::command::Command::Rename(String::new());
             super::command::execute_command(app, cmd, tx);
         }
@@ -869,6 +1013,10 @@ pub fn execute_context_action(
             super::keybindings::open_metadata_editor(app);
         }
         ContextAction::MoveToTrash => {
+            if app.browse.is_in_archive() {
+                archive_synthetic_file_op_status(app, "trash");
+                return;
+            }
             let cmd = super::command::Command::Delete;
             super::command::execute_command(app, cmd, tx);
         }
@@ -1236,6 +1384,10 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::BulkRename => {
+            if app.browse.is_in_archive() {
+                archive_synthetic_file_op_status(app, "bulk rename");
+                return;
+            }
             // Reuse the same path as the R keybinding.
             let paths = super::command::collect_selection_for_file_ops(app);
             let audio_paths: Vec<std::path::PathBuf> = paths
@@ -1250,10 +1402,18 @@ pub fn execute_context_action(
             super::keybindings::open_bulk_rename(app, audio_paths);
         }
         ContextAction::CopyTo => {
+            if app.browse.is_in_archive() {
+                archive_synthetic_file_op_status(app, "copy/move");
+                return;
+            }
             let sources = super::command::collect_selection_for_file_ops(app);
             super::command::open_file_picker_for_copy_move(app, sources, false, false);
         }
         ContextAction::MoveTo => {
+            if app.browse.is_in_archive() {
+                archive_synthetic_file_op_status(app, "copy/move");
+                return;
+            }
             let sources = super::command::collect_selection_for_file_ops(app);
             super::command::open_file_picker_for_copy_move(app, sources, false, true);
         }
@@ -1540,6 +1700,80 @@ mod tests {
             album_artist: None,
             genre: None,
             year: None,
+        }
+    }
+
+
+    fn archive_test_entry(kind: EntryKind) -> BrowseEntry {
+        BrowseEntry::new(
+            std::path::PathBuf::from("/tmp/archive.zip/inner/track.flac"),
+            "track.flac".to_string(),
+            kind,
+            0,
+            None,
+        )
+    }
+
+    fn menu_labels_recursive(entries: &[ContextMenuEntry]) -> Vec<String> {
+        let mut labels = Vec::new();
+        for entry in entries {
+            match entry {
+                ContextMenuEntry::Item(item) => labels.push(item.label.clone()),
+                ContextMenuEntry::Submenu { label, children } => {
+                    labels.push(label.clone());
+                    labels.extend(menu_labels_recursive(children));
+                }
+                ContextMenuEntry::Separator => {}
+            }
+        }
+        labels
+    }
+
+    #[test]
+    fn archive_audio_menu_hides_generic_filesystem_operations() {
+        let entry = archive_test_entry(EntryKind::AudioFile(
+            crate::convert::formats::AudioFormat::Flac,
+        ));
+        let labels = menu_labels_recursive(&build_archive_browse_entry_menu(&entry));
+
+        assert!(labels.iter().any(|label| label == "Edit metadata"));
+        assert!(labels.iter().any(|label| label == "Rename"));
+        for forbidden in [
+            "Bulk Rename",
+            "Copy to...",
+            "Move to...",
+            "Move to Trash",
+            "Analyze",
+            "Tagging",
+            "Utilities",
+            "Disc Tools",
+        ] {
+            assert!(
+                !labels.iter().any(|label| label == forbidden),
+                "archive audio menu must not expose generic filesystem action: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_directory_menu_hides_rename_and_metadata() {
+        let entry = archive_test_entry(EntryKind::Directory);
+        let labels = menu_labels_recursive(&build_archive_browse_entry_menu(&entry));
+
+        assert!(labels.iter().any(|label| label == "Open"));
+        for forbidden in [
+            "Edit metadata",
+            "File operations",
+            "Rename",
+            "Bulk Rename",
+            "Copy to...",
+            "Move to...",
+            "Move to Trash",
+        ] {
+            assert!(
+                !labels.iter().any(|label| label == forbidden),
+                "archive directory menu must not expose unsupported action: {forbidden}"
+            );
         }
     }
 

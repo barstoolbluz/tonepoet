@@ -1324,6 +1324,50 @@ impl PendingBrowseArchiveMetadataEdit {
     }
 }
 
+
+/// Lifecycle handle for Browse-screen archive-entry rename. The operation
+/// extracts the archive into staging, performs the filesystem rename inside
+/// staging, repackages the archive atomically, then cleans staging in the
+/// event-loop completion path.
+#[derive(Clone)]
+pub struct PendingBrowseArchiveRename {
+    pub archive_path: PathBuf,
+    pub staging_dir: PathBuf,
+    pub old_inner_path: String,
+    pub new_inner_path: String,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+impl fmt::Debug for PendingBrowseArchiveRename {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingBrowseArchiveRename")
+            .field("archive_path", &self.archive_path)
+            .field("staging_dir", &self.staging_dir)
+            .field("old_inner_path", &self.old_inner_path)
+            .field("new_inner_path", &self.new_inner_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingBrowseArchiveRename {
+    pub fn new(archive_path: PathBuf, old_inner_path: String, new_inner_path: String) -> Self {
+        Self {
+            archive_path,
+            staging_dir: std::env::temp_dir().join(format!(
+                "tonepoet-archive-rename-{}",
+                uuid::Uuid::new_v4()
+            )),
+            old_inner_path,
+            new_inner_path,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn matches(&self, archive_path: &Path, staging_dir: &Path) -> bool {
+        self.archive_path.as_path() == archive_path && self.staging_dir.as_path() == staging_dir
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveMetadataEditOwner {
     Browse,
@@ -7271,6 +7315,10 @@ pub struct AppState {
     /// editor or an error/stale result cleans it up.
     pub pending_browse_archive_metadata: Option<PendingBrowseArchiveMetadataEdit>,
 
+    /// Browse-screen archive-entry rename currently in flight. This owns the
+    /// temporary staging tree until the matching completion arrives.
+    pub pending_browse_archive_rename: Option<PendingBrowseArchiveRename>,
+
     /// Browse-screen archive repackage currently in flight after staged tag
     /// writes have succeeded. The event-loop completion clears this and removes
     /// staging regardless of success or failure.
@@ -7286,6 +7334,11 @@ pub struct AppState {
     /// to finish. Successful completion resumes shutdown; failure keeps the app
     /// open long enough for the user to see the error.
     pub quit_after_browse_archive_repackage: bool,
+
+    /// True when quit is waiting for an in-flight Browse archive-entry rename to
+    /// finish. The rename worker owns active extraction/repackage I/O, so quit
+    /// must never remove its staging directory out from under it.
+    pub quit_after_browse_archive_rename: bool,
 
     /// Parked CuePreviewState while command mode is open. Set when `:`
     /// is pressed in the CUE preview overlay; consumed by `:w` (writes
@@ -7689,9 +7742,11 @@ impl AppState {
             pending_bulk_rename: None,
             pending_metadata_editor: None,
             pending_browse_archive_metadata: None,
+            pending_browse_archive_rename: None,
             browse_archive_repackage: None,
             quit_after_browse_archive_metadata_resolution: false,
             quit_after_browse_archive_repackage: false,
+            quit_after_browse_archive_rename: false,
             pending_cue_preview: None,
             pending_mb_select: None,
             status_message: theme_startup_status.map(|message| (message, std::time::Instant::now())),
@@ -7829,6 +7884,20 @@ impl AppState {
         self.touch_archive_listing_cache_key(&key);
         self.evict_archive_listing_cache_over_budget();
         true
+    }
+
+
+    pub fn invalidate_archive_listing_cache_for_path(&mut self, path: &Path) {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let keys: Vec<_> = self
+            .archive_listing_cache
+            .keys()
+            .filter(|key| key.path.as_path() == canonical.as_path() || key.path.as_path() == path)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.remove_archive_listing_cache_key(&key);
+        }
     }
 
     #[cfg(test)]

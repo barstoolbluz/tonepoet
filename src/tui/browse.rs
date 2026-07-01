@@ -633,6 +633,13 @@ pub struct BrowseState {
     /// Prevents duplicate spawns when the cursor moves rapidly.
     pub probe_pending: std::collections::HashSet<PathBuf>,
 
+    /// Per-archive mutation/probe epoch. Archive-entry probes capture this
+    /// value when launched and completions are accepted only if it still
+    /// matches. Successful archive metadata repack/rename and explicit
+    /// archive probe invalidation bump the affected archive's epoch, so stale
+    /// in-flight workers cannot repopulate synthetic-path metadata afterward.
+    pub archive_probe_epochs: HashMap<PathBuf, u64>,
+
     /// Directory stats cache: path → (file_count, audio_count, total_size)
     pub dir_stats_cache: HashMap<PathBuf, Arc<DirStats>>,
 
@@ -767,6 +774,7 @@ impl BrowseState {
             format_filter: FormatFilter::Off,
             probe_cache: HashMap::new(),
             probe_pending: std::collections::HashSet::new(),
+            archive_probe_epochs: HashMap::new(),
             dir_stats_cache: HashMap::new(),
             dir_stats_pending: std::collections::HashSet::new(),
             sacd_classify_cache: HashMap::new(),
@@ -865,7 +873,75 @@ impl BrowseState {
             password,
         });
         self.multi_selected.clear();
+        self.multi_select_anchor = None;
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+        self.clear_type_ahead();
         self.refresh_archive_view();
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// Replace the active archive listing after the archive changed on disk,
+    /// preserving the current archive directory and cursor when those entries
+    /// still exist. Used after metadata edits and repackages so file sizes and
+    /// packed sizes do not remain stale while the user stays inside the archive.
+    pub fn replace_active_archive_listing(
+        &mut self,
+        listing: super::archive_listing::ArchiveListing,
+        password: Option<String>,
+    ) {
+        let active_same_archive = self
+            .archive
+            .as_ref()
+            .is_some_and(|arc| arc.listing.archive_path == listing.archive_path);
+        if !active_same_archive {
+            self.enter_archive(listing, password);
+            return;
+        }
+
+        let previous_inner = self
+            .archive
+            .as_ref()
+            .map(|arc| arc.inner_path.clone())
+            .unwrap_or_default();
+        let previous_selected_inner = self
+            .entries
+            .get(self.selected_index)
+            .and_then(|entry| self.archive_inner_path_for_entry(entry));
+
+        let inner_still_exists = previous_inner.is_empty()
+            || listing.entries.iter().any(|entry| {
+                entry.path == previous_inner
+                    || entry
+                        .path
+                        .strip_prefix(previous_inner.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            });
+
+        self.archive = Some(ArchiveBrowseState {
+            listing,
+            inner_path: if inner_still_exists {
+                previous_inner
+            } else {
+                String::new()
+            },
+            password,
+        });
+        self.multi_selected.clear();
+        self.multi_select_anchor = None;
+        self.clear_type_ahead();
+        self.refresh_archive_view();
+
+        if let Some(inner) = previous_selected_inner {
+            if let Some(archive_path) = self.archive.as_ref().map(|arc| arc.listing.archive_path.clone()) {
+                let selected_path = archive_path.join(inner);
+                if let Some(idx) = self.entries.iter().position(|entry| entry.path == selected_path) {
+                    self.selected_index = idx;
+                    self.ensure_visible();
+                }
+            }
+        }
     }
 
     /// Exit the archive and return to filesystem browsing.
@@ -953,6 +1029,9 @@ impl BrowseState {
             }
         }
 
+        sort_entries(&mut dirs, self.sort_by, self.sort_dir);
+        sort_entries(&mut files, self.sort_by, self.sort_dir);
+
         // Build entries: parent + dirs + files (same order as filesystem browse).
         if let Some(ref parent) = self.parent_entry {
             self.entries.push(parent.clone());
@@ -960,9 +1039,20 @@ impl BrowseState {
         self.entries.extend(dirs);
         self.entries.extend(files);
 
-        // Clamp selection.
-        if self.selected_index >= self.entries.len() && !self.entries.is_empty() {
-            self.selected_index = self.entries.len() - 1;
+        // Clamp selection and viewport against the archive-local model. This is
+        // deliberately independent of the parent directory's previous scroll
+        // state; stale offsets were the root cause of blank archive panes after
+        // opening entries that had been far down a long parent listing.
+        if self.entries.is_empty() {
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+        } else {
+            if self.selected_index >= self.entries.len() {
+                self.selected_index = self.entries.len() - 1;
+            }
+            let max_offset = self.entries.len().saturating_sub(self.visible_height.max(1));
+            self.scroll_offset = self.scroll_offset.min(max_offset);
+            self.ensure_visible();
         }
     }
 
@@ -1238,7 +1328,11 @@ impl BrowseState {
             .entries
             .get(self.selected_index)
             .map(|e| e.path.clone());
-        self.apply_view();
+        if self.archive.is_some() {
+            self.refresh_archive_view();
+        } else {
+            self.apply_view();
+        }
         self.restore_cursor_on_path(prev_path);
     }
 
@@ -1389,6 +1483,58 @@ impl BrowseState {
             self.refresh();
             Ok(())
         }
+    }
+
+
+    /// Resolve a synthetic archive-entry path back to the relative path stored
+    /// in the archive listing. Returns `None` outside archive-browse mode or
+    /// for the synthetic parent (`..`) row.
+    pub fn archive_inner_path_for_path(&self, path: &Path) -> Option<String> {
+        let arc = self.archive.as_ref()?;
+        if path == Path::new("..") {
+            return None;
+        }
+        if let Ok(relative) = path.strip_prefix(&arc.listing.archive_path) {
+            if let Some(normalized) = normalize_archive_relative_path(relative) {
+                if !normalized.is_empty() {
+                    return Some(normalized);
+                }
+            }
+        }
+
+        // Fallback for callers holding a BrowseEntry whose synthetic path could
+        // not be stripped byte-for-byte (for example after a relative/absolute
+        // path normalization difference). Rebuild it from the archive-local
+        // directory plus the visible entry name, and accept it only if the
+        // listing contains that exact file or directory.
+        let name = path.file_name().and_then(|name| name.to_str())?;
+        let candidate = if arc.inner_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", arc.inner_path, name)
+        };
+        arc.listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == candidate)
+            .then_some(candidate)
+    }
+
+    pub fn archive_inner_path_for_entry(&self, entry: &BrowseEntry) -> Option<String> {
+        if matches!(entry.kind, EntryKind::ParentDir) {
+            return None;
+        }
+        self.archive_inner_path_for_path(&entry.path)
+    }
+
+    pub fn archive_entry_for_path(&self, path: &Path) -> Option<&super::archive_listing::ArchiveEntry> {
+        let inner = self.archive_inner_path_for_path(path)?;
+        self.archive
+            .as_ref()?
+            .listing
+            .entries
+            .iter()
+            .find(|entry| entry.path == inner)
     }
 
     pub fn selected_entry(&self) -> Option<&BrowseEntry> {
@@ -2027,6 +2173,35 @@ impl BrowseState {
             None => return,
         };
 
+        if self.archive.is_some() {
+            if entry.is_audio() {
+                let path = entry.path.clone();
+                if self.probe_cache.contains_key(&path) || self.probe_pending.contains(&path) {
+                    return;
+                }
+                let Some(inner_path) = self.archive_inner_path_for_entry(entry) else {
+                    return;
+                };
+                let Some(arc) = self.archive.as_ref() else {
+                    return;
+                };
+                let archive_path = arc.listing.archive_path.clone();
+                let probe_context = self.archive_entry_probe_context_for(&archive_path);
+                let password = arc.password.clone();
+
+                self.probe_pending.insert(path.clone());
+                spawn_archive_entry_audio_probe(
+                    archive_path,
+                    inner_path,
+                    path,
+                    password,
+                    probe_context,
+                    tx.clone(),
+                );
+            }
+            return;
+        }
+
         if entry.is_probeable() {
             let path = entry.path.clone();
             if self.probe_cache.contains_key(&path) || self.probe_pending.contains(&path) {
@@ -2063,6 +2238,67 @@ impl BrowseState {
             self.dir_stats_pending.insert(path.clone());
             spawn_dir_stats(path, tx.clone());
         }
+    }
+
+    /// Current archive-entry probe epoch for `archive_path`. Missing entries
+    /// are epoch 0 so old bundles and newly opened archives start naturally.
+    pub fn archive_probe_epoch_for(&self, archive_path: &Path) -> u64 {
+        self.archive_probe_epochs
+            .get(archive_path)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Build the acceptance context attached to a worker launched for a
+    /// synthetic archive entry. The completion handler compares this captured
+    /// epoch with the current one before it can write `probe_cache`.
+    pub fn archive_entry_probe_context_for(
+        &self,
+        archive_path: &Path,
+    ) -> super::message::AudioProbeContext {
+        super::message::AudioProbeContext::ArchiveEntry {
+            archive_path: archive_path.to_path_buf(),
+            archive_probe_epoch: self.archive_probe_epoch_for(archive_path),
+        }
+    }
+
+    /// Bump the mutation epoch for one archive and return the new value.
+    pub fn bump_archive_probe_epoch_for(&mut self, archive_path: &Path) -> u64 {
+        let epoch = self
+            .archive_probe_epochs
+            .entry(archive_path.to_path_buf())
+            .or_insert(0);
+        *epoch = epoch.saturating_add(1);
+        *epoch
+    }
+
+    /// Remove all in-memory probe state associated with an archive and its
+    /// synthetic archive-entry paths (`archive.zip/inner/file.flac`). This is
+    /// intentionally prefix-based because synthetic entries are not real
+    /// filesystem children but are represented as joined paths in Browse. The
+    /// archive epoch is also bumped so any worker that was already extracting
+    /// or probing an old archive member is rejected when it eventually reports.
+    pub fn invalidate_archive_probe_cache_for(&mut self, archive_path: &Path) {
+        self.bump_archive_probe_epoch_for(archive_path);
+        self.probe_cache.retain(|path, _| !archive_probe_path_matches(path, archive_path));
+        self.probe_pending
+            .retain(|path| !archive_probe_path_matches(path, archive_path));
+    }
+
+    /// Return whether an archive-entry probe completion is still current.
+    /// Requiring both a live pending marker and an unchanged archive epoch
+    /// prevents pre-repackage workers from repopulating stale synthetic-path
+    /// metadata after the archive has been rewritten.
+    pub fn accept_archive_entry_probe_completion(
+        &self,
+        path: &Path,
+        archive_path: &Path,
+        archive_probe_epoch: u64,
+        was_pending: bool,
+    ) -> bool {
+        was_pending
+            && archive_probe_path_matches(path, archive_path)
+            && self.archive_probe_epoch_for(archive_path) == archive_probe_epoch
     }
 
     /// Get cached info for the currently selected audio file, if probed
@@ -2108,10 +2344,129 @@ fn spawn_cached_audio_probe_metadata_completion(
         let _ = tx
             .send(super::message::AppMessage::AudioProbeComplete {
                 path,
+                context: super::message::AudioProbeContext::Filesystem,
                 result: Box::new(result),
             })
             .await;
     });
+}
+
+
+/// Spawn a worker that extracts one archive member to a private temp tree,
+/// probes that real file, then reports the result under the synthetic browse
+/// path. The temp tree is removed before the message is sent, so cache entries
+/// never point at short-lived staging files.
+fn spawn_archive_entry_audio_probe(
+    archive_path: PathBuf,
+    inner_path: String,
+    synthetic_path: PathBuf,
+    password: Option<String>,
+    probe_context: super::message::AudioProbeContext,
+    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let result = async {
+            let staging_dir = std::env::temp_dir().join(format!(
+                "tonepoet-archive-entry-probe-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let extracted = extract_archive_entry_to_temp(
+                &archive_path,
+                &inner_path,
+                password.as_deref(),
+                &staging_dir,
+            )
+            .await;
+
+            let result: Result<CachedInfo, String> = match extracted {
+                Ok(path) => {
+                    let path_for_task = path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let source = crate::tui::probe::probe_audio(&path_for_task)
+                            .map_err(|err| format!("{}", err))?;
+                        let metadata = crate::tui::probe::read_metadata(&path_for_task)
+                            .unwrap_or_else(|_| {
+                                let mut metadata = SourceMetadata::default();
+                                metadata.preemphasis_metadata =
+                                    crate::tui::probe::preemphasis_metadata_check_blocking(
+                                        &path_for_task,
+                                    );
+                                metadata
+                            });
+                        Ok(CachedInfo { source, metadata })
+                    })
+                    .await
+                    .unwrap_or_else(|join_err| {
+                        Err(format!("archive entry probe task panicked: {}", join_err))
+                    })
+                }
+                Err(err) => Err(err),
+            };
+
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            result
+        }
+        .await;
+
+        let _ = tx
+            .send(super::message::AppMessage::AudioProbeComplete {
+                path: synthetic_path,
+                context: probe_context,
+                result: Box::new(result),
+            })
+            .await;
+    });
+}
+
+async fn extract_archive_entry_to_temp(
+    archive_path: &Path,
+    inner_path: &str,
+    password: Option<&str>,
+    staging_dir: &Path,
+) -> Result<PathBuf, String> {
+    let extracted = staging_path_for_archive_inner(staging_dir, inner_path)?;
+    let extraction_mode = validate_archive_entry_probe_selector(inner_path)?;
+    let bin = crate::detect_7z_binary()
+        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+    std::fs::create_dir_all(staging_dir)
+        .map_err(|err| format!("create archive-entry probe staging failed: {err}"))?;
+
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("x")
+        .arg(archive_path)
+        .arg(format!("-o{}", staging_dir.display()))
+        .arg("-y")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let ArchiveEntryProbeExtraction::SingleMember = extraction_mode {
+        cmd.arg(inner_path);
+    }
+    if let Some(password) = password {
+        cmd.arg(format!("-p{}", password));
+    }
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|err| format!("failed to run {}: {}", bin, err))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let operation = match extraction_mode {
+            ArchiveEntryProbeExtraction::SingleMember => "archive entry extraction",
+            ArchiveEntryProbeExtraction::FullArchiveFallback => "archive extraction fallback",
+        };
+        return Err(format!("{} failed: {}", operation, stderr.trim()));
+    }
+
+    if extracted.is_file() {
+        Ok(extracted)
+    } else {
+        Err(format!(
+            "archive entry extraction did not produce a file: {}",
+            inner_path
+        ))
+    }
 }
 
 /// Spawn a background tokio task that probes the audio file at `path` and
@@ -2149,6 +2504,7 @@ pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::mes
         let _ = tx
             .send(super::message::AppMessage::AudioProbeComplete {
                 path,
+                context: super::message::AudioProbeContext::Filesystem,
                 result: Box::new(result),
             })
             .await;
@@ -2186,6 +2542,7 @@ pub fn spawn_cue_proxy_audio_probe(
         let _ = tx
             .send(super::message::AppMessage::AudioProbeComplete {
                 path,
+                context: super::message::AudioProbeContext::Filesystem,
                 result: Box::new(result),
             })
             .await;
@@ -2386,6 +2743,85 @@ fn entry_passes_view(
         }
     }
     true
+}
+
+
+fn normalize_archive_relative_path(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn archive_probe_path_matches(path: &Path, archive_path: &Path) -> bool {
+    if path == archive_path {
+        return true;
+    }
+    path.strip_prefix(archive_path)
+        .ok()
+        .is_some_and(|relative| !relative.as_os_str().is_empty())
+}
+
+fn staging_path_for_archive_inner(staging_dir: &Path, inner_path: &str) -> Result<PathBuf, String> {
+    let mut out = staging_dir.to_path_buf();
+    for component in Path::new(inner_path).components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "archive entry path is unsafe: {}",
+                    inner_path
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveEntryProbeExtraction {
+    SingleMember,
+    FullArchiveFallback,
+}
+
+fn validate_archive_entry_probe_selector(
+    inner_path: &str,
+) -> Result<ArchiveEntryProbeExtraction, String> {
+    if inner_path.is_empty() {
+        return Err("archive entry path is empty".to_string());
+    }
+
+    let mut wildcard_syntax = false;
+    for component in Path::new(inner_path).components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!("archive entry path is unsafe: {}", inner_path));
+        };
+        let text = part.to_string_lossy();
+        if text.starts_with('-') || text.starts_with('@') {
+            return Err(format!(
+                "archive entry path is unsafe for single-entry extraction: {}",
+                inner_path
+            ));
+        }
+        wildcard_syntax |= text.contains('*')
+            || text.contains('?')
+            || text.contains('[')
+            || text.contains(']');
+    }
+
+    if wildcard_syntax {
+        Ok(ArchiveEntryProbeExtraction::FullArchiveFallback)
+    } else {
+        Ok(ArchiveEntryProbeExtraction::SingleMember)
+    }
 }
 
 /// Sort a vec of entries by the given field and direction
@@ -3572,6 +4008,54 @@ mod tests {
         state
     }
 
+    #[test]
+    fn archive_probe_selector_rejects_unsafe_path_structure() {
+        for inner in ["", "/abs.flac", "../escape.flac", "dir/../escape.flac"] {
+            assert!(
+                validate_archive_entry_probe_selector(inner).is_err(),
+                "unsafe archive entry path should be rejected: {inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_probe_selector_rejects_switch_and_listfile_components() {
+        for inner in [
+            "-track.flac",
+            "dir/-track.flac",
+            "@listfile.flac",
+            "dir/@listfile.flac",
+        ] {
+            assert!(
+                validate_archive_entry_probe_selector(inner).is_err(),
+                "selector should be rejected: {inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_probe_selector_uses_full_archive_fallback_for_wildcard_like_names() {
+        for inner in [
+            "disc/*.flac",
+            "disc/track?.flac",
+            "Disc 1/01 - Song [Live].flac",
+        ] {
+            assert_eq!(
+                validate_archive_entry_probe_selector(inner),
+                Ok(ArchiveEntryProbeExtraction::FullArchiveFallback),
+                "wildcard-looking archive entry should use full extraction fallback: {inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_probe_selector_accepts_normal_archive_paths() {
+        assert_eq!(
+            validate_archive_entry_probe_selector("Disc 1/01 - Song.flac"),
+            Ok(ArchiveEntryProbeExtraction::SingleMember)
+        );
+    }
+
     fn make_valid_bluray_layout(
         root: &std::path::Path,
         bdmv_name: &str,
@@ -4641,6 +5125,94 @@ FILE "10 - Live Version.wav" WAVE
         assert_eq!(expanded.len(), 1);
         assert!(path_list_contains(&expanded, &cue));
         assert!(!path_list_contains(&expanded, &image));
+    }
+
+    #[test]
+    fn archive_relative_path_normalization_rejects_unsafe_components() {
+        assert_eq!(
+            normalize_archive_relative_path(std::path::Path::new("disc 1/track.flac")).as_deref(),
+            Some("disc 1/track.flac")
+        );
+        assert_eq!(
+            normalize_archive_relative_path(std::path::Path::new("./disc 1/track.flac")).as_deref(),
+            Some("disc 1/track.flac")
+        );
+        assert!(normalize_archive_relative_path(std::path::Path::new("../track.flac")).is_none());
+        assert!(normalize_archive_relative_path(std::path::Path::new("disc/../track.flac")).is_none());
+        assert!(normalize_archive_relative_path(std::path::Path::new("/absolute/track.flac")).is_none());
+    }
+
+    #[test]
+    fn archive_probe_invalidation_removes_synthetic_entries_only_for_that_archive() {
+        let archive = std::path::PathBuf::from("/tmp/Album.zip");
+        let synthetic = archive.join("Disc 1/01.flac");
+        let pending = archive.join("Disc 1/02.flac");
+        let sibling = std::path::PathBuf::from("/tmp/Album.zipx/01.flac");
+
+        let mut state = BrowseState::new();
+        state.probe_cache.insert(archive.clone(), None);
+        state.probe_cache.insert(synthetic.clone(), None);
+        state.probe_cache.insert(sibling.clone(), None);
+        state.probe_pending.insert(pending.clone());
+        state.probe_pending.insert(sibling.clone());
+
+        state.invalidate_archive_probe_cache_for(&archive);
+
+        assert!(!state.probe_cache.contains_key(&archive));
+        assert!(!state.probe_cache.contains_key(&synthetic));
+        assert!(!state.probe_pending.contains(&pending));
+        assert!(state.probe_cache.contains_key(&sibling));
+        assert!(state.probe_pending.contains(&sibling));
+        assert_eq!(state.archive_probe_epoch_for(&archive), 1);
+    }
+
+    #[test]
+    fn archive_probe_completion_acceptance_rejects_stale_epoch() {
+        let archive = std::path::PathBuf::from("/tmp/Album.zip");
+        let synthetic = archive.join("Disc 1/01.flac");
+        let mut state = BrowseState::new();
+
+        let captured_epoch = state.archive_probe_epoch_for(&archive);
+        state.probe_pending.insert(synthetic.clone());
+        state.invalidate_archive_probe_cache_for(&archive);
+        let was_pending = state.probe_pending.remove(&synthetic);
+
+        assert!(!state.accept_archive_entry_probe_completion(
+            &synthetic,
+            &archive,
+            captured_epoch,
+            was_pending,
+        ));
+    }
+
+    #[test]
+    fn archive_probe_completion_acceptance_requires_pending_marker() {
+        let archive = std::path::PathBuf::from("/tmp/Album.zip");
+        let synthetic = archive.join("Disc 1/01.flac");
+        let state = BrowseState::new();
+        let captured_epoch = state.archive_probe_epoch_for(&archive);
+
+        assert!(!state.accept_archive_entry_probe_completion(
+            &synthetic,
+            &archive,
+            captured_epoch,
+            false,
+        ));
+    }
+
+    #[test]
+    fn archive_probe_completion_acceptance_allows_current_pending_probe() {
+        let archive = std::path::PathBuf::from("/tmp/Album.zip");
+        let synthetic = archive.join("Disc 1/01.flac");
+        let state = BrowseState::new();
+        let captured_epoch = state.archive_probe_epoch_for(&archive);
+
+        assert!(state.accept_archive_entry_probe_completion(
+            &synthetic,
+            &archive,
+            captured_epoch,
+            true,
+        ));
     }
 
     #[test]

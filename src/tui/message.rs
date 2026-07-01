@@ -25,6 +25,22 @@ pub enum MbOutcome {
     },
 }
 
+
+/// Probe-completion acceptance context for Browse audio probes.
+///
+/// Filesystem probes are keyed only by their real path. Archive-entry probes
+/// carry the archive mutation epoch captured when the worker was launched, so
+/// completions from workers that started before a repack/rename/cache
+/// invalidation cannot repopulate stale synthetic-path metadata afterward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioProbeContext {
+    Filesystem,
+    ArchiveEntry {
+        archive_path: std::path::PathBuf,
+        archive_probe_epoch: u64,
+    },
+}
+
 /// Per-dispatch context for the unified `:tags-mb` flow. Three entry
 /// points build one of these:
 ///
@@ -139,6 +155,23 @@ pub enum AppMessage {
         staging_dir: std::path::PathBuf,
         result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String>,
     },
+
+    /// Milestone from Browse-screen archive-entry rename. Displayed only while
+    /// it matches the current pending rename handle.
+    ArchiveEntryRenameProgress {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        message: String,
+    },
+    /// Completed Browse-screen archive-entry rename. Staging is cleaned up by
+    /// the event-loop reducer in every outcome.
+    ArchiveEntryRenameResult {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        old_inner_path: String,
+        new_inner_path: String,
+        result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String>,
+    },
     /// Result of an asynchronous audio probe (lofty + ffmpeg) launched by
     /// `BrowseState::probe_current`. The main loop updates `probe_cache` and
     /// removes the path from `probe_pending`. Reducers must not perform
@@ -146,6 +179,8 @@ pub enum AppMessage {
     /// optional metadata before sending this message.
     AudioProbeComplete {
         path: std::path::PathBuf,
+        /// Acceptance guard captured when the worker was launched.
+        context: AudioProbeContext,
         /// Owned cached-info on success; error string on failure.
         result: Box<Result<crate::tui::browse::CachedInfo, String>>,
     },

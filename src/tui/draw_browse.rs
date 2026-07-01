@@ -986,6 +986,7 @@ fn entry_info_lines(
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let mut meta_field_rows: Vec<(MetadataField, usize)> = Vec::new();
     let mut inline_cursor: Option<(usize, u16)> = None;
+    let archive_metadata_inline_disabled = browse.is_in_archive();
     // Pill rows set by branches that emit them after their content.
     // SacdIso is the only branch using this besides AudioFile (which
     // returns early), but the pattern generalises if more arms grow
@@ -994,6 +995,9 @@ fn entry_info_lines(
     let mut audio_streams_pill_row: Option<usize> = None;
 
     let inline_metadata_input = |field: MetadataField| -> Option<&TextInputState> {
+        if archive_metadata_inline_disabled {
+            return None;
+        }
         inline_edit.and_then(|state| match &state.target {
             BrowseInlineEditTarget::Metadata { path, field: active_field }
                 if path == &entry.path && *active_field == field => Some(&state.input),
@@ -1001,7 +1005,8 @@ fn entry_info_lines(
         })
     };
     let metadata_focused = |field: MetadataField| -> bool {
-        matches!(info_focus, Some(BrowseInfoFocus::Metadata(active)) if active == field)
+        !archive_metadata_inline_disabled
+            && matches!(info_focus, Some(BrowseInfoFocus::Metadata(active)) if active == field)
     };
     let metadata_label_style = |field: MetadataField| {
         if metadata_focused(field) {
@@ -1259,7 +1264,9 @@ fn entry_info_lines(
                         ]);
                     } else {
                         lines.push(vec![Span::styled(
-                            if metadata_focused(MetadataField::Title) {
+                            if archive_metadata_inline_disabled {
+                                "   (use edit tags)"
+                            } else if metadata_focused(MetadataField::Title) {
                                 "   (type to add)"
                             } else {
                                 "   (click to add)"
@@ -1267,7 +1274,9 @@ fn entry_info_lines(
                             metadata_placeholder_style(MetadataField::Title),
                         )]);
                     }
-                    meta_field_rows.push((MetadataField::Title, title_value_row));
+                    if !archive_metadata_inline_disabled {
+                        meta_field_rows.push((MetadataField::Title, title_value_row));
+                    }
 
                     // Artist: inline label + value. Clickable on the whole line.
                     let artist_row = lines.len();
@@ -1286,7 +1295,9 @@ fn entry_info_lines(
                         lines.push(vec![
                             Span::styled("   artist  ", metadata_label_style(MetadataField::Artist)),
                             Span::styled(
-                                if metadata_focused(MetadataField::Artist) {
+                                if archive_metadata_inline_disabled {
+                                    "(use edit tags)"
+                                } else if metadata_focused(MetadataField::Artist) {
                                     "(type to add)"
                                 } else {
                                     "(click to add)"
@@ -1295,7 +1306,9 @@ fn entry_info_lines(
                             ),
                         ]);
                     }
-                    meta_field_rows.push((MetadataField::Artist, artist_row));
+                    if !archive_metadata_inline_disabled {
+                        meta_field_rows.push((MetadataField::Artist, artist_row));
+                    }
 
                     // Album
                     let album_row = lines.len();
@@ -1314,7 +1327,9 @@ fn entry_info_lines(
                         lines.push(vec![
                             Span::styled("   album   ", metadata_label_style(MetadataField::Album)),
                             Span::styled(
-                                if metadata_focused(MetadataField::Album) {
+                                if archive_metadata_inline_disabled {
+                                    "(use edit tags)"
+                                } else if metadata_focused(MetadataField::Album) {
                                     "(type to add)"
                                 } else {
                                     "(click to add)"
@@ -1323,7 +1338,9 @@ fn entry_info_lines(
                             ),
                         ]);
                     }
-                    meta_field_rows.push((MetadataField::Album, album_row));
+                    if !archive_metadata_inline_disabled {
+                        meta_field_rows.push((MetadataField::Album, album_row));
+                    }
 
                     // Genre
                     let genre_row = lines.len();
@@ -1342,7 +1359,9 @@ fn entry_info_lines(
                         lines.push(vec![
                             Span::styled("   genre   ", metadata_label_style(MetadataField::Genre)),
                             Span::styled(
-                                if metadata_focused(MetadataField::Genre) {
+                                if archive_metadata_inline_disabled {
+                                    "(use edit tags)"
+                                } else if metadata_focused(MetadataField::Genre) {
                                     "(type to add)"
                                 } else {
                                     "(click to add)"
@@ -1351,7 +1370,9 @@ fn entry_info_lines(
                             ),
                         ]);
                     }
-                    meta_field_rows.push((MetadataField::Genre, genre_row));
+                    if !archive_metadata_inline_disabled {
+                        meta_field_rows.push((MetadataField::Genre, genre_row));
+                    }
 
                     // Year
                     let year_row = lines.len();
@@ -1370,7 +1391,9 @@ fn entry_info_lines(
                         lines.push(vec![
                             Span::styled("   year    ", metadata_label_style(MetadataField::Year)),
                             Span::styled(
-                                if metadata_focused(MetadataField::Year) {
+                                if archive_metadata_inline_disabled {
+                                    "(use edit tags)"
+                                } else if metadata_focused(MetadataField::Year) {
                                     "(type to add)"
                                 } else {
                                     "(click to add)"
@@ -1379,7 +1402,9 @@ fn entry_info_lines(
                             ),
                         ]);
                     }
-                    meta_field_rows.push((MetadataField::Year, year_row));
+                    if !archive_metadata_inline_disabled {
+                        meta_field_rows.push((MetadataField::Year, year_row));
+                    }
                 }
             } else {
                 // Not yet probed or probe failed — show basic info
@@ -1391,6 +1416,21 @@ fn entry_info_lines(
                     Span::styled("   size    ", theme.muted()),
                     Span::styled(size_str(entry.size), theme.text_style()),
                 ]);
+                if let Some(archive_entry) = browse.archive_entry_for_path(&entry.path) {
+                    if archive_entry.packed_size > 0 {
+                        lines.push(vec![
+                            Span::styled("   packed  ", theme.muted()),
+                            Span::styled(size_str(archive_entry.packed_size), theme.text_style()),
+                        ]);
+                    }
+                    lines.push(vec![
+                        Span::styled("   archive ", theme.muted()),
+                        Span::styled(
+                            if archive_entry.encrypted { "encrypted" } else { "entry" },
+                            theme.text_style(),
+                        ),
+                    ]);
+                }
 
                 // Analyze pill after basic info.
                 lines.push(vec![]);
