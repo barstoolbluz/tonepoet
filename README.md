@@ -101,7 +101,7 @@ The TUI is the primary interface. Five screens: Browse, Library, Convert, Queue,
 - **Browse** — full-featured file browser with audio-only filtering, type-ahead and recursive search, visual/range selection, column sorting, right-click context menus with disc verification, audio analysis, metadata editing, and conversion actions. Info pane shows metadata, analysis results, and artwork.
 - **Convert** — four-pane staging screen (source, metadata, format, output options) with pill-based controls, per-codec settings overlays (FLAC, AAC, Opus, MP3, WavPack), per-resampler settings overlays (SSRC, Sox, Soxr), preset system, DSD-aware gain controls
 - **Queue** — batch conversion monitor with per-track progress, expandable sub-lines, pause/resume, retry failed, clear completed
-- **Config** — settings editor with archive password keychain
+- **Config** — settings editor with archive password keychain, 24 built-in themes (dark + light) with theme builder, performance tuning for archive browsing
 
 Every action has three input paths: keyboard (vi-style colon commands), mouse clicks, and right-click context menus. Format-specific settings overlays include scrollable context-sensitive help (`?` key).
 
@@ -158,7 +158,7 @@ All provided by the nix flake:
 | AtomicParsley | AAC/M4A metadata |
 | libbluray | Blu-ray disc reading + AACS integration |
 | libaacs | Blu-ray AACS decryption (requires user-provided KEYDB.cfg) |
-| 7z (p7zip) | Archive extraction |
+| 7z (p7zip) | Archive extraction + repackaging |
 
 ## License
 
