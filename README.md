@@ -13,7 +13,7 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 ### Browsing and file management
 
 - **File browser** — audio-only filtering, type-ahead and recursive search, visual/range selection, column sorting, right-click context menus, info pane with metadata and analysis
-- **Archive browsing** — preview 7z/zip/rar contents before extraction, password keychain for encrypted archives
+- **Archive browsing** — browse inside 7z/zip/rar/tar/tar.gz/tar.bz2/tar.xz/tar.zst archives transparently. Rename files, edit metadata tags, and delete entries — all changes staged locally and repackaged atomically on navigate-away. Deferred save with SQLite crash recovery. Password keychain for encrypted archives. Info pane shows full metadata and format details for files inside archives. Progress overlay during repackage operations.
 - **Template-based naming** — folder and filename templates with tag variables (%ARTIST%, %ALBUM%, %TITLE%, etc.), interactive template builder with saved presets
 - **Bulk rename** — tag-based batch renaming with preview
 - **Bookmarks** — saved directory shortcuts
@@ -48,7 +48,7 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 
 **Output:** FLAC, Opus, AAC (libfdk_aac), MP3, ALAC, WAV, WavPack, DSF, DFF, W64, RF64, AIFF, LPCM, WebM, MKV
 
-**Input (decode-only):** All output formats plus ISO (SACD, DVD-Audio, DVD-Video, Blu-ray), Blu-ray BDMV directories, CUE+image, 7z/zip/rar archives, SHN, APE, DTS, AC3
+**Input (decode-only):** All output formats plus ISO (SACD, DVD-Audio, DVD-Video, Blu-ray), Blu-ray BDMV directories, CUE+image, 7z/zip/rar/tar/tar.gz/tar.bz2/tar.xz/tar.zst archives, SHN, APE, DTS, AC3
 
 **Resamplers:**
 
