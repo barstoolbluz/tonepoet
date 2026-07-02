@@ -1015,7 +1015,6 @@ fn entry_info_lines(
         if metadata_focused(field) {
             Style::default()
                 .fg(theme.text_bright)
-                .bg(theme.input_unfocused_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
             theme.muted()
@@ -1251,34 +1250,36 @@ fn entry_info_lines(
                     let inline_max = max_value_chars.saturating_sub(11);
                     lines.push(vec![]);
 
-                    // Title: 2-line layout (label + value). Clickable on value row.
-                    lines.push(vec![Span::styled("   title", metadata_label_style(MetadataField::Title))]);
-                    let title_value_row = lines.len();
+                    // Title: inline label + value (same layout as artist/album/genre/year).
+                    let title_row = lines.len();
                     if let Some(input) = inline_metadata_input(MetadataField::Title) {
                         lines.push(vec![
-                            Span::raw("   "),
-                            render_inline_value("", true, input, true, max_value_chars, theme),
+                            Span::styled("   title   ", metadata_label_style(MetadataField::Title)),
+                            render_inline_value("", true, input, true, inline_max, theme),
                         ]);
-                        inline_cursor = Some((title_value_row, 3 + inline_cursor_col(input, max_value_chars)));
+                        inline_cursor = Some((title_row, 11 + inline_cursor_col(input, inline_max)));
                     } else if let Some(title) = &meta.title {
                         lines.push(vec![
-                            Span::raw("   "),
-                            Span::styled(truncate_to(title, max_value_chars), metadata_value_style(MetadataField::Title)),
+                            Span::styled("   title   ", metadata_label_style(MetadataField::Title)),
+                            Span::styled(truncate_to(title, inline_max), metadata_value_style(MetadataField::Title)),
                         ]);
                     } else {
-                        lines.push(vec![Span::styled(
-                            if archive_metadata_inline_disabled {
-                                "   (use edit tags)"
-                            } else if metadata_focused(MetadataField::Title) {
-                                "   (type to add)"
-                            } else {
-                                "   (click to add)"
-                            },
-                            metadata_placeholder_style(MetadataField::Title),
-                        )]);
+                        lines.push(vec![
+                            Span::styled("   title   ", metadata_label_style(MetadataField::Title)),
+                            Span::styled(
+                                if archive_metadata_inline_disabled {
+                                    "(use edit tags)"
+                                } else if metadata_focused(MetadataField::Title) {
+                                    "(type to add)"
+                                } else {
+                                    "(click to add)"
+                                },
+                                metadata_placeholder_style(MetadataField::Title),
+                            ),
+                        ]);
                     }
                     if !archive_metadata_inline_disabled {
-                        meta_field_rows.push((MetadataField::Title, title_value_row));
+                        meta_field_rows.push((MetadataField::Title, title_row));
                     }
 
                     // Artist: inline label + value. Clickable on the whole line.
