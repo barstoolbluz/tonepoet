@@ -735,6 +735,109 @@ impl ScanHandle {
 }
 
 /// State for browsing inside an archive.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum ArchiveEdit {
+    Rename { from: String, to: String },
+    /// Replayable single-field tag write.
+    ///
+    /// Older recovery rows may contain generic values such as
+    /// `field=metadata,value=updated`; new inline writes store the actual
+    /// edited metadata field and final value. Repackage still treats the
+    /// staged tree as the source of truth, but the log is now meaningful for
+    /// audit, recovery review, and future replay.
+    MetadataWrite { inner_path: String, field: String, value: String },
+    /// Non-field-specific file content change.
+    ///
+    /// The metadata editor, artwork writer, and ReplayGain writer can update
+    /// multiple tags and sidecar-derived fields in one save. When the caller
+    /// cannot supply exact field-level deltas, record that the staged member
+    /// content changed instead of fabricating a fake `metadata=updated` edit.
+    ContentModified { inner_path: String, kind: String },
+    Delete { inner_path: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveStagingSession {
+    pub staging_dir: PathBuf,
+    pub archive_path: PathBuf,
+    pub archive_mtime_secs: i64,
+    pub archive_mtime_nanos: u32,
+    pub archive_size: u64,
+    pub edits: Vec<ArchiveEdit>,
+    pub dirty: bool,
+}
+
+impl ArchiveStagingSession {
+    pub fn new(
+        staging_dir: PathBuf,
+        archive_path: PathBuf,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
+        Self {
+            staging_dir,
+            archive_path,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+            edits: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    pub fn append_edit(&mut self, edit: ArchiveEdit) {
+        self.edits.push(edit);
+        self.dirty = true;
+    }
+
+    pub fn append_metadata_write(&mut self, inner_path: String, field: String, value: String) {
+        if let Some(ArchiveEdit::MetadataWrite {
+            value: existing_value,
+            ..
+        }) = self.edits.iter_mut().rev().find(|edit| {
+            matches!(
+                edit,
+                ArchiveEdit::MetadataWrite {
+                    inner_path: existing_inner,
+                    field: existing_field,
+                    ..
+                } if existing_inner == &inner_path && existing_field == &field
+            )
+        }) {
+            *existing_value = value;
+            self.dirty = true;
+            return;
+        }
+
+        self.edits.push(ArchiveEdit::MetadataWrite {
+            inner_path,
+            field,
+            value,
+        });
+        self.dirty = true;
+    }
+
+    pub fn append_content_modified(&mut self, inner_path: String, kind: String) {
+        if self.edits.iter().any(|edit| {
+            matches!(
+                edit,
+                ArchiveEdit::ContentModified {
+                    inner_path: existing_inner,
+                    kind: existing_kind,
+                } if existing_inner == &inner_path && existing_kind == &kind
+            )
+        }) {
+            self.dirty = true;
+            return;
+        }
+
+        self.edits.push(ArchiveEdit::ContentModified { inner_path, kind });
+        self.dirty = true;
+    }
+}
+
+/// State for browsing inside an archive.
 #[derive(Debug, Clone)]
 pub struct ArchiveBrowseState {
     /// The parsed archive listing.
@@ -743,6 +846,8 @@ pub struct ArchiveBrowseState {
     pub inner_path: String,
     /// Password used to open this archive (for re-listing / extraction).
     pub password: Option<String>,
+    /// Persistent staging session for deferred archive saves.
+    pub staging: Option<ArchiveStagingSession>,
 }
 
 impl BrowseState {
@@ -871,6 +976,7 @@ impl BrowseState {
             listing,
             inner_path: String::new(),
             password,
+            staging: None,
         });
         self.multi_selected.clear();
         self.multi_select_anchor = None;
@@ -919,6 +1025,7 @@ impl BrowseState {
                         .is_some_and(|rest| rest.starts_with('/'))
             });
 
+        let previous_staging = self.archive.as_ref().and_then(|arc| arc.staging.clone());
         self.archive = Some(ArchiveBrowseState {
             listing,
             inner_path: if inner_still_exists {
@@ -927,6 +1034,7 @@ impl BrowseState {
                 String::new()
             },
             password,
+            staging: previous_staging,
         });
         self.multi_selected.clear();
         self.multi_select_anchor = None;
@@ -942,6 +1050,18 @@ impl BrowseState {
                 }
             }
         }
+    }
+
+    pub fn active_archive_staging(&self) -> Option<&ArchiveStagingSession> {
+        self.archive.as_ref().and_then(|arc| arc.staging.as_ref())
+    }
+
+    pub fn active_archive_staging_mut(&mut self) -> Option<&mut ArchiveStagingSession> {
+        self.archive.as_mut().and_then(|arc| arc.staging.as_mut())
+    }
+
+    pub fn take_active_archive_staging(&mut self) -> Option<ArchiveStagingSession> {
+        self.archive.as_mut().and_then(|arc| arc.staging.take())
     }
 
     /// Exit the archive and return to filesystem browsing.
@@ -986,7 +1106,7 @@ impl BrowseState {
     }
 
     /// Repopulate `entries` from the archive listing at the current inner path.
-    fn refresh_archive_view(&mut self) {
+    pub(crate) fn refresh_archive_view(&mut self) {
         self.entries.clear();
         self.parent_entry = None;
 
@@ -1004,28 +1124,53 @@ impl BrowseState {
             None,
         ));
 
-        let items = arc.listing.entries_at(&arc.inner_path);
-
-        // Convert ArchiveListItems to BrowseEntries.
         let mut dirs = Vec::new();
         let mut files = Vec::new();
-        for item in &items {
-            let kind = if item.is_dir {
-                EntryKind::Directory
-            } else {
-                classify_file(Path::new(&item.name))
-            };
-            let entry = BrowseEntry::new(
-                arc.listing.archive_path.join(&item.full_path),
-                item.name.clone(),
-                kind,
-                item.size,
-                None,
-            );
-            if item.is_dir {
-                dirs.push(entry);
-            } else {
-                files.push(entry);
+        if let Some(staging) = arc.staging.as_ref() {
+            let current_dir = staging.staging_dir.join(&arc.inner_path);
+            if let Ok(read_dir) = fs::read_dir(&current_dir) {
+                for child in read_dir.flatten() {
+                    let path = child.path();
+                    let Ok(meta) = child.metadata() else { continue };
+                    let is_dir = meta.is_dir();
+                    let name = child.file_name().to_string_lossy().into_owned();
+                    let inner = if arc.inner_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", arc.inner_path, name)
+                    };
+                    let kind = if is_dir { EntryKind::Directory } else { classify_file(&path) };
+                    let modified = meta.modified().ok();
+                    let entry = BrowseEntry::new(
+                        arc.listing.archive_path.join(inner),
+                        name,
+                        kind,
+                        if is_dir { 0 } else { meta.len() },
+                        modified,
+                    );
+                    if is_dir { dirs.push(entry); } else { files.push(entry); }
+                }
+            }
+        } else {
+            let items = arc.listing.entries_at(&arc.inner_path);
+            for item in &items {
+                let kind = if item.is_dir {
+                    EntryKind::Directory
+                } else {
+                    classify_file(Path::new(&item.name))
+                };
+                let entry = BrowseEntry::new(
+                    arc.listing.archive_path.join(&item.full_path),
+                    item.name.clone(),
+                    kind,
+                    item.size,
+                    None,
+                );
+                if item.is_dir {
+                    dirs.push(entry);
+                } else {
+                    files.push(entry);
+                }
             }
         }
 
@@ -2187,6 +2332,31 @@ impl BrowseState {
                 };
                 let archive_path = arc.listing.archive_path.clone();
                 let probe_context = self.archive_entry_probe_context_for(&archive_path);
+                if let Some(staging) = arc.staging.as_ref() {
+                    match staging_path_for_archive_inner(&staging.staging_dir, &inner_path) {
+                        Ok(staged_path) if staged_path.is_file() => {
+                            self.probe_pending.insert(path.clone());
+                            spawn_staged_archive_audio_probe(staged_path, path, probe_context, tx.clone());
+                        }
+                        Ok(_) => {
+                            self.probe_pending.insert(path.clone());
+                            let _ = tx.try_send(super::message::AppMessage::AudioProbeComplete {
+                                path: path.clone(),
+                                context: probe_context,
+                                result: Box::new(Err("staged archive entry is missing or is not a file".to_string())),
+                            });
+                        }
+                        Err(err) => {
+                            self.probe_pending.insert(path.clone());
+                            let _ = tx.try_send(super::message::AppMessage::AudioProbeComplete {
+                                path: path.clone(),
+                                context: probe_context,
+                                result: Box::new(Err(err)),
+                            });
+                        }
+                    }
+                    return;
+                }
                 let password = arc.password.clone();
 
                 self.probe_pending.insert(path.clone());
@@ -2351,6 +2521,42 @@ fn spawn_cached_audio_probe_metadata_completion(
     });
 }
 
+
+/// Spawn a worker that probes an already-extracted staged archive member and
+/// reports the result under the synthetic archive browse path. This is the
+/// deferred-save path: once staging exists, the staged file is authoritative
+/// for info-pane metadata, renamed paths, and deleted/missing entries.
+fn spawn_staged_archive_audio_probe(
+    staged_path: PathBuf,
+    synthetic_path: PathBuf,
+    probe_context: super::message::AudioProbeContext,
+    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let path_for_task = staged_path.clone();
+        let result: Result<CachedInfo, String> = tokio::task::spawn_blocking(move || {
+            let source = crate::tui::probe::probe_audio(&path_for_task)
+                .map_err(|err| format!("{}", err))?;
+            let metadata = crate::tui::probe::read_metadata(&path_for_task).unwrap_or_else(|_| {
+                let mut metadata = SourceMetadata::default();
+                metadata.preemphasis_metadata =
+                    crate::tui::probe::preemphasis_metadata_check_blocking(&path_for_task);
+                metadata
+            });
+            Ok(CachedInfo { source, metadata })
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(format!("staged archive probe task panicked: {}", join_err)));
+
+        let _ = tx
+            .send(super::message::AppMessage::AudioProbeComplete {
+                path: synthetic_path,
+                context: probe_context,
+                result: Box::new(result),
+            })
+            .await;
+    });
+}
 
 /// Spawn a worker that extracts one archive member to a private temp tree,
 /// probes that real file, then reports the result under the synthetic browse
@@ -5255,4 +5461,70 @@ FILE "10 - Live Version.wav" WAVE
         );
     }
 
+}
+
+#[cfg(test)]
+mod archive_edit_log_semantics_tests {
+    use super::*;
+
+    fn session() -> ArchiveStagingSession {
+        ArchiveStagingSession::new(
+            std::path::PathBuf::from("/tmp/staging"),
+            std::path::PathBuf::from("/tmp/archive.zip"),
+            1,
+            2,
+            3,
+        )
+    }
+
+    #[test]
+    fn metadata_field_edits_are_replayable_and_coalesced_to_final_value() {
+        let mut staging = session();
+
+        staging.append_metadata_write(
+            "Disc 1/01.flac".to_string(),
+            "Title".to_string(),
+            "Old title".to_string(),
+        );
+        staging.append_metadata_write(
+            "Disc 1/01.flac".to_string(),
+            "Title".to_string(),
+            "Final title".to_string(),
+        );
+
+        assert!(staging.dirty);
+        assert_eq!(staging.edits.len(), 1);
+        assert_eq!(
+            staging.edits[0],
+            ArchiveEdit::MetadataWrite {
+                inner_path: "Disc 1/01.flac".to_string(),
+                field: "Title".to_string(),
+                value: "Final title".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn content_modified_dirty_markers_do_not_fabricate_metadata_fields() {
+        let mut staging = session();
+
+        staging.append_content_modified(
+            "Disc 1/01.flac".to_string(),
+            "metadata-editor-save".to_string(),
+        );
+        staging.append_content_modified(
+            "Disc 1/01.flac".to_string(),
+            "metadata-editor-save".to_string(),
+        );
+
+        assert!(staging.dirty);
+        assert_eq!(staging.edits.len(), 1);
+        assert_eq!(
+            staging.edits[0],
+            ArchiveEdit::ContentModified {
+                inner_path: "Disc 1/01.flac".to_string(),
+                kind: "metadata-editor-save".to_string(),
+            }
+        );
+    }
 }

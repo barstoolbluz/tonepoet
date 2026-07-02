@@ -11,11 +11,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{MaterializeError, ToolRunnerError};
@@ -324,6 +326,101 @@ impl ArchiveRepackageReport {
     }
 }
 
+pub const ARCHIVE_REPACKAGE_CANCELLED: &str = "archive repackage cancelled";
+
+pub fn is_archive_repackage_cancelled(error: &str) -> bool {
+    error == ARCHIVE_REPACKAGE_CANCELLED
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveRepackageStage {
+    Validating,
+    Compressing,
+    Verifying,
+    PreservingMetadata,
+    Installing,
+    Completed,
+}
+
+impl ArchiveRepackageStage {
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::Validating => "Validating staged files...",
+            Self::Compressing => "Compressing archive...",
+            Self::Verifying => "Verifying archive...",
+            Self::PreservingMetadata => "Preserving archive metadata...",
+            Self::Installing => "Installing archive...",
+            Self::Completed => "Completed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveRepackageProgressSnapshot {
+    pub stage: ArchiveRepackageStage,
+    pub status: String,
+    pub current_item: Option<String>,
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
+    pub items_done: u64,
+    pub items_total: Option<u64>,
+    pub rate_bytes_per_sec: Option<u64>,
+}
+
+impl ArchiveRepackageProgressSnapshot {
+    fn new(stage: ArchiveRepackageStage, status: impl Into<String>) -> Self {
+        Self {
+            stage,
+            status: status.into(),
+            current_item: None,
+            bytes_done: 0,
+            bytes_total: None,
+            items_done: 0,
+            items_total: Some(1),
+            rate_bytes_per_sec: None,
+        }
+    }
+
+    fn with_archive_bytes(
+        stage: ArchiveRepackageStage,
+        status: impl Into<String>,
+        archive_label: &str,
+        bytes_done: u64,
+        bytes_total: Option<u64>,
+        rate_bytes_per_sec: Option<u64>,
+    ) -> Self {
+        Self {
+            stage,
+            status: status.into(),
+            current_item: Some(archive_label.to_string()),
+            bytes_done,
+            bytes_total,
+            items_done: 0,
+            items_total: Some(1),
+            rate_bytes_per_sec,
+        }
+    }
+
+    fn completed(archive_label: &str, bytes_total: u64) -> Self {
+        Self {
+            stage: ArchiveRepackageStage::Completed,
+            status: "Completed".to_string(),
+            current_item: Some(archive_label.to_string()),
+            bytes_done: bytes_total,
+            bytes_total: Some(bytes_total),
+            items_done: 1,
+            items_total: Some(1),
+            rate_bytes_per_sec: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RepackageStagingStats {
+    regular_files: u64,
+    bytes_total: u64,
+}
+
 #[derive(Debug, Clone)]
 struct ArchiveInstallMetadata {
     permissions: fs::Permissions,
@@ -376,25 +473,86 @@ pub async fn repackage_archive(
     original_archive: &Path,
     tool_paths: &HashMap<String, PathBuf>,
 ) -> Result<(), String> {
-    repackage_archive_with_progress(staging_dir, original_archive, tool_paths, |_| {})
-        .await
-        .map(|_| ())
+    let cancel = CancellationToken::new();
+    repackage_archive_with_progress_and_cancel(
+        staging_dir,
+        original_archive,
+        tool_paths,
+        &cancel,
+        |_| {},
+    )
+    .await
+    .map(|_| ())
 }
 
-/// Repackage an archive while reporting durable milestones to the caller.
-/// The callback is intentionally synchronous so TUI callers can use
-/// non-blocking channel sends and conversion callers can pass a no-op.
+/// Repackage an archive while reporting typed progress snapshots to the caller.
+///
+/// The callback is intentionally synchronous so TUI callers can use non-blocking
+/// channel sends and conversion callers can pass a no-op. Use
+/// [`repackage_archive_with_progress_and_cancel`] when the host has a real
+/// cancellation channel.
 pub async fn repackage_archive_with_progress<F>(
     staging_dir: &Path,
     original_archive: &Path,
     tool_paths: &HashMap<String, PathBuf>,
+    progress: F,
+) -> Result<ArchiveRepackageReport, String>
+where
+    F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
+{
+    let cancel = CancellationToken::new();
+    repackage_archive_with_progress_and_cancel(
+        staging_dir,
+        original_archive,
+        tool_paths,
+        &cancel,
+        progress,
+    )
+    .await
+}
+
+/// Repackage an archive with typed progress and cooperative cancellation.
+///
+/// Cancellation is checked before every destructive phase and is also wired into
+/// child-process execution. If cancellation wins before the archive has been
+/// installed, any newly-created temporary archive is removed and staged edits
+/// remain untouched for retry/discard by the caller. Once installation begins,
+/// replacement is allowed to finish because interrupting an atomic replace path
+/// would be more dangerous than completing the already-verified save.
+pub async fn repackage_archive_with_progress_and_cancel<F>(
+    staging_dir: &Path,
+    original_archive: &Path,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
     mut progress: F,
 ) -> Result<ArchiveRepackageReport, String>
 where
-    F: FnMut(&'static str) + Send,
+    F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
 {
-    progress("Validating archive staging tree...");
-    validate_repackage_staging_tree(staging_dir)?;
+    let archive_label = original_archive
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| original_archive.display().to_string());
+
+    progress(ArchiveRepackageProgressSnapshot::new(
+        ArchiveRepackageStage::Validating,
+        ArchiveRepackageStage::Validating.status_label(),
+    ));
+    check_repackage_cancelled(cancel)?;
+    let staging_stats = validate_repackage_staging_tree(staging_dir, cancel)?;
+    let planned_bytes = staging_stats.bytes_total.max(1);
+    progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+        ArchiveRepackageStage::Validating,
+        format!(
+            "Validated {} staged file(s) ({})",
+            staging_stats.regular_files,
+            human_bytes(staging_stats.bytes_total)
+        ),
+        &archive_label,
+        0,
+        Some(planned_bytes),
+        None,
+    ));
 
     let format = repackage_archive_format(original_archive)?;
     let parent = original_archive
@@ -417,23 +575,76 @@ where
     let backup_archive = parent.join(format!(".{file_name}.tonepoet-backup-{nonce}"));
 
     let result = async {
-        progress("Creating repackaged archive...");
-        create_repackaged_archive(format, staging_dir, &temp_archive, tool_paths).await?;
+        check_repackage_cancelled(cancel)?;
+        progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+            ArchiveRepackageStage::Compressing,
+            ArchiveRepackageStage::Compressing.status_label(),
+            &archive_label,
+            0,
+            Some(planned_bytes),
+            None,
+        ));
+        create_repackaged_archive(
+            format,
+            staging_dir,
+            &temp_archive,
+            tool_paths,
+            cancel,
+            &archive_label,
+            planned_bytes,
+            &mut progress,
+        )
+        .await?;
 
-        progress("Verifying repackaged archive...");
-        verify_repackaged_archive(format, &temp_archive, tool_paths).await?;
-        let size = fs::metadata(&temp_archive)
+        check_repackage_cancelled(cancel)?;
+        let created_size = fs::metadata(&temp_archive)
             .map_err(|err| format!("repackaged archive metadata failed: {err}"))?
             .len();
-        if size == 0 {
+        progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+            ArchiveRepackageStage::Verifying,
+            ArchiveRepackageStage::Verifying.status_label(),
+            &archive_label,
+            0,
+            Some(created_size.max(1)),
+            None,
+        ));
+        verify_repackaged_archive(
+            format,
+            &temp_archive,
+            tool_paths,
+            cancel,
+            &archive_label,
+            created_size.max(1),
+            &mut progress,
+        )
+        .await?;
+        if created_size == 0 {
             return Err("repackaged archive is empty".to_string());
         }
 
-        progress("Preserving archive file metadata...");
+        check_repackage_cancelled(cancel)?;
+        progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+            ArchiveRepackageStage::PreservingMetadata,
+            ArchiveRepackageStage::PreservingMetadata.status_label(),
+            &archive_label,
+            created_size,
+            Some(created_size.max(1)),
+            None,
+        ));
         let install_metadata_warning =
             apply_archive_install_metadata(&temp_archive, &install_metadata);
 
-        progress("Installing repackaged archive...");
+        // Installation is deliberately not cancelled once entered: the new
+        // archive has already been created and verified, and completing the
+        // atomic replacement is safer than interrupting the handoff.
+        progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+            ArchiveRepackageStage::Installing,
+            ArchiveRepackageStage::Installing.status_label(),
+            &archive_label,
+            created_size,
+            Some(created_size.max(1)),
+            None,
+        ));
         let report = replace_archive_atomically(
             original_archive,
             &temp_archive,
@@ -441,8 +652,19 @@ where
             install_metadata_warning,
         )?;
         if report.has_warnings() {
-            progress("Archive installed; preservation or backup cleanup needs attention.");
+            progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+                ArchiveRepackageStage::Installing,
+                "Archive installed; preservation or backup cleanup needs attention.",
+                &archive_label,
+                created_size,
+                Some(created_size.max(1)),
+                None,
+            ));
         }
+        progress(ArchiveRepackageProgressSnapshot::completed(
+            &archive_label,
+            created_size.max(1),
+        ));
         Ok(report)
     }
     .await;
@@ -456,6 +678,30 @@ where
 
     result
 }
+
+fn check_repackage_cancelled(cancel: &CancellationToken) -> Result<(), String> {
+    if cancel.is_cancelled() {
+        Err(ARCHIVE_REPACKAGE_CANCELLED.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 
 fn repackage_archive_format(path: &Path) -> Result<RepackageArchiveFormat, String> {
     let file_name = path
@@ -490,12 +736,27 @@ fn repackage_format_suffix(format: RepackageArchiveFormat) -> &'static str {
     }
 }
 
-async fn create_repackaged_archive(
+async fn create_repackaged_archive<F>(
     format: RepackageArchiveFormat,
     staging_dir: &Path,
     temp_archive: &Path,
     tool_paths: &HashMap<String, PathBuf>,
-) -> Result<(), String> {
+    cancel: &CancellationToken,
+    archive_label: &str,
+    planned_bytes: u64,
+    progress: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
+{
+    let monitor = RepackageCommandMonitor {
+        stage: ArchiveRepackageStage::Compressing,
+        status: ArchiveRepackageStage::Compressing.status_label(),
+        archive_label,
+        observed_path: Some(temp_archive),
+        bytes_total: Some(planned_bytes),
+        complete_bytes_done: Some(planned_bytes),
+    };
     match format {
         RepackageArchiveFormat::SevenZip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
@@ -507,7 +768,7 @@ async fn create_repackaged_archive(
                 .arg("-mmt=on")
                 .arg(".")
                 .current_dir(staging_dir);
-            run_repackage_command(command, "create 7z archive").await
+            run_repackage_command(command, "create 7z archive", cancel, monitor, progress).await
         }
         RepackageArchiveFormat::Zip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
@@ -518,7 +779,7 @@ async fn create_repackaged_archive(
                 .arg(temp_archive)
                 .arg(".")
                 .current_dir(staging_dir);
-            run_repackage_command(command, "create zip archive").await
+            run_repackage_command(command, "create zip archive", cancel, monitor, progress).await
         }
         RepackageArchiveFormat::Tar => {
             let tar = repackage_tool_path(tool_paths, &["tar"]);
@@ -529,7 +790,7 @@ async fn create_repackaged_archive(
                 .arg("-C")
                 .arg(staging_dir)
                 .arg(".");
-            run_repackage_command(command, "create tar archive").await
+            run_repackage_command(command, "create tar archive", cancel, monitor, progress).await
         }
         RepackageArchiveFormat::TarGz => {
             let tar = repackage_tool_path(tool_paths, &["tar"]);
@@ -540,7 +801,7 @@ async fn create_repackaged_archive(
                 .arg("-C")
                 .arg(staging_dir)
                 .arg(".");
-            run_repackage_command(command, "create tar.gz archive").await
+            run_repackage_command(command, "create tar.gz archive", cancel, monitor, progress).await
         }
         RepackageArchiveFormat::Rar => {
             let rar = repackage_tool_path(tool_paths, &["rar"]);
@@ -551,7 +812,7 @@ async fn create_repackaged_archive(
                 .arg(temp_archive)
                 .arg(".")
                 .current_dir(staging_dir);
-            run_repackage_command(command, "create rar archive")
+            run_repackage_command(command, "create rar archive", cancel, monitor, progress)
                 .await
                 .map_err(|err| {
                     if err.contains("not found") || err.contains("No such file") {
@@ -564,32 +825,48 @@ async fn create_repackaged_archive(
     }
 }
 
-async fn verify_repackaged_archive(
+async fn verify_repackaged_archive<F>(
     format: RepackageArchiveFormat,
     temp_archive: &Path,
     tool_paths: &HashMap<String, PathBuf>,
-) -> Result<(), String> {
+    cancel: &CancellationToken,
+    archive_label: &str,
+    archive_bytes: u64,
+    progress: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
+{
+    let monitor = RepackageCommandMonitor {
+        stage: ArchiveRepackageStage::Verifying,
+        status: ArchiveRepackageStage::Verifying.status_label(),
+        archive_label,
+        observed_path: Some(temp_archive),
+        bytes_total: Some(archive_bytes),
+        complete_bytes_done: Some(archive_bytes),
+    };
     match format {
         RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
             let mut command = tokio::process::Command::new(seven_zip);
             command.arg("t").arg(temp_archive);
-            run_repackage_command(command, "verify repackaged archive").await
+            run_repackage_command(command, "verify repackaged archive", cancel, monitor, progress).await
         }
         RepackageArchiveFormat::Tar | RepackageArchiveFormat::TarGz => {
             let tar = repackage_tool_path(tool_paths, &["tar"]);
             let mut command = tokio::process::Command::new(tar);
             command.arg("tf").arg(temp_archive);
-            run_repackage_command(command, "verify repackaged tar archive").await
+            run_repackage_command(command, "verify repackaged tar archive", cancel, monitor, progress).await
         }
         RepackageArchiveFormat::Rar => {
             let rar = repackage_tool_path(tool_paths, &["rar"]);
             let mut command = tokio::process::Command::new(rar);
             command.arg("t").arg(temp_archive);
-            run_repackage_command(command, "verify repackaged rar archive").await
+            run_repackage_command(command, "verify repackaged rar archive", cancel, monitor, progress).await
         }
     }
 }
+
 
 fn require_repackage_tool_available(
     tool_paths: &HashMap<String, PathBuf>,
@@ -651,29 +928,127 @@ fn repackage_tool_path(tool_paths: &HashMap<String, PathBuf>, names: &[&str]) ->
     PathBuf::from(names.first().copied().unwrap_or_default())
 }
 
-async fn run_repackage_command(
+struct RepackageCommandMonitor<'a> {
+    stage: ArchiveRepackageStage,
+    status: &'static str,
+    archive_label: &'a str,
+    observed_path: Option<&'a Path>,
+    bytes_total: Option<u64>,
+    complete_bytes_done: Option<u64>,
+}
+
+async fn run_repackage_command<F>(
     mut command: tokio::process::Command,
     label: &str,
-) -> Result<(), String> {
-    let output = command
-        .output()
-        .await
+    cancel: &CancellationToken,
+    monitor: RepackageCommandMonitor<'_>,
+    progress: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
+{
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
         .map_err(|err| format!("{label}: command not found or failed to start: {err}"))?;
-    if output.status.success() {
-        return Ok(());
+
+    let mut stdout_task = child.stdout.take().map(|mut stdout| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+    let mut stderr_task = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+
+    let started = Instant::now();
+    let mut last_emit = Instant::now();
+    let mut last_bytes = 0u64;
+    loop {
+        if cancel.is_cancelled() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
+        }
+        match child
+            .try_wait()
+            .map_err(|err| format!("{label}: failed to poll child process: {err}"))?
+        {
+            Some(status) => {
+                let stdout = match stdout_task.take() {
+                    Some(task) => task.await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let stderr = match stderr_task.take() {
+                    Some(task) => task.await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                if status.success() {
+                    let done = monitor
+                        .complete_bytes_done
+                        .or_else(|| observed_file_len(monitor.observed_path))
+                        .unwrap_or(last_bytes);
+                    progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+                        monitor.stage,
+                        monitor.status,
+                        monitor.archive_label,
+                        done,
+                        monitor.bytes_total.or(Some(done.max(1))),
+                        None,
+                    ));
+                    return Ok(());
+                }
+                let stderr = String::from_utf8_lossy(&stderr);
+                let stdout = String::from_utf8_lossy(&stdout);
+                let detail = if !stderr.trim().is_empty() {
+                    stderr.trim().to_string()
+                } else {
+                    stdout.trim().to_string()
+                };
+                return if detail.is_empty() {
+                    Err(format!("{label}: command exited with status {status}"))
+                } else {
+                    Err(format!("{label}: {detail}"))
+                };
+            }
+            None => {
+                let now = Instant::now();
+                if now.saturating_duration_since(last_emit) >= Duration::from_millis(250) {
+                    let bytes_done = observed_file_len(monitor.observed_path).unwrap_or(last_bytes);
+                    let elapsed = now.saturating_duration_since(started).as_secs_f64();
+                    let rate = if elapsed > 0.0 && bytes_done >= last_bytes {
+                        Some((bytes_done as f64 / elapsed).round() as u64).filter(|rate| *rate > 0)
+                    } else {
+                        None
+                    };
+                    last_bytes = bytes_done;
+                    last_emit = now;
+                    progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+                        monitor.stage,
+                        monitor.status,
+                        monitor.archive_label,
+                        monitor
+                            .bytes_total
+                            .map(|total| bytes_done.min(total))
+                            .unwrap_or(bytes_done),
+                        monitor.bytes_total,
+                        rate,
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = if !stderr.trim().is_empty() {
-        stderr.trim().to_string()
-    } else {
-        stdout.trim().to_string()
-    };
-    if detail.is_empty() {
-        Err(format!("{label}: command exited with status {}", output.status))
-    } else {
-        Err(format!("{label}: {detail}"))
-    }
+}
+
+fn observed_file_len(path: Option<&Path>) -> Option<u64> {
+    path.and_then(|path| fs::metadata(path).ok().map(|metadata| metadata.len()))
 }
 
 
@@ -772,7 +1147,10 @@ fn apply_archive_owner(temp_archive: &Path, original: &ArchiveInstallMetadata) -
     }
 }
 
-fn validate_repackage_staging_tree(staging_dir: &Path) -> Result<(), String> {
+fn validate_repackage_staging_tree(
+    staging_dir: &Path,
+    cancel: &CancellationToken,
+) -> Result<RepackageStagingStats, String> {
     let root = fs::canonicalize(staging_dir)
         .map_err(|err| format!("repackage staging directory is unavailable: {err}"))?;
     if !root.is_dir() {
@@ -780,14 +1158,16 @@ fn validate_repackage_staging_tree(staging_dir: &Path) -> Result<(), String> {
     }
 
     let mut stack = vec![root.clone()];
-    let mut regular_files = 0usize;
+    let mut stats = RepackageStagingStats::default();
     while let Some(dir) = stack.pop() {
+        check_repackage_cancelled(cancel)?;
         let mut entries = fs::read_dir(&dir)
             .map_err(|err| format!("failed to read staging directory '{}': {err}", dir.display()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("failed to read staging entry: {err}"))?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
+            check_repackage_cancelled(cancel)?;
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|err| format!("failed to inspect staging entry '{}': {err}", path.display()))?;
@@ -809,15 +1189,16 @@ fn validate_repackage_staging_tree(staging_dir: &Path) -> Result<(), String> {
             if file_type.is_dir() {
                 stack.push(canonical);
             } else if file_type.is_file() {
-                regular_files = regular_files.saturating_add(1);
+                stats.regular_files = stats.regular_files.saturating_add(1);
+                stats.bytes_total = stats.bytes_total.saturating_add(metadata.len());
             }
         }
     }
 
-    if regular_files == 0 {
+    if stats.regular_files == 0 {
         return Err("cannot repackage archive: staging tree contains no regular files".to_string());
     }
-    Ok(())
+    Ok(stats)
 }
 
 fn replace_archive_atomically(
@@ -2463,8 +2844,8 @@ mod tests {
             let tool_paths = HashMap::from([("tar".to_string(), tar.clone())]);
 
             let mut progress = Vec::new();
-            let report = repackage_archive_with_progress(&staging, &original, &tool_paths, |message| {
-                progress.push(message.to_string());
+            let report = repackage_archive_with_progress(&staging, &original, &tool_paths, |snapshot| {
+                progress.push(snapshot);
             })
             .await
             .unwrap_or_else(|err| panic!("repackage {archive_name}: {err}"));
@@ -2474,11 +2855,12 @@ mod tests {
                 "successful fixture repackage should not report cleanup warnings"
             );
             assert!(
-                progress.iter().any(|message| message.contains("Validating"))
-                    && progress.iter().any(|message| message.contains("Creating"))
-                    && progress.iter().any(|message| message.contains("Verifying"))
-                    && progress.iter().any(|message| message.contains("Installing")),
-                "repackage should emit hand-off-grade progress milestones: {progress:?}"
+                progress.iter().any(|snapshot| snapshot.stage == ArchiveRepackageStage::Validating)
+                    && progress.iter().any(|snapshot| snapshot.stage == ArchiveRepackageStage::Compressing)
+                    && progress.iter().any(|snapshot| snapshot.stage == ArchiveRepackageStage::Verifying)
+                    && progress.iter().any(|snapshot| snapshot.stage == ArchiveRepackageStage::Installing)
+                    && progress.iter().any(|snapshot| snapshot.bytes_total.is_some()),
+                "repackage should emit typed progress snapshots with phases and byte totals: {progress:?}"
             );
             assert!(original.exists(), "original archive path must be restored after replacement");
             assert!(
@@ -2493,6 +2875,45 @@ mod tests {
                 .unwrap_or_else(|err| panic!("extract repackaged {archive_name}: {err}"));
             assert_repackaged_content(&out, &expected);
         }
+    }
+
+
+    #[tokio::test]
+    async fn repackage_archive_cancelled_before_create_preserves_original_and_reports_cancel() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.tar");
+        fs::write(&original, b"old archive bytes").expect("original archive placeholder");
+        let staging = write_repackage_staging(temp.path(), "edited payload")
+            .expect("write repackage staging");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut progress = Vec::new();
+
+        let err = repackage_archive_with_progress_and_cancel(
+            &staging,
+            &original,
+            &HashMap::new(),
+            &cancel,
+            |snapshot| progress.push(snapshot),
+        )
+        .await
+        .expect_err("pre-cancelled repackage should abort");
+
+        assert_eq!(err, ARCHIVE_REPACKAGE_CANCELLED);
+        assert!(original.exists(), "cancel must preserve the original archive");
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("temp dir entries")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("tonepoet-repack")),
+            "cancel before create must not leave temp repack artifacts"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|snapshot| snapshot.stage == ArchiveRepackageStage::Validating),
+            "cancel should still emit the initial validating snapshot"
+        );
     }
 
     #[tokio::test]

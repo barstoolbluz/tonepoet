@@ -373,6 +373,7 @@ fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry>
         }
         EntryKind::Directory => {
             items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(separator());
             items.push(item("Select", ContextAction::Select));
             items.push(item("Select All", ContextAction::SelectAll));
@@ -959,7 +960,7 @@ pub fn execute_context_action(
                         EntryKind::Directory | EntryKind::ParentDir if app.browse.is_in_archive() => {
                             if matches!(entry.kind.clone(), EntryKind::ParentDir) {
                                 if !app.browse.go_up_in_archive() {
-                                    app.browse.exit_archive();
+                                    super::keybindings::exit_browse_archive(app, tx);
                                 }
                                 app.browse.probe_current_with_db(tx, Some(&app.db));
                             } else if let Some(inner) = app.browse.archive_inner_path_for_path(&entry.path) {
@@ -1014,7 +1015,7 @@ pub fn execute_context_action(
         }
         ContextAction::MoveToTrash => {
             if app.browse.is_in_archive() {
-                archive_synthetic_file_op_status(app, "trash");
+                super::keybindings::start_browse_archive_entry_delete(app, tx);
                 return;
             }
             let cmd = super::command::Command::Delete;
@@ -1548,10 +1549,7 @@ pub fn execute_context_action(
 
         // ── Global ──────────────────────────────────────────────────
         ContextAction::GoToScreen(screen) => {
-            app.current_screen = screen;
-            if screen == AppScreen::Browse {
-                app.browse.probe_current_with_db(tx, Some(&app.db));
-            }
+            super::keybindings::switch_screen_reconciling_browse_archive(app, screen, tx);
         }
         // Disc-specific actions are handled by disc_browser_actions before
         // this match (early return at the top of this function).
@@ -1756,13 +1754,13 @@ mod tests {
     }
 
     #[test]
-    fn archive_directory_menu_hides_rename_and_metadata() {
+    fn archive_directory_menu_exposes_metadata_but_hides_rename() {
         let entry = archive_test_entry(EntryKind::Directory);
         let labels = menu_labels_recursive(&build_archive_browse_entry_menu(&entry));
 
         assert!(labels.iter().any(|label| label == "Open"));
+        assert!(labels.iter().any(|label| label == "Edit metadata"));
         for forbidden in [
-            "Edit metadata",
             "File operations",
             "Rename",
             "Bulk Rename",
@@ -1772,7 +1770,7 @@ mod tests {
         ] {
             assert!(
                 !labels.iter().any(|label| label == forbidden),
-                "archive directory menu must not expose unsupported action: {forbidden}"
+                "archive directory menu must not expose unsupported filesystem action: {forbidden}"
             );
         }
     }

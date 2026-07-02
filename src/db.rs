@@ -8,7 +8,7 @@ use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 19;
+const CURRENT_VERSION: u32 = 20;
 
 // ── CTDB parity matrix cache tunables ─────────────────────────────────
 //
@@ -30,6 +30,19 @@ const MB_CACHE_MAX_ROWS: usize = 5000;
 const MB_CACHE_EVICT_THRESHOLD: usize = (MB_CACHE_MAX_ROWS * 110) / 100;
 const MB_CACHE_EVICT_TARGET: usize = (MB_CACHE_MAX_ROWS * 90) / 100;
 const MB_CACHE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingArchiveSessionRecovery {
+    pub archive_path: PathBuf,
+    pub staging_dir: PathBuf,
+    pub archive_mtime_secs: i64,
+    pub archive_mtime_nanos: u32,
+    pub archive_size: u64,
+    pub edits_json: String,
+    pub conflicted: bool,
+    pub conflict_reason: Option<String>,
+}
+
 
 // MusicBrainz text-search + release-detail cache (Phase B-5). Keys are
 // canonical query strings produced by the musicbrainz module
@@ -151,6 +164,9 @@ impl Database {
         }
         if version < 19 {
             self.migrate_v19()?;
+        }
+        if version < 20 {
+            self.migrate_v20()?;
         }
 
         self.conn
@@ -678,6 +694,148 @@ impl Database {
             )
             .map_err(|e| format!("v19 migration failed: {}", e))?;
         Ok(())
+    }
+
+
+    /// v20: crash recovery records for deferred archive-edit staging sessions.
+    fn migrate_v20(&mut self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "
+            CREATE TABLE IF NOT EXISTS pending_archive_sessions (
+                archive_path        TEXT PRIMARY KEY,
+                staging_dir         TEXT NOT NULL,
+                archive_mtime_secs  INTEGER NOT NULL,
+                archive_mtime_nanos INTEGER NOT NULL DEFAULT 0,
+                archive_size        INTEGER NOT NULL,
+                edits_json          TEXT NOT NULL,
+                created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        ",
+            )
+            .map_err(|e| format!("v20 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    pub fn upsert_pending_archive_session(
+        &self,
+        archive_path: &std::path::Path,
+        staging_dir: &std::path::Path,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+        edits_json: &str,
+    ) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT INTO pending_archive_sessions (
+                archive_path, staging_dir, archive_mtime_secs, archive_mtime_nanos,
+                archive_size, edits_json, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))
+             ON CONFLICT(archive_path) DO UPDATE SET
+                staging_dir=excluded.staging_dir,
+                archive_mtime_secs=excluded.archive_mtime_secs,
+                archive_mtime_nanos=excluded.archive_mtime_nanos,
+                archive_size=excluded.archive_size,
+                edits_json=excluded.edits_json,
+                updated_at=datetime('now')",
+            params![
+                archive_path.display().to_string(),
+                staging_dir.display().to_string(),
+                archive_mtime_secs,
+                i64::from(archive_mtime_nanos),
+                archive_size as i64,
+                edits_json,
+            ],
+        ).map_err(|e| format!("pending archive session save: {e}"))?;
+        Ok(())
+    }
+
+    pub fn delete_pending_archive_session(&self, archive_path: &std::path::Path) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_archive_sessions WHERE archive_path = ?1",
+                params![archive_path.display().to_string()],
+            )
+            .map_err(|e| format!("pending archive session delete: {e}"))?;
+        Ok(())
+    }
+
+    pub fn recover_pending_archive_sessions_at_startup(&self) -> Result<Vec<PendingArchiveSessionRecovery>, String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT archive_path, staging_dir, archive_mtime_secs, archive_mtime_nanos, archive_size, edits_json
+             FROM pending_archive_sessions
+             ORDER BY updated_at DESC"
+        ).map_err(|e| format!("pending archive session query: {e}"))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        }).map_err(|e| format!("pending archive session scan: {e}"))?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            let (archive_path, staging_dir, mtime_secs, mtime_nanos, archive_size, edits_json) =
+                row.map_err(|e| format!("pending archive session row: {e}"))?;
+            let archive = std::path::PathBuf::from(&archive_path);
+            let staging = std::path::PathBuf::from(&staging_dir);
+
+            if !staging.is_dir() {
+                let _ = self.delete_pending_archive_session(&archive);
+                continue;
+            }
+
+            let mut conflicted = false;
+            let mut conflict_reason = None;
+            match std::fs::metadata(&archive) {
+                Ok(meta) => {
+                    match meta.modified().ok().and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok()) {
+                        Some(modified) => {
+                            if modified.as_secs() as i64 != mtime_secs
+                                || i64::from(modified.subsec_nanos()) != mtime_nanos
+                                || meta.len() as i64 != archive_size
+                            {
+                                conflicted = true;
+                                conflict_reason = Some("archive file changed since staging was created".to_string());
+                            }
+                        }
+                        None => {
+                            conflicted = true;
+                            conflict_reason = Some("archive modification time could not be read".to_string());
+                        }
+                    }
+                }
+                Err(err) => {
+                    conflicted = true;
+                    conflict_reason = Some(format!("archive file is missing or unreadable: {err}"));
+                }
+            }
+
+            sessions.push(PendingArchiveSessionRecovery {
+                archive_path: archive,
+                staging_dir: staging,
+                archive_mtime_secs: mtime_secs,
+                archive_mtime_nanos: mtime_nanos as u32,
+                archive_size: archive_size as u64,
+                edits_json,
+                conflicted,
+                conflict_reason,
+            });
+        }
+
+        Ok(sessions)
+    }
+
+    pub fn reconcile_pending_archive_sessions_at_startup(&self) -> Result<(usize, usize), String> {
+        let sessions = self.recover_pending_archive_sessions_at_startup()?;
+        let valid = sessions.iter().filter(|session| !session.conflicted).count();
+        let conflicted = sessions.len().saturating_sub(valid);
+        Ok((valid, conflicted))
     }
 
     // ── AccurateRip cache ───────────────────────────────────────

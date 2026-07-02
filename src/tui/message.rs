@@ -141,15 +141,17 @@ pub enum AppMessage {
         staging_dir: std::path::PathBuf,
         result: Result<crate::tui::app::ArchiveMetadataEditorPayload, String>,
     },
-    /// Milestone from Browse-screen archive repackage after staged metadata
-    /// writes. Displayed only while it matches the active repackage context.
+    /// Typed progress snapshot from Browse-screen archive repackage after staged
+    /// metadata writes. Routed into the active FileTaskProgress overlay only
+    /// while it matches the active repackage context.
     ArchiveRepackageProgress {
         archive_path: std::path::PathBuf,
         staging_dir: std::path::PathBuf,
-        message: String,
+        snapshot: crate::convert::pipeline::materializer_archive::ArchiveRepackageProgressSnapshot,
     },
     /// Completed Browse-screen archive repackage after staged metadata writes.
-    /// Staging is cleaned up by the event-loop reducer in every outcome.
+    /// Staging is cleaned up only after a successful archive replacement;
+    /// failure leaves the staged edits durable for retry/discard.
     ArchiveRepackageResult {
         archive_path: std::path::PathBuf,
         staging_dir: std::path::PathBuf,
@@ -170,7 +172,23 @@ pub enum AppMessage {
         staging_dir: std::path::PathBuf,
         old_inner_path: String,
         new_inner_path: String,
-        result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String>,
+        result: Result<(), String>,
+    },
+    /// Milestone from Browse-screen archive-entry delete. Displayed only while
+    /// it matches the current pending delete handle.
+    ArchiveEntryDeleteProgress {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        message: String,
+    },
+    /// Completed Browse-screen archive-entry delete. On success, the staging
+    /// directory becomes the active deferred-save session; it is not
+    /// repackaged until the user leaves the archive/screen/quits.
+    ArchiveEntryDeleteResult {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        inner_paths: Vec<String>,
+        result: Result<(), String>,
     },
     /// Result of an asynchronous audio probe (lofty + ffmpeg) launched by
     /// `BrowseState::probe_current`. The main loop updates `probe_cache` and
@@ -254,6 +272,7 @@ pub enum AppMessage {
     MetadataWriteComplete {
         path: std::path::PathBuf,
         field: crate::tui::probe::MetadataField,
+        value: String,
         result: Result<(), String>,
     },
     /// Results of an async recursive search.

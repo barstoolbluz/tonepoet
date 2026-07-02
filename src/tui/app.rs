@@ -1290,7 +1290,11 @@ impl PendingArchivePreview {
 pub struct PendingBrowseArchiveMetadataEdit {
     pub archive_path: PathBuf,
     pub staging_dir: PathBuf,
+    pub archive_mtime_secs: i64,
+    pub archive_mtime_nanos: u32,
+    pub archive_size: u64,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub owns_staging: bool,
 }
 
 impl fmt::Debug for PendingBrowseArchiveMetadataEdit {
@@ -1298,19 +1302,46 @@ impl fmt::Debug for PendingBrowseArchiveMetadataEdit {
         f.debug_struct("PendingBrowseArchiveMetadataEdit")
             .field("archive_path", &self.archive_path)
             .field("staging_dir", &self.staging_dir)
+            .field("archive_mtime_secs", &self.archive_mtime_secs)
+            .field("archive_mtime_nanos", &self.archive_mtime_nanos)
+            .field("archive_size", &self.archive_size)
+            .field("owns_staging", &self.owns_staging)
             .finish_non_exhaustive()
     }
 }
 
 impl PendingBrowseArchiveMetadataEdit {
-    pub fn new(archive_path: PathBuf) -> Self {
+    pub fn new(
+        archive_path: PathBuf,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
         Self {
             archive_path,
             staging_dir: std::env::temp_dir().join(format!(
                 "tonepoet-archive-metadata-{}",
                 uuid::Uuid::new_v4()
             )),
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
             cancel: tokio_util::sync::CancellationToken::new(),
+            owns_staging: true,
+        }
+    }
+
+    pub fn from_existing(archive_path: PathBuf, staging_dir: PathBuf) -> Self {
+        let (archive_mtime_secs, archive_mtime_nanos, archive_size) =
+            archive_fingerprint(&archive_path).unwrap_or((0, 0, 0));
+        Self {
+            archive_path,
+            staging_dir,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            owns_staging: false,
         }
     }
 
@@ -1320,21 +1351,27 @@ impl PendingBrowseArchiveMetadataEdit {
 
     pub fn cancel_and_cleanup(self) {
         self.cancel.cancel();
-        cleanup_archive_metadata_staging_dir(&self.staging_dir);
+        if self.owns_staging {
+            cleanup_archive_metadata_staging_dir(&self.staging_dir);
+        }
     }
 }
 
 
 /// Lifecycle handle for Browse-screen archive-entry rename. The operation
-/// extracts the archive into staging, performs the filesystem rename inside
-/// staging, repackages the archive atomically, then cleans staging in the
-/// event-loop completion path.
+/// captures the archive fingerprint, extracts into staging, and performs the
+/// filesystem rename inside staging. The deferred-save lifecycle owns the later
+/// archive repackage/cleanup step after navigation, screen switch, quit, or an
+/// explicit retry/overwrite action.
 #[derive(Clone)]
 pub struct PendingBrowseArchiveRename {
     pub archive_path: PathBuf,
     pub staging_dir: PathBuf,
     pub old_inner_path: String,
     pub new_inner_path: String,
+    pub archive_mtime_secs: i64,
+    pub archive_mtime_nanos: u32,
+    pub archive_size: u64,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -1345,12 +1382,22 @@ impl fmt::Debug for PendingBrowseArchiveRename {
             .field("staging_dir", &self.staging_dir)
             .field("old_inner_path", &self.old_inner_path)
             .field("new_inner_path", &self.new_inner_path)
+            .field("archive_mtime_secs", &self.archive_mtime_secs)
+            .field("archive_mtime_nanos", &self.archive_mtime_nanos)
+            .field("archive_size", &self.archive_size)
             .finish_non_exhaustive()
     }
 }
 
 impl PendingBrowseArchiveRename {
-    pub fn new(archive_path: PathBuf, old_inner_path: String, new_inner_path: String) -> Self {
+    pub fn new(
+        archive_path: PathBuf,
+        old_inner_path: String,
+        new_inner_path: String,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
         Self {
             archive_path,
             staging_dir: std::env::temp_dir().join(format!(
@@ -1359,6 +1406,9 @@ impl PendingBrowseArchiveRename {
             )),
             old_inner_path,
             new_inner_path,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
             cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1366,6 +1416,74 @@ impl PendingBrowseArchiveRename {
     pub fn matches(&self, archive_path: &Path, staging_dir: &Path) -> bool {
         self.archive_path.as_path() == archive_path && self.staging_dir.as_path() == staging_dir
     }
+}
+
+/// Lifecycle handle for Browse-screen archive-entry delete. The operation
+/// extracts the archive into persistent deferred-save staging when needed,
+/// removes the selected staged member(s), and then leaves the archive dirty
+/// for the normal save-on-exit path. Unlike the old per-edit archive mutation
+/// model, this handle never repackages the archive itself.
+#[derive(Clone)]
+pub struct PendingBrowseArchiveDelete {
+    pub archive_path: PathBuf,
+    pub staging_dir: PathBuf,
+    pub inner_paths: Vec<String>,
+    pub archive_mtime_secs: i64,
+    pub archive_mtime_nanos: u32,
+    pub archive_size: u64,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+impl fmt::Debug for PendingBrowseArchiveDelete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingBrowseArchiveDelete")
+            .field("archive_path", &self.archive_path)
+            .field("staging_dir", &self.staging_dir)
+            .field("inner_paths", &self.inner_paths)
+            .field("archive_mtime_secs", &self.archive_mtime_secs)
+            .field("archive_mtime_nanos", &self.archive_mtime_nanos)
+            .field("archive_size", &self.archive_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingBrowseArchiveDelete {
+    pub fn new(
+        archive_path: PathBuf,
+        inner_paths: Vec<String>,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
+        Self {
+            archive_path,
+            staging_dir: std::env::temp_dir().join(format!(
+                "tonepoet-archive-delete-{}",
+                uuid::Uuid::new_v4()
+            )),
+            inner_paths,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn matches(&self, archive_path: &Path, staging_dir: &Path) -> bool {
+        self.archive_path.as_path() == archive_path && self.staging_dir.as_path() == staging_dir
+    }
+}
+
+pub fn archive_fingerprint(path: &std::path::Path) -> Result<(i64, u32, u64), String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|err| format!("stat archive for conflict detection failed: {err}"))?;
+    let modified = meta
+        .modified()
+        .map_err(|err| format!("read archive mtime for conflict detection failed: {err}"))?;
+    let duration = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "archive mtime predates UNIX epoch".to_string())?;
+    Ok((duration.as_secs() as i64, duration.subsec_nanos(), meta.len()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1383,15 +1501,92 @@ pub struct ArchiveMetadataEditContext {
     pub owner: ArchiveMetadataEditOwner,
     pub archive_path: PathBuf,
     pub staging_dir: PathBuf,
+    pub archive_mtime_secs: Option<i64>,
+    pub archive_mtime_nanos: Option<u32>,
+    pub archive_size: Option<u64>,
+    /// True only when the metadata editor created this staging tree for its
+    /// own transient Browse archive edit. When the editor opens against an
+    /// already-active ArchiveBrowseState staging session, Browse owns the
+    /// directory and the editor must never remove it on cancel/close.
+    pub editor_owns_staging: bool,
 }
 
 impl ArchiveMetadataEditContext {
     pub fn browse(archive_path: PathBuf, staging_dir: PathBuf) -> Self {
-        Self { owner: ArchiveMetadataEditOwner::Browse, archive_path, staging_dir }
+        let (archive_mtime_secs, archive_mtime_nanos, archive_size) = archive_fingerprint(&archive_path)
+            .map(|(secs, nanos, size)| (Some(secs), Some(nanos), Some(size)))
+            .unwrap_or((None, None, None));
+        Self {
+            owner: ArchiveMetadataEditOwner::Browse,
+            archive_path,
+            staging_dir,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+            editor_owns_staging: true,
+        }
+    }
+
+    /// Construct a Browse archive edit context for metadata-editor-created
+    /// staging, such as whole-archive editing launched from the archive file in
+    /// the parent directory. Do not use this for an existing
+    /// `ArchiveBrowseState::staging`; those sessions are owned by Browse and
+    /// must use `browse_active_staging_with_fingerprint()` so cancellation does
+    /// not install editor-owned retry/discard state.
+    pub fn browse_with_fingerprint(
+        archive_path: PathBuf,
+        staging_dir: PathBuf,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
+        Self {
+            owner: ArchiveMetadataEditOwner::Browse,
+            archive_path,
+            staging_dir,
+            archive_mtime_secs: Some(archive_mtime_secs),
+            archive_mtime_nanos: Some(archive_mtime_nanos),
+            archive_size: Some(archive_size),
+            editor_owns_staging: true,
+        }
+    }
+
+    pub fn browse_active_staging_with_fingerprint(
+        archive_path: PathBuf,
+        staging_dir: PathBuf,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
+        Self {
+            owner: ArchiveMetadataEditOwner::Browse,
+            archive_path,
+            staging_dir,
+            archive_mtime_secs: Some(archive_mtime_secs),
+            archive_mtime_nanos: Some(archive_mtime_nanos),
+            archive_size: Some(archive_size),
+            editor_owns_staging: false,
+        }
     }
 
     pub fn convert(archive_path: PathBuf, staging_dir: PathBuf) -> Self {
-        Self { owner: ArchiveMetadataEditOwner::Convert, archive_path, staging_dir }
+        Self {
+            owner: ArchiveMetadataEditOwner::Convert,
+            archive_path,
+            staging_dir,
+            archive_mtime_secs: None,
+            archive_mtime_nanos: None,
+            archive_size: None,
+            editor_owns_staging: true,
+        }
+    }
+
+    pub fn archive_conflict(&self) -> Result<bool, String> {
+        let Some(expected_secs) = self.archive_mtime_secs else { return Ok(false); };
+        let Some(expected_nanos) = self.archive_mtime_nanos else { return Ok(false); };
+        let Some(expected_size) = self.archive_size else { return Ok(false); };
+        let (actual_secs, actual_nanos, actual_size) = archive_fingerprint(&self.archive_path)?;
+        Ok(actual_secs != expected_secs || actual_nanos != expected_nanos || actual_size != expected_size)
     }
 
     pub fn cleanup_staging(&self) {
@@ -7195,6 +7390,40 @@ pub enum ConfirmAction {
         offset: i32,
         expected_crcs: Vec<u32>,
     },
+    /// Resolve a deferred Browse archive save after the original archive was
+    /// modified outside the app. Confirming overwrites the archive with the
+    /// staged edits; cancelling keeps the live staging session for later
+    /// retry/discard; pressing D discards the staged edits explicitly.
+    ArchiveExternalConflict {
+        context: ArchiveMetadataEditContext,
+    },
+    /// Resolve a failed deferred Browse archive save. Confirming retries the
+    /// save; cancelling keeps the live staging session; pressing D discards
+    /// the staged edits explicitly.
+    ArchiveRepackageFailure {
+        context: ArchiveMetadataEditContext,
+        error: String,
+    },
+    /// Mouse-accessible destructive discard confirmation for a staged Browse
+    /// archive session. This exists because the generic confirmation overlay
+    /// exposes only confirm/cancel buttons; the primary conflict/failure
+    /// dialogs keep cancel non-destructive and route mouse users through this
+    /// second explicit confirmation before deleting staged edits.
+    ArchiveDiscardStaging {
+        context: ArchiveMetadataEditContext,
+        quit_after_discard: bool,
+    },
+    /// Mouse-accessible destructive discard confirmation for a recovered
+    /// startup archive session.
+    ArchiveDiscardStartupRecovery {
+        session: crate::db::PendingArchiveSessionRecovery,
+    },
+    /// Resolve a durable archive staging session found on startup. Confirming
+    /// resumes it in Browse; D discards the staged files; N/Esc keeps it in the
+    /// database for a later startup.
+    ArchiveStartupRecovery {
+        session: crate::db::PendingArchiveSessionRecovery,
+    },
 }
 
 /// Repair parameters parked while AR verification runs to resolve
@@ -7319,10 +7548,38 @@ pub struct AppState {
     /// temporary staging tree until the matching completion arrives.
     pub pending_browse_archive_rename: Option<PendingBrowseArchiveRename>,
 
-    /// Browse-screen archive repackage currently in flight after staged tag
-    /// writes have succeeded. The event-loop completion clears this and removes
-    /// staging regardless of success or failure.
+    /// Browse-screen archive-entry delete currently in flight. This owns the
+    /// initial extraction staging tree until the matching completion attaches
+    /// it as the active deferred-save session or cleans it on failure.
+    pub pending_browse_archive_delete: Option<PendingBrowseArchiveDelete>,
+
+    /// Browse-screen archive repackage currently in flight for deferred archive
+    /// saves. Staging is removed only after a successful archive replacement;
+    /// failures keep staged edits available for retry/discard.
     pub browse_archive_repackage: Option<ArchiveMetadataEditContext>,
+
+    /// Editor-owned whole-archive metadata staging preserved after a cancelled
+    /// or failed repackage. Unlike in-archive Browse staging, parent-directory
+    /// archive edits have no live ArchiveBrowseState owner, so the AppState must
+    /// retain the retry/discard context until the user explicitly resolves it.
+    pub preserved_editor_archive_repackage: Option<ArchiveMetadataEditContext>,
+
+    /// Durable pending archive sessions discovered on startup and awaiting
+    /// explicit resume/discard/keep decisions.
+    pub pending_archive_recovery: std::collections::VecDeque<crate::db::PendingArchiveSessionRecovery>,
+
+    /// Recovery session selected for resume while its archive listing worker is
+    /// running. The listing completion attaches this staging session to Browse.
+    pub pending_archive_recovery_resume: Option<crate::tui::browse::ArchiveStagingSession>,
+
+    /// True when the recovery session being resumed already conflicted with an
+    /// externally changed archive. The session is still resumable, but the next
+    /// save must present the normal overwrite/discard choice.
+    pub pending_archive_recovery_resume_conflicted: bool,
+
+    /// True when a startup recovery confirmation is open. Used to advance to
+    /// the next retained session after the user keeps/discards/resumes one.
+    pub archive_recovery_prompt_active: bool,
 
     /// True when global quit has been requested while a Browse archive metadata
     /// editor still needs close-time reconciliation. The event loop defers the
@@ -7339,6 +7596,22 @@ pub struct AppState {
     /// finish. The rename worker owns active extraction/repackage I/O, so quit
     /// must never remove its staging directory out from under it.
     pub quit_after_browse_archive_rename: bool,
+
+    /// True when quit is waiting for an in-flight Browse archive-entry delete to
+    /// finish. Successful delete completion resumes quit, which then runs the
+    /// normal dirty-staging repackage path; failure cancels quit.
+    pub quit_after_browse_archive_delete: bool,
+
+    /// Target screen requested while a first archive edit is still extracting.
+    /// The screen switch is not considered complete until the edit is either
+    /// saved, discarded, or cancelled without staged changes.
+    pub deferred_browse_archive_screen_switch: Option<AppScreen>,
+
+    /// True when the user has requested ordinary archive exit (Esc/Left/Back/.. )
+    /// while first-edit archive staging is still in flight. Completion must attach
+    /// the staged session and run the same deferred-save path rather than strand
+    /// the edit for startup recovery.
+    pub deferred_browse_archive_exit: bool,
 
     /// Parked CuePreviewState while command mode is open. Set when `:`
     /// is pressed in the CUE preview overlay; consumed by `:w` (writes
@@ -7622,7 +7895,7 @@ impl AppState {
         let mut config = config;
         let configured_theme_slug = config.ui.theme.clone();
         let theme_overrides = crate::tui::theme::ThemeOverrides::load_default().unwrap_or_default();
-        let (theme, theme_startup_status) = match crate::tui::theme::load_theme_draft(&configured_theme_slug) {
+        let (theme, mut theme_startup_status) = match crate::tui::theme::load_theme_draft(&configured_theme_slug) {
             Ok(draft) => {
                 let resolved = crate::tui::theme::resolve_theme_draft(
                     &draft,
@@ -7663,6 +7936,42 @@ impl AppState {
                 crate::db::Database::open_memory().expect("in-memory DB should never fail")
             }
         };
+
+        let mut pending_archive_recovery: std::collections::VecDeque<crate::db::PendingArchiveSessionRecovery> =
+            std::collections::VecDeque::new();
+        if let Ok(sessions) = db.recover_pending_archive_sessions_at_startup() {
+            if !sessions.is_empty() {
+                let valid = sessions.iter().filter(|session| !session.conflicted).count();
+                let conflicted = sessions.len().saturating_sub(valid);
+                pending_archive_recovery = sessions.into();
+                let archive_status = if conflicted > 0 {
+                    format!("archive recovery: {valid} resumable staged session(s), {conflicted} conflict(s) need review")
+                } else {
+                    format!("archive recovery: {valid} resumable staged session(s)")
+                };
+                theme_startup_status = Some(match theme_startup_status.take() {
+                    Some(existing) => format!("{existing}; {archive_status}"),
+                    None => archive_status,
+                });
+            }
+        }
+
+        let mut active_overlay = ActiveOverlay::None;
+        let mut archive_recovery_prompt_active = false;
+        if let Some(session) = pending_archive_recovery.front().cloned() {
+            let reason = session.conflict_reason.as_deref().unwrap_or("none");
+            active_overlay = ActiveOverlay::Confirmation {
+                message: format!(
+                    "Recovered staged archive edits from a previous run:\n{}\n\nStaging: {}\nEdits: {}\nConflict: {}\n\nY resumes the staged archive view. D discards staged edits. N/Esc keeps them for next startup.",
+                    session.archive_path.display(),
+                    session.staging_dir.display(),
+                    session.edits_json,
+                    reason,
+                ),
+                action: ConfirmAction::ArchiveStartupRecovery { session },
+            };
+            archive_recovery_prompt_active = true;
+        }
 
         let theme_library = crate::tui::theme::ThemeLibrarySnapshot::load();
 
@@ -7738,15 +8047,24 @@ impl AppState {
             wizard: None,
             wizard_mouse_areas: None,
             wizard_target: WizardTarget::ConfigureAll,
-            active_overlay: ActiveOverlay::None,
+            active_overlay,
             pending_bulk_rename: None,
             pending_metadata_editor: None,
             pending_browse_archive_metadata: None,
             pending_browse_archive_rename: None,
+            pending_browse_archive_delete: None,
             browse_archive_repackage: None,
+            preserved_editor_archive_repackage: None,
+            pending_archive_recovery,
+            pending_archive_recovery_resume: None,
+            pending_archive_recovery_resume_conflicted: false,
+            archive_recovery_prompt_active,
             quit_after_browse_archive_metadata_resolution: false,
             quit_after_browse_archive_repackage: false,
             quit_after_browse_archive_rename: false,
+            quit_after_browse_archive_delete: false,
+            deferred_browse_archive_screen_switch: None,
+            deferred_browse_archive_exit: false,
             pending_cue_preview: None,
             pending_mb_select: None,
             status_message: theme_startup_status.map(|message| (message, std::time::Instant::now())),

@@ -1111,6 +1111,13 @@ impl FileTaskProgressState {
         if self.is_terminal() {
             return vec![(" OK ".to_string(), ProgressHitAction::Acknowledge, self.theme.progress_button)];
         }
+        if matches!(&self.kind, FileTaskKind::Archive) {
+            return vec![(
+                " Esc Abort ".to_string(),
+                ProgressHitAction::Abort,
+                self.theme.progress_destructive,
+            )];
+        }
         let pause_label = if matches!(self.phase, FileTaskPhase::Paused) {
             " p Resume "
         } else {

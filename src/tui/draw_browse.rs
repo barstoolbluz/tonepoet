@@ -251,10 +251,12 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let dirty = arc.staging.as_ref().is_some_and(|staging| staging.dirty);
+        let marker = if dirty { " [modified]" } else { "" };
         if arc.inner_path.is_empty() {
-            format!("{}:/", archive_name)
+            format!("{}:/{}", archive_name, marker)
         } else {
-            format!("{}:/{}", archive_name, arc.inner_path)
+            format!("{}:/{}{}", archive_name, arc.inner_path, marker)
         }
     } else {
         let path_str = browse.current_dir.display().to_string();
@@ -986,7 +988,8 @@ fn entry_info_lines(
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let mut meta_field_rows: Vec<(MetadataField, usize)> = Vec::new();
     let mut inline_cursor: Option<(usize, u16)> = None;
-    let archive_metadata_inline_disabled = browse.is_in_archive();
+    let archive_metadata_inline_disabled = browse.is_in_archive()
+        && browse.active_archive_staging().is_none();
     // Pill rows set by branches that emit them after their content.
     // SacdIso is the only branch using this besides AudioFile (which
     // returns early), but the pattern generalises if more arms grow
