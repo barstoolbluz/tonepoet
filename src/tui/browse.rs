@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use ratatui::layout::Rect;
+
 /// Type-ahead buffer resets after this duration of inactivity.
 const TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -1126,6 +1128,11 @@ pub struct BrowseState {
     pub columns: Vec<BrowseColumn>,
     pub options_menu: BrowseOptionsMenu,
 
+    /// Last frame area used to render Browse. Mouse hit-testing for floating
+    /// Browse overlays must use this rendered coordinate space rather than
+    /// assuming Browse starts at the terminal origin.
+    pub last_render_area: Option<Rect>,
+
     /// Directory navigation history backing toolbar Back/Fwd.
     pub nav_history: Vec<PathBuf>,
     pub nav_history_index: usize,
@@ -1379,6 +1386,7 @@ impl BrowseState {
             browse_title_last_click: None,
             columns,
             options_menu: BrowseOptionsMenu::Closed,
+            last_render_area: None,
             nav_history: vec![start_dir],
             nav_history_index: 0,
             search_result_cap: config.search_result_cap,

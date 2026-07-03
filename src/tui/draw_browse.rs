@@ -127,6 +127,8 @@ fn name_column_width(layout: &[BrowseColumnCell]) -> usize {
 
 /// Draw the full browse screen
 pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
+    app.browse.last_render_area = Some(area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -196,6 +198,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         draw_options_menu(
             f,
             chunks[1],
+            area,
             &app.browse,
             &app.config.performance.browsing.archive_listing,
             &mut app.button_map,
@@ -214,7 +217,14 @@ fn browse_content_layout(area: Rect, browse: &BrowseState) -> std::rc::Rc<[Rect]
     ) {
         (false, false, _, _) => vec![Constraint::Length(0), Constraint::Percentage(100), Constraint::Length(0)],
         (false, true, _, true) => vec![Constraint::Length(0), Constraint::Min(40), Constraint::Length(3)],
-        (false, true, _, false) => vec![Constraint::Length(0), Constraint::Percentage(60), Constraint::Percentage(40)],
+        (false, true, _, false) => {
+            let info_width = area.width / 3;
+            vec![
+                Constraint::Length(0),
+                Constraint::Length(area.width.saturating_sub(info_width)),
+                Constraint::Length(info_width),
+            ]
+        },
         (true, false, true, _) => vec![Constraint::Length(3), Constraint::Min(40), Constraint::Length(0)],
         (true, false, false, _) => vec![Constraint::Percentage(20), Constraint::Percentage(80), Constraint::Length(0)],
         (true, true, true, true) => vec![Constraint::Length(3), Constraint::Min(40), Constraint::Length(3)],
@@ -462,6 +472,7 @@ fn draw_collapsed_pane(
 fn draw_options_menu(
     f: &mut Frame,
     toolbar_area: Rect,
+    screen_area: Rect,
     browse: &BrowseState,
     archive_listing_mode: &str,
     buttons: &mut ButtonRenderMap,
@@ -469,17 +480,17 @@ fn draw_options_menu(
     theme: super::theme::Theme,
 ) {
     let root_rows = options_root_rows(browse);
-    let root_width = options_menu_panel_width("Options", &root_rows, toolbar_area.width);
-    let root_height = root_rows.len() as u16 + 2;
-    let preferred_x = toolbar_area.x.saturating_add(30);
-    let y = toolbar_area.y.saturating_add(1);
-    let root_x = clamp_menu_x(preferred_x, root_width, toolbar_area);
-    let root_area = Rect::new(root_x, y, root_width, root_height);
+    let geometry = options_menu_geometry_for_area(
+        toolbar_area,
+        screen_area,
+        browse,
+        archive_listing_mode,
+    );
     let active_parent = active_options_parent_button(browse.options_menu);
 
     render_options_menu_panel(
         f,
-        root_area,
+        geometry.root_area,
         "Options",
         &root_rows,
         buttons,
@@ -488,11 +499,10 @@ fn draw_options_menu(
         theme,
     );
 
-    if let Some((title, submenu_rows)) = options_submenu_rows(browse, archive_listing_mode) {
-        let submenu_width = options_menu_panel_width(title, &submenu_rows, toolbar_area.width);
-        let submenu_height = submenu_rows.len() as u16 + 2;
-        let submenu_area = options_submenu_area(root_area, submenu_width, submenu_height, toolbar_area);
-
+    if let (Some((title, submenu_rows)), Some(submenu_area)) = (
+        options_submenu_rows(browse, archive_listing_mode),
+        geometry.submenu_area,
+    ) {
         render_options_menu_panel(
             f,
             submenu_area,
@@ -504,6 +514,85 @@ fn draw_options_menu(
             theme,
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OptionsMenuGeometry {
+    pub(super) root_area: Rect,
+    pub(super) submenu_area: Option<Rect>,
+}
+
+impl OptionsMenuGeometry {
+    pub(super) fn contains(self, x: u16, y: u16) -> bool {
+        rect_contains(self.root_area, x, y)
+            || match self.submenu_area {
+                Some(area) => rect_contains(area, x, y),
+                None => false,
+            }
+    }
+}
+
+pub(super) fn browse_toolbar_area_for_screen(screen_area: Rect) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(screen_area)[1]
+}
+
+pub(super) fn options_menu_geometry_for_area(
+    toolbar_area: Rect,
+    screen_area: Rect,
+    browse: &BrowseState,
+    archive_listing_mode: &str,
+) -> OptionsMenuGeometry {
+    let root_rows = options_root_rows(browse);
+    let root_width = options_menu_panel_width("Options", &root_rows, toolbar_area.width);
+    let root_height = root_rows.len() as u16 + 2;
+    let preferred_x = toolbar_area.x.saturating_add(30);
+    let root_y = toolbar_area.y.saturating_add(1);
+    let root_x = clamp_menu_x(preferred_x, root_width, toolbar_area);
+    let root_area = Rect::new(root_x, root_y, root_width, root_height);
+    let active_parent = active_options_parent_button(browse.options_menu);
+
+    let submenu_area = options_submenu_rows(browse, archive_listing_mode).map(|(title, submenu_rows)| {
+        let submenu_width = options_menu_panel_width(title, &submenu_rows, screen_area.width);
+        let submenu_height = submenu_rows.len() as u16 + 2;
+        let parent_row_index = active_parent
+            .and_then(|active| {
+                root_rows
+                    .iter()
+                    .position(|(_, button)| *button == Some(active))
+            })
+            .unwrap_or(0);
+        let preferred_submenu_y = root_area
+            .y
+            .saturating_add(1)
+            .saturating_add(parent_row_index as u16);
+        options_submenu_area(
+            root_area,
+            submenu_width,
+            submenu_height,
+            preferred_submenu_y,
+            screen_area,
+        )
+    });
+
+    OptionsMenuGeometry {
+        root_area,
+        submenu_area,
+    }
+}
+
+fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
 }
 
 fn options_root_rows(browse: &BrowseState) -> Vec<(String, Option<TuiButton>)> {
@@ -652,15 +741,22 @@ fn clamp_menu_x(preferred_x: u16, width: u16, outer: Rect) -> u16 {
     preferred_x.min(max_x).max(outer.x)
 }
 
-fn options_submenu_area(root_area: Rect, width: u16, height: u16, outer: Rect) -> Rect {
+fn options_submenu_area(
+    root_area: Rect,
+    width: u16,
+    height: u16,
+    preferred_y: u16,
+    outer: Rect,
+) -> Rect {
+    let y = clamp_menu_y(preferred_y, height, outer);
     let right_x = root_area.x.saturating_add(root_area.width);
     let outer_right = outer.x.saturating_add(outer.width);
     if right_x.saturating_add(width) <= outer_right {
-        return Rect::new(right_x, root_area.y, width, height);
+        return Rect::new(right_x, y, width, height);
     }
 
     if root_area.x >= outer.x.saturating_add(width) {
-        return Rect::new(root_area.x - width, root_area.y, width, height);
+        return Rect::new(root_area.x - width, y, width, height);
     }
 
     let right_candidate = clamp_menu_x(right_x, width, outer);
@@ -676,7 +772,13 @@ fn options_submenu_area(root_area: Rect, width: u16, height: u16, outer: Rect) -
     } else {
         right_candidate
     };
-    Rect::new(x, root_area.y, width, height)
+    Rect::new(x, y, width, height)
+}
+
+fn clamp_menu_y(preferred_y: u16, height: u16, outer: Rect) -> u16 {
+    let bottom = outer.y.saturating_add(outer.height);
+    let max_y = bottom.saturating_sub(height);
+    preferred_y.min(max_y).max(outer.y)
 }
 
 fn horizontal_overlap(ax: u16, aw: u16, bx: u16, bw: u16) -> u16 {
@@ -780,6 +882,43 @@ mod options_menu_tests {
     use super::*;
 
     #[test]
+    fn layout_gives_recovered_explore_space_to_browse_pane() {
+        let mut browse = BrowseState::new();
+        browse.explore_enabled = false;
+        browse.info_enabled = true;
+        browse.explore_collapsed = false;
+        browse.info_collapsed = false;
+
+        for width in [99, 100, 101] {
+            let chunks = browse_content_layout(Rect::new(0, 0, width, 10), &browse);
+            let expected_info = width / 3;
+
+            assert_eq!(chunks[0].width, 0);
+            assert_eq!(chunks[1].width, width - expected_info);
+            assert_eq!(chunks[2].width, expected_info);
+            assert!(
+                chunks[2].width <= width / 3,
+                "info pane exceeded one-third cap at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_gives_recovered_info_space_to_browse_pane() {
+        let mut browse = BrowseState::new();
+        browse.explore_enabled = true;
+        browse.info_enabled = false;
+        browse.explore_collapsed = false;
+        browse.info_collapsed = false;
+
+        let chunks = browse_content_layout(Rect::new(0, 0, 100, 10), &browse);
+
+        assert_eq!(chunks[0].width, 20);
+        assert_eq!(chunks[1].width, 80);
+        assert_eq!(chunks[2].width, 0);
+    }
+
+    #[test]
     fn archive_listing_submenu_marks_current_mode() {
         let mut browse = BrowseState::new();
         browse.options_menu = BrowseOptionsMenu::ArchiveListing;
@@ -808,7 +947,7 @@ mod options_menu_tests {
         let outer = Rect::new(0, 0, 100, 20);
         let root = Rect::new(30, 1, 24, 10);
 
-        let submenu = options_submenu_area(root, 20, 8, outer);
+        let submenu = options_submenu_area(root, 20, 8, root.y, outer);
 
         assert_eq!(submenu.x, root.x + root.width);
         assert_eq!(horizontal_overlap(submenu.x, submenu.width, root.x, root.width), 0);
@@ -819,7 +958,7 @@ mod options_menu_tests {
         let outer = Rect::new(0, 0, 60, 20);
         let root = Rect::new(30, 1, 24, 10);
 
-        let submenu = options_submenu_area(root, 20, 8, outer);
+        let submenu = options_submenu_area(root, 20, 8, root.y, outer);
 
         assert_eq!(submenu.x + submenu.width, root.x);
         assert_eq!(horizontal_overlap(submenu.x, submenu.width, root.x, root.width), 0);
@@ -830,10 +969,65 @@ mod options_menu_tests {
         let outer = Rect::new(0, 0, 30, 20);
         let root = Rect::new(5, 1, 22, 10);
 
-        let submenu = options_submenu_area(root, 20, 8, outer);
+        let submenu = options_submenu_area(root, 20, 8, root.y, outer);
 
         assert!(submenu.x >= outer.x);
         assert!(submenu.x + submenu.width <= outer.x + outer.width);
+    }
+
+    #[test]
+    fn submenu_geometry_anchors_to_parent_row() {
+        let outer = Rect::new(0, 0, 100, 20);
+        let root = Rect::new(30, 1, 24, 10);
+        let preferred_y = root.y + 1 + 4;
+
+        let submenu = options_submenu_area(root, 20, 8, preferred_y, outer);
+
+        assert_eq!(submenu.y, preferred_y);
+    }
+
+    #[test]
+    fn options_menu_geometry_places_layout_submenu_on_parent_row() {
+        let mut browse = BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::Layout;
+        let screen = Rect::new(0, 0, 120, 30);
+        let toolbar = browse_toolbar_area_for_screen(screen);
+
+        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let submenu = geometry.submenu_area.expect("layout submenu");
+
+        assert_eq!(submenu.y, geometry.root_area.y + 2);
+        assert!(geometry.contains(submenu.x + 1, submenu.y));
+    }
+
+
+    #[test]
+    fn options_menu_geometry_respects_nonzero_browse_area_origin() {
+        let mut browse = BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::Layout;
+        let screen = Rect::new(7, 3, 120, 30);
+        let toolbar = browse_toolbar_area_for_screen(screen);
+
+        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let submenu = geometry.submenu_area.expect("layout submenu");
+
+        assert!(geometry.root_area.x >= screen.x);
+        assert_eq!(geometry.root_area.y, screen.y + 8);
+        assert!(submenu.x >= screen.x);
+        assert!(submenu.y >= screen.y);
+        assert!(geometry.contains(submenu.x + 1, submenu.y));
+    }
+
+    #[test]
+    fn submenu_geometry_clamps_to_terminal_bottom() {
+        let outer = Rect::new(0, 0, 100, 12);
+        let root = Rect::new(30, 1, 24, 10);
+        let preferred_y = 10;
+
+        let submenu = options_submenu_area(root, 20, 8, preferred_y, outer);
+
+        assert_eq!(submenu.y, 4);
+        assert!(submenu.y + submenu.height <= outer.y + outer.height);
     }
 
     #[test]

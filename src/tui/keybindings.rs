@@ -7,7 +7,11 @@ use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use super::app::*;
+use super::browse::BrowseOptionsMenu;
 use super::button_map::TuiButton;
+use super::draw_browse::{
+    browse_toolbar_area_for_screen, options_menu_geometry_for_area, OptionsMenuGeometry,
+};
 use super::message::AppMessage;
 use crate::convert::{ConversionOptions, ConversionStatus};
 
@@ -242,7 +246,6 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         _ => {} // placeholder screens
     }
 }
-
 
 
 fn open_theme_apply_dialog(app: &mut AppState, forward: bool) {
@@ -1017,6 +1020,207 @@ fn is_browse_options_menu_button(button: TuiButton) -> bool {
             | TuiButton::BrowseOptionsFilterChoice(_)
             | TuiButton::BrowseOptionsArchiveChoice(_)
     )
+}
+
+fn options_menu_hover_update(app: &mut AppState, mouse_x: u16, mouse_y: u16) {
+    let geometry = options_menu_geometry_for_current_browse_area(app);
+    app.browse.options_menu = options_menu_hover_next_menu_at(
+        app.browse.options_menu,
+        app.hover_target,
+        Some((mouse_x, mouse_y)),
+        geometry,
+    );
+}
+
+fn options_menu_geometry_for_current_browse_area(app: &AppState) -> Option<OptionsMenuGeometry> {
+    if app.current_screen != AppScreen::Browse || !app.browse.options_menu.is_open() {
+        return None;
+    }
+
+    let screen_area = app.browse.last_render_area.unwrap_or_else(|| {
+        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+        Rect::new(0, 0, width, height)
+    });
+    let toolbar_area = browse_toolbar_area_for_screen(screen_area);
+    Some(options_menu_geometry_for_area(
+        toolbar_area,
+        screen_area,
+        &app.browse,
+        &app.config.performance.browsing.archive_listing,
+    ))
+}
+
+#[cfg(test)]
+fn options_menu_hover_next_menu(
+    current: BrowseOptionsMenu,
+    hover: Option<TuiButton>,
+) -> BrowseOptionsMenu {
+    options_menu_hover_next_menu_at(current, hover, None, None)
+}
+
+fn options_menu_hover_next_menu_at(
+    current: BrowseOptionsMenu,
+    hover: Option<TuiButton>,
+    mouse: Option<(u16, u16)>,
+    geometry: Option<OptionsMenuGeometry>,
+) -> BrowseOptionsMenu {
+    match hover {
+        Some(TuiButton::BrowseOptionsLayout) => BrowseOptionsMenu::Layout,
+        Some(TuiButton::BrowseOptionsColumns) => BrowseOptionsMenu::Columns,
+        Some(TuiButton::BrowseOptionsSort) => BrowseOptionsMenu::Sort,
+        Some(TuiButton::BrowseOptionsFilter) => BrowseOptionsMenu::Filter,
+        Some(TuiButton::BrowseOptionsArchiveListing) => BrowseOptionsMenu::ArchiveListing,
+
+        Some(TuiButton::BrowseOptionsShowHidden)
+        | Some(TuiButton::BrowseOptionsSaveLayout)
+        | Some(TuiButton::BrowseOptionsRestoreDefaults) => BrowseOptionsMenu::Root,
+
+        Some(button) if is_browse_options_menu_button(button) => current,
+
+        _ if match (mouse, geometry) {
+            (Some((x, y)), Some(geometry)) => geometry.contains(x, y),
+            _ => false,
+        } => current,
+
+        _ => match current {
+            BrowseOptionsMenu::Closed | BrowseOptionsMenu::Root => current,
+            _ => BrowseOptionsMenu::Root,
+        },
+    }
+}
+
+#[cfg(test)]
+mod options_menu_hover_tests {
+    use super::*;
+
+    #[test]
+    fn hover_over_root_submenu_items_opens_matching_submenu() {
+        assert_eq!(
+            options_menu_hover_next_menu(
+                BrowseOptionsMenu::Root,
+                Some(TuiButton::BrowseOptionsLayout),
+            ),
+            BrowseOptionsMenu::Layout
+        );
+        assert_eq!(
+            options_menu_hover_next_menu(
+                BrowseOptionsMenu::Layout,
+                Some(TuiButton::BrowseOptionsArchiveListing),
+            ),
+            BrowseOptionsMenu::ArchiveListing
+        );
+    }
+
+    #[test]
+    fn hover_over_non_submenu_root_items_closes_open_submenu() {
+        for button in [
+            TuiButton::BrowseOptionsShowHidden,
+            TuiButton::BrowseOptionsSaveLayout,
+            TuiButton::BrowseOptionsRestoreDefaults,
+        ] {
+            assert_eq!(
+                options_menu_hover_next_menu(BrowseOptionsMenu::Columns, Some(button)),
+                BrowseOptionsMenu::Root
+            );
+        }
+    }
+
+    #[test]
+    fn hover_over_submenu_item_keeps_current_submenu_open() {
+        assert_eq!(
+            options_menu_hover_next_menu(
+                BrowseOptionsMenu::Columns,
+                Some(TuiButton::BrowseOptionsColumn(
+                    super::super::browse::BrowseColumn::Size,
+                )),
+            ),
+            BrowseOptionsMenu::Columns
+        );
+        assert_eq!(
+            options_menu_hover_next_menu(
+                BrowseOptionsMenu::Layout,
+                Some(TuiButton::BrowseOptionsToggleInfo),
+            ),
+            BrowseOptionsMenu::Layout
+        );
+    }
+
+    #[test]
+    fn hover_outside_menu_closes_only_the_submenu() {
+        assert_eq!(
+            options_menu_hover_next_menu(BrowseOptionsMenu::Sort, None),
+            BrowseOptionsMenu::Root
+        );
+        assert_eq!(
+            options_menu_hover_next_menu(BrowseOptionsMenu::Root, None),
+            BrowseOptionsMenu::Root
+        );
+        assert_eq!(
+            options_menu_hover_next_menu(BrowseOptionsMenu::Closed, None),
+            BrowseOptionsMenu::Closed
+        );
+    }
+
+    #[test]
+    fn hover_on_submenu_top_border_preserves_open_submenu() {
+        let mut browse = crate::tui::browse::BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::Layout;
+        let screen = Rect::new(0, 0, 120, 30);
+        let toolbar = browse_toolbar_area_for_screen(screen);
+        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let submenu = geometry.submenu_area.expect("layout submenu");
+
+        assert_eq!(
+            options_menu_hover_next_menu_at(
+                BrowseOptionsMenu::Layout,
+                None,
+                Some((submenu.x + 1, submenu.y)),
+                Some(geometry),
+            ),
+            BrowseOptionsMenu::Layout
+        );
+    }
+
+
+    #[test]
+    fn hover_inside_offset_panel_geometry_preserves_open_submenu() {
+        let mut browse = crate::tui::browse::BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::Layout;
+        let screen = Rect::new(11, 5, 120, 30);
+        let toolbar = browse_toolbar_area_for_screen(screen);
+        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let submenu = geometry.submenu_area.expect("layout submenu");
+
+        assert_eq!(geometry.root_area.y, screen.y + 8);
+        assert_eq!(
+            options_menu_hover_next_menu_at(
+                BrowseOptionsMenu::Layout,
+                None,
+                Some((submenu.x + 1, submenu.y)),
+                Some(geometry),
+            ),
+            BrowseOptionsMenu::Layout
+        );
+    }
+
+    #[test]
+    fn hover_outside_panel_geometry_closes_open_submenu() {
+        let mut browse = crate::tui::browse::BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::Layout;
+        let screen = Rect::new(0, 0, 120, 30);
+        let toolbar = browse_toolbar_area_for_screen(screen);
+        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+
+        assert_eq!(
+            options_menu_hover_next_menu_at(
+                BrowseOptionsMenu::Layout,
+                None,
+                Some((0, screen.height - 1)),
+                Some(geometry),
+            ),
+            BrowseOptionsMenu::Root
+        );
+    }
 }
 
 fn set_browse_filter_choice(
@@ -5739,7 +5943,6 @@ mod progress_dialog_theme_tests {
         assert_eq!(progress.theme().progress_button.fg, Some(next_theme.progress_dialog_button_fg));
         assert_eq!(progress.theme().progress_destructive.bg, Some(next_theme.progress_dialog_abort_bg));
     }
-
 
 
     #[test]
@@ -22912,6 +23115,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
         let new_hover = app.button_map.find_button_at(mouse.column, mouse.row);
         app.hover_target = new_hover;
+        if app.current_screen == AppScreen::Browse && app.browse.options_menu.is_open() {
+            options_menu_hover_update(app, mouse.column, mouse.row);
+        }
         return; // Move events don't trigger actions.
     }
 
