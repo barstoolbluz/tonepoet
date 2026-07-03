@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "tonepoet"
-version = "0.2.9"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.82"
 description = "Standalone CLI + TUI audio conversion toolkit"
