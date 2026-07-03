@@ -70,6 +70,18 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // F5 refreshes the browse screen regardless of sub-state (search panel,
+    // filter input, path editing, etc.) — just like Windows/Linux file managers.
+    if app.current_screen == AppScreen::Browse
+        && ((key.code == KeyCode::F(5))
+            || (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL)))
+    {
+        app.browse.refresh_with_search(Some(tx));
+        app.browse.probe_current_with_db(tx, Some(&app.db));
+        app.set_status("browse refreshed");
+        return;
+    }
+
     // Browse info-pane metadata focus is not yet an editor, but printable
     // keys are still semantically field input. Let Browse handle them before
     // global 1-5 tab shortcuts or command-mode keys can steal the keystroke.
@@ -2528,13 +2540,6 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Refresh (F5, like Windows/Linux file managers)
-        (KeyCode::F(5), _) => {
-            app.browse.refresh_with_search(Some(tx));
-            app.browse.probe_current_with_db(tx, Some(&app.db));
-            app.set_status("browse refreshed");
-        }
-
         // Rename the selected file/folder inline in the list.
         (KeyCode::F(2), KeyModifiers::NONE) => {
             clear_browse_info_focus(app);
@@ -2710,8 +2715,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             // Browse is home — Esc with nothing to clear is a no-op.
         }
 
-        // Ctrl+E = open metadata editor for selected audio file(s)
-        (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+        // Ctrl+E / Alt+Enter = open metadata editor for selected audio file(s).
+        // If the selection has no audio content, stub status for future
+        // properties dialog.
+        (KeyCode::Char('e'), KeyModifiers::CONTROL)
+        | (KeyCode::Enter, KeyModifiers::ALT) => {
             clear_browse_info_focus(app);
             open_metadata_editor(app);
         }

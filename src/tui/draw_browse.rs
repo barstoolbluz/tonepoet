@@ -196,7 +196,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
 fn browse_content_layout(area: Rect, browse: &BrowseState) -> std::rc::Rc<[Rect]> {
     let constraints: Vec<Constraint> = match (browse.explore_collapsed, browse.info_collapsed) {
         (true, true) => vec![Constraint::Length(3), Constraint::Min(40), Constraint::Length(3)],
-        (true, false) => vec![Constraint::Length(3), Constraint::Percentage(55), Constraint::Percentage(45)],
+        (true, false) => vec![Constraint::Length(3), Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)],
         (false, true) => vec![Constraint::Percentage(20), Constraint::Min(40), Constraint::Length(3)],
         (false, false) => vec![Constraint::Percentage(20), Constraint::Percentage(50), Constraint::Percentage(30)],
     };
@@ -228,13 +228,6 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarOptions, x, y, " Options ▾ ", true, theme);
     x = x.saturating_add(12);
     draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarSearch, x, y, " Search ", true, theme);
-
-    let hidden_label = if app.browse.show_hidden { " Show hidden: ● " } else { " Show hidden: ○ " };
-    let hidden_w = hidden_label.chars().count() as u16;
-    if area.width > hidden_w + 2 {
-        let hx = area.x + area.width - hidden_w;
-        draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarShowHidden, hx, y, hidden_label, true, theme);
-    }
 
     draw_breadcrumb(f, rows[1], &app.browse, theme);
     app.button_map.record_button(TuiButton::BrowseBreadcrumb, rows[1]);
@@ -384,16 +377,28 @@ fn draw_collapsed_pane(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // Fill the entire collapsed pane with a subtle background so it doesn't
+    // blend into the screen background, but keep it muted (not the active
+    // border color).
+    let collapsed_bg = theme.surface;
+    let fill_style = Style::default().bg(collapsed_bg);
+    for row in 0..area.height {
+        f.render_widget(
+            Paragraph::new(" ".repeat(area.width as usize)).style(fill_style),
+            Rect::new(area.x, area.y + row, area.width, 1),
+        );
+    }
     let block = Block::default().borders(Borders::ALL).border_style(theme.border(theme.border_dim));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let text_style = Style::default().fg(theme.text_muted).bg(collapsed_bg);
     let chars = std::iter::once('▸')
         .chain(std::iter::once(' '))
         .chain(title.chars())
         .collect::<Vec<_>>();
     for (row, ch) in chars.into_iter().enumerate().take(inner.height as usize) {
         let rect = Rect::new(inner.x, inner.y + row as u16, 1, 1);
-        f.render_widget(Paragraph::new(ch.to_string()).style(theme.text_style()), rect);
+        f.render_widget(Paragraph::new(ch.to_string()).style(text_style), rect);
     }
     buttons.record_button(TuiButton::BrowsePaneToggle(pane), area);
 }
