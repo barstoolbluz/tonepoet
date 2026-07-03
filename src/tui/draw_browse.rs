@@ -131,7 +131,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7), // header banner
-            Constraint::Length(4), // toolbar + path bar
+            Constraint::Length(5), // toolbar + path bar (two boxes, shared middle border)
             Constraint::Min(10),   // three-pane browse content
             Constraint::Length(2), // footer (tabs + context)
         ])
@@ -207,16 +207,48 @@ fn browse_content_layout(area: Rect, browse: &BrowseState) -> std::rc::Rc<[Rect]
 }
 
 fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
-    if area.height < 3 || area.width < 20 {
+    if area.height < 5 || area.width < 20 {
         return;
     }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(3)])
-        .split(area);
 
-    let mut x = area.x;
-    let y = rows[0].y;
+    // Two stacked boxes sharing a middle border line:
+    //   Line 0: ┌──────────────────────────────────────┐
+    //   Line 1: │ ‹ Back  › Fwd  ↑ Up  Refresh  ...   │
+    //   Line 2: ├──────────────────────────────────────┤
+    //   Line 3: │ path: ~/dir                     [Go] │
+    //   Line 4: └──────────────────────────────────────┘
+    let border_color = if app.browse.path_input.is_some() {
+        theme.blue
+    } else {
+        theme.border_dim
+    };
+    let bs = theme.border(border_color);
+    let w = area.width as usize;
+    let inner_w = w.saturating_sub(2);
+
+    // Line 0: top border
+    let top = Line::from(Span::styled(format!("┌{}┐", "─".repeat(inner_w)), bs));
+    f.render_widget(Paragraph::new(top), Rect::new(area.x, area.y, area.width, 1));
+
+    // Line 1: side borders (button content rendered on top)
+    f.render_widget(Paragraph::new("│").style(bs), Rect::new(area.x, area.y + 1, 1, 1));
+    f.render_widget(Paragraph::new("│").style(bs), Rect::new(area.x + area.width - 1, area.y + 1, 1, 1));
+
+    // Line 2: shared middle border
+    let mid = Line::from(Span::styled(format!("├{}┤", "─".repeat(inner_w)), bs));
+    f.render_widget(Paragraph::new(mid), Rect::new(area.x, area.y + 2, area.width, 1));
+
+    // Line 3: side borders (path content rendered on top)
+    f.render_widget(Paragraph::new("│").style(bs), Rect::new(area.x, area.y + 3, 1, 1));
+    f.render_widget(Paragraph::new("│").style(bs), Rect::new(area.x + area.width - 1, area.y + 3, 1, 1));
+
+    // Line 4: bottom border
+    let bot = Line::from(Span::styled(format!("└{}┘", "─".repeat(inner_w)), bs));
+    f.render_widget(Paragraph::new(bot), Rect::new(area.x, area.y + 4, area.width, 1));
+
+    // Render toolbar buttons on line 1, inside the borders
+    let mut x = area.x + 1;
+    let y = area.y + 1;
     draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarBack, x, y, " ‹ Back ", app.browse.can_go_back(), theme);
     x = x.saturating_add(8);
     draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarForward, x, y, " › Fwd ", app.browse.can_go_forward(), theme);
@@ -229,10 +261,12 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     x = x.saturating_add(12);
     draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarSearch, x, y, " Search ", true, theme);
 
-    draw_breadcrumb(f, rows[1], &app.browse, theme);
-    app.button_map.record_button(TuiButton::BrowseBreadcrumb, rows[1]);
-    if rows[1].width > 6 {
-        let go = Rect::new(rows[1].x + rows[1].width - 6, rows[1].y + 1, 5, 1);
+    // Render path bar on line 3, inside the borders
+    let path_area = Rect::new(area.x + 1, area.y + 3, area.width.saturating_sub(2), 1);
+    draw_breadcrumb_inline(f, path_area, &app.browse, theme);
+    app.button_map.record_button(TuiButton::BrowseBreadcrumb, path_area);
+    if path_area.width > 6 {
+        let go = Rect::new(path_area.x + path_area.width - 5, path_area.y, 5, 1);
         f.render_widget(Paragraph::new(" Go ").style(browse_toolbar_button_style(theme)), go);
         app.button_map.record_button(TuiButton::BrowsePathGo, go);
     }
@@ -611,39 +645,21 @@ fn render_path_input_spans(
     (spans, cursor_col)
 }
 
-/// Draw the breadcrumb bar showing the current directory path
-/// (and the active text filter, if any).
-fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super::theme::Theme) {
+/// Draw the path bar inline (no border — caller provides the containing border).
+fn draw_breadcrumb_inline(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super::theme::Theme) {
     if area.width < 10 {
         return;
     }
 
-    let border_color = if browse.path_input.is_some() {
-        theme.blue
-    } else {
-        theme.border_dim
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.width < 4 {
-        return;
-    }
-
-    // Editable path input mode. Use the same selection-aware inline renderer
-    // as Browse rename/metadata fields so partial Shift/Ctrl selections are
-    // visible in the path bar, not just Ctrl+A whole-field selection.
+    // Editable path input mode.
     if let Some(ref input) = browse.path_input {
-        let (spans, cursor_col) = render_path_input_spans(input, inner.width as usize, theme);
+        let (spans, cursor_col) = render_path_input_spans(input, area.width as usize, theme);
         let line = Paragraph::new(Line::from(spans));
-        f.render_widget(line, inner);
+        f.render_widget(line, area);
 
-        let cursor_x = inner.x + cursor_col;
-        if cursor_x < inner.x + inner.width {
-            f.set_cursor(cursor_x, inner.y);
+        let cursor_x = area.x + cursor_col;
+        if cursor_x < area.x + area.width {
+            f.set_cursor(cursor_x, area.y);
         }
         return;
     }
@@ -688,7 +704,7 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super
     let prefix = " path: ";
     let prefix_w = prefix.chars().count();
     let suffix_w = filter_suffix.chars().count() + type_ahead_suffix.chars().count();
-    let path_max = (inner.width as usize)
+    let path_max = (area.width as usize)
         .saturating_sub(prefix_w)
         .saturating_sub(suffix_w)
         .saturating_sub(1);
@@ -712,7 +728,7 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super
     }
 
     let line = Paragraph::new(Line::from(spans));
-    f.render_widget(line, inner);
+    f.render_widget(line, area);
 }
 
 /// Truncate a string from the LEFT to fit `max` chars, prepending `…` if cut.
