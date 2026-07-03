@@ -9,11 +9,11 @@ use ratatui::{
 };
 
 use super::app::{AppState, BrowseInfoFocus, BrowseInlineEditState, BrowseInlineEditTarget};
-use super::browse::{BrowseEntry, BrowseState, EntryKind, SortBy, SortDir};
-use super::button_map::{ButtonRenderMap, ColumnKind, TuiButton};
+use super::browse::{BrowseColumn, BrowseEntry, BrowseOptionsMenu, BrowsePaneId, BrowseState, CachedInfo, EntryKind, FormatFilter, SortBy, SortDir};
+use super::button_map::{ButtonRenderMap, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
-use super::inline_edit::{inline_cursor_col, render_inline_value};
+use super::inline_edit::{inline_cursor_col, render_inline_value_with_embedded_cursor};
 use super::probe::MetadataField;
 use super::text_input::TextInputState;
 
@@ -21,12 +21,109 @@ use super::text_input::TextInputState;
 const COL_SIZE_W: usize = 9;
 const COL_DATE_W: usize = 12;
 const COL_TYPE_W: usize = 8;
-/// Spaces between name|size, size|date, date|type columns.
-const COL_GAPS: usize = 3;
 /// Prefix: cursor(2) + check(1) + space(1).
 const ROW_PREFIX: usize = 4;
 /// Trailing space before the right border.
 const ROW_TRAILING: usize = 2;
+const MIN_NAME_W: usize = 8;
+const COL_FORMAT_W: usize = 8;
+const COL_CODEC_W: usize = 12;
+const COL_SAMPLE_RATE_W: usize = 11;
+const COL_CHANNELS_W: usize = 8;
+const COL_DURATION_W: usize = 9;
+const COL_ARTIST_W: usize = 16;
+const COL_ALBUM_W: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
+struct BrowseColumnCell {
+    column: BrowseColumn,
+    width: usize,
+}
+
+fn column_fixed_width(column: BrowseColumn) -> usize {
+    match column {
+        BrowseColumn::Name => MIN_NAME_W,
+        BrowseColumn::Size => COL_SIZE_W,
+        BrowseColumn::Date => COL_DATE_W,
+        BrowseColumn::Type => COL_TYPE_W,
+        BrowseColumn::Format => COL_FORMAT_W,
+        BrowseColumn::Codec => COL_CODEC_W,
+        BrowseColumn::SampleRate => COL_SAMPLE_RATE_W,
+        BrowseColumn::Channels => COL_CHANNELS_W,
+        BrowseColumn::Duration => COL_DURATION_W,
+        BrowseColumn::Artist => COL_ARTIST_W,
+        BrowseColumn::Album => COL_ALBUM_W,
+    }
+}
+
+fn column_right_aligned(column: BrowseColumn) -> bool {
+    matches!(
+        column,
+        BrowseColumn::Size | BrowseColumn::SampleRate | BrowseColumn::Channels | BrowseColumn::Duration
+    )
+}
+
+fn browse_column_layout(inner_width: usize, configured: &[BrowseColumn]) -> Vec<BrowseColumnCell> {
+    let mut columns = Vec::new();
+    for column in configured.iter().copied() {
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    if !columns.contains(&BrowseColumn::Name) {
+        columns.insert(0, BrowseColumn::Name);
+    }
+    if columns.first() != Some(&BrowseColumn::Name) {
+        columns.retain(|column| *column != BrowseColumn::Name);
+        columns.insert(0, BrowseColumn::Name);
+    }
+
+    while columns.len() > 1 {
+        let non_name_width: usize = columns
+            .iter()
+            .copied()
+            .filter(|column| *column != BrowseColumn::Name)
+            .map(column_fixed_width)
+            .sum();
+        let gaps = columns.len().saturating_sub(1);
+        let needed = ROW_PREFIX + ROW_TRAILING + non_name_width + gaps + MIN_NAME_W;
+        if needed <= inner_width {
+            break;
+        }
+        columns.pop();
+    }
+
+    let non_name_width: usize = columns
+        .iter()
+        .copied()
+        .filter(|column| *column != BrowseColumn::Name)
+        .map(column_fixed_width)
+        .sum();
+    let gaps = columns.len().saturating_sub(1);
+    let name_width = inner_width
+        .saturating_sub(ROW_PREFIX + ROW_TRAILING + non_name_width + gaps)
+        .max(1);
+
+    columns
+        .into_iter()
+        .map(|column| BrowseColumnCell {
+            column,
+            width: if column == BrowseColumn::Name {
+                name_width
+            } else {
+                column_fixed_width(column)
+            },
+        })
+        .collect()
+}
+
+fn name_column_width(layout: &[BrowseColumnCell]) -> usize {
+    layout
+        .iter()
+        .find(|cell| cell.column == BrowseColumn::Name)
+        .map(|cell| cell.width)
+        .unwrap_or(MIN_NAME_W)
+}
 
 /// Draw the full browse screen
 pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
@@ -34,34 +131,52 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7), // header banner
-            Constraint::Length(3), // breadcrumb (bordered)
-            Constraint::Min(10),   // main content (list + info)
+            Constraint::Length(4), // toolbar + path bar
+            Constraint::Min(10),   // three-pane browse content
             Constraint::Length(2), // footer (tabs + context)
         ])
         .split(area);
 
     draw_header(f, chunks[0], theme);
-    draw_breadcrumb(f, chunks[1], &app.browse, theme);
-    app.button_map.record_button(TuiButton::BrowseBreadcrumb, chunks[1]);
+    draw_browse_toolbar(f, chunks[1], app, theme);
 
-    // Split main content horizontally: list (2/3) + info (1/3)
-    let content_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
-        .split(chunks[2]);
+    let content_chunks = browse_content_layout(chunks[2], &app.browse);
+    let explore_area = content_chunks[0];
+    let list_area = content_chunks[1];
+    let info_area = content_chunks[2];
 
-    let list_area = content_chunks[0];
     let hover = app.hover_target;
     let inline_edit = app.browse_inline_edit.clone();
+
+    if app.browse.explore_collapsed {
+        draw_collapsed_pane(f, explore_area, BrowsePaneId::Explore, "explore", &mut app.button_map, theme);
+    } else {
+        draw_explore_pane(f, explore_area, &mut app.browse, &mut app.button_map, hover, theme);
+    }
+
     draw_browse_list(f, list_area, &mut app.browse, inline_edit.as_ref(), hover, theme);
-    draw_browse_info(
-        f,
-        content_chunks[1],
-        &app.browse,
-        inline_edit.as_ref(),
-        app.browse_info_focus,
-        &mut app.button_map,
-        hover, theme);
+    register_browse_buttons(&mut app.button_map, list_area, &app.browse);
+    // The Browse pane is maximized/restored by double-clicking its title.
+    // Do not also register the title glyph as a single-click toggle: Browse
+    // never collapses, and a destructive single-click here violates the
+    // documented interaction model.
+    app.button_map.record_button(TuiButton::BrowsePaneTitle(BrowsePaneId::Browse), Rect::new(list_area.x, list_area.y, list_area.width, 1));
+
+    if app.browse.info_collapsed {
+        draw_collapsed_pane(f, info_area, BrowsePaneId::Info, "info", &mut app.button_map, theme);
+    } else {
+        draw_browse_info(
+            f,
+            info_area,
+            &app.browse,
+            inline_edit.as_ref(),
+            app.browse_info_focus,
+            &mut app.button_map,
+            hover,
+            theme,
+        );
+        app.button_map.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Info), Rect::new(info_area.x + 1, info_area.y, 7.min(info_area.width.saturating_sub(2)), 1));
+    }
 
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
@@ -73,8 +188,282 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         theme,
     );
 
-    // Register clickable regions for mouse support (split borrow)
-    register_browse_buttons(&mut app.button_map, list_area, &app.browse);
+    if app.browse.options_menu.is_open() {
+        draw_options_menu(f, chunks[1], &app.browse, &mut app.button_map, theme);
+    }
+}
+
+fn browse_content_layout(area: Rect, browse: &BrowseState) -> std::rc::Rc<[Rect]> {
+    let constraints: Vec<Constraint> = match (browse.explore_collapsed, browse.info_collapsed) {
+        (true, true) => vec![Constraint::Length(3), Constraint::Min(40), Constraint::Length(3)],
+        (true, false) => vec![Constraint::Length(3), Constraint::Percentage(55), Constraint::Percentage(45)],
+        (false, true) => vec![Constraint::Percentage(20), Constraint::Min(40), Constraint::Length(3)],
+        (false, false) => vec![Constraint::Percentage(20), Constraint::Percentage(50), Constraint::Percentage(30)],
+    };
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area)
+}
+
+fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
+    if area.height < 3 || area.width < 20 {
+        return;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(3)])
+        .split(area);
+
+    let mut x = area.x;
+    let y = rows[0].y;
+    draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarBack, x, y, " ‹ Back ", app.browse.can_go_back(), theme);
+    x = x.saturating_add(8);
+    draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarForward, x, y, " › Fwd ", app.browse.can_go_forward(), theme);
+    x = x.saturating_add(8);
+    draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarUp, x, y, " ↑ Up ", app.browse.current_dir.parent().is_some(), theme);
+    x = x.saturating_add(7);
+    draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarRefresh, x, y, " Refresh ", true, theme);
+    x = x.saturating_add(10);
+    draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarOptions, x, y, " Options ▾ ", true, theme);
+    x = x.saturating_add(12);
+    draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarSearch, x, y, " Search ", true, theme);
+
+    let hidden_label = if app.browse.show_hidden { " Show hidden: ● " } else { " Show hidden: ○ " };
+    let hidden_w = hidden_label.chars().count() as u16;
+    if area.width > hidden_w + 2 {
+        let hx = area.x + area.width - hidden_w;
+        draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarShowHidden, hx, y, hidden_label, true, theme);
+    }
+
+    draw_breadcrumb(f, rows[1], &app.browse, theme);
+    app.button_map.record_button(TuiButton::BrowseBreadcrumb, rows[1]);
+    if rows[1].width > 6 {
+        let go = Rect::new(rows[1].x + rows[1].width - 6, rows[1].y + 1, 5, 1);
+        f.render_widget(Paragraph::new(" Go ").style(browse_toolbar_button_style(theme)), go);
+        app.button_map.record_button(TuiButton::BrowsePathGo, go);
+    }
+}
+
+fn draw_toolbar_button(
+    f: &mut Frame,
+    buttons: &mut ButtonRenderMap,
+    button: TuiButton,
+    x: u16,
+    y: u16,
+    label: &str,
+    enabled: bool,
+    theme: super::theme::Theme,
+) {
+    let width = label.chars().count() as u16;
+    let style = if enabled {
+        browse_toolbar_button_style(theme)
+    } else {
+        browse_toolbar_button_disabled_style(theme)
+    };
+    f.render_widget(Paragraph::new(label).style(style), Rect::new(x, y, width, 1));
+    if enabled {
+        buttons.record_button(button, Rect::new(x, y, width, 1));
+    }
+}
+
+
+fn browse_toolbar_button_style(theme: super::theme::Theme) -> Style {
+    // Match the file-picker toolbar button styling. The Browse toolbar should
+    // look like actionable buttons, not dim text sitting on the pane surface.
+    Style::default().fg(theme.bg).bg(theme.cyan).add_modifier(Modifier::BOLD)
+}
+
+fn browse_toolbar_button_disabled_style(theme: super::theme::Theme) -> Style {
+    Style::default().fg(theme.text_muted).bg(theme.border_dim)
+}
+
+fn draw_explore_pane(
+    f: &mut Frame,
+    area: Rect,
+    browse: &mut BrowseState,
+    buttons: &mut ButtonRenderMap,
+    hover: Option<TuiButton>,
+    theme: super::theme::Theme,
+) {
+    if area.height < 3 || area.width < 6 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("▾ explore")
+        .border_style(theme.border(theme.cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    buttons.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Explore), Rect::new(area.x + 1, area.y, 9.min(area.width.saturating_sub(2)), 1));
+
+    browse.set_tree_visible_height(inner.height as usize);
+    let start = browse.tree_scroll;
+    let end = (start + inner.height as usize).min(browse.tree_nodes.len());
+    let lines = browse.tree_nodes[start..end]
+        .iter()
+        .enumerate()
+        .map(|(row, node)| {
+            let absolute = start + row;
+            render_browse_tree_node_line(
+                node,
+                absolute == browse.tree_cursor,
+                hover == Some(TuiButton::BrowseTreeNode(absolute)),
+                theme,
+            )
+        })
+        .collect::<Vec<_>>();
+    for (row, absolute) in (start..end).enumerate() {
+        buttons.record_button(
+            TuiButton::BrowseTreeNode(absolute),
+            Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+        );
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+
+fn render_browse_tree_node_line(
+    node: &super::browse::BrowseTreeNode,
+    selected: bool,
+    hovered: bool,
+    theme: super::theme::Theme,
+) -> Line<'static> {
+    // Keep Browse tree row presentation behind a single adapter over the
+    // file-picker TreeNode model. That avoids a second tree row model drifting
+    // away from the picker while still allowing Browse-specific selection and
+    // hover colors.
+    let glyph = if node.has_children {
+        if node.expanded { "▾" } else { "▸" }
+    } else {
+        " "
+    };
+    let indent = "  ".repeat(node.depth);
+    let mut style = theme.text_style();
+    if selected {
+        style = style.bg(theme.selection_bg).fg(theme.bg);
+    } else if hovered {
+        style = style.bg(theme.surface);
+    }
+    Line::from(Span::styled(format!("{}{} {}", indent, glyph, node.name), style))
+}
+
+fn draw_collapsed_pane(
+    f: &mut Frame,
+    area: Rect,
+    pane: BrowsePaneId,
+    title: &str,
+    buttons: &mut ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(theme.border(theme.border_dim));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chars = std::iter::once('▸')
+        .chain(std::iter::once(' '))
+        .chain(title.chars())
+        .collect::<Vec<_>>();
+    for (row, ch) in chars.into_iter().enumerate().take(inner.height as usize) {
+        let rect = Rect::new(inner.x, inner.y + row as u16, 1, 1);
+        f.render_widget(Paragraph::new(ch.to_string()).style(theme.text_style()), rect);
+    }
+    buttons.record_button(TuiButton::BrowsePaneToggle(pane), area);
+}
+
+fn draw_options_menu(
+    f: &mut Frame,
+    toolbar_area: Rect,
+    browse: &BrowseState,
+    buttons: &mut ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
+    let x = toolbar_area.x.saturating_add(30);
+    let y = toolbar_area.y.saturating_add(1);
+    let (title, rows): (&str, Vec<(String, Option<TuiButton>)>) = match browse.options_menu {
+        BrowseOptionsMenu::Columns => (
+            "Columns",
+            super::browse::BrowseColumn::ALL
+                .iter()
+                .map(|column| {
+                    let mark = if browse.columns.contains(column) { "☑" } else { "☐" };
+                    (format!(" {} {}", mark, column.label()), Some(TuiButton::BrowseOptionsColumn(*column)))
+                })
+                .collect(),
+        ),
+        BrowseOptionsMenu::Sort => (
+            "Default sort",
+            SortBy::ALL
+                .into_iter()
+                .flat_map(|by| [(by, SortDir::Asc), (by, SortDir::Desc)])
+                .map(|(by, dir)| {
+                    let mark = if browse.default_sort_by == by && browse.default_sort_dir == dir {
+                        "●"
+                    } else {
+                        "○"
+                    };
+                    let arrow = match dir {
+                        SortDir::Asc => "↑",
+                        SortDir::Desc => "↓",
+                    };
+                    (
+                        format!(" {} {} {}", mark, by.display_label(), arrow),
+                        Some(TuiButton::BrowseOptionsSortChoice(by, dir)),
+                    )
+                })
+                .collect(),
+        ),
+        BrowseOptionsMenu::Filter => (
+            "Filter",
+            FormatFilter::menu_choices()
+                .into_iter()
+                .enumerate()
+                .map(|(index, filter)| {
+                    let mark = if browse.format_filter == filter { "●" } else { "○" };
+                    (format!(" {} {}", mark, filter.menu_label()), Some(TuiButton::BrowseOptionsFilterChoice(index)))
+                })
+                .collect(),
+        ),
+        BrowseOptionsMenu::ArchiveListing => (
+            "Archive listing",
+            vec![
+                (" Auto (skip remote)".to_string(), Some(TuiButton::BrowseOptionsArchiveChoice(0))),
+                (" Always".to_string(), Some(TuiButton::BrowseOptionsArchiveChoice(1))),
+                (" Never".to_string(), Some(TuiButton::BrowseOptionsArchiveChoice(2))),
+            ],
+        ),
+        BrowseOptionsMenu::Root | BrowseOptionsMenu::Closed => (
+            "Options",
+            vec![
+                ((if browse.show_hidden { " ● Show hidden files" } else { " ○ Show hidden files" }).to_string(), Some(TuiButton::BrowseOptionsShowHidden)),
+                (" Columns               ▸".to_string(), Some(TuiButton::BrowseOptionsColumns)),
+                (" Default sort          ▸".to_string(), Some(TuiButton::BrowseOptionsSort)),
+                (" Filter                ▸".to_string(), Some(TuiButton::BrowseOptionsFilter)),
+                (" Archive listing mode  ▸".to_string(), Some(TuiButton::BrowseOptionsArchiveListing)),
+                (" ─────────────────────".to_string(), None),
+                (" Save layout as default".to_string(), Some(TuiButton::BrowseOptionsSaveLayout)),
+                (" Restore defaults".to_string(), Some(TuiButton::BrowseOptionsRestoreDefaults)),
+            ],
+        ),
+    };
+    let width = rows.iter().map(|(row, _)| row.chars().count()).max().unwrap_or(12).max(title.len() + 4) as u16 + 2;
+    let height = rows.len() as u16 + 2;
+    let area = Rect::new(x, y, width.min(40), height);
+    let block = Block::default().borders(Borders::ALL).title(title).border_style(theme.border(theme.cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines = rows.iter().map(|(row, button)| {
+        let style = if button.is_some() { theme.text_style() } else { Style::default().fg(theme.border_dim) };
+        Line::from(Span::styled(row.clone(), style))
+    }).collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines), inner);
+    for (idx, (_, button)) in rows.iter().enumerate() {
+        if let Some(button) = button {
+            buttons.record_button(*button, Rect::new(inner.x, inner.y + idx as u16, inner.width, 1));
+        }
+    }
 }
 
 /// Register mouse click targets for the browse list: column headers,
@@ -89,35 +478,21 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
 
     let w = area.width as usize;
     let inner_w = w.saturating_sub(2);
-    if inner_w <= ROW_PREFIX + ROW_TRAILING + COL_SIZE_W + COL_DATE_W + COL_TYPE_W + COL_GAPS {
+    if inner_w <= ROW_PREFIX + ROW_TRAILING + MIN_NAME_W {
         return;
     }
-    let name_w =
-        inner_w - ROW_PREFIX - ROW_TRAILING - COL_SIZE_W - COL_DATE_W - COL_TYPE_W - COL_GAPS;
+    let columns = browse_column_layout(inner_w, &browse.columns);
 
     // Column x-offsets (relative to area.x). Header row is area.y + 1 (inside top border).
-    let name_x0 = area.x + 1 + ROW_PREFIX as u16;
-    let size_x0 = name_x0 + name_w as u16 + 1;
-    let date_x0 = size_x0 + COL_SIZE_W as u16 + 1;
-    let type_x0 = date_x0 + COL_DATE_W as u16 + 1;
-
     let header_y = area.y + 1;
-    buttons.record_button(
-        TuiButton::BrowseColumn(ColumnKind::Name),
-        Rect::new(name_x0, header_y, name_w as u16, 1),
-    );
-    buttons.record_button(
-        TuiButton::BrowseColumn(ColumnKind::Size),
-        Rect::new(size_x0, header_y, COL_SIZE_W as u16, 1),
-    );
-    buttons.record_button(
-        TuiButton::BrowseColumn(ColumnKind::Date),
-        Rect::new(date_x0, header_y, COL_DATE_W as u16, 1),
-    );
-    buttons.record_button(
-        TuiButton::BrowseColumn(ColumnKind::Type),
-        Rect::new(type_x0, header_y, COL_TYPE_W as u16, 1),
-    );
+    let mut x = area.x + 1 + ROW_PREFIX as u16;
+    for cell in &columns {
+        buttons.record_button(
+            TuiButton::BrowseColumn(cell.column),
+            Rect::new(x, header_y, cell.width as u16, 1),
+        );
+        x = x.saturating_add(cell.width as u16).saturating_add(1);
+    }
 
     // Search toggle in the top border (right-aligned "search" label).
     {
@@ -187,6 +562,25 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
     }
 }
 
+fn render_path_input_spans(
+    input: &TextInputState,
+    inner_width: usize,
+    theme: super::theme::Theme,
+) -> (Vec<Span<'static>>, u16) {
+    let prefix = " path: ";
+    let prefix_w = prefix.chars().count();
+    let input_max = inner_width
+        .saturating_sub(prefix_w)
+        .saturating_sub(1)
+        .max(1);
+
+    let mut spans = vec![Span::styled(prefix, Style::default().fg(theme.blue))];
+    spans.extend(render_inline_value_with_embedded_cursor(input, input_max, theme));
+
+    let cursor_col = prefix_w as u16 + inline_cursor_col(input, input_max);
+    (spans, cursor_col)
+}
+
 /// Draw the breadcrumb bar showing the current directory path
 /// (and the active text filter, if any).
 fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super::theme::Theme) {
@@ -209,34 +603,15 @@ fn draw_breadcrumb(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super
         return;
     }
 
-    // Editable path input mode
+    // Editable path input mode. Use the same selection-aware inline renderer
+    // as Browse rename/metadata fields so partial Shift/Ctrl selections are
+    // visible in the path bar, not just Ctrl+A whole-field selection.
     if let Some(ref input) = browse.path_input {
-        let prefix = " path: ";
-        let prefix_w = prefix.chars().count();
-        let input_max = (inner.width as usize).saturating_sub(prefix_w).saturating_sub(1);
-        let cursor_char_pos = input.text[..input.cursor].chars().count();
-
-        let scroll_offset = if cursor_char_pos > input_max {
-            cursor_char_pos - input_max
-        } else {
-            0
-        };
-        let visible: String = input.text.chars().skip(scroll_offset).take(input_max).collect();
-        let cursor_in_visible = cursor_char_pos.saturating_sub(scroll_offset);
-
-        let text_style = if input.select_all {
-            Style::default().fg(theme.bg).bg(theme.selection_bg)
-        } else {
-            theme.bright()
-        };
-        let spans = vec![
-            Span::styled(prefix, Style::default().fg(theme.blue)),
-            Span::styled(visible, text_style),
-        ];
+        let (spans, cursor_col) = render_path_input_spans(input, inner.width as usize, theme);
         let line = Paragraph::new(Line::from(spans));
         f.render_widget(line, inner);
 
-        let cursor_x = inner.x + prefix_w as u16 + cursor_in_visible as u16;
+        let cursor_x = inner.x + cursor_col;
         if cursor_x < inner.x + inner.width {
             f.set_cursor(cursor_x, inner.y);
         }
@@ -351,7 +726,7 @@ fn draw_browse_list(
     let inner_w = w.saturating_sub(2);
 
     // Top border with title
-    let title = " browse ";
+    let title = "▾ browse ";
     let search_label = if browse.search.active {
         " search ✓ "
     } else {
@@ -359,7 +734,8 @@ fn draw_browse_list(
     };
     let search_display_w = search_label.chars().count();
     // ┌ + title + dashes + search_label + ┐ = w
-    let dash_count = w.saturating_sub(1 + title.len() + search_display_w + 1);
+    let title_w = title.chars().count();
+    let dash_count = w.saturating_sub(1 + title_w + search_display_w + 1);
 
     let search_style = if browse.search.active {
         Style::default()
@@ -395,9 +771,8 @@ fn draw_browse_list(
     let content_height = (area.height as usize).saturating_sub(reserved);
     browse.visible_height = content_height;
 
-    // Compute name column width, guarding against narrow widths.
-    let fixed = ROW_PREFIX + ROW_TRAILING + COL_SIZE_W + COL_DATE_W + COL_TYPE_W + COL_GAPS;
-    let name_w = inner_w.saturating_sub(fixed);
+    let column_layout = browse_column_layout(inner_w, &browse.columns);
+    let name_w = name_column_width(&column_layout);
 
     let mut lines: Vec<Line> = vec![top_line];
 
@@ -405,7 +780,7 @@ fn draw_browse_list(
     lines.push(render_header_row(
         border_color,
         w,
-        name_w,
+        &column_layout,
         browse.sort_by,
         browse.sort_dir, theme));
 
@@ -535,7 +910,8 @@ fn draw_browse_list(
             lines.push(render_entry_line(
                 border_color,
                 w,
-                name_w,
+                &column_layout,
+                browse,
                 entry,
                 inline_rename_input,
                 is_selected,
@@ -599,7 +975,7 @@ fn draw_browse_list(
 fn render_header_row(
     border_color: ratatui::style::Color,
     width: usize,
-    name_w: usize,
+    columns: &[BrowseColumnCell],
     sort_by: SortBy,
     sort_dir: SortDir,
     theme: super::theme::Theme,
@@ -609,49 +985,38 @@ fn render_header_row(
         SortDir::Desc => "▼",
     };
 
-    let header_cell =
-        |label: &'static str, col: SortBy, col_w: usize, right_align: bool| -> Vec<Span<'static>> {
-            let is_active = sort_by == col;
-            let style = if is_active {
-                Style::default()
-                    .fg(theme.cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                theme.muted()
-            };
-            // Cell text: "label ▲" if active, else "label"
-            let text: String = if is_active {
-                format!("{} {}", label, arrow)
-            } else {
-                label.to_string()
-            };
-            let text_w = text.chars().count();
-            let pad = col_w.saturating_sub(text_w);
-            if right_align {
-                vec![Span::raw(" ".repeat(pad)), Span::styled(text, style)]
-            } else {
-                vec![Span::styled(text, style), Span::raw(" ".repeat(pad))]
-            }
-        };
-
     let mut spans = vec![
         Span::styled("│", theme.border(border_color)),
         Span::raw(" ".repeat(ROW_PREFIX)),
     ];
-    spans.extend(header_cell("name", SortBy::Name, name_w, false));
-    spans.push(Span::raw(" "));
-    spans.extend(header_cell("size", SortBy::Size, COL_SIZE_W, true));
-    spans.push(Span::raw(" "));
-    spans.extend(header_cell("date", SortBy::Date, COL_DATE_W, false));
-    spans.push(Span::raw(" "));
-    spans.extend(header_cell("type", SortBy::Type, COL_TYPE_W, false));
+
+    for (idx, cell) in columns.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let is_active = sort_by == cell.column.sort_by();
+        let style = if is_active {
+            Style::default()
+                .fg(theme.cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme.muted()
+        };
+        let text = if is_active {
+            format!("{} {}", cell.column.config_key(), arrow)
+        } else {
+            cell.column.config_key().to_string()
+        };
+        let display = pad_or_truncate(&text, cell.width, column_right_aligned(cell.column));
+        spans.push(Span::styled(display, style));
+    }
+
     spans.push(Span::raw(" ".repeat(ROW_TRAILING)));
     spans.push(Span::styled("│", theme.border(border_color)));
 
     // Pad any shortfall to reach the right border cleanly (safety net).
     let used: usize = spans.iter().map(|s| s.width()).sum();
     if used < width {
-        // Insert padding before the closing border
         let pad = width - used;
         let last = spans.pop().unwrap();
         spans.push(Span::raw(" ".repeat(pad)));
@@ -661,11 +1026,12 @@ fn render_header_row(
     Line::from(spans)
 }
 
-/// Render a single entry row with fixed columns: name | size | date | type
+/// Render a single entry row using the active configured Browse columns.
 fn render_entry_line(
     border_color: ratatui::style::Color,
     width: usize,
-    name_w: usize,
+    columns: &[BrowseColumnCell],
+    browse: &BrowseState,
     entry: &BrowseEntry,
     inline_rename_input: Option<&TextInputState>,
     is_selected: bool,
@@ -689,70 +1055,34 @@ fn render_entry_line(
         Style::default().fg(theme.text_dim)
     };
 
-    // Entry name color. Broken symlinks override to red regardless of kind.
-    let name_style = if entry.is_broken_symlink {
-        Style::default().fg(theme.destructive)
-    } else {
-        match &entry.kind {
-            EntryKind::ParentDir => Style::default().fg(theme.text_muted),
-            EntryKind::Directory => Style::default().fg(theme.blue),
-            EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir => {
-                Style::default().fg(theme.purple)
-            }
-            EntryKind::AudioFile(_) => {
-                if is_selected {
-                    Style::default()
-                        .fg(theme.text_bright)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text)
-                }
-            }
-            EntryKind::Archive => Style::default().fg(theme.amber),
-            EntryKind::SacdIso
-            | EntryKind::DvdAudioIso
-            | EntryKind::DvdVideoIso
-            | EntryKind::BlurayIso => Style::default().fg(theme.purple),
-            EntryKind::OtherFile => Style::default().fg(theme.text_dim),
-        }
-    };
-
-    // Name (truncated to name_w), or inline rename editor.
-    let name_span = if let Some(input) = inline_rename_input {
-        render_inline_value("", true, input, true, name_w, theme)
-    } else {
-        let name_display = pad_or_truncate(&entry.name, name_w, false);
-        Span::styled(name_display, name_style)
-    };
-
-    // Size (right-aligned, hidden for dirs/parent)
-    let size_text = match &entry.kind {
-        EntryKind::ParentDir | EntryKind::Directory => String::new(),
-        _ => size_str(entry.size),
-    };
-    let size_display = pad_or_truncate(&size_text, COL_SIZE_W, true);
-
-    // Date (left-aligned)
-    let date_display = pad_or_truncate(&entry.date_label(), COL_DATE_W, false);
-
-    // Type (left-aligned)
-    let type_display = pad_or_truncate(&entry.type_label(), COL_TYPE_W, false);
-
+    let cached = cached_info_for_entry(browse, entry);
     let mut spans = vec![
         Span::styled("│", theme.border(border_color)),
         Span::styled(cursor, cursor_style),
         Span::styled(check, check_style),
         Span::raw(" "),
-        name_span,
-        Span::raw(" "),
-        Span::styled(size_display, theme.muted()),
-        Span::raw(" "),
-        Span::styled(date_display, theme.muted()),
-        Span::raw(" "),
-        Span::styled(type_display, theme.muted()),
-        Span::raw(" ".repeat(ROW_TRAILING)),
-        Span::styled("│", theme.border(border_color)),
     ];
+
+    for (idx, cell) in columns.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
+        if cell.column == BrowseColumn::Name {
+            if let Some(input) = inline_rename_input {
+                spans.extend(render_inline_value_with_embedded_cursor(input, cell.width, theme));
+            } else {
+                let name_display = pad_or_truncate(&entry.name, cell.width, false);
+                spans.push(Span::styled(name_display, entry_name_style(entry, is_selected, theme)));
+            }
+        } else {
+            let value = entry_column_text(entry, cell.column, cached);
+            let display = pad_or_truncate(&value, cell.width, column_right_aligned(cell.column));
+            spans.push(Span::styled(display, entry_column_style(entry, cell.column, cached, theme)));
+        }
+    }
+
+    spans.push(Span::raw(" ".repeat(ROW_TRAILING)));
+    spans.push(Span::styled("│", theme.border(border_color)));
 
     // Pad any shortfall before the right border (safety net on narrow widths).
     let used: usize = spans.iter().map(|s| s.width()).sum();
@@ -780,6 +1110,133 @@ fn render_entry_line(
     }
 
     Line::from(spans)
+}
+
+fn cached_info_for_entry<'a>(browse: &'a BrowseState, entry: &BrowseEntry) -> Option<&'a CachedInfo> {
+    browse
+        .probe_cache
+        .get(&entry.path)
+        .and_then(|cached| cached.as_ref().map(|info| info.as_ref()))
+}
+
+fn entry_name_style(
+    entry: &BrowseEntry,
+    is_selected: bool,
+    theme: super::theme::Theme,
+) -> Style {
+    if entry.is_broken_symlink {
+        return Style::default().fg(theme.destructive);
+    }
+    match &entry.kind {
+        EntryKind::ParentDir => Style::default().fg(theme.text_muted),
+        EntryKind::Directory => Style::default().fg(theme.blue),
+        EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir => {
+            Style::default().fg(theme.purple)
+        }
+        EntryKind::AudioFile(_) => {
+            if is_selected {
+                Style::default()
+                    .fg(theme.text_bright)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            }
+        }
+        EntryKind::Archive => Style::default().fg(theme.amber),
+        EntryKind::SacdIso
+        | EntryKind::DvdAudioIso
+        | EntryKind::DvdVideoIso
+        | EntryKind::BlurayIso => Style::default().fg(theme.purple),
+        EntryKind::OtherFile => Style::default().fg(theme.text_dim),
+    }
+}
+
+fn entry_column_style(
+    entry: &BrowseEntry,
+    column: BrowseColumn,
+    cached: Option<&CachedInfo>,
+    theme: super::theme::Theme,
+) -> Style {
+    if is_audio_column(column) && !entry.is_audio() {
+        return Style::default().fg(theme.text_dim);
+    }
+    if is_audio_column(column) && cached.is_none() {
+        return Style::default().fg(theme.text_dim);
+    }
+    theme.muted()
+}
+
+fn entry_column_text(
+    entry: &BrowseEntry,
+    column: BrowseColumn,
+    cached: Option<&CachedInfo>,
+) -> String {
+    match column {
+        BrowseColumn::Name => entry.name.clone(),
+        BrowseColumn::Size => match &entry.kind {
+            EntryKind::ParentDir | EntryKind::Directory => String::new(),
+            _ => size_str(entry.size),
+        },
+        BrowseColumn::Date => entry.date_label(),
+        BrowseColumn::Type => entry.type_label(),
+        BrowseColumn::Format => audio_column_value(entry, cached, |info| {
+            non_empty(info.source.format_name.clone()).or_else(|| Some(entry.type_label()))
+        }),
+        BrowseColumn::Codec => audio_column_value(entry, cached, |info| {
+            non_empty(info.source.codec_display())
+        }),
+        BrowseColumn::SampleRate => audio_column_value(entry, cached, |info| {
+            (info.source.sample_rate > 0).then(|| info.source.sample_rate_display())
+        }),
+        BrowseColumn::Channels => audio_column_value(entry, cached, |info| {
+            (info.source.channels > 0).then(|| info.source.channels_display())
+        }),
+        BrowseColumn::Duration => audio_column_value(entry, cached, |info| {
+            (info.source.duration_secs.is_finite() && info.source.duration_secs > 0.0)
+                .then(|| info.source.duration_display())
+        }),
+        BrowseColumn::Artist => audio_column_value(entry, cached, |info| {
+            info.metadata.artist.clone().and_then(non_empty)
+        }),
+        BrowseColumn::Album => audio_column_value(entry, cached, |info| {
+            info.metadata.album.clone().and_then(non_empty)
+        }),
+    }
+}
+
+fn audio_column_value<F>(
+    entry: &BrowseEntry,
+    cached: Option<&CachedInfo>,
+    value: F,
+) -> String
+where
+    F: FnOnce(&CachedInfo) -> Option<String>,
+{
+    if !entry.is_audio() {
+        return "—".to_string();
+    }
+    cached.and_then(value).unwrap_or_else(|| "—".to_string())
+}
+
+fn non_empty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn is_audio_column(column: BrowseColumn) -> bool {
+    matches!(
+        column,
+        BrowseColumn::Format
+            | BrowseColumn::Codec
+            | BrowseColumn::SampleRate
+            | BrowseColumn::Channels
+            | BrowseColumn::Duration
+            | BrowseColumn::Artist
+            | BrowseColumn::Album
+    )
 }
 
 /// Pad a string to `width` chars, or truncate with ellipsis if too long.
@@ -842,8 +1299,9 @@ fn draw_browse_info(
     let w = area.width as usize;
 
     // Top border
-    let title = " info ";
-    let dash_count = w.saturating_sub(2 + title.len());
+    let title = "▾ info ";
+    let title_w = title.chars().count();
+    let dash_count = w.saturating_sub(2 + title_w);
 
     let top_line = Line::from(vec![
         Span::styled("┌", theme.border(border_color)),
@@ -1253,10 +1711,11 @@ fn entry_info_lines(
                     // Title: inline label + value (same layout as artist/album/genre/year).
                     let title_row = lines.len();
                     if let Some(input) = inline_metadata_input(MetadataField::Title) {
-                        lines.push(vec![
+                        let mut row = vec![
                             Span::styled("   title   ", metadata_label_style(MetadataField::Title)),
-                            render_inline_value("", true, input, true, inline_max, theme),
-                        ]);
+                        ];
+                        row.extend(render_inline_value_with_embedded_cursor(input, inline_max, theme));
+                        lines.push(row);
                         inline_cursor = Some((title_row, 11 + inline_cursor_col(input, inline_max)));
                     } else if let Some(title) = &meta.title {
                         lines.push(vec![
@@ -1285,10 +1744,11 @@ fn entry_info_lines(
                     // Artist: inline label + value. Clickable on the whole line.
                     let artist_row = lines.len();
                     if let Some(input) = inline_metadata_input(MetadataField::Artist) {
-                        lines.push(vec![
+                        let mut row = vec![
                             Span::styled("   artist  ", metadata_label_style(MetadataField::Artist)),
-                            render_inline_value("", true, input, true, inline_max, theme),
-                        ]);
+                        ];
+                        row.extend(render_inline_value_with_embedded_cursor(input, inline_max, theme));
+                        lines.push(row);
                         inline_cursor = Some((artist_row, 11 + inline_cursor_col(input, inline_max)));
                     } else if let Some(artist) = &meta.artist {
                         lines.push(vec![
@@ -1317,10 +1777,11 @@ fn entry_info_lines(
                     // Album
                     let album_row = lines.len();
                     if let Some(input) = inline_metadata_input(MetadataField::Album) {
-                        lines.push(vec![
+                        let mut row = vec![
                             Span::styled("   album   ", metadata_label_style(MetadataField::Album)),
-                            render_inline_value("", true, input, true, inline_max, theme),
-                        ]);
+                        ];
+                        row.extend(render_inline_value_with_embedded_cursor(input, inline_max, theme));
+                        lines.push(row);
                         inline_cursor = Some((album_row, 11 + inline_cursor_col(input, inline_max)));
                     } else if let Some(album) = &meta.album {
                         lines.push(vec![
@@ -1349,10 +1810,11 @@ fn entry_info_lines(
                     // Genre
                     let genre_row = lines.len();
                     if let Some(input) = inline_metadata_input(MetadataField::Genre) {
-                        lines.push(vec![
+                        let mut row = vec![
                             Span::styled("   genre   ", metadata_label_style(MetadataField::Genre)),
-                            render_inline_value("", true, input, true, inline_max, theme),
-                        ]);
+                        ];
+                        row.extend(render_inline_value_with_embedded_cursor(input, inline_max, theme));
+                        lines.push(row);
                         inline_cursor = Some((genre_row, 11 + inline_cursor_col(input, inline_max)));
                     } else if let Some(genre) = &meta.genre {
                         lines.push(vec![
@@ -1381,10 +1843,11 @@ fn entry_info_lines(
                     // Year
                     let year_row = lines.len();
                     if let Some(input) = inline_metadata_input(MetadataField::Year) {
-                        lines.push(vec![
+                        let mut row = vec![
                             Span::styled("   year    ", metadata_label_style(MetadataField::Year)),
-                            render_inline_value("", true, input, true, inline_max, theme),
-                        ]);
+                        ];
+                        row.extend(render_inline_value_with_embedded_cursor(input, inline_max, theme));
+                        lines.push(row);
                         inline_cursor = Some((year_row, 11 + inline_cursor_col(input, inline_max)));
                     } else if let Some(year) = &meta.year {
                         lines.push(vec![
@@ -1844,5 +2307,32 @@ fn size_str(bytes: u64) -> String {
         format!("{:.1} KB", b / 1024.0)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod path_field_render_tests {
+    use super::*;
+
+    #[test]
+    fn path_input_renderer_shows_partial_selection() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
+        let mut input = TextInputState::new("Music/Album".to_string());
+        input.selection_anchor = Some("Music/".len());
+        input.cursor = "Music/Al".len();
+
+        let (spans, cursor_col) = render_path_input_spans(&input, 32, theme);
+        let rendered = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.starts_with(" path: Music/Album"));
+        assert_eq!(cursor_col, (" path: Music/Al".chars().count()) as u16);
+        assert!(spans.iter().any(|span| {
+            span.content.as_ref().contains("Al")
+                && span.style.bg == Some(theme.selection_bg)
+                && span.style.fg == Some(theme.bg)
+        }));
     }
 }

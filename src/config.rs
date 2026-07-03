@@ -8,6 +8,8 @@ pub struct TonepoetConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub performance: PerformanceConfig,
+    #[serde(default)]
+    pub browsing: BrowsingConfig,
 }
 
 
@@ -51,6 +53,175 @@ fn default_archive_listing_mode() -> String {
 
 fn default_archive_listing_timeout() -> u64 {
     30
+}
+
+
+/// Browse-screen view and interaction preferences.
+///
+/// This table is intentionally separate from `[performance.browsing]`, which
+/// owns operational concerns such as archive-listing policy and timeouts.
+/// Deserialization accepts missing fields for backwards compatibility; callers
+/// should use [`BrowsingConfig::normalized`] before applying user-edited values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowsingConfig {
+    #[serde(default)]
+    pub show_hidden: bool,
+    #[serde(default = "default_browse_columns")]
+    pub columns: Vec<String>,
+    #[serde(default = "default_browse_sort")]
+    pub default_sort: String,
+    #[serde(default = "default_browse_sort_dir")]
+    pub default_sort_dir: String,
+    #[serde(default = "default_browse_filter")]
+    pub default_filter: String,
+    #[serde(default = "default_browse_layout_open")]
+    pub layout_explore: String,
+    #[serde(default = "default_browse_layout_open")]
+    pub layout_info: String,
+    /// Maximum number of recursive search results retained after global sorting.
+    /// The worker scores every match first; this cap is applied only after sort
+    /// so late high-quality matches are not discarded by walk order.
+    #[serde(default = "default_browse_search_result_cap")]
+    pub search_result_cap: usize,
+}
+
+impl Default for BrowsingConfig {
+    fn default() -> Self {
+        Self {
+            show_hidden: false,
+            columns: default_browse_columns(),
+            default_sort: default_browse_sort(),
+            default_sort_dir: default_browse_sort_dir(),
+            default_filter: default_browse_filter(),
+            layout_explore: default_browse_layout_open(),
+            layout_info: default_browse_layout_open(),
+            search_result_cap: default_browse_search_result_cap(),
+        }
+    }
+}
+
+impl BrowsingConfig {
+    pub fn normalized(&self) -> Self {
+        let mut columns = Vec::new();
+        for raw in &self.columns {
+            let column = normalize_browse_token(raw);
+            if is_supported_browse_column(&column) && !columns.iter().any(|c| c == &column) {
+                columns.push(column);
+            }
+        }
+        if columns.is_empty() {
+            columns = default_browse_columns();
+        } else if !columns.iter().any(|c| c == "name") {
+            columns.insert(0, "name".to_string());
+        }
+
+        let default_sort = normalize_browse_token(&self.default_sort);
+        let default_sort = if is_supported_browse_sort(&default_sort) {
+            default_sort
+        } else {
+            default_browse_sort()
+        };
+
+        let default_sort_dir = normalize_browse_token(&self.default_sort_dir);
+        let default_sort_dir = match default_sort_dir.as_str() {
+            "asc" | "ascending" => "asc".to_string(),
+            "desc" | "descending" => "desc".to_string(),
+            _ => default_browse_sort_dir(),
+        };
+
+        let default_filter = normalize_browse_token(&self.default_filter);
+        let default_filter = if is_supported_browse_filter(&default_filter) {
+            default_filter
+        } else {
+            default_browse_filter()
+        };
+
+        let layout_explore = normalize_layout_state(&self.layout_explore);
+        let layout_info = normalize_layout_state(&self.layout_info);
+        let search_result_cap = normalize_search_result_cap(self.search_result_cap);
+
+        Self {
+            show_hidden: self.show_hidden,
+            columns,
+            default_sort,
+            default_sort_dir,
+            default_filter,
+            layout_explore,
+            layout_info,
+            search_result_cap,
+        }
+    }
+}
+
+fn default_browse_columns() -> Vec<String> {
+    ["name", "size", "date", "type"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_browse_sort() -> String { "name".to_string() }
+fn default_browse_sort_dir() -> String { "asc".to_string() }
+fn default_browse_filter() -> String { "all".to_string() }
+fn default_browse_layout_open() -> String { "open".to_string() }
+fn default_browse_search_result_cap() -> usize { 2000 }
+
+fn normalize_search_result_cap(value: usize) -> usize {
+    value.clamp(1, 100_000)
+}
+
+fn normalize_browse_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(' ', "_").replace('-', "_")
+}
+
+fn normalize_layout_state(value: &str) -> String {
+    match normalize_browse_token(value).as_str() {
+        "collapsed" | "closed" | "collapse" => "collapsed".to_string(),
+        _ => "open".to_string(),
+    }
+}
+
+fn is_supported_browse_column(value: &str) -> bool {
+    matches!(
+        value,
+        "name"
+            | "size"
+            | "date"
+            | "type"
+            | "format"
+            | "codec"
+            | "sample_rate"
+            | "channels"
+            | "duration"
+            | "artist"
+            | "album"
+    )
+}
+
+fn is_supported_browse_sort(value: &str) -> bool {
+    matches!(
+        value,
+        "name"
+            | "size"
+            | "date"
+            | "type"
+            | "format"
+            | "codec"
+            | "sample_rate"
+            | "channels"
+            | "duration"
+            | "artist"
+            | "album"
+    )
+}
+
+fn is_supported_browse_filter(value: &str) -> bool {
+    matches!(
+        value,
+        "all" | "off" | "audio" | "audio_only" | "flac" | "opus" | "aac" | "mp3"
+            | "alac" | "wav" | "wavpack" | "aiff" | "dsf" | "dff" | "dts" | "ac3"
+            | "ape" | "lpcm"
+    )
 }
 
 /// UI-related configuration.
@@ -154,6 +325,7 @@ impl Default for TonepoetConfig {
             conversion: ConversionSettings::default(),
             ui: UiConfig::default(),
             performance: PerformanceConfig::default(),
+            browsing: BrowsingConfig::default(),
         }
     }
 }
@@ -281,6 +453,73 @@ compare_keep_reference = false
             let decoded: TonepoetConfig = toml::from_str(&encoded).expect("decode config");
             assert_eq!(decoded.ui.theme, palette.slug);
         }
+    }
+
+
+    #[test]
+    fn browsing_defaults_when_missing_from_toml() {
+        let config: TonepoetConfig = toml::from_str(
+            r#"
+[conversion]
+preferred_backend = "ffmpeg"
+worker_count = 2
+process_priority = 0
+calculate_replaygain = true
+generate_cue_files = false
+cue_generation_mode = "IfMerging"
+write_log_file = false
+persist_queue = true
+append_lineage_to_comment = false
+"#,
+        )
+        .expect("config parses without browsing");
+
+        assert_eq!(config.browsing, BrowsingConfig::default());
+    }
+
+    #[test]
+    fn browsing_config_normalizes_user_values() {
+        let config = BrowsingConfig {
+            show_hidden: true,
+            columns: vec!["Size".into(), "sample-rate".into(), "size".into()],
+            default_sort: "nonsense".into(),
+            default_sort_dir: "descending".into(),
+            default_filter: "audio only".into(),
+            layout_explore: "closed".into(),
+            layout_info: "OPEN".into(),
+            search_result_cap: 0,
+        }
+        .normalized();
+
+        assert_eq!(config.columns, vec!["name", "size", "sample_rate"]);
+        assert_eq!(config.default_sort, "name");
+        assert_eq!(config.default_sort_dir, "desc");
+        assert_eq!(config.default_filter, "audio_only");
+        assert_eq!(config.layout_explore, "collapsed");
+        assert_eq!(config.layout_info, "open");
+        assert_eq!(config.search_result_cap, 1);
+        assert!(config.show_hidden);
+    }
+
+    #[test]
+    fn browsing_config_round_trips_through_toml() {
+        let mut config = TonepoetConfig::default();
+        config.browsing.show_hidden = true;
+        config.browsing.columns = vec!["name".into(), "codec".into()];
+        config.browsing.default_sort = "date".into();
+        config.browsing.default_sort_dir = "desc".into();
+        config.browsing.default_filter = "flac".into();
+        config.browsing.layout_explore = "collapsed".into();
+        config.browsing.search_result_cap = 4096;
+
+        let encoded = toml::to_string_pretty(&config).expect("encode config");
+        assert!(encoded.contains("[browsing]"));
+        assert!(encoded.contains("show_hidden = true"));
+        assert!(encoded.contains("default_sort = \"date\""));
+        assert!(encoded.contains("search_result_cap = 4096"));
+
+        let decoded: TonepoetConfig = toml::from_str(&encoded).expect("decode config");
+        assert_eq!(decoded.browsing.normalized(), config.browsing.normalized());
     }
 
 }

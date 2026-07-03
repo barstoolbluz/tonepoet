@@ -762,7 +762,7 @@ fn reduce_file_task_progress(
         app.set_status(status);
     }
     if refresh_after_terminal {
-        app.browse.refresh();
+        app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
         super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
     }
@@ -1619,7 +1619,7 @@ fn complete_browse_archive_metadata_save(
     if context.editor_owns_staging {
         start_browse_archive_repackage(app, context, tx);
     } else {
-        app.browse.refresh();
+        app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
         app.set_status("metadata editor: saved staged archive tags; archive changes pending".to_string());
     }
@@ -1906,7 +1906,7 @@ fn handle_archive_entry_rename_result(
                     && !app.deferred_browse_archive_exit
                     && !quit_after_rename
                 {
-                    app.browse.refresh();
+                    app.browse.refresh_with_search(Some(tx));
                     let target_path = archive_path.join(&new_inner_path);
                     if let Some(idx) = app.browse.entries.iter().position(|entry| entry.path == target_path) {
                         app.browse.selected_index = idx;
@@ -1935,7 +1935,7 @@ fn handle_archive_entry_rename_result(
                 // extracted staging tree off-screen; keep the pre-registered
                 // empty session for startup recovery rather than silently
                 // applying a hidden rename.
-                app.browse.refresh();
+                app.browse.refresh_with_search(Some(tx));
                 app.set_status(format!(
                     "archive rename for {archive_label} was extracted after navigation; staged snapshot preserved for recovery without applying the rename"
                 ));
@@ -2064,7 +2064,7 @@ fn handle_archive_entry_delete_result(
                     app.quit_after_browse_archive_repackage = quit_after_delete;
                     start_browse_archive_repackage(app, context, tx);
                 } else {
-                    app.browse.refresh();
+                    app.browse.refresh_with_search(Some(tx));
                     app.force_redraw = true;
                 }
             } else {
@@ -2185,7 +2185,7 @@ fn handle_convert_audio_probe_complete(
     }
 }
 
-fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
+pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::ClearTrackProgress {
             item_id,
@@ -2469,6 +2469,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         app.browse
                             .probe_cache
                             .insert(path.clone(), Some(std::sync::Arc::new(info.clone())));
+                        app.browse.resort_after_probe_cache_update_with_search(Some(tx));
 
                         if let Ok(meta) = std::fs::metadata(&path) {
                             let mtime = meta
@@ -2495,6 +2496,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     // Cache the failure so browse does not retry; renderers can
                     // fall back to basic path/size information.
                     app.browse.probe_cache.insert(path, None);
+                    app.browse.resort_after_probe_cache_update_with_search(Some(tx));
                 }
             }
         }
@@ -2760,40 +2762,54 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 app.active_overlay = super::app::ActiveOverlay::Verify { scroll: 0 };
             }
         }
-        AppMessage::PathValidationComplete { input, result } => match result {
-            Ok(path) => {
-                let display = path.display().to_string();
-                app.browse.navigate_to(path);
-                app.set_status(&format!("cd: {}", display));
+        AppMessage::PathValidationComplete {
+            generation,
+            origin_dir,
+            input,
+            result,
+        } => {
+            if !app.browse.is_current_path_validation(generation, &origin_dir) {
+                return;
             }
-            Err(e) => {
-                app.set_status(&format!(":cd {}: {}", input, e));
+            match result {
+                Ok(path) => {
+                    let display = path.display().to_string();
+                    app.browse.navigate_to(path);
+                    app.set_status(&format!("cd: {}", display));
+                }
+                Err(e) => {
+                    app.set_status(&format!(":cd {}: {}", input, e));
+                }
             }
         },
         AppMessage::DirScanComplete {
+            generation,
             path,
             parent_entry,
             mut dirs,
             files,
             error,
         } => {
-            // Race protection: discard if user has navigated elsewhere.
-            if app.browse.current_dir != path {
+            // Race protection: discard stale scans, including stale successful
+            // scans for the same directory. Directory path alone is not a
+            // sufficient identity because cancelled scans can still complete
+            // after a newer refresh has started.
+            if !app.browse.is_current_dir_scan(generation, &path) {
+                app.browse
+                    .clear_pending_inline_rename_after_scan_generation(generation);
                 return;
             }
 
             if let Some(err) = error {
-                if err == "cancelled" {
-                    // Don't clear scan_pending — a newer scan is in flight.
-                    return;
-                }
-                app.browse.scan_pending = None;
+                app.browse.finish_dir_scan_if_current(generation, &path);
+                app.browse
+                    .clear_pending_inline_rename_after_scan_generation(generation);
                 app.browse.error = Some(err);
                 return;
             }
 
             // Success — clear the scan handle.
-            app.browse.scan_pending = None;
+            app.browse.finish_dir_scan_if_current(generation, &path);
 
             // Populate raw scan results. Classify DVD-Audio directories before publishing.
             app.browse.classify_scanned_directory_entries(&mut dirs);
@@ -2805,8 +2821,11 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             // magic is found. Cheap on warm cache, sub-50ms cold.
             app.browse.upgrade_iso_kinds();
 
-            // Apply current filter/sort.
-            app.browse.apply_view();
+            // Apply current filter/sort. While search is active, the search
+            // panel owns `entries`; re-run the active search against the
+            // refreshed scan data instead of publishing the ordinary Browse
+            // listing under an open search UI.
+            app.browse.reapply_after_directory_scan_complete(Some(tx));
 
             // Cursor restoration (e.g., after go_parent).
             if let Some(target) = app.browse.cursor_restore_target.take() {
@@ -2816,9 +2835,26 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
 
-            // Probe the newly selected entry.
-            app.browse.probe_current_with_db(tx, Some(&app.db));
-            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            // Sequential inline rename continuation (Tab / Shift+Tab). Filesystem
+            // rename refreshes are async in the normal TUI runtime and clear
+            // entries immediately, so resume the captured next/previous target
+            // only after the same directory scan publishes the new view.
+            let resume_inline_rename_target = app
+                .browse
+                .take_inline_rename_after_scan_target(generation, &path);
+            let resumed_inline_rename = if let Some(target_path) = resume_inline_rename_target {
+                super::keybindings::begin_browse_inline_rename(app, target_path);
+                true
+            } else {
+                false
+            };
+
+            // Probe the newly selected entry unless it is being edited inline;
+            // the next probe will run on commit/cursor movement.
+            if !resumed_inline_rename {
+                app.browse.probe_current_with_db(tx, Some(&app.db));
+                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            }
         }
         AppMessage::MetadataWriteComplete {
             path,
@@ -2835,6 +2871,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     let _ = std::fs::remove_file(&backup);
                     app.browse.probe_cache.remove(&path);
                     app.browse.probe_pending.remove(&path);
+                    app.browse.invalidate_search_tag_cache_for_metadata_path(&path);
                     let _ = app.db.invalidate_probe(&path_str);
                     let staged_tracking_error = {
                         let staging = app.browse.active_archive_staging().cloned();
@@ -2921,7 +2958,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                         .as_ref()
                         .is_some_and(|arc| arc.listing.archive_path == archive_path)
                     {
-                        app.browse.replace_active_archive_listing(listing, password);
+                        app.browse.replace_active_archive_listing_with_search(listing, password, Some(tx));
                     } else {
                         app.browse.enter_archive(listing, password);
                     }
@@ -2936,7 +2973,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                                     arc.staging = Some(session);
                                 }
                             }
-                            app.browse.refresh_archive_view();
+                            app.browse.refresh_archive_view_with_search(Some(tx));
                         }
                     }
                     app.force_redraw = true;
@@ -2985,7 +3022,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                                     if let Some(arc) = app.browse.archive.as_mut() {
                                         arc.staging = Some(session);
                                     }
-                                    app.browse.refresh_archive_view();
+                                    app.browse.refresh_archive_view_with_search(Some(tx));
                                     app.force_redraw = true;
                                     let conflict_note = if app.pending_archive_recovery_resume_conflicted {
                                         "; original archive needs overwrite/discard review before save"
@@ -3026,18 +3063,76 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 }
             }
         },
-        AppMessage::SearchComplete { results } => {
+        AppMessage::SearchComplete {
+            generation,
+            root,
+            recursive,
+            archive_path,
+            archive_inner_path,
+            query,
+            mode,
+            show_hidden,
+            audio_only,
+            format_filter,
+            sort,
+            sort_dir,
+            result_cap,
+            total_matches,
+            pre_sorted,
+            archive_tag_cache_updates,
+            results,
+        } => {
             if !app.browse.search.active {
                 return; // Search was closed while task was running.
             }
+
+            let current_query = app.browse.search.input.text.trim().to_ascii_lowercase();
+            let current_cap = app.browse.search_result_cap.max(1);
+            let current_archive_path = app
+                .browse
+                .archive
+                .as_ref()
+                .map(|archive| archive.listing.archive_path.clone());
+            let current_archive_inner_path = app
+                .browse
+                .archive
+                .as_ref()
+                .map(|archive| archive.inner_path.clone());
+            if generation != app.browse.search.generation
+                || root != app.browse.current_dir
+                || recursive != app.browse.search.recursive
+                || archive_path != current_archive_path
+                || archive_inner_path != current_archive_inner_path
+                || query != current_query
+                || mode != app.browse.search.mode
+                || show_hidden != app.browse.show_hidden
+                || audio_only != app.browse.search.audio_only
+                || format_filter != app.browse.format_filter
+                || sort != app.browse.search.sort
+                || sort_dir != app.browse.search.sort_dir
+                || result_cap != current_cap
+            {
+                return;
+            }
+
             app.browse.search.searching = false;
+            app.browse.search.cancel = None;
+            for (synthetic_path, archive_fingerprint, password_identity, tags) in archive_tag_cache_updates {
+                app.browse.search.archive_tag_cache.insert(
+                    synthetic_path,
+                    super::browse::CachedArchiveTagSearchString {
+                        archive_fingerprint,
+                        password_identity,
+                        tags,
+                    },
+                );
+            }
 
             let mut scored = results;
-            super::browse::sort_search_results(
-                &mut scored,
-                app.browse.search.sort,
-                app.browse.search.sort_dir,
-            );
+            if !pre_sorted {
+                super::browse::sort_search_results(&mut scored, sort, sort_dir);
+            }
+            scored.truncate(result_cap);
 
             let mut entries: Vec<super::browse::BrowseEntry> = Vec::new();
             if let Some(ref parent) = app.browse.parent_entry {
@@ -3047,7 +3142,14 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             app.browse.entries = entries;
             app.browse.selected_index = 0;
             app.browse.scroll_offset = 0;
-        }
+
+            if total_matches > result_cap {
+                app.set_status(format!(
+                    "search: showing best {} of {} matches; raise [browsing] search_result_cap to show more",
+                    result_cap, total_matches
+                ));
+            }
+        },
         AppMessage::FilePickerComplete { session_id, purpose, path } => {
             reduce_file_picker_complete(app, session_id, purpose, path, tx);
         }
@@ -3569,7 +3671,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                     app.set_status(summary);
                     app.active_overlay = ActiveOverlay::None;
                     // Refresh browse listing since files were replaced.
-                    app.browse.refresh();
+                    app.browse.refresh_with_search(Some(tx));
                 }
                 Err(e) => {
                     app.set_status(format!("Offset correction failed: {}", e));
@@ -3580,7 +3682,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
             Ok(summary) => {
                 app.set_status(summary);
                 app.active_overlay = ActiveOverlay::None;
-                app.browse.refresh();
+                app.browse.refresh_with_search(Some(tx));
             }
             Err(e) => {
                 app.set_status(format!("CTDB repair failed: {}", e));
@@ -3591,7 +3693,7 @@ fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMess
                 Ok(message) => {
                     app.set_status(message);
                     if refresh_browse && app.current_screen == AppScreen::Browse {
-                        app.browse.refresh();
+                        app.browse.refresh_with_search(Some(tx));
                         app.browse.probe_current_with_db(tx, Some(&app.db));
                     }
                 }

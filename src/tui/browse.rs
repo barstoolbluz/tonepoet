@@ -119,23 +119,42 @@ impl ClassificationFingerprint {
     }
 }
 
-/// Sort field for browse listings
+/// Sort field for browse listings. Probe-backed fields are valid sort keys
+/// too; unknown/unprobed values sort after known values in ascending order and
+/// then fall back to entry name for deterministic results.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortBy {
     Name,
     Date,
     Type,
     Size,
+    Format,
+    Codec,
+    SampleRate,
+    Channels,
+    Duration,
+    Artist,
+    Album,
 }
 
 impl SortBy {
+    pub const ALL: [Self; 11] = [
+        Self::Name,
+        Self::Size,
+        Self::Date,
+        Self::Type,
+        Self::Format,
+        Self::Codec,
+        Self::SampleRate,
+        Self::Channels,
+        Self::Duration,
+        Self::Artist,
+        Self::Album,
+    ];
+
     pub fn next(&self) -> Self {
-        match self {
-            Self::Name => Self::Date,
-            Self::Date => Self::Type,
-            Self::Type => Self::Size,
-            Self::Size => Self::Name,
-        }
+        let idx = Self::ALL.iter().position(|candidate| candidate == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
     }
 
     pub fn label(&self) -> &'static str {
@@ -144,7 +163,60 @@ impl SortBy {
             Self::Date => "date",
             Self::Type => "type",
             Self::Size => "size",
+            Self::Format => "format",
+            Self::Codec => "codec",
+            Self::SampleRate => "sample_rate",
+            Self::Channels => "channels",
+            Self::Duration => "duration",
+            Self::Artist => "artist",
+            Self::Album => "album",
         }
+    }
+
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Date => "Date",
+            Self::Type => "Type",
+            Self::Size => "Size",
+            Self::Format => "Format",
+            Self::Codec => "Codec",
+            Self::SampleRate => "Sample rate",
+            Self::Channels => "Channels",
+            Self::Duration => "Duration",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+        }
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace(' ', "_").replace('-', "_").as_str() {
+            "name" => Some(Self::Name),
+            "date" | "modified" | "mtime" => Some(Self::Date),
+            "type" | "extension" => Some(Self::Type),
+            "size" => Some(Self::Size),
+            "format" => Some(Self::Format),
+            "codec" => Some(Self::Codec),
+            "sample_rate" | "samplerate" => Some(Self::SampleRate),
+            "channels" => Some(Self::Channels),
+            "duration" => Some(Self::Duration),
+            "artist" => Some(Self::Artist),
+            "album" => Some(Self::Album),
+            _ => None,
+        }
+    }
+
+    pub fn uses_probe_cache(&self) -> bool {
+        matches!(
+            self,
+            Self::Format
+                | Self::Codec
+                | Self::SampleRate
+                | Self::Channels
+                | Self::Duration
+                | Self::Artist
+                | Self::Album
+        )
     }
 }
 
@@ -169,6 +241,14 @@ impl SortDir {
             Self::Desc => "desc",
         }
     }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "asc" | "ascending" => Some(Self::Asc),
+            "desc" | "descending" => Some(Self::Desc),
+            _ => None,
+        }
+    }
 }
 
 /// Format filter: None = all audio formats, Some(fmt) = only that format,
@@ -181,26 +261,47 @@ pub enum FormatFilter {
 }
 
 impl FormatFilter {
+    /// Full filter menu order. Keep this as the single source of truth for
+    /// cycling, config restoration, and the Options → Filter submenu so the UI
+    /// cannot silently omit formats supported elsewhere in Browse.
+    pub fn menu_choices() -> Vec<Self> {
+        vec![
+            Self::Off,
+            Self::AudioOnly,
+            Self::Only(AudioFormat::Flac),
+            Self::Only(AudioFormat::Opus),
+            Self::Only(AudioFormat::Aac),
+            Self::Only(AudioFormat::Mp3),
+            Self::Only(AudioFormat::Alac),
+            Self::Only(AudioFormat::Wav),
+            Self::Only(AudioFormat::WavPack),
+            Self::Only(AudioFormat::Aiff),
+            Self::Only(AudioFormat::Dsf),
+            Self::Only(AudioFormat::Dff),
+            Self::Only(AudioFormat::Dts),
+            Self::Only(AudioFormat::Ac3),
+            Self::Only(AudioFormat::Ape),
+            Self::Only(AudioFormat::Lpcm),
+        ]
+    }
+
+    pub fn from_menu_index(index: usize) -> Option<Self> {
+        Self::menu_choices().get(index).copied()
+    }
+
+    pub fn menu_label(&self) -> String {
+        match self {
+            Self::Off => "All files".to_string(),
+            Self::AudioOnly => "Audio only".to_string(),
+            Self::Only(fmt) => fmt.name().to_string(),
+        }
+    }
+
     /// Cycle to the next filter: Off → AudioOnly → each audio format → Off
     pub fn next(&self) -> Self {
-        match self {
-            Self::Off => Self::AudioOnly,
-            Self::AudioOnly => Self::Only(AudioFormat::Flac),
-            Self::Only(AudioFormat::Flac) => Self::Only(AudioFormat::Opus),
-            Self::Only(AudioFormat::Opus) => Self::Only(AudioFormat::Aac),
-            Self::Only(AudioFormat::Aac) => Self::Only(AudioFormat::Mp3),
-            Self::Only(AudioFormat::Mp3) => Self::Only(AudioFormat::Alac),
-            Self::Only(AudioFormat::Alac) => Self::Only(AudioFormat::Wav),
-            Self::Only(AudioFormat::Wav) => Self::Only(AudioFormat::WavPack),
-            Self::Only(AudioFormat::WavPack) => Self::Only(AudioFormat::Aiff),
-            Self::Only(AudioFormat::Aiff) => Self::Only(AudioFormat::Dsf),
-            Self::Only(AudioFormat::Dsf) => Self::Only(AudioFormat::Dff),
-            Self::Only(AudioFormat::Dff) => Self::Only(AudioFormat::Dts),
-            Self::Only(AudioFormat::Dts) => Self::Only(AudioFormat::Ac3),
-            Self::Only(AudioFormat::Ac3) => Self::Only(AudioFormat::Ape),
-            Self::Only(AudioFormat::Ape) => Self::Only(AudioFormat::Lpcm),
-            Self::Only(AudioFormat::Lpcm) => Self::Off,
-        }
+        let choices = Self::menu_choices();
+        let current = choices.iter().position(|choice| choice == self).unwrap_or(0);
+        choices[(current + 1) % choices.len()]
     }
 
     pub fn label(&self) -> String {
@@ -208,6 +309,36 @@ impl FormatFilter {
             Self::Off => "off".to_string(),
             Self::AudioOnly => "audio".to_string(),
             Self::Only(fmt) => fmt.name().to_string(),
+        }
+    }
+
+    pub fn config_label(&self) -> String {
+        match self {
+            Self::Off => "all".to_string(),
+            Self::AudioOnly => "audio".to_string(),
+            Self::Only(fmt) => fmt.name().to_ascii_lowercase(),
+        }
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace(' ', "_").replace('-', "_").as_str() {
+            "all" | "off" => Some(Self::Off),
+            "audio" | "audio_only" => Some(Self::AudioOnly),
+            "flac" => Some(Self::Only(AudioFormat::Flac)),
+            "opus" => Some(Self::Only(AudioFormat::Opus)),
+            "aac" => Some(Self::Only(AudioFormat::Aac)),
+            "mp3" => Some(Self::Only(AudioFormat::Mp3)),
+            "alac" => Some(Self::Only(AudioFormat::Alac)),
+            "wav" => Some(Self::Only(AudioFormat::Wav)),
+            "wavpack" | "wv" => Some(Self::Only(AudioFormat::WavPack)),
+            "aiff" => Some(Self::Only(AudioFormat::Aiff)),
+            "dsf" => Some(Self::Only(AudioFormat::Dsf)),
+            "dff" => Some(Self::Only(AudioFormat::Dff)),
+            "dts" => Some(Self::Only(AudioFormat::Dts)),
+            "ac3" => Some(Self::Only(AudioFormat::Ac3)),
+            "ape" => Some(Self::Only(AudioFormat::Ape)),
+            "lpcm" => Some(Self::Only(AudioFormat::Lpcm)),
+            _ => None,
         }
     }
 
@@ -256,7 +387,7 @@ impl FormatFilter {
                 )
                     || is_cue_sheet_path(&entry.path)
             }
-            Self::Only(fmt) => matches!(entry.kind, EntryKind::AudioFile(f) if f == *fmt),
+            Self::Only(fmt) => matches!(&entry.kind, EntryKind::AudioFile(f) if f == fmt),
         }
     }
 }
@@ -355,6 +486,73 @@ pub enum SearchFocus {
     Results,
 }
 
+/// Fingerprint used to validate the local tag-search cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagCacheFingerprint {
+    pub modified: Option<SystemTime>,
+    pub size: u64,
+}
+
+impl TagCacheFingerprint {
+    fn for_path(path: &Path) -> Option<Self> {
+        let metadata = fs::metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(Self {
+            modified: metadata.modified().ok(),
+            size: metadata.len(),
+        })
+    }
+}
+
+/// Password identity used for archive-entry tag-cache validation. The cache
+/// must not reuse an empty/failed result from an earlier password attempt after
+/// the user supplies a different archive password. Store only a process-local
+/// hash rather than the password text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ArchiveTagPasswordIdentity {
+    pub has_password: bool,
+    pub hash: u64,
+}
+
+impl ArchiveTagPasswordIdentity {
+    fn for_password(password: Option<&str>) -> Self {
+        match password {
+            Some(password) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(password, &mut hasher);
+                Self {
+                    has_password: true,
+                    hash: std::hash::Hasher::finish(&hasher),
+                }
+            }
+            None => Self {
+                has_password: false,
+                hash: 0,
+            },
+        }
+    }
+}
+
+/// Cached local tag-search text plus the filesystem fingerprint it was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedTagSearchString {
+    pub fingerprint: TagCacheFingerprint,
+    pub tag_string: String,
+}
+
+/// Cached archive-entry tag data. The key is the synthetic archive-entry path
+/// (`archive_path/inner/member.flac`), while the fingerprint is taken from the
+/// containing archive file. That makes Tags/Both archive search independent of
+/// incidental probe-cache warmth but still invalidates when the archive changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedArchiveTagSearchString {
+    pub archive_fingerprint: TagCacheFingerprint,
+    pub password_identity: ArchiveTagPasswordIdentity,
+    pub tags: TagReadResult,
+}
+
 /// State for the inline search panel in the browse screen.
 #[derive(Debug, Clone)]
 pub struct SearchState {
@@ -378,11 +576,20 @@ pub struct SearchState {
     pub last_keystroke: Option<std::time::Instant>,
     /// True while an async search is in flight.
     pub searching: bool,
-    /// In-memory tag cache for non-recursive tag search (avoids repeated
-    /// lofty reads on each debounce). Cleared on search close / dir change.
-    pub tag_cache: std::collections::HashMap<PathBuf, String>,
+    /// In-memory tag cache for non-recursive tag search. Entries are
+    /// fingerprinted by file size + mtime so an active search panel cannot
+    /// keep matching stale tags after metadata writes or external changes.
+    /// Cleared on search close and directory-context changes.
+    pub tag_cache: std::collections::HashMap<PathBuf, CachedTagSearchString>,
+    /// Archive-entry tag cache for non-staged archive Browse search/sort. Unlike
+    /// `tag_cache`, these keys are synthetic archive-member paths and are
+    /// validated against the containing archive file fingerprint.
+    pub archive_tag_cache: std::collections::HashMap<PathBuf, CachedArchiveTagSearchString>,
     /// Cancel flag for async recursive search tasks.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Monotonic identity for search launches. Recursive workers echo the value
+    /// so the reducer can reject late completions from superseded searches.
+    pub generation: u64,
 }
 
 impl SearchState {
@@ -399,7 +606,9 @@ impl SearchState {
             last_keystroke: None,
             searching: false,
             tag_cache: std::collections::HashMap::new(),
+            archive_tag_cache: std::collections::HashMap::new(),
             cancel: None,
+            generation: 0,
         }
     }
 }
@@ -574,6 +783,177 @@ impl BrowseEntry {
     }
 }
 
+
+/// Browse panes that can be collapsed or restored from title-bar controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowsePaneId {
+    Explore,
+    Browse,
+    Info,
+}
+
+/// Configurable browse table columns. The core table renderer always keeps
+/// `Name` available; audio-specific columns are optional and render as empty
+/// values for non-audio entries until probe data is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BrowseColumn {
+    Name,
+    Size,
+    Date,
+    Type,
+    Format,
+    Codec,
+    SampleRate,
+    Channels,
+    Duration,
+    Artist,
+    Album,
+}
+
+impl BrowseColumn {
+    pub const ALL: [BrowseColumn; 11] = [
+        BrowseColumn::Name,
+        BrowseColumn::Size,
+        BrowseColumn::Date,
+        BrowseColumn::Type,
+        BrowseColumn::Format,
+        BrowseColumn::Codec,
+        BrowseColumn::SampleRate,
+        BrowseColumn::Channels,
+        BrowseColumn::Duration,
+        BrowseColumn::Artist,
+        BrowseColumn::Album,
+    ];
+
+    pub fn config_key(self) -> &'static str {
+        match self {
+            BrowseColumn::Name => "name",
+            BrowseColumn::Size => "size",
+            BrowseColumn::Date => "date",
+            BrowseColumn::Type => "type",
+            BrowseColumn::Format => "format",
+            BrowseColumn::Codec => "codec",
+            BrowseColumn::SampleRate => "sample_rate",
+            BrowseColumn::Channels => "channels",
+            BrowseColumn::Duration => "duration",
+            BrowseColumn::Artist => "artist",
+            BrowseColumn::Album => "album",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrowseColumn::Name => "Name",
+            BrowseColumn::Size => "Size",
+            BrowseColumn::Date => "Date",
+            BrowseColumn::Type => "Type",
+            BrowseColumn::Format => "Format",
+            BrowseColumn::Codec => "Codec",
+            BrowseColumn::SampleRate => "Sample rate",
+            BrowseColumn::Channels => "Channels",
+            BrowseColumn::Duration => "Duration",
+            BrowseColumn::Artist => "Artist",
+            BrowseColumn::Album => "Album",
+        }
+    }
+
+    pub fn from_config_key(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace(' ', "_").replace('-', "_").as_str() {
+            "name" => Some(BrowseColumn::Name),
+            "size" => Some(BrowseColumn::Size),
+            "date" | "modified" | "mtime" => Some(BrowseColumn::Date),
+            "type" | "extension" => Some(BrowseColumn::Type),
+            "format" => Some(BrowseColumn::Format),
+            "codec" => Some(BrowseColumn::Codec),
+            "sample_rate" | "samplerate" => Some(BrowseColumn::SampleRate),
+            "channels" => Some(BrowseColumn::Channels),
+            "duration" => Some(BrowseColumn::Duration),
+            "artist" => Some(BrowseColumn::Artist),
+            "album" => Some(BrowseColumn::Album),
+            _ => None,
+        }
+    }
+
+    pub fn sort_by(self) -> SortBy {
+        match self {
+            BrowseColumn::Name => SortBy::Name,
+            BrowseColumn::Size => SortBy::Size,
+            BrowseColumn::Date => SortBy::Date,
+            BrowseColumn::Type => SortBy::Type,
+            BrowseColumn::Format => SortBy::Format,
+            BrowseColumn::Codec => SortBy::Codec,
+            BrowseColumn::SampleRate => SortBy::SampleRate,
+            BrowseColumn::Channels => SortBy::Channels,
+            BrowseColumn::Duration => SortBy::Duration,
+            BrowseColumn::Artist => SortBy::Artist,
+            BrowseColumn::Album => SortBy::Album,
+        }
+    }
+
+    pub fn from_sort_by(sort_by: SortBy) -> Self {
+        match sort_by {
+            SortBy::Name => BrowseColumn::Name,
+            SortBy::Size => BrowseColumn::Size,
+            SortBy::Date => BrowseColumn::Date,
+            SortBy::Type => BrowseColumn::Type,
+            SortBy::Format => BrowseColumn::Format,
+            SortBy::Codec => BrowseColumn::Codec,
+            SortBy::SampleRate => BrowseColumn::SampleRate,
+            SortBy::Channels => BrowseColumn::Channels,
+            SortBy::Duration => BrowseColumn::Duration,
+            SortBy::Artist => BrowseColumn::Artist,
+            SortBy::Album => BrowseColumn::Album,
+        }
+    }
+
+    pub fn default_columns() -> Vec<Self> {
+        vec![BrowseColumn::Name, BrowseColumn::Size, BrowseColumn::Date, BrowseColumn::Type]
+    }
+
+    pub fn from_config_list(values: &[String]) -> Vec<Self> {
+        let mut columns = Vec::new();
+        for value in values {
+            let Some(column) = BrowseColumn::from_config_key(value) else { continue; };
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        if columns.is_empty() {
+            BrowseColumn::default_columns()
+        } else {
+            if !columns.contains(&BrowseColumn::Name) {
+                columns.insert(0, BrowseColumn::Name);
+            }
+            columns
+        }
+    }
+}
+
+/// Options dropdown state for the Browse toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseOptionsMenu {
+    Closed,
+    Root,
+    Columns,
+    Sort,
+    Filter,
+    ArchiveListing,
+}
+
+impl BrowseOptionsMenu {
+    pub fn is_open(self) -> bool {
+        !matches!(self, BrowseOptionsMenu::Closed)
+    }
+}
+
+/// Explore pane tree node. Reuse the file-picker tree node type directly so
+/// Browse and the picker share one filesystem-tree data model.
+///
+/// Use the explicit module path instead of assuming `TreeNode` is re-exported
+/// at the `tui_file_picker` crate root. In the file-picker crate, `TreeNode`
+/// is the shared state model consumed by `tree.rs` and the picker renderer.
+pub type BrowseTreeNode = tui_file_picker::TreeNode;
+
 /// State for the browse screen
 #[derive(Debug, Clone)]
 pub struct BrowseState {
@@ -611,6 +991,11 @@ pub struct BrowseState {
     /// Path bar input (when the breadcrumb is in edit mode)
     pub path_input: Option<TextInputState>,
 
+    /// Monotonic token for async path validations. Every launch and every
+    /// directory/archive navigation invalidates older completions so stale
+    /// workers cannot navigate Browse after the user has moved elsewhere.
+    pub path_validation_generation: u64,
+
     /// Filter input (when /-mode is active)
     pub filter_input: Option<TextInputState>,
     /// Committed filter text (empty = no filter)
@@ -619,9 +1004,17 @@ pub struct BrowseState {
     filter_text_prior: Option<String>,
     pub show_hidden: bool,
 
-    /// Sort field and direction
+    /// Active sort field and direction for the current directory. Column-header
+    /// clicks update these ad hoc values only; directory navigation resets them
+    /// from `default_sort_by` / `default_sort_dir`.
     pub sort_by: SortBy,
     pub sort_dir: SortDir,
+
+    /// Persisted default sort applied when entering a new directory. Kept
+    /// separate from the active sort so column-click sorting remains local to
+    /// the current directory, matching the Browse options model.
+    pub default_sort_by: SortBy,
+    pub default_sort_dir: SortDir,
 
     /// Format filter (cycle with `f`)
     pub format_filter: FormatFilter,
@@ -697,6 +1090,12 @@ pub struct BrowseState {
     /// scan is running. Used for cancellation and loading indicator.
     pub scan_pending: Option<ScanHandle>,
 
+    /// Monotonic token for async directory scans. Every async scan gets a
+    /// unique generation; reducers must accept only the currently pending
+    /// generation so stale same-directory completions cannot publish old
+    /// listings or consume deferred inline-rename continuations.
+    pub scan_generation: u64,
+
     /// After `go_parent`, the name of the directory we came from — so the
     /// DirScanComplete handler can position the cursor on it.
     pub cursor_restore_target: Option<String>,
@@ -706,26 +1105,60 @@ pub struct BrowseState {
     /// Instant of the last type-ahead keystroke, for timeout reset.
     pub type_ahead_last_keystroke: Option<Instant>,
 
+    /// Explore pane directory tree. Expanded/collapsed state is session-local.
+    pub tree_nodes: Vec<BrowseTreeNode>,
+    pub tree_cursor: usize,
+    pub tree_scroll: usize,
+    pub tree_visible_height: usize,
+
+    /// Three-pane Browse layout state. Browse itself is never fully collapsed.
+    pub explore_collapsed: bool,
+    pub info_collapsed: bool,
+    pub browse_maximized: bool,
+    pub browse_title_last_click: Option<Instant>,
+
+    /// Configurable visible columns and toolbar options-menu state.
+    pub columns: Vec<BrowseColumn>,
+    pub options_menu: BrowseOptionsMenu,
+
+    /// Directory navigation history backing toolbar Back/Fwd.
+    pub nav_history: Vec<PathBuf>,
+    pub nav_history_index: usize,
+
+    /// Cap for search results. Recursive search applies this only after global
+    /// scoring and sorting so walk order cannot hide better later matches.
+    pub search_result_cap: usize,
+
+    /// Pending sequential inline-rename target captured before a filesystem
+    /// rename triggers an async refresh that temporarily clears `entries`.
+    pub pending_inline_rename_after_scan: Option<PendingBrowseInlineRenameAfterScan>,
+
     /// Channel sender for async messages. Set after construction by the
     /// event loop. `None` during the initial synchronous scan.
-    scan_tx: Option<tokio::sync::mpsc::Sender<super::message::AppMessage>>,
+    scan_tx: Option<tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
 }
 
 /// Handle to a cancellable background directory scan.
 #[derive(Debug, Clone)]
 pub struct ScanHandle {
+    generation: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ScanHandle {
-    pub fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    pub fn new(generation: u64) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         (
             Self {
+                generation,
                 cancel: flag.clone(),
             },
             flag,
         )
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn cancel(&self) {
@@ -841,7 +1274,7 @@ impl ArchiveStagingSession {
 #[derive(Debug, Clone)]
 pub struct ArchiveBrowseState {
     /// The parsed archive listing.
-    pub listing: super::archive_listing::ArchiveListing,
+    pub listing: crate::tui::archive_listing::ArchiveListing,
     /// Current directory path inside the archive ("" = root).
     pub inner_path: String,
     /// Password used to open this archive (for re-listing / extraction).
@@ -850,14 +1283,38 @@ pub struct ArchiveBrowseState {
     pub staging: Option<ArchiveStagingSession>,
 }
 
+/// Continuation for Tab/Shift+Tab sequential rename across an async filesystem refresh.
+///
+/// Filesystem renames refresh the directory after the on-disk rename. In the normal
+/// interactive app that refresh is async and clears `entries` immediately, so the
+/// next/previous entry must be captured before committing and resumed when the
+/// scan for the same directory completes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingBrowseInlineRenameAfterScan {
+    pub scan_generation: u64,
+    pub directory: PathBuf,
+    pub target_path: PathBuf,
+}
+
 impl BrowseState {
     pub fn new() -> Self {
+        Self::new_with_config(&crate::config::BrowsingConfig::default())
+    }
+
+    pub fn new_with_config(config: &crate::config::BrowsingConfig) -> Self {
         let start_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/"));
+        let config = config.normalized();
+        let sort_by = SortBy::from_label(&config.default_sort).unwrap_or(SortBy::Name);
+        let sort_dir = SortDir::from_label(&config.default_sort_dir).unwrap_or(SortDir::Asc);
+        let format_filter = FormatFilter::from_label(&config.default_filter).unwrap_or(FormatFilter::Off);
+        let columns = BrowseColumn::from_config_list(&config.columns);
+        let explore_collapsed = config.layout_explore == "collapsed";
+        let info_collapsed = config.layout_info == "collapsed";
 
         let mut state = Self {
-            current_dir: start_dir,
+            current_dir: start_dir.clone(),
             parent_entry: None,
             all_dirs: Vec::new(),
             all_files: Vec::new(),
@@ -870,13 +1327,16 @@ impl BrowseState {
             visual_mode: false,
             search: SearchState::new(),
             path_input: None,
+            path_validation_generation: 0,
             filter_input: None,
             filter_text: String::new(),
             filter_text_prior: None,
-            show_hidden: false,
-            sort_by: SortBy::Name,
-            sort_dir: SortDir::Asc,
-            format_filter: FormatFilter::Off,
+            show_hidden: config.show_hidden,
+            sort_by,
+            sort_dir,
+            default_sort_by: sort_by,
+            default_sort_dir: sort_dir,
+            format_filter,
             probe_cache: HashMap::new(),
             probe_pending: std::collections::HashSet::new(),
             archive_probe_epochs: HashMap::new(),
@@ -896,17 +1356,33 @@ impl BrowseState {
             error: None,
             archive: None,
             scan_pending: None,
+            scan_generation: 0,
             cursor_restore_target: None,
             type_ahead_buffer: String::new(),
             type_ahead_last_keystroke: None,
+            tree_nodes: initial_browse_tree_nodes(&start_dir, config.show_hidden),
+            tree_cursor: 0,
+            tree_scroll: 0,
+            tree_visible_height: 0,
+            explore_collapsed,
+            info_collapsed,
+            browse_maximized: explore_collapsed && info_collapsed,
+            browse_title_last_click: None,
+            columns,
+            options_menu: BrowseOptionsMenu::Closed,
+            nav_history: vec![start_dir],
+            nav_history_index: 0,
+            search_result_cap: config.search_result_cap,
+            pending_inline_rename_after_scan: None,
             scan_tx: None,
         };
+        state.sync_tree_to_current_dir();
         state.refresh(); // Initial scan is synchronous (no tx yet).
         state
     }
 
     /// Set the message channel sender (called once from the event loop).
-    pub fn set_tx(&mut self, tx: tokio::sync::mpsc::Sender<super::message::AppMessage>) {
+    pub fn set_tx(&mut self, tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>) {
         self.scan_tx = Some(tx);
     }
 
@@ -915,13 +1391,270 @@ impl BrowseState {
         self.scan_tx.is_some()
     }
 
+    /// Persistable snapshot of Browse view preferences.
+    pub fn capture_browsing_config(&self) -> crate::config::BrowsingConfig {
+        crate::config::BrowsingConfig {
+            show_hidden: self.show_hidden,
+            columns: self
+                .columns
+                .iter()
+                .map(|column| column.config_key().to_string())
+                .collect(),
+            default_sort: self.default_sort_by.label().to_string(),
+            default_sort_dir: self.default_sort_dir.label().to_string(),
+            default_filter: self.format_filter.config_label(),
+            layout_explore: if self.explore_collapsed { "collapsed" } else { "open" }.to_string(),
+            layout_info: if self.info_collapsed { "collapsed" } else { "open" }.to_string(),
+            search_result_cap: self.search_result_cap,
+        }
+        .normalized()
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.nav_history_index > 0 && self.nav_history_index < self.nav_history.len()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.nav_history_index + 1 < self.nav_history.len()
+    }
+
+    pub fn go_back(&mut self) -> bool {
+        if !self.can_go_back() {
+            return false;
+        }
+        self.nav_history_index -= 1;
+        if let Some(path) = self.nav_history.get(self.nav_history_index).cloned() {
+            self.navigate_without_history(path);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn go_forward(&mut self) -> bool {
+        if !self.can_go_forward() {
+            return false;
+        }
+        self.nav_history_index += 1;
+        if let Some(path) = self.nav_history.get(self.nav_history_index).cloned() {
+            self.navigate_without_history(path);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn push_nav_history(&mut self, path: PathBuf) {
+        if self.nav_history.get(self.nav_history_index).is_some_and(|current| same_path(current, &path)) {
+            return;
+        }
+        if self.nav_history_index + 1 < self.nav_history.len() {
+            self.nav_history.truncate(self.nav_history_index + 1);
+        }
+        self.nav_history.push(path);
+        self.nav_history_index = self.nav_history.len().saturating_sub(1);
+    }
+
+    fn navigate_without_history(&mut self, path: PathBuf) {
+        if !path.is_dir() {
+            return;
+        }
+        self.invalidate_path_validation();
+        self.current_dir = path;
+        self.selected_index = 0;
+        self.reset_nav_state();
+        self.reset_sort_to_default();
+        self.sync_tree_to_current_dir();
+        self.refresh();
+    }
+
+    pub fn toggle_pane(&mut self, pane: BrowsePaneId) {
+        match pane {
+            BrowsePaneId::Explore => self.explore_collapsed = !self.explore_collapsed,
+            BrowsePaneId::Info => self.info_collapsed = !self.info_collapsed,
+            // Browse never fully collapses. Maximization is a distinct
+            // double-click action on the Browse title, not a single-click
+            // pane-toggle action. Keep this no-op as a defensive guard for
+            // stale or future hit targets.
+            BrowsePaneId::Browse => return,
+        }
+        self.browse_maximized = self.explore_collapsed && self.info_collapsed;
+    }
+
+    pub fn toggle_browse_maximized(&mut self) {
+        if self.explore_collapsed && self.info_collapsed {
+            self.explore_collapsed = false;
+            self.info_collapsed = false;
+            self.browse_maximized = false;
+        } else {
+            self.explore_collapsed = true;
+            self.info_collapsed = true;
+            self.browse_maximized = true;
+        }
+    }
+
+    pub fn reset_browse_layout(&mut self) {
+        self.explore_collapsed = false;
+        self.info_collapsed = false;
+        self.browse_maximized = false;
+    }
+
+    /// Apply persisted Browse preferences to the live session without replacing
+    /// BrowseState. This preserves current directory, archive/session state,
+    /// navigation history, pending scans, caches, and selection context.
+    pub fn apply_browsing_config(&mut self, config: &crate::config::BrowsingConfig) {
+        self.apply_browsing_config_with_search(config, None);
+    }
+
+    pub fn apply_browsing_config_with_search(
+        &mut self,
+        config: &crate::config::BrowsingConfig,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
+        let config = config.normalized();
+        let previous_hidden = self.show_hidden;
+        self.show_hidden = config.show_hidden;
+        self.columns = BrowseColumn::from_config_list(&config.columns);
+        self.default_sort_by = SortBy::from_label(&config.default_sort).unwrap_or(SortBy::Name);
+        self.default_sort_dir = SortDir::from_label(&config.default_sort_dir).unwrap_or(SortDir::Asc);
+        self.reset_sort_to_default();
+        self.format_filter = FormatFilter::from_label(&config.default_filter).unwrap_or(FormatFilter::Off);
+        self.explore_collapsed = config.layout_explore == "collapsed";
+        self.info_collapsed = config.layout_info == "collapsed";
+        self.browse_maximized = self.explore_collapsed && self.info_collapsed;
+        self.search_result_cap = config.search_result_cap;
+        self.close_options_menu();
+
+        if previous_hidden != self.show_hidden {
+            self.rebuild_tree_preserving_expansion();
+        } else {
+            self.sync_tree_to_current_dir();
+        }
+        self.reapply_after_browse_preference_change(tx);
+    }
+
+    pub fn toggle_column(&mut self, column: BrowseColumn) {
+        if column == BrowseColumn::Name {
+            return;
+        }
+        if let Some(index) = self.columns.iter().position(|existing| *existing == column) {
+            self.columns.remove(index);
+        } else {
+            self.columns.push(column);
+        }
+        if !self.columns.contains(&BrowseColumn::Name) {
+            self.columns.insert(0, BrowseColumn::Name);
+        }
+    }
+
+    pub fn close_options_menu(&mut self) {
+        self.options_menu = BrowseOptionsMenu::Closed;
+    }
+
+    pub fn toggle_options_menu(&mut self) {
+        self.options_menu = if self.options_menu.is_open() {
+            BrowseOptionsMenu::Closed
+        } else {
+            BrowseOptionsMenu::Root
+        };
+    }
+
+    pub fn set_tree_visible_height(&mut self, height: usize) {
+        self.tree_visible_height = height;
+        self.ensure_tree_visible();
+    }
+
+    pub fn tree_node_path(&self, index: usize) -> Option<PathBuf> {
+        self.tree_nodes.get(index).map(|node| node.path.clone())
+    }
+
+    pub fn select_tree_index(&mut self, index: usize) -> Option<PathBuf> {
+        if index >= self.tree_nodes.len() {
+            return None;
+        }
+        self.tree_cursor = index;
+        self.ensure_tree_visible();
+        self.tree_nodes.get(index).map(|node| node.path.clone())
+    }
+
+    pub fn toggle_tree_node(&mut self, index: usize) {
+        if index >= self.tree_nodes.len() {
+            return;
+        }
+        if self.tree_nodes[index].expanded {
+            let depth = self.tree_nodes[index].depth;
+            self.tree_nodes[index].expanded = false;
+            let remove_start = index + 1;
+            let remove_end = self.tree_nodes[remove_start..]
+                .iter()
+                .position(|node| node.depth <= depth)
+                .map(|offset| remove_start + offset)
+                .unwrap_or(self.tree_nodes.len());
+            self.tree_nodes.drain(remove_start..remove_end);
+            if self.tree_cursor >= self.tree_nodes.len() {
+                self.tree_cursor = self.tree_nodes.len().saturating_sub(1);
+            }
+            self.ensure_tree_visible();
+            return;
+        }
+        let children = tui_file_picker::child_directories(&self.tree_nodes[index].path, self.tree_nodes[index].depth + 1, self.show_hidden);
+        self.tree_nodes[index].expanded = true;
+        for (offset, child) in children.into_iter().enumerate() {
+            self.tree_nodes.insert(index + 1 + offset, child);
+        }
+    }
+
+    pub fn sync_tree_to_current_dir(&mut self) {
+        let root_misses_current = self
+            .tree_nodes
+            .first()
+            .map(|node| !self.current_dir.starts_with(&node.path))
+            .unwrap_or(true);
+        if root_misses_current {
+            self.tree_nodes = initial_browse_tree_nodes(&self.current_dir, self.show_hidden);
+        }
+        browse_tree_expand_ancestors(&mut self.tree_nodes, &self.current_dir, self.show_hidden);
+        if let Some(index) = self
+            .tree_nodes
+            .iter()
+            .position(|node| same_path(&node.path, &self.current_dir))
+        {
+            self.tree_cursor = index;
+            self.ensure_tree_visible();
+        }
+    }
+
+    fn ensure_tree_visible(&mut self) {
+        if self.tree_visible_height == 0 {
+            return;
+        }
+        if self.tree_cursor < self.tree_scroll {
+            self.tree_scroll = self.tree_cursor;
+        } else if self.tree_cursor >= self.tree_scroll + self.tree_visible_height {
+            self.tree_scroll = self.tree_cursor + 1 - self.tree_visible_height;
+        }
+    }
+
     /// Full refresh: re-scan disk, then re-apply the view filters/sort.
     /// Uses async scan if tx is available, otherwise falls back to synchronous.
     pub fn refresh(&mut self) {
+        self.refresh_with_search(None);
+    }
+
+    /// Refresh while preserving the active-search ownership invariant. Interactive
+    /// callers should pass `tx` so archive tag searches that require extraction
+    /// restart through the async worker instead of falling back to synchronous
+    /// tag extraction on the TUI path.
+    pub fn refresh_with_search(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
         if self.archive.is_some() {
-            self.refresh_archive_view();
+            self.refresh_archive_view_with_search(tx);
             return;
         }
+        self.sync_tree_to_current_dir();
+        self.invalidate_recursive_search_for_refresh();
         if self.scan_tx.is_some() {
             self.begin_async_scan();
         } else {
@@ -929,7 +1662,7 @@ impl BrowseState {
             self.scan();
             self.classify_dvda_directory_entries();
             self.upgrade_iso_kinds();
-            self.apply_view();
+            self.reapply_after_directory_scan_complete(tx);
         }
     }
 
@@ -940,6 +1673,7 @@ impl BrowseState {
         if let Some(handle) = self.scan_pending.take() {
             handle.cancel();
         }
+        self.clear_pending_inline_rename_after_scan();
 
         // Clear display state.
         self.parent_entry = None;
@@ -955,10 +1689,12 @@ impl BrowseState {
             None => return, // No channel — shouldn't happen after set_tx.
         };
 
-        let (handle, cancel_flag) = ScanHandle::new();
+        self.scan_generation = self.scan_generation.wrapping_add(1);
+        let generation = self.scan_generation;
+        let (handle, cancel_flag) = ScanHandle::new(generation);
         self.scan_pending = Some(handle);
 
-        spawn_dir_scan(self.current_dir.clone(), cancel_flag, tx);
+        spawn_dir_scan(self.current_dir.clone(), generation, cancel_flag, tx);
     }
 
     /// Whether we're currently browsing inside an archive.
@@ -969,9 +1705,11 @@ impl BrowseState {
     /// Enter an archive: set archive state and populate entries from listing.
     pub fn enter_archive(
         &mut self,
-        listing: super::archive_listing::ArchiveListing,
+        listing: crate::tui::archive_listing::ArchiveListing,
         password: Option<String>,
     ) {
+        self.close_search_for_navigation();
+        self.clear_archive_tag_cache_for_archive(&listing.archive_path);
         self.archive = Some(ArchiveBrowseState {
             listing,
             inner_path: String::new(),
@@ -983,6 +1721,7 @@ impl BrowseState {
         self.selected_index = 0;
         self.scroll_offset = 0;
         self.clear_type_ahead();
+        self.reset_sort_to_default();
         self.refresh_archive_view();
         self.selected_index = 0;
         self.scroll_offset = 0;
@@ -994,8 +1733,17 @@ impl BrowseState {
     /// packed sizes do not remain stale while the user stays inside the archive.
     pub fn replace_active_archive_listing(
         &mut self,
-        listing: super::archive_listing::ArchiveListing,
+        listing: crate::tui::archive_listing::ArchiveListing,
         password: Option<String>,
+    ) {
+        self.replace_active_archive_listing_with_search(listing, password, None);
+    }
+
+    pub fn replace_active_archive_listing_with_search(
+        &mut self,
+        listing: crate::tui::archive_listing::ArchiveListing,
+        password: Option<String>,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
     ) {
         let active_same_archive = self
             .archive
@@ -1004,6 +1752,16 @@ impl BrowseState {
         if !active_same_archive {
             self.enter_archive(listing, password);
             return;
+        }
+
+        let old_password_identity = self
+            .archive
+            .as_ref()
+            .map(|arc| ArchiveTagPasswordIdentity::for_password(arc.password.as_deref()))
+            .unwrap_or_else(|| ArchiveTagPasswordIdentity::for_password(None));
+        let new_password_identity = ArchiveTagPasswordIdentity::for_password(password.as_deref());
+        if old_password_identity != new_password_identity {
+            self.clear_archive_tag_cache_for_archive(&listing.archive_path);
         }
 
         let previous_inner = self
@@ -1039,7 +1797,8 @@ impl BrowseState {
         self.multi_selected.clear();
         self.multi_select_anchor = None;
         self.clear_type_ahead();
-        self.refresh_archive_view();
+        self.reset_sort_to_default();
+        self.refresh_archive_view_with_search(tx);
 
         if let Some(inner) = previous_selected_inner {
             if let Some(archive_path) = self.archive.as_ref().map(|arc| arc.listing.archive_path.clone()) {
@@ -1066,27 +1825,35 @@ impl BrowseState {
 
     /// Exit the archive and return to filesystem browsing.
     pub fn exit_archive(&mut self) {
+        self.invalidate_path_validation();
+        self.close_search_for_navigation();
         self.archive = None;
         self.multi_selected.clear();
         self.selected_index = 0;
         self.scroll_offset = 0;
+        self.reset_sort_to_default();
         self.refresh();
     }
 
     /// Navigate into a subdirectory inside the archive.
     pub fn enter_archive_dir(&mut self, dir_path: &str) {
+        self.invalidate_path_validation();
+        self.close_search_for_navigation();
         if let Some(ref mut arc) = self.archive {
             arc.inner_path = dir_path.to_string();
         }
         self.multi_selected.clear();
         self.selected_index = 0;
         self.scroll_offset = 0;
+        self.reset_sort_to_default();
         self.refresh_archive_view();
     }
 
     /// Navigate up one level inside the archive. Returns false if already
     /// at archive root (caller should exit the archive entirely).
     pub fn go_up_in_archive(&mut self) -> bool {
+        self.invalidate_path_validation();
+        self.close_search_for_navigation();
         if let Some(ref mut arc) = self.archive {
             if arc.inner_path.is_empty() {
                 return false; // At root — caller should exit archive.
@@ -1099,23 +1866,68 @@ impl BrowseState {
             self.multi_selected.clear();
             self.selected_index = 0;
             self.scroll_offset = 0;
+            self.reset_sort_to_default();
             self.refresh_archive_view();
             return true;
         }
         false
     }
 
-    /// Repopulate `entries` from the archive listing at the current inner path.
+    /// Rebuild the archive-local raw model for the current inner path and then
+    /// publish it through the same view/search pipeline as filesystem Browse.
+    ///
+    /// Archive Browse must not write visible rows directly into `entries`: doing
+    /// so bypasses Show Hidden, format filters, ad hoc sorting, configured
+    /// columns, and the active-search ownership invariant. The archive path now
+    /// mirrors filesystem scans: `parent_entry` + `all_dirs` + `all_files` are
+    /// the raw model, and `apply_view()` / search produce the visible list.
     pub(crate) fn refresh_archive_view(&mut self) {
-        self.entries.clear();
+        self.refresh_archive_view_with_search(None);
+    }
+
+    pub(crate) fn refresh_archive_view_with_search(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
+        let prev_path = self
+            .entries
+            .get(self.selected_index)
+            .map(|entry| entry.path.clone());
+
+        self.rebuild_archive_raw_entries();
+        self.reapply_after_directory_scan_complete(tx);
+        self.restore_cursor_on_path(prev_path);
+
+        if self.entries.is_empty() {
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+        } else {
+            if self.selected_index >= self.entries.len() {
+                self.selected_index = self.entries.len() - 1;
+            }
+            let max_offset = self.entries.len().saturating_sub(self.visible_height.max(1));
+            self.scroll_offset = self.scroll_offset.min(max_offset);
+            self.ensure_visible();
+        }
+    }
+
+    /// Populate `parent_entry`, `all_dirs`, and `all_files` from the active
+    /// archive directory without applying visibility, format, text, or search
+    /// filters. This is the archive-mode equivalent of `scan()`.
+    fn rebuild_archive_raw_entries(&mut self) {
         self.parent_entry = None;
+        self.all_dirs.clear();
+        self.all_files.clear();
+        self.entries.clear();
 
         let arc = match &self.archive {
             Some(a) => a,
             None => return,
         };
 
-        // Add parent-dir entry.
+        // Preserve the historical archive Browse affordance: `..` is always
+        // visible and lets callers either move up inside the archive or exit the
+        // archive from its root.
         self.parent_entry = Some(BrowseEntry::new(
             PathBuf::from(".."),
             "..".to_string(),
@@ -1174,31 +1986,8 @@ impl BrowseState {
             }
         }
 
-        sort_entries(&mut dirs, self.sort_by, self.sort_dir);
-        sort_entries(&mut files, self.sort_by, self.sort_dir);
-
-        // Build entries: parent + dirs + files (same order as filesystem browse).
-        if let Some(ref parent) = self.parent_entry {
-            self.entries.push(parent.clone());
-        }
-        self.entries.extend(dirs);
-        self.entries.extend(files);
-
-        // Clamp selection and viewport against the archive-local model. This is
-        // deliberately independent of the parent directory's previous scroll
-        // state; stale offsets were the root cause of blank archive panes after
-        // opening entries that had been far down a long parent listing.
-        if self.entries.is_empty() {
-            self.selected_index = 0;
-            self.scroll_offset = 0;
-        } else {
-            if self.selected_index >= self.entries.len() {
-                self.selected_index = self.entries.len() - 1;
-            }
-            let max_offset = self.entries.len().saturating_sub(self.visible_height.max(1));
-            self.scroll_offset = self.scroll_offset.min(max_offset);
-            self.ensure_visible();
-        }
+        self.all_dirs = dirs;
+        self.all_files = files;
     }
 
     /// Read the directory from disk into `parent_entry` / `all_dirs` / `all_files`.
@@ -1453,8 +2242,8 @@ impl BrowseState {
             .cloned()
             .collect();
 
-        sort_entries(&mut dirs, self.sort_by, self.sort_dir);
-        sort_entries(&mut files, self.sort_by, self.sort_dir);
+        sort_entries(&mut dirs, self.sort_by, self.sort_dir, &self.probe_cache);
+        sort_entries(&mut files, self.sort_by, self.sort_dir, &self.probe_cache);
 
         self.entries.extend(dirs);
         self.entries.extend(files);
@@ -1473,43 +2262,134 @@ impl BrowseState {
             .entries
             .get(self.selected_index)
             .map(|e| e.path.clone());
-        if self.archive.is_some() {
-            self.refresh_archive_view();
-        } else {
-            self.apply_view();
-        }
+        self.apply_view();
         self.restore_cursor_on_path(prev_path);
+    }
+
+    /// Reset the active directory sort to the persisted default. Call this only
+    /// on directory-entry transitions; explicit refresh preserves ad hoc sorting
+    /// in the current directory.
+    fn reset_sort_to_default(&mut self) {
+        self.sort_by = self.default_sort_by;
+        self.sort_dir = self.default_sort_dir;
+    }
+
+    /// Update the persisted default sort. When `apply_current_directory` is true
+    /// (for the Options submenu), the current directory is re-sorted immediately;
+    /// column-header clicks must use `set_sort` instead so they remain ad hoc.
+    pub fn set_default_sort(
+        &mut self,
+        by: SortBy,
+        dir: SortDir,
+        apply_current_directory: bool,
+    ) {
+        self.set_default_sort_with_search(by, dir, apply_current_directory, None);
+    }
+
+    pub fn set_default_sort_with_search(
+        &mut self,
+        by: SortBy,
+        dir: SortDir,
+        apply_current_directory: bool,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
+        self.default_sort_by = by;
+        self.default_sort_dir = dir;
+        if apply_current_directory {
+            self.sort_by = by;
+            self.sort_dir = dir;
+            self.reapply_after_browse_preference_change(tx);
+        }
     }
 
     /// Cycle to the next sort field and re-apply, preserving cursor on current entry
     pub fn cycle_sort_by(&mut self) {
+        self.cycle_sort_by_with_search(None);
+    }
+
+    pub fn cycle_sort_by_with_search(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
         self.sort_by = self.sort_by.next();
-        self.apply_view_preserving_cursor();
+        self.reapply_after_browse_preference_change(tx);
     }
 
     /// Toggle sort direction and re-apply, preserving cursor on current entry
     pub fn toggle_sort_dir(&mut self) {
+        self.toggle_sort_dir_with_search(None);
+    }
+
+    pub fn toggle_sort_dir_with_search(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
         self.sort_dir = self.sort_dir.toggle();
-        self.apply_view_preserving_cursor();
+        self.reapply_after_browse_preference_change(tx);
     }
 
     /// Set sort field and direction explicitly, preserving cursor
     pub fn set_sort(&mut self, by: SortBy, dir: SortDir) {
+        self.set_sort_with_search(by, dir, None);
+    }
+
+    pub fn set_sort_with_search(
+        &mut self,
+        by: SortBy,
+        dir: SortDir,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
         self.sort_by = by;
         self.sort_dir = dir;
-        self.apply_view_preserving_cursor();
+        self.reapply_after_browse_preference_change(tx);
+    }
+
+    /// Re-sort when probe-backed fields arrive. No-op for path-only sort keys,
+    /// so late probe completions cannot perturb ordinary name/date/type/size order.
+    pub fn resort_after_probe_cache_update(&mut self) {
+        self.resort_after_probe_cache_update_with_search(None);
+    }
+
+    pub fn resort_after_probe_cache_update_with_search(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
+        if self.active_search_depends_on_tag_or_probe_metadata() || self.sort_by.uses_probe_cache() {
+            self.reapply_after_browse_preference_change(tx);
+        }
+    }
+
+    fn active_search_depends_on_tag_or_probe_metadata(&self) -> bool {
+        self.search.active
+            && (matches!(self.search.mode, SearchMode::Tags | SearchMode::Both)
+                || self.search.sort.is_tag_sort())
     }
 
     /// Cycle to the next format filter and re-apply, preserving cursor if possible
     pub fn cycle_format_filter(&mut self) {
+        self.cycle_format_filter_with_search(None);
+    }
+
+    pub fn cycle_format_filter_with_search(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
         self.format_filter = self.format_filter.next();
-        self.apply_view_preserving_cursor();
+        self.reapply_after_browse_preference_change(tx);
     }
 
     /// Set format filter explicitly, preserving cursor
     pub fn set_format_filter(&mut self, filter: FormatFilter) {
+        self.set_format_filter_with_search(filter, None);
+    }
+
+    pub fn set_format_filter_with_search(
+        &mut self,
+        filter: FormatFilter,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
         self.format_filter = filter;
-        self.apply_view_preserving_cursor();
+        self.reapply_after_browse_preference_change(tx);
     }
 
     /// After a refresh, try to reposition the cursor on the entry with the given path.
@@ -1527,9 +2407,14 @@ impl BrowseState {
     pub fn enter_selected(&mut self) -> bool {
         if let Some(entry) = self.entries.get(self.selected_index) {
             if entry.is_dir() {
-                self.current_dir = entry.path.clone();
+                let path = entry.path.clone();
+                self.invalidate_path_validation();
+                self.push_nav_history(path.clone());
+                self.current_dir = path;
                 self.selected_index = 0;
                 self.reset_nav_state();
+                self.reset_sort_to_default();
+                self.sync_tree_to_current_dir();
                 self.refresh();
                 return true;
             }
@@ -1546,8 +2431,13 @@ impl BrowseState {
                 .current_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string());
-            self.current_dir = parent.to_path_buf();
+            let parent = parent.to_path_buf();
+            self.invalidate_path_validation();
+            self.push_nav_history(parent.clone());
+            self.current_dir = parent;
             self.reset_nav_state();
+            self.reset_sort_to_default();
+            self.sync_tree_to_current_dir();
             self.refresh();
             return true;
         }
@@ -1557,9 +2447,13 @@ impl BrowseState {
     /// Navigate directly to a given path
     pub fn navigate_to(&mut self, path: PathBuf) {
         if path.is_dir() {
+            self.invalidate_path_validation();
+            self.push_nav_history(path.clone());
             self.current_dir = path;
             self.selected_index = 0;
             self.reset_nav_state();
+            self.reset_sort_to_default();
+            self.sync_tree_to_current_dir();
             self.refresh();
         }
     }
@@ -1593,9 +2487,10 @@ impl BrowseState {
 
         // If we have a tx, do the blocking canonicalize + is_dir check
         // asynchronously. Otherwise fall back to synchronous.
-        if let Some(tx) = &self.scan_tx {
-            let tx = tx.clone();
+        if let Some(tx) = self.scan_tx.clone() {
             let input_str = input.to_string();
+            let origin_dir = self.current_dir.clone();
+            let generation = self.next_path_validation_generation();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let final_path = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
@@ -1609,7 +2504,9 @@ impl BrowseState {
                 .unwrap_or_else(|e| Err(format!("path check failed: {}", e)));
 
                 let _ = tx
-                    .send(super::message::AppMessage::PathValidationComplete {
+                    .send(crate::tui::message::AppMessage::PathValidationComplete {
+                        generation,
+                        origin_dir,
                         input: input_str,
                         result,
                     })
@@ -1622,9 +2519,13 @@ impl BrowseState {
             if !final_path.is_dir() {
                 return Err(format!("not a directory: {}", final_path.display()));
             }
+            self.invalidate_path_validation();
+            self.push_nav_history(final_path.clone());
             self.current_dir = final_path;
             self.selected_index = 0;
             self.reset_nav_state();
+            self.reset_sort_to_default();
+            self.sync_tree_to_current_dir();
             self.refresh();
             Ok(())
         }
@@ -1672,7 +2573,7 @@ impl BrowseState {
         self.archive_inner_path_for_path(&entry.path)
     }
 
-    pub fn archive_entry_for_path(&self, path: &Path) -> Option<&super::archive_listing::ArchiveEntry> {
+    pub fn archive_entry_for_path(&self, path: &Path) -> Option<&crate::tui::archive_listing::ArchiveEntry> {
         let inner = self.archive_inner_path_for_path(path)?;
         self.archive
             .as_ref()?
@@ -1905,9 +2806,172 @@ impl BrowseState {
     }
 
     pub fn toggle_hidden(&mut self) {
+        self.toggle_hidden_with_search(None);
+    }
+
+    /// Toggle hidden-file visibility while preserving the active search
+    /// contract. If the search panel is active, changing visibility is a
+    /// search-identity change, not an ordinary directory-filter change: cancel
+    /// any recursive worker and re-run the current query with the new setting.
+    pub fn toggle_hidden_with_search(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
         self.show_hidden = !self.show_hidden;
-        // Hidden files were captured by scan(); just re-apply the view layer.
-        self.apply_view_preserving_cursor();
+        self.rebuild_tree_preserving_expansion();
+
+        if self.search.active {
+            self.restart_active_search_after_preference_change(tx);
+        } else {
+            // Hidden files were captured by scan(); just re-apply the view layer.
+            self.apply_view_preserving_cursor();
+        }
+    }
+
+    /// Re-run the active search after a visibility/filter identity change.
+    /// This intentionally bypasses `apply_view_preserving_cursor()`: while the
+    /// search panel is active, `entries` must remain a search result set, not
+    /// the ordinary directory listing.
+    fn restart_active_search_after_preference_change(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
+        if self.archive.is_some() {
+            if self.archive_search_requires_async(self.search.mode, self.search.sort) && tx.is_none() {
+                if let Some(ref flag) = self.search.cancel {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.search.cancel = None;
+                self.search.searching = false;
+                self.search.generation = self.search.generation.wrapping_add(1);
+                self.search.last_keystroke = Some(std::time::Instant::now());
+            } else {
+                self.execute_search(tx);
+            }
+            return;
+        }
+
+        if !self.search.recursive {
+            self.execute_search(tx);
+            return;
+        }
+
+        if let Some(tx) = tx {
+            self.execute_search(Some(tx));
+        } else {
+            if let Some(ref flag) = self.search.cancel {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.search.cancel = None;
+            self.search.searching = false;
+            self.search.generation = self.search.generation.wrapping_add(1);
+            self.search.last_keystroke = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Re-apply the visible Browse entries after a view preference changes.
+    /// The key invariant is that an open search panel owns `entries`: while
+    /// search is active, preferences such as Show Hidden, Filter, Default sort,
+    /// and Restore defaults must re-run the active search (or schedule its
+    /// debounce) instead of repopulating the ordinary directory listing under
+    /// an apparently active search UI.
+    pub fn reapply_after_browse_preference_change(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
+        if self.search.active {
+            self.restart_active_search_after_preference_change(tx);
+        } else {
+            self.apply_view_preserving_cursor();
+        }
+    }
+
+    /// Apply freshly scanned directory contents to the visible Browse list.
+    ///
+    /// Search is an ownership boundary for `entries`: while the search panel is
+    /// open, a directory scan completion must re-run the active search against
+    /// the refreshed raw scan data rather than publishing the ordinary Browse
+    /// listing under an apparently active search UI.
+    pub fn reapply_after_directory_scan_complete(
+        &mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
+        if self.search.active {
+            self.restart_active_search_after_preference_change(tx);
+        } else {
+            self.apply_view();
+        }
+    }
+
+    /// Invalidate an in-flight recursive search before a refresh rescan. The
+    /// replacement is launched after the scan publishes fresh raw entries.
+    fn invalidate_recursive_search_for_refresh(&mut self) {
+        if !(self.search.active && self.search.recursive) {
+            return;
+        }
+        if let Some(ref flag) = self.search.cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.search.cancel = None;
+        self.search.searching = false;
+        self.search.last_keystroke = None;
+        self.search.generation = self.search.generation.wrapping_add(1);
+    }
+
+    /// Close search without applying the ordinary listing. Directory/archive
+    /// navigation calls this before it refreshes the destination, so applying
+    /// the old directory's raw entries here would briefly create an incoherent
+    /// state.
+    fn close_search_for_navigation(&mut self) {
+        if let Some(ref flag) = self.search.cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.search.active = false;
+        self.search.input = TextInputState::new(String::new());
+        self.search.focus = SearchFocus::Input;
+        self.search.last_keystroke = None;
+        self.search.searching = false;
+        self.clear_search_tag_cache();
+        self.search.cancel = None;
+        self.search.generation = self.search.generation.wrapping_add(1);
+    }
+
+    fn clear_archive_tag_cache_for_archive(&mut self, archive_path: &Path) {
+        self.search
+            .archive_tag_cache
+            .retain(|synthetic_path, _| !synthetic_path.starts_with(archive_path));
+    }
+
+    fn rebuild_tree_preserving_expansion(&mut self) {
+        let expanded_paths = self
+            .tree_nodes
+            .iter()
+            .filter(|node| node.expanded)
+            .map(|node| node.path.clone())
+            .collect::<Vec<_>>();
+        let cursor_path = self.tree_nodes.get(self.tree_cursor).map(|node| node.path.clone());
+        let root = self
+            .tree_nodes
+            .first()
+            .map(|node| node.path.clone())
+            .filter(|root| self.current_dir.starts_with(root))
+            .unwrap_or_else(|| self.current_dir.clone());
+
+        self.tree_nodes = initial_browse_tree_nodes(&root, self.show_hidden);
+        for path in expanded_paths {
+            browse_tree_expand_path(&mut self.tree_nodes, &path, self.show_hidden);
+        }
+        self.sync_tree_to_current_dir();
+        if let Some(cursor_path) = cursor_path {
+            if let Some(index) = self
+                .tree_nodes
+                .iter()
+                .position(|node| same_path(&node.path, &cursor_path))
+            {
+                self.tree_cursor = index;
+                self.ensure_tree_visible();
+            }
+        }
     }
 
     // ── Text filter (live, case-insensitive substring on entry name) ─
@@ -1943,8 +3007,34 @@ impl BrowseState {
         }
     }
 
+    /// Invalidate any in-flight async path validation.
+    fn invalidate_path_validation(&mut self) {
+        self.path_validation_generation = self.path_validation_generation.wrapping_add(1);
+    }
+
+    /// Allocate the next async path-validation generation.
+    fn next_path_validation_generation(&mut self) -> u64 {
+        self.invalidate_path_validation();
+        self.path_validation_generation
+    }
+
+    /// Return true only for the newest async path validation launched from the
+    /// still-current directory. This protects the reducer from late workers
+    /// after the user enters another path, navigates elsewhere, or reopens the
+    /// path editor for a new edit.
+    pub fn is_current_path_validation(&self, generation: u64, origin_dir: &Path) -> bool {
+        self.path_input.is_none()
+            && generation == self.path_validation_generation
+            && same_path(&self.current_dir, origin_dir)
+    }
+
     /// Open the path bar input, seeded with the current directory.
     pub fn open_path_input(&mut self) {
+        // A newly opened path editor supersedes any submitted async path
+        // validation. Late completions must not navigate while the user is
+        // actively composing a different path.
+        self.invalidate_path_validation();
+
         let display = {
             let path_str = self.current_dir.display().to_string();
             let home = std::env::var("HOME").unwrap_or_default();
@@ -1987,8 +3077,16 @@ impl BrowseState {
         self.filter_text_prior = None;
     }
 
-    /// Open the search panel. Clears any active old-style filter.
+    /// Open the search panel, or focus its input if already open.
+    ///
+    /// Reopening search must not blank the current query while leaving old
+    /// result rows visible. Treat repeated toolbar/Search-key activation as a
+    /// focus action; explicit close/toggle paths continue to call close_search().
     pub fn open_search(&mut self) {
+        if self.search.active {
+            self.search.focus = SearchFocus::Input;
+            return;
+        }
         self.search.active = true;
         self.search.focus = SearchFocus::Input;
         self.search.input = TextInputState::new(String::new());
@@ -2008,8 +3106,9 @@ impl BrowseState {
         self.search.input = TextInputState::new(String::new());
         self.search.last_keystroke = None;
         self.search.searching = false;
-        self.search.tag_cache.clear();
+        self.clear_search_tag_cache();
         self.search.cancel = None;
+        self.search.generation = self.search.generation.wrapping_add(1);
         // Restore normal listing.
         self.apply_view_preserving_cursor();
     }
@@ -2018,34 +3117,424 @@ impl BrowseState {
     /// Recursive spawns an async task and sends results via tx.
     pub fn execute_search(
         &mut self,
-        tx: Option<&tokio::sync::mpsc::Sender<super::message::AppMessage>>,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
     ) {
+        if let Some(ref flag) = self.search.cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.search.cancel = None;
+        self.search.searching = false;
+        self.search.generation = self.search.generation.wrapping_add(1);
+
         let query = self.search.input.text.trim().to_ascii_lowercase();
         if query.is_empty() {
             self.apply_view_preserving_cursor();
             return;
         }
 
+        let generation = self.search.generation;
         let show_hidden = self.show_hidden;
         let audio_only = self.search.audio_only;
+        let format_filter = self.format_filter;
         let mode = self.search.mode;
+        let sort = self.search.sort;
+        let sort_dir = self.search.sort_dir;
+        let result_cap = self.search_result_cap.max(1);
 
-        if self.search.recursive {
+        if self.archive.is_some() {
+            if self.archive_search_requires_async(mode, sort) {
+                if let Some(tx) = tx {
+                    self.spawn_archive_search_async(
+                        generation,
+                        &query,
+                        show_hidden,
+                        audio_only,
+                        format_filter,
+                        mode,
+                        sort,
+                        sort_dir,
+                        result_cap,
+                        self.search.recursive,
+                        tx.clone(),
+                    );
+                } else {
+                    // Unit-test and synchronous fallback path only. The normal
+                    // interactive app has a tx and must use the async worker so
+                    // archive tag extraction cannot freeze the TUI.
+                    self.execute_search_archive(&query, show_hidden, audio_only, format_filter, mode, self.search.recursive);
+                }
+            } else {
+                self.execute_search_archive(&query, show_hidden, audio_only, format_filter, mode, self.search.recursive);
+            }
+        } else if self.search.recursive {
             if let Some(tx) = tx {
-                self.spawn_search_async(&query, show_hidden, audio_only, mode, tx.clone());
+                self.spawn_search_async(
+                    generation,
+                    &query,
+                    show_hidden,
+                    audio_only,
+                    format_filter,
+                    mode,
+                    sort,
+                    sort_dir,
+                    result_cap,
+                    tx.clone(),
+                );
             }
         } else {
-            self.execute_search_local(&query, show_hidden, audio_only, mode);
+            self.execute_search_local(&query, show_hidden, audio_only, format_filter, mode);
         }
     }
 
-    /// Non-recursive search: filter current directory's entries.
+    /// Non-recursive search: filter the current raw model.
     fn execute_search_local(
         &mut self,
         query: &str,
         show_hidden: bool,
         audio_only: bool,
+        format_filter: FormatFilter,
         mode: SearchMode,
+    ) {
+        let mut sources = Vec::with_capacity(self.all_dirs.len() + self.all_files.len());
+        sources.extend(self.all_dirs.iter().cloned());
+        sources.extend(self.all_files.iter().cloned());
+        self.execute_search_over_entries(query, show_hidden, audio_only, format_filter, mode, sources);
+    }
+
+    /// Archive search never falls back to the parent filesystem directory.
+    /// Non-recursive search uses the current archive directory's raw model;
+    /// recursive search builds an archive-local descendant model from the
+    /// listing or active staging tree and searches that synchronously.
+    fn execute_search_archive(
+        &mut self,
+        query: &str,
+        show_hidden: bool,
+        audio_only: bool,
+        format_filter: FormatFilter,
+        mode: SearchMode,
+        recursive: bool,
+    ) {
+        let sources = if recursive {
+            self.archive_recursive_search_entries()
+        } else {
+            let mut entries = Vec::with_capacity(self.all_dirs.len() + self.all_files.len());
+            entries.extend(self.all_dirs.iter().cloned());
+            entries.extend(self.all_files.iter().cloned());
+            entries
+        };
+        self.search.searching = false;
+        self.search.cancel = None;
+        self.execute_search_over_entries(query, show_hidden, audio_only, format_filter, mode, sources);
+    }
+
+    fn archive_search_requires_async(&self, mode: SearchMode, sort: SearchSort) -> bool {
+        self.archive.is_some() && (matches!(mode, SearchMode::Tags | SearchMode::Both) || sort.is_tag_sort())
+    }
+
+    fn archive_search_candidates(&self, recursive: bool) -> Vec<ArchiveSearchCandidate> {
+        let sources = if recursive {
+            self.archive_recursive_search_entries()
+        } else {
+            let mut entries = Vec::with_capacity(self.all_dirs.len() + self.all_files.len());
+            entries.extend(self.all_dirs.iter().cloned());
+            entries.extend(self.all_files.iter().cloned());
+            entries
+        };
+
+        sources
+            .into_iter()
+            .map(|entry| {
+                let inner_path = self.archive_inner_path_for_entry(&entry);
+                let staged_path = self.archive_staged_path_for_entry(&entry);
+                let fallback_metadata = self
+                    .probe_cache
+                    .get(&entry.path)
+                    .and_then(|cached| cached.as_ref())
+                    .map(|cached| cached.metadata.clone());
+                ArchiveSearchCandidate {
+                    entry,
+                    inner_path,
+                    staged_path,
+                    fallback_metadata,
+                }
+            })
+            .collect()
+    }
+
+    /// Spawn archive-local search when tag matching or tag sorting may require
+    /// reading member metadata. This keeps extraction-backed tag reads off the
+    /// TUI thread and gives the reducer the same generation/identity guard used
+    /// by filesystem recursive search.
+    fn spawn_archive_search_async(
+        &mut self,
+        generation: u64,
+        query: &str,
+        show_hidden: bool,
+        audio_only: bool,
+        format_filter: FormatFilter,
+        mode: SearchMode,
+        sort: SearchSort,
+        sort_dir: SortDir,
+        result_cap: usize,
+        recursive: bool,
+        tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        let Some(arc) = self.archive.as_ref() else { return; };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.search.cancel = Some(cancel.clone());
+        self.search.searching = true;
+
+        let root = self.current_dir.clone();
+        let archive_path = arc.listing.archive_path.clone();
+        let archive_inner_path = arc.inner_path.clone();
+        let password = arc.password.clone();
+        let archive_fingerprint = TagCacheFingerprint::for_path(&archive_path);
+        let cached_archive_tags = self.search.archive_tag_cache.clone();
+        let candidates = self.archive_search_candidates(recursive);
+        let query = query.to_string();
+
+        tokio::spawn(async move {
+            let query_for_worker = query.clone();
+            let archive_path_for_worker = archive_path.clone();
+            let password_for_worker = password.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                run_archive_search_worker(
+                    archive_path_for_worker,
+                    password_for_worker,
+                    archive_fingerprint,
+                    cached_archive_tags,
+                    candidates,
+                    query_for_worker,
+                    show_hidden,
+                    audio_only,
+                    format_filter,
+                    mode,
+                    sort,
+                    sort_dir,
+                    result_cap,
+                    cancel,
+                )
+            })
+            .await
+            .unwrap_or(None);
+
+            if let Some(output) = result {
+                let _ = tx
+                    .send(crate::tui::message::AppMessage::SearchComplete {
+                        generation,
+                        root,
+                        recursive,
+                        archive_path: Some(archive_path),
+                        archive_inner_path: Some(archive_inner_path),
+                        query,
+                        mode,
+                        show_hidden,
+                        audio_only,
+                        format_filter,
+                        sort,
+                        sort_dir,
+                        result_cap,
+                        total_matches: output.total_matches,
+                        pre_sorted: true,
+                        archive_tag_cache_updates: output.archive_tag_cache_updates,
+                        results: output.results,
+                    })
+                    .await;
+            }
+        });
+    }
+
+    fn archive_staged_path_for_entry(&self, entry: &BrowseEntry) -> Option<PathBuf> {
+        let inner = self.archive_inner_path_for_entry(entry)?;
+        let staging = self.active_archive_staging()?;
+        let staged = staging_path_for_archive_inner(&staging.staging_dir, &inner).ok()?;
+        staged.is_file().then_some(staged)
+    }
+
+    fn tag_source_for_entry(&self, entry: &BrowseEntry) -> TagSearchSource {
+        if let Some(arc) = self.archive.as_ref() {
+            let fallback_metadata = self
+                .probe_cache
+                .get(&entry.path)
+                .and_then(|cached| cached.as_ref())
+                .map(|cached| cached.metadata.clone());
+
+            if let Some(staged_path) = self.archive_staged_path_for_entry(entry) {
+                return TagSearchSource::StagedArchiveEntry {
+                    staged_path,
+                    fallback_metadata,
+                };
+            }
+
+            if let Some(metadata) = fallback_metadata {
+                return TagSearchSource::Metadata(metadata);
+            }
+
+            if entry.is_audio() {
+                if let Some(inner_path) = self.archive_inner_path_for_entry(entry) {
+                    return TagSearchSource::ExtractArchiveEntry {
+                        archive_path: arc.listing.archive_path.clone(),
+                        inner_path,
+                        password: arc.password.clone(),
+                        synthetic_path: entry.path.clone(),
+                    };
+                }
+            }
+
+            return TagSearchSource::Missing;
+        }
+
+        TagSearchSource::Filesystem(entry.path.clone())
+    }
+
+    fn tag_search_string_for_entry(&mut self, entry: &BrowseEntry) -> String {
+        match self.tag_source_for_entry(entry) {
+            TagSearchSource::Filesystem(path) => {
+                build_tag_search_string_cached(&path, &mut self.search.tag_cache)
+            }
+            TagSearchSource::StagedArchiveEntry {
+                staged_path,
+                fallback_metadata,
+            } => {
+                let from_staged = build_tag_search_string_cached(&staged_path, &mut self.search.tag_cache);
+                if !from_staged.is_empty() {
+                    from_staged
+                } else {
+                    fallback_metadata
+                        .as_ref()
+                        .map(tag_search_string_from_metadata)
+                        .unwrap_or_default()
+                }
+            }
+            TagSearchSource::Metadata(metadata) => tag_search_string_from_metadata(&metadata),
+            TagSearchSource::ExtractArchiveEntry {
+                archive_path,
+                inner_path,
+                password,
+                synthetic_path,
+            } => self
+                .archive_tag_read_result_cached(&archive_path, &inner_path, password.as_deref(), &synthetic_path)
+                .tag_string,
+            TagSearchSource::Missing => String::new(),
+        }
+    }
+
+    fn tag_sort_key_for_entry(&mut self, entry: &BrowseEntry, sort: SearchSort) -> String {
+        match self.tag_source_for_entry(entry) {
+            TagSearchSource::Filesystem(path) => extract_tag_sort_key(&path, sort),
+            TagSearchSource::StagedArchiveEntry {
+                staged_path,
+                fallback_metadata,
+            } => {
+                let from_staged = extract_tag_sort_key(&staged_path, sort);
+                if !from_staged.is_empty() {
+                    from_staged
+                } else {
+                    fallback_metadata
+                        .as_ref()
+                        .map(|metadata| tag_sort_key_from_metadata(metadata, sort))
+                        .unwrap_or_default()
+                }
+            }
+            TagSearchSource::Metadata(metadata) => tag_sort_key_from_metadata(&metadata, sort),
+            TagSearchSource::ExtractArchiveEntry {
+                archive_path,
+                inner_path,
+                password,
+                synthetic_path,
+            } => {
+                let tags = self.archive_tag_read_result_cached(
+                    &archive_path,
+                    &inner_path,
+                    password.as_deref(),
+                    &synthetic_path,
+                );
+                tag_sort_key_from_read_result(&tags, sort)
+            }
+            TagSearchSource::Missing => String::new(),
+        }
+    }
+
+    fn archive_tag_read_result_cached(
+        &mut self,
+        archive_path: &Path,
+        inner_path: &str,
+        password: Option<&str>,
+        synthetic_path: &Path,
+    ) -> TagReadResult {
+        let fingerprint = match TagCacheFingerprint::for_path(archive_path) {
+            Some(fingerprint) => fingerprint,
+            None => {
+                self.search.archive_tag_cache.remove(synthetic_path);
+                return TagReadResult::empty();
+            }
+        };
+
+        let password_identity = ArchiveTagPasswordIdentity::for_password(password);
+        if let Some(cached) = self.search.archive_tag_cache.get(synthetic_path) {
+            if cached.archive_fingerprint == fingerprint
+                && cached.password_identity == password_identity
+                && cached.tags.has_tag_data()
+            {
+                return cached.tags.clone();
+            }
+        }
+
+        let tags = read_tags_from_archive_entry(archive_path, inner_path, password);
+        if tags.has_tag_data() {
+            self.search.archive_tag_cache.insert(
+                synthetic_path.to_path_buf(),
+                CachedArchiveTagSearchString {
+                    archive_fingerprint: fingerprint,
+                    password_identity,
+                    tags: tags.clone(),
+                },
+            );
+        } else {
+            self.search.archive_tag_cache.remove(synthetic_path);
+        }
+        tags
+    }
+
+    fn sort_search_results_for_current_context(&mut self, scored: &mut Vec<(BrowseEntry, i64)>) {
+        let sort = self.search.sort;
+        let dir = self.search.sort_dir;
+
+        if !sort.is_tag_sort() {
+            sort_search_results(scored, sort, dir);
+            return;
+        }
+
+        let entries: Vec<BrowseEntry> = scored.iter().map(|(entry, _)| entry.clone()).collect();
+        let mut keyed: Vec<(bool, String, String, usize)> = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let key = self.tag_sort_key_for_entry(entry, sort);
+                (key.is_empty(), key, entry.name_lower.clone(), idx)
+            })
+            .collect();
+
+        keyed.sort_by(|a, b| {
+            let ord = a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2));
+            match dir {
+                SortDir::Asc => ord,
+                SortDir::Desc => ord.reverse(),
+            }
+        });
+
+        let sorted: Vec<_> = keyed.iter().map(|(_, _, _, idx)| scored[*idx].clone()).collect();
+        *scored = sorted;
+    }
+
+    fn execute_search_over_entries(
+        &mut self,
+        query: &str,
+        show_hidden: bool,
+        audio_only: bool,
+        format_filter: FormatFilter,
+        mode: SearchMode,
+        sources: Vec<BrowseEntry>,
     ) {
         use fuzzy_matcher::skim::SkimMatcherV2;
         use fuzzy_matcher::FuzzyMatcher;
@@ -2056,42 +3545,40 @@ impl BrowseState {
         let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
         let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
 
-        for entries_list in [&self.all_dirs, &self.all_files] {
-            for e in entries_list {
-                if !show_hidden && e.name.starts_with('.') {
-                    continue;
-                }
-                if audio_only && !is_audio_filter_visible_entry(e) {
-                    continue;
-                }
+        for e in &sources {
+            if !show_hidden && browse_entry_name_is_hidden(&e.name) {
+                continue;
+            }
+            if !entry_passes_search_effective_filters(e, show_hidden, audio_only, &format_filter) {
+                continue;
+            }
 
-                let mut best_score: Option<i64> = None;
+            let mut best_score: Option<i64> = None;
 
-                // Directories always match on filename (for navigation),
-                // even in tags-only mode.
-                if search_filename || matches!(e.kind, EntryKind::Directory) {
-                    if let Some(s) = matcher.fuzzy_match(&e.name_lower, query) {
+            // Directories always match on filename (for navigation), even in
+            // tags-only mode.
+            if search_filename || matches!(&e.kind, EntryKind::Directory) {
+                if let Some(s) = matcher.fuzzy_match(&e.name_lower, query) {
+                    best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+                }
+            }
+
+            if search_tags && matches!(&e.kind, EntryKind::AudioFile(_)) {
+                let tag_str = self.tag_search_string_for_entry(e);
+                if !tag_str.is_empty() {
+                    if let Some(s) = matcher.fuzzy_match(&tag_str, query) {
                         best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                     }
                 }
+            }
 
-                if search_tags && matches!(e.kind, EntryKind::AudioFile(_)) {
-                    let tag_str =
-                        build_tag_search_string_cached(&e.path, &mut self.search.tag_cache);
-                    if !tag_str.is_empty() {
-                        if let Some(s) = matcher.fuzzy_match(&tag_str, query) {
-                            best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
-                        }
-                    }
-                }
-
-                if let Some(score) = best_score {
-                    scored.push((e.clone(), score));
-                }
+            if let Some(score) = best_score {
+                scored.push((e.clone(), score));
             }
         }
 
-        sort_search_results(&mut scored, self.search.sort, self.search.sort_dir);
+        self.sort_search_results_for_current_context(&mut scored);
+        scored.truncate(self.search_result_cap.max(1));
 
         let mut results: Vec<BrowseEntry> = Vec::new();
         if let Some(p) = parent {
@@ -2104,26 +3591,104 @@ impl BrowseState {
         self.scroll_offset = 0;
     }
 
+    fn archive_recursive_search_entries(&self) -> Vec<BrowseEntry> {
+        let arc = match &self.archive {
+            Some(arc) => arc,
+            None => return Vec::new(),
+        };
+        let prefix = if arc.inner_path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", arc.inner_path)
+        };
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        if let Some(staging) = arc.staging.as_ref() {
+            let root = staging.staging_dir.join(&arc.inner_path);
+            for entry in walkdir::WalkDir::new(&root).min_depth(1).into_iter().filter_map(Result::ok) {
+                let path = entry.path().to_path_buf();
+                let Ok(meta) = entry.metadata() else { continue };
+                let is_dir = meta.is_dir();
+                let Ok(relative_to_staging) = path.strip_prefix(&staging.staging_dir) else { continue };
+                let Some(inner) = normalize_archive_relative_path(relative_to_staging) else { continue };
+                if inner.is_empty() {
+                    continue;
+                }
+                let display_name = inner
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&inner)
+                    .to_string();
+                let kind = if is_dir { EntryKind::Directory } else { classify_file(&path) };
+                let entry = BrowseEntry::new(
+                    arc.listing.archive_path.join(&inner),
+                    display_name,
+                    kind,
+                    if is_dir { 0 } else { meta.len() },
+                    meta.modified().ok(),
+                );
+                if is_dir { dirs.push(entry); } else { files.push(entry); }
+            }
+        } else {
+            for item in &arc.listing.entries {
+                if !prefix.is_empty() && !item.path.starts_with(&prefix) {
+                    continue;
+                }
+                if item.path == arc.inner_path {
+                    continue;
+                }
+                let display_name = item
+                    .path
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&item.path)
+                    .to_string();
+                if display_name.is_empty() {
+                    continue;
+                }
+                let kind = if item.is_dir {
+                    EntryKind::Directory
+                } else {
+                    classify_file(Path::new(&item.path))
+                };
+                let entry = BrowseEntry::new(
+                    arc.listing.archive_path.join(&item.path),
+                    display_name,
+                    kind,
+                    item.size,
+                    None,
+                );
+                if item.is_dir { dirs.push(entry); } else { files.push(entry); }
+            }
+        }
+
+        sort_entries(&mut dirs, self.sort_by, self.sort_dir, &self.probe_cache);
+        sort_entries(&mut files, self.sort_by, self.sort_dir, &self.probe_cache);
+        dirs.extend(files);
+        dirs
+    }
+
     /// Spawn an async recursive search task. Results arrive via SearchComplete.
     fn spawn_search_async(
         &mut self,
+        generation: u64,
         query: &str,
         show_hidden: bool,
         audio_only: bool,
+        format_filter: FormatFilter,
         mode: SearchMode,
-        tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+        sort: SearchSort,
+        sort_dir: SortDir,
+        result_cap: usize,
+        tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
     ) {
-        // Cancel any previous search task.
-        if let Some(ref flag) = self.search.cancel {
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.search.cancel = Some(cancel.clone());
         self.search.searching = true;
 
         let root = self.current_dir.clone();
         let query = query.to_string();
+        let root_for_worker = root.clone();
+        let query_for_worker = query.clone();
         let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
         let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
 
@@ -2140,7 +3705,7 @@ impl BrowseState {
                     // Open own DB connection for tag cache.
                     let db = crate::db::Database::open().ok();
 
-                    for entry in WalkDir::new(&root)
+                    for entry in WalkDir::new(&root_for_worker)
                         .min_depth(1)
                         .follow_links(false)
                         .into_iter()
@@ -2179,30 +3744,28 @@ impl BrowseState {
 
                         let path = entry.path().to_path_buf();
                         let kind = classify_file(&path);
-
-                        if audio_only
-                            && !matches!(kind, EntryKind::AudioFile(_))
-                            && !is_cue_sheet_path(&path)
-                        {
-                            continue;
-                        }
-
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
                         let rel = path
-                            .strip_prefix(&root)
+                            .strip_prefix(&root_for_worker)
                             .unwrap_or(&path)
                             .to_string_lossy()
                             .to_string();
-                        let rel_lower = rel.to_lowercase();
+                        let candidate = BrowseEntry::new(path.clone(), rel, kind, size, modified);
+
+                        if !entry_passes_search_effective_filters(&candidate, show_hidden, audio_only, &format_filter) {
+                            continue;
+                        }
 
                         let mut best_score: Option<i64> = None;
 
                         if search_filename {
-                            if let Some(s) = matcher.fuzzy_match(&rel_lower, &query) {
+                            if let Some(s) = matcher.fuzzy_match(&candidate.name_lower, &query_for_worker) {
                                 best_score = Some(s);
                             }
                         }
 
-                        if search_tags && matches!(kind, EntryKind::AudioFile(_)) {
+                        if search_tags && matches!(&candidate.kind, EntryKind::AudioFile(_)) {
                             // Try DB cache first, then lofty.
                             let tag_str = if let Some(ref db) = db {
                                 let path_str = path.display().to_string();
@@ -2238,7 +3801,7 @@ impl BrowseState {
                             };
 
                             if !tag_str.is_empty() {
-                                if let Some(s) = matcher.fuzzy_match(&tag_str, &query) {
+                                if let Some(s) = matcher.fuzzy_match(&tag_str, &query_for_worker) {
                                     best_score =
                                         Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                                 }
@@ -2246,13 +3809,7 @@ impl BrowseState {
                         }
 
                         if let Some(score) = best_score {
-                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
-                            scored.push((BrowseEntry::new(path, rel, kind, size, modified), score));
-
-                            if scored.len() >= 500 {
-                                break;
-                            }
+                            scored.push((candidate, score));
                         }
                     }
 
@@ -2261,10 +3818,30 @@ impl BrowseState {
                 .await
                 .unwrap_or(None);
 
-            // Only send results if not cancelled.
+            // Only send results if not cancelled. The reducer still validates
+            // the complete launch identity before mutating Browse state.
             if let Some(results) = results {
+                let total_matches = results.len();
                 let _ = tx
-                    .send(super::message::AppMessage::SearchComplete { results })
+                    .send(crate::tui::message::AppMessage::SearchComplete {
+                        generation,
+                        root,
+                        recursive: true,
+                        archive_path: None,
+                        archive_inner_path: None,
+                        query,
+                        mode,
+                        show_hidden,
+                        audio_only,
+                        format_filter,
+                        sort,
+                        sort_dir,
+                        result_cap,
+                        total_matches,
+                        pre_sorted: false,
+                        archive_tag_cache_updates: Vec::new(),
+                        results,
+                    })
                     .await;
             }
         });
@@ -2274,9 +3851,120 @@ impl BrowseState {
     /// methods. The anchor is for range-select (Alt+click) and is a
     /// per-directory context.
     fn reset_nav_state(&mut self) {
+        self.close_search_for_navigation();
         self.reset_filter_state();
         self.multi_select_anchor = None;
         self.clear_type_ahead();
+        self.clear_pending_inline_rename_after_scan();
+        self.clear_search_tag_cache();
+    }
+
+    /// Clear all tag-search text cached by the active Browse search panel.
+    pub fn clear_search_tag_cache(&mut self) {
+        self.search.tag_cache.clear();
+        self.search.archive_tag_cache.clear();
+    }
+
+    /// Invalidate local tag-search cache entries that may correspond to a file
+    /// whose metadata changed. For normal filesystem browsing this removes the
+    /// file path directly. For active archive metadata editing, the completed
+    /// write path is usually inside the private staging directory while Browse
+    /// rows use a synthetic `archive_path/inner/path` key; remove both.
+    pub fn invalidate_search_tag_cache_for_metadata_path(&mut self, path: &Path) {
+        self.search.tag_cache.remove(path);
+
+        if let Ok(canonical) = path.canonicalize() {
+            if canonical != path {
+                self.search.tag_cache.remove(&canonical);
+            }
+        }
+
+        self.search.archive_tag_cache.remove(path);
+
+        if let Some(staging) = self.active_archive_staging().cloned() {
+            if let Ok(relative) = path.strip_prefix(&staging.staging_dir) {
+                let synthetic = staging.archive_path.join(relative);
+                self.search.tag_cache.remove(&synthetic);
+                self.search.archive_tag_cache.remove(&synthetic);
+            }
+        }
+    }
+
+    /// Schedule a sequential inline rename to resume after the async scan for
+    /// `directory` repopulates `entries`. The target path is captured before the
+    /// current rename is committed so sorting/filtering changes cannot make the
+    /// continuation depend on stale indices.
+    pub fn schedule_inline_rename_after_scan(
+        &mut self,
+        scan_generation: u64,
+        directory: PathBuf,
+        target_path: PathBuf,
+    ) {
+        self.pending_inline_rename_after_scan = Some(PendingBrowseInlineRenameAfterScan {
+            scan_generation,
+            directory,
+            target_path,
+        });
+    }
+
+    pub fn pending_scan_generation(&self) -> Option<u64> {
+        self.scan_pending.as_ref().map(ScanHandle::generation)
+    }
+
+    /// Accept only the currently pending scan for the still-current directory.
+    pub fn is_current_dir_scan(&self, generation: u64, scan_path: &Path) -> bool {
+        self.scan_pending
+            .as_ref()
+            .is_some_and(|handle| handle.generation() == generation)
+            && same_path(&self.current_dir, scan_path)
+    }
+
+    /// Mark a matching scan generation as terminal. Returns true only when the
+    /// completion belonged to the current pending scan.
+    pub fn finish_dir_scan_if_current(&mut self, generation: u64, scan_path: &Path) -> bool {
+        if !self.is_current_dir_scan(generation, scan_path) {
+            return false;
+        }
+        self.scan_pending = None;
+        true
+    }
+
+    /// Clear any deferred sequential inline rename. Used when navigation or
+    /// other user actions supersede the directory refresh that created it.
+    pub fn clear_pending_inline_rename_after_scan(&mut self) {
+        self.pending_inline_rename_after_scan = None;
+    }
+
+    /// Clear a deferred sequential inline rename for a terminal scan generation.
+    pub fn clear_pending_inline_rename_after_scan_generation(&mut self, generation: u64) {
+        if self
+            .pending_inline_rename_after_scan
+            .as_ref()
+            .is_some_and(|pending| pending.scan_generation == generation)
+        {
+            self.pending_inline_rename_after_scan = None;
+        }
+    }
+
+    /// Consume a pending sequential inline rename after a successful scan.
+    /// Returns the target path after positioning the cursor, or `None` if the
+    /// pending action was stale or the target no longer exists in the filtered view.
+    pub fn take_inline_rename_after_scan_target(
+        &mut self,
+        scan_generation: u64,
+        scan_path: &Path,
+    ) -> Option<PathBuf> {
+        let pending = self.pending_inline_rename_after_scan.take()?;
+        if pending.scan_generation != scan_generation || !same_path(&pending.directory, scan_path) {
+            return None;
+        }
+
+        let idx = self.entries.iter().position(|entry| {
+            entry.path == pending.target_path && !matches!(entry.kind, EntryKind::ParentDir)
+        })?;
+        self.selected_index = idx;
+        self.ensure_visible();
+        Some(pending.target_path)
     }
 
     /// Resolve the range-select anchor to an index in the current `entries` vec.
@@ -2301,7 +3989,7 @@ impl BrowseState {
     /// `AppMessage::DirStatsComplete` and the event loop populates the
     /// respective caches. Pending sets prevent duplicate spawns when the
     /// cursor moves rapidly back and forth.
-    pub fn probe_current(&mut self, tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>) {
+    pub fn probe_current(&mut self, tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>) {
         self.probe_current_with_db(tx, None);
     }
 
@@ -2310,7 +3998,7 @@ impl BrowseState {
     /// the in-memory cache directly and skips the async probe.
     pub fn probe_current_with_db(
         &mut self,
-        tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
         db: Option<&crate::db::Database>,
     ) {
         let entry = match self.entries.get(self.selected_index) {
@@ -2340,7 +4028,7 @@ impl BrowseState {
                         }
                         Ok(_) => {
                             self.probe_pending.insert(path.clone());
-                            let _ = tx.try_send(super::message::AppMessage::AudioProbeComplete {
+                            let _ = tx.try_send(crate::tui::message::AppMessage::AudioProbeComplete {
                                 path: path.clone(),
                                 context: probe_context,
                                 result: Box::new(Err("staged archive entry is missing or is not a file".to_string())),
@@ -2348,7 +4036,7 @@ impl BrowseState {
                         }
                         Err(err) => {
                             self.probe_pending.insert(path.clone());
-                            let _ = tx.try_send(super::message::AppMessage::AudioProbeComplete {
+                            let _ = tx.try_send(crate::tui::message::AppMessage::AudioProbeComplete {
                                 path: path.clone(),
                                 context: probe_context,
                                 result: Box::new(Err(err)),
@@ -2425,8 +4113,8 @@ impl BrowseState {
     pub fn archive_entry_probe_context_for(
         &self,
         archive_path: &Path,
-    ) -> super::message::AudioProbeContext {
-        super::message::AudioProbeContext::ArchiveEntry {
+    ) -> crate::tui::message::AudioProbeContext {
+        crate::tui::message::AudioProbeContext::ArchiveEntry {
             archive_path: archive_path.to_path_buf(),
             archive_probe_epoch: self.archive_probe_epoch_for(archive_path),
         }
@@ -2497,7 +4185,7 @@ impl BrowseState {
 fn spawn_cached_audio_probe_metadata_completion(
     path: PathBuf,
     mut info: CachedInfo,
-    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
     tokio::spawn(async move {
         let path_for_task = path.clone();
@@ -2512,9 +4200,9 @@ fn spawn_cached_audio_probe_metadata_completion(
         .unwrap_or_else(|join_err| Err(format!("cached probe metadata task panicked: {}", join_err)));
 
         let _ = tx
-            .send(super::message::AppMessage::AudioProbeComplete {
+            .send(crate::tui::message::AppMessage::AudioProbeComplete {
                 path,
-                context: super::message::AudioProbeContext::Filesystem,
+                context: crate::tui::message::AudioProbeContext::Filesystem,
                 result: Box::new(result),
             })
             .await;
@@ -2529,8 +4217,8 @@ fn spawn_cached_audio_probe_metadata_completion(
 fn spawn_staged_archive_audio_probe(
     staged_path: PathBuf,
     synthetic_path: PathBuf,
-    probe_context: super::message::AudioProbeContext,
-    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+    probe_context: crate::tui::message::AudioProbeContext,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
     tokio::spawn(async move {
         let path_for_task = staged_path.clone();
@@ -2549,7 +4237,7 @@ fn spawn_staged_archive_audio_probe(
         .unwrap_or_else(|join_err| Err(format!("staged archive probe task panicked: {}", join_err)));
 
         let _ = tx
-            .send(super::message::AppMessage::AudioProbeComplete {
+            .send(crate::tui::message::AppMessage::AudioProbeComplete {
                 path: synthetic_path,
                 context: probe_context,
                 result: Box::new(result),
@@ -2567,8 +4255,8 @@ fn spawn_archive_entry_audio_probe(
     inner_path: String,
     synthetic_path: PathBuf,
     password: Option<String>,
-    probe_context: super::message::AudioProbeContext,
-    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+    probe_context: crate::tui::message::AudioProbeContext,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
     tokio::spawn(async move {
         let result = async {
@@ -2615,7 +4303,7 @@ fn spawn_archive_entry_audio_probe(
         .await;
 
         let _ = tx
-            .send(super::message::AppMessage::AudioProbeComplete {
+            .send(crate::tui::message::AppMessage::AudioProbeComplete {
                 path: synthetic_path,
                 context: probe_context,
                 result: Box::new(result),
@@ -2682,7 +4370,7 @@ async fn extract_archive_entry_to_temp(
 /// performs external pre-emphasis metadata enrichment; only failed metadata
 /// reads get a single fallback PE check so successful fresh probes do not
 /// duplicate tag/CUE/catalog work.
-pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::message::AppMessage>) {
+pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>) {
     if is_cue_sheet_path(&path) {
         // Defense in depth: callers should route CUE preview through
         // `spawn_cue_proxy_audio_probe`, but never allow a `.cue` text file to
@@ -2708,9 +4396,9 @@ pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::mes
         .unwrap_or_else(|join_err| Err(format!("probe task panicked: {}", join_err)));
 
         let _ = tx
-            .send(super::message::AppMessage::AudioProbeComplete {
+            .send(crate::tui::message::AppMessage::AudioProbeComplete {
                 path,
-                context: super::message::AudioProbeContext::Filesystem,
+                context: crate::tui::message::AudioProbeContext::Filesystem,
                 result: Box::new(result),
             })
             .await;
@@ -2724,7 +4412,7 @@ pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::mes
 /// itself is never routed through `probe_audio`.
 pub fn spawn_cue_proxy_audio_probe(
     path: PathBuf,
-    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
     tokio::spawn(async move {
         let path_for_task = path.clone();
@@ -2746,9 +4434,9 @@ pub fn spawn_cue_proxy_audio_probe(
         .unwrap_or_else(|join_err| Err(format!("CUE proxy probe task panicked: {}", join_err)));
 
         let _ = tx
-            .send(super::message::AppMessage::AudioProbeComplete {
+            .send(crate::tui::message::AppMessage::AudioProbeComplete {
                 path,
-                context: super::message::AudioProbeContext::Filesystem,
+                context: crate::tui::message::AudioProbeContext::Filesystem,
                 result: Box::new(result),
             })
             .await;
@@ -2761,7 +4449,7 @@ pub fn spawn_cue_proxy_audio_probe(
 /// runs on `spawn_blocking` so it doesn't tie up an async worker thread —
 /// the original sync version was the source of the Phase 4d UI freeze on
 /// large directories like ~/Downloads.
-pub fn spawn_dir_stats(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::message::AppMessage>) {
+pub fn spawn_dir_stats(path: PathBuf, tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>) {
     tokio::spawn(async move {
         let path_for_task = path.clone();
         let stats = tokio::task::spawn_blocking(move || compute_dir_stats(&path_for_task))
@@ -2769,7 +4457,7 @@ pub fn spawn_dir_stats(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::messa
             .unwrap_or_default();
 
         let _ = tx
-            .send(super::message::AppMessage::DirStatsComplete { path, stats })
+            .send(crate::tui::message::AppMessage::DirStatsComplete { path, stats })
             .await;
     });
 }
@@ -2780,8 +4468,9 @@ pub fn spawn_dir_stats(path: PathBuf, tx: tokio::sync::mpsc::Sender<super::messa
 /// Wrapped in a 30-second timeout.
 pub fn spawn_dir_scan(
     path: PathBuf,
+    generation: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    tx: tokio::sync::mpsc::Sender<super::message::AppMessage>,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
     tokio::spawn(async move {
         let scan_path = path.clone();
@@ -2814,7 +4503,8 @@ pub fn spawn_dir_scan(
         };
 
         let _ = tx
-            .send(super::message::AppMessage::DirScanComplete {
+            .send(crate::tui::message::AppMessage::DirScanComplete {
+                generation,
                 path,
                 parent_entry,
                 dirs,
@@ -2918,6 +4608,12 @@ fn scan_directory_blocking(
     Ok((parent_entry, dirs, files))
 }
 
+fn browse_entry_name_is_hidden(name: &str) -> bool {
+    name.split('/')
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment.starts_with('.') && segment != "." && segment != "..")
+}
+
 /// View-layer filter check: returns true if the entry passes the hidden,
 /// format, and text filters. Pure function — no state captured, easy to test.
 fn entry_passes_view(
@@ -2927,14 +4623,14 @@ fn entry_passes_view(
     filter_lower: Option<&str>,
 ) -> bool {
     // Hidden filter
-    if !show_hidden && entry.name.starts_with('.') {
+    if !show_hidden && browse_entry_name_is_hidden(&entry.name) {
         return false;
     }
     // Format filter (only applies to non-directory entries). Use the
     // path-aware check so `.cue` stays visible as a convertible source under
     // AudioOnly without widening the filter to all `OtherFile` entries.
     if !matches!(
-        entry.kind,
+        &entry.kind,
         EntryKind::Directory
             | EntryKind::DvdAudioDir
             | EntryKind::DvdVideoDir
@@ -2947,6 +4643,30 @@ fn entry_passes_view(
         if !entry.name_lower.contains(needle) {
             return false;
         }
+    }
+    true
+}
+
+fn entry_passes_search_effective_filters(
+    entry: &BrowseEntry,
+    show_hidden: bool,
+    audio_only: bool,
+    format_filter: &FormatFilter,
+) -> bool {
+    if !show_hidden && browse_entry_name_is_hidden(&entry.name) {
+        return false;
+    }
+    if audio_only && !is_audio_filter_visible_entry(entry) {
+        return false;
+    }
+    if !matches!(
+        &entry.kind,
+        EntryKind::Directory
+            | EntryKind::DvdAudioDir
+            | EntryKind::DvdVideoDir
+            | EntryKind::BlurayDir
+    ) && !format_filter.allows_entry(entry) {
+        return false;
     }
     true
 }
@@ -3030,34 +4750,126 @@ fn validate_archive_entry_probe_selector(
     }
 }
 
-/// Sort a vec of entries by the given field and direction
-fn sort_entries(entries: &mut [BrowseEntry], by: SortBy, dir: SortDir) {
-    use std::cmp::Ordering;
-
+/// Sort a vec of entries by the given field and direction.
+///
+/// Probe-backed columns use `probe_cache` when available. Unknown values remain
+/// deterministic: they sort after known values in ascending order and then fall
+/// back to the entry name, so enabling audio columns never makes list order
+/// depend on filesystem walk order or hash-map iteration.
+fn sort_entries(
+    entries: &mut [BrowseEntry],
+    by: SortBy,
+    dir: SortDir,
+    probe_cache: &HashMap<PathBuf, Option<Arc<CachedInfo>>>,
+) {
     entries.sort_by(|a, b| {
+        let a_info = cached_info_for_sort(probe_cache, a);
+        let b_info = cached_info_for_sort(probe_cache, b);
+        let name_ord = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
         let ord = match by {
-            SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            SortBy::Date => match (a.modified, b.modified) {
-                (Some(at), Some(bt)) => at.cmp(&bt),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            },
-            SortBy::Size => a.size.cmp(&b.size),
+            SortBy::Name => name_ord(),
+            SortBy::Date => compare_opt_ord(a.modified, b.modified).then_with(name_ord),
+            SortBy::Size => a.size.cmp(&b.size).then_with(name_ord),
             SortBy::Type => {
-                // Sort by kind first (audio formats grouped), then by name within group
                 let a_rank = entry_type_rank(&a.kind);
                 let b_rank = entry_type_rank(&b.kind);
-                a_rank
-                    .cmp(&b_rank)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            }
+                a_rank.cmp(&b_rank).then_with(name_ord)
+            },
+            SortBy::Format => compare_opt_string(
+                audio_format_sort_value(a, a_info),
+                audio_format_sort_value(b, b_info),
+            )
+            .then_with(name_ord),
+            SortBy::Codec => compare_opt_string(
+                a_info.map(|info| info.source.codec_display()),
+                b_info.map(|info| info.source.codec_display()),
+            )
+            .then_with(name_ord),
+            SortBy::SampleRate => compare_opt_ord(
+                a_info.and_then(|info| positive_u32(info.source.sample_rate)),
+                b_info.and_then(|info| positive_u32(info.source.sample_rate)),
+            )
+            .then_with(name_ord),
+            SortBy::Channels => compare_opt_ord(
+                a_info.and_then(|info| positive_u32(info.source.channels)),
+                b_info.and_then(|info| positive_u32(info.source.channels)),
+            )
+            .then_with(name_ord),
+            SortBy::Duration => compare_opt_f64(
+                a_info.and_then(|info| positive_f64(info.source.duration_secs)),
+                b_info.and_then(|info| positive_f64(info.source.duration_secs)),
+            )
+            .then_with(name_ord),
+            SortBy::Artist => compare_opt_string(
+                a_info.and_then(|info| info.metadata.artist.clone()),
+                b_info.and_then(|info| info.metadata.artist.clone()),
+            )
+            .then_with(name_ord),
+            SortBy::Album => compare_opt_string(
+                a_info.and_then(|info| info.metadata.album.clone()),
+                b_info.and_then(|info| info.metadata.album.clone()),
+            )
+            .then_with(name_ord),
         };
         match dir {
             SortDir::Asc => ord,
             SortDir::Desc => ord.reverse(),
         }
     });
+}
+
+fn cached_info_for_sort<'a>(
+    probe_cache: &'a HashMap<PathBuf, Option<Arc<CachedInfo>>>,
+    entry: &BrowseEntry,
+) -> Option<&'a CachedInfo> {
+    probe_cache
+        .get(&entry.path)
+        .and_then(|cached| cached.as_ref().map(|info| info.as_ref()))
+}
+
+fn audio_format_sort_value(entry: &BrowseEntry, cached: Option<&CachedInfo>) -> Option<String> {
+    if !entry.is_audio() {
+        return None;
+    }
+    cached
+        .map(|info| info.source.format_name.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| Some(entry.type_label()))
+}
+
+fn compare_opt_ord<T: Ord>(left: Option<T>, right: Option<T>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_opt_string(left: Option<String>, right: Option<String>) -> std::cmp::Ordering {
+    compare_opt_ord(
+        left.map(|value| value.to_ascii_lowercase()),
+        right.map(|value| value.to_ascii_lowercase()),
+    )
+}
+
+fn compare_opt_f64(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn positive_u32(value: u32) -> Option<u32> {
+    (value > 0).then_some(value)
+}
+
+fn positive_f64(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 /// Numeric rank for type sorting: audio files grouped by format, then archive, then other
@@ -3158,6 +4970,40 @@ impl Default for BrowseState {
     }
 }
 
+#[cfg(test)]
+mod browse_pane_toggle_tests {
+    use super::*;
+
+    #[test]
+    fn single_click_browse_pane_toggle_is_non_destructive() {
+        let mut browse = BrowseState::new();
+        browse.explore_collapsed = false;
+        browse.info_collapsed = false;
+        browse.browse_maximized = false;
+
+        browse.toggle_pane(BrowsePaneId::Browse);
+
+        assert!(!browse.explore_collapsed);
+        assert!(!browse.info_collapsed);
+        assert!(!browse.browse_maximized);
+    }
+
+    #[test]
+    fn browse_title_double_click_path_still_maximizes_and_restores() {
+        let mut browse = BrowseState::new();
+
+        browse.toggle_browse_maximized();
+        assert!(browse.explore_collapsed);
+        assert!(browse.info_collapsed);
+        assert!(browse.browse_maximized);
+
+        browse.toggle_browse_maximized();
+        assert!(!browse.explore_collapsed);
+        assert!(!browse.info_collapsed);
+        assert!(!browse.browse_maximized);
+    }
+}
+
 /// Classify a file by its extension
 /// Expand a list of paths into audio files suitable for queuing.
 /// - Audio files and archives are kept as-is.
@@ -3167,28 +5013,101 @@ impl Default for BrowseState {
 /// Public and screen-agnostic — usable by Browse, Library, or any
 /// future screen that needs to queue directories or mixed selections.
 /// Build a lowercase searchable string from an audio file's metadata tags.
-/// Uses the in-memory `tag_cache` if available, otherwise reads via lofty
-/// and populates the cache.
+/// Uses the in-memory `tag_cache` only when the current file fingerprint
+/// matches the fingerprint captured when tags were read. This prevents an
+/// active search panel from matching stale tags after metadata writes.
 fn build_tag_search_string_cached(
     path: &Path,
-    tag_cache: &mut std::collections::HashMap<PathBuf, String>,
+    tag_cache: &mut std::collections::HashMap<PathBuf, CachedTagSearchString>,
 ) -> String {
+    let fingerprint = match TagCacheFingerprint::for_path(path) {
+        Some(fingerprint) => fingerprint,
+        None => {
+            tag_cache.remove(path);
+            return read_tags_from_file(path).tag_string;
+        }
+    };
+
     if let Some(cached) = tag_cache.get(path) {
-        return cached.clone();
+        if cached.fingerprint == fingerprint {
+            return cached.tag_string.clone();
+        }
     }
+
     let result = read_tags_from_file(path);
-    tag_cache.insert(path.to_path_buf(), result.tag_string.clone());
+    tag_cache.insert(
+        path.to_path_buf(),
+        CachedTagSearchString {
+            fingerprint,
+            tag_string: result.tag_string.clone(),
+        },
+    );
     result.tag_string
 }
 
+#[derive(Debug, Clone)]
+enum TagSearchSource {
+    Filesystem(PathBuf),
+    StagedArchiveEntry {
+        staged_path: PathBuf,
+        fallback_metadata: Option<SourceMetadata>,
+    },
+    Metadata(SourceMetadata),
+    ExtractArchiveEntry {
+        archive_path: PathBuf,
+        inner_path: String,
+        password: Option<String>,
+        synthetic_path: PathBuf,
+    },
+    Missing,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveSearchCandidate {
+    entry: BrowseEntry,
+    inner_path: Option<String>,
+    staged_path: Option<PathBuf>,
+    fallback_metadata: Option<SourceMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveSearchWorkerOutput {
+    results: Vec<(BrowseEntry, i64)>,
+    total_matches: usize,
+    archive_tag_cache_updates: Vec<(PathBuf, TagCacheFingerprint, ArchiveTagPasswordIdentity, TagReadResult)>,
+}
+
 /// Tag data read from a file for search and cache storage.
-struct TagReadResult {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagReadResult {
     tag_string: String,
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
     genre: Option<String>,
     year: Option<String>,
+}
+
+impl TagReadResult {
+    fn empty() -> Self {
+        Self {
+            tag_string: String::new(),
+            title: None,
+            artist: None,
+            album: None,
+            genre: None,
+            year: None,
+        }
+    }
+
+    fn has_tag_data(&self) -> bool {
+        !self.tag_string.trim().is_empty()
+            || self.title.as_ref().is_some_and(|value| !value.trim().is_empty())
+            || self.artist.as_ref().is_some_and(|value| !value.trim().is_empty())
+            || self.album.as_ref().is_some_and(|value| !value.trim().is_empty())
+            || self.genre.as_ref().is_some_and(|value| !value.trim().is_empty())
+            || self.year.as_ref().is_some_and(|value| !value.trim().is_empty())
+    }
 }
 
 /// Read tag fields from a file via lofty. Returns concatenated search
@@ -3200,27 +5119,13 @@ fn read_tags_from_file(path: &Path) -> TagReadResult {
     let tagged = match lofty::read_from_path(path) {
         Ok(t) => t,
         Err(_) => {
-            return TagReadResult {
-                tag_string: String::new(),
-                title: None,
-                artist: None,
-                album: None,
-                genre: None,
-                year: None,
-            }
+            return TagReadResult::empty()
         }
     };
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
         Some(t) => t,
         None => {
-            return TagReadResult {
-                tag_string: String::new(),
-                title: None,
-                artist: None,
-                album: None,
-                genre: None,
-                year: None,
-            }
+            return TagReadResult::empty()
         }
     };
 
@@ -3254,6 +5159,510 @@ fn read_tags_from_file(path: &Path) -> TagReadResult {
         album,
         genre,
         year,
+    }
+}
+
+fn read_tags_from_archive_entry(
+    archive_path: &Path,
+    inner_path: &str,
+    password: Option<&str>,
+) -> TagReadResult {
+    let staging_dir = std::env::temp_dir().join(format!(
+        "tonepoet-archive-tag-search-{}",
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = match extract_archive_entry_to_temp_blocking(
+        archive_path,
+        inner_path,
+        password,
+        &staging_dir,
+    ) {
+        Ok(path) => read_tags_from_file(&path),
+        Err(_) => TagReadResult::empty(),
+    };
+
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    result
+}
+
+fn extract_archive_entry_to_temp_blocking(
+    archive_path: &Path,
+    inner_path: &str,
+    password: Option<&str>,
+    staging_dir: &Path,
+) -> Result<PathBuf, String> {
+    let extracted = staging_path_for_archive_inner(staging_dir, inner_path)?;
+    let extraction_mode = validate_archive_entry_probe_selector(inner_path)?;
+    let bin = crate::detect_7z_binary()
+        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+    std::fs::create_dir_all(staging_dir)
+        .map_err(|err| format!("create archive-entry tag-search staging failed: {err}"))?;
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("x")
+        .arg(archive_path)
+        .arg(format!("-o{}", staging_dir.display()))
+        .arg("-y")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let ArchiveEntryProbeExtraction::SingleMember = extraction_mode {
+        cmd.arg(inner_path);
+    }
+    if let Some(password) = password {
+        cmd.arg(format!("-p{}", password));
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|err| format!("failed to run {}: {}", bin, err))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let operation = match extraction_mode {
+            ArchiveEntryProbeExtraction::SingleMember => "archive entry tag extraction",
+            ArchiveEntryProbeExtraction::FullArchiveFallback => "archive tag extraction fallback",
+        };
+        return Err(format!("{} failed: {}", operation, stderr.trim()));
+    }
+
+    if extracted.is_file() {
+        Ok(extracted)
+    } else {
+        Err(format!(
+            "archive entry tag extraction did not produce a file: {}",
+            inner_path
+        ))
+    }
+}
+
+
+#[cfg(test)]
+static TEST_ARCHIVE_TAG_FIXTURES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<(PathBuf, String), TagReadResult>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn test_archive_tag_fixture(archive_path: &Path, inner_path: &str) -> Option<TagReadResult> {
+    TEST_ARCHIVE_TAG_FIXTURES
+        .get()
+        .and_then(|fixtures| fixtures.lock().ok())
+        .and_then(|fixtures| fixtures.get(&(archive_path.to_path_buf(), inner_path.to_string())).cloned())
+}
+
+struct ArchiveTagExtractionSession {
+    archive_path: PathBuf,
+    password: Option<String>,
+    staging_dir: PathBuf,
+    full_archive_extracted: bool,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ArchiveTagExtractionSession {
+    fn new(
+        archive_path: PathBuf,
+        password: Option<String>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let staging_dir = std::env::temp_dir().join(format!(
+            "tonepoet-archive-tag-search-{}",
+            uuid::Uuid::new_v4()
+        ));
+        Self {
+            archive_path,
+            password,
+            staging_dir,
+            full_archive_extracted: false,
+            cancel,
+        }
+    }
+
+    fn read_entry(&mut self, inner_path: &str) -> TagReadResult {
+        #[cfg(test)]
+        if let Some(tags) = test_archive_tag_fixture(&self.archive_path, inner_path) {
+            return tags;
+        }
+
+        match self.extract_entry(inner_path) {
+            Ok(path) => read_tags_from_file(&path),
+            Err(_) => TagReadResult::empty(),
+        }
+    }
+
+    fn extract_entry(&mut self, inner_path: &str) -> Result<PathBuf, String> {
+        let extracted = staging_path_for_archive_inner(&self.staging_dir, inner_path)?;
+        let extraction_mode = validate_archive_entry_probe_selector(inner_path)?;
+        match extraction_mode {
+            ArchiveEntryProbeExtraction::SingleMember => {
+                if !extracted.is_file() {
+                    run_7z_extract_to_dir(
+                        &self.archive_path,
+                        self.password.as_deref(),
+                        &self.staging_dir,
+                        Some(inner_path),
+                        "archive entry tag extraction",
+                        Some(&self.cancel),
+                    )?;
+                }
+            }
+            ArchiveEntryProbeExtraction::FullArchiveFallback => {
+                if !self.full_archive_extracted {
+                    run_7z_extract_to_dir(
+                        &self.archive_path,
+                        self.password.as_deref(),
+                        &self.staging_dir,
+                        None,
+                        "archive tag extraction fallback",
+                        Some(&self.cancel),
+                    )?;
+                    self.full_archive_extracted = true;
+                }
+            }
+        }
+
+        if extracted.is_file() {
+            Ok(extracted)
+        } else {
+            Err(format!(
+                "archive entry tag extraction did not produce a file: {}",
+                inner_path
+            ))
+        }
+    }
+}
+
+impl Drop for ArchiveTagExtractionSession {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.staging_dir);
+    }
+}
+
+fn run_7z_extract_to_dir(
+    archive_path: &Path,
+    password: Option<&str>,
+    staging_dir: &Path,
+    member: Option<&str>,
+    operation: &str,
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), String> {
+    let bin = crate::detect_7z_binary()
+        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+    std::fs::create_dir_all(staging_dir)
+        .map_err(|err| format!("create archive-entry tag-search staging failed: {err}"))?;
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("x")
+        .arg(archive_path)
+        .arg(format!("-o{}", staging_dir.display()))
+        .arg("-y")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let Some(member) = member {
+        cmd.arg(member);
+    }
+    if let Some(password) = password {
+        cmd.arg(format!("-p{}", password));
+    }
+
+    if let Some(cancel) = cancel {
+        use std::io::Read;
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| format!("failed to run {}: {}", bin, err))?;
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{} cancelled", operation));
+            }
+            match child
+                .try_wait()
+                .map_err(|err| format!("failed to wait for {}: {}", bin, err))?
+            {
+                Some(status) => {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    if !status.success() {
+                        return Err(format!("{} failed: {}", operation, stderr.trim()));
+                    }
+                    return Ok(());
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(25)),
+            }
+        }
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|err| format!("failed to run {}: {}", bin, err))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("{} failed: {}", operation, stderr.trim()));
+    }
+    Ok(())
+}
+
+fn run_archive_search_worker(
+    archive_path: PathBuf,
+    password: Option<String>,
+    archive_fingerprint: Option<TagCacheFingerprint>,
+    cached_archive_tags: HashMap<PathBuf, CachedArchiveTagSearchString>,
+    candidates: Vec<ArchiveSearchCandidate>,
+    query: String,
+    show_hidden: bool,
+    audio_only: bool,
+    format_filter: FormatFilter,
+    mode: SearchMode,
+    sort: SearchSort,
+    sort_dir: SortDir,
+    result_cap: usize,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<ArchiveSearchWorkerOutput> {
+    use fuzzy_matcher::skim::SkimMatcherV2;
+    use fuzzy_matcher::FuzzyMatcher;
+
+    let matcher = SkimMatcherV2::default();
+    let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
+    let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
+    let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
+    let mut resolved_tags: HashMap<PathBuf, TagReadResult> = HashMap::new();
+    let mut cache_updates: Vec<(PathBuf, TagCacheFingerprint, ArchiveTagPasswordIdentity, TagReadResult)> = Vec::new();
+    let password_identity = ArchiveTagPasswordIdentity::for_password(password.as_deref());
+    let mut extraction = ArchiveTagExtractionSession::new(archive_path, password, cancel.clone());
+
+    for candidate in &candidates {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let e = &candidate.entry;
+        if !show_hidden && browse_entry_name_is_hidden(&e.name) {
+            continue;
+        }
+        if !entry_passes_search_effective_filters(e, show_hidden, audio_only, &format_filter) {
+            continue;
+        }
+
+        let mut best_score: Option<i64> = None;
+        if search_filename || matches!(&e.kind, EntryKind::Directory) {
+            if let Some(s) = matcher.fuzzy_match(&e.name_lower, &query) {
+                best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+            }
+        }
+        if search_tags && matches!(&e.kind, EntryKind::AudioFile(_)) {
+            let tags = archive_tags_for_candidate_worker(
+                candidate,
+                archive_fingerprint.as_ref(),
+                &cached_archive_tags,
+                &mut resolved_tags,
+                password_identity,
+                &mut cache_updates,
+                &mut extraction,
+            );
+            if !tags.tag_string.is_empty() {
+                if let Some(s) = matcher.fuzzy_match(&tags.tag_string, &query) {
+                    best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
+                }
+            }
+        }
+
+        if let Some(score) = best_score {
+            scored.push((e.clone(), score));
+        }
+    }
+
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+
+    if sort.is_tag_sort() {
+        let mut keyed: Vec<(bool, String, String, usize)> = scored
+            .iter()
+            .enumerate()
+            .map(|(idx, (entry, _))| {
+                let key = candidates
+                    .iter()
+                    .find(|candidate| candidate.entry.path == entry.path)
+                    .map(|candidate| {
+                        let tags = archive_tags_for_candidate_worker(
+                            candidate,
+                            archive_fingerprint.as_ref(),
+                            &cached_archive_tags,
+                            &mut resolved_tags,
+                            password_identity,
+                            &mut cache_updates,
+                            &mut extraction,
+                        );
+                        tag_sort_key_from_read_result(&tags, sort)
+                    })
+                    .unwrap_or_default();
+                (key.is_empty(), key, entry.name_lower.clone(), idx)
+            })
+            .collect();
+        keyed.sort_by(|a, b| {
+            let ord = a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2));
+            match sort_dir {
+                SortDir::Asc => ord,
+                SortDir::Desc => ord.reverse(),
+            }
+        });
+        let sorted: Vec<_> = keyed.into_iter().map(|(_, _, _, idx)| scored[idx].clone()).collect();
+        scored = sorted;
+    } else {
+        sort_search_results(&mut scored, sort, sort_dir);
+    }
+
+    let total_matches = scored.len();
+    scored.truncate(result_cap.max(1));
+
+    Some(ArchiveSearchWorkerOutput {
+        results: scored,
+        total_matches,
+        archive_tag_cache_updates: cache_updates,
+    })
+}
+
+fn archive_tags_for_candidate_worker(
+    candidate: &ArchiveSearchCandidate,
+    archive_fingerprint: Option<&TagCacheFingerprint>,
+    cached_archive_tags: &HashMap<PathBuf, CachedArchiveTagSearchString>,
+    resolved_tags: &mut HashMap<PathBuf, TagReadResult>,
+    password_identity: ArchiveTagPasswordIdentity,
+    cache_updates: &mut Vec<(PathBuf, TagCacheFingerprint, ArchiveTagPasswordIdentity, TagReadResult)>,
+    extraction: &mut ArchiveTagExtractionSession,
+) -> TagReadResult {
+    let synthetic_path = &candidate.entry.path;
+    if let Some(tags) = resolved_tags.get(synthetic_path) {
+        return tags.clone();
+    }
+
+    if let Some(staged_path) = candidate.staged_path.as_ref() {
+        let tags = read_tags_from_file(staged_path);
+        if !tags.tag_string.is_empty() {
+            resolved_tags.insert(synthetic_path.clone(), tags.clone());
+            return tags;
+        }
+    }
+
+    if let Some(metadata) = candidate.fallback_metadata.as_ref() {
+        let tags = tag_read_result_from_metadata(metadata);
+        if !tags.tag_string.is_empty() {
+            resolved_tags.insert(synthetic_path.clone(), tags.clone());
+            return tags;
+        }
+    }
+
+    if let (Some(fingerprint), Some(cached)) = (archive_fingerprint, cached_archive_tags.get(synthetic_path)) {
+        if &cached.archive_fingerprint == fingerprint
+            && cached.password_identity == password_identity
+            && cached.tags.has_tag_data()
+        {
+            resolved_tags.insert(synthetic_path.clone(), cached.tags.clone());
+            return cached.tags.clone();
+        }
+    }
+
+    let tags = if matches!(candidate.entry.kind, EntryKind::AudioFile(_)) {
+        candidate
+            .inner_path
+            .as_deref()
+            .map(|inner| extraction.read_entry(inner))
+            .unwrap_or_else(TagReadResult::empty)
+    } else {
+        TagReadResult::empty()
+    };
+
+    if let Some(fingerprint) = archive_fingerprint {
+        if tags.has_tag_data() {
+            cache_updates.push((synthetic_path.clone(), fingerprint.clone(), password_identity, tags.clone()));
+        }
+    }
+    resolved_tags.insert(synthetic_path.clone(), tags.clone());
+    tags
+}
+
+fn tag_search_string_from_metadata(metadata: &SourceMetadata) -> String {
+    tag_read_result_from_metadata(metadata).tag_string
+}
+
+fn tag_read_result_from_metadata(metadata: &SourceMetadata) -> TagReadResult {
+    let title = metadata.title.clone().filter(|value| !value.trim().is_empty());
+    let artist = metadata.artist.clone().filter(|value| !value.trim().is_empty());
+    let album = metadata.album.clone().filter(|value| !value.trim().is_empty());
+    let genre = metadata.genre.clone().filter(|value| !value.trim().is_empty());
+    let year = metadata.year.clone().filter(|value| !value.trim().is_empty());
+
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(ref value) = title {
+        parts.push(value);
+    }
+    if let Some(ref value) = artist {
+        parts.push(value);
+    }
+    if let Some(ref value) = album {
+        parts.push(value);
+    }
+    if let Some(ref value) = genre {
+        parts.push(value);
+    }
+    if let Some(ref value) = year {
+        parts.push(value);
+    }
+
+    TagReadResult {
+        tag_string: parts.join(" ").to_lowercase(),
+        title,
+        artist,
+        album,
+        genre,
+        year,
+    }
+}
+
+fn tag_sort_key_from_read_result(tags: &TagReadResult, sort: SearchSort) -> String {
+    let value = match sort {
+        SearchSort::Artist => tags.artist.as_deref(),
+        SearchSort::Album => tags.album.as_deref(),
+        SearchSort::Year => tags.year.as_deref(),
+        SearchSort::Title => tags.title.as_deref(),
+        _ => None,
+    };
+
+    match sort {
+        SearchSort::Year => value.map(normalize_year_sort_key).unwrap_or_default(),
+        _ => value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default(),
+    }
+}
+
+fn tag_sort_key_from_metadata(metadata: &SourceMetadata, sort: SearchSort) -> String {
+    let value = match sort {
+        SearchSort::Artist => metadata.artist.as_deref(),
+        SearchSort::Album => metadata.album.as_deref(),
+        SearchSort::Year => metadata.year.as_deref(),
+        SearchSort::Title => metadata.title.as_deref(),
+        _ => None,
+    };
+
+    match sort {
+        SearchSort::Year => value.map(normalize_year_sort_key).unwrap_or_default(),
+        _ => value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default(),
+    }
+}
+
+fn normalize_year_sort_key(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Ok(year) = trimmed.parse::<u32>() {
+        format!("{:04}", year)
+    } else {
+        trimmed.to_ascii_lowercase()
     }
 }
 
@@ -3640,6 +6049,39 @@ fn cue_queue_decision_for_path(cue_path: &Path) -> Result<CueQueueDecision, Stri
 /// referenced files, because once the CUE provides split points for any audio
 /// file, the materializer owns the complete CUE track index and raw audio paths
 /// must not be queued separately.
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn initial_browse_tree_nodes(current_dir: &Path, show_hidden: bool) -> Vec<BrowseTreeNode> {
+    tui_file_picker::initial_tree_nodes_with_hidden(current_dir, show_hidden)
+}
+
+fn browse_tree_expand_ancestors(nodes: &mut Vec<BrowseTreeNode>, target: &Path, show_hidden: bool) {
+    if nodes.is_empty() {
+        *nodes = initial_browse_tree_nodes(target, show_hidden);
+    }
+    tui_file_picker::expand_tree_to_path(nodes, target, show_hidden);
+}
+
+fn browse_tree_expand_path(nodes: &mut Vec<BrowseTreeNode>, target: &Path, show_hidden: bool) {
+    browse_tree_expand_ancestors(nodes, target, show_hidden);
+    let Some(index) = nodes.iter().position(|node| same_path(&node.path, target)) else {
+        return;
+    };
+    if nodes[index].expanded || !nodes[index].has_children {
+        return;
+    }
+    nodes[index].expanded = true;
+    tui_file_picker::refresh_tree_children(nodes, target, show_hidden);
+}
+
 #[cfg(test)]
 pub(crate) fn cue_referenced_audio_paths_to_suppress_for_queue(
     cue_path: &Path,
@@ -4212,6 +6654,700 @@ mod tests {
             modified,
         ));
         state
+    }
+
+    #[test]
+    fn path_validation_acceptance_rejects_superseded_generation() {
+        let mut state = BrowseState::new();
+        let origin = std::path::PathBuf::from("/tmp/browse-origin");
+        state.current_dir = origin.clone();
+
+        let first_generation = state.next_path_validation_generation();
+        assert!(state.is_current_path_validation(first_generation, &origin));
+
+        let second_generation = state.next_path_validation_generation();
+        assert_ne!(first_generation, second_generation);
+        assert!(!state.is_current_path_validation(first_generation, &origin));
+        assert!(state.is_current_path_validation(second_generation, &origin));
+    }
+
+    #[test]
+    fn path_validation_acceptance_rejects_changed_origin_directory() {
+        let mut state = BrowseState::new();
+        let origin = std::path::PathBuf::from("/tmp/browse-origin");
+        let other = std::path::PathBuf::from("/tmp/browse-other");
+        state.current_dir = origin.clone();
+
+        let generation = state.next_path_validation_generation();
+        assert!(state.is_current_path_validation(generation, &origin));
+
+        state.current_dir = other.clone();
+        assert!(!state.is_current_path_validation(generation, &origin));
+        assert!(same_path(&state.current_dir, &other));
+    }
+
+
+    #[test]
+    fn path_validation_acceptance_rejects_reopened_path_editor() {
+        let mut state = BrowseState::new();
+        let origin = std::path::PathBuf::from("/tmp/browse-origin");
+        state.current_dir = origin.clone();
+
+        let generation = state.next_path_validation_generation();
+        assert!(state.is_current_path_validation(generation, &origin));
+
+        state.open_path_input();
+        assert!(state.path_input.is_some());
+        assert!(!state.is_current_path_validation(generation, &origin));
+    }
+
+    #[test]
+    fn path_validation_acceptance_rejects_active_path_editor_even_with_matching_generation() {
+        let mut state = BrowseState::new();
+        let origin = std::path::PathBuf::from("/tmp/browse-origin");
+        state.current_dir = origin.clone();
+
+        let generation = state.next_path_validation_generation();
+        state.path_input = Some(TextInputState::new("/tmp/other".to_string()));
+
+        assert!(!state.is_current_path_validation(generation, &origin));
+    }
+
+    fn unique_test_audio_path(name: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "tonepoet-browse-{name}-{}-{}.flac",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn local_tag_search_cache_is_fingerprint_validated() {
+        let path = unique_test_audio_path("fingerprint-cache");
+        std::fs::write(&path, b"not real audio").expect("write test file");
+        let fingerprint = TagCacheFingerprint::for_path(&path).expect("fingerprint");
+
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            path.clone(),
+            CachedTagSearchString {
+                fingerprint,
+                tag_string: "old artist old album".to_string(),
+            },
+        );
+
+        assert_eq!(build_tag_search_string_cached(&path, &mut cache), "old artist old album");
+
+        // Changing the file size simulates a metadata rewrite and must make the
+        // path-only cached tag text unusable even while the search panel stays open.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for append");
+        f.write_all(b"changed").expect("append");
+        drop(f);
+
+        assert_eq!(build_tag_search_string_cached(&path, &mut cache), "");
+        assert_ne!(
+            cache.get(&path).map(|cached| cached.tag_string.as_str()),
+            Some("old artist old album")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn metadata_write_invalidation_prevents_active_local_tag_search_from_using_stale_text() {
+        let path = unique_test_audio_path("metadata-invalidation");
+        std::fs::write(&path, b"not real audio").expect("write test file");
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let fingerprint = TagCacheFingerprint::for_path(&path).expect("fingerprint");
+
+        let mut state = BrowseState::new();
+        state.search.active = true;
+        state.search.mode = SearchMode::Tags;
+        state.all_dirs.clear();
+        state.parent_entry = None;
+        state.all_files = vec![BrowseEntry::new(
+            path.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            metadata.len(),
+            metadata.modified().ok(),
+        )];
+        state.search.tag_cache.insert(
+            path.clone(),
+            CachedTagSearchString {
+                fingerprint,
+                tag_string: "staleartist stalealbum".to_string(),
+            },
+        );
+
+        state.execute_search_local("staleartist", true, false, FormatFilter::Off, SearchMode::Tags);
+        assert_eq!(state.entries.len(), 1, "cached old tag text should initially match");
+
+        state.invalidate_search_tag_cache_for_metadata_path(&path);
+        state.execute_search_local("staleartist", true, false, FormatFilter::Off, SearchMode::Tags);
+        assert!(
+            state.entries.is_empty(),
+            "after metadata-write invalidation, active local tag search must not reuse stale tag text"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn navigation_clears_local_tag_search_cache() {
+        let path = unique_test_audio_path("nav-clear");
+        std::fs::write(&path, b"not real audio").expect("write test file");
+        let fingerprint = TagCacheFingerprint::for_path(&path).expect("fingerprint");
+
+        let mut state = BrowseState::new();
+        state.search.tag_cache.insert(
+            path.clone(),
+            CachedTagSearchString {
+                fingerprint,
+                tag_string: "old artist".to_string(),
+            },
+        );
+
+        state.reset_nav_state();
+        assert!(state.search.tag_cache.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn archive_staged_metadata_write_invalidates_synthetic_archive_entry_tag_cache() {
+        let archive_path = std::path::PathBuf::from("/tmp/test-archive.zip");
+        let staging_dir = std::env::temp_dir().join(format!(
+            "tonepoet-staging-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let staged_file = staging_dir.join("Disc 1").join("01.flac");
+        std::fs::create_dir_all(staged_file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&staged_file, b"not real audio").expect("write staged file");
+        let fingerprint = TagCacheFingerprint::for_path(&staged_file).expect("fingerprint");
+        let synthetic = archive_path.join("Disc 1").join("01.flac");
+
+        let mut state = BrowseState::new();
+        state.archive = Some(ArchiveBrowseState {
+            listing: crate::tui::archive_listing::ArchiveListing {
+                archive_path: archive_path.clone(),
+                format: "zip".to_string(),
+                physical_size: 0,
+                entries: Vec::new(),
+            },
+            inner_path: String::new(),
+            password: None,
+            staging: Some(ArchiveStagingSession::new(
+                staging_dir.clone(),
+                archive_path.clone(),
+                0,
+                0,
+                0,
+            )),
+        });
+        state.search.tag_cache.insert(
+            synthetic.clone(),
+            CachedTagSearchString {
+                fingerprint,
+                tag_string: "stale archive artist".to_string(),
+            },
+        );
+
+        state.invalidate_search_tag_cache_for_metadata_path(&staged_file);
+        assert!(!state.search.tag_cache.contains_key(&synthetic));
+
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+
+
+    #[test]
+    fn show_hidden_toggle_preserves_active_local_search_results() {
+        let visible_path = std::path::PathBuf::from("/tmp/needle-visible.flac");
+        let hidden_path = std::path::PathBuf::from("/tmp/.needle-hidden.flac");
+        let other_path = std::path::PathBuf::from("/tmp/other.flac");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let mut state = BrowseState::new();
+        state.show_hidden = false;
+        state.search.active = true;
+        state.search.recursive = false;
+        state.search.mode = SearchMode::Filename;
+        state.search.audio_only = false;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.parent_entry = None;
+        state.all_dirs.clear();
+        state.all_files = vec![
+            BrowseEntry::new(
+                visible_path.clone(),
+                "needle-visible.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                hidden_path.clone(),
+                ".needle-hidden.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                other_path,
+                "other.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+        ];
+
+        state.execute_search(Some(&tx));
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].path, visible_path);
+
+        state.toggle_hidden_with_search(Some(&tx));
+        let result_paths = state
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(state.search.active);
+        assert!(state.show_hidden);
+        assert_eq!(result_paths.len(), 2);
+        assert!(result_paths.contains(&visible_path));
+        assert!(result_paths.contains(&hidden_path));
+        assert!(state
+            .entries
+            .iter()
+            .all(|entry| entry.name_lower.contains("needle")));
+    }
+
+    #[test]
+    fn active_local_search_filter_change_keeps_query_constrained_results() {
+        let flac_path = std::path::PathBuf::from("/tmp/needle.flac");
+        let mp3_path = std::path::PathBuf::from("/tmp/needle.mp3");
+        let other_path = std::path::PathBuf::from("/tmp/other.flac");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let mut state = BrowseState::new();
+        state.search.active = true;
+        state.search.recursive = false;
+        state.search.mode = SearchMode::Filename;
+        state.search.audio_only = false;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.parent_entry = None;
+        state.all_dirs.clear();
+        state.all_files = vec![
+            BrowseEntry::new(
+                flac_path.clone(),
+                "needle.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                mp3_path,
+                "needle.mp3".to_string(),
+                EntryKind::AudioFile(AudioFormat::Mp3),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                other_path,
+                "other.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+        ];
+
+        state.execute_search(Some(&tx));
+        assert_eq!(state.entries.len(), 2);
+
+        state.set_format_filter_with_search(FormatFilter::Only(AudioFormat::Flac), Some(&tx));
+
+        assert!(state.search.active);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].path, flac_path);
+        assert!(state
+            .entries
+            .iter()
+            .all(|entry| entry.name_lower.contains("needle")));
+    }
+
+    #[test]
+    fn active_local_search_default_sort_change_does_not_restore_directory_listing() {
+        let needle_a = std::path::PathBuf::from("/tmp/needle-a.flac");
+        let needle_b = std::path::PathBuf::from("/tmp/needle-b.flac");
+        let other = std::path::PathBuf::from("/tmp/other.flac");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let mut state = BrowseState::new();
+        state.search.active = true;
+        state.search.recursive = false;
+        state.search.mode = SearchMode::Filename;
+        state.search.audio_only = false;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.parent_entry = None;
+        state.all_dirs.clear();
+        state.all_files = vec![
+            BrowseEntry::new(
+                needle_a,
+                "needle-a.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                1,
+                None,
+            ),
+            BrowseEntry::new(
+                needle_b,
+                "needle-b.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                2,
+                None,
+            ),
+            BrowseEntry::new(
+                other,
+                "other.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                3,
+                None,
+            ),
+        ];
+
+        state.execute_search(Some(&tx));
+        assert_eq!(state.entries.len(), 2);
+
+        state.set_default_sort_with_search(SortBy::Size, SortDir::Asc, true, Some(&tx));
+
+        assert!(state.search.active);
+        assert_eq!(state.entries.len(), 2);
+        assert!(state
+            .entries
+            .iter()
+            .all(|entry| entry.name_lower.contains("needle")));
+        assert_eq!(state.default_sort_by, SortBy::Size);
+        assert_eq!(state.default_sort_dir, SortDir::Asc);
+    }
+
+    #[test]
+    fn active_local_search_restore_defaults_does_not_restore_directory_listing() {
+        let needle = std::path::PathBuf::from("/tmp/needle.flac");
+        let other = std::path::PathBuf::from("/tmp/other.flac");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let mut state = BrowseState::new();
+        state.show_hidden = true;
+        state.format_filter = FormatFilter::Only(AudioFormat::Flac);
+        state.search.active = true;
+        state.search.recursive = false;
+        state.search.mode = SearchMode::Filename;
+        state.search.audio_only = false;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.parent_entry = None;
+        state.all_dirs.clear();
+        state.all_files = vec![
+            BrowseEntry::new(
+                needle.clone(),
+                "needle.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                other,
+                "other.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+        ];
+
+        state.execute_search(Some(&tx));
+        assert_eq!(state.entries.len(), 1);
+
+        state.apply_browsing_config_with_search(&crate::config::BrowsingConfig::default(), Some(&tx));
+
+        assert!(state.search.active);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].path, needle);
+        assert!(state
+            .entries
+            .iter()
+            .all(|entry| entry.name_lower.contains("needle")));
+        assert_eq!(state.show_hidden, crate::config::BrowsingConfig::default().show_hidden);
+    }
+
+    #[test]
+    fn hidden_toggle_captured_config_matches_keyboard_and_context_persistence_payload() {
+        let mut state = BrowseState::new();
+        state.show_hidden = false;
+        state.toggle_hidden_with_search(None);
+
+        let captured = state.capture_browsing_config();
+        assert!(captured.show_hidden);
+    }
+
+    #[tokio::test]
+    async fn show_hidden_toggle_replaces_active_recursive_search() {
+        let root = std::env::temp_dir().join(format!(
+            "tonepoet-recursive-hidden-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("needle-visible.flac"), b"not real audio").expect("write visible");
+        std::fs::write(root.join(".needle-hidden.flac"), b"not real audio").expect("write hidden");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let old_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut state = BrowseState::new();
+        state.current_dir = root.clone();
+        state.show_hidden = false;
+        state.search.active = true;
+        state.search.recursive = true;
+        state.search.mode = SearchMode::Filename;
+        state.search.audio_only = false;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.search.cancel = Some(old_cancel.clone());
+        state.search.searching = true;
+        let old_generation = state.search.generation;
+
+        state.toggle_hidden_with_search(Some(&tx));
+
+        assert!(old_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(state.show_hidden);
+        assert!(state.search.searching);
+        assert!(state.search.cancel.is_some());
+        assert!(state.search.generation > old_generation);
+
+        let message = rx.recv().await.expect("recursive search completion");
+        match message {
+            crate::tui::message::AppMessage::SearchComplete {
+                generation,
+                root: completed_root,
+                query,
+                show_hidden,
+                results,
+                ..
+            } => {
+                assert_eq!(generation, state.search.generation);
+                assert_eq!(completed_root, root);
+                assert_eq!(query, "needle");
+                assert!(show_hidden);
+                assert!(results
+                    .iter()
+                    .any(|(entry, _)| entry.name == ".needle-hidden.flac"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn active_local_search_refresh_reapplies_query_after_scan_data_changes() {
+        let needle = std::path::PathBuf::from("/tmp/needle-refresh.flac");
+        let other = std::path::PathBuf::from("/tmp/other-refresh.flac");
+
+        let mut state = BrowseState::new();
+        state.search.active = true;
+        state.search.recursive = false;
+        state.search.mode = SearchMode::Filename;
+        state.search.audio_only = false;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.parent_entry = None;
+        state.all_dirs.clear();
+        state.all_files = vec![
+            BrowseEntry::new(
+                needle.clone(),
+                "needle-refresh.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                other.clone(),
+                "other-refresh.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+        ];
+        state.entries = state.all_files.clone();
+
+        state.reapply_after_directory_scan_complete(None);
+
+        assert!(state.search.active);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].path, needle);
+        assert!(state
+            .entries
+            .iter()
+            .all(|entry| entry.name_lower.contains("needle")));
+    }
+
+    #[tokio::test]
+    async fn active_recursive_search_refresh_invalidates_and_restarts_after_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "tonepoet-recursive-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("needle-refresh.flac"), b"not real audio").expect("write needle");
+        std::fs::write(root.join("other-refresh.flac"), b"not real audio").expect("write other");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let old_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut state = BrowseState::new();
+        state.current_dir = root.clone();
+        state.set_tx(tx.clone());
+        state.search.active = true;
+        state.search.recursive = true;
+        state.search.mode = SearchMode::Filename;
+        state.search.audio_only = false;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.search.cancel = Some(old_cancel.clone());
+        state.search.searching = true;
+        let old_generation = state.search.generation;
+
+        state.refresh();
+
+        assert!(old_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(state.search.active);
+        assert!(state.search.recursive);
+        assert!(state.search.generation > old_generation);
+        assert!(state.pending_scan_generation().is_some());
+
+        state.parent_entry = None;
+        state.all_dirs.clear();
+        state.all_files = vec![
+            BrowseEntry::new(
+                root.join("needle-refresh.flac"),
+                "needle-refresh.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                root.join("other-refresh.flac"),
+                "other-refresh.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                0,
+                None,
+            ),
+        ];
+
+        state.reapply_after_directory_scan_complete(Some(&tx));
+        assert!(state.search.searching);
+
+        let mut saw_replacement = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Some(message) = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("message timeout")
+            else {
+                break;
+            };
+            if let crate::tui::message::AppMessage::SearchComplete {
+                root: completed_root,
+                query,
+                show_hidden,
+                results,
+                ..
+            } = message
+            {
+                if completed_root == root && query == "needle" {
+                    assert_eq!(show_hidden, state.show_hidden);
+                    assert!(results
+                        .iter()
+                        .all(|(entry, _)| entry.name_lower.contains("needle")));
+                    saw_replacement = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_replacement, "refresh should launch a replacement recursive search");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opening_search_when_active_focuses_without_blank_query_or_stale_results() {
+        let result_path = std::path::PathBuf::from("/tmp/needle-existing.flac");
+        let mut state = BrowseState::new();
+        state.search.active = true;
+        state.search.focus = SearchFocus::Results;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.entries = vec![BrowseEntry::new(
+            result_path.clone(),
+            "needle-existing.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            0,
+            None,
+        )];
+
+        state.open_search();
+
+        assert!(state.search.active);
+        assert_eq!(state.search.focus, SearchFocus::Input);
+        assert_eq!(state.search.input.text, "needle");
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].path, result_path);
+    }
+
+    #[test]
+    fn directory_navigation_closes_search_instead_of_carrying_stale_panel() {
+        let root = std::env::temp_dir().join(format!(
+            "tonepoet-search-nav-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).expect("mkdir child");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut state = BrowseState::new();
+        state.current_dir = root.clone();
+        state.search.active = true;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.search.cancel = Some(cancel.clone());
+        state.search.searching = true;
+
+        state.navigate_to(child.clone());
+
+        assert_eq!(state.current_dir, child);
+        assert!(!state.search.active);
+        assert!(state.search.input.text.is_empty());
+        assert!(state.search.cancel.is_none());
+        assert!(!state.search.searching);
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5459,6 +8595,700 @@ FILE "10 - Live Version.wav" WAVE
             !fresh_probe.contains("metadata.preemphasis_metadata.is_none()"),
             "successful fresh browse metadata reads already perform PE enrichment and must not repeat it"
         );
+    }
+
+
+    fn archive_listing_for_tests(entries: Vec<crate::tui::archive_listing::ArchiveEntry>) -> crate::tui::archive_listing::ArchiveListing {
+        archive_listing_for_tests_at(std::path::PathBuf::from("/tmp/test-album.zip"), entries)
+    }
+
+    fn archive_listing_for_tests_at(
+        archive_path: std::path::PathBuf,
+        entries: Vec<crate::tui::archive_listing::ArchiveEntry>,
+    ) -> crate::tui::archive_listing::ArchiveListing {
+        crate::tui::archive_listing::ArchiveListing {
+            archive_path,
+            format: "zip".to_string(),
+            physical_size: 4096,
+            entries,
+        }
+    }
+
+    fn archive_entry_for_tests(path: &str, is_dir: bool) -> crate::tui::archive_listing::ArchiveEntry {
+        crate::tui::archive_listing::ArchiveEntry {
+            path: path.to_string(),
+            size: if is_dir { 0 } else { 100 },
+            packed_size: if is_dir { 0 } else { 80 },
+            is_dir,
+            encrypted: false,
+        }
+    }
+
+    #[test]
+    fn archive_view_audio_filter_hides_non_audio_entries() {
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![
+                archive_entry_for_tests("track.flac", false),
+                archive_entry_for_tests("cover.jpg", false),
+                archive_entry_for_tests("notes.txt", false),
+            ]),
+            None,
+        );
+
+        state.set_format_filter(FormatFilter::AudioOnly);
+
+        let names: Vec<_> = state.entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"track.flac"));
+        assert!(!names.contains(&"cover.jpg"));
+        assert!(!names.contains(&"notes.txt"));
+        assert!(state.all_files.iter().any(|entry| entry.name == "cover.jpg"));
+    }
+
+    #[test]
+    fn archive_view_honors_hidden_filter_without_losing_raw_model() {
+        let mut state = BrowseState::new();
+        state.show_hidden = false;
+        state.enter_archive(
+            archive_listing_for_tests(vec![
+                archive_entry_for_tests(".hidden.flac", false),
+                archive_entry_for_tests("visible.flac", false),
+            ]),
+            None,
+        );
+
+        let visible_names: Vec<_> = state.entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(visible_names.contains(&"visible.flac"));
+        assert!(!visible_names.contains(&".hidden.flac"));
+        assert!(state.all_files.iter().any(|entry| entry.name == ".hidden.flac"));
+
+        state.toggle_hidden();
+        let visible_names: Vec<_> = state.entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(visible_names.contains(&".hidden.flac"));
+    }
+
+    #[test]
+    fn archive_local_search_uses_archive_model_not_parent_directory_model() {
+        let mut state = BrowseState::new();
+        state.all_files = vec![BrowseEntry::new(
+            std::path::PathBuf::from("/parent/needle.flac"),
+            "needle.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            100,
+            None,
+        )];
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("archive-track.flac", false)]),
+            None,
+        );
+
+        state.search.active = true;
+        state.search.mode = SearchMode::Filename;
+        state.search.input = TextInputState::new("archive".to_string());
+        state.execute_search(None);
+
+        let names: Vec<_> = state.entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"archive-track.flac"));
+        assert!(!names.contains(&"needle.flac"));
+        assert!(state.entries.iter().any(|entry| entry.path == std::path::PathBuf::from("/tmp/test-album.zip/archive-track.flac")));
+    }
+
+    #[test]
+    fn archive_recursive_search_is_archive_local() {
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![
+                archive_entry_for_tests("Disc 1", true),
+                archive_entry_for_tests("Disc 1/01 - Song.flac", false),
+                archive_entry_for_tests("Disc 1/cover.jpg", false),
+            ]),
+            None,
+        );
+
+        state.search.active = true;
+        state.search.recursive = true;
+        state.search.mode = SearchMode::Filename;
+        state.search.input = TextInputState::new("song".to_string());
+        state.execute_search(None);
+
+        let names: Vec<_> = state.entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"Disc 1/01 - Song.flac"));
+        assert!(!names.contains(&"Disc 1/cover.jpg"));
+    }
+
+    fn cache_archive_probe_metadata(
+        state: &mut BrowseState,
+        inner_path: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+        album: Option<&str>,
+        year: Option<&str>,
+    ) {
+        let archive_path = state
+            .archive
+            .as_ref()
+            .expect("archive state")
+            .listing
+            .archive_path
+            .clone();
+        state.probe_cache.insert(
+            archive_path.join(inner_path),
+            Some(std::sync::Arc::new(CachedInfo {
+                source: crate::tui::probe::SourceInfo {
+                    format_name: "FLAC".to_string(),
+                    codec: "flac".to_string(),
+                    bit_depth: Some(16),
+                    sample_rate: 44_100,
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: 4096,
+                },
+                metadata: crate::tui::probe::SourceMetadata {
+                    title: title.map(str::to_string),
+                    artist: artist.map(str::to_string),
+                    album: album.map(str::to_string),
+                    year: year.map(str::to_string),
+                    ..Default::default()
+                },
+            })),
+        );
+    }
+
+    fn result_names_without_parent(state: &BrowseState) -> Vec<String> {
+        state
+            .entries
+            .iter()
+            .filter(|entry| !matches!(entry.kind, EntryKind::ParentDir))
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
+    fn cached_archive_tags(
+        state: &mut BrowseState,
+        archive_path: &std::path::Path,
+        inner_path: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+        album: Option<&str>,
+        year: Option<&str>,
+    ) {
+        let synthetic = archive_path.join(inner_path);
+        let fingerprint = TagCacheFingerprint::for_path(archive_path).expect("archive fingerprint");
+        let mut tags = TagReadResult::empty();
+        tags.title = title.map(str::to_string);
+        tags.artist = artist.map(str::to_string);
+        tags.album = album.map(str::to_string);
+        tags.year = year.map(str::to_string);
+        let mut parts = Vec::new();
+        if let Some(value) = tags.title.as_deref() { parts.push(value); }
+        if let Some(value) = tags.artist.as_deref() { parts.push(value); }
+        if let Some(value) = tags.album.as_deref() { parts.push(value); }
+        if let Some(value) = tags.year.as_deref() { parts.push(value); }
+        tags.tag_string = parts.join(" ").to_ascii_lowercase();
+        state.search.archive_tag_cache.insert(
+            synthetic,
+            CachedArchiveTagSearchString {
+                archive_fingerprint: fingerprint,
+                password_identity: ArchiveTagPasswordIdentity::for_password(None),
+                tags,
+            },
+        );
+    }
+
+    fn install_test_archive_tags(
+        archive_path: &std::path::Path,
+        inner_path: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+        album: Option<&str>,
+        year: Option<&str>,
+    ) {
+        let mut tags = TagReadResult::empty();
+        tags.title = title.map(str::to_string);
+        tags.artist = artist.map(str::to_string);
+        tags.album = album.map(str::to_string);
+        tags.year = year.map(str::to_string);
+        let mut parts = Vec::new();
+        if let Some(value) = tags.title.as_deref() { parts.push(value); }
+        if let Some(value) = tags.artist.as_deref() { parts.push(value); }
+        if let Some(value) = tags.album.as_deref() { parts.push(value); }
+        if let Some(value) = tags.year.as_deref() { parts.push(value); }
+        tags.tag_string = parts.join(" ").to_ascii_lowercase();
+
+        let fixtures = TEST_ARCHIVE_TAG_FIXTURES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        fixtures
+            .lock()
+            .expect("test archive tag fixtures")
+            .insert((archive_path.to_path_buf(), inner_path.to_string()), tags);
+    }
+
+    #[tokio::test]
+    async fn archive_async_tags_search_finds_unprobed_entry_without_preseeded_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive file");
+        install_test_archive_tags(
+            &archive,
+            "track.flac",
+            Some("Async Title"),
+            Some("Async Artist"),
+            Some("Async Album"),
+            Some("1986"),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![archive_entry_for_tests("track.flac", false)],
+            ),
+            None,
+        );
+        state.search.active = true;
+        state.search.mode = SearchMode::Tags;
+        state.search.input = TextInputState::new("async artist".to_string());
+
+        assert!(state.probe_cache.is_empty());
+        assert!(state.search.archive_tag_cache.is_empty());
+        state.execute_search(Some(&tx));
+        assert!(state.search.searching, "archive tag search should run asynchronously");
+
+        let message = rx.recv().await.expect("archive search completion");
+        match message {
+            crate::tui::message::AppMessage::SearchComplete {
+                archive_path,
+                archive_inner_path,
+                pre_sorted,
+                archive_tag_cache_updates,
+                results,
+                ..
+            } => {
+                assert_eq!(archive_path.as_deref(), Some(archive.as_path()));
+                assert_eq!(archive_inner_path.as_deref(), Some(""));
+                assert!(pre_sorted);
+                assert!(!archive_tag_cache_updates.is_empty());
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].0.name, "track.flac");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_unprobed_tag_source_is_extraction_backed_not_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive file");
+
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![archive_entry_for_tests("track.flac", false)],
+            ),
+            Some("secret".to_string()),
+        );
+
+        let entry = state
+            .all_files
+            .iter()
+            .find(|entry| entry.name == "track.flac")
+            .expect("archive file entry")
+            .clone();
+        assert!(!state.probe_cache.contains_key(&entry.path));
+
+        match state.tag_source_for_entry(&entry) {
+            TagSearchSource::ExtractArchiveEntry { archive_path, inner_path, password, synthetic_path } => {
+                assert_eq!(archive_path, archive);
+                assert_eq!(inner_path, "track.flac");
+                assert_eq!(password.as_deref(), Some("secret"));
+                assert_eq!(synthetic_path, entry.path);
+            }
+            other => panic!("unprobed archive audio entry should be extraction-backed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_tags_search_uses_archive_tag_cache_without_probe_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive file");
+
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![archive_entry_for_tests("track.flac", false)],
+            ),
+            None,
+        );
+        cached_archive_tags(
+            &mut state,
+            &archive,
+            "track.flac",
+            Some("Unprobed Title"),
+            Some("Unprobed Artist"),
+            Some("Unprobed Album"),
+            Some("1984"),
+        );
+
+        state.search.active = true;
+        state.search.mode = SearchMode::Tags;
+        state.search.input = TextInputState::new("unprobed artist".to_string());
+        state.execute_search(None);
+
+        assert!(state.probe_cache.is_empty());
+        assert_eq!(result_names_without_parent(&state), vec!["track.flac".to_string()]);
+    }
+
+    #[test]
+    fn archive_recursive_tags_search_uses_archive_tag_cache_for_descendants() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive file");
+
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![
+                    archive_entry_for_tests("Disc 1", true),
+                    archive_entry_for_tests("Disc 1/01.flac", false),
+                ],
+            ),
+            None,
+        );
+        cached_archive_tags(
+            &mut state,
+            &archive,
+            "Disc 1/01.flac",
+            Some("Recursive Title"),
+            Some("Deep Artist"),
+            Some("Album"),
+            None,
+        );
+
+        state.search.active = true;
+        state.search.recursive = true;
+        state.search.mode = SearchMode::Tags;
+        state.search.input = TextInputState::new("deep artist".to_string());
+        state.execute_search(None);
+
+        assert_eq!(result_names_without_parent(&state), vec!["Disc 1/01.flac".to_string()]);
+    }
+
+    #[test]
+    fn active_archive_both_search_reapplies_when_probe_metadata_arrives() {
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+
+        state.search.active = true;
+        state.search.mode = SearchMode::Both;
+        state.search.input = TextInputState::new("late artist".to_string());
+        state.execute_search(None);
+        assert!(result_names_without_parent(&state).is_empty());
+
+        cache_archive_probe_metadata(
+            &mut state,
+            "track.flac",
+            Some("Late Title"),
+            Some("Late Artist"),
+            Some("Album"),
+            None,
+        );
+        state.resort_after_probe_cache_update();
+
+        assert_eq!(result_names_without_parent(&state), vec!["track.flac".to_string()]);
+    }
+
+    #[test]
+    fn active_archive_tag_sort_reorders_when_probe_metadata_arrives() {
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![
+                archive_entry_for_tests("a.flac", false),
+                archive_entry_for_tests("b.flac", false),
+            ]),
+            None,
+        );
+
+        state.search.active = true;
+        state.search.mode = SearchMode::Both;
+        state.search.sort = SearchSort::Artist;
+        state.search.sort_dir = SortDir::Asc;
+        state.search.input = TextInputState::new("flac".to_string());
+        state.execute_search(None);
+
+        cache_archive_probe_metadata(&mut state, "a.flac", Some("A"), Some("Zulu"), None, None);
+        cache_archive_probe_metadata(&mut state, "b.flac", Some("B"), Some("Alpha"), None, None);
+        state.resort_after_probe_cache_update();
+
+        assert_eq!(result_names_without_parent(&state), vec!["b.flac".to_string(), "a.flac".to_string()]);
+    }
+
+    #[test]
+    fn archive_tags_search_uses_probe_cache_metadata() {
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        cache_archive_probe_metadata(
+            &mut state,
+            "track.flac",
+            Some("Hidden Title"),
+            Some("Needle Artist"),
+            Some("Archive Album"),
+            Some("1984"),
+        );
+
+        state.search.active = true;
+        state.search.mode = SearchMode::Tags;
+        state.search.input = TextInputState::new("needle artist".to_string());
+        state.execute_search(None);
+
+        let names = result_names_without_parent(&state);
+        assert_eq!(names, vec!["track.flac".to_string()]);
+    }
+
+    #[test]
+    fn archive_both_search_matches_filename_or_archive_metadata() {
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![
+                archive_entry_for_tests("boring.flac", false),
+                archive_entry_for_tests("filename-needle.flac", false),
+                archive_entry_for_tests("miss.flac", false),
+            ]),
+            None,
+        );
+        cache_archive_probe_metadata(
+            &mut state,
+            "boring.flac",
+            Some("Needle Title"),
+            Some("Artist"),
+            Some("Album"),
+            None,
+        );
+
+        state.search.active = true;
+        state.search.mode = SearchMode::Both;
+        state.search.input = TextInputState::new("needle".to_string());
+        state.execute_search(None);
+
+        let names = result_names_without_parent(&state);
+        assert!(names.contains(&"boring.flac".to_string()));
+        assert!(names.contains(&"filename-needle.flac".to_string()));
+        assert!(!names.contains(&"miss.flac".to_string()));
+    }
+
+    #[test]
+    fn archive_tag_sort_uses_probe_cache_metadata_not_synthetic_paths() {
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![
+                archive_entry_for_tests("zeta.flac", false),
+                archive_entry_for_tests("alpha.flac", false),
+            ]),
+            None,
+        );
+        cache_archive_probe_metadata(&mut state, "zeta.flac", Some("Z"), Some("Zulu"), Some("B"), Some("1999"));
+        cache_archive_probe_metadata(&mut state, "alpha.flac", Some("A"), Some("Alpha"), Some("A"), Some("2001"));
+
+        state.search.active = true;
+        state.search.mode = SearchMode::Both;
+        state.search.sort = SearchSort::Artist;
+        state.search.sort_dir = SortDir::Asc;
+        state.search.input = TextInputState::new("flac".to_string());
+        state.execute_search(None);
+
+        let names = result_names_without_parent(&state);
+        assert_eq!(names, vec!["alpha.flac".to_string(), "zeta.flac".to_string()]);
+    }
+
+    #[test]
+    fn archive_staging_tag_search_falls_back_to_probe_metadata_for_synthetic_entry() {
+        let staging_dir = std::env::temp_dir().join(format!(
+            "tonepoet-archive-tag-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let staged_file = staging_dir.join("Disc 1").join("01.flac");
+        std::fs::create_dir_all(staged_file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&staged_file, b"not real audio, forcing probe-cache fallback").expect("write staged file");
+
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("Disc 1/01.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        state.archive.as_mut().expect("archive").staging = Some(ArchiveStagingSession::new(
+            staging_dir.clone(),
+            archive_path,
+            0,
+            0,
+            0,
+        ));
+        cache_archive_probe_metadata(
+            &mut state,
+            "Disc 1/01.flac",
+            Some("Staged Needle"),
+            Some("Staged Artist"),
+            Some("Staged Album"),
+            None,
+        );
+
+        state.search.active = true;
+        state.search.mode = SearchMode::Tags;
+        state.search.input = TextInputState::new("staged needle".to_string());
+        state.execute_search(None);
+
+        let names = result_names_without_parent(&state);
+        assert_eq!(names, vec!["Disc 1/01.flac".to_string()]);
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+
+    #[tokio::test]
+    async fn archive_refresh_with_active_tag_search_launches_async_worker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive file");
+        install_test_archive_tags(
+            &archive,
+            "track.flac",
+            Some("Needle Title"),
+            Some("Needle Artist"),
+            Some("Album"),
+            None,
+        );
+
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![archive_entry_for_tests("track.flac", false)],
+            ),
+            None,
+        );
+        state.search.active = true;
+        state.search.mode = SearchMode::Tags;
+        state.search.input = TextInputState::new("needle artist".to_string());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        state.refresh_with_search(Some(&tx));
+
+        assert!(state.search.searching, "archive tag refresh should launch an async worker");
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("search completion timeout")
+            .expect("search completion");
+        match msg {
+            crate::tui::message::AppMessage::SearchComplete {
+                archive_path,
+                mode,
+                archive_tag_cache_updates,
+                results,
+                ..
+            } => {
+                assert_eq!(archive_path, Some(archive.clone()));
+                assert_eq!(mode, SearchMode::Tags);
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].0.name, "track.flac");
+                assert!(!archive_tag_cache_updates.is_empty());
+            }
+            other => panic!("expected archive SearchComplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_tag_cache_is_password_identity_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("encrypted.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive file");
+        install_test_archive_tags(
+            &archive,
+            "track.flac",
+            Some("Correct Password Title"),
+            Some("Correct Artist"),
+            Some("Album"),
+            None,
+        );
+
+        let mut state = BrowseState::new();
+        let synthetic = archive.join("track.flac");
+        let fingerprint = TagCacheFingerprint::for_path(&archive).expect("archive fingerprint");
+        let mut stale = TagReadResult::empty();
+        stale.title = Some("Stale Title".to_string());
+        stale.artist = Some("Stale Artist".to_string());
+        stale.tag_string = "stale title stale artist".to_string();
+        state.search.archive_tag_cache.insert(
+            synthetic.clone(),
+            CachedArchiveTagSearchString {
+                archive_fingerprint: fingerprint,
+                password_identity: ArchiveTagPasswordIdentity::for_password(Some("wrong")),
+                tags: stale,
+            },
+        );
+
+        let tags = state.archive_tag_read_result_cached(
+            &archive,
+            "track.flac",
+            Some("correct"),
+            &synthetic,
+        );
+
+        assert!(tags.tag_string.contains("correct artist"));
+        let cached = state.search.archive_tag_cache.get(&synthetic).expect("refreshed cache");
+        assert_eq!(
+            cached.password_identity,
+            ArchiveTagPasswordIdentity::for_password(Some("correct"))
+        );
+        assert!(cached.tags.tag_string.contains("correct artist"));
+    }
+
+    #[test]
+    fn changing_archive_password_clears_archive_tag_cache_for_archive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("encrypted.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive file");
+
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![archive_entry_for_tests("track.flac", false)],
+            ),
+            Some("wrong".to_string()),
+        );
+        cached_archive_tags(
+            &mut state,
+            &archive,
+            "track.flac",
+            Some("Cached"),
+            Some("Artist"),
+            None,
+            None,
+        );
+        assert!(!state.search.archive_tag_cache.is_empty());
+
+        state.replace_active_archive_listing(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![archive_entry_for_tests("track.flac", false)],
+            ),
+            Some("correct".to_string()),
+        );
+
+        assert!(state.search.archive_tag_cache.is_empty());
     }
 
 }

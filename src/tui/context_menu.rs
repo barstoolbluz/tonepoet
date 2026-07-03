@@ -10,6 +10,14 @@ use super::browse::{BrowseEntry, EntryKind};
 use super::message::AppMessage;
 use crate::convert::ConversionStatus;
 
+
+fn persist_browse_config(app: &mut AppState) {
+    app.config.browsing = app.browse.capture_browsing_config();
+    if let Err(err) = app.config.save() {
+        app.set_status(format!("browse settings changed, but config save failed: {err}"));
+    }
+}
+
 // ── Data structures ─────────────────────────────────────────────────
 
 /// Hard cap on the cascade depth of context menus. The active overlay
@@ -1420,20 +1428,21 @@ pub fn execute_context_action(
         }
         ContextAction::Refresh => {
             if app.current_screen == AppScreen::Browse {
-                app.browse.refresh();
+                app.browse.refresh_with_search(Some(tx));
                 app.browse.probe_current_with_db(tx, Some(&app.db));
                 app.set_status("refreshed");
             }
         }
         ContextAction::ToggleHidden => {
             if app.current_screen == AppScreen::Browse {
-                app.browse.toggle_hidden();
+                app.browse.toggle_hidden_with_search(Some(tx));
+                persist_browse_config(app);
                 app.browse.probe_current_with_db(tx, Some(&app.db));
             }
         }
         ContextAction::CycleSortBy => {
             if app.current_screen == AppScreen::Browse {
-                app.browse.cycle_sort_by();
+                app.browse.cycle_sort_by_with_search(Some(tx));
                 let msg = format!(
                     "Sort: {} {}",
                     app.browse.sort_by.label(),

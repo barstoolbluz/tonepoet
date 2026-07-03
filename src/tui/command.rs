@@ -63,6 +63,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "sort",
     "sortdir",
     "filter",
+    "refresh",
     "rename",
     "del",
     "delete",
@@ -316,6 +317,8 @@ pub enum Command {
     SortDir,
     /// Filter command for the browse screen. Arg: format name or empty (cycle)
     Filter(Option<String>),
+    /// Refresh the current browse directory from the filesystem.
+    Refresh,
     /// Rename the current browse selection to the given name.
     /// Empty arg opens the rename overlay seeded with the current name.
     Rename(String),
@@ -528,6 +531,7 @@ impl std::fmt::Debug for Command {
             Command::Sort(field, dir) => f.debug_tuple("Sort").field(field).field(dir).finish(),
             Command::SortDir => f.write_str("SortDir"),
             Command::Filter(arg) => f.debug_tuple("Filter").field(arg).finish(),
+            Command::Refresh => f.write_str("Refresh"),
             Command::Rename(arg) => f.debug_tuple("Rename").field(arg).finish(),
             Command::Delete => f.write_str("Delete"),
             Command::Copy { dest, force } => f
@@ -740,6 +744,7 @@ pub fn parse_command(input: &str) -> Command {
             };
             Command::Filter(arg)
         }
+        "refresh" => Command::Refresh,
         "del" | "delete" | "trash" => Command::Delete,
         "rename" => Command::Rename(args.to_string()),
         "cp" | "copy" => Command::Copy {
@@ -1099,7 +1104,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             .unwrap_or_else(|| path.display().to_string());
                         app.set_status(format!("CUE written: {}", name));
                         if app.current_screen == AppScreen::Browse {
-                            app.browse.refresh();
+                            app.browse.refresh_with_search(Some(tx));
                             app.browse.probe_current_with_db(tx, Some(&app.db));
                         }
                     }
@@ -1151,7 +1156,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             .unwrap_or_else(|| path.display().to_string());
                         app.set_status(format!("CUE written: {}", name));
                         if app.current_screen == AppScreen::Browse {
-                            app.browse.refresh();
+                            app.browse.refresh_with_search(Some(tx));
                             app.browse.probe_current_with_db(tx, Some(&app.db));
                         }
                     }
@@ -1407,14 +1412,14 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             };
         }
         Command::Sort(field, dir) => {
-            execute_sort(app, field.as_deref(), dir.as_deref());
+            execute_sort(app, field.as_deref(), dir.as_deref(), tx);
         }
         Command::SortDir => {
             if app.current_screen != AppScreen::Browse {
                 app.set_status(":sortdir only works on the browse screen");
                 return;
             }
-            app.browse.toggle_sort_dir();
+            app.browse.toggle_sort_dir_with_search(Some(tx));
             let msg = format!(
                 "Sort: {} {}",
                 app.browse.sort_by.label(),
@@ -1423,7 +1428,17 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.set_status(msg);
         }
         Command::Filter(arg) => {
-            execute_filter(app, arg.as_deref());
+            execute_filter(app, arg.as_deref(), tx);
+        }
+        Command::Refresh => {
+            if app.current_screen == AppScreen::Browse {
+                app.browse.refresh_with_search(Some(tx));
+                app.browse.probe_current_with_db(tx, Some(&app.db));
+                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                app.set_status("browse refreshed");
+            } else {
+                app.set_status(":refresh is available on the browse screen");
+            }
         }
         Command::Delete => {
             execute_delete(app);
@@ -3776,7 +3791,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
 }
 
 /// Execute a :sort command for the browse screen
-fn execute_sort(app: &mut AppState, field: Option<&str>, dir: Option<&str>) {
+fn execute_sort(
+    app: &mut AppState,
+    field: Option<&str>,
+    dir: Option<&str>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
     use super::browse::{SortBy, SortDir};
 
     if app.current_screen != AppScreen::Browse {
@@ -3786,7 +3806,7 @@ fn execute_sort(app: &mut AppState, field: Option<&str>, dir: Option<&str>) {
 
     // No args → cycle to next field
     if field.is_none() {
-        app.browse.cycle_sort_by();
+        app.browse.cycle_sort_by_with_search(Some(tx));
         let msg = format!(
             "Sort: {} {}",
             app.browse.sort_by.label(),
@@ -3797,15 +3817,13 @@ fn execute_sort(app: &mut AppState, field: Option<&str>, dir: Option<&str>) {
     }
 
     // Parse explicit field
-    let new_field = match field.unwrap().to_lowercase().as_str() {
-        "name" | "n" => SortBy::Name,
-        "date" | "d" | "modified" | "m" => SortBy::Date,
-        "type" | "t" | "kind" => SortBy::Type,
-        "size" | "s" => SortBy::Size,
-        other => {
+    let requested_field = field.unwrap();
+    let new_field = match SortBy::from_label(requested_field) {
+        Some(field) => field,
+        None => {
             app.set_status(format!(
-                "Unknown sort field: {}. Try: name, date, type, size",
-                other
+                "Unknown sort field: {}. Try: name, size, date, type, format, codec, sample_rate, channels, duration, artist, album",
+                requested_field
             ));
             return;
         }
@@ -3824,7 +3842,7 @@ fn execute_sort(app: &mut AppState, field: Option<&str>, dir: Option<&str>) {
         },
     };
 
-    app.browse.set_sort(new_field, new_dir);
+    app.browse.set_sort_with_search(new_field, new_dir, Some(tx));
     let msg = format!(
         "Sort: {} {}",
         app.browse.sort_by.label(),
@@ -3834,7 +3852,7 @@ fn execute_sort(app: &mut AppState, field: Option<&str>, dir: Option<&str>) {
 }
 
 /// Execute a :filter command for the browse screen
-fn execute_filter(app: &mut AppState, arg: Option<&str>) {
+fn execute_filter(app: &mut AppState, arg: Option<&str>, tx: &mpsc::Sender<AppMessage>) {
     use super::browse::FormatFilter;
     use crate::convert::formats::AudioFormat;
 
@@ -3845,7 +3863,7 @@ fn execute_filter(app: &mut AppState, arg: Option<&str>) {
 
     // No arg → cycle to next filter
     if arg.is_none() {
-        app.browse.cycle_format_filter();
+        app.browse.cycle_format_filter_with_search(Some(tx));
         let msg = format!("Filter: {}", app.browse.format_filter.label());
         app.set_status(msg);
         return;
@@ -3872,7 +3890,7 @@ fn execute_filter(app: &mut AppState, arg: Option<&str>) {
         }
     };
 
-    app.browse.set_format_filter(new_filter);
+    app.browse.set_format_filter_with_search(new_filter, Some(tx));
     let msg = format!("Filter: {}", app.browse.format_filter.label());
     app.set_status(msg);
 }

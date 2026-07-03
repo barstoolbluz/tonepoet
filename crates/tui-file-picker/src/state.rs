@@ -89,6 +89,8 @@ pub struct TreeNode {
     pub has_children: bool,
 }
 
+/// Shared filesystem-tree construction for hosts embedding the file-picker
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePickerEntry {
     pub name: String,

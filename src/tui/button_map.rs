@@ -13,15 +13,6 @@ pub enum MetadataFieldKind {
     Year,
 }
 
-/// Sortable column in the browse screen
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ColumnKind {
-    Name,
-    Size,
-    Date,
-    Type,
-}
-
 /// Identifies a clickable element in the TUI
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TuiButton {
@@ -203,9 +194,31 @@ pub enum TuiButton {
 
     // Browse screen
     BrowseEntry(usize),
-    BrowseColumn(ColumnKind),
+    BrowseColumn(crate::tui::browse::BrowseColumn),
     BrowseList, // catch-all region for scroll wheel routing
     BrowseBreadcrumb, // click to edit path
+    BrowseToolbarBack,
+    BrowseToolbarForward,
+    BrowseToolbarUp,
+    BrowseToolbarRefresh,
+    BrowseToolbarOptions,
+    BrowseToolbarSearch,
+    BrowseToolbarShowHidden,
+    BrowsePathGo,
+    BrowsePaneToggle(crate::tui::browse::BrowsePaneId),
+    BrowsePaneTitle(crate::tui::browse::BrowsePaneId),
+    BrowseTreeNode(usize),
+    BrowseOptionsShowHidden,
+    BrowseOptionsColumns,
+    BrowseOptionsSort,
+    BrowseOptionsFilter,
+    BrowseOptionsArchiveListing,
+    BrowseOptionsSaveLayout,
+    BrowseOptionsRestoreDefaults,
+    BrowseOptionsColumn(crate::tui::browse::BrowseColumn),
+    BrowseOptionsSortChoice(crate::tui::browse::SortBy, crate::tui::browse::SortDir),
+    BrowseOptionsFilterChoice(usize),
+    BrowseOptionsArchiveChoice(usize),
 
     // Browse info pane: clickable metadata field (click → edit tag).
     BrowseInfoMeta(crate::tui::probe::MetadataField),
@@ -445,6 +458,28 @@ impl TuiButton {
             | Self::BrowseColumn(_)
             | Self::BrowseList
             | Self::BrowseBreadcrumb
+            | Self::BrowseToolbarBack
+            | Self::BrowseToolbarForward
+            | Self::BrowseToolbarUp
+            | Self::BrowseToolbarRefresh
+            | Self::BrowseToolbarOptions
+            | Self::BrowseToolbarSearch
+            | Self::BrowseToolbarShowHidden
+            | Self::BrowsePathGo
+            | Self::BrowsePaneToggle(_)
+            | Self::BrowsePaneTitle(_)
+            | Self::BrowseTreeNode(_)
+            | Self::BrowseOptionsShowHidden
+            | Self::BrowseOptionsColumns
+            | Self::BrowseOptionsSort
+            | Self::BrowseOptionsFilter
+            | Self::BrowseOptionsArchiveListing
+            | Self::BrowseOptionsSaveLayout
+            | Self::BrowseOptionsRestoreDefaults
+            | Self::BrowseOptionsColumn(_)
+            | Self::BrowseOptionsSortChoice(_, _)
+            | Self::BrowseOptionsFilterChoice(_)
+            | Self::BrowseOptionsArchiveChoice(_)
             | Self::BrowseInfoMeta(_)
             | Self::BrowseInfoAnalyze
             | Self::BrowseInfoEditTags

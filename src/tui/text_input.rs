@@ -17,6 +17,13 @@ pub struct TextInputState {
     /// When true, the entire text is selected. The next character input
     /// replaces all text; navigation keys clear the selection.
     pub select_all: bool,
+    /// Byte offset where selection started. Selection is active when this is
+    /// Some and differs from `cursor`; both endpoints are kept on UTF-8
+    /// boundaries.
+    pub selection_anchor: Option<usize>,
+    /// Internal per-field clipboard for terminal environments where the host
+    /// clipboard is unavailable to the TUI.
+    pub clipboard: String,
 }
 
 /// Completion strategy for an inline text field.
@@ -60,6 +67,8 @@ impl TextInputState {
             text: initial,
             cursor,
             select_all: false,
+            selection_anchor: None,
+            clipboard: String::new(),
         }
     }
 
@@ -70,6 +79,8 @@ impl TextInputState {
             text: initial,
             cursor,
             select_all: true,
+            selection_anchor: Some(0),
+            clipboard: String::new(),
         }
     }
 
@@ -78,14 +89,82 @@ impl TextInputState {
         Self::new(String::new())
     }
 
+    pub fn selection_range(&self) -> Option<std::ops::Range<usize>> {
+        if self.select_all && !self.text.is_empty() {
+            return Some(0..self.text.len());
+        }
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            return None;
+        }
+        let (start, end) = if anchor < self.cursor { (anchor, self.cursor) } else { (self.cursor, anchor) };
+        if self.text.is_char_boundary(start) && self.text.is_char_boundary(end) {
+            Some(start..end)
+        } else {
+            None
+        }
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.select_all = false;
+        self.selection_anchor = None;
+    }
+
+    pub fn select_all_text(&mut self) {
+        self.cursor = self.text.len();
+        self.select_all = true;
+        self.selection_anchor = Some(0);
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some(range) = self.selection_range() else {
+            self.clear_selection();
+            return false;
+        };
+        let start = range.start;
+        self.text.replace_range(range, "");
+        self.cursor = start;
+        self.clear_selection();
+        true
+    }
+
+    pub fn copy_selection(&mut self) -> bool {
+        let Some(range) = self.selection_range() else { return false; };
+        self.clipboard = self.text[range].to_string();
+        true
+    }
+
+    pub fn cut_selection(&mut self) -> bool {
+        if !self.copy_selection() {
+            return false;
+        }
+        self.delete_selection();
+        true
+    }
+
+    pub fn paste_clipboard(&mut self) -> bool {
+        if self.clipboard.is_empty() {
+            return false;
+        }
+        let clipboard = self.clipboard.clone();
+        self.insert_string(&clipboard);
+        true
+    }
+
     /// Insert a character at the cursor and advance the cursor.
     pub fn insert_char(&mut self, c: char) {
+        self.delete_selection();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
 
     /// Insert a string at the cursor and advance the cursor past it.
     pub fn insert_string(&mut self, s: &str) {
+        self.delete_selection();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
@@ -104,7 +183,7 @@ impl TextInputState {
         }
         self.text.replace_range(range.clone(), replacement);
         self.cursor = range.start + replacement.len();
-        self.select_all = false;
+        self.clear_selection();
     }
 
     /// Replace the full text and clamp the cursor to a valid char boundary.
@@ -114,11 +193,14 @@ impl TextInputState {
         while self.cursor > 0 && !self.text.is_char_boundary(self.cursor) {
             self.cursor -= 1;
         }
-        self.select_all = false;
+        self.clear_selection();
     }
 
     /// Delete the character before the cursor (Backspace behavior).
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if let Some(prev) = self.prev_char_boundary() {
             self.text.remove(prev);
             self.cursor = prev;
@@ -127,6 +209,9 @@ impl TextInputState {
 
     /// Delete the character at the cursor (Delete key behavior).
     pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor < self.text.len() {
             self.text.remove(self.cursor);
         }
@@ -134,6 +219,7 @@ impl TextInputState {
 
     /// Move cursor one char left.
     pub fn cursor_left(&mut self) {
+        self.clear_selection();
         if let Some(prev) = self.prev_char_boundary() {
             self.cursor = prev;
         }
@@ -141,17 +227,114 @@ impl TextInputState {
 
     /// Move cursor one char right.
     pub fn cursor_right(&mut self) {
+        self.clear_selection();
         if let Some(next) = self.next_char_boundary() {
             self.cursor = next;
         }
     }
 
     pub fn cursor_home(&mut self) {
+        self.clear_selection();
         self.cursor = 0;
     }
 
     pub fn cursor_end(&mut self) {
+        self.clear_selection();
         self.cursor = self.text.len();
+    }
+
+    pub fn cursor_word_left(&mut self) {
+        self.clear_selection();
+        self.move_word_left(false);
+    }
+
+    pub fn cursor_word_right(&mut self) {
+        self.clear_selection();
+        self.move_word_right(false);
+    }
+
+    pub fn extend_left(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+        if let Some(prev) = self.prev_char_boundary() {
+            self.cursor = prev;
+        }
+        self.select_all = false;
+    }
+
+    pub fn extend_right(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+        if let Some(next) = self.next_char_boundary() {
+            self.cursor = next;
+        }
+        self.select_all = false;
+    }
+
+    pub fn extend_word_left(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+        self.move_word_left(true);
+    }
+
+    pub fn extend_word_right(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+        self.move_word_right(true);
+    }
+
+    fn move_word_left(&mut self, keep_selection: bool) {
+        if self.cursor == 0 {
+            return;
+        }
+        while self.cursor > 0 {
+            let prev = self.prev_char_boundary().unwrap();
+            let c = self.text[prev..self.cursor].chars().next().unwrap();
+            if !c.is_whitespace() {
+                break;
+            }
+            self.cursor = prev;
+        }
+        while self.cursor > 0 {
+            let prev = self.prev_char_boundary().unwrap();
+            let c = self.text[prev..self.cursor].chars().next().unwrap();
+            if c.is_whitespace() {
+                break;
+            }
+            self.cursor = prev;
+        }
+        if !keep_selection {
+            self.clear_selection();
+        }
+    }
+
+    fn move_word_right(&mut self, keep_selection: bool) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        while self.cursor < self.text.len() {
+            let next = next_boundary_after(&self.text, self.cursor).unwrap();
+            let c = self.text[self.cursor..next].chars().next().unwrap();
+            self.cursor = next;
+            if c.is_whitespace() {
+                break;
+            }
+        }
+        while self.cursor < self.text.len() {
+            let next = next_boundary_after(&self.text, self.cursor).unwrap();
+            let c = self.text[self.cursor..next].chars().next().unwrap();
+            if !c.is_whitespace() {
+                break;
+            }
+            self.cursor = next;
+        }
+        if !keep_selection {
+            self.clear_selection();
+        }
     }
 
     /// Find the previous char boundary before the cursor, if any.
@@ -181,6 +364,9 @@ impl TextInputState {
     /// Walk back from `cursor` skipping whitespace then non-whitespace,
     /// then delete the resulting range. Implements readline `unix-word-rubout`.
     pub fn delete_word_back(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -211,6 +397,9 @@ impl TextInputState {
     /// Walk forward from `cursor` skipping non-whitespace then whitespace,
     /// then delete the resulting range. Cursor stays at its current position.
     pub fn delete_word_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor >= self.text.len() {
             return;
         }
@@ -241,6 +430,9 @@ impl TextInputState {
 
     /// Delete everything from cursor back to the start of the input.
     pub fn kill_to_start(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -250,6 +442,9 @@ impl TextInputState {
 
     /// Delete everything from cursor to the end of the input.
     pub fn kill_to_end(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor < self.text.len() {
             self.text.truncate(self.cursor);
         }
@@ -308,40 +503,56 @@ fn next_boundary_after(text: &str, pos: usize) -> Option<usize> {
 pub fn handle_text_input_key(input: &mut TextInputState, key: &KeyEvent) -> bool {
     use crossterm::event::KeyModifiers as M;
 
-    // Select-all handling: typing replaces all text, navigation clears selection.
+    let ctrl = key.modifiers.contains(M::CONTROL);
+    let alt = key.modifiers.contains(M::ALT);
+    let shift = key.modifiers.contains(M::SHIFT);
+
+    // Select-all handling: typing replaces all text, destructive keys delete it,
+    // movement collapses the selection unless Shift is extending it.
     if input.select_all {
         match key.code {
-            KeyCode::Char(c) if !key.modifiers.contains(M::CONTROL) && !key.modifiers.contains(M::ALT) => {
+            KeyCode::Char(c) if !ctrl && !alt => {
                 input.text.clear();
                 input.cursor = 0;
-                input.select_all = false;
+                input.clear_selection();
                 input.insert_char(c);
                 return true;
             }
             KeyCode::Backspace | KeyCode::Delete => {
                 input.text.clear();
                 input.cursor = 0;
-                input.select_all = false;
+                input.clear_selection();
                 return true;
             }
-            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
-                input.select_all = false;
-                // Fall through to normal handling
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End if !shift => {
+                input.clear_selection();
             }
-            _ => {
-                input.select_all = false;
-            }
+            _ => {}
         }
     }
 
-    let ctrl = key.modifiers.contains(M::CONTROL);
-    let alt = key.modifiers.contains(M::ALT);
+    match (ctrl, alt, shift, key.code) {
+        // Clipboard/select commands.
+        (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'a') => {
+            input.select_all_text();
+            true
+        }
+        (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'c') => {
+            input.copy_selection();
+            true
+        }
+        (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'x') => {
+            input.cut_selection();
+            true
+        }
+        (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'v') => {
+            input.paste_clipboard();
+            true
+        }
 
-    match (ctrl, alt, key.code) {
-        // ── Ctrl+letter / Ctrl+Backspace / Ctrl+Delete ──
-        (true, false, KeyCode::Char(c)) => {
+        // Readline-style movement/editing.
+        (true, false, _, KeyCode::Char(c)) => {
             match c.to_ascii_lowercase() {
-                'a' => input.cursor_home(),
                 'e' => input.cursor_end(),
                 'b' => input.cursor_left(),
                 'f' => input.cursor_right(),
@@ -354,57 +565,119 @@ pub fn handle_text_input_key(input: &mut TextInputState, key: &KeyEvent) -> bool
             }
             true
         }
-        (true, false, KeyCode::Backspace) => {
+        (true, false, false, KeyCode::Left) => {
+            input.cursor_word_left();
+            true
+        }
+        (true, false, false, KeyCode::Right) => {
+            input.cursor_word_right();
+            true
+        }
+        (true, false, true, KeyCode::Left) => {
+            input.extend_word_left();
+            true
+        }
+        (true, false, true, KeyCode::Right) => {
+            input.extend_word_right();
+            true
+        }
+        (true, false, _, KeyCode::Home) => {
+            if shift {
+                if input.selection_anchor.is_none() {
+                    input.selection_anchor = Some(input.cursor);
+                }
+                input.cursor = 0;
+                input.select_all = false;
+            } else {
+                input.cursor_home();
+            }
+            true
+        }
+        (true, false, _, KeyCode::End) => {
+            if shift {
+                if input.selection_anchor.is_none() {
+                    input.selection_anchor = Some(input.cursor);
+                }
+                input.cursor = input.text.len();
+                input.select_all = false;
+            } else {
+                input.cursor_end();
+            }
+            true
+        }
+        (true, false, _, KeyCode::Backspace) => {
             input.delete_word_back();
             true
         }
-        (true, false, KeyCode::Delete) => {
+        (true, false, _, KeyCode::Delete) => {
             input.delete_word_forward();
             true
         }
-        (true, false, _) => false,
+        (true, false, _, _) => false,
 
-        // ── Alt combos: Alt+Backspace and Alt+D ──
-        (false, true, KeyCode::Backspace) => {
+        // Alt combos: Alt+Backspace and Alt+D.
+        (false, true, _, KeyCode::Backspace) => {
             input.delete_word_back();
             true
         }
-        (false, true, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'d') => {
+        (false, true, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'d') => {
             input.delete_word_forward();
             true
         }
-        (false, true, _) => false,
+        (false, true, _, _) => false,
+        (true, true, _, _) => false,
 
-        // ── Ctrl+Alt+anything → ignore (system shortcut territory) ──
-        (true, true, _) => false,
-
-        // ── Plain keys (SHIFT may be set; that's fine for capitalization) ──
-        (false, false, KeyCode::Char(c)) => {
+        // Plain/Shift editing and selection.
+        (false, false, _, KeyCode::Char(c)) => {
             input.insert_char(c);
             true
         }
-        (false, false, KeyCode::Backspace) => {
+        (false, false, _, KeyCode::Backspace) => {
             input.backspace();
             true
         }
-        (false, false, KeyCode::Delete) => {
+        (false, false, _, KeyCode::Delete) => {
             input.delete();
             true
         }
-        (false, false, KeyCode::Left) => {
+        (false, false, true, KeyCode::Left) => {
+            input.extend_left();
+            true
+        }
+        (false, false, true, KeyCode::Right) => {
+            input.extend_right();
+            true
+        }
+        (false, false, false, KeyCode::Left) => {
             input.cursor_left();
             true
         }
-        (false, false, KeyCode::Right) => {
+        (false, false, false, KeyCode::Right) => {
             input.cursor_right();
             true
         }
-        (false, false, KeyCode::Home) => {
-            input.cursor_home();
+        (false, false, _, KeyCode::Home) => {
+            if shift {
+                if input.selection_anchor.is_none() {
+                    input.selection_anchor = Some(input.cursor);
+                }
+                input.cursor = 0;
+                input.select_all = false;
+            } else {
+                input.cursor_home();
+            }
             true
         }
-        (false, false, KeyCode::End) => {
-            input.cursor_end();
+        (false, false, _, KeyCode::End) => {
+            if shift {
+                if input.selection_anchor.is_none() {
+                    input.selection_anchor = Some(input.cursor);
+                }
+                input.cursor = input.text.len();
+                input.select_all = false;
+            } else {
+                input.cursor_end();
+            }
             true
         }
         _ => false,
@@ -505,8 +778,15 @@ fn complete_path_text(
     let typed = &before[component_start..];
     let prefix_path = &before[..component_start];
 
-    let (scan_dir, visible_prefix) = if let Some(base) = base_dir {
-        (base.to_path_buf(), prefix_path.to_string())
+    let (scan_dir, visible_prefix) = if prefix_path.starts_with('~')
+        || Path::new(prefix_path).is_absolute()
+    {
+        let prefix = if prefix_path.is_empty() { "." } else { prefix_path };
+        let expanded = expand_tilde(prefix);
+        (PathBuf::from(expanded), prefix_path.to_string())
+    } else if let Some(base) = base_dir {
+        let relative_prefix = if prefix_path.is_empty() { "." } else { prefix_path };
+        (base.join(relative_prefix), prefix_path.to_string())
     } else {
         let prefix = if prefix_path.is_empty() { "." } else { prefix_path };
         let expanded = expand_tilde(prefix);
@@ -946,6 +1226,37 @@ mod tests {
         assert!(apply_path_completion(&mut input, Some(temp.path()), false));
         assert_eq!(input.text, "track-one.flac");
         assert_eq!(input.cursor, "track-one.flac".len());
+    }
+
+
+    #[test]
+    fn path_completion_prefixed_relative_path_uses_supplied_base_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("Music").join("Album")).expect("fixture");
+
+        let mut input = TextInputState::new("Music/Al".to_string());
+        input.cursor_end();
+
+        apply_path_completion(&mut input, Some(tmp.path()), true);
+
+        assert_eq!(input.text, format!("Music{}Album{}", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR));
+        assert_eq!(input.cursor, input.text.len());
+    }
+
+    #[test]
+    fn path_completion_absolute_path_ignores_supplied_base_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("AbsoluteCandidate")).expect("fixture");
+        let other = tempfile::tempdir().expect("other");
+
+        let prefix = tmp.path().join("Abs").to_string_lossy().to_string();
+        let mut input = TextInputState::new(prefix);
+        input.cursor_end();
+
+        apply_path_completion(&mut input, Some(other.path()), true);
+
+        assert!(input.text.ends_with(&format!("AbsoluteCandidate{}", std::path::MAIN_SEPARATOR)));
+        assert_eq!(input.cursor, input.text.len());
     }
 
 }

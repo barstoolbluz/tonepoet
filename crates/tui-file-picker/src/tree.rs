@@ -3,7 +3,14 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) fn initial_tree_nodes(current_dir: &Path) -> Vec<TreeNode> {
+pub fn initial_tree_nodes(current_dir: &Path) -> Vec<TreeNode> {
+    initial_tree_nodes_with_hidden(current_dir, false)
+}
+
+/// Build initial tree nodes using the same filesystem discovery rules as the
+/// file picker, with an explicit hidden-directory policy for hosts such as the
+/// Browse screen.
+pub fn initial_tree_nodes_with_hidden(current_dir: &Path, show_hidden: bool) -> Vec<TreeNode> {
     let mut nodes = Vec::new();
     if let Some(home) = home_dir() {
         nodes.push(TreeNode {
@@ -15,7 +22,7 @@ pub(crate) fn initial_tree_nodes(current_dir: &Path) -> Vec<TreeNode> {
             path: home.clone(),
             depth: 0,
             expanded: current_dir.starts_with(&home),
-            has_children: has_child_directories(&home, false),
+            has_children: has_child_directories(&home, show_hidden),
         });
     }
 
@@ -36,15 +43,15 @@ pub(crate) fn initial_tree_nodes(current_dir: &Path) -> Vec<TreeNode> {
             path: network.clone(),
             depth: 0,
             expanded: false,
-            has_children: has_child_directories(&network, false),
+            has_children: has_child_directories(&network, show_hidden),
         });
     }
 
-    expand_ancestors_for_current_dir(&mut nodes, current_dir, false);
+    expand_ancestors_for_current_dir(&mut nodes, current_dir, show_hidden);
     nodes
 }
 
-pub(crate) fn refresh_tree_children(nodes: &mut Vec<TreeNode>, dir: &Path, show_hidden: bool) {
+pub fn refresh_tree_children(nodes: &mut Vec<TreeNode>, dir: &Path, show_hidden: bool) {
     let Some(index) = nodes.iter().position(|node| same_path(&node.path, dir)) else {
         return;
     };
@@ -63,6 +70,11 @@ pub(crate) fn refresh_tree_children(nodes: &mut Vec<TreeNode>, dir: &Path, show_
     nodes.splice(insert_at..insert_at, children);
 }
 
+/// Expand tree nodes so ancestors of `current_dir` are materialized and open.
+pub fn expand_tree_to_path(nodes: &mut Vec<TreeNode>, current_dir: &Path, show_hidden: bool) {
+    expand_ancestors_for_current_dir(nodes, current_dir, show_hidden);
+}
+
 fn expand_ancestors_for_current_dir(nodes: &mut Vec<TreeNode>, current_dir: &Path, show_hidden: bool) {
     let mut index = 0usize;
     while index < nodes.len() {
@@ -75,7 +87,7 @@ fn expand_ancestors_for_current_dir(nodes: &mut Vec<TreeNode>, current_dir: &Pat
     }
 }
 
-fn child_directories(dir: &Path, depth: usize, show_hidden: bool) -> Vec<TreeNode> {
+pub fn child_directories(dir: &Path, depth: usize, show_hidden: bool) -> Vec<TreeNode> {
     let Ok(read_dir) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -90,7 +102,7 @@ fn child_directories(dir: &Path, depth: usize, show_hidden: bool) -> Vec<TreeNod
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) || path.is_dir() {
             children.push(TreeNode {
                 has_children: has_child_directories(&path, show_hidden),
                 expanded: false,
@@ -113,14 +125,14 @@ fn has_child_directories(dir: &Path, show_hidden: bool) -> bool {
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) || entry.path().is_dir() {
             return true;
         }
     }
     false
 }
 
-pub(crate) fn filesystem_root() -> PathBuf {
+pub fn filesystem_root() -> PathBuf {
     if cfg!(windows) {
         std::env::var_os("SystemDrive")
             .map(PathBuf::from)

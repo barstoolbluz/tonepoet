@@ -968,6 +968,36 @@ fn clear_browse_info_focus(app: &mut AppState) {
     app.browse_info_focus = None;
 }
 
+fn persist_browse_config(app: &mut AppState) {
+    app.config.browsing = app.browse.capture_browsing_config();
+    if let Err(err) = app.config.save() {
+        app.set_status(format!("browse settings changed, but config save failed: {err}"));
+    }
+}
+
+fn set_browse_filter_choice(
+    app: &mut AppState,
+    choice: usize,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let filter = super::browse::FormatFilter::from_menu_index(choice)
+        .unwrap_or(super::browse::FormatFilter::Off);
+    app.browse.set_format_filter_with_search(filter, Some(tx));
+}
+
+fn set_archive_listing_choice(app: &mut AppState, choice: usize) {
+    app.config.performance.browsing.archive_listing = match choice {
+        1 => "always".to_string(),
+        2 => "never".to_string(),
+        _ => "auto".to_string(),
+    };
+    if let Err(err) = app.config.save() {
+        app.set_status(format!("archive listing mode changed, but config save failed: {err}"));
+    } else {
+        app.set_status(format!("archive listing mode: {}", app.config.performance.browsing.archive_listing));
+    }
+}
+
 
 fn activate_archive_browse_directory(
     app: &mut AppState,
@@ -1269,7 +1299,7 @@ fn handle_output_options_inline_edit_key(app: &mut AppState, key: KeyEvent) {
     }
 }
 
-fn begin_browse_inline_rename(app: &mut AppState, path: std::path::PathBuf) {
+pub(super) fn begin_browse_inline_rename(app: &mut AppState, path: std::path::PathBuf) {
     let initial = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1283,6 +1313,11 @@ fn begin_browse_inline_rename(app: &mut AppState, path: std::path::PathBuf) {
         target: BrowseInlineEditTarget::Rename { path },
         input: super::text_input::TextInputState::new_selected(initial),
     });
+}
+
+fn browse_entry_supports_inline_rename(app: &AppState, kind: &super::browse::EntryKind) -> bool {
+    !matches!(kind, super::browse::EntryKind::ParentDir)
+        && !(app.browse.is_in_archive() && matches!(kind, super::browse::EntryKind::Directory))
 }
 
 fn begin_selected_browse_inline_rename(app: &mut AppState) {
@@ -1374,13 +1409,13 @@ fn browse_inline_commit_from_state(state: BrowseInlineEditState) -> BrowseInline
     }
 }
 
-fn commit_browse_inline_edit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+fn commit_browse_inline_edit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
     let Some(state) = app.browse_inline_edit.take() else {
-        return;
+        return true;
     };
-    match browse_inline_commit_from_state(state) {
+    let committed = match browse_inline_commit_from_state(state.clone()) {
         BrowseInlineCommit::Rename { path, value } => {
-            commit_browse_rename(app, path, value.trim(), tx);
+            commit_browse_rename(app, path, value.trim(), tx)
         }
         BrowseInlineCommit::Metadata { path, field, value } => {
             apply_text_edit(
@@ -1389,8 +1424,89 @@ fn commit_browse_inline_edit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) 
                 &value,
                 tx,
             );
+            true
         }
+    };
+    if !committed {
+        app.browse_inline_edit = Some(state);
     }
+    committed
+}
+
+fn sequential_inline_rename_target(app: &AppState, forward: bool) -> Option<std::path::PathBuf> {
+    let entries = &app.browse.entries;
+    if entries.is_empty() || app.browse.selected_index >= entries.len() {
+        return None;
+    }
+
+    if forward {
+        entries
+            .iter()
+            .skip(app.browse.selected_index.saturating_add(1))
+            .find(|entry| browse_entry_supports_inline_rename(app, &entry.kind))
+            .map(|entry| entry.path.clone())
+    } else {
+        entries
+            .iter()
+            .take(app.browse.selected_index)
+            .rev()
+            .find(|entry| browse_entry_supports_inline_rename(app, &entry.kind))
+            .map(|entry| entry.path.clone())
+    }
+}
+
+fn begin_browse_inline_rename_for_path(app: &mut AppState, target_path: &std::path::Path) -> bool {
+    let Some(idx) = app
+        .browse
+        .entries
+        .iter()
+        .position(|entry| entry.path == target_path && browse_entry_supports_inline_rename(app, &entry.kind))
+    else {
+        return false;
+    };
+    app.browse.selected_index = idx;
+    app.browse.ensure_visible();
+    begin_browse_inline_rename(app, target_path.to_path_buf());
+    true
+}
+
+fn browse_inline_tab_advance(app: &mut AppState, forward: bool, tx: &mpsc::Sender<AppMessage>) {
+    let was_rename = matches!(
+        app.browse_inline_edit.as_ref().map(|state| &state.target),
+        Some(BrowseInlineEditTarget::Rename { .. })
+    );
+    let resume_directory = app.browse.current_dir.clone();
+    let resume_target = if was_rename {
+        sequential_inline_rename_target(app, forward)
+    } else {
+        None
+    };
+
+    let committed = commit_browse_inline_edit(app, tx);
+    if !was_rename || !committed {
+        app.browse.clear_pending_inline_rename_after_scan();
+        return;
+    }
+
+    let Some(target_path) = resume_target else {
+        return;
+    };
+
+    // Normal runtime refreshes filesystem renames asynchronously and clears
+    // entries immediately. Defer the continuation until DirScanComplete
+    // repopulates the same directory. In synchronous/no-op paths, continue now.
+    if app.browse.entries.is_empty() {
+        if let Some(scan_generation) = app.browse.pending_scan_generation() {
+            app.browse.schedule_inline_rename_after_scan(
+                scan_generation,
+                resume_directory,
+                target_path,
+            );
+        }
+        return;
+    }
+
+    let _ = begin_browse_inline_rename_for_path(app, &target_path);
 }
 
 fn handle_browse_inline_edit_key(
@@ -1406,22 +1522,10 @@ fn handle_browse_inline_edit_key(
             finish_active_inline_edit(app, InlineEditResolution::Cancel, tx);
         }
         (KeyCode::Tab, KeyModifiers::NONE) => {
-            let base_dir = app.browse_inline_edit.as_ref().and_then(|state| match &state.target {
-                BrowseInlineEditTarget::Rename { path } => path.parent().map(|p| p.to_path_buf()),
-                BrowseInlineEditTarget::Metadata { .. } => None,
-            });
-            if let Some(state) = app.browse_inline_edit.as_mut() {
-                match &state.target {
-                    BrowseInlineEditTarget::Rename { .. } => {
-                        let _ = super::text_input::apply_path_completion(
-                            &mut state.input,
-                            base_dir.as_deref(),
-                            false,
-                        );
-                    }
-                    BrowseInlineEditTarget::Metadata { .. } => {}
-                }
-            }
+            browse_inline_tab_advance(app, true, tx);
+        }
+        (KeyCode::BackTab, _) => {
+            browse_inline_tab_advance(app, false, tx);
         }
         _ => {
             if let Some(state) = app.browse_inline_edit.as_mut() {
@@ -1698,23 +1802,28 @@ mod inline_edit_behavior_tests {
     }
 
     #[test]
-    fn browse_rename_tab_completion_uses_entry_parent_directory() {
+    fn browse_inline_tab_with_no_next_entry_commits_rename_without_resuming() {
         let (tx, _rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("track-one.flac"), b"audio").expect("fixture");
+        let original = temp.path().join("old.flac");
+        let renamed = temp.path().join("new.flac");
+        std::fs::write(&original, b"audio").expect("fixture");
+
         let mut app = AppState::new(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(original.clone())];
+        app.browse.selected_index = 0;
         app.browse_inline_edit = Some(BrowseInlineEditState {
-            target: BrowseInlineEditTarget::Rename { path: temp.path().join("old.flac") },
-            input: super::super::text_input::TextInputState::new("tra".to_string()),
+            target: BrowseInlineEditTarget::Rename { path: original },
+            input: super::super::text_input::TextInputState::new("new.flac".to_string()),
         });
 
         handle_browse_inline_edit_key(&mut app, key(KeyCode::Tab), &tx);
 
-        assert_eq!(
-            app.browse_inline_edit.as_ref().unwrap().input.text,
-            "track-one.flac"
-        );
+        assert!(renamed.exists());
+        assert!(app.browse_inline_edit.is_none());
+        assert!(app.browse.pending_inline_rename_after_scan.is_none());
     }
 
     #[test]
@@ -1834,6 +1943,274 @@ mod inline_edit_behavior_tests {
             .map(|(message, _)| message.contains("not a writable filesystem file"))
             .unwrap_or(false));
     }
+
+    fn browse_file_entry(path: std::path::PathBuf) -> crate::tui::browse::BrowseEntry {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        crate::tui::browse::BrowseEntry::new(
+            path,
+            name,
+            crate::tui::browse::EntryKind::OtherFile,
+            1,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn browse_inline_tab_rename_resumes_next_entry_after_async_scan() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("a.txt");
+        let renamed = temp.path().join("aa.txt");
+        let next = temp.path().join("b.txt");
+        let last = temp.path().join("c.txt");
+        std::fs::write(&original, b"a").expect("a");
+        std::fs::write(&next, b"b").expect("b");
+        std::fs::write(&last, b"c").expect("c");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            browse_file_entry(original.clone()),
+            browse_file_entry(next.clone()),
+            browse_file_entry(last.clone()),
+        ];
+        app.browse.selected_index = 0;
+        app.browse.set_tx(tx.clone());
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename { path: original.clone() },
+            input: super::super::text_input::TextInputState::new("aa.txt".to_string()),
+        });
+
+        browse_inline_tab_advance(&mut app, true, &tx);
+
+        assert!(app.browse.entries.is_empty(), "async refresh should clear visible entries");
+        assert!(app.browse.pending_inline_rename_after_scan.is_some());
+        assert!(app.browse_inline_edit.is_none());
+
+        let scan_generation = app.browse.pending_scan_generation().expect("scan generation");
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::DirScanComplete {
+                generation: scan_generation,
+                path: temp.path().to_path_buf(),
+                parent_entry: None,
+                dirs: Vec::new(),
+                files: vec![
+                    browse_file_entry(renamed),
+                    browse_file_entry(next.clone()),
+                    browse_file_entry(last),
+                ],
+                error: None,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.selected_entry().map(|entry| entry.path.clone()), Some(next.clone()));
+        match app.browse_inline_edit.as_ref().map(|state| &state.target) {
+            Some(BrowseInlineEditTarget::Rename { path }) => assert_eq!(path, &next),
+            other => panic!("expected resumed inline rename on next entry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_inline_shift_tab_rename_resumes_previous_entry_after_async_scan() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("a.txt");
+        let previous = temp.path().join("b.txt");
+        let original = temp.path().join("c.txt");
+        let renamed = temp.path().join("cc.txt");
+        std::fs::write(&first, b"a").expect("a");
+        std::fs::write(&previous, b"b").expect("b");
+        std::fs::write(&original, b"c").expect("c");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            browse_file_entry(first.clone()),
+            browse_file_entry(previous.clone()),
+            browse_file_entry(original.clone()),
+        ];
+        app.browse.selected_index = 2;
+        app.browse.set_tx(tx.clone());
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename { path: original.clone() },
+            input: super::super::text_input::TextInputState::new("cc.txt".to_string()),
+        });
+
+        browse_inline_tab_advance(&mut app, false, &tx);
+
+        assert!(app.browse.entries.is_empty(), "async refresh should clear visible entries");
+        assert!(app.browse.pending_inline_rename_after_scan.is_some());
+        assert!(app.browse_inline_edit.is_none());
+
+        let scan_generation = app.browse.pending_scan_generation().expect("scan generation");
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::DirScanComplete {
+                generation: scan_generation,
+                path: temp.path().to_path_buf(),
+                parent_entry: None,
+                dirs: Vec::new(),
+                files: vec![
+                    browse_file_entry(first),
+                    browse_file_entry(previous.clone()),
+                    browse_file_entry(renamed),
+                ],
+                error: None,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.selected_entry().map(|entry| entry.path.clone()), Some(previous.clone()));
+        match app.browse_inline_edit.as_ref().map(|state| &state.target) {
+            Some(BrowseInlineEditTarget::Rename { path }) => assert_eq!(path, &previous),
+            other => panic!("expected resumed inline rename on previous entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn browse_inline_tab_rejected_archive_rename_does_not_advance() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+
+        let archive_path = std::path::PathBuf::from("/tmp/album.zip");
+        app.browse.enter_archive(
+            crate::tui::archive_listing::ArchiveListing {
+                archive_path: archive_path.clone(),
+                format: "zip".to_string(),
+                physical_size: 1024,
+                entries: vec![
+                    crate::tui::archive_listing::ArchiveEntry {
+                        path: "a.flac".to_string(),
+                        size: 100,
+                        packed_size: 80,
+                        is_dir: false,
+                        encrypted: false,
+                    },
+                    crate::tui::archive_listing::ArchiveEntry {
+                        path: "b.flac".to_string(),
+                        size: 100,
+                        packed_size: 80,
+                        is_dir: false,
+                        encrypted: false,
+                    },
+                ],
+            },
+            None,
+        );
+        app.browse.selected_index = 1;
+        let original = archive_path.join("a.flac");
+        let next = archive_path.join("b.flac");
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename { path: original.clone() },
+            input: super::super::text_input::TextInputState::new("aa.flac".to_string()),
+        });
+        app.pending_browse_archive_rename = Some(PendingBrowseArchiveRename::new(
+            archive_path.clone(),
+            "other.flac".to_string(),
+            "other-renamed.flac".to_string(),
+            0,
+            0,
+            0,
+        ));
+
+        browse_inline_tab_advance(&mut app, true, &tx);
+
+        assert_eq!(app.browse.selected_entry().map(|entry| entry.path.clone()), Some(original.clone()));
+        match app.browse_inline_edit.as_ref().map(|state| &state.target) {
+            Some(BrowseInlineEditTarget::Rename { path }) => assert_eq!(path, &original),
+            other => panic!("expected rejected archive rename to keep current inline editor, got {other:?}"),
+        }
+        assert!(app.pending_browse_archive_rename.is_some());
+        assert_ne!(app.browse.selected_entry().map(|entry| entry.path.clone()), Some(next));
+    }
+
+    #[tokio::test]
+    async fn stale_same_directory_scan_does_not_resume_deferred_inline_rename() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("b.txt");
+        std::fs::write(&target, b"b").expect("target");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.set_tx(tx.clone());
+
+        app.browse.refresh();
+        let stale_generation = app.browse.pending_scan_generation().expect("first scan generation");
+        app.browse.schedule_inline_rename_after_scan(
+            stale_generation,
+            temp.path().to_path_buf(),
+            target.clone(),
+        );
+
+        app.browse.refresh();
+        let current_generation = app.browse.pending_scan_generation().expect("second scan generation");
+        assert_ne!(stale_generation, current_generation);
+
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::DirScanComplete {
+                generation: stale_generation,
+                path: temp.path().to_path_buf(),
+                parent_entry: None,
+                dirs: Vec::new(),
+                files: vec![browse_file_entry(target.clone())],
+                error: None,
+            },
+            &tx,
+        );
+
+        assert!(app.browse_inline_edit.is_none());
+        assert!(app.browse.pending_inline_rename_after_scan.is_none());
+        assert_eq!(app.browse.pending_scan_generation(), Some(current_generation));
+    }
+
+    #[tokio::test]
+    async fn terminal_scan_error_clears_matching_deferred_inline_rename() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("b.txt");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.set_tx(tx.clone());
+        app.browse.refresh();
+        let scan_generation = app.browse.pending_scan_generation().expect("scan generation");
+        app.browse.schedule_inline_rename_after_scan(
+            scan_generation,
+            temp.path().to_path_buf(),
+            target,
+        );
+
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::DirScanComplete {
+                generation: scan_generation,
+                path: temp.path().to_path_buf(),
+                parent_entry: None,
+                dirs: Vec::new(),
+                files: Vec::new(),
+                error: Some("scan timed out (30s)".to_string()),
+            },
+            &tx,
+        );
+
+        assert!(app.browse.pending_scan_generation().is_none());
+        assert!(app.browse.pending_inline_rename_after_scan.is_none());
+        assert!(app.browse_inline_edit.is_none());
+    }
+
 }
 
 
@@ -2282,7 +2659,8 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 
         // Toggle hidden files
         (KeyCode::Char('.'), KeyModifiers::NONE) => {
-            app.browse.toggle_hidden();
+            app.browse.toggle_hidden_with_search(Some(tx));
+            persist_browse_config(app);
             selection_may_have_changed = true;
         }
 
@@ -2526,7 +2904,7 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
 }
 
 fn handle_browse_path_input_key(app: &mut AppState, key: KeyEvent) {
-    use super::text_input::handle_text_input_key;
+    use super::text_input::{apply_path_completion, handle_text_input_key};
 
     match (key.code, key.modifiers) {
         (KeyCode::Enter, _) => {
@@ -2534,6 +2912,15 @@ fn handle_browse_path_input_key(app: &mut AppState, key: KeyEvent) {
         }
         (KeyCode::Esc, _) => {
             app.browse.close_path_input(false);
+        }
+        (KeyCode::Tab, _) => {
+            if let Some(input) = &mut app.browse.path_input {
+                // Complete relative paths, including prefixed paths such as
+                // `Music/Al`, against the active Browse directory. Absolute
+                // and tilde-prefixed edits are handled as absolute inputs by
+                // the completion helper.
+                apply_path_completion(input, Some(app.browse.current_dir.as_path()), true);
+            }
         }
         _ => {
             if let Some(input) = &mut app.browse.path_input {
@@ -4868,7 +5255,7 @@ fn request_metadata_editor_close(
                 &[],
             ) {
                 Ok(()) => {
-                    app.browse.refresh();
+                    app.browse.refresh_with_search(Some(_tx));
                     app.active_overlay = ActiveOverlay::None;
                     app.set_status("metadata editor: staged archive changes pending; save occurs when leaving archive".to_string());
                 }
@@ -9070,7 +9457,7 @@ pub(super) fn start_browse_archive_entry_delete(
         }
         app.browse.invalidate_archive_probe_cache_for(&archive_path);
         app.browse.clear_multi_selection();
-        app.browse.refresh();
+        app.browse.refresh_with_search(Some(tx));
         app.force_redraw = true;
         let count = inner_paths.len();
         app.set_status(format!(
@@ -17045,7 +17432,7 @@ fn execute_bulk_rename(
             ));
             app.active_overlay = ActiveOverlay::None;
             // Refresh browse to reflect the renames.
-            app.browse.refresh();
+            app.browse.refresh_with_search(Some(_tx));
         }
         Err(e) => {
             app.set_status(&format!("Rename failed: {}", e));
@@ -21198,14 +21585,16 @@ fn start_browse_archive_entry_rename(
     old_inner_path: String,
     new_name: &str,
     tx: &mpsc::Sender<AppMessage>,
-) {
+) -> Result<(), String> {
     if app.pending_browse_archive_rename.is_some() {
-        app.set_status("rename: wait for the current archive rename to finish");
-        return;
+        let message = "rename: wait for the current archive rename to finish".to_string();
+        app.set_status(message.clone());
+        return Err(message);
     }
     if app.pending_browse_archive_metadata.is_some() || app.browse_archive_repackage.is_some() {
-        app.set_status("rename: wait for the current archive metadata operation to finish");
-        return;
+        let message = "rename: wait for the current archive metadata operation to finish".to_string();
+        app.set_status(message.clone());
+        return Err(message);
     }
 
     let old_name = old_inner_path
@@ -21234,8 +21623,9 @@ fn start_browse_archive_entry_rename(
             }
         })
     {
-        app.set_status(format!("rename: target already exists in archive: {new_name}"));
-        return;
+        let message = format!("rename: target already exists in archive: {new_name}");
+        app.set_status(message.clone());
+        return Err(message);
     }
 
     if let Some(staging) = app
@@ -21253,7 +21643,7 @@ fn start_browse_archive_entry_rename(
         ) {
             Ok(()) => {
                 app.browse.invalidate_archive_probe_cache_for(&archive_path);
-                app.browse.refresh();
+                app.browse.refresh_with_search(Some(tx));
                 let target_path = archive_path.join(&new_inner_path);
                 if let Some(idx) = app.browse.entries.iter().position(|entry| entry.path == target_path) {
                     app.browse.selected_index = idx;
@@ -21261,9 +21651,13 @@ fn start_browse_archive_entry_rename(
                 }
                 app.set_status(format!("renamed staged archive entry: {old_name} -> {new_name}; archive changes pending"));
             }
-            Err(err) => app.set_status(format!("rename failed: {err}")),
+            Err(err) => {
+                let message = format!("rename failed: {err}");
+                app.set_status(message.clone());
+                return Err(message);
+            }
         }
-        return;
+        return Ok(());
     }
 
     let tool_paths = app.manager.config.tool_paths.clone();
@@ -21271,15 +21665,17 @@ fn start_browse_archive_entry_rename(
         &archive_path,
         &tool_paths,
     ) {
-        app.set_status(format!("rename: archive cannot be edited: {err}"));
-        return;
+        let message = format!("rename: archive cannot be edited: {err}");
+        app.set_status(message.clone());
+        return Err(message);
     }
 
     let (archive_mtime_secs, archive_mtime_nanos, archive_size) = match super::app::archive_fingerprint(&archive_path) {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
-            app.set_status(format!("rename: cannot establish archive conflict baseline: {err}"));
-            return;
+            let message = format!("rename: cannot establish archive conflict baseline: {err}");
+            app.set_status(message.clone());
+            return Err(message);
         }
     };
 
@@ -21300,8 +21696,9 @@ fn start_browse_archive_entry_rename(
         archive_mtime_nanos,
         archive_size,
     ) {
-        app.set_status(format!("rename: cannot register archive recovery session before extraction: {err}"));
-        return;
+        let message = format!("rename: cannot register archive recovery session before extraction: {err}");
+        app.set_status(message.clone());
+        return Err(message);
     }
     let cancel = pending.cancel.clone();
     let password = app
@@ -21385,6 +21782,8 @@ fn start_browse_archive_entry_rename(
             result,
         }).await;
     });
+
+    Ok(())
 }
 
 /// Commit a rename for a browse entry: validates the new name, constructs the
@@ -21395,7 +21794,7 @@ pub(super) fn commit_browse_rename(
     original_path: std::path::PathBuf,
     new_name: &str,
     tx: &mpsc::Sender<AppMessage>,
-) {
+) -> bool {
     let old_name = original_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -21405,16 +21804,16 @@ pub(super) fn commit_browse_rename(
     // Validation: empty name
     if new_name.is_empty() {
         app.set_status("rename: name cannot be empty");
-        return;
+        return false;
     }
     // Validation: no path separators (would be a move, not a rename)
     if new_name.contains('/') || new_name.contains('\\') {
         app.set_status("rename: name cannot contain path separators");
-        return;
+        return false;
     }
     // No-op if unchanged
     if new_name == old_name {
-        return;
+        return true;
     }
 
     if app.browse.is_in_archive() {
@@ -21425,11 +21824,11 @@ pub(super) fn commit_browse_rename(
             .map(|arc| arc.listing.archive_path.clone())
         else {
             app.set_status("rename: no archive is active");
-            return;
+            return false;
         };
         let Some(inner_path) = app.browse.archive_inner_path_for_path(&original_path) else {
             app.set_status("rename: could not resolve archive entry");
-            return;
+            return false;
         };
         if app
             .browse
@@ -21442,30 +21841,29 @@ pub(super) fn commit_browse_rename(
             app.set_status(
                 "rename: archive directory rename is unavailable; rename files with archive-aware Rename",
             );
-            return;
+            return false;
         }
-        start_browse_archive_entry_rename(app, archive_path, inner_path, new_name, tx);
-        return;
+        return start_browse_archive_entry_rename(app, archive_path, inner_path, new_name, tx).is_ok();
     }
 
     let parent = match original_path.parent() {
         Some(p) => p.to_path_buf(),
         None => {
             app.set_status("rename: cannot rename filesystem root");
-            return;
+            return false;
         }
     };
     let target = parent.join(new_name);
 
     if target.exists() {
         app.set_status(format!("rename: target already exists: {}", new_name));
-        return;
+        return false;
     }
 
     match std::fs::rename(&original_path, &target) {
         Ok(()) => {
             // Refresh the directory and reposition cursor on the renamed entry.
-            app.browse.refresh();
+            app.browse.refresh_with_search(Some(tx));
             if let Some(idx) = app.browse.entries.iter().position(|e| e.path == target) {
                 app.browse.selected_index = idx;
                 app.browse.ensure_visible();
@@ -21473,9 +21871,11 @@ pub(super) fn commit_browse_rename(
             app.browse.probe_current_with_db(tx, Some(&app.db));
                                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             app.set_status(format!("renamed: {} → {}", old_name, new_name));
+            true
         }
         Err(e) => {
             app.set_status(format!("rename failed: {}", e));
+            false
         }
     }
 }
@@ -22029,7 +22429,7 @@ fn execute_confirm_action(
                                 &[],
                             ) {
                                 Ok(()) => {
-                                    app.browse.refresh();
+                                    app.browse.refresh_with_search(Some(tx));
                                     app.set_status("metadata editor: discarded unsaved editor changes; staged archive changes pending".to_string());
                                 }
                                 Err(err) => {
@@ -22150,7 +22550,7 @@ fn execute_confirm_action(
                 }
             }
             app.browse.clear_multi_selection();
-            app.browse.refresh();
+            app.browse.refresh_with_search(Some(tx));
             app.browse.probe_current_with_db(tx, Some(&app.db));
                                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             let mut parts = vec![format!("trashed {} item(s)", trashed)];
@@ -23333,21 +23733,128 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     }
                 }
             }
-            TuiButton::BrowseColumn(col) => {
+            TuiButton::BrowseColumn(column) => {
                 clear_browse_info_focus(app);
-                use super::browse::{SortBy, SortDir};
-                use super::button_map::ColumnKind;
-                let target = match col {
-                    ColumnKind::Name => SortBy::Name,
-                    ColumnKind::Size => SortBy::Size,
-                    ColumnKind::Date => SortBy::Date,
-                    ColumnKind::Type => SortBy::Type,
-                };
+                use super::browse::SortDir;
+                let target = column.sort_by();
                 if app.browse.sort_by == target {
-                    app.browse.toggle_sort_dir();
+                    app.browse.toggle_sort_dir_with_search(Some(tx));
                 } else {
-                    app.browse.set_sort(target, SortDir::Asc);
+                    app.browse.set_sort_with_search(target, SortDir::Asc, Some(tx));
                 }
+            }
+            TuiButton::BrowseToolbarBack => {
+                if app.browse.go_back() {
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                }
+            }
+            TuiButton::BrowseToolbarForward => {
+                if app.browse.go_forward() {
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                }
+            }
+            TuiButton::BrowseToolbarUp => {
+                if app.browse.go_parent() {
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                }
+            }
+            TuiButton::BrowseToolbarRefresh => {
+                app.browse.refresh_with_search(Some(tx));
+                app.browse.probe_current_with_db(tx, Some(&app.db));
+                app.set_status("browse refreshed");
+            }
+            TuiButton::BrowseToolbarOptions => {
+                app.browse.toggle_options_menu();
+            }
+            TuiButton::BrowseToolbarSearch => {
+                app.browse.open_search();
+            }
+            TuiButton::BrowseToolbarShowHidden | TuiButton::BrowseOptionsShowHidden => {
+                app.browse.toggle_hidden_with_search(Some(tx));
+                persist_browse_config(app);
+            }
+            TuiButton::BrowsePathGo => {
+                if let Some(input) = app.browse.path_input.as_ref() {
+                    let path = input.text.clone();
+                    match app.browse.navigate_to_str(&path) {
+                        Ok(()) => app.browse.path_input = None,
+                        Err(err) => app.set_status(err),
+                    }
+                } else {
+                    app.browse.open_path_input();
+                }
+            }
+            TuiButton::BrowsePaneToggle(pane) => {
+                app.browse.toggle_pane(pane);
+                persist_browse_config(app);
+            }
+            TuiButton::BrowsePaneTitle(super::browse::BrowsePaneId::Browse) => {
+                const DCLICK_MS: u64 = 500;
+                let now = std::time::Instant::now();
+                let is_double = app
+                    .browse
+                    .browse_title_last_click
+                    .map(|last| now.duration_since(last).as_millis() < DCLICK_MS as u128)
+                    .unwrap_or(false);
+                app.browse.browse_title_last_click = Some(now);
+                if is_double {
+                    app.browse.toggle_browse_maximized();
+                    persist_browse_config(app);
+                }
+            }
+            TuiButton::BrowsePaneTitle(_) => {}
+            TuiButton::BrowseTreeNode(index) => {
+                let has_children = app
+                    .browse
+                    .tree_nodes
+                    .get(index)
+                    .map(|node| node.has_children)
+                    .unwrap_or(false);
+                if let Some(path) = app.browse.select_tree_index(index) {
+                    if has_children {
+                        app.browse.toggle_tree_node(index);
+                    }
+                    app.browse.navigate_to(path);
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                }
+            }
+            TuiButton::BrowseOptionsColumns => app.browse.options_menu = super::browse::BrowseOptionsMenu::Columns,
+            TuiButton::BrowseOptionsSort => app.browse.options_menu = super::browse::BrowseOptionsMenu::Sort,
+            TuiButton::BrowseOptionsFilter => app.browse.options_menu = super::browse::BrowseOptionsMenu::Filter,
+            TuiButton::BrowseOptionsArchiveListing => app.browse.options_menu = super::browse::BrowseOptionsMenu::ArchiveListing,
+            TuiButton::BrowseOptionsSaveLayout => {
+                persist_browse_config(app);
+                app.browse.close_options_menu();
+                app.set_status("browse layout saved");
+            }
+            TuiButton::BrowseOptionsRestoreDefaults => {
+                app.config.browsing = crate::config::BrowsingConfig::default().normalized();
+                app.browse.apply_browsing_config_with_search(&app.config.browsing, Some(tx));
+                if let Err(err) = app.config.save() {
+                    app.set_status(format!("browse defaults restored, but config save failed: {err}"));
+                } else {
+                    app.set_status("browse defaults restored");
+                }
+            }
+            TuiButton::BrowseOptionsColumn(column) => {
+                app.browse.toggle_column(column);
+                persist_browse_config(app);
+            }
+            TuiButton::BrowseOptionsSortChoice(by, dir) => {
+                app.browse.set_default_sort_with_search(by, dir, true, Some(tx));
+                persist_browse_config(app);
+            }
+            TuiButton::BrowseOptionsFilterChoice(choice) => {
+                set_browse_filter_choice(app, choice, tx);
+                persist_browse_config(app);
+            }
+            TuiButton::BrowseOptionsArchiveChoice(choice) => {
+                set_archive_listing_choice(app, choice);
+                app.browse.close_options_menu();
             }
             TuiButton::BrowseInfoMeta(field) => {
                 if app.browse.is_in_archive() && app.browse.active_archive_staging().is_none() {

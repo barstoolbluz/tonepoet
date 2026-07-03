@@ -255,13 +255,18 @@ pub enum AppMessage {
     CompareComplete {
         result: crate::tui::bit_compare::CompareResult,
     },
-    /// Result of async path validation (canonicalize + is_dir) for :cd.
+    /// Result of async path validation (canonicalize + is_dir) for :cd/path bar.
+    /// Carries the launch generation and origin directory so late completions
+    /// from superseded path navigations cannot move Browse backward.
     PathValidationComplete {
+        generation: u64,
+        origin_dir: std::path::PathBuf,
         input: String,
         result: Result<std::path::PathBuf, String>,
     },
     /// Result of an async directory scan (readdir + lstat per entry).
     DirScanComplete {
+        generation: u64,
         path: std::path::PathBuf,
         parent_entry: Option<crate::tui::browse::BrowseEntry>,
         dirs: Vec<crate::tui::browse::BrowseEntry>,
@@ -275,8 +280,42 @@ pub enum AppMessage {
         value: String,
         result: Result<(), String>,
     },
-    /// Results of an async recursive search.
+    /// Results of an async recursive search. Carries the launch identity so
+    /// the reducer can reject stale completions after query, root, mode,
+    /// visibility, audio/format filter, sort, or cap changes.
     SearchComplete {
+        generation: u64,
+        root: std::path::PathBuf,
+        /// Whether the launch was recursive. Archive-local tag search can also
+        /// be async while non-recursive, so the reducer must validate this
+        /// explicitly instead of assuming every SearchComplete is recursive.
+        recursive: bool,
+        /// Archive identity captured at launch. `None` means ordinary
+        /// filesystem search; `Some` means archive-local search for the given
+        /// archive and inner directory.
+        archive_path: Option<std::path::PathBuf>,
+        archive_inner_path: Option<String>,
+        query: String,
+        mode: crate::tui::browse::SearchMode,
+        show_hidden: bool,
+        audio_only: bool,
+        format_filter: crate::tui::browse::FormatFilter,
+        sort: crate::tui::browse::SearchSort,
+        sort_dir: crate::tui::browse::SortDir,
+        result_cap: usize,
+        total_matches: usize,
+        /// True when the worker already sorted using context that the reducer
+        /// cannot safely reconstruct without blocking the TUI, e.g. archive
+        /// tag-sort keys resolved from staged/extracted members.
+        pre_sorted: bool,
+        /// Archive-entry tag-cache writes produced by an async archive search.
+        /// The reducer applies them only after the launch identity validates.
+        archive_tag_cache_updates: Vec<(
+            std::path::PathBuf,
+            crate::tui::browse::TagCacheFingerprint,
+            crate::tui::browse::ArchiveTagPasswordIdentity,
+            crate::tui::browse::TagReadResult,
+        )>,
         results: Vec<(crate::tui::browse::BrowseEntry, i64)>,
     },
     /// Result of a batch metadata write from the metadata editor.

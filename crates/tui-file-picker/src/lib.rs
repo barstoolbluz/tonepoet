@@ -27,5 +27,6 @@ pub use state::{
     HitRegion, SaveModeConfig, SaveModeStyle, SymlinkCopyPolicy, SymlinkPolicy, ToolbarAction, TreeNode,
 };
 pub use theme::FilePickerTheme;
+pub use tree::{initial_tree_nodes_with_hidden, expand_tree_to_path, refresh_tree_children, child_directories};
 
 pub use ratatui::layout::Rect;

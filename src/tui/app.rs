@@ -8011,6 +8011,7 @@ impl AppState {
         let bookmarks = crate::tui::bookmarks::BookmarksState::load_from_db(&db);
         // Import TOML presets into DB on first run.
         crate::tui::presets::import_presets_to_db(&db);
+        let browse = crate::tui::browse::BrowseState::new_with_config(&config.browsing);
 
         Self {
             config,
@@ -8037,7 +8038,7 @@ impl AppState {
             probe_generation: 0,
             tui_tx: None,
             preset: PresetState::default(),
-            browse: crate::tui::browse::BrowseState::new(),
+            browse,
             queue_focus: QueueFocus::FileList,
             selected_index: 0,
             scroll_offset: 0,

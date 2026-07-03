@@ -79,7 +79,15 @@ pub fn render_inline_value_with_embedded_cursor(
 ) -> Vec<Span<'static>> {
     let width = width.max(1);
     let (visible, cursor_col) = input.view(width);
-    let cp = cursor_col as usize;
+    let cursor_col = cursor_col as usize;
+    let cursor_absolute_col = input.cursor_display_col();
+    let scroll = cursor_absolute_col.saturating_sub(width.saturating_sub(1));
+    let selection_cols = input.selection_range().map(|range| {
+        let start = input.text[..range.start].chars().count();
+        let end = input.text[..range.end].chars().count();
+        (start.saturating_sub(scroll), end.saturating_sub(scroll))
+    });
+
     let mut chars: Vec<char> = visible
         .chars()
         .map(|c| if c == '\n' || c == '\r' { '↵' } else { c })
@@ -88,36 +96,39 @@ pub fn render_inline_value_with_embedded_cursor(
         chars.extend(std::iter::repeat(' ').take(width - chars.len()));
     }
 
-    let before: String = chars[..cp.min(chars.len())].iter().collect();
-    let cursor_ch: String = if cp < chars.len() {
-        chars[cp].to_string()
-    } else {
-        " ".to_string()
-    };
-    let after: String = if cp + 1 < chars.len() {
-        chars[cp + 1..].iter().collect()
-    } else {
-        String::new()
-    };
+    let normal = Style::default()
+        .fg(theme.text_bright)
+        .bg(theme.input_focused_bg);
+    let selected = Style::default()
+        .fg(theme.bg)
+        .bg(theme.selection_bg);
+    let cursor_style = Style::default().fg(theme.bg).bg(theme.text_bright);
 
-    vec![
-        Span::styled(
-            before,
-            Style::default()
-                .fg(theme.text_bright)
-                .bg(theme.input_focused_bg),
-        ),
-        Span::styled(
-            cursor_ch,
-            Style::default().fg(theme.bg).bg(theme.text_bright),
-        ),
-        Span::styled(
-            after,
-            Style::default()
-                .fg(theme.text_bright)
-                .bg(theme.input_focused_bg),
-        ),
-    ]
+    let mut spans = Vec::new();
+    let mut current_style: Option<Style> = None;
+    let mut current = String::new();
+    for (idx, ch) in chars.into_iter().enumerate() {
+        let style = if idx == cursor_col {
+            cursor_style
+        } else if let Some((start, end)) = selection_cols {
+            if idx >= start && idx < end { selected } else { normal }
+        } else {
+            normal
+        };
+        if current_style == Some(style) {
+            current.push(ch);
+        } else {
+            if let Some(style) = current_style.take() {
+                spans.push(Span::styled(std::mem::take(&mut current), style));
+            }
+            current_style = Some(style);
+            current.push(ch);
+        }
+    }
+    if let Some(style) = current_style {
+        spans.push(Span::styled(current, style));
+    }
+    spans
 }
 
 /// Render a complete labelled inline row with an embedded cursor cell.
