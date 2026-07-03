@@ -457,7 +457,12 @@ fn draw_collapsed_pane(
     let block = Block::default().borders(Borders::ALL).border_style(theme.border(theme.border_dim));
     let inner = bordered_panel_inner(area);
     f.render_widget(block, area);
-    let text_style = Style::default().fg(theme.text_muted).bg(collapsed_bg);
+    let active_color = match pane {
+        BrowsePaneId::Explore => theme.cyan,
+        BrowsePaneId::Info => theme.amber,
+        BrowsePaneId::Browse => theme.cyan,
+    };
+    let text_style = Style::default().fg(active_color).bg(collapsed_bg);
     let chars = std::iter::once('▸')
         .chain(std::iter::once(' '))
         .chain(title.chars())
