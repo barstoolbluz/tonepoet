@@ -209,6 +209,9 @@ pub enum TuiButton {
     BrowsePaneTitle(crate::tui::browse::BrowsePaneId),
     BrowseTreeNode(usize),
     BrowseOptionsShowHidden,
+    BrowseOptionsLayout,
+    BrowseOptionsToggleExplore,
+    BrowseOptionsToggleInfo,
     BrowseOptionsColumns,
     BrowseOptionsSort,
     BrowseOptionsFilter,
@@ -470,6 +473,9 @@ impl TuiButton {
             | Self::BrowsePaneTitle(_)
             | Self::BrowseTreeNode(_)
             | Self::BrowseOptionsShowHidden
+            | Self::BrowseOptionsLayout
+            | Self::BrowseOptionsToggleExplore
+            | Self::BrowseOptionsToggleInfo
             | Self::BrowseOptionsColumns
             | Self::BrowseOptionsSort
             | Self::BrowseOptionsFilter

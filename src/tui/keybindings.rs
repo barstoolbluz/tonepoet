@@ -46,6 +46,17 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
     // this keeps programmatic transitions from leaving hidden editors behind.
     finish_hidden_inline_edits(app, tx);
 
+    // The Browse options menu is a dropdown, not a modal overlay, so it must
+    // still get first refusal on Esc before inline editors, search, path input,
+    // and other Browse-local modes consume the key.
+    if app.current_screen == AppScreen::Browse
+        && key.code == KeyCode::Esc
+        && app.browse.options_menu.is_open()
+    {
+        app.browse.back_or_close_options_menu();
+        return;
+    }
+
     // Inline edits are part of the base screen, not modal overlays. They must
     // preempt global/screen shortcuts so text entry cannot accidentally switch
     // screens, launch commands, or leave stale edit state behind.
@@ -985,6 +996,27 @@ fn persist_browse_config(app: &mut AppState) {
     if let Err(err) = app.config.save() {
         app.set_status(format!("browse settings changed, but config save failed: {err}"));
     }
+}
+
+fn is_browse_options_menu_button(button: TuiButton) -> bool {
+    matches!(
+        button,
+        TuiButton::BrowseToolbarOptions
+            | TuiButton::BrowseOptionsShowHidden
+            | TuiButton::BrowseOptionsLayout
+            | TuiButton::BrowseOptionsToggleExplore
+            | TuiButton::BrowseOptionsToggleInfo
+            | TuiButton::BrowseOptionsColumns
+            | TuiButton::BrowseOptionsSort
+            | TuiButton::BrowseOptionsFilter
+            | TuiButton::BrowseOptionsArchiveListing
+            | TuiButton::BrowseOptionsSaveLayout
+            | TuiButton::BrowseOptionsRestoreDefaults
+            | TuiButton::BrowseOptionsColumn(_)
+            | TuiButton::BrowseOptionsSortChoice(_, _)
+            | TuiButton::BrowseOptionsFilterChoice(_)
+            | TuiButton::BrowseOptionsArchiveChoice(_)
+    )
 }
 
 fn set_browse_filter_choice(
@@ -2686,9 +2718,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Esc escalation: type-ahead → search → visual mode → multi-selection → text filter → archive
+        // Esc escalation: options menu → type-ahead → search → visual mode → multi-selection → text filter → archive
         (KeyCode::Esc, _) => {
-            if app.cancel_archive_listing() {
+            if app.browse.options_menu.is_open() {
+                app.browse.back_or_close_options_menu();
+            } else if app.cancel_archive_listing() {
                 app.set_status("archive listing cancelled");
             } else if app.browse.type_ahead_active() {
                 app.browse.clear_type_ahead();
@@ -22987,6 +23021,24 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         }
     }
 
+    // Dropdown dismissal is click-modal: any mouse button outside the
+    // options menu closes it and is consumed, so stale menu state cannot
+    // leak the click through to the underlying Browse panes or toolbar.
+    if app.current_screen == AppScreen::Browse
+        && matches!(app.active_overlay, ActiveOverlay::None)
+        && app.browse.options_menu.is_open()
+        && matches!(mouse.kind, MouseEventKind::Down(_))
+    {
+        let clicked_button = app.button_map.find_button_at(mouse.column, mouse.row);
+        if !clicked_button.is_some_and(is_browse_options_menu_button) {
+            app.browse.close_options_menu();
+            return;
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+    }
+
     // Right-click → select the clicked target, then open its context
     // menu. Desktop-standard: right-click on a file selects it AND
     // shows the menu, just like Windows Explorer / macOS Finder.
@@ -23836,6 +23888,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                     super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
+            }
+            TuiButton::BrowseOptionsLayout => app.browse.options_menu = super::browse::BrowseOptionsMenu::Layout,
+            TuiButton::BrowseOptionsToggleExplore => {
+                app.browse.toggle_pane_enabled(super::browse::BrowsePaneId::Explore);
+                persist_browse_config(app);
+            }
+            TuiButton::BrowseOptionsToggleInfo => {
+                app.browse.toggle_pane_enabled(super::browse::BrowsePaneId::Info);
+                persist_browse_config(app);
             }
             TuiButton::BrowseOptionsColumns => app.browse.options_menu = super::browse::BrowseOptionsMenu::Columns,
             TuiButton::BrowseOptionsSort => app.browse.options_menu = super::browse::BrowseOptionsMenu::Sort,

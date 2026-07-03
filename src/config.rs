@@ -74,6 +74,16 @@ pub struct BrowsingConfig {
     pub default_sort_dir: String,
     #[serde(default = "default_browse_filter")]
     pub default_filter: String,
+    /// Whether the Explore pane is present in Browse layout at all.
+    /// This is independent from `layout_explore`, which preserves the
+    /// enabled pane's collapsed/open state.
+    #[serde(default = "default_true")]
+    pub layout_explore_enabled: bool,
+    /// Whether the Info pane is present in Browse layout at all.
+    /// This is independent from `layout_info`, which preserves the
+    /// enabled pane's collapsed/open state.
+    #[serde(default = "default_true")]
+    pub layout_info_enabled: bool,
     #[serde(default = "default_browse_layout_open")]
     pub layout_explore: String,
     #[serde(default = "default_browse_layout_open")]
@@ -93,6 +103,8 @@ impl Default for BrowsingConfig {
             default_sort: default_browse_sort(),
             default_sort_dir: default_browse_sort_dir(),
             default_filter: default_browse_filter(),
+            layout_explore_enabled: true,
+            layout_info_enabled: true,
             layout_explore: default_browse_layout_open(),
             layout_info: default_browse_layout_open(),
             search_result_cap: default_browse_search_result_cap(),
@@ -146,6 +158,8 @@ impl BrowsingConfig {
             default_sort,
             default_sort_dir,
             default_filter,
+            layout_explore_enabled: self.layout_explore_enabled,
+            layout_info_enabled: self.layout_info_enabled,
             layout_explore,
             layout_info,
             search_result_cap,
@@ -163,6 +177,7 @@ fn default_browse_columns() -> Vec<String> {
 fn default_browse_sort() -> String { "name".to_string() }
 fn default_browse_sort_dir() -> String { "asc".to_string() }
 fn default_browse_filter() -> String { "all".to_string() }
+fn default_true() -> bool { true }
 fn default_browse_layout_open() -> String { "open".to_string() }
 fn default_browse_search_result_cap() -> usize { 2000 }
 
@@ -485,6 +500,8 @@ append_lineage_to_comment = false
             default_sort: "nonsense".into(),
             default_sort_dir: "descending".into(),
             default_filter: "audio only".into(),
+            layout_explore_enabled: false,
+            layout_info_enabled: true,
             layout_explore: "closed".into(),
             layout_info: "OPEN".into(),
             search_result_cap: 0,
@@ -495,6 +512,8 @@ append_lineage_to_comment = false
         assert_eq!(config.default_sort, "name");
         assert_eq!(config.default_sort_dir, "desc");
         assert_eq!(config.default_filter, "audio_only");
+        assert!(!config.layout_explore_enabled);
+        assert!(config.layout_info_enabled);
         assert_eq!(config.layout_explore, "collapsed");
         assert_eq!(config.layout_info, "open");
         assert_eq!(config.search_result_cap, 1);
@@ -509,6 +528,8 @@ append_lineage_to_comment = false
         config.browsing.default_sort = "date".into();
         config.browsing.default_sort_dir = "desc".into();
         config.browsing.default_filter = "flac".into();
+        config.browsing.layout_explore_enabled = true;
+        config.browsing.layout_info_enabled = false;
         config.browsing.layout_explore = "collapsed".into();
         config.browsing.search_result_cap = 4096;
 
@@ -516,6 +537,7 @@ append_lineage_to_comment = false
         assert!(encoded.contains("[browsing]"));
         assert!(encoded.contains("show_hidden = true"));
         assert!(encoded.contains("default_sort = \"date\""));
+        assert!(encoded.contains("layout_info_enabled = false"));
         assert!(encoded.contains("search_result_cap = 4096"));
 
         let decoded: TonepoetConfig = toml::from_str(&encoded).expect("decode config");

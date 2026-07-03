@@ -934,6 +934,7 @@ impl BrowseColumn {
 pub enum BrowseOptionsMenu {
     Closed,
     Root,
+    Layout,
     Columns,
     Sort,
     Filter,
@@ -1112,6 +1113,10 @@ pub struct BrowseState {
     pub tree_visible_height: usize,
 
     /// Three-pane Browse layout state. Browse itself is never fully collapsed.
+    /// `*_enabled` controls whether a side pane participates in layout at all;
+    /// `*_collapsed` controls the enabled pane's 3-column collapsed rail state.
+    pub explore_enabled: bool,
+    pub info_enabled: bool,
     pub explore_collapsed: bool,
     pub info_collapsed: bool,
     pub browse_maximized: bool,
@@ -1310,6 +1315,8 @@ impl BrowseState {
         let sort_dir = SortDir::from_label(&config.default_sort_dir).unwrap_or(SortDir::Asc);
         let format_filter = FormatFilter::from_label(&config.default_filter).unwrap_or(FormatFilter::Off);
         let columns = BrowseColumn::from_config_list(&config.columns);
+        let explore_enabled = config.layout_explore_enabled;
+        let info_enabled = config.layout_info_enabled;
         let explore_collapsed = config.layout_explore == "collapsed";
         let info_collapsed = config.layout_info == "collapsed";
 
@@ -1364,6 +1371,8 @@ impl BrowseState {
             tree_cursor: 0,
             tree_scroll: 0,
             tree_visible_height: 0,
+            explore_enabled,
+            info_enabled,
             explore_collapsed,
             info_collapsed,
             browse_maximized: explore_collapsed && info_collapsed,
@@ -1403,6 +1412,8 @@ impl BrowseState {
             default_sort: self.default_sort_by.label().to_string(),
             default_sort_dir: self.default_sort_dir.label().to_string(),
             default_filter: self.format_filter.config_label(),
+            layout_explore_enabled: self.explore_enabled,
+            layout_info_enabled: self.info_enabled,
             layout_explore: if self.explore_collapsed { "collapsed" } else { "open" }.to_string(),
             layout_info: if self.info_collapsed { "collapsed" } else { "open" }.to_string(),
             search_result_cap: self.search_result_cap,
@@ -1481,6 +1492,14 @@ impl BrowseState {
         self.browse_maximized = self.explore_collapsed && self.info_collapsed;
     }
 
+    pub fn toggle_pane_enabled(&mut self, pane: BrowsePaneId) {
+        match pane {
+            BrowsePaneId::Explore => self.explore_enabled = !self.explore_enabled,
+            BrowsePaneId::Info => self.info_enabled = !self.info_enabled,
+            BrowsePaneId::Browse => return,
+        }
+    }
+
     pub fn toggle_browse_maximized(&mut self) {
         if self.explore_collapsed && self.info_collapsed {
             self.explore_collapsed = false;
@@ -1494,6 +1513,8 @@ impl BrowseState {
     }
 
     pub fn reset_browse_layout(&mut self) {
+        self.explore_enabled = true;
+        self.info_enabled = true;
         self.explore_collapsed = false;
         self.info_collapsed = false;
         self.browse_maximized = false;
@@ -1519,6 +1540,8 @@ impl BrowseState {
         self.default_sort_dir = SortDir::from_label(&config.default_sort_dir).unwrap_or(SortDir::Asc);
         self.reset_sort_to_default();
         self.format_filter = FormatFilter::from_label(&config.default_filter).unwrap_or(FormatFilter::Off);
+        self.explore_enabled = config.layout_explore_enabled;
+        self.info_enabled = config.layout_info_enabled;
         self.explore_collapsed = config.layout_explore == "collapsed";
         self.info_collapsed = config.layout_info == "collapsed";
         self.browse_maximized = self.explore_collapsed && self.info_collapsed;
@@ -1549,6 +1572,14 @@ impl BrowseState {
 
     pub fn close_options_menu(&mut self) {
         self.options_menu = BrowseOptionsMenu::Closed;
+    }
+
+    pub fn back_or_close_options_menu(&mut self) {
+        self.options_menu = match self.options_menu {
+            BrowseOptionsMenu::Closed => BrowseOptionsMenu::Closed,
+            BrowseOptionsMenu::Root => BrowseOptionsMenu::Closed,
+            _ => BrowseOptionsMenu::Root,
+        };
     }
 
     pub fn toggle_options_menu(&mut self) {
@@ -5001,6 +5032,78 @@ mod browse_pane_toggle_tests {
         assert!(!browse.explore_collapsed);
         assert!(!browse.info_collapsed);
         assert!(!browse.browse_maximized);
+    }
+
+    #[test]
+    fn pane_enabled_state_is_independent_from_collapsed_state() {
+        let mut browse = BrowseState::new();
+        browse.explore_collapsed = true;
+        browse.info_collapsed = false;
+        browse.explore_enabled = true;
+        browse.info_enabled = true;
+
+        browse.toggle_pane_enabled(BrowsePaneId::Explore);
+
+        assert!(!browse.explore_enabled);
+        assert!(browse.info_enabled);
+        assert!(browse.explore_collapsed);
+        assert!(!browse.info_collapsed);
+    }
+
+    #[test]
+    fn captured_browsing_config_includes_side_pane_enabled_state() {
+        let mut browse = BrowseState::new();
+        browse.explore_enabled = false;
+        browse.info_enabled = true;
+        browse.explore_collapsed = true;
+        browse.info_collapsed = false;
+
+        let captured = browse.capture_browsing_config();
+
+        assert!(!captured.layout_explore_enabled);
+        assert!(captured.layout_info_enabled);
+        assert_eq!(captured.layout_explore, "collapsed");
+        assert_eq!(captured.layout_info, "open");
+    }
+
+    #[test]
+    fn back_or_close_options_menu_returns_from_submenu_before_closing_root() {
+        let mut browse = BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::Columns;
+
+        browse.back_or_close_options_menu();
+        assert_eq!(browse.options_menu, BrowseOptionsMenu::Root);
+
+        browse.back_or_close_options_menu();
+        assert_eq!(browse.options_menu, BrowseOptionsMenu::Closed);
+
+        browse.back_or_close_options_menu();
+        assert_eq!(browse.options_menu, BrowseOptionsMenu::Closed);
+    }
+
+    #[test]
+    fn apply_browsing_config_preserves_enabled_and_collapsed_as_separate_states() {
+        let mut browse = BrowseState::new();
+        let config = crate::config::BrowsingConfig {
+            layout_explore_enabled: false,
+            layout_info_enabled: true,
+            layout_explore: "collapsed".to_string(),
+            layout_info: "open".to_string(),
+            ..crate::config::BrowsingConfig::default()
+        };
+
+        browse.apply_browsing_config(&config);
+
+        assert!(!browse.explore_enabled);
+        assert!(browse.info_enabled);
+        assert!(browse.explore_collapsed);
+        assert!(!browse.info_collapsed);
+
+        let captured = browse.capture_browsing_config();
+        assert!(!captured.layout_explore_enabled);
+        assert!(captured.layout_info_enabled);
+        assert_eq!(captured.layout_explore, "collapsed");
+        assert_eq!(captured.layout_info, "open");
     }
 }
 

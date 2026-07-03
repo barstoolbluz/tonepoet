@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -148,10 +148,12 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
     let hover = app.hover_target;
     let inline_edit = app.browse_inline_edit.clone();
 
-    if app.browse.explore_collapsed {
-        draw_collapsed_pane(f, explore_area, BrowsePaneId::Explore, "explore", &mut app.button_map, theme);
-    } else {
-        draw_explore_pane(f, explore_area, &mut app.browse, &mut app.button_map, hover, theme);
+    if app.browse.explore_enabled {
+        if app.browse.explore_collapsed {
+            draw_collapsed_pane(f, explore_area, BrowsePaneId::Explore, "explore", &mut app.button_map, theme);
+        } else {
+            draw_explore_pane(f, explore_area, &mut app.browse, &mut app.button_map, hover, theme);
+        }
     }
 
     draw_browse_list(f, list_area, &mut app.browse, inline_edit.as_ref(), hover, theme);
@@ -162,20 +164,22 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
     // documented interaction model.
     app.button_map.record_button(TuiButton::BrowsePaneTitle(BrowsePaneId::Browse), Rect::new(list_area.x, list_area.y, list_area.width, 1));
 
-    if app.browse.info_collapsed {
-        draw_collapsed_pane(f, info_area, BrowsePaneId::Info, "info", &mut app.button_map, theme);
-    } else {
-        draw_browse_info(
-            f,
-            info_area,
-            &app.browse,
-            inline_edit.as_ref(),
-            app.browse_info_focus,
-            &mut app.button_map,
-            hover,
-            theme,
-        );
-        app.button_map.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Info), Rect::new(info_area.x + 1, info_area.y, 7.min(info_area.width.saturating_sub(2)), 1));
+    if app.browse.info_enabled {
+        if app.browse.info_collapsed {
+            draw_collapsed_pane(f, info_area, BrowsePaneId::Info, "info", &mut app.button_map, theme);
+        } else {
+            draw_browse_info(
+                f,
+                info_area,
+                &app.browse,
+                inline_edit.as_ref(),
+                app.browse_info_focus,
+                &mut app.button_map,
+                hover,
+                theme,
+            );
+            app.button_map.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Info), Rect::new(info_area.x + 1, info_area.y, 7.min(info_area.width.saturating_sub(2)), 1));
+        }
     }
 
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
@@ -189,16 +193,34 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
     );
 
     if app.browse.options_menu.is_open() {
-        draw_options_menu(f, chunks[1], &app.browse, &mut app.button_map, theme);
+        draw_options_menu(
+            f,
+            chunks[1],
+            &app.browse,
+            &app.config.performance.browsing.archive_listing,
+            &mut app.button_map,
+            app.hover_target,
+            theme,
+        );
     }
 }
 
 fn browse_content_layout(area: Rect, browse: &BrowseState) -> std::rc::Rc<[Rect]> {
-    let constraints: Vec<Constraint> = match (browse.explore_collapsed, browse.info_collapsed) {
-        (true, true) => vec![Constraint::Length(3), Constraint::Min(40), Constraint::Length(3)],
-        (true, false) => vec![Constraint::Length(3), Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)],
-        (false, true) => vec![Constraint::Percentage(20), Constraint::Min(40), Constraint::Length(3)],
-        (false, false) => vec![Constraint::Percentage(20), Constraint::Percentage(50), Constraint::Percentage(30)],
+    let constraints: Vec<Constraint> = match (
+        browse.explore_enabled,
+        browse.info_enabled,
+        browse.explore_collapsed,
+        browse.info_collapsed,
+    ) {
+        (false, false, _, _) => vec![Constraint::Length(0), Constraint::Percentage(100), Constraint::Length(0)],
+        (false, true, _, true) => vec![Constraint::Length(0), Constraint::Min(40), Constraint::Length(3)],
+        (false, true, _, false) => vec![Constraint::Length(0), Constraint::Percentage(60), Constraint::Percentage(40)],
+        (true, false, true, _) => vec![Constraint::Length(3), Constraint::Min(40), Constraint::Length(0)],
+        (true, false, false, _) => vec![Constraint::Percentage(20), Constraint::Percentage(80), Constraint::Length(0)],
+        (true, true, true, true) => vec![Constraint::Length(3), Constraint::Min(40), Constraint::Length(3)],
+        (true, true, true, false) => vec![Constraint::Length(3), Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)],
+        (true, true, false, true) => vec![Constraint::Percentage(20), Constraint::Min(40), Constraint::Length(3)],
+        (true, true, false, false) => vec![Constraint::Percentage(20), Constraint::Percentage(50), Constraint::Percentage(30)],
     };
     Layout::default()
         .direction(Direction::Horizontal)
@@ -423,7 +445,7 @@ fn draw_collapsed_pane(
         );
     }
     let block = Block::default().borders(Borders::ALL).border_style(theme.border(theme.border_dim));
-    let inner = block.inner(area);
+    let inner = bordered_panel_inner(area);
     f.render_widget(block, area);
     let text_style = Style::default().fg(theme.text_muted).bg(collapsed_bg);
     let chars = std::iter::once('▸')
@@ -441,23 +463,118 @@ fn draw_options_menu(
     f: &mut Frame,
     toolbar_area: Rect,
     browse: &BrowseState,
+    archive_listing_mode: &str,
     buttons: &mut ButtonRenderMap,
+    hover: Option<TuiButton>,
     theme: super::theme::Theme,
 ) {
-    let x = toolbar_area.x.saturating_add(30);
+    let root_rows = options_root_rows(browse);
+    let root_width = options_menu_panel_width("Options", &root_rows, toolbar_area.width);
+    let root_height = root_rows.len() as u16 + 2;
+    let preferred_x = toolbar_area.x.saturating_add(30);
     let y = toolbar_area.y.saturating_add(1);
-    let (title, rows): (&str, Vec<(String, Option<TuiButton>)>) = match browse.options_menu {
-        BrowseOptionsMenu::Columns => (
+    let root_x = clamp_menu_x(preferred_x, root_width, toolbar_area);
+    let root_area = Rect::new(root_x, y, root_width, root_height);
+    let active_parent = active_options_parent_button(browse.options_menu);
+
+    render_options_menu_panel(
+        f,
+        root_area,
+        "Options",
+        &root_rows,
+        buttons,
+        hover,
+        active_parent,
+        theme,
+    );
+
+    if let Some((title, submenu_rows)) = options_submenu_rows(browse, archive_listing_mode) {
+        let submenu_width = options_menu_panel_width(title, &submenu_rows, toolbar_area.width);
+        let submenu_height = submenu_rows.len() as u16 + 2;
+        let submenu_area = options_submenu_area(root_area, submenu_width, submenu_height, toolbar_area);
+
+        render_options_menu_panel(
+            f,
+            submenu_area,
+            title,
+            &submenu_rows,
+            buttons,
+            hover,
+            None,
+            theme,
+        );
+    }
+}
+
+fn options_root_rows(browse: &BrowseState) -> Vec<(String, Option<TuiButton>)> {
+    vec![
+        (
+            (if browse.show_hidden { " ● Show hidden files" } else { " ○ Show hidden files" }).to_string(),
+            Some(TuiButton::BrowseOptionsShowHidden),
+        ),
+        (" Layout                ▸".to_string(), Some(TuiButton::BrowseOptionsLayout)),
+        (" Columns               ▸".to_string(), Some(TuiButton::BrowseOptionsColumns)),
+        (" Default sort          ▸".to_string(), Some(TuiButton::BrowseOptionsSort)),
+        (" Filter                ▸".to_string(), Some(TuiButton::BrowseOptionsFilter)),
+        (
+            " Archive listing mode  ▸".to_string(),
+            Some(TuiButton::BrowseOptionsArchiveListing),
+        ),
+        (" ─────────────────────".to_string(), None),
+        (
+            " Save layout as default".to_string(),
+            Some(TuiButton::BrowseOptionsSaveLayout),
+        ),
+        (
+            " Restore defaults".to_string(),
+            Some(TuiButton::BrowseOptionsRestoreDefaults),
+        ),
+    ]
+}
+
+fn active_options_parent_button(menu: BrowseOptionsMenu) -> Option<TuiButton> {
+    match menu {
+        BrowseOptionsMenu::Layout => Some(TuiButton::BrowseOptionsLayout),
+        BrowseOptionsMenu::Columns => Some(TuiButton::BrowseOptionsColumns),
+        BrowseOptionsMenu::Sort => Some(TuiButton::BrowseOptionsSort),
+        BrowseOptionsMenu::Filter => Some(TuiButton::BrowseOptionsFilter),
+        BrowseOptionsMenu::ArchiveListing => Some(TuiButton::BrowseOptionsArchiveListing),
+        BrowseOptionsMenu::Root | BrowseOptionsMenu::Closed => None,
+    }
+}
+
+fn options_submenu_rows(
+    browse: &BrowseState,
+    archive_listing_mode: &str,
+) -> Option<(&'static str, Vec<(String, Option<TuiButton>)>)> {
+    match browse.options_menu {
+        BrowseOptionsMenu::Layout => Some((
+            "Layout",
+            vec![
+                (
+                    format!(" {} Show Explore pane", if browse.explore_enabled { "●" } else { "○" }),
+                    Some(TuiButton::BrowseOptionsToggleExplore),
+                ),
+                (
+                    format!(" {} Show Info pane", if browse.info_enabled { "●" } else { "○" }),
+                    Some(TuiButton::BrowseOptionsToggleInfo),
+                ),
+            ],
+        )),
+        BrowseOptionsMenu::Columns => Some((
             "Columns",
-            super::browse::BrowseColumn::ALL
+            BrowseColumn::ALL
                 .iter()
                 .map(|column| {
                     let mark = if browse.columns.contains(column) { "☑" } else { "☐" };
-                    (format!(" {} {}", mark, column.label()), Some(TuiButton::BrowseOptionsColumn(*column)))
+                    (
+                        format!(" {} {}", mark, column.label()),
+                        Some(TuiButton::BrowseOptionsColumn(*column)),
+                    )
                 })
                 .collect(),
-        ),
-        BrowseOptionsMenu::Sort => (
+        )),
+        BrowseOptionsMenu::Sort => Some((
             "Default sort",
             SortBy::ALL
                 .into_iter()
@@ -478,55 +595,254 @@ fn draw_options_menu(
                     )
                 })
                 .collect(),
-        ),
-        BrowseOptionsMenu::Filter => (
+        )),
+        BrowseOptionsMenu::Filter => Some((
             "Filter",
             FormatFilter::menu_choices()
                 .into_iter()
                 .enumerate()
                 .map(|(index, filter)| {
                     let mark = if browse.format_filter == filter { "●" } else { "○" };
-                    (format!(" {} {}", mark, filter.menu_label()), Some(TuiButton::BrowseOptionsFilterChoice(index)))
+                    (
+                        format!(" {} {}", mark, filter.menu_label()),
+                        Some(TuiButton::BrowseOptionsFilterChoice(index)),
+                    )
                 })
                 .collect(),
-        ),
-        BrowseOptionsMenu::ArchiveListing => (
-            "Archive listing",
-            vec![
-                (" Auto (skip remote)".to_string(), Some(TuiButton::BrowseOptionsArchiveChoice(0))),
-                (" Always".to_string(), Some(TuiButton::BrowseOptionsArchiveChoice(1))),
-                (" Never".to_string(), Some(TuiButton::BrowseOptionsArchiveChoice(2))),
-            ],
-        ),
-        BrowseOptionsMenu::Root | BrowseOptionsMenu::Closed => (
-            "Options",
-            vec![
-                ((if browse.show_hidden { " ● Show hidden files" } else { " ○ Show hidden files" }).to_string(), Some(TuiButton::BrowseOptionsShowHidden)),
-                (" Columns               ▸".to_string(), Some(TuiButton::BrowseOptionsColumns)),
-                (" Default sort          ▸".to_string(), Some(TuiButton::BrowseOptionsSort)),
-                (" Filter                ▸".to_string(), Some(TuiButton::BrowseOptionsFilter)),
-                (" Archive listing mode  ▸".to_string(), Some(TuiButton::BrowseOptionsArchiveListing)),
-                (" ─────────────────────".to_string(), None),
-                (" Save layout as default".to_string(), Some(TuiButton::BrowseOptionsSaveLayout)),
-                (" Restore defaults".to_string(), Some(TuiButton::BrowseOptionsRestoreDefaults)),
-            ],
-        ),
-    };
-    let width = rows.iter().map(|(row, _)| row.chars().count()).max().unwrap_or(12).max(title.len() + 4) as u16 + 2;
-    let height = rows.len() as u16 + 2;
-    let area = Rect::new(x, y, width.min(40), height);
-    let block = Block::default().borders(Borders::ALL).title(title).border_style(theme.border(theme.cyan));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let lines = rows.iter().map(|(row, button)| {
-        let style = if button.is_some() { theme.text_style() } else { Style::default().fg(theme.border_dim) };
-        Line::from(Span::styled(row.clone(), style))
-    }).collect::<Vec<_>>();
-    f.render_widget(Paragraph::new(lines), inner);
-    for (idx, (_, button)) in rows.iter().enumerate() {
-        if let Some(button) = button {
-            buttons.record_button(*button, Rect::new(inner.x, inner.y + idx as u16, inner.width, 1));
+        )),
+        BrowseOptionsMenu::ArchiveListing => {
+            let auto = archive_listing_choice_mark(archive_listing_mode, "auto");
+            let always = archive_listing_choice_mark(archive_listing_mode, "always");
+            let never = archive_listing_choice_mark(archive_listing_mode, "never");
+            Some((
+                "Archive listing",
+                vec![
+                    (
+                        format!(" {} Auto (skip remote)", auto),
+                        Some(TuiButton::BrowseOptionsArchiveChoice(0)),
+                    ),
+                    (
+                        format!(" {} Always", always),
+                        Some(TuiButton::BrowseOptionsArchiveChoice(1)),
+                    ),
+                    (
+                        format!(" {} Never", never),
+                        Some(TuiButton::BrowseOptionsArchiveChoice(2)),
+                    ),
+                ],
+            ))
         }
+        BrowseOptionsMenu::Root | BrowseOptionsMenu::Closed => None,
+    }
+}
+
+fn options_menu_panel_width(title: &str, rows: &[(String, Option<TuiButton>)], outer_width: u16) -> u16 {
+    let content_width = rows
+        .iter()
+        .map(|(row, _)| row.chars().count())
+        .max()
+        .unwrap_or(12)
+        .max(title.chars().count() + 4) as u16;
+    content_width.saturating_add(2).min(40).min(outer_width.max(1))
+}
+
+fn clamp_menu_x(preferred_x: u16, width: u16, outer: Rect) -> u16 {
+    let right = outer.x.saturating_add(outer.width);
+    let max_x = right.saturating_sub(width);
+    preferred_x.min(max_x).max(outer.x)
+}
+
+fn options_submenu_area(root_area: Rect, width: u16, height: u16, outer: Rect) -> Rect {
+    let right_x = root_area.x.saturating_add(root_area.width);
+    let outer_right = outer.x.saturating_add(outer.width);
+    if right_x.saturating_add(width) <= outer_right {
+        return Rect::new(right_x, root_area.y, width, height);
+    }
+
+    if root_area.x >= outer.x.saturating_add(width) {
+        return Rect::new(root_area.x - width, root_area.y, width, height);
+    }
+
+    let right_candidate = clamp_menu_x(right_x, width, outer);
+    let left_candidate = outer.x.max(root_area.x.saturating_sub(width));
+    let right_overlap = horizontal_overlap(right_candidate, width, root_area.x, root_area.width);
+    let left_overlap = horizontal_overlap(left_candidate, width, root_area.x, root_area.width);
+
+    // Prefer the canonical right-side flyout on ties, but if the terminal is
+    // too narrow for a non-overlapping flyout, choose the side that obscures
+    // the smallest part of the root panel.
+    let x = if left_overlap < right_overlap {
+        left_candidate
+    } else {
+        right_candidate
+    };
+    Rect::new(x, root_area.y, width, height)
+}
+
+fn horizontal_overlap(ax: u16, aw: u16, bx: u16, bw: u16) -> u16 {
+    let a_end = ax.saturating_add(aw);
+    let b_end = bx.saturating_add(bw);
+    a_end.min(b_end).saturating_sub(ax.max(bx))
+}
+
+fn bordered_panel_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn options_menu_row_hitbox(area: Rect, row_index: usize) -> Option<Rect> {
+    let inner = bordered_panel_inner(area);
+    if row_index >= inner.height as usize {
+        return None;
+    }
+    Some(Rect::new(
+        inner.x,
+        inner.y.saturating_add(row_index as u16),
+        inner.width,
+        1,
+    ))
+}
+
+fn archive_listing_choice_mark(config_value: &str, choice: &str) -> &'static str {
+    let normalized = config_value.trim().to_ascii_lowercase();
+    let current = match normalized.as_str() {
+        "always" => "always",
+        "never" => "never",
+        _ => "auto",
+    };
+    if current == choice { "●" } else { "○" }
+}
+
+fn fit_menu_row(row: &str, width: u16) -> String {
+    let target = width as usize;
+    let mut fitted = row.chars().take(target).collect::<String>();
+    let current = fitted.chars().count();
+    if current < target {
+        fitted.push_str(&" ".repeat(target - current));
+    }
+    fitted
+}
+
+fn render_options_menu_panel(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    rows: &[(String, Option<TuiButton>)],
+    buttons: &mut ButtonRenderMap,
+    hover: Option<TuiButton>,
+    selected: Option<TuiButton>,
+    theme: super::theme::Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(theme.border(theme.cyan))
+        .style(Style::default().bg(theme.bg));
+    let inner = bordered_panel_inner(area);
+
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let lines = rows
+        .iter()
+        .map(|(row, button)| {
+            let row_text = fit_menu_row(row, inner.width);
+            let style = match button {
+                Some(button) if hover == Some(*button) || selected == Some(*button) => Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.blue)
+                    .add_modifier(Modifier::BOLD),
+                Some(_) => theme.text_style().bg(theme.bg),
+                None => Style::default().fg(theme.border_dim).bg(theme.bg),
+            };
+            Line::from(Span::styled(row_text, style))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.bg)), inner);
+
+    for (idx, (_, button)) in rows.iter().enumerate() {
+        if let (Some(button), Some(hitbox)) = (button, options_menu_row_hitbox(area, idx)) {
+            buttons.record_button(*button, hitbox);
+        }
+    }
+}
+
+#[cfg(test)]
+mod options_menu_tests {
+    use super::*;
+
+    #[test]
+    fn archive_listing_submenu_marks_current_mode() {
+        let mut browse = BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::ArchiveListing;
+
+        let (_, rows) = options_submenu_rows(&browse, "never").expect("archive rows");
+
+        assert!(rows[0].0.starts_with(" ○ Auto"));
+        assert!(rows[1].0.starts_with(" ○ Always"));
+        assert!(rows[2].0.starts_with(" ● Never"));
+    }
+
+    #[test]
+    fn archive_listing_submenu_treats_unknown_mode_as_auto() {
+        let mut browse = BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::ArchiveListing;
+
+        let (_, rows) = options_submenu_rows(&browse, "unexpected").expect("archive rows");
+
+        assert!(rows[0].0.starts_with(" ● Auto"));
+        assert!(rows[1].0.starts_with(" ○ Always"));
+        assert!(rows[2].0.starts_with(" ○ Never"));
+    }
+
+    #[test]
+    fn submenu_geometry_prefers_right_when_there_is_room() {
+        let outer = Rect::new(0, 0, 100, 20);
+        let root = Rect::new(30, 1, 24, 10);
+
+        let submenu = options_submenu_area(root, 20, 8, outer);
+
+        assert_eq!(submenu.x, root.x + root.width);
+        assert_eq!(horizontal_overlap(submenu.x, submenu.width, root.x, root.width), 0);
+    }
+
+    #[test]
+    fn submenu_geometry_flips_left_before_overlapping_root() {
+        let outer = Rect::new(0, 0, 60, 20);
+        let root = Rect::new(30, 1, 24, 10);
+
+        let submenu = options_submenu_area(root, 20, 8, outer);
+
+        assert_eq!(submenu.x + submenu.width, root.x);
+        assert_eq!(horizontal_overlap(submenu.x, submenu.width, root.x, root.width), 0);
+    }
+
+    #[test]
+    fn submenu_geometry_stays_in_bounds_when_overlap_is_unavoidable() {
+        let outer = Rect::new(0, 0, 30, 20);
+        let root = Rect::new(5, 1, 22, 10);
+
+        let submenu = options_submenu_area(root, 20, 8, outer);
+
+        assert!(submenu.x >= outer.x);
+        assert!(submenu.x + submenu.width <= outer.x + outer.width);
+    }
+
+    #[test]
+    fn options_menu_hitboxes_match_bordered_panel_inner_rows() {
+        let panel = Rect::new(10, 4, 24, 7);
+
+        assert_eq!(options_menu_row_hitbox(panel, 0), Some(Rect::new(11, 5, 22, 1)));
+        assert_eq!(options_menu_row_hitbox(panel, 4), Some(Rect::new(11, 9, 22, 1)));
+        assert_eq!(options_menu_row_hitbox(panel, 5), None);
     }
 }
 
