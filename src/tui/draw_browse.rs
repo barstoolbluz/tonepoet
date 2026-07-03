@@ -1040,6 +1040,365 @@ mod options_menu_tests {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchControlKind {
+    Recursive,
+    Mode,
+    Sort,
+    Audio,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchControlLayoutItem {
+    kind: SearchControlKind,
+    x: u16,
+    width: u16,
+    label: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SearchControlLabelTier {
+    Full,
+    Compact,
+    Tiny,
+}
+
+fn browse_search_rows(active: bool) -> u16 {
+    if active { 2 } else { 0 }
+}
+
+fn browse_header_y(area: Rect, search_active: bool) -> u16 {
+    area.y + 1 + browse_search_rows(search_active)
+}
+
+fn browse_search_input_y(area: Rect) -> u16 {
+    area.y + 1
+}
+
+fn browse_search_controls_y(area: Rect) -> u16 {
+    area.y + 2
+}
+
+fn browse_entry_y_start(area: Rect, search_active: bool) -> u16 {
+    area.y + 2 + browse_search_rows(search_active)
+}
+
+fn search_control_button(kind: SearchControlKind) -> TuiButton {
+    match kind {
+        SearchControlKind::Recursive => TuiButton::BrowseSearchRecursive,
+        SearchControlKind::Mode => TuiButton::BrowseSearchMode,
+        SearchControlKind::Sort => TuiButton::BrowseSearchSort,
+        SearchControlKind::Audio => TuiButton::BrowseSearchAudioOnly,
+    }
+}
+
+fn search_label_abbrev(label: &str) -> &str {
+    match label {
+        "filename" => "file",
+        "relevance" => "rel",
+        "extension" => "ext",
+        other => other,
+    }
+}
+
+fn first_label_char(label: &str) -> char {
+    label.chars().next().unwrap_or('?')
+}
+
+fn search_control_labels_for_tier(
+    tier: SearchControlLabelTier,
+    recursive: bool,
+    mode_label: &str,
+    sort_label: &str,
+    sort_dir: SortDir,
+    audio_only: bool,
+) -> Vec<(SearchControlKind, String)> {
+    let sort_arrow = match sort_dir {
+        SortDir::Asc => "▲",
+        SortDir::Desc => "▼",
+    };
+    let mode_compact = search_label_abbrev(mode_label);
+    let sort_compact = search_label_abbrev(sort_label);
+    let mode_tiny = first_label_char(mode_label);
+
+    match tier {
+        SearchControlLabelTier::Full => vec![
+            (
+                SearchControlKind::Recursive,
+                if recursive { " recursive ✓ " } else { " recursive " }.to_string(),
+            ),
+            (SearchControlKind::Mode, format!(" mode: {} ", mode_label)),
+            (
+                SearchControlKind::Sort,
+                format!(" sort: {} {} ", sort_label, sort_arrow),
+            ),
+            (
+                SearchControlKind::Audio,
+                if audio_only { " audio ✓ " } else { " all files " }.to_string(),
+            ),
+        ],
+        SearchControlLabelTier::Compact => vec![
+            (
+                SearchControlKind::Recursive,
+                if recursive { " rec ✓ " } else { " rec " }.to_string(),
+            ),
+            (SearchControlKind::Mode, format!(" mode:{} ", mode_compact)),
+            (
+                SearchControlKind::Sort,
+                format!(" sort:{} {} ", sort_compact, sort_arrow),
+            ),
+            (
+                SearchControlKind::Audio,
+                if audio_only { " audio ✓ " } else { " files " }.to_string(),
+            ),
+        ],
+        SearchControlLabelTier::Tiny => vec![
+            (
+                SearchControlKind::Recursive,
+                if recursive { " r✓ " } else { " r " }.to_string(),
+            ),
+            (SearchControlKind::Mode, format!(" m:{} ", mode_tiny)),
+            (SearchControlKind::Sort, format!(" s{} ", sort_arrow)),
+            (
+                SearchControlKind::Audio,
+                if audio_only { " a✓ " } else { " a " }.to_string(),
+            ),
+        ],
+    }
+}
+
+fn search_control_label_width(label: &str) -> usize {
+    label.chars().count()
+}
+
+fn search_control_total_width(labels: &[(SearchControlKind, String)]) -> usize {
+    labels
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, label))| {
+            let gap = if idx > 0 { 1 } else { 0 };
+            search_control_label_width(label) + gap
+        })
+        .sum()
+}
+
+fn place_search_control_labels(
+    inner_width: usize,
+    labels: Vec<(SearchControlKind, String)>,
+    require_all: bool,
+) -> Option<Vec<SearchControlLayoutItem>> {
+    let mut items = Vec::new();
+    let mut used = 0usize;
+
+    for (idx, (kind, label)) in labels.into_iter().enumerate() {
+        let gap = if idx > 0 { 1 } else { 0 };
+        let label_width = search_control_label_width(&label);
+        if used + gap + label_width > inner_width {
+            if require_all {
+                return None;
+            }
+            break;
+        }
+        used += gap;
+        items.push(SearchControlLayoutItem {
+            kind,
+            x: used as u16,
+            width: label_width as u16,
+            label,
+        });
+        used += label_width;
+    }
+
+    Some(items)
+}
+
+fn search_control_row_layout(
+    inner_width: usize,
+    recursive: bool,
+    mode_label: &str,
+    sort_label: &str,
+    sort_dir: SortDir,
+    audio_only: bool,
+) -> Vec<SearchControlLayoutItem> {
+    for tier in [
+        SearchControlLabelTier::Full,
+        SearchControlLabelTier::Compact,
+        SearchControlLabelTier::Tiny,
+    ] {
+        let labels = search_control_labels_for_tier(
+            tier,
+            recursive,
+            mode_label,
+            sort_label,
+            sort_dir,
+            audio_only,
+        );
+        if search_control_total_width(&labels) <= inner_width {
+            return place_search_control_labels(inner_width, labels, true).unwrap_or_default();
+        }
+    }
+
+    // Pathological widths cannot display every control. Keep the left-to-right
+    // control order and register only fully visible controls; never allow text
+    // or hitboxes to run into the border or adjacent panes.
+    let labels = search_control_labels_for_tier(
+        SearchControlLabelTier::Tiny,
+        recursive,
+        mode_label,
+        sort_label,
+        sort_dir,
+        audio_only,
+    );
+    place_search_control_labels(inner_width, labels, false).unwrap_or_default()
+}
+
+fn search_control_style(
+    kind: SearchControlKind,
+    recursive: bool,
+    audio_only: bool,
+    theme: super::theme::Theme,
+) -> Style {
+    match kind {
+        SearchControlKind::Recursive if recursive => Style::default()
+            .fg(theme.pill_active_fg)
+            .bg(theme.green)
+            .add_modifier(Modifier::BOLD),
+        SearchControlKind::Audio if audio_only => Style::default()
+            .fg(theme.pill_active_fg)
+            .bg(theme.green)
+            .add_modifier(Modifier::BOLD),
+        SearchControlKind::Recursive | SearchControlKind::Audio => {
+            Style::default().fg(theme.text_dim).bg(theme.surface)
+        }
+        SearchControlKind::Mode | SearchControlKind::Sort => {
+            Style::default().fg(theme.text_bright).bg(theme.surface)
+        }
+    }
+}
+
+fn clipped_inner_row_rect(area: Rect, y: u16, x_offset: u16, width: u16) -> Option<Rect> {
+    let inner_left = area.x.saturating_add(1);
+    let inner_right_exclusive = area.x.saturating_add(area.width.saturating_sub(1));
+    let x = inner_left.saturating_add(x_offset);
+    if x >= inner_right_exclusive {
+        return None;
+    }
+    let end = x.saturating_add(width).min(inner_right_exclusive);
+    if end <= x {
+        return None;
+    }
+    Some(Rect::new(x, y, end - x, 1))
+}
+
+#[cfg(test)]
+mod search_panel_geometry_tests {
+    use super::*;
+
+    fn assert_layout_inside(inner_width: usize, items: &[SearchControlLayoutItem]) {
+        for item in items {
+            assert!((item.x as usize) + (item.width as usize) <= inner_width);
+        }
+    }
+
+    #[test]
+    fn search_panel_row_order_keeps_header_attached_to_results() {
+        let area = Rect::new(10, 4, 90, 20);
+
+        assert_eq!(browse_search_input_y(area), 5);
+        assert_eq!(browse_search_controls_y(area), 6);
+        assert_eq!(browse_header_y(area, true), 7);
+        assert_eq!(browse_entry_y_start(area, true), 8);
+
+        assert!(browse_search_input_y(area) < browse_search_controls_y(area));
+        assert!(browse_search_controls_y(area) < browse_header_y(area, true));
+        assert!(browse_header_y(area, true) < browse_entry_y_start(area, true));
+    }
+
+    #[test]
+    fn search_control_layout_matches_full_width_visual_order() {
+        let items = search_control_row_layout(
+            80,
+            true,
+            "filename",
+            "relevance",
+            SortDir::Asc,
+            false,
+        );
+
+        assert_eq!(
+            items.iter().map(|item| item.kind).collect::<Vec<_>>(),
+            vec![
+                SearchControlKind::Recursive,
+                SearchControlKind::Mode,
+                SearchControlKind::Sort,
+                SearchControlKind::Audio,
+            ]
+        );
+        assert_eq!(items[0].label, " recursive ✓ ");
+        assert_eq!(items[1].label, " mode: filename ");
+        assert_eq!(items[2].label, " sort: relevance ▲ ");
+        assert_eq!(items[3].label, " all files ");
+        assert_layout_inside(80, &items);
+    }
+
+    #[test]
+    fn search_control_layout_compacts_before_clipping() {
+        let items = search_control_row_layout(
+            30,
+            true,
+            "filename",
+            "relevance",
+            SortDir::Desc,
+            true,
+        );
+
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].label, " r✓ ");
+        assert_eq!(items[1].label, " m:f ");
+        assert_eq!(items[2].label, " s▼ ");
+        assert_eq!(items[3].label, " a✓ ");
+        assert_layout_inside(30, &items);
+    }
+
+    #[test]
+    fn search_control_layout_never_overflows_narrow_rows() {
+        for inner_width in 0..64 {
+            let items = search_control_row_layout(
+                inner_width,
+                true,
+                "filename",
+                "relevance",
+                SortDir::Asc,
+                false,
+            );
+            assert_layout_inside(inner_width, &items);
+        }
+    }
+
+    #[test]
+    fn search_control_hitboxes_are_clipped_to_inner_panel() {
+        let area = Rect::new(20, 3, 12, 8);
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let items = search_control_row_layout(
+            inner_width,
+            true,
+            "filename",
+            "relevance",
+            SortDir::Asc,
+            true,
+        );
+        let y = browse_search_controls_y(area);
+
+        for item in &items {
+            let rect = clipped_inner_row_rect(area, y, item.x, item.width).expect("visible hitbox");
+            assert!(rect.x >= area.x + 1);
+            assert!(rect.x + rect.width <= area.x + area.width - 1);
+            assert_eq!(rect.y, y);
+            assert_eq!(rect.height, 1);
+        }
+    }
+}
+
 /// Register mouse click targets for the browse list: column headers,
 /// individual entry rows, and a catch-all list area for scroll wheel routing.
 fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &BrowseState) {
@@ -1057,8 +1416,11 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
     }
     let columns = browse_column_layout(inner_w, &browse.columns);
 
-    // Column x-offsets (relative to area.x). Header row is area.y + 1 (inside top border).
-    let header_y = area.y + 1;
+    // Column x-offsets (relative to area.x). The header sits immediately above
+    // result rows; an active search panel occupies the first two rows inside
+    // the border.
+    let search_rows = browse_search_rows(browse.search.active);
+    let header_y = browse_header_y(area, browse.search.active);
     let mut x = area.x + 1 + ROW_PREFIX as u16;
     for cell in &columns {
         buttons.record_button(
@@ -1078,52 +1440,27 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
         );
     }
 
-    // Search panel toggle pills (if search is active, rows 2-3 inside the border).
+    // Search panel controls (if active): input row first, then all option
+    // controls grouped together on the second row. The helper is shared with
+    // drawing so click targets cannot drift from the rendered geometry.
     if browse.search.active {
-        let panel_y = area.y + 2; // row after column headers
-                                  // Recursive pill: right side of row 1 (width varies with state)
-        let rec_w = if browse.search.recursive {
-            13u16
-        } else {
-            11u16
-        };
-        let rec_x = area.x + area.width - rec_w - 1;
-        buttons.record_button(
-            TuiButton::BrowseSearchRecursive,
-            Rect::new(rec_x, panel_y, rec_w, 1),
-        );
-
-        // Mode, Sort, and AudioOnly: row 2 — widths must match draw code.
-        let panel_y2 = panel_y + 1;
-        // mode: " mode: <label> " — all ASCII, .len() == display width
-        let mode_w = (7 + browse.search.mode.label().len() + 1) as u16;
-        buttons.record_button(
-            TuiButton::BrowseSearchMode,
-            Rect::new(area.x + 1, panel_y2, mode_w, 1),
-        );
-        // sort: " sort: <label> ▲ " — arrow is 1 display col
-        let sort_w = (7 + browse.search.sort.label().len() + 1 + 1 + 1) as u16;
-        let sort_x = area.x + 1 + mode_w + 1;
-        buttons.record_button(
-            TuiButton::BrowseSearchSort,
-            Rect::new(sort_x, panel_y2, sort_w, 1),
-        );
-        // audio: " audio ✓ " (9) or " all files " (11)
-        let audio_w = if browse.search.audio_only {
-            9u16
-        } else {
-            11u16
-        };
-        let audio_x = sort_x + sort_w + 1;
-        buttons.record_button(
-            TuiButton::BrowseSearchAudioOnly,
-            Rect::new(audio_x, panel_y2, audio_w, 1),
-        );
+        let controls_y = browse_search_controls_y(area);
+        for item in search_control_row_layout(
+            inner_w,
+            browse.search.recursive,
+            browse.search.mode.label(),
+            browse.search.sort.label(),
+            browse.search.sort_dir,
+            browse.search.audio_only,
+        ) {
+            if let Some(rect) = clipped_inner_row_rect(area, controls_y, item.x, item.width) {
+                buttons.record_button(search_control_button(item.kind), rect);
+            }
+        }
     }
 
     // Entry rows: below header (and search panel if active), above bottom border.
-    let search_rows = if browse.search.active { 2u16 } else { 0 };
-    let entry_y_start = area.y + 2 + search_rows;
+    let entry_y_start = browse_entry_y_start(area, browse.search.active);
     let content_height = (area.height as usize).saturating_sub(3 + search_rows as usize);
     let start = browse.scroll_offset;
     let end = (start + content_height).min(browse.entries.len());
@@ -1333,36 +1670,12 @@ fn draw_browse_list(
 
     let mut lines: Vec<Line> = vec![top_line];
 
-    // Header row
-    lines.push(render_header_row(
-        border_color,
-        w,
-        &column_layout,
-        browse.sort_by,
-        browse.sort_dir, theme));
-
-    // Search panel (2 rows when active).
+    // Search panel (2 rows when active): input first, then peer controls.
     if browse.search.active {
-        // Row 1: search input + [recursive] toggle
-        // Layout: │ + " / "(3) + input(input_w) + gap(≥1) + rec_pill(pill_w) + │
-        let rec_pill = if browse.search.recursive {
-            Span::styled(
-                " recursive ✓ ",
-                Style::default()
-                    .fg(theme.pill_active_fg)
-                    .bg(theme.green)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            )
-        } else {
-            Span::styled(
-                " recursive ",
-                Style::default().fg(theme.text_dim).bg(theme.surface),
-            )
-        };
-        let pill_w = rec_pill.width();
-        let input_w = inner_w.saturating_sub(3 + 1 + pill_w); // " / " + gap + pill
+        // Row 1: full-width search input.
+        // Layout: │ + " / "(3) + input(input_w) + │
+        let input_w = inner_w.saturating_sub(3);
         let (view, _cursor_col) = browse.search.input.view(input_w);
-        // Pad view to input_w so the pill stays right-aligned.
         let view_len = view.chars().count();
         let padded = if view.is_empty() {
             " ".repeat(input_w.max(1))
@@ -1370,7 +1683,6 @@ fn draw_browse_list(
             let pad = input_w.saturating_sub(view_len);
             format!("{}{}", view, " ".repeat(pad))
         };
-        let search_pad = inner_w.saturating_sub(3 + input_w + pill_w);
         lines.push(Line::from(vec![
             Span::styled("│", theme.border(border_color)),
             Span::styled(" / ", Style::default().fg(theme.amber)),
@@ -1378,48 +1690,55 @@ fn draw_browse_list(
                 padded,
                 Style::default().fg(theme.text_bright).bg(theme.surface),
             ),
-            Span::raw(" ".repeat(search_pad.max(1))),
-            rec_pill,
             Span::styled("│", theme.border(border_color)),
         ]));
 
-        // Row 2: mode cycle + sort cycle + [audio] toggle
-        let mode_label = format!(" mode: {} ", browse.search.mode.label());
-        let sort_arrow = match browse.search.sort_dir {
-            super::browse::SortDir::Asc => "▲",
-            super::browse::SortDir::Desc => "▼",
-        };
-        let sort_label = format!(" sort: {} {} ", browse.search.sort.label(), sort_arrow);
-        let audio_pill = if browse.search.audio_only {
-            Span::styled(
-                " audio ✓ ",
-                Style::default()
-                    .fg(theme.pill_active_fg)
-                    .bg(theme.green)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            )
-        } else {
-            Span::styled(
-                " all files ",
-                Style::default().fg(theme.text_dim).bg(theme.surface),
-            )
-        };
-
-        let sort_display_w = sort_label.chars().count();
-        // Inner content: mode + gap + sort + gap + audio (no borders counted).
-        let row2_content = mode_label.len() + 1 + sort_display_w + 1 + audio_pill.width();
-        let row2_pad = inner_w.saturating_sub(row2_content);
-        lines.push(Line::from(vec![
-            Span::styled("│", theme.border(border_color)),
-            Span::styled(mode_label, Style::default().fg(theme.cyan)),
-            Span::raw(" "),
-            Span::styled(sort_label, Style::default().fg(theme.amber)),
-            Span::raw(" "),
-            audio_pill,
-            Span::raw(" ".repeat(row2_pad)),
-            Span::styled("│", theme.border(border_color)),
-        ]));
+        // Row 2: recursive + mode + sort + audio, all visibly clickable.
+        // The shared layout helper progressively compacts labels and finally
+        // omits trailing controls only when the pane is too narrow to display
+        // every tiny pill without colliding with the right border.
+        let control_items = search_control_row_layout(
+            inner_w,
+            browse.search.recursive,
+            browse.search.mode.label(),
+            browse.search.sort.label(),
+            browse.search.sort_dir,
+            browse.search.audio_only,
+        );
+        let mut row2_spans = vec![Span::styled("│", theme.border(border_color))];
+        let mut used = 0usize;
+        for item in &control_items {
+            let x = item.x as usize;
+            if x > used {
+                row2_spans.push(Span::raw(" ".repeat(x - used)));
+            }
+            row2_spans.push(Span::styled(
+                item.label.clone(),
+                search_control_style(
+                    item.kind,
+                    browse.search.recursive,
+                    browse.search.audio_only,
+                    theme,
+                ),
+            ));
+            used = x + item.width as usize;
+        }
+        if inner_w > used {
+            row2_spans.push(Span::raw(" ".repeat(inner_w - used)));
+        }
+        row2_spans.push(Span::styled("│", theme.border(border_color)));
+        lines.push(Line::from(row2_spans));
     }
+
+    // Header row: after the search panel so the columns anchor to results.
+    lines.push(render_header_row(
+        border_color,
+        w,
+        &column_layout,
+        browse.sort_by,
+        browse.sort_dir,
+        theme,
+    ));
 
     let mut rename_cursor: Option<(usize, u16)> = None;
 
@@ -1510,20 +1829,18 @@ fn draw_browse_list(
 
     // Position the terminal cursor inside the search input or filter input.
     if browse.search.active && browse.search.focus == super::browse::SearchFocus::Input {
-        let pill_w = if browse.search.recursive { 13 } else { 11 };
-        let input_w = inner_w.saturating_sub(3 + 1 + pill_w);
+        let input_w = inner_w.saturating_sub(3);
         let (_, cursor_col) = browse.search.input.view(input_w);
         let cursor_x = area.x + 1 + 3 + cursor_col; // border + " / " prefix
-        let cursor_y = area.y + 2; // top border + header + first search row
+        let cursor_y = browse_search_input_y(area); // top border + first search row
         f.set_cursor(cursor_x, cursor_y);
     } else if let Some(col_in_view) = filter_cursor {
         let cursor_x = area.x + 1 + 3 + col_in_view;
         let cursor_y = area.y + area.height - 2;
         f.set_cursor(cursor_x, cursor_y);
     } else if let Some((row, col_in_view)) = rename_cursor {
-        let search_rows = if browse.search.active { 2u16 } else { 0u16 };
         let cursor_x = area.x + 1 + ROW_PREFIX as u16 + col_in_view;
-        let cursor_y = area.y + 2 + search_rows + row as u16;
+        let cursor_y = browse_entry_y_start(area, browse.search.active) + row as u16;
         f.set_cursor(cursor_x, cursor_y);
     }
 }

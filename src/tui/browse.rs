@@ -11,6 +11,23 @@ use ratatui::layout::Rect;
 /// Type-ahead buffer resets after this duration of inactivity.
 const TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// Skim fuzzy matching is intentionally permissive: any ordered subsequence can
+/// produce a score. Browse search treats very low scores as false positives so
+/// long filenames cannot match short queries solely because the query characters
+/// appear far apart. The floor scales with the non-whitespace query length so
+/// short queries still work while longer queries need proportionally stronger
+/// evidence.
+const SEARCH_FUZZY_MIN_SCORE_PER_QUERY_CHAR: i64 = 10;
+
+fn search_fuzzy_min_score(query: &str) -> i64 {
+    let significant_chars = query.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
+    significant_chars * SEARCH_FUZZY_MIN_SCORE_PER_QUERY_CHAR
+}
+
+fn search_fuzzy_score_passes_threshold(score: i64, min_score: i64) -> bool {
+    score >= min_score
+}
+
 use crate::convert::formats::AudioFormat;
 use crate::tui::probe::{SourceInfo, SourceMetadata};
 use crate::tui::disc_browser::{DiscProbeCacheEntry, DiscProbeFollowup};
@@ -3579,6 +3596,7 @@ impl BrowseState {
         use fuzzy_matcher::FuzzyMatcher;
 
         let matcher = SkimMatcherV2::default();
+        let min_score = search_fuzzy_min_score(query);
         let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
         let parent = self.parent_entry.clone();
         let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
@@ -3612,7 +3630,9 @@ impl BrowseState {
             }
 
             if let Some(score) = best_score {
-                scored.push((e.clone(), score));
+                if search_fuzzy_score_passes_threshold(score, min_score) {
+                    scored.push((e.clone(), score));
+                }
             }
         }
 
@@ -3739,6 +3759,7 @@ impl BrowseState {
                     use walkdir::WalkDir;
 
                     let matcher = SkimMatcherV2::default();
+                    let min_score = search_fuzzy_min_score(&query_for_worker);
                     let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
 
                     // Open own DB connection for tag cache.
@@ -3848,7 +3869,9 @@ impl BrowseState {
                         }
 
                         if let Some(score) = best_score {
-                            scored.push((candidate, score));
+                            if search_fuzzy_score_passes_threshold(score, min_score) {
+                                scored.push((candidate, score));
+                            }
                         }
                     }
 
@@ -5536,6 +5559,7 @@ fn run_archive_search_worker(
     use fuzzy_matcher::FuzzyMatcher;
 
     let matcher = SkimMatcherV2::default();
+    let min_score = search_fuzzy_min_score(&query);
     let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
     let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
     let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
@@ -5580,7 +5604,9 @@ fn run_archive_search_worker(
         }
 
         if let Some(score) = best_score {
-            scored.push((e.clone(), score));
+            if search_fuzzy_score_passes_threshold(score, min_score) {
+                scored.push((e.clone(), score));
+            }
         }
     }
 
@@ -6743,6 +6769,53 @@ fn is_tar_compound(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn search_fuzzy_threshold_rejects_garbage_subsequence_matches() {
+        use fuzzy_matcher::skim::SkimMatcherV2;
+        use fuzzy_matcher::FuzzyMatcher;
+
+        let matcher = SkimMatcherV2::default();
+        let query = "epping";
+        let genuine = matcher
+            .fuzzy_match("the battle of epping forest.flac", query)
+            .expect("genuine title should fuzzy match");
+        let garbage = matcher
+            .fuzzy_match(
+                "genesis - spot the pigeon ep (1977) [flac] {uk  virgin cdf 40} [nimbus]",
+                query,
+            )
+            .expect("garbage subsequence should still produce a raw skim score");
+
+        assert!(
+            search_fuzzy_score_passes_threshold(genuine, search_fuzzy_min_score(query)),
+            "genuine match score {genuine} should pass threshold {}",
+            search_fuzzy_min_score(query)
+        );
+        assert!(
+            !search_fuzzy_score_passes_threshold(garbage, search_fuzzy_min_score(query)),
+            "garbage subsequence score {garbage} should fail threshold {}",
+            search_fuzzy_min_score(query)
+        );
+    }
+
+    #[test]
+    fn search_fuzzy_threshold_keeps_short_query_matches_useful() {
+        use fuzzy_matcher::skim::SkimMatcherV2;
+        use fuzzy_matcher::FuzzyMatcher;
+
+        let matcher = SkimMatcherV2::default();
+        let query = "ab";
+        let score = matcher
+            .fuzzy_match("abacab", query)
+            .expect("short direct subsequence should fuzzy match");
+
+        assert!(
+            search_fuzzy_score_passes_threshold(score, search_fuzzy_min_score(query)),
+            "short query score {score} should pass threshold {}",
+            search_fuzzy_min_score(query)
+        );
+    }
 
     /// Build an `all_files` list with one Archive entry pointing at
     /// `path`, mtime taken from the file. Other BrowseState fields
