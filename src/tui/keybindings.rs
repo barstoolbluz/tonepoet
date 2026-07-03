@@ -2715,11 +2715,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             // Browse is home — Esc with nothing to clear is a no-op.
         }
 
-        // Ctrl+E / Alt+Enter = open metadata editor for selected audio file(s).
+        // Ctrl+E / Alt+P = open metadata editor for selected audio file(s).
         // If the selection has no audio content, stub status for future
         // properties dialog.
         (KeyCode::Char('e'), KeyModifiers::CONTROL)
-        | (KeyCode::Enter, KeyModifiers::ALT) => {
+        | (KeyCode::Char('p'), KeyModifiers::ALT) => {
             clear_browse_info_focus(app);
             open_metadata_editor(app);
         }
