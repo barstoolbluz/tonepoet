@@ -289,13 +289,38 @@ fn draw_explore_pane(
     if area.height < 3 || area.width < 6 {
         return;
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("▾ explore")
-        .border_style(theme.border(theme.cyan));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    buttons.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Explore), Rect::new(area.x + 1, area.y, 9.min(area.width.saturating_sub(2)), 1));
+    let border_color = theme.cyan;
+    let w = area.width as usize;
+
+    // Solid title bar (matches convert screen pane style)
+    let bar_style = Style::default().fg(theme.bg).bg(border_color);
+    let title = "▾ explore ";
+    let title_w = title.chars().count();
+    let dash_count = w.saturating_sub(2 + title_w);
+    let top_line = Line::from(vec![
+        Span::styled("┌", theme.border(border_color)),
+        Span::styled(title, bar_style),
+        Span::styled(" ".repeat(dash_count), bar_style),
+        Span::styled("┐", theme.border(border_color)),
+    ]);
+    let bot_line = Line::from(Span::styled(
+        format!("└{}┘", "─".repeat(w.saturating_sub(2))),
+        theme.border(border_color),
+    ));
+
+    let content_height = (area.height as usize).saturating_sub(2);
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), content_height as u16);
+
+    // Render top border, side borders, and bottom border
+    f.render_widget(Paragraph::new(top_line), Rect::new(area.x, area.y, area.width, 1));
+    for row in 0..content_height {
+        let y = area.y + 1 + row as u16;
+        f.render_widget(Paragraph::new("│").style(theme.border(border_color)), Rect::new(area.x, y, 1, 1));
+        f.render_widget(Paragraph::new("│").style(theme.border(border_color)), Rect::new(area.x + area.width - 1, y, 1, 1));
+    }
+    f.render_widget(Paragraph::new(bot_line), Rect::new(area.x, area.y + area.height - 1, area.width, 1));
+
+    buttons.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Explore), Rect::new(area.x + 1, area.y, title_w as u16, 1));
 
     browse.set_tree_visible_height(inner.height as usize);
     let start = browse.tree_scroll;
@@ -725,7 +750,7 @@ fn draw_browse_list(
     let w = area.width as usize;
     let inner_w = w.saturating_sub(2);
 
-    // Top border with title
+    // Top border with solid title bar
     let title = "▾ browse ";
     let search_label = if browse.search.active {
         " search ✓ "
@@ -733,21 +758,22 @@ fn draw_browse_list(
         " search "
     };
     let search_display_w = search_label.chars().count();
-    // ┌ + title + dashes + search_label + ┐ = w
     let title_w = title.chars().count();
-    let dash_count = w.saturating_sub(1 + title_w + search_display_w + 1);
+    let fill_count = w.saturating_sub(1 + title_w + search_display_w + 1);
 
+    let bar_style = Style::default().fg(theme.bg).bg(border_color);
     let search_style = if browse.search.active {
         Style::default()
             .fg(theme.green)
+            .bg(border_color)
             .add_modifier(ratatui::style::Modifier::BOLD)
     } else {
-        theme.border(border_color)
+        bar_style
     };
     let top_line = Line::from(vec![
         Span::styled("┌", theme.border(border_color)),
-        Span::styled(title, theme.border(border_color)),
-        Span::styled("─".repeat(dash_count), theme.border(border_color)),
+        Span::styled(title, bar_style),
+        Span::styled(" ".repeat(fill_count), bar_style),
         Span::styled(search_label, search_style),
         Span::styled("┐", theme.border(border_color)),
     ]);
@@ -1298,15 +1324,16 @@ fn draw_browse_info(
     let border_color = theme.amber;
     let w = area.width as usize;
 
-    // Top border
+    // Solid title bar (matches convert screen pane style)
+    let bar_style = Style::default().fg(theme.bg).bg(border_color);
     let title = "▾ info ";
     let title_w = title.chars().count();
-    let dash_count = w.saturating_sub(2 + title_w);
+    let fill_count = w.saturating_sub(2 + title_w);
 
     let top_line = Line::from(vec![
         Span::styled("┌", theme.border(border_color)),
-        Span::styled(title, theme.border(border_color)),
-        Span::styled("─".repeat(dash_count), theme.border(border_color)),
+        Span::styled(title, bar_style),
+        Span::styled(" ".repeat(fill_count), bar_style),
         Span::styled("┐", theme.border(border_color)),
     ]);
 

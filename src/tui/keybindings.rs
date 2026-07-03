@@ -2528,6 +2528,13 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
+        // Refresh (F5, like Windows/Linux file managers)
+        (KeyCode::F(5), _) => {
+            app.browse.refresh_with_search(Some(tx));
+            app.browse.probe_current_with_db(tx, Some(&app.db));
+            app.set_status("browse refreshed");
+        }
+
         // Rename the selected file/folder inline in the list.
         (KeyCode::F(2), KeyModifiers::NONE) => {
             clear_browse_info_focus(app);
