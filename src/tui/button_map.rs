@@ -194,6 +194,8 @@ pub enum TuiButton {
 
     // Browse screen
     BrowseEntry(usize),
+    /// Browse row selection gutter (checkbox column). Click toggles mark without moving cursor.
+    BrowseEntryGutter(usize),
     BrowseColumn(crate::tui::browse::BrowseColumn),
     BrowseList, // catch-all region for scroll wheel routing
     BrowseBreadcrumb, // click to edit path
@@ -458,6 +460,7 @@ impl TuiButton {
             | Self::QueueItem(_)
             | Self::QueueItemExpand(_) => Some(AppScreen::Queue),
             Self::BrowseEntry(_)
+            | Self::BrowseEntryGutter(_)
             | Self::BrowseColumn(_)
             | Self::BrowseList
             | Self::BrowseBreadcrumb

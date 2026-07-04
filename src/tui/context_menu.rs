@@ -47,7 +47,7 @@ impl MenuLevel {
 pub struct ContextMenuItem {
     pub label: String,
     pub action: ContextAction,
-    /// Optional shortcut hint displayed right-aligned (e.g., "F2", ":rename").
+    /// Optional shortcut hint displayed right-aligned (e.g., ":rename").
     pub shortcut: Option<String>,
     /// Greyed-out items are visible but not selectable.
     pub enabled: bool,
@@ -96,7 +96,7 @@ pub enum ContextAction {
     SelectInverse,
     /// Clear multi-selection.
     Deselect,
-    /// Rename the selected file (F2 / `:rename`).
+    /// Rename the selected file (`:rename` or context menu).
     RenameEntry,
     /// Move selected file(s) to the system trash.
     MoveToTrash,
@@ -1019,6 +1019,15 @@ pub fn execute_context_action(
             super::command::execute_edit_metadata_pub(app, field);
         }
         ContextAction::EditMetadataFull => {
+            let guard_paths = super::command::collect_selection_for_file_ops(app);
+            if super::command::maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::EditMetadata,
+                BulkGuardCommand::OpenMetadataEditor,
+                &guard_paths,
+            ) {
+                return;
+            }
             super::keybindings::open_metadata_editor(app);
         }
         ContextAction::MoveToTrash => {
@@ -1274,119 +1283,7 @@ pub fn execute_context_action(
             super::command::execute_command(app, cmd, tx);
         }
         ContextAction::QueryGnudb => {
-            // Collect audio file paths, group by disc, query GNUDB.
-            let paths = super::command::collect_selection_for_file_ops(app);
-            let mut audio_paths: Vec<std::path::PathBuf> =
-                super::browse::expand_paths_to_audio(&paths)
-                    .into_iter()
-                    .filter(|p| {
-                        matches!(
-                            super::browse::classify_file(p),
-                            super::browse::EntryKind::AudioFile(_)
-                        )
-                    })
-                    .collect();
-            super::probe::sort_paths_by_track(&mut audio_paths);
-
-            // Check for single-image CUE layout (one audio file + CUE sheet).
-            if audio_paths.len() <= 1 {
-                let dir = if audio_paths.is_empty() {
-                    let sel_dir = super::command::collect_selection_for_file_ops(app);
-                    sel_dir.first().and_then(|p| {
-                        if p.is_dir() {
-                            Some(p.clone())
-                        } else {
-                            p.parent().map(|d| d.to_path_buf())
-                        }
-                    })
-                } else {
-                    audio_paths[0].parent().map(|d| d.to_path_buf())
-                };
-                if let Some(ref dir) = dir {
-                    if let Some(info) = super::cue_parser::detect_single_image(dir) {
-                        launch_single_image_gnudb(info, app, tx);
-                        return;
-                    }
-                }
-                if audio_paths.is_empty() {
-                    app.set_status("No audio files for GNUDB lookup");
-                    return;
-                }
-            }
-
-            let disc_groups = super::gnudb::group_by_disc(&audio_paths);
-
-            if disc_groups.len() == 1 {
-                // Single disc — original flow.
-                let (_, group_paths) = &disc_groups[0];
-                let durations =
-                    super::gnudb::collect_durations(group_paths, &app.browse);
-                if durations.len() != group_paths.len() {
-                    app.set_status("Probe all files first (some durations missing)");
-                    return;
-                }
-                let disc_id = super::gnudb::compute_disc_id(&durations);
-                app.set_status(format!(
-                    "Querying gnudb.org (disc ID: {})...",
-                    disc_id.disc_id
-                ));
-                let paths_for_editor = group_paths.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let result = super::gnudb::query_gnudb(&disc_id).await;
-                    let _ = tx
-                        .send(super::message::AppMessage::GnudbQueryComplete {
-                            result,
-                            paths: paths_for_editor,
-                        })
-                        .await;
-                });
-            } else {
-                // Multi-disc — query each disc sequentially in one task.
-                app.set_status(format!(
-                    "Querying gnudb.org ({} discs)...",
-                    disc_groups.len(),
-                ));
-                // Pre-compute durations and disc IDs before spawning.
-                let mut disc_queries: Vec<(
-                    String,
-                    super::gnudb::DiscIdResult,
-                    Vec<std::path::PathBuf>,
-                )> = Vec::new();
-                for (label, group_paths) in disc_groups {
-                    let durations =
-                        super::gnudb::collect_durations(&group_paths, &app.browse);
-                    if durations.len() != group_paths.len() {
-                        continue;
-                    }
-                    let disc_id = super::gnudb::compute_disc_id(&durations);
-                    disc_queries.push((label, disc_id, group_paths));
-                }
-                if disc_queries.is_empty() {
-                    app.set_status("Could not probe disc durations");
-                    return;
-                }
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let mut all_entries = Vec::new();
-                    for (label, disc_id, group_paths) in disc_queries {
-                        if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
-                            if let Some(m) = matches.first() {
-                                if let Ok(entry) =
-                                    super::gnudb::read_gnudb(&m.category, &m.disc_id).await
-                                {
-                                    all_entries.push((label, entry, group_paths));
-                                }
-                            }
-                        }
-                    }
-                    let _ = tx
-                        .send(super::message::AppMessage::GnudbMultiDiscComplete {
-                            entries: all_entries,
-                        })
-                        .await;
-                });
-            }
+            execute_gnudb_query(app, tx);
         }
         ContextAction::ImportCueFromBrowse => {
             let cmd = super::command::Command::ImportCue;
@@ -1591,6 +1488,134 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+
+/// Execute a GNUDB lookup for the current Browse selection, with the same
+/// bulk-operation guard as command-mode tagging flows.
+pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let guard_paths = super::command::collect_selection_for_file_ops(app);
+    if super::command::maybe_confirm_bulk_operation(
+        app,
+        BulkOperationKind::GnudbTagging,
+        BulkGuardCommand::Gnudb,
+        &guard_paths,
+    ) {
+        return;
+    }
+    // Collect audio file paths, group by disc, query GNUDB.
+    let paths = super::command::collect_selection_for_file_ops(app);
+    let mut audio_paths: Vec<std::path::PathBuf> =
+        super::browse::expand_paths_to_audio(&paths)
+            .into_iter()
+            .filter(|p| {
+                matches!(
+                    super::browse::classify_file(p),
+                    super::browse::EntryKind::AudioFile(_)
+                )
+            })
+            .collect();
+    super::probe::sort_paths_by_track(&mut audio_paths);
+
+    // Check for single-image CUE layout (one audio file + CUE sheet).
+    if audio_paths.len() <= 1 {
+        let dir = if audio_paths.is_empty() {
+            let sel_dir = super::command::collect_selection_for_file_ops(app);
+            sel_dir.first().and_then(|p| {
+                if p.is_dir() {
+                    Some(p.clone())
+                } else {
+                    p.parent().map(|d| d.to_path_buf())
+                }
+            })
+        } else {
+            audio_paths[0].parent().map(|d| d.to_path_buf())
+        };
+        if let Some(ref dir) = dir {
+            if let Some(info) = super::cue_parser::detect_single_image(dir) {
+                launch_single_image_gnudb(info, app, tx);
+                return;
+            }
+        }
+        if audio_paths.is_empty() {
+            app.set_status("No audio files for GNUDB lookup");
+            return;
+        }
+    }
+
+    let disc_groups = super::gnudb::group_by_disc(&audio_paths);
+
+    if disc_groups.len() == 1 {
+        // Single disc — original flow.
+        let (_, group_paths) = &disc_groups[0];
+        let durations =
+            super::gnudb::collect_durations(group_paths, &app.browse);
+        if durations.len() != group_paths.len() {
+            app.set_status("Probe all files first (some durations missing)");
+            return;
+        }
+        let disc_id = super::gnudb::compute_disc_id(&durations);
+        app.set_status(format!(
+            "Querying gnudb.org (disc ID: {})...",
+            disc_id.disc_id
+        ));
+        let paths_for_editor = group_paths.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let result = super::gnudb::query_gnudb(&disc_id).await;
+            let _ = tx
+                .send(super::message::AppMessage::GnudbQueryComplete {
+                    result,
+                    paths: paths_for_editor,
+                })
+                .await;
+        });
+    } else {
+        // Multi-disc — query each disc sequentially in one task.
+        app.set_status(format!(
+            "Querying gnudb.org ({} discs)...",
+            disc_groups.len(),
+        ));
+        // Pre-compute durations and disc IDs before spawning.
+        let mut disc_queries: Vec<(
+            String,
+            super::gnudb::DiscIdResult,
+            Vec<std::path::PathBuf>,
+        )> = Vec::new();
+        for (label, group_paths) in disc_groups {
+            let durations =
+                super::gnudb::collect_durations(&group_paths, &app.browse);
+            if durations.len() != group_paths.len() {
+                continue;
+            }
+            let disc_id = super::gnudb::compute_disc_id(&durations);
+            disc_queries.push((label, disc_id, group_paths));
+        }
+        if disc_queries.is_empty() {
+            app.set_status("Could not probe disc durations");
+            return;
+        }
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut all_entries = Vec::new();
+            for (label, disc_id, group_paths) in disc_queries {
+                if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
+                    if let Some(m) = matches.first() {
+                        if let Ok(entry) =
+                            super::gnudb::read_gnudb(&m.category, &m.disc_id).await
+                        {
+                            all_entries.push((label, entry, group_paths));
+                        }
+                    }
+                }
+            }
+            let _ = tx
+                .send(super::message::AppMessage::GnudbMultiDiscComplete {
+                    entries: all_entries,
+                })
+                .await;
+        });
+    }
 }
 
 /// Launch a GNUDB query for a single-image CUE album.

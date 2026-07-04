@@ -23,8 +23,10 @@ use super::text_input::TextInputState;
 const COL_SIZE_W: usize = 9;
 const COL_DATE_W: usize = 12;
 const COL_TYPE_W: usize = 8;
-/// Prefix: cursor(2) + check(1) + space(1).
+/// Prefix: cursor(2) + selection marker(1) + space(1).
 const ROW_PREFIX: usize = 4;
+const ROW_CURSOR_W: usize = 2;
+const ROW_GUTTER_W: usize = 2;
 /// Trailing space before the right border.
 const ROW_TRAILING: usize = 2;
 const MIN_NAME_W: usize = 8;
@@ -1473,9 +1475,18 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
     let end = (start + content_height).min(browse.entries.len());
     for (row, i) in (start..end).enumerate() {
         let y = entry_y_start + row as u16;
+        let row_rect = Rect::new(area.x + 1, y, inner_w as u16, 1);
+        buttons.record_button(TuiButton::BrowseEntry(i), row_rect);
+        // Record the gutter after the body so reverse hit-testing gives it
+        // priority over the enclosing row hit target.
         buttons.record_button(
-            TuiButton::BrowseEntry(i),
-            Rect::new(area.x + 1, y, (inner_w) as u16, 1),
+            TuiButton::BrowseEntryGutter(i),
+            Rect::new(
+                area.x + 1 + ROW_CURSOR_W as u16,
+                y,
+                ROW_GUTTER_W as u16,
+                1,
+            ),
         );
     }
 }
@@ -1782,6 +1793,7 @@ fn draw_browse_list(
             let entry = &browse.entries[i];
             let is_selected = i == browse.selected_index;
             let is_checked = browse.is_multi_selected(&entry.path);
+            let is_range_preview = browse.is_range_preview_index(i);
             let is_hovered =
                 !is_selected && hover == Some(super::button_map::TuiButton::BrowseEntry(i));
             let inline_rename_input = inline_edit.and_then(|state| match &state.target {
@@ -1800,6 +1812,7 @@ fn draw_browse_list(
                 inline_rename_input,
                 is_selected,
                 is_checked,
+                is_range_preview,
                 is_hovered, theme));
         }
 
@@ -1917,6 +1930,7 @@ fn render_entry_line(
     inline_rename_input: Option<&TextInputState>,
     is_selected: bool,
     is_checked: bool,
+    is_range_preview: bool,
     is_hovered: bool,
     theme: super::theme::Theme,
 ) -> Line<'static> {
@@ -1928,16 +1942,22 @@ fn render_entry_line(
         Style::default().fg(theme.text_dim)
     };
 
-    // Multi-select checkbox
+    // Multi-select gutter. Range preview is deliberately distinct from
+    // committed marks while the marker remains visible in constrained themes.
     let check = if is_checked { "●" } else { " " };
-    let check_style = if is_checked {
+    let mut check_style = if is_range_preview {
+        Style::default().fg(theme.bg).bg(theme.selection_bg)
+    } else if is_checked {
         Style::default().fg(theme.cyan)
     } else {
         Style::default().fg(theme.text_dim)
     };
+    if is_range_preview {
+        check_style = check_style.add_modifier(Modifier::BOLD);
+    }
 
     let cached = cached_info_for_entry(browse, entry);
-    let mut spans = Vec::with_capacity(6 + columns.len().saturating_mul(2));
+    let mut spans = Vec::with_capacity(7 + columns.len().saturating_mul(2));
     spans.push(Span::styled("│", theme.border(border_color)));
     spans.push(Span::styled(cursor, cursor_style));
     spans.push(Span::styled(check, check_style));
@@ -1976,6 +1996,8 @@ fn render_entry_line(
     // Selected row gets a subtle bg highlight; hovered row gets a dimmer one.
     let bg = if is_selected {
         Some(theme.border_dim)
+    } else if is_range_preview {
+        Some(theme.selection_bg)
     } else if is_hovered {
         Some(theme.hover_bg)
     } else {

@@ -7337,6 +7337,61 @@ impl KeychainState {
     }
 }
 
+/// Expensive bulk operation guarded by an audio-file count confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkOperationKind {
+    EditMetadata,
+    Analyze,
+    VerifyIntegrity,
+    AccurateRipVerify,
+    AccurateRipFullScan,
+    AccurateRipBatch,
+    AccurateRipFixOffset,
+    CtdbVerify,
+    MusicBrainzTagging,
+    GnudbTagging,
+    PreemphasisDetection,
+}
+
+impl BulkOperationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EditMetadata => "edit metadata for",
+            Self::Analyze => "analyze",
+            Self::VerifyIntegrity => "verify",
+            Self::AccurateRipVerify => "verify with AccurateRip",
+            Self::AccurateRipFullScan => "run a full AccurateRip scan on",
+            Self::AccurateRipBatch => "batch-verify with AccurateRip",
+            Self::AccurateRipFixOffset => "apply AccurateRip offset correction to",
+            Self::CtdbVerify => "verify with CUETools DB",
+            Self::MusicBrainzTagging => "look up MusicBrainz tags for",
+            Self::GnudbTagging => "look up GNUDB tags for",
+            Self::PreemphasisDetection => "detect pre-emphasis on",
+        }
+    }
+}
+
+/// Cloneable command payload used after the user confirms a guarded bulk
+/// operation. It intentionally covers only operations with stable replay
+/// semantics and avoids storing `Command`, which has non-cloneable closures.
+#[derive(Debug, Clone)]
+pub enum BulkGuardCommand {
+    OpenMetadataEditor,
+    Analyze { force: bool },
+    Verify,
+    AccurateRip { force: bool },
+    AccurateRipBatch,
+    AccurateRipFixOffset,
+    Ctdb,
+    TagsFromMb {
+        query: Option<String>,
+        catno: Option<String>,
+        year: Option<String>,
+    },
+    Gnudb,
+    DetectPreemphasis,
+}
+
 /// What action a confirmation dialog will perform
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
@@ -7361,6 +7416,18 @@ pub enum ConfirmAction {
     ClearAll,
     StopAll,
     ClearQueue,
+    /// Confirm an expensive bulk operation before replaying it once.
+    ///
+    /// The resolved path payload and bounded count are captured when the
+    /// prompt is opened, so confirmation always executes exactly the same
+    /// set the user was warned about even if Browse selection/cursor state
+    /// changes before Enter/Y is processed.
+    BulkOperation {
+        operation: BulkOperationKind,
+        command: BulkGuardCommand,
+        paths: Vec<PathBuf>,
+        count: usize,
+    },
     /// Overwrite the currently active preset after user confirmation.
     SavePresetOverwrite { name: String, path: PathBuf },
     /// Move the given paths to the system trash (XDG Trash / Finder Trash).
@@ -7528,6 +7595,15 @@ pub struct AppState {
 
     // Overlays
     pub active_overlay: ActiveOverlay,
+
+    /// One-shot bypass consumed when replaying a bulk operation after the
+    /// user accepted its confirmation dialog.
+    pub bulk_guard_bypass: Option<BulkOperationKind>,
+
+    /// Frozen Browse/Convert path payload for the command currently being
+    /// replayed from a bulk-operation confirmation. This prevents the
+    /// confirmed action from observing later cursor/selection drift.
+    pub bulk_guard_frozen_paths: Option<Vec<PathBuf>>,
 
     /// Parked BulkRenameState while a per-line TextEdit is open.
     /// Set when `e` is pressed on a BulkRename row; consumed when
@@ -8049,6 +8125,8 @@ impl AppState {
             wizard_mouse_areas: None,
             wizard_target: WizardTarget::ConfigureAll,
             active_overlay,
+            bulk_guard_bypass: None,
+            bulk_guard_frozen_paths: None,
             pending_bulk_rename: None,
             pending_metadata_editor: None,
             pending_browse_archive_metadata: None,

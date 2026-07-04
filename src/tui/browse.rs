@@ -1335,6 +1335,37 @@ impl BrowseOptionsMenu {
     }
 }
 
+/// Browse multi-selection interaction state.
+///
+/// Normal mode keeps marks independent of cursor movement. Range mode is a
+/// modal preview state used by `v`, Shift+movement, and drag selection: the
+/// visible mark set is temporarily replaced by the preview range, while the
+/// pre-range mark set is retained so Enter/Space can merge and Esc can restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionMode {
+    Normal,
+    Range {
+        anchor_index: usize,
+        pre_range_selection: Vec<PathBuf>,
+    },
+}
+
+/// Mouse drag range-selection state for Browse rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowseDragState {
+    pub anchor_index: usize,
+    pub active: bool,
+}
+
+impl Default for BrowseDragState {
+    fn default() -> Self {
+        Self {
+            anchor_index: 0,
+            active: false,
+        }
+    }
+}
+
 /// Explore pane tree node. Reuse the file-picker tree node type directly so
 /// Browse and the picker share one filesystem-tree data model.
 ///
@@ -1366,13 +1397,15 @@ pub struct BrowseState {
     /// Multi-selected file paths
     pub multi_selected: Vec<PathBuf>,
 
-    /// Anchor for range selection: the last plain-clicked entry or V-mode start.
-    /// Path-based so it survives refresh/sort/filter. `None` when no anchor is set.
+    /// Anchor for one-shot extend selection: the most recent toggled or
+    /// clicked selectable row. Path-based so it survives refresh/sort/filter.
     pub multi_select_anchor: Option<PathBuf>,
 
-    /// Visual (V) selection mode: when true, moving the cursor extends the
-    /// selection range from the anchor to the current cursor position.
-    pub visual_mode: bool,
+    /// Modal range-selection state (`v`, Shift+movement, or drag).
+    pub selection_mode: SelectionMode,
+
+    /// Active mouse drag range-selection state.
+    pub drag_state: BrowseDragState,
 
     /// Inline search panel state.
     pub search: SearchState,
@@ -1765,7 +1798,8 @@ impl BrowseState {
             visible_height: 0,
             multi_selected: Vec::new(),
             multi_select_anchor: None,
-            visual_mode: false,
+            selection_mode: SelectionMode::Normal,
+            drag_state: BrowseDragState::default(),
             search: SearchState::new(),
             path_input: None,
             path_validation_generation: 0,
@@ -3239,30 +3273,195 @@ impl BrowseState {
         }
     }
 
-    /// Toggle multi-select on the current entry
-    pub fn toggle_selection(&mut self) {
-        if let Some(entry) = self.entries.get(self.selected_index) {
-            // Allow selecting audio files, archives, directories, and
-            // other files. Only ParentDir (..) is excluded — it's a
-            // navigation pseudo-entry, not a real target.
-            if !matches!(entry.kind, EntryKind::ParentDir) {
-                let path = entry.path.clone();
-                if let Some(pos) = self.multi_selected.iter().position(|p| p == &path) {
-                    self.multi_selected.remove(pos);
-                } else {
-                    self.multi_selected.push(path);
-                }
-            }
+    fn selectable_entry_path_at(&self, index: usize) -> Option<PathBuf> {
+        self.entries
+            .get(index)
+            .filter(|entry| !matches!(entry.kind, EntryKind::ParentDir))
+            .map(|entry| entry.path.clone())
+    }
+
+    fn selected_path_index(&self, path: &Path) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.path == path)
+    }
+
+    fn range_paths_between(&self, a: usize, b: usize) -> Vec<PathBuf> {
+        let lo = a.min(b);
+        let hi = a.max(b);
+        (lo..=hi)
+            .filter_map(|idx| self.selectable_entry_path_at(idx))
+            .collect()
+    }
+
+    fn push_unique_selection(&mut self, path: PathBuf) {
+        if !self.multi_selected.iter().any(|selected| selected == &path) {
+            self.multi_selected.push(path);
         }
+    }
+
+    /// Toggle multi-select on the entry at `index` without changing the cursor.
+    /// ParentDir is deliberately ignored because it is a navigation pseudo-row.
+    pub fn toggle_selection_at_index(&mut self, index: usize) -> Option<PathBuf> {
+        let path = self.selectable_entry_path_at(index)?;
+        if let Some(pos) = self.multi_selected.iter().position(|p| p == &path) {
+            self.multi_selected.remove(pos);
+        } else {
+            self.multi_selected.push(path.clone());
+        }
+        self.multi_select_anchor = Some(path.clone());
+        Some(path)
+    }
+
+    /// Toggle multi-select on the current entry.
+    pub fn toggle_selection(&mut self) {
+        let _ = self.toggle_selection_at_index(self.selected_index);
     }
 
     pub fn is_multi_selected(&self, path: &Path) -> bool {
         self.multi_selected.iter().any(|p| p.as_path() == path)
     }
 
+    pub fn is_range_mode(&self) -> bool {
+        matches!(self.selection_mode, SelectionMode::Range { .. })
+    }
+
+    pub fn is_range_preview_index(&self, index: usize) -> bool {
+        match self.selection_mode {
+            SelectionMode::Range { anchor_index, .. } => {
+                let lo = anchor_index.min(self.selected_index);
+                let hi = anchor_index.max(self.selected_index);
+                (lo..=hi).contains(&index)
+                    && self
+                        .entries
+                        .get(index)
+                        .is_some_and(|entry| !matches!(entry.kind, EntryKind::ParentDir))
+            }
+            SelectionMode::Normal => false,
+        }
+    }
+
+    pub fn begin_range_selection(&mut self) {
+        self.begin_range_selection_at(self.selected_index);
+    }
+
+    pub fn begin_range_selection_at(&mut self, anchor_index: usize) {
+        if !self.is_range_mode() {
+            self.selection_mode = SelectionMode::Range {
+                anchor_index: anchor_index.min(self.entries.len().saturating_sub(1)),
+                pre_range_selection: self.multi_selected.clone(),
+            };
+        }
+        self.update_range_preview();
+    }
+
+    pub fn update_range_preview(&mut self) {
+        let anchor_index = match self.selection_mode {
+            SelectionMode::Range { anchor_index, .. } => anchor_index,
+            SelectionMode::Normal => return,
+        };
+        self.multi_selected = self.range_paths_between(anchor_index, self.selected_index);
+    }
+
+    pub fn commit_range_selection(&mut self) -> bool {
+        let (anchor_index, mut committed) = match std::mem::replace(
+            &mut self.selection_mode,
+            SelectionMode::Normal,
+        ) {
+            SelectionMode::Range {
+                anchor_index,
+                pre_range_selection,
+            } => (anchor_index, pre_range_selection),
+            SelectionMode::Normal => {
+                self.selection_mode = SelectionMode::Normal;
+                return false;
+            }
+        };
+        for path in self.range_paths_between(anchor_index, self.selected_index) {
+            if !committed.iter().any(|selected| selected == &path) {
+                committed.push(path);
+            }
+        }
+        self.multi_selected = committed;
+        if let Some(path) = self.selectable_entry_path_at(self.selected_index) {
+            self.multi_select_anchor = Some(path);
+        }
+        true
+    }
+
+    pub fn cancel_range_selection(&mut self) -> bool {
+        match std::mem::replace(&mut self.selection_mode, SelectionMode::Normal) {
+            SelectionMode::Range {
+                pre_range_selection,
+                ..
+            } => {
+                self.multi_selected = pre_range_selection;
+                true
+            }
+            SelectionMode::Normal => {
+                self.selection_mode = SelectionMode::Normal;
+                false
+            }
+        }
+    }
+
+    pub fn extend_selection_from_anchor_to_index(&mut self, index: usize) {
+        let anchor_index = self
+            .multi_select_anchor
+            .as_ref()
+            .and_then(|path| self.selected_path_index(path))
+            .unwrap_or(self.selected_index);
+        for path in self.range_paths_between(anchor_index, index) {
+            self.push_unique_selection(path);
+        }
+        if let Some(path) = self.selectable_entry_path_at(index) {
+            self.multi_select_anchor = Some(path);
+        }
+    }
+
+    pub fn toggle_all_visible_selection(&mut self) {
+        let visible_paths: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|entry| !matches!(entry.kind, EntryKind::ParentDir))
+            .map(|entry| entry.path.clone())
+            .collect();
+        if visible_paths.is_empty() {
+            return;
+        }
+        let all_selected = visible_paths
+            .iter()
+            .all(|path| self.multi_selected.iter().any(|selected| selected == path));
+        if all_selected {
+            self.multi_selected
+                .retain(|selected| !visible_paths.iter().any(|path| path == selected));
+        } else {
+            for path in visible_paths {
+                self.push_unique_selection(path);
+            }
+        }
+        self.selection_mode = SelectionMode::Normal;
+    }
+
+    pub fn invert_visible_selection(&mut self) {
+        let visible_paths: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|entry| !matches!(entry.kind, EntryKind::ParentDir))
+            .map(|entry| entry.path.clone())
+            .collect();
+        for path in visible_paths {
+            if let Some(pos) = self.multi_selected.iter().position(|selected| selected == &path) {
+                self.multi_selected.remove(pos);
+            } else {
+                self.multi_selected.push(path);
+            }
+        }
+        self.selection_mode = SelectionMode::Normal;
+    }
+
     pub fn clear_multi_selection(&mut self) {
         self.multi_selected.clear();
-        self.visual_mode = false;
+        self.selection_mode = SelectionMode::Normal;
+        self.drag_state.active = false;
     }
 
     fn multi_selected_disc_source_dir_roots(&self) -> Vec<PathBuf> {
@@ -3283,26 +3482,10 @@ impl BrowseState {
         roots
     }
 
-    /// Update the visual selection range from anchor to current cursor.
-    /// Called after every cursor move while visual_mode is active.
+    /// Backward-compatible name for older callers; range mode now owns the
+    /// pre-range snapshot and preview semantics.
     pub fn update_visual_selection(&mut self) {
-        let anchor_idx = self
-            .multi_select_anchor
-            .as_ref()
-            .and_then(|p| self.entries.iter().position(|e| e.path == *p))
-            .unwrap_or(self.selected_index);
-        let lo = anchor_idx.min(self.selected_index);
-        let hi = anchor_idx.max(self.selected_index);
-
-        // Replace multi_selected with the contiguous range (non-ParentDir entries).
-        self.multi_selected.clear();
-        for i in lo..=hi {
-            if let Some(entry) = self.entries.get(i) {
-                if !matches!(entry.kind, EntryKind::ParentDir) {
-                    self.multi_selected.push(entry.path.clone());
-                }
-            }
-        }
+        self.update_range_preview();
     }
 
     /// Collect paths for an enqueue operation (`:queue` / `:convert` etc).
@@ -7623,6 +7806,63 @@ impl IntoIterator for QueueExpansionResult {
     fn into_iter(self) -> Self::IntoIter {
         self.paths.into_iter()
     }
+}
+
+/// Count audio files reachable from `paths`, stopping once `limit` is exceeded.
+///
+/// This is intended for UI guards before expensive bulk operations. It walks
+/// ordinary directories recursively, counts only files classified as audio,
+/// ignores unreadable directories best-effort, and never follows directory
+/// symlinks. Directory entries are inspected as they stream from `read_dir`;
+/// only subdirectories are pushed for later traversal, and the walk returns as
+/// soon as the bounded count exceeds `limit`. Returning `limit + 1` means "more
+/// than `limit`" without enumerating the rest of a huge directory.
+pub fn count_audio_files_bounded(paths: &[PathBuf], limit: usize) -> usize {
+    let mut count = 0usize;
+    let mut stack: Vec<PathBuf> = paths.to_vec();
+
+    while let Some(path) = stack.pop() {
+        if count > limit {
+            return count;
+        }
+
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+
+        if metadata.is_dir() {
+            let Ok(read_dir) = fs::read_dir(&path) else {
+                continue;
+            };
+
+            for child in read_dir.flatten() {
+                let child_path = child.path();
+                let Ok(child_metadata) = fs::symlink_metadata(&child_path) else {
+                    continue;
+                };
+
+                if child_metadata.is_dir() {
+                    stack.push(child_path);
+                } else if child_metadata.is_file() || child_metadata.file_type().is_symlink() {
+                    if matches!(classify_file(&child_path), EntryKind::AudioFile(_)) {
+                        count = count.saturating_add(1);
+                        if count > limit {
+                            return count;
+                        }
+                    }
+                }
+            }
+        } else if metadata.is_file() || metadata.file_type().is_symlink() {
+            if matches!(classify_file(&path), EntryKind::AudioFile(_)) {
+                count = count.saturating_add(1);
+                if count > limit {
+                    return count;
+                }
+            }
+        }
+    }
+
+    count
 }
 
 /// Expands files/directories to queueable audio paths using the historical
@@ -12580,5 +12820,159 @@ mod disc_directory_navigation_tests {
                 .any(|entry| entry.path == disc.path && entry.is_navigable_dir()),
             "directories, including disc directories, must remain filename-searchable for navigation"
         );
+    }
+}
+
+#[cfg(test)]
+mod selection_behavior_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_entry(name: &str, kind: EntryKind) -> BrowseEntry {
+        BrowseEntry::new(
+            PathBuf::from(format!("/tmp/{name}")),
+            name.to_string(),
+            kind,
+            0,
+            None,
+        )
+    }
+
+    fn selection_state() -> BrowseState {
+        let mut state = BrowseState::new();
+        state.entries = vec![
+            test_entry("..", EntryKind::ParentDir),
+            test_entry("a.flac", EntryKind::OtherFile),
+            test_entry("b.flac", EntryKind::OtherFile),
+            test_entry("c.flac", EntryKind::OtherFile),
+        ];
+        state.visible_height = state.entries.len();
+        state.selected_index = 1;
+        state
+    }
+
+    fn selected_names(state: &BrowseState) -> Vec<String> {
+        state
+            .multi_selected
+            .iter()
+            .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn modal_range_preview_commit_merges_with_pre_range_selection_and_excludes_parent_dir() {
+        let mut state = selection_state();
+        let existing = state.entries[3].path.clone();
+        state.multi_selected = vec![existing.clone()];
+
+        state.begin_range_selection_at(0);
+        state.selected_index = 2;
+        state.update_range_preview();
+
+        assert_eq!(selected_names(&state), vec!["a.flac", "b.flac"]);
+        assert!(state.is_range_preview_index(1));
+        assert!(!state.is_range_preview_index(0), "ParentDir must not preview as selectable");
+
+        assert!(state.commit_range_selection());
+        assert_eq!(state.selection_mode, SelectionMode::Normal);
+        assert!(state.multi_selected.iter().any(|path| path == &existing));
+        assert!(state.multi_selected.iter().any(|path| path.ends_with("a.flac")));
+        assert!(state.multi_selected.iter().any(|path| path.ends_with("b.flac")));
+        assert!(!state.multi_selected.iter().any(|path| path.ends_with("..")));
+    }
+
+    #[test]
+    fn modal_range_cancel_restores_pre_range_selection() {
+        let mut state = selection_state();
+        let existing = state.entries[3].path.clone();
+        state.multi_selected = vec![existing.clone()];
+
+        state.begin_range_selection_at(1);
+        state.selected_index = 2;
+        state.update_range_preview();
+        assert_eq!(selected_names(&state), vec!["a.flac", "b.flac"]);
+
+        assert!(state.cancel_range_selection());
+        assert_eq!(state.selection_mode, SelectionMode::Normal);
+        assert_eq!(state.multi_selected, vec![existing]);
+    }
+
+    #[test]
+    fn shift_style_range_continuation_keeps_original_anchor_until_commit() {
+        let mut state = selection_state();
+
+        state.begin_range_selection_at(1);
+        state.selected_index = 2;
+        state.update_range_preview();
+        assert_eq!(selected_names(&state), vec!["a.flac", "b.flac"]);
+
+        state.selected_index = 3;
+        state.update_range_preview();
+        assert_eq!(selected_names(&state), vec!["a.flac", "b.flac", "c.flac"]);
+
+        assert!(state.commit_range_selection());
+        assert_eq!(selected_names(&state), vec!["a.flac", "b.flac", "c.flac"]);
+        assert_eq!(state.multi_select_anchor, Some(state.entries[3].path.clone()));
+    }
+
+    #[test]
+    fn select_all_toggle_and_invert_operate_only_on_visible_non_parent_entries() {
+        let mut state = selection_state();
+
+        state.toggle_all_visible_selection();
+        assert_eq!(selected_names(&state), vec!["a.flac", "b.flac", "c.flac"]);
+        assert!(!state.multi_selected.iter().any(|path| path.ends_with("..")));
+
+        state.toggle_all_visible_selection();
+        assert!(state.multi_selected.is_empty());
+
+        state.toggle_selection_at_index(1);
+        state.invert_visible_selection();
+        assert_eq!(selected_names(&state), vec!["b.flac", "c.flac"]);
+        assert!(!state.multi_selected.iter().any(|path| path.ends_with("..")));
+    }
+}
+
+#[cfg(test)]
+mod bulk_audio_count_tests {
+    use super::*;
+
+    #[test]
+    fn count_audio_files_bounded_returns_limit_plus_one_for_large_flat_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for idx in 0..75 {
+            std::fs::write(
+                temp.path().join(format!("track-{idx:03}.flac")),
+                b"extension-only audio fixture",
+            )
+            .expect("audio fixture");
+        }
+        for idx in 0..20 {
+            std::fs::write(temp.path().join(format!("note-{idx:03}.txt")), b"not audio")
+                .expect("non-audio fixture");
+        }
+
+        assert_eq!(
+            count_audio_files_bounded(&[temp.path().to_path_buf()], 50),
+            51,
+            "guard counting should cap at limit + 1 instead of computing a full exact count"
+        );
+    }
+
+    #[test]
+    fn count_audio_files_bounded_counts_nested_audio_without_following_directory_symlinks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("disc-one");
+        std::fs::create_dir_all(&nested).expect("nested dir fixture");
+        std::fs::write(nested.join("track.flac"), b"extension-only audio fixture")
+            .expect("nested audio fixture");
+
+        #[cfg(unix)]
+        {
+            let linked = temp.path().join("linked-disc");
+            std::os::unix::fs::symlink(&nested, &linked).expect("directory symlink fixture");
+        }
+
+        assert_eq!(count_audio_files_bounded(&[temp.path().to_path_buf()], 50), 1);
     }
 }

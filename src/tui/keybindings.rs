@@ -85,11 +85,12 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
-    // F5 refreshes the browse screen regardless of sub-state (search panel,
-    // filter input, path editing, etc.) — just like Windows/Linux file managers.
+    // Ctrl+R refreshes Browse regardless of sub-state (search panel,
+    // filter input, path editing, etc.). Do not bind F5: function keys are
+    // frequently captured by terminal multiplexers and are forbidden here.
     if app.current_screen == AppScreen::Browse
-        && ((key.code == KeyCode::F(5))
-            || (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL)))
+        && key.code == KeyCode::Char('r')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
     {
         app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
@@ -1274,6 +1275,49 @@ fn activate_archive_browse_directory(
     }
 }
 
+fn activate_browse_entry(
+    app: &mut AppState,
+    idx: usize,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let Some(entry) = app.browse.entries.get(idx).cloned() else {
+        return;
+    };
+
+    if entry.is_navigable_dir() && app.browse.is_in_archive() {
+        if activate_archive_browse_directory(app, idx, tx) {
+            app.browse.probe_current_with_db(tx, Some(&app.db));
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+        }
+        return;
+    }
+
+    if entry.is_navigable_dir() {
+        app.browse.enter_selected();
+        app.browse.probe_current_with_db(tx, Some(&app.db));
+        super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+        return;
+    }
+
+    if matches!(entry.kind, super::browse::EntryKind::Archive) && !app.browse.is_in_archive() {
+        start_browse_archive_listing(app, entry.path.clone(), tx, false);
+        return;
+    }
+
+    if matches!(entry.kind, super::browse::EntryKind::AudioFile(_)) && app.browse.is_in_archive() {
+        app.browse.toggle_selection_at_index(idx);
+        app.set_status(
+            "archive entry selected; use Edit Tags or Rename for archive-aware changes",
+        );
+        app.browse.probe_current_with_db(tx, Some(&app.db));
+        super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+        return;
+    }
+
+    let target = app.browse.return_target;
+    load_browse_selection_pub(app, entry.path.clone(), target);
+}
+
 fn convert_metadata_inline_fields_visible(app: &AppState) -> bool {
     matches!(
         &app.convert.source.mode,
@@ -1566,27 +1610,6 @@ pub(super) fn begin_browse_inline_rename(app: &mut AppState, path: std::path::Pa
 fn browse_entry_supports_inline_rename(app: &AppState, kind: &super::browse::EntryKind) -> bool {
     !matches!(kind, super::browse::EntryKind::ParentDir)
         && !(app.browse.is_in_archive() && matches!(kind, super::browse::EntryKind::Directory))
-}
-
-fn begin_selected_browse_inline_rename(app: &mut AppState) {
-    let Some((path, kind)) = app
-        .browse
-        .selected_entry()
-        .map(|entry| (entry.path.clone(), entry.kind.clone()))
-    else {
-        return;
-    };
-    if matches!(kind, super::browse::EntryKind::ParentDir) {
-        app.set_status("rename: cannot rename parent entry");
-        return;
-    }
-    if app.browse.is_in_archive() && matches!(kind, super::browse::EntryKind::Directory) {
-        app.set_status(
-            "rename: archive directory rename is unavailable; rename files with archive-aware Rename",
-        );
-        return;
-    }
-    begin_browse_inline_rename(app, path);
 }
 
 fn current_browse_metadata_value(app: &AppState, field: crate::tui::probe::MetadataField) -> String {
@@ -1888,6 +1911,177 @@ mod inline_edit_behavior_tests {
 
             assert_eq!(app.browse.current_dir, disc_dir);
             assert!(app.browse.multi_selected.is_empty());
+        }
+    }
+
+    #[test]
+    fn browse_double_click_regular_file_activates_into_convert_instead_of_toggling_selection() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"not real audio; activation only needs a path").expect("file");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(file.clone())];
+        app.button_map
+            .record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 24, 1));
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, click(), &tx);
+        handle_mouse(&mut app, click(), &tx);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert!(app.browse.multi_selected.is_empty());
+    }
+
+    #[test]
+    fn browse_gutter_click_toggles_without_moving_cursor() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![
+            browse_file_entry(std::path::PathBuf::from("/tmp/a.flac")),
+            browse_file_entry(std::path::PathBuf::from("/tmp/b.flac")),
+        ];
+        app.browse.selected_index = 1;
+        app.button_map
+            .record_button(TuiButton::BrowseEntryGutter(0), Rect::new(2, 5, 3, 1));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.selected_index, 1, "gutter click must not move cursor");
+        assert_eq!(app.browse.multi_selected, vec![std::path::PathBuf::from("/tmp/a.flac")]);
+    }
+
+    #[test]
+    fn browse_drag_previews_and_commits_range_selection() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![
+            browse_file_entry(std::path::PathBuf::from("/tmp/a.flac")),
+            browse_file_entry(std::path::PathBuf::from("/tmp/b.flac")),
+            browse_file_entry(std::path::PathBuf::from("/tmp/c.flac")),
+        ];
+        app.browse.visible_height = 3;
+        for idx in 0..3 {
+            app.button_map
+                .record_button(TuiButton::BrowseEntry(idx), Rect::new(4, 4 + idx as u16, 24, 1));
+        }
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 8,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert!(app.browse.drag_state.active);
+        assert!(app.browse.is_range_mode());
+        assert_eq!(app.browse.selected_index, 2);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 8,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.drag_state.active);
+        assert!(!app.browse.is_range_mode());
+        assert_eq!(
+            app.browse.multi_selected,
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+                std::path::PathBuf::from("/tmp/c.flac"),
+            ]
+        );
+    }
+
+    #[test]
+    fn browse_info_edit_tags_button_uses_bulk_guard() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        for idx in 0..=super::super::command::BULK_AUDIO_GUARD_THRESHOLD {
+            std::fs::write(temp.path().join(format!("track-{idx:02}.flac")), b"fixture")
+                .expect("audio fixture");
+        }
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            temp.path().to_path_buf(),
+            "album".to_string(),
+            crate::tui::browse::EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.button_map
+            .record_button(TuiButton::BrowseInfoEditTags, Rect::new(10, 10, 12, 1));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 11,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation {
+                action:
+                    ConfirmAction::BulkOperation {
+                        operation,
+                        command: BulkGuardCommand::OpenMetadataEditor,
+                        paths,
+                        count,
+                    },
+                ..
+            } => {
+                assert_eq!(*operation, BulkOperationKind::EditMetadata);
+                assert_eq!(paths, &vec![temp.path().to_path_buf()]);
+                assert!(*count > super::super::command::BULK_AUDIO_GUARD_THRESHOLD);
+            }
+            other => panic!("expected bulk edit-tags confirmation, got {other:?}"),
         }
     }
 
@@ -2766,52 +2960,80 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Navigation (extends visual selection if V-mode is active)
-        (KeyCode::Up, KeyModifiers::NONE) => {
+        // Shift+movement: enter/continue modal range selection and preview.
+        (KeyCode::Up, KeyModifiers::SHIFT) => {
+            app.browse.begin_range_selection();
             app.browse.move_up();
-            if app.browse.visual_mode {
-                app.browse.update_visual_selection();
-            }
+            app.browse.update_range_preview();
             selection_may_have_changed = true;
         }
-        (KeyCode::Down, KeyModifiers::NONE) => {
+        (KeyCode::Down, KeyModifiers::SHIFT) => {
+            app.browse.begin_range_selection();
             app.browse.move_down();
-            if app.browse.visual_mode {
-                app.browse.update_visual_selection();
-            }
+            app.browse.update_range_preview();
             selection_may_have_changed = true;
         }
-        (KeyCode::Home, _) => {
+        (KeyCode::Home, KeyModifiers::SHIFT) => {
+            app.browse.begin_range_selection();
             app.browse.move_top();
-            if app.browse.visual_mode {
-                app.browse.update_visual_selection();
-            }
+            app.browse.update_range_preview();
             selection_may_have_changed = true;
         }
-        (KeyCode::End, _) => {
+        (KeyCode::End, KeyModifiers::SHIFT) => {
+            app.browse.begin_range_selection();
             app.browse.move_bottom();
-            if app.browse.visual_mode {
-                app.browse.update_visual_selection();
-            }
+            app.browse.update_range_preview();
             selection_may_have_changed = true;
         }
-        (KeyCode::PageUp, _) => {
+        (KeyCode::PageUp, KeyModifiers::SHIFT) => {
+            app.browse.begin_range_selection();
             app.browse.page_up();
-            if app.browse.visual_mode {
-                app.browse.update_visual_selection();
-            }
+            app.browse.update_range_preview();
             selection_may_have_changed = true;
         }
-        (KeyCode::PageDown, _) => {
+        (KeyCode::PageDown, KeyModifiers::SHIFT) => {
+            app.browse.begin_range_selection();
             app.browse.page_down();
-            if app.browse.visual_mode {
-                app.browse.update_visual_selection();
-            }
+            app.browse.update_range_preview();
             selection_may_have_changed = true;
         }
 
-        // Go up (parent directory / archive level)
+        // Plain navigation commits a live range before moving.
+        (KeyCode::Up, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
+            app.browse.move_up();
+            selection_may_have_changed = true;
+        }
+        (KeyCode::Down, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
+            app.browse.move_down();
+            selection_may_have_changed = true;
+        }
+        (KeyCode::Home, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
+            app.browse.move_top();
+            selection_may_have_changed = true;
+        }
+        (KeyCode::End, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
+            app.browse.move_bottom();
+            selection_may_have_changed = true;
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
+            app.browse.page_up();
+            selection_may_have_changed = true;
+        }
+        (KeyCode::PageDown, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
+            app.browse.page_down();
+            selection_may_have_changed = true;
+        }
+
+        // Go up (parent directory / archive level). Non-Shift navigation commits any
+        // live range before moving away from the preview.
         (KeyCode::Left, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
             if app.browse.is_in_archive() {
                 if !app.browse.go_up_in_archive() {
                     exit_browse_archive(app, tx);
@@ -2829,6 +3051,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                 app.browse.type_ahead_pop();
                 selection_may_have_changed = true;
             } else {
+                app.browse.commit_range_selection();
                 if app.browse.is_in_archive() {
                     if !app.browse.go_up_in_archive() {
                         exit_browse_archive(app, tx);
@@ -2844,6 +3067,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         // from deferred-save staging and repackaged later when the user leaves
         // the archive/screen/quits.
         (KeyCode::Delete, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
             if app.browse.is_in_archive() {
                 start_browse_archive_entry_delete(app, tx);
             } else {
@@ -2863,14 +3087,13 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Rename the selected file/folder inline in the list.
-        (KeyCode::F(2), KeyModifiers::NONE) => {
-            clear_browse_info_focus(app);
-            begin_selected_browse_inline_rename(app);
-        }
+        // Rename stays available through the context menu and `:rename`.
+        // Do not bind F-keys here: they are reserved by terminal multiplexers
+        // such as byobu and are forbidden by the Browse selection brief.
 
         // Enter directory/archive or select file
         (KeyCode::Right, KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
             if let Some(entry) = app.browse.selected_entry() {
                 if entry.is_navigable_dir() {
                     if app.browse.is_in_archive() {
@@ -2896,6 +3119,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                     selection_may_have_changed = true;
                 }
             }
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) if app.browse.is_range_mode() => {
+            app.browse.commit_range_selection();
+            app.set_status("Range selected");
+            selection_may_have_changed = true;
         }
         (KeyCode::Enter, KeyModifiers::NONE) => {
             if let Some(entry) = app.browse.selected_entry() {
@@ -2951,11 +3179,15 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Space: literal space in type-ahead when buffer is active,
-        // otherwise toggle multi-select for individual items.
+        // Space: literal space in type-ahead; in range mode it commits;
+        // otherwise it toggles the current row, anchors there, and advances.
         (KeyCode::Char(' '), KeyModifiers::NONE) => {
             if app.browse.type_ahead_active() {
                 app.browse.type_ahead_push(' ');
+                selection_may_have_changed = true;
+            } else if app.browse.is_range_mode() {
+                app.browse.commit_range_selection();
+                app.set_status("Range selected");
                 selection_may_have_changed = true;
             } else {
                 app.browse.toggle_selection();
@@ -2964,23 +3196,34 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Visual (range) selection mode: Ctrl+V toggles. While active,
-        // cursor movement extends the selection from the anchor.
-        (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
-            if app.browse.visual_mode {
-                // Exit visual mode, keep current selection.
-                app.browse.visual_mode = false;
-                app.set_status("Visual select off");
-            } else {
-                // Enter visual mode: anchor at current cursor.
-                app.browse.visual_mode = true;
-                if let Some(entry) = app.browse.entries.get(app.browse.selected_index) {
-                    app.browse.multi_select_anchor = Some(entry.path.clone());
-                }
-                // Select the current entry.
-                app.browse.update_visual_selection();
-                app.set_status("Visual select on — move cursor to extend range");
-            }
+        // Enhanced-key binding when Shift+Space is distinguishable. In legacy
+        // terminals this degrades to ordinary Space before it reaches us.
+        (KeyCode::Char(' '), KeyModifiers::SHIFT) => {
+            app.browse.extend_selection_from_anchor_to_index(app.browse.selected_index);
+            app.set_status("Selection extended from anchor");
+            selection_may_have_changed = true;
+        }
+
+        // Baseline modal range selection. Movement previews; Enter/Space
+        // commits; Esc restores the pre-range mark set.
+        (KeyCode::Char('v'), KeyModifiers::NONE) => {
+            app.browse.begin_range_selection();
+            app.set_status("Range select: move, Enter/Space commits, Esc cancels");
+            selection_may_have_changed = true;
+        }
+
+        // Bulk mark operations over the visible set. Alt is the terminal Meta
+        // baseline on Linux/Windows and works on macOS when Option-as-Meta is
+        // enabled. `*` remains an unconditional invert fallback.
+        (KeyCode::Char('a'), KeyModifiers::ALT) => {
+            app.browse.commit_range_selection();
+            app.browse.toggle_all_visible_selection();
+            selection_may_have_changed = true;
+        }
+        (KeyCode::Char('i'), KeyModifiers::ALT) | (KeyCode::Char('*'), KeyModifiers::NONE) => {
+            app.browse.commit_range_selection();
+            app.browse.invert_visible_selection();
+            selection_may_have_changed = true;
         }
 
         // Toggle hidden files
@@ -3010,9 +3253,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                 app.browse.clear_type_ahead();
             } else if app.browse.search.active {
                 app.browse.close_search();
-            } else if app.browse.visual_mode {
-                app.browse.visual_mode = false;
-                app.set_status("Visual select off");
+            } else if app.browse.cancel_range_selection() {
+                app.set_status("Range selection cancelled");
+                selection_may_have_changed = true;
             } else if app.browse_info_focus.is_some() {
                 clear_browse_info_focus(app);
                 app.set_status("Browse file-list focus");
@@ -3037,16 +3280,23 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         (KeyCode::Char('e'), KeyModifiers::CONTROL)
         | (KeyCode::Char('p'), KeyModifiers::ALT) => {
             clear_browse_info_focus(app);
+            let guard_paths = super::command::collect_selection_for_file_ops(app);
+            if super::command::maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::EditMetadata,
+                BulkGuardCommand::OpenMetadataEditor,
+                &guard_paths,
+            ) {
+                return;
+            }
             open_metadata_editor(app);
         }
 
         // Type-ahead navigation: bare letter/number keys jump to the
         // first entry whose name starts with the accumulated prefix.
         (KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+            app.browse.commit_range_selection();
             app.browse.type_ahead_push(c);
-            if app.browse.visual_mode {
-                app.browse.update_visual_selection();
-            }
             selection_may_have_changed = true;
         }
 
@@ -3535,7 +3785,7 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
                 app.ensure_visible();
             }
         }
-        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+        (KeyCode::Char('a'), KeyModifiers::ALT) => {
             app.manager.select_all();
             app.set_status("Selected all items");
         }
@@ -3746,7 +3996,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         }
         ActiveOverlay::Confirmation { action, .. } => {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.active_overlay = ActiveOverlay::None;
                     execute_confirm_action(app, &action, tx);
                 }
@@ -10266,14 +10516,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
             return;
         };
 
-        let candidate_paths: Vec<std::path::PathBuf> = if app.browse.multi_selected.is_empty() {
-            app.browse
-                .selected_entry()
-                .map(|entry| vec![entry.path.clone()])
-                .unwrap_or_default()
-        } else {
-            app.browse.multi_selected.clone()
-        };
+        let candidate_paths: Vec<std::path::PathBuf> = sel.clone();
 
         let staging = app
             .browse
@@ -22520,6 +22763,11 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
         Some(ConfirmAction::ApplyMbToAllPresentations(_)) => {
             app.set_status(":tags-mb: kept MusicBrainz values on active presentation".to_string());
         }
+        Some(ConfirmAction::BulkOperation { operation, .. }) => {
+            app.bulk_guard_bypass = None;
+            app.bulk_guard_frozen_paths = None;
+            app.set_status(format!("{} cancelled", operation.label()));
+        }
         Some(ConfirmAction::DiscardMetadataEditorChanges) => {
             app.quit_after_browse_archive_metadata_resolution = false;
             app.set_status("metadata editor: discard cancelled".to_string());
@@ -22819,6 +23067,58 @@ fn execute_confirm_action(
                     session: session.clone(),
                 },
             );
+        }
+        ConfirmAction::BulkOperation {
+            operation,
+            command,
+            paths,
+            count: _,
+        } => {
+            let operation = *operation;
+            let command = command.clone();
+            let paths = paths.clone();
+            app.bulk_guard_bypass = Some(operation);
+            app.bulk_guard_frozen_paths = Some(paths);
+            match command {
+                BulkGuardCommand::OpenMetadataEditor => {
+                    open_metadata_editor(app);
+                }
+                BulkGuardCommand::Analyze { force } => {
+                    super::command::execute_command(app, super::command::Command::Analyze { force }, tx);
+                }
+                BulkGuardCommand::Verify => {
+                    super::command::execute_command(app, super::command::Command::Verify, tx);
+                }
+                BulkGuardCommand::AccurateRip { force } => {
+                    super::command::execute_command(app, super::command::Command::AccurateRip { force }, tx);
+                }
+                BulkGuardCommand::AccurateRipBatch => {
+                    super::command::execute_command(app, super::command::Command::ArBatch, tx);
+                }
+                BulkGuardCommand::AccurateRipFixOffset => {
+                    super::command::execute_command(app, super::command::Command::ArFix, tx);
+                }
+                BulkGuardCommand::Ctdb => {
+                    super::command::execute_command(app, super::command::Command::Ctdb, tx);
+                }
+                BulkGuardCommand::TagsFromMb { query, catno, year } => {
+                    super::command::execute_command(
+                        app,
+                        super::command::Command::TagsFromMb { query, catno, year },
+                        tx,
+                    );
+                }
+                BulkGuardCommand::Gnudb => {
+                    super::context_menu::execute_gnudb_query(app, tx);
+                }
+                BulkGuardCommand::DetectPreemphasis => {
+                    super::command::execute_command(app, super::command::Command::DetectPreemphasis, tx);
+                }
+            }
+            if app.bulk_guard_bypass == Some(operation) {
+                app.bulk_guard_bypass = None;
+            }
+            app.bulk_guard_frozen_paths = None;
         }
         ConfirmAction::RemoveSelected => {
             let removed = app.manager.remove_selected();
@@ -23190,6 +23490,63 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         }
     }
 
+    // Browse drag range selection. This is checked before generic hover
+    // tracking so drag events are not consumed as mere hover updates.
+    if app.current_screen == AppScreen::Browse
+        && matches!(app.active_overlay, ActiveOverlay::None)
+        && matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left))
+    {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let target = app.button_map.find_button_at(mouse.column, mouse.row);
+                let idx = match target {
+                    Some(TuiButton::BrowseEntry(i)) | Some(TuiButton::BrowseEntryGutter(i)) => Some(i),
+                    _ => None,
+                };
+                if let Some(idx) = idx {
+                    if app.browse.drag_state.active {
+                        app.browse.selected_index = idx.min(app.browse.entries.len().saturating_sub(1));
+                        app.browse.ensure_visible();
+                        app.browse.begin_range_selection_at(app.browse.drag_state.anchor_index);
+                        app.browse.update_range_preview();
+                    }
+                } else if app.browse.drag_state.active {
+                    if let Some(rect) = app.button_map.find_button_rect(&TuiButton::BrowseList) {
+                        if mouse.row <= rect.y.saturating_add(1) {
+                            app.browse.scroll_viewport(-1);
+                            app.browse.selected_index = app.browse.scroll_offset;
+                            app.browse.begin_range_selection_at(app.browse.drag_state.anchor_index);
+                            app.browse.update_range_preview();
+                        } else if mouse.row >= rect.y.saturating_add(rect.height.saturating_sub(2)) {
+                            app.browse.scroll_viewport(1);
+                            app.browse.selected_index = app
+                                .browse
+                                .scroll_offset
+                                .saturating_add(app.browse.visible_height.saturating_sub(1))
+                                .min(app.browse.entries.len().saturating_sub(1));
+                            app.browse.begin_range_selection_at(app.browse.drag_state.anchor_index);
+                            app.browse.update_range_preview();
+                        }
+                    }
+                }
+                app.hover_target = target;
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if app.browse.drag_state.active {
+                    app.browse.drag_state.active = false;
+                    if app.browse.commit_range_selection() {
+                        app.set_status("Range selected");
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                        super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+
     // Hover tracking: update hover_target on every mouse move.
     if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
         let new_hover = app.button_map.find_button_at(mouse.column, mouse.row);
@@ -23219,6 +23576,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.button_map.find_button_at(mouse.column, mouse.row),
                 Some(TuiButton::BrowseList)
                     | Some(TuiButton::BrowseEntry(_))
+                    | Some(TuiButton::BrowseEntryGutter(_))
                     | Some(TuiButton::BrowseColumn(_))
             );
             if over_list {
@@ -23283,11 +23641,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     let y = mouse.row;
                     match app.current_screen {
                         AppScreen::Browse => {
-                            if let Some(super::button_map::TuiButton::BrowseEntry(idx)) =
-                                app.button_map.find_button_at(x, y)
-                            {
-                                app.browse.selected_index = idx;
-                                app.browse.ensure_visible();
+                            if let Some(button) = app.button_map.find_button_at(x, y) {
+                                if let super::button_map::TuiButton::BrowseEntry(idx)
+                                | super::button_map::TuiButton::BrowseEntryGutter(idx) = button
+                                {
+                                    app.browse.selected_index = idx;
+                                    app.browse.ensure_visible();
+                                }
                             }
                         }
                         AppScreen::Queue => {
@@ -23340,11 +23700,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             // is built for THAT item, not whatever was selected before.
             match app.current_screen {
                 AppScreen::Browse => {
-                    if let Some(super::button_map::TuiButton::BrowseEntry(idx)) =
-                        app.button_map.find_button_at(x, y)
-                    {
-                        app.browse.selected_index = idx;
-                        app.browse.ensure_visible();
+                    if let Some(button) = app.button_map.find_button_at(x, y) {
+                        if let super::button_map::TuiButton::BrowseEntry(idx)
+                        | super::button_map::TuiButton::BrowseEntryGutter(idx) = button
+                        {
+                            app.browse.selected_index = idx;
+                            app.browse.ensure_visible();
+                        }
                     }
                 }
                 AppScreen::Queue => {
@@ -23953,6 +24315,18 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
 
             // ── Browse screen ──
+            TuiButton::BrowseEntryGutter(idx) => {
+                clear_browse_info_focus(app);
+                if idx >= app.browse.entries.len() {
+                    return;
+                }
+                app.browse.commit_range_selection();
+                app.browse.toggle_selection_at_index(idx);
+                app.pending_browse_rename = None;
+                app.browse.drag_state.active = false;
+                app.browse.probe_current_with_db(tx, Some(&app.db));
+                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            }
             TuiButton::BrowseEntry(idx) => {
                 clear_browse_info_focus(app);
 
@@ -23962,126 +24336,78 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
                 let clicked_path = app.browse.entries[idx].path.clone();
                 let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
-
-                // All click modes move the cursor to the clicked entry.
-                app.browse.selected_index = idx;
-                app.browse.ensure_visible();
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let now = std::time::Instant::now();
 
                 if ctrl {
-                    // ── Ctrl+click / Ctrl+double-click ──
-                    // Detect double-click within the Ctrl path using last_browse_click.
-                    const DCLICK_MS: u64 = 500;
-                    let now = std::time::Instant::now();
-                    let is_ctrl_double = app
-                        .last_browse_click
-                        .as_ref()
-                        .filter(|(p, _)| *p == clicked_path)
-                        .map(|(_, t)| now.duration_since(*t).as_millis() < DCLICK_MS as u128)
-                        .unwrap_or(false);
-
-                    if is_ctrl_double {
-                        // ── Ctrl+double-click: range-select from anchor to here ──
-                        let anchor_idx = app
-                            .browse
-                            .multi_select_anchor
-                            .as_ref()
-                            .and_then(|p| app.browse.entries.iter().position(|e| e.path == *p))
-                            .unwrap_or(idx);
-                        let lo = anchor_idx.min(idx);
-                        let hi = anchor_idx.max(idx);
-                        let to_add: Vec<std::path::PathBuf> = (lo..=hi)
-                            .filter_map(|i| app.browse.entries.get(i))
-                            .filter(|e| !e.is_navigable_dir())
-                            .map(|e| e.path.clone())
-                            .collect();
-                        for p in to_add {
-                            if !app.browse.multi_selected.iter().any(|sp| *sp == p) {
-                                app.browse.multi_selected.push(p);
-                            }
-                        }
-                        app.last_browse_click = None;
-                    } else {
-                        // ── Ctrl+single-click: toggle individual item ──
-                        app.browse.toggle_selection();
-                        app.last_browse_click = Some((clicked_path, now));
-                    }
+                    // Ctrl+click toggles the clicked row without moving cursor.
+                    app.browse.commit_range_selection();
+                    app.browse.toggle_selection_at_index(idx);
+                    app.last_browse_click = Some((clicked_path, now));
                     app.pending_browse_rename = None;
+                    app.browse.drag_state.active = false;
                     app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-                } else {
-                    // ── Plain click: select vs schedule-rename vs fresh ──
-                    //
-                    // - Click within the double-click window of the prior click
-                    //   on the same path → double-click: toggle selection (files)
-                    //   or navigate into directory.
-                    // - Same-path click OUTSIDE the double-click window schedules
-                    //   a rename (commits after another delay unless cancelled).
-                    // - Click on a different path → fresh click, cancel pending.
-                    const OPEN_MS: u64 = 500;
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                    return;
+                }
 
-                    let now = std::time::Instant::now();
-                    let is_double_click = app
+                if shift {
+                    // Shift+click extends from the current anchor to the clicked row.
+                    app.browse.commit_range_selection();
+                    app.browse.selected_index = idx;
+                    app.browse.ensure_visible();
+                    app.browse.extend_selection_from_anchor_to_index(idx);
+                    app.last_browse_click = Some((clicked_path, now));
+                    app.pending_browse_rename = None;
+                    app.browse.drag_state.active = false;
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                    return;
+                }
+
+                app.browse.commit_range_selection();
+                app.browse.selected_index = idx;
+                app.browse.ensure_visible();
+                app.browse.drag_state = super::browse::BrowseDragState {
+                    anchor_index: idx,
+                    active: true,
+                };
+
+                // Plain click moves the cursor and preserves marks. A second
+                // click within the open window activates the row.
+                const OPEN_MS: u64 = 500;
+                let is_double_click = app
+                    .last_browse_click
+                    .as_ref()
+                    .filter(|(p, _)| *p == clicked_path)
+                    .map(|(_, t)| now.duration_since(*t).as_millis() < OPEN_MS as u128)
+                    .unwrap_or(false);
+
+                if is_double_click {
+                    app.last_browse_click = None;
+                    app.pending_browse_rename = None;
+                    app.browse.drag_state.active = false;
+                    activate_browse_entry(app, idx, tx);
+                } else {
+                    app.pending_browse_rename = None;
+                    let same_path_as_last = app
                         .last_browse_click
                         .as_ref()
-                        .filter(|(p, _)| *p == clicked_path)
-                        .map(|(_, t)| now.duration_since(*t).as_millis() < OPEN_MS as u128)
+                        .map(|(p, _)| *p == clicked_path)
                         .unwrap_or(false);
 
-                    if is_double_click {
-                        app.last_browse_click = None;
-                        app.pending_browse_rename = None;
-                        let is_navigable_dir = app.browse.entries[idx].is_navigable_dir();
-                        match is_navigable_dir {
-                            // Directories: double-click navigates into them.
-                            true if app.browse.is_in_archive() => {
-                                app.browse.multi_selected.clear();
-                                if activate_archive_browse_directory(app, idx, tx) {
-                                    app.browse.probe_current_with_db(tx, Some(&app.db));
-                                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-                                }
-                            }
-                            true => {
-                                app.browse.multi_selected.clear();
-                                app.browse.enter_selected();
-                                app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-                            }
-                            // Files: double-click toggles selection (like Ctrl+click).
-                            false => {
-                                app.browse.toggle_selection();
-                                app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-                            }
-                        }
-                    } else {
-                        // Not a double-click. Plain click clears multi-selection
-                        // (only Ctrl+click and Alt+click modify it).
-                        app.browse.multi_selected.clear();
-                        // Any click cancels any pending rename.
-                        app.pending_browse_rename = None;
-
-                        let same_path_as_last = app
-                            .last_browse_click
-                            .as_ref()
-                            .map(|(p, _)| *p == clicked_path)
-                            .unwrap_or(false);
-
-                        if same_path_as_last {
-                            // Same-path click outside the double-click window.
-                            // Schedule a rename for +OPEN_MS. A subsequent
-                            // click within that window will cancel it (→ open).
-                            // Don't schedule for ParentDir.
-                            if !matches!(app.browse.entries[idx].kind, super::browse::EntryKind::ParentDir) {
-                                begin_browse_inline_rename(app, clicked_path.clone());
-                            }
-                        }
-
-                        // Record this click and anchor.
-                        app.last_browse_click = Some((clicked_path.clone(), now));
-                        app.browse.multi_select_anchor = Some(clicked_path);
-                        app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                    if same_path_as_last
+                        && !matches!(app.browse.entries[idx].kind, super::browse::EntryKind::ParentDir)
+                    {
+                        begin_browse_inline_rename(app, clicked_path.clone());
                     }
+
+                    app.last_browse_click = Some((clicked_path.clone(), now));
+                    if !matches!(app.browse.entries[idx].kind, super::browse::EntryKind::ParentDir) {
+                        app.browse.multi_select_anchor = Some(clicked_path);
+                    }
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
             }
             TuiButton::BrowseColumn(column) => {
@@ -24231,6 +24557,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseInfoEditTags => {
                 clear_browse_info_focus(app);
+                let guard_paths = super::command::collect_selection_for_file_ops(app);
+                if super::command::maybe_confirm_bulk_operation(
+                    app,
+                    BulkOperationKind::EditMetadata,
+                    BulkGuardCommand::OpenMetadataEditor,
+                    &guard_paths,
+                ) {
+                    return;
+                }
                 open_metadata_editor(app);
             }
             TuiButton::BrowseInfoAudioStreams => {

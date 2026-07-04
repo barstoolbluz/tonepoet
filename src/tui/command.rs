@@ -15,6 +15,99 @@ use crate::convert::simple_wizard::DitherType;
 const CD_FRAMES_PER_SECOND: f64 = 75.0;
 const CD_TOC_PREGAP_FRAMES: u32 = 150;
 
+/// Audio-file threshold above which expensive bulk actions require confirmation.
+pub const BULK_AUDIO_GUARD_THRESHOLD: usize = 50;
+/// Count exactly up to this many files for the confirmation copy; above this
+/// bound the prompt intentionally uses a capped wording to keep counting fast.
+pub const BULK_AUDIO_GUARD_EXACT_LIMIT: usize = 500;
+
+fn consume_bulk_guard_bypass(app: &mut AppState, operation: BulkOperationKind) -> bool {
+    if app.bulk_guard_bypass == Some(operation) {
+        app.bulk_guard_bypass = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn bulk_guard_message(operation: BulkOperationKind, count: usize) -> String {
+    let count_text = if count > BULK_AUDIO_GUARD_EXACT_LIMIT {
+        format!("more than {}", BULK_AUDIO_GUARD_EXACT_LIMIT)
+    } else {
+        count.to_string()
+    };
+    format!(
+        "This will {} {} audio files.\nContinue? [Enter = yes, Esc = cancel]",
+        operation.label(),
+        count_text,
+    )
+}
+
+/// Open a confirmation overlay when an operation would touch more than the
+/// configured bulk-audio threshold. Returns true when the caller must stop
+/// dispatch because the confirmation overlay has taken over.
+pub fn maybe_confirm_bulk_operation(
+    app: &mut AppState,
+    operation: BulkOperationKind,
+    command: BulkGuardCommand,
+    paths: &[PathBuf],
+) -> bool {
+    if consume_bulk_guard_bypass(app, operation) {
+        return false;
+    }
+    let count = super::browse::count_audio_files_bounded(paths, BULK_AUDIO_GUARD_EXACT_LIMIT);
+    if count <= BULK_AUDIO_GUARD_THRESHOLD {
+        return false;
+    }
+    app.active_overlay = ActiveOverlay::Confirmation {
+        message: bulk_guard_message(operation, count),
+        action: ConfirmAction::BulkOperation {
+            operation,
+            command,
+            paths: paths.to_vec(),
+            count,
+        },
+    };
+    true
+}
+
+fn current_bulk_guard_paths(app: &AppState) -> Vec<PathBuf> {
+    if let Some(paths) = app.bulk_guard_frozen_paths.as_ref() {
+        return paths.clone();
+    }
+    match app.current_screen {
+        AppScreen::Browse => collect_selection_for_file_ops(app),
+        AppScreen::Convert => app.convert.source.mode.all_paths(),
+        _ => Vec::new(),
+    }
+}
+fn expand_audio_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    super::browse::expand_paths_to_audio(paths)
+        .into_iter()
+        .filter(|p| {
+            matches!(
+                super::browse::classify_file(p),
+                super::browse::EntryKind::AudioFile(_)
+            )
+        })
+        .collect()
+}
+
+fn current_audio_paths(app: &AppState, include_convert: bool) -> Vec<PathBuf> {
+    if let Some(paths) = app.bulk_guard_frozen_paths.as_ref() {
+        return expand_audio_paths(paths);
+    }
+    match app.current_screen {
+        AppScreen::Browse => {
+            let sel = collect_selection_for_file_ops(app);
+            expand_audio_paths(&sel)
+        }
+        AppScreen::Convert if include_convert => app.convert.source.mode.all_paths(),
+        _ => Vec::new(),
+    }
+}
+
+
 /// Full list of command-mode tokens (including aliases) recognised by
 /// `parse_command`. Used by the tab-completion machinery.
 ///
@@ -1487,25 +1580,20 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::Analyze { force } => {
+            let guard_paths = current_bulk_guard_paths(app);
+            if maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::Analyze,
+                BulkGuardCommand::Analyze { force },
+                &guard_paths,
+            ) {
+                return;
+            }
+
             // Collect paths to analyze from the current context.
             // On Browse, directories are expanded recursively to find
             // nested audio files (e.g., disc 01/disc 02 folders).
-            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
-                AppScreen::Browse => {
-                    let sel = collect_selection_for_file_ops(app);
-                    super::browse::expand_paths_to_audio(&sel)
-                        .into_iter()
-                        .filter(|p| {
-                            matches!(
-                                super::browse::classify_file(p),
-                                super::browse::EntryKind::AudioFile(_)
-                            )
-                        })
-                        .collect()
-                }
-                AppScreen::Convert => app.convert.source.mode.all_paths(),
-                _ => Vec::new(),
-            };
+            let mut paths: Vec<std::path::PathBuf> = current_audio_paths(app, true);
             // Sort by disc/track for logical result order.
             super::probe::sort_paths_by_track(&mut paths);
             // Check for single-image CUE layout.
@@ -1838,22 +1926,17 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::Verify => {
-            let paths: Vec<std::path::PathBuf> = match app.current_screen {
-                AppScreen::Browse => {
-                    let sel = collect_selection_for_file_ops(app);
-                    super::browse::expand_paths_to_audio(&sel)
-                        .into_iter()
-                        .filter(|p| {
-                            matches!(
-                                super::browse::classify_file(p),
-                                super::browse::EntryKind::AudioFile(_)
-                            )
-                        })
-                        .collect()
-                }
-                AppScreen::Convert => app.convert.source.mode.all_paths(),
-                _ => Vec::new(),
-            };
+            let guard_paths = current_bulk_guard_paths(app);
+            if maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::VerifyIntegrity,
+                BulkGuardCommand::Verify,
+                &guard_paths,
+            ) {
+                return;
+            }
+
+            let paths: Vec<std::path::PathBuf> = current_audio_paths(app, true);
             if paths.is_empty() {
                 app.set_status("No audio files to verify");
             } else {
@@ -2382,6 +2465,20 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             ));
         }
         Command::TagsFromMb { query, catno, year } => {
+            let guard_paths = current_bulk_guard_paths(app);
+            if maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::MusicBrainzTagging,
+                BulkGuardCommand::TagsFromMb {
+                    query: query.clone(),
+                    catno: catno.clone(),
+                    year: year.clone(),
+                },
+                &guard_paths,
+            ) {
+                return;
+            }
+
             let explicit_args = query.is_some() || catno.is_some() || year.is_some();
             let direct_seed = if explicit_args {
                 Some(SacdMbSeed {
@@ -2538,21 +2635,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 }
             }
 
-            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
-                AppScreen::Browse => {
-                    let sel = collect_selection_for_file_ops(app);
-                    super::browse::expand_paths_to_audio(&sel)
-                        .into_iter()
-                        .filter(|p| {
-                            matches!(
-                                super::browse::classify_file(p),
-                                super::browse::EntryKind::AudioFile(_)
-                            )
-                        })
-                        .collect()
-                }
-                _ => Vec::new(),
-            };
+            let mut paths: Vec<std::path::PathBuf> = current_audio_paths(app, false);
             if paths.is_empty() {
                 // SACD ISOs are handled by the auto-open block at the
                 // top of this arm (C-2d); anything reaching here is
@@ -2883,21 +2966,17 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::DetectPreemphasis => {
-            let paths: Vec<std::path::PathBuf> = match app.current_screen {
-                AppScreen::Browse => {
-                    let sel = collect_selection_for_file_ops(app);
-                    super::browse::expand_paths_to_audio(&sel)
-                        .into_iter()
-                        .filter(|p| {
-                            matches!(
-                                super::browse::classify_file(p),
-                                super::browse::EntryKind::AudioFile(_)
-                            )
-                        })
-                        .collect()
-                }
-                _ => Vec::new(),
-            };
+            let guard_paths = current_bulk_guard_paths(app);
+            if maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::PreemphasisDetection,
+                BulkGuardCommand::DetectPreemphasis,
+                &guard_paths,
+            ) {
+                return;
+            }
+
+            let paths: Vec<std::path::PathBuf> = current_audio_paths(app, false);
             if paths.is_empty() {
                 app.set_status("No audio files for pre-emphasis detection");
             } else {
@@ -3187,23 +3266,23 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::AccurateRip { force } => {
-            // Collect audio file paths from the current context.
-            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
-                AppScreen::Browse => {
-                    let sel = collect_selection_for_file_ops(app);
-                    super::browse::expand_paths_to_audio(&sel)
-                        .into_iter()
-                        .filter(|p| {
-                            matches!(
-                                super::browse::classify_file(p),
-                                super::browse::EntryKind::AudioFile(_)
-                            )
-                        })
-                        .collect()
-                }
-                AppScreen::Convert => app.convert.source.mode.all_paths(),
-                _ => Vec::new(),
+            let guard_paths = current_bulk_guard_paths(app);
+            let operation = if force {
+                BulkOperationKind::AccurateRipFullScan
+            } else {
+                BulkOperationKind::AccurateRipVerify
             };
+            if maybe_confirm_bulk_operation(
+                app,
+                operation,
+                BulkGuardCommand::AccurateRip { force },
+                &guard_paths,
+            ) {
+                return;
+            }
+
+            // Collect audio file paths from the current context.
+            let mut paths: Vec<std::path::PathBuf> = current_audio_paths(app, true);
             super::probe::sort_paths_by_track(&mut paths);
             // Check for single-image CUE layout before the normal multi-file flow.
             if paths.len() <= 1 {
@@ -3320,6 +3399,21 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::ArFix => {
+            let guard_paths = if let ActiveOverlay::AccurateRipVerify(ref state) = app.active_overlay {
+                let page = &state.pages[state.active_page];
+                page.result.tracks.iter().map(|t| t.path.clone()).collect::<Vec<_>>()
+            } else {
+                current_bulk_guard_paths(app)
+            };
+            if maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::AccurateRipFixOffset,
+                BulkGuardCommand::AccurateRipFixOffset,
+                &guard_paths,
+            ) {
+                return;
+            }
+
             // Check that the AR verification overlay is active.
             if let ActiveOverlay::AccurateRipVerify(ref state) = app.active_overlay {
                 let page = &state.pages[state.active_page];
@@ -3343,27 +3437,29 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 }
             } else {
                 // No overlay open — run verification first, then auto-fix.
+                // A confirmed fix-offset bulk guard already covers the
+                // verification pass it must run to discover the offset, so
+                // suppress a duplicate count prompt for the nested AR verify.
                 app.auto_fix_on_complete = true;
+                if app.bulk_guard_frozen_paths.is_some() {
+                    app.bulk_guard_bypass = Some(BulkOperationKind::AccurateRipVerify);
+                }
                 execute_command(app, Command::AccurateRip { force: false }, tx);
             }
         }
         Command::Ctdb => {
+            let guard_paths = current_bulk_guard_paths(app);
+            if maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::CtdbVerify,
+                BulkGuardCommand::Ctdb,
+                &guard_paths,
+            ) {
+                return;
+            }
+
             // Same path collection as :ar.
-            let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
-                AppScreen::Browse => {
-                    let sel = collect_selection_for_file_ops(app);
-                    super::browse::expand_paths_to_audio(&sel)
-                        .into_iter()
-                        .filter(|p| {
-                            matches!(
-                                super::browse::classify_file(p),
-                                super::browse::EntryKind::AudioFile(_)
-                            )
-                        })
-                        .collect()
-                }
-                _ => Vec::new(),
-            };
+            let mut paths: Vec<std::path::PathBuf> = current_audio_paths(app, true);
             super::probe::sort_paths_by_track(&mut paths);
             // Check for single-image CUE layout.
             if paths.len() <= 1 {
@@ -3680,11 +3776,24 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             // Use the selected entry if it's a directory, otherwise
             // use the current browse directory.
             let scan_dir = app
-                .browse
-                .selected_entry()
-                .filter(|e| e.path.is_dir())
-                .map(|e| e.path.clone())
+                .bulk_guard_frozen_paths
+                .as_ref()
+                .and_then(|paths| paths.first().cloned())
+                .or_else(|| {
+                    app.browse
+                        .selected_entry()
+                        .filter(|e| e.path.is_dir())
+                        .map(|e| e.path.clone())
+                })
                 .unwrap_or_else(|| app.browse.current_dir.clone());
+            if maybe_confirm_bulk_operation(
+                app,
+                BulkOperationKind::AccurateRipBatch,
+                BulkGuardCommand::AccurateRipBatch,
+                &[scan_dir.clone()],
+            ) {
+                return;
+            }
             app.set_status(format!(
                 "AccurateRip batch: scanning {}...",
                 scan_dir.display()
@@ -4902,6 +5011,9 @@ fn preset_picker_policy() -> tui_file_picker::FileOperationPolicy {
 /// `collect_selection_for_queue`, directories are NOT expanded — the
 /// op targets the directory itself.
 pub(super) fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
+    if let Some(paths) = app.bulk_guard_frozen_paths.as_ref() {
+        return paths.clone();
+    }
     use super::browse::EntryKind;
     if !app.browse.multi_selected.is_empty() {
         return app.browse.multi_selected.clone();
@@ -12651,5 +12763,74 @@ mod dvdv_metadata_editor_sidecar_preload_tests {
             vec!["Authored Chapter Fixture".to_string(), "Authored Chapter Fixture".to_string()]
         );
         assert!(!album.is_mixed);
+    }
+}
+
+#[cfg(test)]
+mod bulk_guard_behavior_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use std::path::PathBuf;
+
+    fn audio_tree(count: usize) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        for idx in 0..count {
+            std::fs::write(album.join(format!("track-{idx:03}.flac")), b"fixture")
+                .expect("audio fixture");
+        }
+        (temp, album)
+    }
+
+    #[test]
+    fn bulk_guard_threshold_opens_confirmation_only_above_threshold() {
+        let (_small_temp, small_album) = audio_tree(BULK_AUDIO_GUARD_THRESHOLD);
+        let mut app = AppState::new(TonepoetConfig::default());
+        assert!(!maybe_confirm_bulk_operation(
+            &mut app,
+            BulkOperationKind::Analyze,
+            BulkGuardCommand::Analyze { force: false },
+            &[small_album],
+        ));
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+
+        let (_large_temp, large_album) = audio_tree(BULK_AUDIO_GUARD_THRESHOLD + 1);
+        assert!(maybe_confirm_bulk_operation(
+            &mut app,
+            BulkOperationKind::Analyze,
+            BulkGuardCommand::Analyze { force: false },
+            &[large_album.clone()],
+        ));
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation {
+                message,
+                action:
+                    ConfirmAction::BulkOperation {
+                        operation,
+                        command: BulkGuardCommand::Analyze { force: false },
+                        paths,
+                        count,
+                    },
+            } => {
+                assert_eq!(*operation, BulkOperationKind::Analyze);
+                assert_eq!(paths, &vec![large_album]);
+                assert_eq!(*count, BULK_AUDIO_GUARD_THRESHOLD + 1);
+                assert!(message.contains(&(BULK_AUDIO_GUARD_THRESHOLD + 1).to_string()));
+            }
+            other => panic!("expected analyze confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frozen_guard_paths_override_later_browse_selection_for_replay() {
+        let (_temp, frozen_album) = audio_tree(BULK_AUDIO_GUARD_THRESHOLD + 1);
+        let later_path = PathBuf::from("/tmp/later-selection.flac");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.browse.multi_selected = vec![later_path];
+        app.bulk_guard_frozen_paths = Some(vec![frozen_album.clone()]);
+
+        assert_eq!(collect_selection_for_file_ops(&app), vec![frozen_album]);
     }
 }
