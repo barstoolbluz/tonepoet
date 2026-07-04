@@ -1808,6 +1808,89 @@ mod inline_edit_behavior_tests {
         app
     }
 
+    fn browse_app_with_disc_directory(
+        kind: crate::tui::browse::EntryKind,
+    ) -> (AppState, tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let disc_dir = root.join("disc-source");
+        std::fs::create_dir_all(disc_dir.join("artwork")).expect("disc directory fixture");
+        let metadata = std::fs::metadata(&disc_dir).expect("disc metadata");
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = root;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            disc_dir.clone(),
+            "disc-source".to_string(),
+            kind,
+            metadata.len(),
+            metadata.modified().ok(),
+        )];
+        app.browse.selected_index = 0;
+        (app, temp, disc_dir)
+    }
+
+    #[test]
+    fn browse_enter_key_descends_into_disc_directory_kinds() {
+        let (tx, _rx) = channel();
+        for kind in [
+            crate::tui::browse::EntryKind::DvdAudioDir,
+            crate::tui::browse::EntryKind::DvdVideoDir,
+            crate::tui::browse::EntryKind::BlurayDir,
+        ] {
+            let (mut app, _temp, disc_dir) = browse_app_with_disc_directory(kind);
+
+            handle_key(&mut app, key(KeyCode::Enter), &tx);
+
+            assert_eq!(app.browse.current_dir, disc_dir);
+            assert!(app.browse.multi_selected.is_empty());
+        }
+    }
+
+    #[test]
+    fn browse_right_key_descends_into_disc_directory_kinds() {
+        let (tx, _rx) = channel();
+        for kind in [
+            crate::tui::browse::EntryKind::DvdAudioDir,
+            crate::tui::browse::EntryKind::DvdVideoDir,
+            crate::tui::browse::EntryKind::BlurayDir,
+        ] {
+            let (mut app, _temp, disc_dir) = browse_app_with_disc_directory(kind);
+
+            handle_key(&mut app, key(KeyCode::Right), &tx);
+
+            assert_eq!(app.browse.current_dir, disc_dir);
+            assert!(app.browse.multi_selected.is_empty());
+        }
+    }
+
+    #[test]
+    fn browse_double_click_descends_into_disc_directory_kinds() {
+        let (tx, _rx) = channel();
+        for kind in [
+            crate::tui::browse::EntryKind::DvdAudioDir,
+            crate::tui::browse::EntryKind::DvdVideoDir,
+            crate::tui::browse::EntryKind::BlurayDir,
+        ] {
+            let (mut app, _temp, disc_dir) = browse_app_with_disc_directory(kind);
+            app.button_map
+                .record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 24, 1));
+            let click = || MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            };
+
+            handle_mouse(&mut app, click(), &tx);
+            handle_mouse(&mut app, click(), &tx);
+
+            assert_eq!(app.browse.current_dir, disc_dir);
+            assert!(app.browse.multi_selected.is_empty());
+        }
+    }
+
     #[test]
     fn output_inline_printable_key_starts_edit_and_enter_commits() {
         let (tx, _rx) = channel();
@@ -2789,7 +2872,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         // Enter directory/archive or select file
         (KeyCode::Right, KeyModifiers::NONE) => {
             if let Some(entry) = app.browse.selected_entry() {
-                if entry.is_dir() {
+                if entry.is_navigable_dir() {
                     if app.browse.is_in_archive() {
                         // Navigate into subdirectory inside archive.
                         let item_name = entry
@@ -2817,7 +2900,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         (KeyCode::Enter, KeyModifiers::NONE) => {
             if let Some(entry) = app.browse.selected_entry() {
                 match &entry.kind {
-                    EntryKind::Directory | EntryKind::ParentDir if app.browse.is_in_archive() => {
+                    _ if entry.is_navigable_dir() && app.browse.is_in_archive() => {
                         if matches!(entry.kind, EntryKind::ParentDir) {
                             if !app.browse.go_up_in_archive() {
                                 exit_browse_archive(app, tx);
@@ -2841,7 +2924,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                         }
                         selection_may_have_changed = true;
                     }
-                    EntryKind::Directory | EntryKind::ParentDir => {
+                    _ if entry.is_navigable_dir() => {
                         app.browse.enter_selected();
                         selection_may_have_changed = true;
                     }
@@ -2860,16 +2943,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                             "archive entry selected; use Edit Tags or Rename for archive-aware changes",
                         );
                     }
-                    EntryKind::AudioFile(_)
-                    | EntryKind::Archive
-                    | EntryKind::SacdIso
-                    | EntryKind::DvdAudioIso
-                    | EntryKind::DvdAudioDir
-                    | EntryKind::DvdVideoIso
-                    | EntryKind::DvdVideoDir
-                    | EntryKind::BlurayIso
-                    | EntryKind::BlurayDir
-                    | EntryKind::OtherFile => {
+                    _ => {
                         // Toggle selection — converting is via context menu or :queue.
                         app.browse.toggle_selection();
                     }
@@ -23880,7 +23954,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
             // ── Browse screen ──
             TuiButton::BrowseEntry(idx) => {
-                use super::browse::EntryKind;
                 clear_browse_info_focus(app);
 
                 if idx >= app.browse.entries.len() {
@@ -23918,7 +23991,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         let hi = anchor_idx.max(idx);
                         let to_add: Vec<std::path::PathBuf> = (lo..=hi)
                             .filter_map(|i| app.browse.entries.get(i))
-                            .filter(|e| !e.is_dir())
+                            .filter(|e| !e.is_navigable_dir())
                             .map(|e| e.path.clone())
                             .collect();
                         for p in to_add {
@@ -23957,24 +24030,24 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     if is_double_click {
                         app.last_browse_click = None;
                         app.pending_browse_rename = None;
-                        let entry_kind = app.browse.entries[idx].kind.clone();
-                        match entry_kind {
+                        let is_navigable_dir = app.browse.entries[idx].is_navigable_dir();
+                        match is_navigable_dir {
                             // Directories: double-click navigates into them.
-                            EntryKind::Directory | EntryKind::ParentDir if app.browse.is_in_archive() => {
+                            true if app.browse.is_in_archive() => {
                                 app.browse.multi_selected.clear();
                                 if activate_archive_browse_directory(app, idx, tx) {
                                     app.browse.probe_current_with_db(tx, Some(&app.db));
                                     super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                                 }
                             }
-                            EntryKind::Directory | EntryKind::ParentDir => {
+                            true => {
                                 app.browse.multi_selected.clear();
                                 app.browse.enter_selected();
                                 app.browse.probe_current_with_db(tx, Some(&app.db));
                                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                             }
                             // Files: double-click toggles selection (like Ctrl+click).
-                            _ => {
+                            false => {
                                 app.browse.toggle_selection();
                                 app.browse.probe_current_with_db(tx, Some(&app.db));
                                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
@@ -23998,7 +24071,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                             // Schedule a rename for +OPEN_MS. A subsequent
                             // click within that window will cancel it (→ open).
                             // Don't schedule for ParentDir.
-                            if !matches!(app.browse.entries[idx].kind, EntryKind::ParentDir) {
+                            if !matches!(app.browse.entries[idx].kind, super::browse::EntryKind::ParentDir) {
                                 begin_browse_inline_rename(app, clicked_path.clone());
                             }
                         }

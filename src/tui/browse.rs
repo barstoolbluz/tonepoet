@@ -1040,8 +1040,31 @@ impl BrowseEntry {
         }
     }
 
+    /// Returns true for entries that represent filesystem directories or the
+    /// synthetic parent-directory row. Disc-directory classifications are an
+    /// overlay on real directories, so they must keep directory semantics.
     pub fn is_dir(&self) -> bool {
-        matches!(self.kind, EntryKind::Directory | EntryKind::ParentDir)
+        self.is_navigable_dir()
+    }
+
+    /// Returns true for entries that Browse may descend into. Disc source
+    /// directories remain navigable even though their `EntryKind` carries
+    /// richer media classification for info/probe/convert routing.
+    pub fn is_navigable_dir(&self) -> bool {
+        matches!(
+            self.kind,
+            EntryKind::Directory
+                | EntryKind::ParentDir
+                | EntryKind::DvdAudioDir
+                | EntryKind::DvdVideoDir
+                | EntryKind::BlurayDir
+        )
+    }
+
+    /// Returns true for real filesystem directory entries and false for the
+    /// synthetic `..` navigation row.
+    pub fn is_child_dir(&self) -> bool {
+        self.is_navigable_dir() && !matches!(self.kind, EntryKind::ParentDir)
     }
 
     pub fn is_audio(&self) -> bool {
@@ -3242,6 +3265,24 @@ impl BrowseState {
         self.visual_mode = false;
     }
 
+    fn multi_selected_disc_source_dir_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        let mut root_keys = HashSet::new();
+        for selected_path in &self.multi_selected {
+            let selected_entry = self
+                .entries
+                .iter()
+                .find(|entry| same_path(&entry.path, selected_path));
+            if selected_entry
+                .map(|entry| entry.is_disc_source() && entry.is_child_dir())
+                .unwrap_or(false)
+            {
+                push_unique_path_with_keys(&mut roots, &mut root_keys, selected_path.clone());
+            }
+        }
+        roots
+    }
+
     /// Update the visual selection range from anchor to current cursor.
     /// Called after every cursor move while visual_mode is active.
     pub fn update_visual_selection(&mut self) {
@@ -3266,28 +3307,50 @@ impl BrowseState {
 
     /// Collect paths for an enqueue operation (`:queue` / `:convert` etc).
     ///
-    /// - If `multi_selected` is non-empty, expands any directories into
-    ///   their audio file contents (recursively) and returns the result.
+    /// - If `multi_selected` is non-empty, expands ordinary directories into
+    ///   their audio file contents while preserving classified disc-source
+    ///   directories as atomic disc roots for conversion routing.
     /// - Otherwise, if the cursor is on an audio file, archive, or
-    ///   directory, returns it (directories expanded).
+    ///   directory, returns it. Plain directories are expanded; classified
+    ///   disc-source directories are preserved as disc roots so conversion
+    ///   routing can handle them as disc sources.
     /// - Returns an empty vec if nothing valid is selected.
     ///
     /// The expansion helper (`expand_paths_to_audio`) is screen-agnostic
     /// so Library and future screens can reuse the same logic.
     pub fn collect_selection_for_queue(&self) -> QueueExpansionResult {
         if !self.multi_selected.is_empty() {
-            return expand_paths_to_audio_with_metadata(&self.multi_selected);
+            let preserved_disc_roots = self.multi_selected_disc_source_dir_roots();
+            if preserved_disc_roots.is_empty() {
+                return expand_paths_to_audio_with_metadata(&self.multi_selected);
+            }
+            return expand_paths_to_audio_with_preserved_disc_roots(
+                &self.multi_selected,
+                &preserved_disc_roots,
+            );
         }
         if let Some(entry) = self.selected_entry() {
             match &entry.kind {
                 EntryKind::AudioFile(_) | EntryKind::Archive => {
-                    return QueueExpansionResult { paths: vec![entry.path.clone()], cue_artifact_audio: HashSet::new() };
+                    return QueueExpansionResult {
+                        paths: vec![entry.path.clone()],
+                        cue_artifact_audio: HashSet::new(),
+                    };
                 }
                 EntryKind::OtherFile if is_cue_sheet_path(&entry.path) => {
-                    return QueueExpansionResult { paths: vec![entry.path.clone()], cue_artifact_audio: HashSet::new() };
+                    return QueueExpansionResult {
+                        paths: vec![entry.path.clone()],
+                        cue_artifact_audio: HashSet::new(),
+                    };
                 }
                 EntryKind::Directory => {
                     return expand_paths_to_audio_with_metadata(&[entry.path.clone()]);
+                }
+                EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir => {
+                    return QueueExpansionResult {
+                        paths: vec![entry.path.clone()],
+                        cue_artifact_audio: HashSet::new(),
+                    };
                 }
                 _ => {}
             }
@@ -4049,7 +4112,7 @@ impl BrowseState {
 
             // Directories always match on filename (for navigation), even in
             // tags-only mode.
-            if search_filename || matches!(&e.kind, EntryKind::Directory) {
+            if search_filename || e.is_navigable_dir() {
                 if let Some(s) = matcher.fuzzy_match(&e.name_lower, query) {
                     best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                 }
@@ -4858,11 +4921,19 @@ impl BrowseState {
                 // last scan. Clear stale in-memory state and stop; a later
                 // scan/refresh must provide a valid entry before probing resumes.
                 self.remove_probe_cache_entry(&path);
+                if entry.is_child_dir() {
+                    self.remove_dir_stats_cache_entry(&path);
+                    self.dir_stats_pending.remove(&path);
+                }
                 self.probe_debounce = None;
                 self.clear_browse_cold_probe_queue();
                 self.clear_browse_cold_probe_tracking_for(&path);
                 return;
             };
+
+            if entry.is_child_dir() {
+                self.schedule_dir_stats_for_focused_entry(&entry, identity, tx);
+            }
 
             if let Some(cached) = self.cached_probe_for_entry(&entry, identity) {
                 if let Some(info) = cached {
@@ -4875,7 +4946,9 @@ impl BrowseState {
                 return;
             }
 
-            if self.probe_pending.contains(&path) || self.has_browse_cold_probe_queued_or_active(&path) {
+            if self.probe_pending.contains(&path)
+                || self.has_browse_cold_probe_queued_or_active(&path)
+            {
                 return;
             }
 
@@ -4893,9 +4966,15 @@ impl BrowseState {
                             // require tag/CUE/catalog reads. Keep that work on
                             // the browse worker path so cursor movement never
                             // performs media/tag I/O in the TUI reducer.
-                            let info_arc = self.insert_probe_cache_hit(path.clone(), identity, info.clone());
+                            let info_arc =
+                                self.insert_probe_cache_hit(path.clone(), identity, info.clone());
                             self.probe_pending.insert(path.clone());
-                            spawn_cached_audio_probe_metadata_completion(path, identity, (*info_arc).clone(), tx.clone());
+                            spawn_cached_audio_probe_metadata_completion(
+                                path,
+                                identity,
+                                (*info_arc).clone(),
+                                tx.clone(),
+                            );
                             self.probe_debounce = None;
                             return;
                         }
@@ -4910,7 +4989,7 @@ impl BrowseState {
             }
 
             self.schedule_cursor_focused_cold_probe(path, identity, tx);
-        } else if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) {
+        } else if entry.is_child_dir() {
             self.probe_debounce = None;
             let path = entry.path.clone();
             let Some(identity) = Self::current_filesystem_probe_identity(&entry) else {
@@ -4918,10 +4997,7 @@ impl BrowseState {
                 self.dir_stats_pending.remove(&path);
                 return;
             };
-            if self.valid_dir_stats_for_entry(&entry).is_some() || self.dir_stats_pending.contains(&path) {
-                return;
-            }
-            self.schedule_cursor_focused_dir_stats(path, identity, tx);
+            self.schedule_dir_stats_for_focused_entry(&entry, identity, tx);
         } else {
             self.probe_debounce = None;
         }
@@ -5074,7 +5150,7 @@ impl BrowseState {
     fn current_directory_entry_path(&self) -> Option<PathBuf> {
         self.entries
             .get(self.selected_index)
-            .filter(|entry| entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir))
+            .filter(|entry| entry.is_child_dir())
             .map(|entry| entry.path.clone())
     }
 
@@ -5158,6 +5234,22 @@ impl BrowseState {
             },
         );
         spawn_dir_stats(path, identity, cancel, tx.clone());
+    }
+
+    fn schedule_dir_stats_for_focused_entry(
+        &mut self,
+        entry: &BrowseEntry,
+        identity: ProbeCacheIdentity,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        debug_assert!(entry.is_child_dir());
+        let path = entry.path.clone();
+        if self.valid_dir_stats_for_entry(entry).is_some()
+            || self.dir_stats_pending.contains(&path)
+        {
+            return;
+        }
+        self.schedule_cursor_focused_dir_stats(path, identity, tx);
     }
 
     fn schedule_cursor_focused_dir_stats(
@@ -5613,7 +5705,7 @@ impl BrowseState {
     }
 
     pub fn valid_dir_stats_for_entry(&self, entry: &BrowseEntry) -> Option<&Arc<DirStats>> {
-        if !matches!(entry.kind, EntryKind::Directory) {
+        if !entry.is_child_dir() {
             return None;
         }
         let identity = ProbeCacheIdentity::from_entry(entry);
@@ -6292,13 +6384,7 @@ fn entry_passes_view(
     // Format filter (only applies to non-directory entries). Use the
     // path-aware check so `.cue` stays visible as a convertible source under
     // AudioOnly without widening the filter to all `OtherFile` entries.
-    if !matches!(
-        &entry.kind,
-        EntryKind::Directory
-            | EntryKind::DvdAudioDir
-            | EntryKind::DvdVideoDir
-            | EntryKind::BlurayDir
-    ) && !format_filter.allows_entry(entry) {
+    if !entry.is_navigable_dir() && !format_filter.allows_entry(entry) {
         return false;
     }
     // Text filter (case-insensitive substring)
@@ -6322,13 +6408,7 @@ fn entry_passes_search_effective_filters(
     if audio_only && !is_audio_filter_visible_entry(entry) {
         return false;
     }
-    if !matches!(
-        &entry.kind,
-        EntryKind::Directory
-            | EntryKind::DvdAudioDir
-            | EntryKind::DvdVideoDir
-            | EntryKind::BlurayDir
-    ) && !format_filter.allows_entry(entry) {
+    if !entry.is_navigable_dir() && !format_filter.allows_entry(entry) {
         return false;
     }
     true
@@ -7565,6 +7645,25 @@ pub fn expand_paths_to_audio_with_metadata(paths: &[PathBuf]) -> QueueExpansionR
     plan.into_queue_paths()
 }
 
+fn expand_paths_to_audio_with_preserved_disc_roots(
+    paths: &[PathBuf],
+    preserved_disc_roots: &[PathBuf],
+) -> QueueExpansionResult {
+    let preserved_disc_root_keys: HashSet<PathBuf> = preserved_disc_roots
+        .iter()
+        .map(|path| queue_path_key(path))
+        .collect();
+    let mut plan = QueueExpansionPlan::default();
+    for path in paths {
+        if preserved_disc_root_keys.contains(&queue_path_key(path)) {
+            plan.add_disc_root(path.clone());
+        } else {
+            collect_queue_candidates(path, &mut plan);
+        }
+    }
+    plan.into_queue_paths()
+}
+
 /// Directory/file expansion plan for conversion queue inputs.
 ///
 /// Build the whole candidate set before deciding what to queue. A split-source
@@ -7572,6 +7671,8 @@ pub fn expand_paths_to_audio_with_metadata(paths: &[PathBuf]) -> QueueExpansionR
 /// so queue decisions must happen after collection to stay idempotent.
 #[derive(Default)]
 struct QueueExpansionPlan {
+    disc_roots: Vec<PathBuf>,
+    disc_root_keys: HashSet<PathBuf>,
     cue_sheets: Vec<CueQueueCandidate>,
     queueable_non_cue: Vec<PathBuf>,
     queueable_non_cue_keys: HashSet<PathBuf>,
@@ -7585,6 +7686,10 @@ struct CueQueueCandidate {
 }
 
 impl QueueExpansionPlan {
+    fn add_disc_root(&mut self, path: PathBuf) {
+        push_unique_path_with_keys(&mut self.disc_roots, &mut self.disc_root_keys, path);
+    }
+
     fn add_explicit_file(&mut self, path: PathBuf) {
         self.add_file(path, true);
     }
@@ -7625,6 +7730,8 @@ impl QueueExpansionPlan {
 
     fn into_queue_paths(self) -> QueueExpansionResult {
         let QueueExpansionPlan {
+            disc_roots,
+            disc_root_keys,
             cue_sheets,
             queueable_non_cue,
             queueable_non_cue_keys: _,
@@ -7635,7 +7742,14 @@ impl QueueExpansionPlan {
         let mut suppressed_audio_keys = HashSet::new();
         let mut cue_artifact_audio_keys = HashSet::new();
 
+        for disc_root in disc_roots {
+            push_unique_path_with_keys(&mut result, &mut result_keys, disc_root);
+        }
+
         for cue in cue_sheets {
+            if path_key_is_under_any_root(&queue_path_key(&cue.path), &disc_root_keys) {
+                continue;
+            }
             match cue_queue_decision_for_path(&cue.path) {
                 Ok(CueQueueDecision::SplitSource { referenced_audio }) => {
                     push_unique_path_with_keys(&mut result, &mut result_keys, cue.path);
@@ -7680,6 +7794,9 @@ impl QueueExpansionPlan {
             // same source twice through both the CUE materializer and the
             // raw audio-file path.
             let path_key = queue_path_key(&path);
+            if path_key_is_under_any_root(&path_key, &disc_root_keys) {
+                continue;
+            }
             if is_audio_file_path(&path) && suppressed_audio_keys.contains(&path_key) {
                 continue;
             }
@@ -7694,6 +7811,10 @@ impl QueueExpansionPlan {
             cue_artifact_audio,
         }
     }
+}
+
+fn path_key_is_under_any_root(path_key: &Path, root_keys: &HashSet<PathBuf>) -> bool {
+    root_keys.iter().any(|root_key| path_key.starts_with(root_key))
 }
 
 fn mark_sibling_audio_as_cue_artifacts(
@@ -12271,3 +12392,193 @@ mod browse_perf_followup_v10_tests {
         assert!(state.dir_stats_active.keys().any(|path| same_path(path, &current.path)));
     }
  }
+
+#[cfg(test)]
+mod disc_directory_navigation_tests {
+    use super::*;
+
+    fn disc_entry(kind: EntryKind) -> BrowseEntry {
+        BrowseEntry::new(
+            PathBuf::from("/tmp/tonepoet-disc-dir"),
+            "tonepoet-disc-dir".to_string(),
+            kind,
+            0,
+            None,
+        )
+    }
+
+    #[test]
+    fn disc_directory_kinds_keep_directory_navigation_semantics() {
+        for kind in [EntryKind::DvdAudioDir, EntryKind::DvdVideoDir, EntryKind::BlurayDir] {
+            let entry = disc_entry(kind);
+            assert!(entry.is_disc_source());
+            assert!(entry.is_dir());
+            assert!(entry.is_navigable_dir());
+            assert!(entry.is_child_dir());
+        }
+
+        let parent = disc_entry(EntryKind::ParentDir);
+        assert!(parent.is_dir());
+        assert!(parent.is_navigable_dir());
+        assert!(!parent.is_child_dir());
+    }
+
+    #[test]
+    fn enter_selected_descends_into_disc_directory_kinds() {
+        for kind in [EntryKind::DvdAudioDir, EntryKind::DvdVideoDir, EntryKind::BlurayDir] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = temp.path();
+            let disc_dir = root.join("disc-source");
+            let child_dir = disc_dir.join("artwork");
+            std::fs::create_dir_all(&child_dir).expect("disc directory fixture");
+            let metadata = std::fs::metadata(&disc_dir).expect("disc metadata");
+
+            let mut state = BrowseState::new();
+            state.current_dir = root.to_path_buf();
+            state.entries = vec![BrowseEntry::new(
+                disc_dir.clone(),
+                "disc-source".to_string(),
+                kind,
+                metadata.len(),
+                metadata.modified().ok(),
+            )];
+            state.selected_index = 0;
+
+            assert!(state.enter_selected());
+            assert!(same_path(&state.current_dir, &disc_dir));
+            assert!(
+                state.entries.iter().any(|entry| entry.name == "artwork" && entry.is_child_dir()),
+                "destination directory contents should be displayed after navigation"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_stats_cache_accepts_disc_directory_entries() {
+        for kind in [EntryKind::DvdAudioDir, EntryKind::DvdVideoDir, EntryKind::BlurayDir] {
+            let entry = disc_entry(kind);
+            let identity = ProbeCacheIdentity::from_entry(&entry);
+            let mut state = BrowseState::new();
+            state.insert_dir_stats_for_identity(
+                entry.path.clone(),
+                identity,
+                DirStats {
+                    file_count: 7,
+                    audio_count: 2,
+                    total_size: 4096,
+                },
+            );
+
+            let stats = state
+                .valid_dir_stats_for_entry(&entry)
+                .expect("disc directories should use the directory-stats cache");
+            assert_eq!(stats.file_count, 7);
+            assert_eq!(stats.audio_count, 2);
+            assert_eq!(stats.total_size, 4096);
+        }
+
+        let parent = disc_entry(EntryKind::ParentDir);
+        let mut state = BrowseState::new();
+        state.insert_dir_stats_for_identity(
+            parent.path.clone(),
+            ProbeCacheIdentity::from_entry(&parent),
+            DirStats {
+                file_count: 1,
+                audio_count: 0,
+                total_size: 1,
+            },
+        );
+        assert!(state.valid_dir_stats_for_entry(&parent).is_none());
+    }
+
+    #[test]
+    fn queue_collection_preserves_disc_directory_roots_for_convert_routing() {
+        for kind in [EntryKind::DvdAudioDir, EntryKind::DvdVideoDir, EntryKind::BlurayDir] {
+            let entry = disc_entry(kind);
+            let mut state = BrowseState::new();
+            state.entries = vec![entry.clone()];
+            state.selected_index = 0;
+
+            let selection = state.collect_selection_for_queue();
+
+            assert_eq!(selection.paths, vec![entry.path]);
+            assert!(selection.cue_artifact_audio.is_empty());
+        }
+    }
+
+    #[test]
+    fn queue_collection_preserves_multi_selected_disc_directory_roots() {
+        for kind in [EntryKind::DvdAudioDir, EntryKind::DvdVideoDir, EntryKind::BlurayDir] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let disc_dir = temp.path().join("disc-source");
+            let nested_audio = disc_dir.join("VIDEO_TS").join("track.flac");
+            std::fs::create_dir_all(nested_audio.parent().unwrap()).expect("disc audio fixture");
+            std::fs::write(&nested_audio, b"not real audio, extension is enough for queue classification")
+                .expect("disc nested audio fixture");
+
+            let normal_dir = temp.path().join("ordinary-folder");
+            let normal_audio = normal_dir.join("track.flac");
+            std::fs::create_dir_all(&normal_dir).expect("ordinary folder fixture");
+            std::fs::write(&normal_audio, b"not real audio, extension is enough for queue classification")
+                .expect("ordinary audio fixture");
+
+            let disc_entry = BrowseEntry::new(
+                disc_dir.clone(),
+                "disc-source".to_string(),
+                kind,
+                0,
+                None,
+            );
+            let normal_entry = BrowseEntry::new(
+                normal_dir.clone(),
+                "ordinary-folder".to_string(),
+                EntryKind::Directory,
+                0,
+                None,
+            );
+
+            let mut state = BrowseState::new();
+            state.entries = vec![disc_entry, normal_entry];
+            state.multi_selected = vec![disc_dir.clone(), normal_dir.clone(), nested_audio.clone()];
+
+            let selection = state.collect_selection_for_queue();
+
+            assert!(path_list_contains(&selection.paths, &disc_dir));
+            assert!(path_list_contains(&selection.paths, &normal_audio));
+            assert!(
+                !path_list_contains(&selection.paths, &nested_audio),
+                "a selected disc root must own its nested contents so conversion does not flatten or double-queue it"
+            );
+            assert!(selection.cue_artifact_audio.is_empty());
+        }
+    }
+
+    #[test]
+    fn tag_only_search_keeps_disc_directories_navigable_by_filename() {
+        let mut state = BrowseState::new();
+        let disc = BrowseEntry::new(
+            PathBuf::from("/tmp/Led Zeppelin DVD"),
+            "Led Zeppelin DVD".to_string(),
+            EntryKind::DvdVideoDir,
+            0,
+            None,
+        );
+
+        state.execute_search_over_entries(
+            "Zeppelin",
+            true,
+            false,
+            FormatFilter::Off,
+            SearchMode::Tags,
+            vec![disc.clone()],
+        );
+
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|entry| entry.path == disc.path && entry.is_navigable_dir()),
+            "directories, including disc directories, must remain filename-searchable for navigation"
+        );
+    }
+}
