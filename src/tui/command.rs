@@ -3034,7 +3034,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 });
                 // Invalidate probe cache for the written files.
                 for r in &app.analysis_results {
-                    app.browse.probe_cache.remove(&r.path);
+                    app.browse.remove_probe_cache_entry(&r.path);
                     let _ = app.db.invalidate_probe(&r.path.display().to_string());
                 }
             }
@@ -9041,9 +9041,10 @@ fn execute_edit_metadata(app: &mut AppState, field: crate::tui::probe::MetadataF
     // Pre-fill with the current value from probe cache (if available).
     let current_value = app
         .browse
-        .probe_cache
-        .get(&path)
-        .and_then(|opt| opt.as_ref())
+        .entries
+        .iter()
+        .find(|e| e.path == path)
+        .and_then(|e| app.browse.valid_probe_arc_for_entry(e))
         .map(|cached| {
             let m = &cached.metadata;
             match field {

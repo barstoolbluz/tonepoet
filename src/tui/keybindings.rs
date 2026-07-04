@@ -2134,7 +2134,7 @@ mod inline_edit_behavior_tests {
         );
         app.browse.selected_index = 1; // skip synthetic parent row
         let synthetic_path = archive_path.join("track.flac");
-        app.browse.probe_cache.insert(
+        app.browse.insert_probe_cache_for_test(
             synthetic_path,
             Some(std::sync::Arc::new(crate::tui::browse::CachedInfo {
                 source: crate::tui::probe::SourceInfo {
@@ -2253,6 +2253,7 @@ mod inline_edit_behavior_tests {
                     browse_file_entry(next.clone()),
                     browse_file_entry(last),
                 ],
+                classification_updates: Default::default(),
                 error: None,
             },
             &tx,
@@ -2311,6 +2312,7 @@ mod inline_edit_behavior_tests {
                     browse_file_entry(previous.clone()),
                     browse_file_entry(renamed),
                 ],
+                classification_updates: Default::default(),
                 error: None,
             },
             &tx,
@@ -2413,6 +2415,7 @@ mod inline_edit_behavior_tests {
                 parent_entry: None,
                 dirs: Vec::new(),
                 files: vec![browse_file_entry(target.clone())],
+                classification_updates: Default::default(),
                 error: None,
             },
             &tx,
@@ -2449,6 +2452,7 @@ mod inline_edit_behavior_tests {
                 parent_entry: None,
                 dirs: Vec::new(),
                 files: Vec::new(),
+                classification_updates: Default::default(),
                 error: Some("scan timed out (30s)".to_string()),
             },
             &tx,
@@ -17713,9 +17717,10 @@ pub fn open_bulk_rename(app: &mut AppState, paths: Vec<std::path::PathBuf>) {
         .iter()
         .map(|p| {
             app.browse
-                .probe_cache
-                .get(p)
-                .and_then(|opt| opt.as_ref())
+                .entries
+                .iter()
+                .find(|e| &e.path == p)
+                .and_then(|e| app.browse.valid_probe_arc_for_entry(e))
                 .map(|cached| cached.metadata.clone())
                 .unwrap_or_default()
         })

@@ -14,6 +14,11 @@ use super::keybindings::{handle_key, handle_mouse};
 use super::message::AppMessage;
 use super::text_input::TextInputState;
 
+/// Keep bursty async completions from monopolizing a frame. If more messages
+/// remain, the next loop uses a zero poll timeout so deferred work continues
+/// promptly without making one render absorb an unbounded reducer batch.
+const MAX_ASYNC_MESSAGES_PER_FRAME: usize = 32;
+
 /// Run the main TUI event loop
 pub async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -33,6 +38,7 @@ pub async fn run_app(
         app.clear_expired_status();
         check_pending_browse_rename(app);
         check_batch_probe_debounce(app, &tx);
+        check_browse_probe_debounce(app, &tx);
         check_search_debounce(app, &tx);
         // Close browse-only overlays if the user has left the browse screen.
         if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
@@ -118,13 +124,26 @@ pub async fn run_app(
             break;
         }
 
-        // 4. Drain async messages
-        while let Ok(msg) = rx.try_recv() {
-            handle_message(app, msg, &tx);
+        // 4. Drain async messages, but cap per-frame reducer work. Probe, scan,
+        // and search completions can arrive in bursts; spreading them across
+        // frames keeps input and redraw latency bounded under heavy I/O.
+        let drained = drain_async_messages_for_frame(app, &mut rx, &tx);
+        let reducer_work_remains = drained == MAX_ASYNC_MESSAGES_PER_FRAME
+            || app.browse.has_probe_cache_warm_backlog();
+        if reducer_work_remains {
+            app.force_redraw = true;
         }
 
-        // 5. Poll for crossterm events (100ms timeout for responsive UI updates)
-        if event::poll(Duration::from_millis(100))? {
+        // 5. Poll for crossterm events. When reducer work was capped, do not
+        // sleep before the next loop; remaining async messages or warm-cache
+        // merge work should continue draining immediately after one render
+        // boundary, while still giving input a chance between slices.
+        let poll_timeout = if reducer_work_remains {
+            Duration::from_millis(0)
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => handle_key(app, key, &tx),
                 Event::Mouse(mouse) => handle_mouse(app, mouse, &tx),
@@ -138,6 +157,48 @@ pub async fn run_app(
     Ok(())
 }
 
+
+fn drain_async_messages_for_frame(
+    app: &mut AppState,
+    rx: &mut mpsc::Receiver<AppMessage>,
+    tx: &mpsc::Sender<AppMessage>,
+) -> usize {
+    let mut drained = 0usize;
+    while drained < MAX_ASYNC_MESSAGES_PER_FRAME {
+        let Ok(msg) = rx.try_recv() else {
+            break;
+        };
+        handle_message(app, msg, tx);
+        drained += 1;
+    }
+    if drained == MAX_ASYNC_MESSAGES_PER_FRAME {
+        log::debug!("async message drain cap reached ({} messages); deferring remaining reducer work", drained);
+    }
+    flush_browse_deferred_work(app, tx);
+    drained
+}
+
+fn flush_browse_deferred_work(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    // Merge only a small warm-cache slice per frame. The expensive SQLite read
+    // already runs off-thread; this protects the reducer from a 5K-20K row
+    // state-update spike when those rows arrive together.
+    let (_merged, warm_backlog_remaining) = app.browse.drain_probe_cache_warm_rows_for_frame();
+
+    let work = app.browse.take_browse_deferred_work();
+    if work.classification_changed || work.visible_entries_changed {
+        app.browse.reapply_after_browse_preference_change(Some(tx));
+    } else if work.probe_backed_resort_needed || work.search_reapply_needed {
+        app.browse.resort_after_probe_cache_update_with_search(Some(tx));
+    }
+
+    if work.info_pane_changed {
+        app.browse.probe_current_with_db(tx, Some(&app.db));
+    }
+
+    if warm_backlog_remaining {
+        app.force_redraw = true;
+    }
+}
 
 fn defer_quit_for_browse_archive_metadata(
     app: &mut AppState,
@@ -323,6 +384,14 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
             );
         }
     }
+}
+
+fn check_browse_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    if app.current_screen != AppScreen::Browse {
+        app.browse.probe_debounce = None;
+        return;
+    }
+    app.browse.check_probe_debounce(tx);
 }
 
 /// Fire a debounced search if the user has stopped typing for 200ms.
@@ -2416,22 +2485,81 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 baseline,
             );
         }
+        AppMessage::ProbeCacheWarmComplete { generation, path, rows } => {
+            // Do not merge here. Queue rows and let the post-drain flush merge a
+            // bounded slice, generation/path-checked again, so warm-cache bursts
+            // cannot create a long reducer frame.
+            let queued = app.browse.enqueue_probe_cache_warm_rows(generation, path.clone(), rows);
+            if queued > 0 {
+                app.force_redraw = true;
+            } else {
+                log::debug!("discarded stale or empty probe-cache warm result for generation {} path {}", generation, path.display());
+            }
+        }
         AppMessage::AudioProbeComplete { path, context, result } => {
             let was_pending = app.browse.probe_pending.remove(&path);
-            if let super::message::AudioProbeContext::ArchiveEntry {
-                archive_path,
-                archive_probe_epoch,
-            } = &context
-            {
-                if !app.browse.accept_archive_entry_probe_completion(
-                    &path,
+            if matches!(&context, super::message::AudioProbeContext::Filesystem { .. }) {
+                app.browse.complete_browse_cold_probe(&path, tx);
+            }
+            app.browse.probe_cache_needs_metadata_enrichment.remove(&path);
+
+            let filesystem_identity = match &context {
+                super::message::AudioProbeContext::Filesystem { identity } => {
+                    if !was_pending {
+                        return;
+                    }
+                    *identity
+                },
+                super::message::AudioProbeContext::ArchiveEntry {
                     archive_path,
-                    *archive_probe_epoch,
-                    was_pending,
-                ) {
-                    return;
+                    archive_probe_epoch,
+                } => {
+                    if !app.browse.accept_archive_entry_probe_completion(
+                        &path,
+                        archive_path,
+                        *archive_probe_epoch,
+                        was_pending,
+                    ) {
+                        log::debug!(
+                            "discarded stale archive-entry probe completion for {}",
+                            path.display()
+                        );
+                        return;
+                    }
+                    None
+                }
+            };
+
+            if let Some(identity) = filesystem_identity {
+                match app.browse.classify_filesystem_async_completion(&path, identity) {
+                    crate::tui::browse::FilesystemAsyncCompletion::Accept => {}
+                    crate::tui::browse::FilesystemAsyncCompletion::Changed => {
+                        log::debug!("dropping stale audio-probe completion after identity change: {}", path.display());
+                        // The path still exists but no longer has the launch
+                        // identity. Drop the stale completion, invalidate derived
+                        // state, and re-evaluate only if this same statable path
+                        // is still selected. This gives changed files one fresh
+                        // pass without letting old completions loop forever.
+                        app.browse.remove_probe_cache_entry(&path);
+                        if app.browse.current_entry_is_still_statable(&path) {
+                            app.browse.probe_current_with_db(tx, Some(&app.db));
+                        }
+                        return;
+                    }
+                    crate::tui::browse::FilesystemAsyncCompletion::MissingOrUnstatable => {
+                        log::debug!("dropping audio-probe completion for missing/unstatable path: {}", path.display());
+                        // The selected file disappeared or became unreadable.
+                        // Clear stale state and stop probing until scan/refresh
+                        // supplies a valid BrowseEntry again.
+                        app.browse.remove_probe_cache_entry(&path);
+                        app.browse.probe_debounce = None;
+                        app.browse.clear_browse_cold_probe_queue();
+                        app.browse.clear_browse_cold_probe_tracking_for(&path);
+                        return;
+                    }
                 }
             }
+
             match *result {
                 Ok(mut info) => {
                     let is_cue_proxy_result = super::browse::is_cue_sheet_path(&path);
@@ -2441,7 +2569,8 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         // which carries generation and baseline guards. Keeping
                         // this reducer browse-only prevents late navigation probes
                         // from resetting Convert metadata or output settings.
-                        if let Ok(meta) = std::fs::metadata(&path) {
+                        let metadata = std::fs::metadata(&path).ok();
+                        if let Some(meta) = metadata.as_ref() {
                             let mtime = meta
                                 .modified()
                                 .map(crate::db::systemtime_to_unix)
@@ -2466,12 +2595,20 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             }
                         }
 
-                        app.browse
-                            .probe_cache
-                            .insert(path.clone(), Some(std::sync::Arc::new(info.clone())));
-                        app.browse.resort_after_probe_cache_update_with_search(Some(tx));
+                        let cache_identity = filesystem_identity
+                            .or_else(|| app.browse.probe_identity_for_current_entry_path(&path))
+                            .unwrap_or(crate::tui::browse::ProbeCacheIdentity {
+                                modified: None,
+                                size: info.source.file_size,
+                            });
+                        app.browse.insert_probe_for_identity(
+                            path.clone(),
+                            cache_identity,
+                            Some(std::sync::Arc::new(info.clone())),
+                        );
+                        app.browse.mark_probe_cache_update_pending(false);
 
-                        if let Ok(meta) = std::fs::metadata(&path) {
+                        if let Some(meta) = metadata.as_ref() {
                             let mtime = meta
                                 .modified()
                                 .map(crate::db::systemtime_to_unix)
@@ -2492,11 +2629,15 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     // launched through ConvertAudioProbeComplete. Generic browse
                     // cache entries remain untouched for text CUE paths.
                 }
-                Err(_) => {
-                    // Cache the failure so browse does not retry; renderers can
-                    // fall back to basic path/size information.
-                    app.browse.probe_cache.insert(path, None);
-                    app.browse.resort_after_probe_cache_update_with_search(Some(tx));
+                Err(error) => {
+                    let cache_identity = filesystem_identity
+                        .or_else(|| app.browse.probe_identity_for_current_entry_path(&path))
+                        .unwrap_or(crate::tui::browse::ProbeCacheIdentity {
+                            modified: None,
+                            size: 0,
+                        });
+                    app.browse.remember_probe_failure_for_identity(path, cache_identity, &error);
+                    app.browse.mark_probe_cache_update_pending(false);
                 }
             }
         }
@@ -2515,6 +2656,12 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         if let Some(followup) = app.browse.disc_probe_followup.remove(&path) {
                             super::disc_browser_actions::handle_disc_probe_followup(app, &path, followup);
                         }
+                    } else {
+                        log::debug!(
+                            "discarded stale disc-probe completion after fingerprint change: {}",
+                            path.display()
+                        );
+                        app.browse.disc_probe_followup.remove(&path);
                     }
                 }
                 (Some(fingerprint), Err(error)) => {
@@ -2526,14 +2673,26 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             path.clone(),
                             crate::tui::disc_browser::DiscProbeCacheEntry::from_error(fingerprint, error.clone()),
                         );
+                        app.set_status(format!("Disc analysis failed: {error}"));
+                    } else {
+                        log::debug!(
+                            "discarded stale disc-probe error after fingerprint change: {}",
+                            path.display()
+                        );
                     }
                     app.browse.disc_probe_followup.remove(&path);
-                    app.set_status(format!("Disc analysis failed: {error}"));
                 }
                 (None, Err(error)) => {
                     app.browse.disc_probe_cache.remove(&path);
                     app.browse.disc_probe_followup.remove(&path);
-                    app.set_status(format!("Disc analysis failed: {error}"));
+                    if app.browse.current_selected_disc_source_matches(&path) {
+                        app.set_status(format!("Disc analysis failed: {error}"));
+                    } else {
+                        log::debug!(
+                            "discarded stale disc-probe launch error without fingerprint: {}",
+                            path.display()
+                        );
+                    }
                 }
                 (None, Ok(contents)) => {
                     if let Ok(fingerprint) = crate::tui::disc_browser::disc_probe_fingerprint(&path) {
@@ -2545,11 +2704,31 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::DirStatsComplete { path, stats } => {
-            app.browse.dir_stats_pending.remove(&path);
-            app.browse
-                .dir_stats_cache
-                .insert(path, std::sync::Arc::new(stats));
+        AppMessage::DirStatsComplete { path, identity, stats, cancelled } => {
+            let was_pending = app.browse.complete_dir_stats(&path, tx);
+            if !was_pending {
+                return;
+            }
+            if cancelled {
+                log::debug!("dropping cancelled directory-stats completion: {}", path.display());
+                return;
+            }
+            match app.browse.classify_filesystem_async_completion(&path, identity) {
+                crate::tui::browse::FilesystemAsyncCompletion::Accept => {
+                    app.browse.insert_dir_stats_for_identity(path, identity, stats);
+                }
+                crate::tui::browse::FilesystemAsyncCompletion::Changed => {
+                    log::debug!("dropping stale directory-stats completion after identity change: {}", path.display());
+                    app.browse.remove_dir_stats_cache_entry(&path);
+                    if app.browse.current_entry_is_still_statable(&path) {
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                    }
+                }
+                crate::tui::browse::FilesystemAsyncCompletion::MissingOrUnstatable => {
+                    log::debug!("dropping directory-stats completion for missing/unstatable path: {}", path.display());
+                    app.browse.remove_dir_stats_cache_entry(&path);
+                }
+            }
         }
         AppMessage::AnalysisComplete { result } => {
             app.analysis_pending = app.analysis_pending.saturating_sub(1);
@@ -2577,15 +2756,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         }
                     }
 
-                    // Update probe cache with HDCD info so the info
-                    // pane shows it without re-probing.
+                    // Update probe cache with HDCD info only when the
+                    // cached row still matches the file identity observed at
+                    // completion time. AnalysisComplete does not carry a launch
+                    // token in this bundle, so never refresh a stale path-only
+                    // row from it.
                     if result.hdcd_detected == Some(true) {
-                        if let Some(Some(cached)) = app.browse.probe_cache.get(&result.path) {
-                            let mut info = (**cached).clone();
-                            info.metadata.hdcd_detail = result.hdcd_detail.clone();
-                            app.browse
-                                .probe_cache
-                                .insert(result.path.clone(), Some(std::sync::Arc::new(info)));
+                        if let Ok(meta) = std::fs::metadata(&result.path) {
+                            let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(&meta);
+                            app.browse.update_valid_probe_for_identity(&result.path, identity, |cached| {
+                                cached.metadata.hdcd_detail = result.hdcd_detail.clone();
+                            });
+                        } else {
+                            app.browse.remove_probe_cache_entry(&result.path);
                         }
                     }
 
@@ -2786,8 +2969,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             generation,
             path,
             parent_entry,
-            mut dirs,
+            dirs,
             files,
+            classification_updates,
             error,
         } => {
             // Race protection: discard stale scans, including stale successful
@@ -2795,6 +2979,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             // sufficient identity because cancelled scans can still complete
             // after a newer refresh has started.
             if !app.browse.is_current_dir_scan(generation, &path) {
+                log::debug!("discarded stale directory scan completion for generation {} path {}", generation, path.display());
                 app.browse
                     .clear_pending_inline_rename_after_scan_generation(generation);
                 return;
@@ -2811,15 +2996,20 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             // Success — clear the scan handle.
             app.browse.finish_dir_scan_if_current(generation, &path);
 
-            // Populate raw scan results. Classify DVD-Audio directories before publishing.
-            app.browse.classify_scanned_directory_entries(&mut dirs);
+            // The blocking scan worker performs cold disc-source classification
+            // before publication and returns identity-bound cache updates. This
+            // preserves the old stable one-batch display semantics without
+            // doing ISO/DVD-A/DVD-Video/Blu-ray filesystem I/O in the reducer.
+            app.browse.apply_classification_cache_updates(classification_updates);
             app.browse.parent_entry = parent_entry;
             app.browse.all_dirs = dirs;
             app.browse.all_files = files;
 
-            // Upgrade `.iso` archives to SacdIso where ScarletBook
-            // magic is found. Cheap on warm cache, sub-50ms cold.
-            app.browse.upgrade_iso_kinds();
+            // Warm the in-memory probe cache from SQLite off the reducer path.
+            // Large folders must publish promptly; warm rows merge later only
+            // if this generation/path remains current.
+            app.browse
+                .spawn_probe_cache_warm_from_db(generation, path.clone(), tx.clone());
 
             // Apply current filter/sort. While search is active, the search
             // panel owns `entries`; re-run the active search against the
@@ -2869,7 +3059,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 Ok(()) => {
                     let _ = app.db.complete_metadata_write(&path_str);
                     let _ = std::fs::remove_file(&backup);
-                    app.browse.probe_cache.remove(&path);
+                    app.browse.remove_probe_cache_entry(&path);
                     app.browse.probe_pending.remove(&path);
                     app.browse.invalidate_search_tag_cache_for_metadata_path(&path);
                     let _ = app.db.invalidate_probe(&path_str);
@@ -3112,6 +3302,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 || sort_dir != app.browse.search.sort_dir
                 || result_cap != current_cap
             {
+                log::debug!("discarded stale Browse search completion for generation {} root {}", generation, root.display());
                 return;
             }
 
@@ -3229,21 +3420,16 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                 }
 
                                 if item.facts.hdcd_detected == Some(true) {
-                                    let updated_probe = app
-                                        .browse
-                                        .probe_cache
-                                        .get(&item.path)
-                                        .and_then(|entry| entry.as_ref())
-                                        .map(|cached| {
-                                            let mut info = (**cached).clone();
-                                            info.metadata.hdcd_detail = item.facts.hdcd_detail.clone();
-                                            info
+                                    if let (Some(modified), Some(size)) = (item.modified, item.file_size) {
+                                        let identity = crate::tui::browse::ProbeCacheIdentity {
+                                            modified: Some(modified),
+                                            size,
+                                        };
+                                        app.browse.update_valid_probe_for_identity(&item.path, identity, |cached| {
+                                            cached.metadata.hdcd_detail = item.facts.hdcd_detail.clone();
                                         });
-                                    if let Some(info) = updated_probe {
-                                        app.browse.probe_cache.insert(
-                                            item.path.clone(),
-                                            Some(std::sync::Arc::new(info)),
-                                        );
+                                    } else {
+                                        app.browse.remove_probe_cache_entry(&item.path);
                                     }
                                 }
                             }
@@ -3316,7 +3502,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                     Ok(())
                                 };
                                 for path in &paths {
-                                    app.browse.probe_cache.remove(path);
+                                    app.browse.remove_probe_cache_entry(path);
                                     let _ = app.db.invalidate_probe(&path.display().to_string());
                                 }
                                 if let Err(err) = archive_persist_result {
@@ -3378,7 +3564,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                     Ok(())
                                 };
                                 for path in &paths {
-                                    app.browse.probe_cache.remove(path);
+                                    app.browse.remove_probe_cache_entry(path);
                                     let _ = app.db.invalidate_probe(&path.display().to_string());
                                 }
                                 if let Err(err) = archive_persist_result {
@@ -3430,7 +3616,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 {
                     let close_editor = summary.all_saved();
                     for path in &summary.saved_paths {
-                        app.browse.probe_cache.remove(path);
+                        app.browse.remove_probe_cache_entry(path);
                         let _ = app.db.invalidate_probe(&path.display().to_string());
                     }
                     if !summary.saved_paths.is_empty() {
@@ -6303,5 +6489,255 @@ mod copy_move_file_picker_flow_tests {
             !nested_dest.join("album").exists(),
             "recursive destination target must not be created synchronously"
         );
+    }
+}
+
+#[cfg(test)]
+mod async_message_drain_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    fn status(app: &AppState) -> Option<&str> {
+        app.status_message.as_ref().map(|(message, _)| message.as_str())
+    }
+
+    fn test_cached_info(file_size: u64, title: &str) -> crate::tui::browse::CachedInfo {
+        crate::tui::browse::CachedInfo {
+            source: crate::tui::probe::SourceInfo {
+                format_name: "FLAC".to_string(),
+                codec: "flac".to_string(),
+                bit_depth: Some(16),
+                sample_rate: 44_100,
+                channels: 2,
+                channel_layout: "stereo".to_string(),
+                duration_secs: 1.0,
+                file_size,
+            },
+            metadata: crate::tui::probe::SourceMetadata {
+                title: Some(title.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn capped_drain_preserves_order_and_leaves_remainder_for_next_frame() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let (tx, mut rx) = mpsc::channel(MAX_ASYNC_MESSAGES_PER_FRAME + 8);
+        let total = MAX_ASYNC_MESSAGES_PER_FRAME + 4;
+        for i in 0..total {
+            tx.try_send(AppMessage::StatusMessage(format!("msg-{i}")))
+                .expect("queue message");
+        }
+
+        let first = drain_async_messages_for_frame(&mut app, &mut rx, &tx);
+        assert_eq!(first, MAX_ASYNC_MESSAGES_PER_FRAME);
+        let expected_first = format!("msg-{}", MAX_ASYNC_MESSAGES_PER_FRAME - 1);
+        assert_eq!(status(&app), Some(expected_first.as_str()));
+
+        let second = drain_async_messages_for_frame(&mut app, &mut rx, &tx);
+        assert_eq!(second, 4);
+        let expected_second = format!("msg-{}", total - 1);
+        assert_eq!(status(&app), Some(expected_second.as_str()));
+    }
+
+    #[test]
+    fn changed_filesystem_probe_completion_invalidates_and_schedules_one_reevaluation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("changed.flac");
+        std::fs::write(&path, b"old").expect("write old");
+        let old_identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
+            &std::fs::metadata(&path).expect("old metadata"),
+        );
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(),
+            "changed.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            old_identity.size,
+            old_identity.modified,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.probe_pending.insert(path.clone());
+        app.browse.insert_probe_miss_for_identity(path.clone(), old_identity);
+
+        std::fs::write(&path, b"new contents with different size").expect("write new");
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::AudioProbeComplete {
+                path: path.clone(),
+                context: crate::tui::message::AudioProbeContext::Filesystem {
+                    identity: Some(old_identity),
+                },
+                result: Box::new(Err("stale result".to_string())),
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.probe_pending.contains(&path));
+        assert_eq!(app.browse.probe_debounce.as_ref().map(|d| d.path.as_path()), Some(path.as_path()));
+        assert!(!app.browse.has_probe_cache_entry_for_identity(&path, old_identity));
+    }
+
+    #[test]
+    fn stale_probe_completion_cannot_insert_old_metadata_after_file_identity_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("changed-ok.flac");
+        std::fs::write(&path, b"old").expect("write old");
+        let old_identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
+            &std::fs::metadata(&path).expect("old metadata"),
+        );
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(),
+            "changed-ok.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            old_identity.size,
+            old_identity.modified,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.probe_pending.insert(path.clone());
+        app.browse.insert_probe_miss_for_identity(path.clone(), old_identity);
+
+        std::fs::write(&path, b"new contents with different size").expect("write new");
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::AudioProbeComplete {
+                path: path.clone(),
+                context: crate::tui::message::AudioProbeContext::Filesystem {
+                    identity: Some(old_identity),
+                },
+                result: Box::new(Ok(test_cached_info(old_identity.size, "stale"))),
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.has_probe_cache_entry_for_identity(&path, old_identity));
+        assert!(app.browse.current_cached_info().is_none());
+        assert_eq!(app.browse.probe_debounce.as_ref().map(|d| d.path.as_path()), Some(path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn stale_dir_stats_completion_rechecks_only_when_current_and_statable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album");
+        std::fs::create_dir(&path).expect("mkdir");
+        let stale_identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 };
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.dir_stats_pending.insert(path.clone());
+
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::DirStatsComplete {
+                path: path.clone(),
+                identity: stale_identity,
+                stats: crate::tui::browse::DirStats {
+                    file_count: 99,
+                    audio_count: 99,
+                    total_size: 99,
+                },
+                cancelled: false,
+            },
+            &tx,
+        );
+
+        assert!(app.browse.current_dir_stats().is_none());
+        assert!(app.browse.dir_stats_pending.contains(&path));
+    }
+
+    #[test]
+    fn missing_dir_stats_completion_stops_without_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("gone");
+        std::fs::create_dir(&path).expect("mkdir");
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
+            &std::fs::metadata(&path).expect("metadata"),
+        );
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(),
+            "gone".to_string(),
+            EntryKind::Directory,
+            identity.size,
+            identity.modified,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.dir_stats_pending.insert(path.clone());
+        std::fs::remove_dir(&path).expect("remove dir");
+
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::DirStatsComplete {
+                path: path.clone(),
+                identity,
+                stats: crate::tui::browse::DirStats {
+                    file_count: 1,
+                    audio_count: 1,
+                    total_size: 1,
+                },
+                cancelled: false,
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.dir_stats_pending.contains(&path));
+        assert!(app.browse.current_dir_stats().is_none());
+    }
+
+    #[test]
+    fn disappeared_filesystem_probe_completion_does_not_reschedule() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("deleted.flac");
+        std::fs::write(&path, b"audio").expect("write");
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(&meta);
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(),
+            "deleted.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            identity.size,
+            identity.modified,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.probe_pending.insert(path.clone());
+
+        std::fs::remove_file(&path).expect("delete");
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::AudioProbeComplete {
+                path: path.clone(),
+                context: crate::tui::message::AudioProbeContext::Filesystem { identity: Some(identity) },
+                result: Box::new(Err("file disappeared".to_string())),
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.probe_pending.contains(&path));
+        assert!(app.browse.probe_debounce.is_none());
+        assert!(app.browse.current_cached_info().is_none());
     }
 }

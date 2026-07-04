@@ -720,15 +720,12 @@ pub fn find_cue_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
 /// re-enter the event-loop thread.
 pub fn collect_durations(
     paths: &[PathBuf],
-    probe_cache: &std::collections::HashMap<
-        PathBuf,
-        Option<std::sync::Arc<super::browse::CachedInfo>>,
-    >,
+    browse: &super::browse::BrowseState,
 ) -> Vec<f64> {
     let mut durations = Vec::new();
     for path in paths {
-        if let Some(Some(cached)) = probe_cache.get(path) {
-            durations.push(cached.source.duration_secs);
+        if let Some(dur) = browse.probe_duration_for_path(path) {
+            durations.push(dur);
             continue;
         }
 

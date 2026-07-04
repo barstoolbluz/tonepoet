@@ -1320,7 +1320,7 @@ pub fn execute_context_action(
                 // Single disc — original flow.
                 let (_, group_paths) = &disc_groups[0];
                 let durations =
-                    super::gnudb::collect_durations(group_paths, &app.browse.probe_cache);
+                    super::gnudb::collect_durations(group_paths, &app.browse);
                 if durations.len() != group_paths.len() {
                     app.set_status("Probe all files first (some durations missing)");
                     return;
@@ -1355,7 +1355,7 @@ pub fn execute_context_action(
                 )> = Vec::new();
                 for (label, group_paths) in disc_groups {
                     let durations =
-                        super::gnudb::collect_durations(&group_paths, &app.browse.probe_cache);
+                        super::gnudb::collect_durations(&group_paths, &app.browse);
                     if durations.len() != group_paths.len() {
                         continue;
                     }

@@ -28,13 +28,15 @@ pub enum MbOutcome {
 
 /// Probe-completion acceptance context for Browse audio probes.
 ///
-/// Filesystem probes are keyed only by their real path. Archive-entry probes
-/// carry the archive mutation epoch captured when the worker was launched, so
-/// completions from workers that started before a repack/rename/cache
+/// Filesystem probes carry the file identity captured when the worker was
+/// launched. Archive-entry probes carry the archive mutation epoch captured at
+/// launch, so completions from workers that started before a repack/rename/cache
 /// invalidation cannot repopulate stale synthetic-path metadata afterward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioProbeContext {
-    Filesystem,
+    Filesystem {
+        identity: Option<crate::tui::browse::ProbeCacheIdentity>,
+    },
     ArchiveEntry {
         archive_path: std::path::PathBuf,
         archive_probe_epoch: u64,
@@ -190,6 +192,16 @@ pub enum AppMessage {
         inner_paths: Vec<String>,
         result: Result<(), String>,
     },
+    /// Chunk of valid SQLite probe-cache rows warmed after a Browse directory
+    /// scan. The reducer merges rows only while the same generation/path is
+    /// still current. Large bursts are queued and merged in bounded frame-sized
+    /// slices, so a slow warm worker cannot repopulate a later listing or make
+    /// one reducer frame absorb thousands of cache inserts.
+    ProbeCacheWarmComplete {
+        generation: u64,
+        path: std::path::PathBuf,
+        rows: Vec<crate::tui::browse::ProbeCacheWarmRow>,
+    },
     /// Result of an asynchronous audio probe (lofty + ffmpeg) launched by
     /// `BrowseState::probe_current`. The main loop updates `probe_cache` and
     /// removes the path from `probe_pending`. Reducers must not perform
@@ -224,11 +236,15 @@ pub enum AppMessage {
         result: Box<Result<crate::disc::DiscContents, String>>,
     },
     /// Result of an asynchronous directory-stats computation launched by
-    /// `BrowseState::probe_current` for a directory entry. The main loop
-    /// updates `dir_stats_cache` and removes the path from `dir_stats_pending`.
+    /// `BrowseState::probe_current` for a directory entry. The completion
+    /// carries the directory identity captured at dispatch so stale walkers
+    /// cannot publish stats after the selected directory has changed or
+    /// disappeared.
     DirStatsComplete {
         path: std::path::PathBuf,
+        identity: crate::tui::browse::ProbeCacheIdentity,
         stats: crate::tui::browse::DirStats,
+        cancelled: bool,
     },
     /// Result of an async audio analysis (DR, peak, RMS, etc.).
     /// `result` is Ok on success, Err(message) on failure.
@@ -271,6 +287,7 @@ pub enum AppMessage {
         parent_entry: Option<crate::tui::browse::BrowseEntry>,
         dirs: Vec<crate::tui::browse::BrowseEntry>,
         files: Vec<crate::tui::browse::BrowseEntry>,
+        classification_updates: crate::tui::browse::BrowseClassificationCacheUpdates,
         error: Option<String>,
     },
     /// Result of an async metadata tag write.

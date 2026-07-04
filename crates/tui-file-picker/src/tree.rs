@@ -1,7 +1,63 @@
 use crate::state::{home_dir, TreeNode};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
+
+const MAX_HAS_CHILD_CACHE_ENTRIES: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryFingerprint {
+    modified: Option<SystemTime>,
+    len: u64,
+    readonly: bool,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime_sec: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl DirectoryFingerprint {
+    fn read(dir: &Path) -> Option<Self> {
+        fs::metadata(dir).ok().map(|meta| Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            readonly: meta.permissions().readonly(),
+            #[cfg(unix)]
+            dev: meta.dev(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+            #[cfg(unix)]
+            ctime_sec: meta.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: meta.ctime_nsec(),
+        })
+    }
+}
+
+type HasChildCacheKey = (PathBuf, bool);
+
+struct HasChildCacheEntry {
+    fingerprint: Option<DirectoryFingerprint>,
+    verdict: bool,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct HasChildDirectoriesCache {
+    entries: HashMap<HasChildCacheKey, HasChildCacheEntry>,
+    tick: u64,
+}
+
+static HAS_CHILD_DIRECTORIES_CACHE: OnceLock<Mutex<HasChildDirectoriesCache>> = OnceLock::new();
 
 pub fn initial_tree_nodes(current_dir: &Path) -> Vec<TreeNode> {
     initial_tree_nodes_with_hidden(current_dir, false)
@@ -112,11 +168,75 @@ pub fn child_directories(dir: &Path, depth: usize, show_hidden: bool) -> Vec<Tre
             });
         }
     }
-    children.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    children.sort_by_cached_key(|node| node.name.to_ascii_lowercase());
     children
 }
 
 fn has_child_directories(dir: &Path, show_hidden: bool) -> bool {
+    let fingerprint = DirectoryFingerprint::read(dir);
+    let key = (dir.to_path_buf(), show_hidden);
+    let cache = HAS_CHILD_DIRECTORIES_CACHE.get_or_init(|| {
+        Mutex::new(HasChildDirectoriesCache::default())
+    });
+
+    if let Ok(mut cache) = cache.lock() {
+        cache.tick = cache.tick.wrapping_add(1);
+        let tick = cache.tick;
+        if let Some(entry) = cache.entries.get_mut(&key) {
+            if entry.fingerprint == fingerprint {
+                entry.last_used = tick;
+                return entry.verdict;
+            }
+        }
+    }
+
+    let verdict = has_child_directories_uncached(dir, show_hidden);
+
+    if let Ok(mut cache) = cache.lock() {
+        cache.tick = cache.tick.wrapping_add(1);
+        let tick = cache.tick;
+        if cache.entries.len() >= MAX_HAS_CHILD_CACHE_ENTRIES {
+            evict_old_has_child_cache_entries(&mut cache);
+        }
+        // `false` is safe to memoize only for this directory identity. Permission
+        // or child changes alter the fingerprint on supported platforms; the
+        // cache is in-memory only, so transient filesystem states cannot poison
+        // persistent Browse behavior.
+        cache.entries.insert(
+            key,
+            HasChildCacheEntry {
+                fingerprint,
+                verdict,
+                last_used: tick,
+            },
+        );
+    }
+
+    verdict
+}
+
+fn evict_old_has_child_cache_entries(cache: &mut HasChildDirectoriesCache) {
+    if cache.entries.len() < MAX_HAS_CHILD_CACHE_ENTRIES {
+        return;
+    }
+
+    // This cache is an interactivity optimization, not authoritative state.
+    // Trim the oldest half only when the cap is reached so one unusually large
+    // tree walk does not discard every hot ancestor and sibling entry.
+    let target_len = MAX_HAS_CHILD_CACHE_ENTRIES / 2;
+    let remove_count = cache.entries.len().saturating_sub(target_len);
+    let mut by_age: Vec<(HasChildCacheKey, u64)> = cache
+        .entries
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.last_used))
+        .collect();
+    by_age.sort_by_key(|(_, last_used)| *last_used);
+    for (key, _) in by_age.into_iter().take(remove_count) {
+        cache.entries.remove(&key);
+    }
+}
+
+fn has_child_directories_uncached(dir: &Path, show_hidden: bool) -> bool {
     let Ok(read_dir) = fs::read_dir(dir) else {
         return false;
     };
@@ -168,9 +288,30 @@ fn same_path(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static TEST_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn lock_test_cache() -> std::sync::MutexGuard<'static, ()> {
+        TEST_CACHE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test cache lock")
+    }
+
+    fn clear_has_child_directories_cache() {
+        let cache = HAS_CHILD_DIRECTORIES_CACHE.get_or_init(|| {
+            Mutex::new(HasChildDirectoriesCache::default())
+        });
+        let mut cache = cache.lock().expect("cache lock");
+        cache.entries.clear();
+        cache.tick = 0;
+    }
 
     #[test]
     fn tree_contains_current_dir_ancestor() {
+        let _guard = lock_test_cache();
+        clear_has_child_directories_cache();
         let temp = tempfile::tempdir().expect("tempdir");
         let child = temp.path().join("child");
         fs::create_dir(&child).expect("child");
@@ -183,5 +324,127 @@ mod tests {
         }];
         refresh_tree_children(&mut nodes, temp.path(), false);
         assert!(nodes.iter().any(|node| node.path == child));
+    }
+
+    #[test]
+    fn has_child_cache_keeps_hidden_policy_separate() {
+        let _guard = lock_test_cache();
+        clear_has_child_directories_cache();
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join(".hidden-child")).expect("hidden child");
+
+        assert!(!has_child_directories(temp.path(), false));
+        assert!(has_child_directories(temp.path(), true));
+
+        let visible = child_directories(temp.path(), 1, false);
+        let hidden_allowed = child_directories(temp.path(), 1, true);
+        assert!(visible.is_empty());
+        assert_eq!(hidden_allowed.len(), 1);
+        assert_eq!(hidden_allowed[0].name, ".hidden-child");
+    }
+
+    #[test]
+    fn stale_cache_with_same_mtime_but_different_identity_is_ignored() {
+        let _guard = lock_test_cache();
+        clear_has_child_directories_cache();
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("child")).expect("child");
+
+        let mut stale_fingerprint =
+            DirectoryFingerprint::read(temp.path()).expect("directory fingerprint");
+        stale_fingerprint.len = stale_fingerprint.len.wrapping_add(1);
+
+        let cache = HAS_CHILD_DIRECTORIES_CACHE.get_or_init(|| {
+            Mutex::new(HasChildDirectoriesCache::default())
+        });
+        let mut cache = cache.lock().expect("cache lock");
+        cache.entries.insert(
+            (temp.path().to_path_buf(), false),
+            HasChildCacheEntry {
+                fingerprint: Some(stale_fingerprint),
+                verdict: false,
+                last_used: 1,
+            },
+        );
+        cache.tick = 1;
+        drop(cache);
+
+        assert!(has_child_directories(temp.path(), false));
+    }
+
+    #[test]
+    fn has_child_cache_eviction_retains_recent_entries() {
+        let _guard = lock_test_cache();
+        clear_has_child_directories_cache();
+        let mut cache = HasChildDirectoriesCache::default();
+        for idx in 0..MAX_HAS_CHILD_CACHE_ENTRIES {
+            cache.entries.insert(
+                (PathBuf::from(format!("cache-entry-{idx}")), false),
+                HasChildCacheEntry {
+                    fingerprint: None,
+                    verdict: idx % 2 == 0,
+                    last_used: idx as u64,
+                },
+            );
+        }
+
+        evict_old_has_child_cache_entries(&mut cache);
+
+        assert_eq!(cache.entries.len(), MAX_HAS_CHILD_CACHE_ENTRIES / 2);
+        assert!(!cache
+            .entries
+            .contains_key(&(PathBuf::from("cache-entry-0"), false)));
+        assert!(cache.entries.contains_key(&cache_key(MAX_HAS_CHILD_CACHE_ENTRIES - 1)));
+    }
+
+    fn cache_key(idx: usize) -> HasChildCacheKey {
+        (PathBuf::from(format!("cache-entry-{idx}")), false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_directory_is_reported_as_tree_child() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = lock_test_cache();
+        clear_has_child_directories_cache();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target");
+        let link = temp.path().join("linked");
+        fs::create_dir(&target).expect("target dir");
+        symlink(&target, &link).expect("directory symlink");
+
+        let children = child_directories(temp.path(), 1, false);
+        assert!(children
+            .iter()
+            .any(|node| node.name == "linked" && node.path == link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_is_treated_as_leaf_when_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = lock_test_cache();
+        clear_has_child_directories_cache();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let denied = temp.path().join("denied");
+        fs::create_dir(&denied).expect("denied dir");
+        fs::create_dir(denied.join("child")).expect("child");
+
+        let original_permissions = fs::metadata(&denied).expect("metadata").permissions();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000))
+            .expect("remove permissions");
+
+        let read_dir_failed = fs::read_dir(&denied).is_err();
+        let verdict = has_child_directories(&denied, false);
+        let children = child_directories(&denied, 1, false);
+
+        fs::set_permissions(&denied, original_permissions).expect("restore permissions");
+
+        if read_dir_failed {
+            assert!(!verdict);
+            assert!(children.is_empty());
+        }
     }
 }

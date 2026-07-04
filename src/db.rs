@@ -85,6 +85,13 @@ impl Database {
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|e| format!("foreign_keys pragma failed: {}", e))?;
 
+        // Browse performs many small cache reads during navigation. A larger
+        // page cache and mmap window reduce syscall churn without changing
+        // schema or transaction semantics; unsupported platforms simply clamp
+        // mmap_size to SQLite's accepted value.
+        conn.execute_batch("PRAGMA cache_size = -65536; PRAGMA mmap_size = 268435456;")
+            .map_err(|e| format!("performance pragmas failed: {}", e))?;
+
         let mut db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -96,6 +103,8 @@ impl Database {
             .map_err(|e| format!("failed to open in-memory DB: {}", e))?;
         conn.execute_batch("PRAGMA journal_mode = WAL;")
             .map_err(|e| format!("WAL pragma failed: {}", e))?;
+        conn.execute_batch("PRAGMA cache_size = -32768;")
+            .map_err(|e| format!("cache_size pragma failed: {}", e))?;
         let mut db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -1838,32 +1847,64 @@ impl Database {
                 "SELECT * FROM probe_cache WHERE file_path = ?1
              AND file_mtime = ?2 AND file_size = ?3",
                 params![file_path, current_mtime, current_size as i64],
-                |row| {
-                    Ok(CachedProbeRow {
-                        format_name: row.get("format_name")?,
-                        codec: row.get("codec")?,
-                        bit_depth: row.get("bit_depth")?,
-                        sample_rate: row.get("sample_rate")?,
-                        channels: row.get("channels")?,
-                        channel_layout: row.get("channel_layout")?,
-                        duration_secs: row.get("duration_secs")?,
-                        title: row.get("title")?,
-                        artist: row.get("artist")?,
-                        album: row.get("album")?,
-                        genre: row.get("genre")?,
-                        year: row.get("year")?,
-                        track_number: row.get("track_number")?,
-                        catalog_number: row.get("catalog_number")?,
-                        rg_track_gain: row.get("rg_track_gain")?,
-                        rg_track_peak: row.get("rg_track_peak")?,
-                        rg_album_gain: row.get("rg_album_gain")?,
-                        rg_album_peak: row.get("rg_album_peak")?,
-                        r128_track_gain: row.get("r128_track_gain")?,
-                        r128_album_gain: row.get("r128_album_gain")?,
-                    })
-                },
+                cached_probe_row_from_sql,
             )
             .ok()
+    }
+
+    /// Batch-load valid probe-cache rows for a directory scan. SQLite's primary
+    /// key handles each `IN` member as an indexed lookup, but doing this in
+    /// chunks avoids one prepare/step cycle per cursor movement in large dirs.
+    pub fn get_cached_probes_for_files(
+        &self,
+        files: &[(String, i64, u64)],
+    ) -> Vec<(String, CachedProbeRow)> {
+        if files.is_empty() {
+            return Vec::new();
+        }
+
+        let mut expected = std::collections::HashMap::with_capacity(files.len());
+        for (path, mtime, size) in files {
+            expected.insert(path.clone(), (*mtime, *size));
+        }
+
+        let mut out = Vec::new();
+        for chunk in files.chunks(900) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT * FROM probe_cache WHERE file_path IN ({})",
+                placeholders
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            let params = rusqlite::params_from_iter(chunk.iter().map(|(path, _, _)| path.as_str()));
+            let Ok(rows) = stmt.query_map(params, |row| {
+                let file_path: String = row.get("file_path")?;
+                let file_mtime: i64 = row.get("file_mtime")?;
+                let file_size_i64: i64 = row.get("file_size")?;
+                let cached = cached_probe_row_from_sql(row)?;
+                Ok((file_path, file_mtime, file_size_i64, cached))
+            }) else {
+                continue;
+            };
+
+            for row in rows.flatten() {
+                let (file_path, file_mtime, file_size_i64, cached) = row;
+                let file_size = u64::try_from(file_size_i64).unwrap_or(0);
+                if expected
+                    .get(&file_path)
+                    .is_some_and(|(mtime, size)| *mtime == file_mtime && *size == file_size)
+                {
+                    out.push((file_path, cached));
+                }
+            }
+        }
+
+        out
     }
 
     /// Store a probe result in the cache (upsert).
@@ -2193,6 +2234,31 @@ pub struct CachedProbeRow {
     pub rg_album_peak: Option<String>,
     pub r128_track_gain: Option<String>,
     pub r128_album_gain: Option<String>,
+}
+
+fn cached_probe_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedProbeRow> {
+    Ok(CachedProbeRow {
+        format_name: row.get("format_name")?,
+        codec: row.get("codec")?,
+        bit_depth: row.get("bit_depth")?,
+        sample_rate: row.get("sample_rate")?,
+        channels: row.get("channels")?,
+        channel_layout: row.get("channel_layout")?,
+        duration_secs: row.get("duration_secs")?,
+        title: row.get("title")?,
+        artist: row.get("artist")?,
+        album: row.get("album")?,
+        genre: row.get("genre")?,
+        year: row.get("year")?,
+        track_number: row.get("track_number")?,
+        catalog_number: row.get("catalog_number")?,
+        rg_track_gain: row.get("rg_track_gain")?,
+        rg_track_peak: row.get("rg_track_peak")?,
+        rg_album_gain: row.get("rg_album_gain")?,
+        rg_album_peak: row.get("rg_album_peak")?,
+        r128_track_gain: row.get("r128_track_gain")?,
+        r128_album_gain: row.get("r128_album_gain")?,
+    })
 }
 
 // ── Conversion helpers ──────────────────────────────────────────
@@ -2720,6 +2786,43 @@ mod tests {
         db.invalidate_probe("/music/song.flac").unwrap();
         let cached = db.get_cached_probe("/music/song.flac", 1000, 5000000);
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn batch_probe_cache_filters_stale_mtime_and_size_rows() {
+        let db = Database::open_memory().unwrap();
+        let row = CachedProbeRow {
+            format_name: Some("flac".into()),
+            codec: Some("flac".into()),
+            sample_rate: Some(44100),
+            channels: Some(2),
+            title: Some("Batch Song".into()),
+            ..Default::default()
+        };
+        db.store_probe("/music/batch.flac", 1000, 5000000, &row)
+            .unwrap();
+
+        let stale_mtime = db.get_cached_probes_for_files(&[(
+            "/music/batch.flac".to_string(),
+            1001,
+            5000000,
+        )]);
+        assert!(stale_mtime.is_empty());
+
+        let stale_size = db.get_cached_probes_for_files(&[(
+            "/music/batch.flac".to_string(),
+            1000,
+            5000001,
+        )]);
+        assert!(stale_size.is_empty());
+
+        let fresh = db.get_cached_probes_for_files(&[(
+            "/music/batch.flac".to_string(),
+            1000,
+            5000000,
+        )]);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].1.title.as_deref(), Some("Batch Song"));
     }
 
     #[test]

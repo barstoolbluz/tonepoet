@@ -1,15 +1,40 @@
 //! File browser state and directory scanning
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::layout::Rect;
 
 /// Type-ahead buffer resets after this duration of inactivity.
 const TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Cold filesystem audio probes are delayed briefly while the cursor is moving.
+/// Cache hits still publish immediately, so steady-state browsing stays instant
+/// while rapid scrolls avoid launching probes for entries the user only crossed.
+const BROWSE_PROBE_DEBOUNCE: Duration = Duration::from_millis(175);
+
+/// Keep scan-completion cache warming bounded. Cursor-focused lookups still
+/// fall back to per-file SQLite/fresh probes for entries beyond the warm set.
+const PROBE_CACHE_WARM_MAX_CANDIDATES: usize = 4096;
+const PROBE_CACHE_WARM_MESSAGE_CHUNK: usize = 128;
+const PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME: usize = 128;
+/// Cold filesystem probes are expensive and cannot be cancelled once the
+/// blocking ffmpeg/lofty work has started. Keep only a tiny number in flight
+/// and queue the cursor-focused request ahead of any stale pre-start work.
+const BROWSE_COLD_PROBE_MAX_IN_FLIGHT: usize = 2;
+const BROWSE_COLD_PROBE_QUEUE_MAX: usize = 16;
+/// Recursive directory stats walk subtrees and can be expensive on large
+/// libraries. Keep at most one active from Browse cursor movement and queue
+/// only the current directory selection ahead of stale hover/cursor positions.
+const BROWSE_DIR_STATS_MAX_IN_FLIGHT: usize = 1;
+const BROWSE_DIR_STATS_QUEUE_MAX: usize = 8;
+/// Short in-memory retry backoff for transient probe failures. This is not a
+/// correctness cache: it only prevents hot retry loops for files that may
+/// become readable or probeable without a content change.
+const TRANSIENT_PROBE_FAILURE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Skim fuzzy matching is intentionally permissive: any ordered subsequence can
 /// produce a score. Browse search treats very low scores as false positives so
@@ -28,6 +53,104 @@ fn search_fuzzy_score_passes_threshold(score: i64, min_score: i64) -> bool {
     score >= min_score
 }
 
+fn search_score_better(candidate: i64, incumbent: i64, dir: SortDir) -> bool {
+    match dir {
+        SortDir::Asc => candidate < incumbent,
+        SortDir::Desc => candidate > incumbent,
+    }
+}
+
+struct BoundedScoreSearchResults {
+    heap: BinaryHeap<RetainedScoreResult>,
+    cap: usize,
+    dir: SortDir,
+    next_seq: usize,
+}
+
+struct RetainedScoreResult {
+    entry: BrowseEntry,
+    score: i64,
+    seq: usize,
+    dir: SortDir,
+}
+
+impl PartialEq for RetainedScoreResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.seq == other.seq && self.dir == other.dir
+    }
+}
+
+impl Eq for RetainedScoreResult {}
+
+impl PartialOrd for RetainedScoreResult {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RetainedScoreResult {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let score_order = match self.dir {
+            // BinaryHeap exposes the greatest item. Make the root the worst
+            // retained candidate so replacement is O(log cap) instead of a
+            // linear scan across the retained set for every broad match.
+            SortDir::Desc => other.score.cmp(&self.score),
+            SortDir::Asc => self.score.cmp(&other.score),
+        };
+        // Equal scores keep the older match, matching the previous full-sort
+        // behavior as closely as possible. Newer equal-score entries are worse
+        // if the heap ever has to choose among them.
+        score_order.then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
+impl BoundedScoreSearchResults {
+    fn new(cap: usize, dir: SortDir) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(cap),
+            cap,
+            dir,
+            next_seq: 0,
+        }
+    }
+
+    fn push(&mut self, entry: BrowseEntry, score: i64) {
+        if self.cap == 0 {
+            return;
+        }
+        let candidate = RetainedScoreResult {
+            entry,
+            score,
+            seq: self.next_seq,
+            dir: self.dir,
+        };
+        self.next_seq = self.next_seq.saturating_add(1);
+
+        if self.heap.len() < self.cap {
+            self.heap.push(candidate);
+            return;
+        }
+
+        let Some(worst) = self.heap.peek() else {
+            self.heap.push(candidate);
+            return;
+        };
+        if search_score_better(candidate.score, worst.score, self.dir) {
+            let mut slot = self.heap.peek_mut().expect("peek succeeded above");
+            *slot = candidate;
+        }
+    }
+
+    fn into_vec(self) -> Vec<(BrowseEntry, i64)> {
+        let mut retained = self.heap.into_vec();
+        retained.sort_by_key(|item| item.seq);
+        retained
+            .into_iter()
+            .map(|item| (item.entry, item.score))
+            .collect()
+    }
+}
+
 use crate::convert::formats::AudioFormat;
 use crate::tui::probe::{SourceInfo, SourceMetadata};
 use crate::tui::disc_browser::{DiscProbeCacheEntry, DiscProbeFollowup};
@@ -40,12 +163,184 @@ pub struct CachedInfo {
     pub metadata: SourceMetadata,
 }
 
+/// File identity captured alongside in-memory probe-cache entries.
+///
+/// The persistent SQLite cache is validated by `(path, mtime, size)`, and the
+/// in-memory layer must obey the same contract. Keeping this fingerprint with
+/// each hit/failure prevents externally modified files from reusing stale
+/// metadata after a refresh or a focused metadata check observes a new identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeCacheIdentity {
+    pub modified: Option<SystemTime>,
+    pub size: u64,
+}
+
+impl ProbeCacheIdentity {
+    pub fn from_entry(entry: &BrowseEntry) -> Self {
+        Self {
+            modified: entry.modified,
+            size: entry.size,
+        }
+    }
+
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            size: metadata.len(),
+        }
+    }
+}
+
+/// Identity-validated in-memory probe-cache value. `info = None` records only
+/// deterministic negatives such as "not audio" for the same file identity.
+/// Transient failures use a short retry backoff instead and are never persisted.
+#[derive(Debug, Clone)]
+pub struct ProbeCacheEntry {
+    pub identity: ProbeCacheIdentity,
+    pub info: Option<Arc<CachedInfo>>,
+}
+
+impl ProbeCacheEntry {
+    pub fn hit(identity: ProbeCacheIdentity, info: Arc<CachedInfo>) -> Self {
+        Self {
+            identity,
+            info: Some(info),
+        }
+    }
+
+    pub fn miss(identity: ProbeCacheIdentity) -> Self {
+        Self { identity, info: None }
+    }
+
+    pub fn is_valid_for(&self, identity: ProbeCacheIdentity) -> bool {
+        self.identity == identity
+    }
+}
+
+/// Row emitted by the asynchronous SQLite probe-cache warmer. Rows carry the
+/// scan-time identity they were validated against; the reducer checks the
+/// directory generation/path before merging them into `probe_cache`.
+#[derive(Debug, Clone)]
+pub struct ProbeCacheWarmRow {
+    pub path: PathBuf,
+    pub identity: ProbeCacheIdentity,
+    pub info: CachedInfo,
+}
+
+#[derive(Debug, Clone)]
+struct ProbeCacheWarmBatch {
+    generation: u64,
+    path: PathBuf,
+    rows: VecDeque<ProbeCacheWarmRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowseColdProbeRequest {
+    path: PathBuf,
+    identity: ProbeCacheIdentity,
+    /// Directory scan generation captured when the request was queued.
+    /// Low-priority/background work is dropped before launch if navigation or
+    /// refresh has moved Browse to a newer generation.
+    scan_generation: u64,
+    /// Cursor-focused requests are high priority. They are dropped before
+    /// launch if the cursor has moved away, so old scroll positions cannot
+    /// accumulate behind already-running probes.
+    cursor_focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirStatsRequest {
+    path: PathBuf,
+    identity: ProbeCacheIdentity,
+    scan_generation: u64,
+    cursor_focused: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DirStatsActiveJob {
+    identity: ProbeCacheIdentity,
+    scan_generation: u64,
+    cursor_focused: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Coalesced Browse reducer work. Async completions set these flags while the
+/// event loop drains messages, and the loop performs each expensive operation
+/// at most once after the batch.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BrowseDeferredWorkFlags {
+    pub probe_backed_resort_needed: bool,
+    pub search_reapply_needed: bool,
+    pub visible_entries_changed: bool,
+    pub info_pane_changed: bool,
+    pub classification_changed: bool,
+}
+
+impl BrowseDeferredWorkFlags {
+    pub fn has_expensive_work(self) -> bool {
+        self.probe_backed_resort_needed
+            || self.search_reapply_needed
+            || self.visible_entries_changed
+            || self.info_pane_changed
+            || self.classification_changed
+    }
+}
+
+/// Reducer decision for filesystem-backed async completions. Every Browse
+/// worker that can update state after navigation or external file mutation
+/// must prove that the current filesystem identity still matches the identity
+/// captured at dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemAsyncCompletion {
+    /// The file or directory still has the launch identity; the reducer may
+    /// apply the result.
+    Accept,
+    /// The path still exists but no longer matches the launch identity. The
+    /// reducer must drop the stale result, invalidate derived state, and may
+    /// re-evaluate the current selection once.
+    Changed,
+    /// The path disappeared or cannot be statted. The reducer must clear
+    /// pending/cache state and must not schedule another probe from this stale
+    /// completion.
+    MissingOrUnstatable,
+}
+
 /// Cached statistics for a directory
 #[derive(Debug, Clone, Default)]
 pub struct DirStats {
     pub file_count: usize,
     pub audio_count: usize,
     pub total_size: u64,
+}
+
+/// Identity-validated recursive directory-stats cache value. Directory stats
+/// are computed asynchronously and can arrive after external filesystem
+/// mutation; keeping the launch identity with the result prevents stale subtree
+/// totals from being shown for a changed directory path.
+#[derive(Debug, Clone)]
+pub struct DirStatsCacheEntry {
+    pub identity: ProbeCacheIdentity,
+    pub stats: Arc<DirStats>,
+}
+
+impl DirStatsCacheEntry {
+    pub fn new(identity: ProbeCacheIdentity, stats: DirStats) -> Self {
+        Self {
+            identity,
+            stats: Arc::new(stats),
+        }
+    }
+
+    pub fn is_valid_for(&self, identity: ProbeCacheIdentity) -> bool {
+        self.identity == identity
+    }
+}
+
+/// Debounced cold-probe request for the current Browse cursor.
+#[derive(Debug, Clone)]
+pub struct BrowseProbeDebounce {
+    pub path: PathBuf,
+    pub deadline: Instant,
 }
 
 /// What to do when the user selects a file in the browse screen
@@ -134,6 +429,57 @@ impl ClassificationFingerprint {
             len: metadata.len(),
             modified: metadata.modified().ok(),
             markers: Vec::new(),
+        }
+    }
+}
+
+
+/// Negative classification/probe results are cached only when the failure is
+/// deterministic for the captured file or directory identity. Permission,
+/// locking, disappearance, cancellation, and decoder/extraction failures are
+/// intentionally treated as transient so they cannot poison long-lived caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegativeCacheDecision {
+    CacheDeterministic,
+    DoNotCacheTransient,
+}
+
+/// Classification cache updates produced by the background directory-scan
+/// worker. The reducer applies them only after the scan generation/path has
+/// validated, keeping cold ISO/DVD-A/DVD-Video/Blu-ray checks off the TUI path
+/// while preserving the same pre-publication entry kinds.
+#[derive(Debug, Clone, Default)]
+pub struct BrowseClassificationCacheUpdates {
+    pub sacd_iso: Vec<(PathBuf, ClassificationFingerprint, bool)>,
+    pub dvda_iso: Vec<(PathBuf, ClassificationFingerprint, bool)>,
+    pub dvdv_iso: Vec<(PathBuf, ClassificationFingerprint, bool)>,
+    pub bluray_iso: Vec<(PathBuf, ClassificationFingerprint, bool)>,
+    pub dvda_dir: Vec<(PathBuf, ClassificationFingerprint, bool)>,
+    pub dvdv_dir: Vec<(PathBuf, ClassificationFingerprint, bool)>,
+    pub bluray_dir: Vec<(PathBuf, ClassificationFingerprint, bool)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BrowseClassificationCacheSnapshot {
+    sacd_iso: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+    dvda_iso: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+    dvdv_iso: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+    bluray_iso: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+    dvda_dir: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+    dvdv_dir: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+    bluray_dir: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
+}
+
+impl BrowseClassificationCacheSnapshot {
+    fn from_state(state: &BrowseState) -> Self {
+        Self {
+            sacd_iso: state.sacd_classify_cache.clone(),
+            dvda_iso: state.dvda_iso_classify_cache.clone(),
+            dvdv_iso: state.dvdv_iso_classify_cache.clone(),
+            bluray_iso: state.bluray_iso_classify_cache.clone(),
+            dvda_dir: state.dvda_dir_classify_cache.clone(),
+            dvdv_dir: state.dvdv_dir_classify_cache.clone(),
+            bluray_dir: state.bluray_dir_classify_cache.clone(),
         }
     }
 }
@@ -1039,12 +1385,47 @@ pub struct BrowseState {
     /// Format filter (cycle with `f`)
     pub format_filter: FormatFilter,
 
-    /// Probe cache: path → Some(info) if probed, None if probe failed
-    pub probe_cache: HashMap<PathBuf, Option<Arc<CachedInfo>>>,
+    /// Probe cache: path → identity-validated hit/failure entry.
+    probe_cache: HashMap<PathBuf, ProbeCacheEntry>,
+
+    /// Paths loaded from SQLite that should receive worker-side metadata
+    /// enrichment the next time they become cursor-focused. This keeps the
+    /// UI instant on DB hits without doing tag/CUE/catalog I/O on the TUI path.
+    pub probe_cache_needs_metadata_enrichment: HashSet<PathBuf>,
+
+    /// Pending cold filesystem probe for Browse cursor debouncing.
+    pub probe_debounce: Option<BrowseProbeDebounce>,
+
+    /// Coalesced expensive work requested by async completions during the
+    /// current reducer batch. The event loop flushes these flags once after
+    /// draining messages so bursts of probe/search/classification updates do
+    /// not repeatedly re-sort, re-search, or re-enter the current probe path.
+    pub deferred_work: BrowseDeferredWorkFlags,
+
+    /// Warmed SQLite rows waiting for bounded reducer-side merge. The DB query
+    /// runs on a blocking worker, but merging thousands of rows can still be
+    /// visible; process this queue in small frame-sized slices.
+    probe_cache_warm_pending: VecDeque<ProbeCacheWarmBatch>,
+
+    /// Cold filesystem Browse probes waiting for an in-flight slot. Cache hits,
+    /// SQLite hits, archive probes, and worker-side metadata enrichment bypass
+    /// this queue and remain immediate.
+    browse_cold_probe_queue: VecDeque<BrowseColdProbeRequest>,
+
+    /// Cold filesystem Browse probes that have actually started. This is a
+    /// subset of `probe_pending` and provides backpressure across distinct
+    /// paths during rapid scrolling.
+    browse_cold_probe_active: HashSet<PathBuf>,
 
     /// Set of paths whose probe is currently in flight on a background task.
     /// Prevents duplicate spawns when the cursor moves rapidly.
     pub probe_pending: std::collections::HashSet<PathBuf>,
+
+    /// Short-lived in-memory backoff for transient probe failures. Deterministic
+    /// negatives use `probe_cache` with file identity; transient failures stay
+    /// out of SQLite and long-lived caches so later readability/success is not
+    /// suppressed.
+    transient_probe_failures: HashMap<PathBuf, (ProbeCacheIdentity, Instant)>,
 
     /// Per-archive mutation/probe epoch. Archive-entry probes capture this
     /// value when launched and completions are accepted only if it still
@@ -1053,21 +1434,27 @@ pub struct BrowseState {
     /// in-flight workers cannot repopulate synthetic-path metadata afterward.
     pub archive_probe_epochs: HashMap<PathBuf, u64>,
 
-    /// Directory stats cache: path → (file_count, audio_count, total_size)
-    pub dir_stats_cache: HashMap<PathBuf, Arc<DirStats>>,
+    /// Directory stats cache: path → identity-validated recursive stats.
+    dir_stats_cache: HashMap<PathBuf, DirStatsCacheEntry>,
 
-    /// Set of directory paths whose stats are currently being computed on
-    /// a background task. Prevents duplicate spawns.
+    /// Set of directory paths whose stats are queued or currently being
+    /// computed. Used by the info pane to show the existing "computing..."
+    /// state without launching duplicates.
     pub dir_stats_pending: std::collections::HashSet<PathBuf>,
 
-    /// Cache of SACD-ISO classifications keyed by path. The value
-    /// pairs the file's mtime at probe time with the verdict
-    /// (`true` = ScarletBook magic found). Re-probing skips when
-    /// the cached mtime still matches; if the file has been
-    /// touched the entry is re-evaluated (the underlying ISO
-    /// could have been re-burned). Populated by `upgrade_iso_kinds`
-    /// after every directory scan.
-    pub sacd_classify_cache: HashMap<PathBuf, (std::time::SystemTime, bool)>,
+    /// Recursive directory stats walks that have actually started. This is a
+    /// subset of `dir_stats_pending` and provides backpressure across distinct
+    /// directories when the cursor moves rapidly over folders.
+    dir_stats_active: HashMap<PathBuf, DirStatsActiveJob>,
+
+    /// Recursive directory stats requests waiting for an in-flight slot.
+    /// Current-selection requests are kept ahead of stale cursor positions.
+    dir_stats_queue: VecDeque<DirStatsRequest>,
+
+    /// Cache of SACD-ISO classifications keyed by path + len + mtime. The
+    /// verdict may be negative only when the ISO was readable, so permission or
+    /// transient read failures do not poison future scans.
+    pub sacd_classify_cache: HashMap<PathBuf, (ClassificationFingerprint, bool)>,
 
     /// Cache of DVD-Audio ISO classifications keyed by path + len + mtime.
     /// This is used only by scan/upgrade code, never by render code.
@@ -1369,10 +1756,19 @@ impl BrowseState {
             default_sort_dir: sort_dir,
             format_filter,
             probe_cache: HashMap::new(),
+            probe_cache_needs_metadata_enrichment: HashSet::new(),
+            probe_debounce: None,
+            deferred_work: BrowseDeferredWorkFlags::default(),
+            probe_cache_warm_pending: VecDeque::new(),
+            browse_cold_probe_queue: VecDeque::new(),
+            browse_cold_probe_active: HashSet::new(),
             probe_pending: std::collections::HashSet::new(),
+            transient_probe_failures: HashMap::new(),
             archive_probe_epochs: HashMap::new(),
             dir_stats_cache: HashMap::new(),
             dir_stats_pending: std::collections::HashSet::new(),
+            dir_stats_active: HashMap::new(),
+            dir_stats_queue: VecDeque::new(),
             sacd_classify_cache: HashMap::new(),
             dvda_iso_classify_cache: HashMap::new(),
             dvda_dir_classify_cache: HashMap::new(),
@@ -1739,6 +2135,10 @@ impl BrowseState {
         self.error = None;
         self.selected_index = 0;
         self.scroll_offset = 0;
+        self.probe_debounce = None;
+        self.clear_probe_cache_warm_backlog();
+        self.clear_browse_cold_probe_queue();
+        self.clear_dir_stats_work_queue();
 
         let tx = match &self.scan_tx {
             Some(tx) => tx.clone(),
@@ -1750,7 +2150,8 @@ impl BrowseState {
         let (handle, cancel_flag) = ScanHandle::new(generation);
         self.scan_pending = Some(handle);
 
-        spawn_dir_scan(self.current_dir.clone(), generation, cancel_flag, tx);
+        let classification_cache = self.classification_cache_snapshot();
+        spawn_dir_scan(self.current_dir.clone(), generation, cancel_flag, classification_cache, tx);
     }
 
     /// Whether we're currently browsing inside an archive.
@@ -1776,6 +2177,7 @@ impl BrowseState {
         self.multi_select_anchor = None;
         self.selected_index = 0;
         self.scroll_offset = 0;
+        self.clear_dir_stats_work_queue();
         self.clear_type_ahead();
         self.reset_sort_to_default();
         self.refresh_archive_view();
@@ -1852,6 +2254,7 @@ impl BrowseState {
         });
         self.multi_selected.clear();
         self.multi_select_anchor = None;
+        self.clear_dir_stats_work_queue();
         self.clear_type_ahead();
         self.reset_sort_to_default();
         self.refresh_archive_view_with_search(tx);
@@ -1901,6 +2304,7 @@ impl BrowseState {
         self.multi_selected.clear();
         self.selected_index = 0;
         self.scroll_offset = 0;
+        self.clear_dir_stats_work_queue();
         self.reset_sort_to_default();
         self.refresh_archive_view();
     }
@@ -1922,6 +2326,7 @@ impl BrowseState {
             self.multi_selected.clear();
             self.selected_index = 0;
             self.scroll_offset = 0;
+            self.clear_dir_stats_work_queue();
             self.reset_sort_to_default();
             self.refresh_archive_view();
             return true;
@@ -2167,20 +2572,22 @@ impl BrowseState {
                 continue;
             }
 
-            // SACD first: the probe is three tiny magic-byte reads.
-            let mtime = entry.modified;
-            let cache_hit = mtime.and_then(|m| {
-                self.sacd_classify_cache
-                    .get(&entry.path)
-                    .filter(|(cached_m, _)| *cached_m == m)
-                    .map(|(_, verdict)| *verdict)
-            });
+            // SACD first: the probe is three tiny magic-byte reads. Cache by
+            // file identity, not just mtime, so coarse timestamp filesystems
+            // cannot reuse a stale negative after a same-tick size change.
+            let sacd_fingerprint = ClassificationFingerprint::from_entry(entry);
+            let cache_hit = self
+                .sacd_classify_cache
+                .get(&entry.path)
+                .filter(|(cached, _)| *cached == sacd_fingerprint)
+                .map(|(_, verdict)| *verdict);
             let is_sacd = if let Some(v) = cache_hit {
                 v
             } else {
                 let v = super::sacd::is_sacd_iso(&entry.path);
-                if let Some(m) = mtime {
-                    self.sacd_classify_cache.insert(entry.path.clone(), (m, v));
+                if v || should_cache_file_classification_negative(&entry.path) {
+                    self.sacd_classify_cache
+                        .insert(entry.path.clone(), (sacd_fingerprint.clone(), v));
                 }
                 v
             };
@@ -2200,8 +2607,10 @@ impl BrowseState {
                 .map(|(_, verdict)| *verdict)
                 .unwrap_or_else(|| {
                     let verdict = crate::disc::dvda_utils::is_dvda_iso(&entry.path);
-                    self.dvda_iso_classify_cache
-                        .insert(entry.path.clone(), (fingerprint.clone(), verdict));
+                    if verdict || should_cache_file_classification_negative(&entry.path) {
+                        self.dvda_iso_classify_cache
+                            .insert(entry.path.clone(), (fingerprint.clone(), verdict));
+                    }
                     verdict
                 });
             if is_dvda {
@@ -2218,8 +2627,10 @@ impl BrowseState {
                 .map(|(_, verdict)| *verdict)
                 .unwrap_or_else(|| {
                     let verdict = crate::disc::dvdv_utils::is_dvdv_iso(&entry.path);
-                    self.dvdv_iso_classify_cache
-                        .insert(entry.path.clone(), (fingerprint.clone(), verdict));
+                    if verdict || should_cache_file_classification_negative(&entry.path) {
+                        self.dvdv_iso_classify_cache
+                            .insert(entry.path.clone(), (fingerprint.clone(), verdict));
+                    }
                     verdict
                 });
             if is_dvdv {
@@ -2236,8 +2647,10 @@ impl BrowseState {
                 .map(|(_, verdict)| *verdict)
                 .unwrap_or_else(|| {
                     let verdict = crate::disc::bluray_utils::is_bluray_iso(&entry.path);
-                    self.bluray_iso_classify_cache
-                        .insert(entry.path.clone(), (fingerprint.clone(), verdict));
+                    if verdict || should_cache_file_classification_negative(&entry.path) {
+                        self.bluray_iso_classify_cache
+                            .insert(entry.path.clone(), (fingerprint.clone(), verdict));
+                    }
                     verdict
                 });
             if is_bluray {
@@ -2255,11 +2668,32 @@ impl BrowseState {
         }
     }
 
-    pub(super) fn classify_scanned_directory_entries(&mut self, dirs: &mut [BrowseEntry]) {
-        for entry in dirs.iter_mut() {
-            classify_dvda_directory_entry(entry, &mut self.dvda_dir_classify_cache);
-            classify_dvdv_directory_entry(entry, &mut self.dvdv_dir_classify_cache);
-            classify_bluray_directory_entry(entry, &mut self.bluray_dir_classify_cache);
+
+    fn classification_cache_snapshot(&self) -> BrowseClassificationCacheSnapshot {
+        BrowseClassificationCacheSnapshot::from_state(self)
+    }
+
+    pub fn apply_classification_cache_updates(&mut self, updates: BrowseClassificationCacheUpdates) {
+        for (path, fingerprint, verdict) in updates.sacd_iso {
+            self.sacd_classify_cache.insert(path, (fingerprint, verdict));
+        }
+        for (path, fingerprint, verdict) in updates.dvda_iso {
+            self.dvda_iso_classify_cache.insert(path, (fingerprint, verdict));
+        }
+        for (path, fingerprint, verdict) in updates.dvdv_iso {
+            self.dvdv_iso_classify_cache.insert(path, (fingerprint, verdict));
+        }
+        for (path, fingerprint, verdict) in updates.bluray_iso {
+            self.bluray_iso_classify_cache.insert(path, (fingerprint, verdict));
+        }
+        for (path, fingerprint, verdict) in updates.dvda_dir {
+            self.dvda_dir_classify_cache.insert(path, (fingerprint, verdict));
+        }
+        for (path, fingerprint, verdict) in updates.dvdv_dir {
+            self.dvdv_dir_classify_cache.insert(path, (fingerprint, verdict));
+        }
+        for (path, fingerprint, verdict) in updates.bluray_dir {
+            self.bluray_dir_classify_cache.insert(path, (fingerprint, verdict));
         }
     }
 
@@ -3303,9 +3737,7 @@ impl BrowseState {
                 let inner_path = self.archive_inner_path_for_entry(&entry);
                 let staged_path = self.archive_staged_path_for_entry(&entry);
                 let fallback_metadata = self
-                    .probe_cache
-                    .get(&entry.path)
-                    .and_then(|cached| cached.as_ref())
+                    .valid_probe_for_entry(&entry)
                     .map(|cached| cached.metadata.clone());
                 ArchiveSearchCandidate {
                     entry,
@@ -3410,9 +3842,7 @@ impl BrowseState {
     fn tag_source_for_entry(&self, entry: &BrowseEntry) -> TagSearchSource {
         if let Some(arc) = self.archive.as_ref() {
             let fallback_metadata = self
-                .probe_cache
-                .get(&entry.path)
-                .and_then(|cached| cached.as_ref())
+                .valid_probe_for_entry(entry)
                 .map(|cached| cached.metadata.clone());
 
             if let Some(staged_path) = self.archive_staged_path_for_entry(entry) {
@@ -3597,7 +4027,12 @@ impl BrowseState {
 
         let matcher = SkimMatcherV2::default();
         let min_score = search_fuzzy_min_score(query);
+        let bounded_filename_score_results = matches!(mode, SearchMode::Filename)
+            && matches!(self.search.sort, SearchSort::Score);
+        let cap = self.search_result_cap.max(1);
         let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
+        let mut bounded_scored = bounded_filename_score_results
+            .then(|| BoundedScoreSearchResults::new(cap, self.search.sort_dir));
         let parent = self.parent_entry.clone();
         let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
         let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
@@ -3631,13 +4066,20 @@ impl BrowseState {
 
             if let Some(score) = best_score {
                 if search_fuzzy_score_passes_threshold(score, min_score) {
-                    scored.push((e.clone(), score));
+                    if let Some(bounded) = bounded_scored.as_mut() {
+                        bounded.push(e.clone(), score);
+                    } else {
+                        scored.push((e.clone(), score));
+                    }
                 }
             }
         }
 
+        if let Some(bounded) = bounded_scored {
+            scored = bounded.into_vec();
+        }
         self.sort_search_results_for_current_context(&mut scored);
-        scored.truncate(self.search_result_cap.max(1));
+        scored.truncate(cap);
 
         let mut results: Vec<BrowseEntry> = Vec::new();
         if let Some(p) = parent {
@@ -3753,7 +4195,7 @@ impl BrowseState {
 
         tokio::spawn(async move {
             let results =
-                tokio::task::spawn_blocking(move || -> Option<Vec<(BrowseEntry, i64)>> {
+                tokio::task::spawn_blocking(move || -> Option<(Vec<(BrowseEntry, i64)>, usize)> {
                     use fuzzy_matcher::skim::SkimMatcherV2;
                     use fuzzy_matcher::FuzzyMatcher;
                     use walkdir::WalkDir;
@@ -3761,6 +4203,11 @@ impl BrowseState {
                     let matcher = SkimMatcherV2::default();
                     let min_score = search_fuzzy_min_score(&query_for_worker);
                     let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
+                    let bounded_filename_score_results = matches!(mode, SearchMode::Filename)
+                        && matches!(sort, SearchSort::Score);
+                    let mut bounded_scored = bounded_filename_score_results
+                        .then(|| BoundedScoreSearchResults::new(result_cap, sort_dir));
+                    let mut total_matches = 0usize;
 
                     // Open own DB connection for tag cache.
                     let db = crate::db::Database::open().ok();
@@ -3842,22 +4289,37 @@ impl BrowseState {
                                 {
                                     cached
                                 } else {
-                                    let r = read_tags_from_file(&path);
-                                    let _ = db.store_cached_tags(
-                                        &path_str,
-                                        mtime,
-                                        size,
-                                        r.title.as_deref(),
-                                        r.artist.as_deref(),
-                                        r.album.as_deref(),
-                                        r.genre.as_deref(),
-                                        r.year.as_deref(),
-                                        &r.tag_string,
-                                    );
-                                    r.tag_string
+                                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                        return None;
+                                    }
+                                    match read_tags_from_file_checked(&path) {
+                                        Ok(r) => {
+                                            // A readable file with no tags is deterministic for
+                                            // this identity and may be cached. Lofty/open errors
+                                            // are transient and deliberately stay out of SQLite.
+                                            let _ = db.store_cached_tags(
+                                                &path_str,
+                                                mtime,
+                                                size,
+                                                r.title.as_deref(),
+                                                r.artist.as_deref(),
+                                                r.album.as_deref(),
+                                                r.genre.as_deref(),
+                                                r.year.as_deref(),
+                                                &r.tag_string,
+                                            );
+                                            r.tag_string
+                                        }
+                                        Err(_) => String::new(),
+                                    }
                                 }
                             } else {
-                                read_tags_from_file(&path).tag_string
+                                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return None;
+                                }
+                                read_tags_from_file_checked(&path)
+                                    .map(|tags| tags.tag_string)
+                                    .unwrap_or_default()
                             };
 
                             if !tag_str.is_empty() {
@@ -3870,20 +4332,29 @@ impl BrowseState {
 
                         if let Some(score) = best_score {
                             if search_fuzzy_score_passes_threshold(score, min_score) {
-                                scored.push((candidate, score));
+                                total_matches = total_matches.saturating_add(1);
+                                if let Some(bounded) = bounded_scored.as_mut() {
+                                    bounded.push(candidate, score);
+                                } else {
+                                    scored.push((candidate, score));
+                                }
                             }
                         }
                     }
 
-                    Some(scored)
+                    if let Some(bounded) = bounded_scored {
+                        scored = bounded.into_vec();
+                    } else {
+                        total_matches = scored.len();
+                    }
+                    Some((scored, total_matches))
                 })
                 .await
                 .unwrap_or(None);
 
             // Only send results if not cancelled. The reducer still validates
             // the complete launch identity before mutating Browse state.
-            if let Some(results) = results {
-                let total_matches = results.len();
+            if let Some((results, total_matches)) = results {
                 let _ = tx
                     .send(crate::tui::message::AppMessage::SearchComplete {
                         generation,
@@ -3918,6 +4389,9 @@ impl BrowseState {
         self.multi_select_anchor = None;
         self.clear_type_ahead();
         self.clear_pending_inline_rename_after_scan();
+        self.probe_debounce = None;
+        self.clear_browse_cold_probe_queue();
+        self.clear_dir_stats_work_queue();
         self.clear_search_tag_cache();
     }
 
@@ -4042,8 +4516,260 @@ impl BrowseState {
         self.selected_index
     }
 
+    /// Best-effort current filesystem identity for a probeable entry. A focused
+    /// cache hit pays one cheap metadata stat so external edits cannot keep
+    /// stale in-memory probe data alive until a full directory refresh.
+    fn current_filesystem_probe_identity(entry: &BrowseEntry) -> Option<ProbeCacheIdentity> {
+        std::fs::metadata(&entry.path)
+            .ok()
+            .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+    }
+
+    /// Classify whether a filesystem-backed async completion still applies.
+    /// This implements the Browse stale-result invariant: same identity accepts,
+    /// changed identity invalidates and may be re-evaluated once, and missing or
+    /// unreadable paths stop without retrying until a scan/refresh supplies a
+    /// valid entry again.
+    pub fn classify_filesystem_async_completion(
+        &self,
+        path: &Path,
+        launched_identity: ProbeCacheIdentity,
+    ) -> FilesystemAsyncCompletion {
+        match std::fs::metadata(path)
+            .ok()
+            .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+        {
+            Some(current) if current == launched_identity => FilesystemAsyncCompletion::Accept,
+            Some(_) => FilesystemAsyncCompletion::Changed,
+            None => FilesystemAsyncCompletion::MissingOrUnstatable,
+        }
+    }
+
+    /// A stale completion is allowed to trigger exactly one fresh evaluation
+    /// only while the same path remains focused and is still statable.
+    pub fn current_entry_is_still_statable(&self, path: &Path) -> bool {
+        self.is_current_entry_path(path) && std::fs::metadata(path).is_ok()
+    }
+
+    /// Return a valid in-memory probe-cache value for `entry`, removing stale
+    /// path hits whose recorded identity no longer matches the current entry.
+    fn cached_probe_for_entry(
+        &mut self,
+        entry: &BrowseEntry,
+        identity: ProbeCacheIdentity,
+    ) -> Option<Option<Arc<CachedInfo>>> {
+        match self.probe_cache.get(&entry.path) {
+            Some(cached) if cached.is_valid_for(identity) => Some(cached.info.clone()),
+            Some(_) => {
+                self.remove_probe_cache_entry(&entry.path);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn has_valid_probe_cache_entry(&mut self, entry: &BrowseEntry, identity: ProbeCacheIdentity) -> bool {
+        self.cached_probe_for_entry(entry, identity).is_some()
+    }
+
+    /// Identity-checked probe info for a Browse entry. This is the canonical
+    /// read path for rendering, search, sorting, and info-pane consumers.
+    pub fn valid_probe_for_entry(&self, entry: &BrowseEntry) -> Option<&CachedInfo> {
+        self.valid_probe_arc_for_entry(entry).map(|info| info.as_ref())
+    }
+
+    /// Identity-checked probe info as an `Arc`, for callers that must keep the
+    /// cache value alive after leaving the borrowed state.
+    pub fn valid_probe_arc_for_entry(&self, entry: &BrowseEntry) -> Option<&Arc<CachedInfo>> {
+        let identity = ProbeCacheIdentity::from_entry(entry);
+        self.valid_probe_arc_for_identity(&entry.path, identity)
+    }
+
+    /// Identity-checked probe info for a path/fingerprint pair. Use this when
+    /// the caller already captured the current file identity from metadata.
+    pub fn valid_probe_arc_for_identity(
+        &self,
+        path: &Path,
+        identity: ProbeCacheIdentity,
+    ) -> Option<&Arc<CachedInfo>> {
+        self.probe_cache
+            .get(path)
+            .filter(|cached| cached.is_valid_for(identity))
+            .and_then(|cached| cached.info.as_ref())
+    }
+
+    /// True for either a cached hit or deterministic negative with the same
+    /// identity. Cold probe scheduling uses this to avoid retrying known
+    /// non-audio files until the file changes.
+    pub fn has_probe_cache_entry_for_identity(
+        &self,
+        path: &Path,
+        identity: ProbeCacheIdentity,
+    ) -> bool {
+        self.probe_cache
+            .get(path)
+            .map(|cached| cached.is_valid_for(identity))
+            .unwrap_or(false)
+    }
+
+    /// Insert a probe cache hit or miss for an explicit file identity. All
+    /// production writes should go through this helper so the cache cannot
+    /// regress to path-only semantics.
+    pub fn insert_probe_for_identity(
+        &mut self,
+        path: PathBuf,
+        identity: ProbeCacheIdentity,
+        info: Option<Arc<CachedInfo>>,
+    ) {
+        self.transient_probe_failures.remove(&path);
+        self.probe_cache.insert(path, ProbeCacheEntry { identity, info });
+    }
+
+    fn insert_probe_cache_hit(
+        &mut self,
+        path: PathBuf,
+        identity: ProbeCacheIdentity,
+        info: CachedInfo,
+    ) -> Arc<CachedInfo> {
+        let info = Arc::new(info);
+        self.insert_probe_for_identity(path, identity, Some(info.clone()));
+        info
+    }
+
+    pub fn insert_probe_miss_for_identity(&mut self, path: PathBuf, identity: ProbeCacheIdentity) {
+        self.insert_probe_for_identity(path, identity, None);
+    }
+
+    /// Remove all in-memory probe state for a path, including pending
+    /// Look up cached probe duration for a path (used by gnudb disc ID).
+    pub fn probe_duration_for_path(&self, path: &Path) -> Option<f64> {
+        self.probe_cache
+            .get(path)
+            .and_then(|cached| cached.info.as_ref())
+            .map(|info| info.source.duration_secs)
+    }
+
+    /// enrichment metadata and transient retry backoff. This is the canonical
+    /// invalidation path for identity-bound probe state.
+    /// Test-only: insert a probe result directly into the cache without
+    /// identity validation.
+    #[cfg(test)]
+    pub fn insert_probe_cache_for_test(&mut self, path: PathBuf, info: Option<Arc<CachedInfo>>) {
+        let entry = ProbeCacheEntry {
+            identity: ProbeCacheIdentity { modified: None, size: 0 },
+            info,
+        };
+        self.probe_cache.insert(path, entry);
+    }
+
+    pub fn remove_probe_cache_entry(&mut self, path: &Path) {
+        self.probe_cache.remove(path);
+        self.probe_cache_needs_metadata_enrichment.remove(path);
+        self.transient_probe_failures.remove(path);
+    }
+
+    fn remember_transient_probe_failure(&mut self, path: PathBuf, identity: ProbeCacheIdentity) {
+        self.transient_probe_failures.insert(path, (identity, Instant::now()));
+    }
+
+    fn has_recent_transient_probe_failure(
+        &mut self,
+        path: &Path,
+        identity: ProbeCacheIdentity,
+    ) -> bool {
+        let Some((cached_identity, recorded_at)) = self.transient_probe_failures.get(path).copied() else {
+            return false;
+        };
+        if cached_identity != identity {
+            self.transient_probe_failures.remove(path);
+            return false;
+        }
+        if recorded_at.elapsed() <= TRANSIENT_PROBE_FAILURE_RETRY_DELAY {
+            return true;
+        }
+        self.transient_probe_failures.remove(path);
+        false
+    }
+
+    pub fn remember_probe_failure_for_identity(
+        &mut self,
+        path: PathBuf,
+        identity: ProbeCacheIdentity,
+        error: &str,
+    ) {
+        match classify_probe_failure_for_negative_cache(error) {
+            NegativeCacheDecision::CacheDeterministic => {
+                // A file with a stable identity but no audio stream is a true
+                // negative for Browse probing. Store it only in memory and only
+                // for this identity; SQLite remains success-only.
+                self.insert_probe_miss_for_identity(path, identity);
+            }
+            NegativeCacheDecision::DoNotCacheTransient => {
+                // Decode/open/extraction failures may succeed later without an
+                // mtime/size change. Keep only a short backoff to prevent a hot
+                // retry loop while the file is locked or transiently unreadable.
+                self.remember_transient_probe_failure(path, identity);
+            }
+        }
+    }
+
+    /// Returns true if `path` is the currently focused Browse entry.
+    pub fn is_current_entry_path(&self, path: &Path) -> bool {
+        self.entries
+            .get(self.selected_index)
+            .map(|entry| same_path(&entry.path, path))
+            .unwrap_or(false)
+    }
+
+    /// A disc-probe launch can fail before a disc fingerprint is available
+    /// (for example, metadata permission errors or a disappeared path). Without
+    /// a fingerprint, the only safe visible applicability proof is that the
+    /// same disc-like row is still selected when the failure arrives.
+    pub fn current_selected_disc_source_matches(&self, path: &Path) -> bool {
+        self.entries
+            .get(self.selected_index)
+            .map(|entry| same_path(&entry.path, path) && entry.is_disc_source())
+            .unwrap_or(false)
+    }
+
+    /// Update cached probe metadata only when the cache entry still matches an
+    /// explicit filesystem identity carried or revalidated by the async caller.
+    /// This is the preferred path for stale-completion-safe metadata enrichment.
+    pub fn update_valid_probe_for_identity(
+        &mut self,
+        path: &Path,
+        identity: ProbeCacheIdentity,
+        update: impl FnOnce(&mut CachedInfo),
+    ) -> bool {
+        let Some(info) = self.valid_probe_arc_for_identity(path, identity).cloned() else {
+            if self.probe_cache.contains_key(path) {
+                self.remove_probe_cache_entry(path);
+            }
+            return false;
+        };
+        let mut updated = (*info).clone();
+        update(&mut updated);
+        self.insert_probe_for_identity(path.to_path_buf(), identity, Some(Arc::new(updated)));
+        true
+    }
+
+    /// Update cached probe metadata only when the cache entry still matches the
+    /// current BrowseEntry identity. Use `update_valid_probe_for_identity` when
+    /// the async result carries a stronger launch or result fingerprint.
+    pub fn update_valid_probe_for_current_path(
+        &mut self,
+        path: &Path,
+        update: impl FnOnce(&mut CachedInfo),
+    ) -> bool {
+        let Some(identity) = self.probe_identity_for_current_entry_path(path) else {
+            self.remove_probe_cache_entry(path);
+            return false;
+        };
+        self.update_valid_probe_for_identity(path, identity, update)
+    }
+
     /// Kick off background lookup for the currently-selected entry:
-    /// - Audio files → `spawn_audio_probe` (lofty + ffmpeg metadata read)
+    /// - Audio files → cached info immediately, otherwise a debounced cold probe
     /// - Subdirectories (not ParentDir) → `spawn_dir_stats` (file count + total size)
     /// - Other kinds → no-op
     ///
@@ -4056,25 +4782,28 @@ impl BrowseState {
     }
 
     /// Probe the current selection, checking the SQLite cache first.
-    /// If the DB has a valid cached probe (matching mtime + size), populates
-    /// the in-memory cache directly and skips the async probe.
+    /// Valid in-memory/SQLite cache hits stay immediate. Cold filesystem
+    /// probes launched from the interactive event loop are delayed briefly so
+    /// rapid cursor motion does not fan out into probes for every crossed row.
     pub fn probe_current_with_db(
         &mut self,
         tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
         db: Option<&crate::db::Database>,
     ) {
-        let entry = match self.entries.get(self.selected_index) {
+        let entry = match self.entries.get(self.selected_index).cloned() {
             Some(e) => e,
             None => return,
         };
 
         if self.archive.is_some() {
+            self.probe_debounce = None;
             if entry.is_audio() {
                 let path = entry.path.clone();
-                if self.probe_cache.contains_key(&path) || self.probe_pending.contains(&path) {
+                let identity = ProbeCacheIdentity::from_entry(&entry);
+                if self.has_valid_probe_cache_entry(&entry, identity) || self.probe_pending.contains(&path) {
                     return;
                 }
-                let Some(inner_path) = self.archive_inner_path_for_entry(entry) else {
+                let Some(inner_path) = self.archive_inner_path_for_entry(&entry) else {
                     return;
                 };
                 let Some(arc) = self.archive.as_ref() else {
@@ -4124,40 +4853,687 @@ impl BrowseState {
 
         if entry.is_probeable() {
             let path = entry.path.clone();
-            if self.probe_cache.contains_key(&path) || self.probe_pending.contains(&path) {
+            let Some(identity) = Self::current_filesystem_probe_identity(&entry) else {
+                // The selected file was removed or became unreadable after the
+                // last scan. Clear stale in-memory state and stop; a later
+                // scan/refresh must provide a valid entry before probing resumes.
+                self.remove_probe_cache_entry(&path);
+                self.probe_debounce = None;
+                self.clear_browse_cold_probe_queue();
+                self.clear_browse_cold_probe_tracking_for(&path);
+                return;
+            };
+
+            if let Some(cached) = self.cached_probe_for_entry(&entry, identity) {
+                if let Some(info) = cached {
+                    self.spawn_cached_probe_metadata_completion_if_needed(&path, identity, info, tx);
+                }
                 return;
             }
 
-            // Check SQLite probe cache before spawning an async probe.
+            if self.has_recent_transient_probe_failure(&path, identity) {
+                return;
+            }
+
+            if self.probe_pending.contains(&path) || self.has_browse_cold_probe_queued_or_active(&path) {
+                return;
+            }
+
+            // Check SQLite probe cache before scheduling a cold probe. Use the
+            // focused file's current identity, not stale scan metadata, so an
+            // external edit invalidates both memory and persistent-cache hits.
             if let Some(db) = db {
-                if let Some(mtime) = entry.modified {
+                if let Some(mtime) = identity.modified {
                     let mtime_unix = crate::db::systemtime_to_unix(mtime);
                     if let Some(row) =
-                        db.get_cached_probe(&path.display().to_string(), mtime_unix, entry.size)
+                        db.get_cached_probe(&path.display().to_string(), mtime_unix, identity.size)
                     {
-                        if let Some(info) = row.to_cached_info(entry.size) {
-                            // The probe row itself is cached, but PE metadata may
-                            // require tag/CUE/catalog file reads. Keep that work
-                            // on the browse probe worker path so cursor movement
-                            // never runs media/tag I/O in the TUI reducer.
+                        if let Some(info) = row.to_cached_info(identity.size) {
+                            // The row itself is cached, but PE metadata may
+                            // require tag/CUE/catalog reads. Keep that work on
+                            // the browse worker path so cursor movement never
+                            // performs media/tag I/O in the TUI reducer.
+                            let info_arc = self.insert_probe_cache_hit(path.clone(), identity, info.clone());
                             self.probe_pending.insert(path.clone());
-                            spawn_cached_audio_probe_metadata_completion(path, info, tx.clone());
+                            spawn_cached_audio_probe_metadata_completion(path, identity, (*info_arc).clone(), tx.clone());
+                            self.probe_debounce = None;
                             return;
                         }
                     }
                 }
-            }
 
-            self.probe_pending.insert(path.clone());
-            spawn_audio_probe(path, tx.clone());
-        } else if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) {
-            let path = entry.path.clone();
-            if self.dir_stats_cache.contains_key(&path) || self.dir_stats_pending.contains(&path) {
+                self.probe_debounce = Some(BrowseProbeDebounce {
+                    path,
+                    deadline: Instant::now() + BROWSE_PROBE_DEBOUNCE,
+                });
                 return;
             }
-            self.dir_stats_pending.insert(path.clone());
-            spawn_dir_stats(path, tx.clone());
+
+            self.schedule_cursor_focused_cold_probe(path, identity, tx);
+        } else if entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir) {
+            self.probe_debounce = None;
+            let path = entry.path.clone();
+            let Some(identity) = Self::current_filesystem_probe_identity(&entry) else {
+                self.remove_dir_stats_cache_entry(&path);
+                self.dir_stats_pending.remove(&path);
+                return;
+            };
+            if self.valid_dir_stats_for_entry(&entry).is_some() || self.dir_stats_pending.contains(&path) {
+                return;
+            }
+            self.schedule_cursor_focused_dir_stats(path, identity, tx);
+        } else {
+            self.probe_debounce = None;
         }
+    }
+
+
+    fn has_browse_cold_probe_queued_or_active(&self, path: &Path) -> bool {
+        self.browse_cold_probe_active
+            .iter()
+            .any(|active| same_path(active, path))
+            || self
+                .browse_cold_probe_queue
+                .iter()
+                .any(|request| same_path(&request.path, path))
+    }
+
+    fn current_probeable_entry_path(&self) -> Option<PathBuf> {
+        self.entries
+            .get(self.selected_index)
+            .filter(|entry| entry.is_probeable())
+            .map(|entry| entry.path.clone())
+    }
+
+    fn discard_stale_queued_browse_cold_probes(&mut self) {
+        let current_path = self.current_probeable_entry_path();
+        let current_generation = self.scan_generation;
+        self.browse_cold_probe_queue.retain(|request| {
+            if request.scan_generation != current_generation {
+                return false;
+            }
+            if !request.cursor_focused {
+                return true;
+            }
+            current_path
+                .as_deref()
+                .map(|path| same_path(path, &request.path))
+                .unwrap_or(false)
+        });
+    }
+
+    fn start_browse_cold_probe_now(
+        &mut self,
+        path: PathBuf,
+        identity: ProbeCacheIdentity,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        self.probe_pending.insert(path.clone());
+        self.browse_cold_probe_active.insert(path.clone());
+        spawn_audio_probe(path, identity, tx.clone());
+    }
+
+    fn schedule_cursor_focused_cold_probe(
+        &mut self,
+        path: PathBuf,
+        identity: ProbeCacheIdentity,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        self.discard_stale_queued_browse_cold_probes();
+        if self.probe_pending.contains(&path) || self.has_browse_cold_probe_queued_or_active(&path) {
+            return;
+        }
+
+        if self.browse_cold_probe_active.len() < BROWSE_COLD_PROBE_MAX_IN_FLIGHT {
+            self.start_browse_cold_probe_now(path, identity, tx);
+            return;
+        }
+
+        // Cursor-focused work is high priority: remove any older copy and put
+        // the current selection at the front. The queue is intentionally small;
+        // if future background prefetch requests are added, they will be the
+        // first to fall off the back under sustained scroll pressure.
+        self.browse_cold_probe_queue
+            .retain(|request| !same_path(&request.path, &path));
+        self.browse_cold_probe_queue.push_front(BrowseColdProbeRequest {
+            path,
+            identity,
+            scan_generation: self.scan_generation,
+            cursor_focused: true,
+        });
+        while self.browse_cold_probe_queue.len() > BROWSE_COLD_PROBE_QUEUE_MAX {
+            self.browse_cold_probe_queue.pop_back();
+        }
+    }
+
+    /// Called when a Browse filesystem probe finishes, regardless of whether
+    /// the result is accepted or discarded. It frees a cold-probe slot and
+    /// starts the highest-priority still-current queued request, if any.
+    pub fn complete_browse_cold_probe(
+        &mut self,
+        path: &Path,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        self.browse_cold_probe_active.retain(|active| !same_path(active, path));
+        self.launch_ready_browse_cold_probes(tx);
+    }
+
+    fn launch_ready_browse_cold_probes(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        self.discard_stale_queued_browse_cold_probes();
+        while self.browse_cold_probe_active.len() < BROWSE_COLD_PROBE_MAX_IN_FLIGHT {
+            let Some(request) = self.browse_cold_probe_queue.pop_front() else {
+                break;
+            };
+            if request.scan_generation != self.scan_generation {
+                continue;
+            }
+            if self.probe_pending.contains(&request.path)
+                || self.browse_cold_probe_active.iter().any(|active| same_path(active, &request.path))
+            {
+                continue;
+            }
+            if request.cursor_focused && !self.is_current_entry_path(&request.path) {
+                continue;
+            }
+
+            let Some(current_identity) = std::fs::metadata(&request.path)
+                .ok()
+                .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+            else {
+                self.remove_probe_cache_entry(&request.path);
+                continue;
+            };
+            if current_identity != request.identity {
+                self.remove_probe_cache_entry(&request.path);
+                if request.cursor_focused && self.is_current_entry_path(&request.path) {
+                    self.schedule_cursor_focused_cold_probe(request.path, current_identity, tx);
+                }
+                continue;
+            }
+
+            self.start_browse_cold_probe_now(request.path, request.identity, tx);
+        }
+    }
+
+    pub fn clear_browse_cold_probe_tracking_for(&mut self, path: &Path) {
+        self.browse_cold_probe_queue
+            .retain(|request| !same_path(&request.path, path));
+        self.browse_cold_probe_active
+            .retain(|active| !same_path(active, path));
+        self.probe_pending.remove(path);
+    }
+
+    pub fn clear_browse_cold_probe_queue(&mut self) {
+        self.browse_cold_probe_queue.clear();
+    }
+
+
+    fn current_directory_entry_path(&self) -> Option<PathBuf> {
+        self.entries
+            .get(self.selected_index)
+            .filter(|entry| entry.is_dir() && !matches!(entry.kind, EntryKind::ParentDir))
+            .map(|entry| entry.path.clone())
+    }
+
+    fn discard_stale_queued_dir_stats(&mut self) {
+        let current_path = self.current_directory_entry_path();
+        let current_generation = self.scan_generation;
+        let mut kept = VecDeque::with_capacity(self.dir_stats_queue.len());
+
+        while let Some(request) = self.dir_stats_queue.pop_front() {
+            let generation_current = request.scan_generation == current_generation;
+            let cursor_still_focused = !request.cursor_focused
+                || current_path
+                    .as_deref()
+                    .map(|path| same_path(path, &request.path))
+                    .unwrap_or(false);
+
+            if generation_current && cursor_still_focused {
+                kept.push_back(request);
+            } else {
+                self.dir_stats_pending.remove(&request.path);
+            }
+        }
+
+        self.dir_stats_queue = kept;
+    }
+
+    fn cancel_stale_active_dir_stats(&mut self) {
+        let current_path = self.current_directory_entry_path();
+        let current_generation = self.scan_generation;
+        let stale_paths: Vec<PathBuf> = self
+            .dir_stats_active
+            .iter()
+            .filter_map(|(path, job)| {
+                let generation_current = job.scan_generation == current_generation;
+                let cursor_still_focused = !job.cursor_focused
+                    || current_path
+                        .as_deref()
+                        .map(|current| same_path(current, path))
+                        .unwrap_or(false);
+                let identity_current = std::fs::metadata(path)
+                    .ok()
+                    .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+                    .map(|identity| identity == job.identity)
+                    .unwrap_or(false);
+
+                if generation_current && cursor_still_focused && identity_current {
+                    None
+                } else {
+                    Some(path.clone())
+                }
+            })
+            .collect();
+
+        for path in stale_paths {
+            if let Some(job) = self.dir_stats_active.remove(&path) {
+                // Recursive stats walks can traverse very large subtrees.
+                // Cancelling stale active jobs frees the single stats slot
+                // quickly instead of waiting for a completion that will be
+                // discarded by identity checks anyway.
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+            self.dir_stats_pending.remove(&path);
+        }
+    }
+
+    fn start_dir_stats_now(
+        &mut self,
+        path: PathBuf,
+        identity: ProbeCacheIdentity,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.dir_stats_pending.insert(path.clone());
+        self.dir_stats_active.insert(
+            path.clone(),
+            DirStatsActiveJob {
+                identity,
+                scan_generation: self.scan_generation,
+                cursor_focused: true,
+                cancel: cancel.clone(),
+            },
+        );
+        spawn_dir_stats(path, identity, cancel, tx.clone());
+    }
+
+    fn schedule_cursor_focused_dir_stats(
+        &mut self,
+        path: PathBuf,
+        identity: ProbeCacheIdentity,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        self.discard_stale_queued_dir_stats();
+        self.cancel_stale_active_dir_stats();
+        if self.dir_stats_pending.contains(&path) {
+            return;
+        }
+        if self.dir_stats_active.len() < BROWSE_DIR_STATS_MAX_IN_FLIGHT {
+            self.start_dir_stats_now(path, identity, tx);
+            return;
+        }
+
+        self.dir_stats_pending.insert(path.clone());
+        self.dir_stats_queue
+            .retain(|request| !same_path(&request.path, &path));
+        self.dir_stats_queue.push_front(DirStatsRequest {
+            path,
+            identity,
+            scan_generation: self.scan_generation,
+            cursor_focused: true,
+        });
+        while self.dir_stats_queue.len() > BROWSE_DIR_STATS_QUEUE_MAX {
+            if let Some(dropped) = self.dir_stats_queue.pop_back() {
+                self.dir_stats_pending.remove(&dropped.path);
+            }
+        }
+    }
+
+    pub fn complete_dir_stats(
+        &mut self,
+        path: &Path,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) -> bool {
+        let was_pending = self.dir_stats_pending.remove(path);
+        if let Some(job) = self.dir_stats_active.remove(path) {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.launch_ready_dir_stats(tx);
+        was_pending
+    }
+
+    fn launch_ready_dir_stats(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        self.discard_stale_queued_dir_stats();
+        self.cancel_stale_active_dir_stats();
+        while self.dir_stats_active.len() < BROWSE_DIR_STATS_MAX_IN_FLIGHT {
+            let Some(request) = self.dir_stats_queue.pop_front() else {
+                break;
+            };
+            if request.scan_generation != self.scan_generation {
+                self.dir_stats_pending.remove(&request.path);
+                continue;
+            }
+            if request.cursor_focused && !self.is_current_entry_path(&request.path) {
+                self.dir_stats_pending.remove(&request.path);
+                continue;
+            }
+            if self.has_valid_dir_stats_for_identity(&request.path, request.identity)
+                || self.dir_stats_active.keys().any(|active| same_path(active, &request.path))
+            {
+                self.dir_stats_pending.remove(&request.path);
+                continue;
+            }
+            let Some(current_identity) = std::fs::metadata(&request.path)
+                .ok()
+                .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+            else {
+                self.dir_stats_pending.remove(&request.path);
+                self.remove_dir_stats_cache_entry(&request.path);
+                continue;
+            };
+            if current_identity != request.identity {
+                self.dir_stats_pending.remove(&request.path);
+                self.remove_dir_stats_cache_entry(&request.path);
+                if request.cursor_focused && self.is_current_entry_path(&request.path) {
+                    self.schedule_cursor_focused_dir_stats(request.path, current_identity, tx);
+                }
+                continue;
+            }
+            self.start_dir_stats_now(request.path, request.identity, tx);
+        }
+    }
+
+    pub fn clear_dir_stats_work_queue(&mut self) {
+        self.dir_stats_queue.clear();
+        for (_, job) in self.dir_stats_active.drain() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.dir_stats_pending.clear();
+    }
+
+    fn spawn_cached_probe_metadata_completion_if_needed(
+        &mut self,
+        path: &Path,
+        identity: ProbeCacheIdentity,
+        info: Arc<CachedInfo>,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        if !self.probe_cache_needs_metadata_enrichment.remove(path) {
+            return;
+        }
+        if self.probe_pending.contains(path) {
+            return;
+        }
+        self.probe_pending.insert(path.to_path_buf());
+        spawn_cached_audio_probe_metadata_completion(
+            path.to_path_buf(),
+            identity,
+            (*info).clone(),
+            tx.clone(),
+        );
+    }
+
+    /// Fire a delayed cold Browse probe once the cursor has rested on the same
+    /// uncached file. This is called by the event loop before rendering.
+    pub fn check_probe_debounce(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        let Some(pending) = self.probe_debounce.clone() else {
+            return;
+        };
+        if Instant::now() < pending.deadline {
+            return;
+        }
+        self.probe_debounce = None;
+
+        if self.archive.is_some() {
+            return;
+        }
+        let Some(entry) = self.entries.get(self.selected_index).cloned() else {
+            return;
+        };
+        if entry.path != pending.path || !entry.is_probeable() {
+            return;
+        }
+        let Some(identity) = Self::current_filesystem_probe_identity(&entry) else {
+            self.remove_probe_cache_entry(&pending.path);
+            self.clear_browse_cold_probe_tracking_for(&pending.path);
+            return;
+        };
+        if self.has_valid_probe_cache_entry(&entry, identity)
+            || self.probe_pending.contains(&pending.path)
+            || self.has_browse_cold_probe_queued_or_active(&pending.path)
+        {
+            return;
+        }
+
+        self.schedule_cursor_focused_cold_probe(pending.path, identity, tx);
+    }
+
+    /// Spawn bounded SQLite probe-cache warm-up for the current scan. The DB
+    /// work runs entirely off the reducer path and completions carry the scan
+    /// generation/path so stale workers cannot merge after navigation.
+    pub fn spawn_probe_cache_warm_from_db(
+        &self,
+        generation: u64,
+        path: PathBuf,
+        tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        let mut candidates = Vec::new();
+        for entry in self.all_files.iter().filter(|entry| entry.is_probeable()) {
+            let identity = ProbeCacheIdentity::from_entry(entry);
+            if self.has_probe_cache_entry_for_identity(&entry.path, identity) {
+                continue;
+            }
+            let Some(mtime) = identity.modified.map(crate::db::systemtime_to_unix) else {
+                continue;
+            };
+            candidates.push((
+                entry.path.display().to_string(),
+                mtime,
+                identity.size,
+                entry.path.clone(),
+                identity,
+            ));
+            if candidates.len() >= PROBE_CACHE_WARM_MAX_CANDIDATES {
+                break;
+            }
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<Vec<ProbeCacheWarmRow>, String> {
+                let db = crate::db::Database::open()?;
+                let mut path_meta = HashMap::with_capacity(candidates.len());
+                let requests: Vec<(String, i64, u64)> = candidates
+                    .into_iter()
+                    .map(|(key, mtime, size, path, identity)| {
+                        path_meta.insert(key.clone(), (path, identity));
+                        (key, mtime, size)
+                    })
+                    .collect();
+
+                let mut warmed = Vec::new();
+                for (key, row) in db.get_cached_probes_for_files(&requests) {
+                    let Some((path, identity)) = path_meta.get(&key).cloned() else {
+                        continue;
+                    };
+                    let current_identity = std::fs::metadata(&path)
+                        .ok()
+                        .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata));
+                    if current_identity != Some(identity) {
+                        continue;
+                    }
+                    if let Some(info) = row.to_cached_info(identity.size) {
+                        warmed.push(ProbeCacheWarmRow { path, identity, info });
+                    }
+                }
+                Ok(warmed)
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(format!("probe-cache warm task panicked: {}", join_err)));
+
+            let Ok(rows) = result else { return; };
+            for chunk in rows.chunks(PROBE_CACHE_WARM_MESSAGE_CHUNK) {
+                let _ = tx
+                    .send(crate::tui::message::AppMessage::ProbeCacheWarmComplete {
+                        generation,
+                        path: path.clone(),
+                        rows: chunk.to_vec(),
+                    })
+                    .await;
+            }
+        });
+    }
+
+    pub fn is_current_directory_generation(&self, generation: u64, path: &Path) -> bool {
+        self.scan_generation == generation && same_path(&self.current_dir, path)
+    }
+
+    pub fn probe_identity_for_current_entry_path(&self, path: &Path) -> Option<ProbeCacheIdentity> {
+        self.entries
+            .iter()
+            .chain(self.all_files.iter())
+            .chain(self.all_dirs.iter())
+            .find(|entry| same_path(&entry.path, path))
+            .map(ProbeCacheIdentity::from_entry)
+    }
+
+    fn merge_probe_cache_warm_row(&mut self, row: ProbeCacheWarmRow) -> bool {
+        let Some(current_identity) = self.probe_identity_for_current_entry_path(&row.path) else {
+            return false;
+        };
+        if current_identity != row.identity {
+            return false;
+        }
+        if let Some(cached) = self.probe_cache.get(&row.path) {
+            if cached.is_valid_for(row.identity) || cached.is_valid_for(current_identity) {
+                return false;
+            }
+        }
+        self.insert_probe_for_identity(
+            row.path.clone(),
+            row.identity,
+            Some(Arc::new(row.info)),
+        );
+        self.probe_cache_needs_metadata_enrichment.insert(row.path);
+        true
+    }
+
+    pub fn merge_probe_cache_warm_rows(&mut self, rows: Vec<ProbeCacheWarmRow>) -> usize {
+        let mut merged = 0usize;
+        for row in rows {
+            if self.merge_probe_cache_warm_row(row) {
+                merged = merged.saturating_add(1);
+            }
+        }
+        merged
+    }
+
+    pub fn enqueue_probe_cache_warm_rows(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        rows: Vec<ProbeCacheWarmRow>,
+    ) -> usize {
+        if rows.is_empty() || !self.is_current_directory_generation(generation, &path) {
+            return 0;
+        }
+        let count = rows.len();
+        self.probe_cache_warm_pending.push_back(ProbeCacheWarmBatch {
+            generation,
+            path,
+            rows: rows.into_iter().collect(),
+        });
+        count
+    }
+
+    pub fn drain_probe_cache_warm_rows_for_frame(&mut self) -> (usize, bool) {
+        let mut inspected = 0usize;
+        let mut merged = 0usize;
+
+        while inspected < PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME {
+            let Some(mut batch) = self.probe_cache_warm_pending.pop_front() else {
+                break;
+            };
+
+            if !self.is_current_directory_generation(batch.generation, &batch.path) {
+                continue;
+            }
+
+            while inspected < PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME {
+                let Some(row) = batch.rows.pop_front() else {
+                    break;
+                };
+                inspected = inspected.saturating_add(1);
+                if self.merge_probe_cache_warm_row(row) {
+                    merged = merged.saturating_add(1);
+                }
+            }
+
+            if !batch.rows.is_empty() {
+                self.probe_cache_warm_pending.push_front(batch);
+                break;
+            }
+        }
+
+        if merged > 0 {
+            self.mark_probe_cache_update_pending(true);
+        }
+
+        (merged, !self.probe_cache_warm_pending.is_empty())
+    }
+
+    pub fn has_probe_cache_warm_backlog(&self) -> bool {
+        !self.probe_cache_warm_pending.is_empty()
+    }
+
+    pub fn clear_probe_cache_warm_backlog(&mut self) {
+        self.probe_cache_warm_pending.clear();
+    }
+
+    pub fn mark_probe_cache_update_pending(&mut self, refresh_current: bool) {
+        self.deferred_work.probe_backed_resort_needed = true;
+        if self.active_search_depends_on_tag_or_probe_metadata() {
+            self.deferred_work.search_reapply_needed = true;
+        }
+        if !self.search.active && self.sort_by.uses_probe_cache() {
+            self.deferred_work.visible_entries_changed = true;
+        }
+        if refresh_current {
+            self.deferred_work.info_pane_changed = true;
+        }
+    }
+
+    pub fn mark_visible_entries_changed_pending(&mut self) {
+        self.deferred_work.visible_entries_changed = true;
+    }
+
+    pub fn mark_classification_changed_pending(&mut self) {
+        self.deferred_work.classification_changed = true;
+        self.deferred_work.visible_entries_changed = true;
+    }
+
+    pub fn take_browse_deferred_work(&mut self) -> BrowseDeferredWorkFlags {
+        std::mem::take(&mut self.deferred_work)
+    }
+
+    pub fn take_probe_cache_deferred_work(&mut self) -> (bool, bool) {
+        let work = self.take_browse_deferred_work();
+        (
+            work.probe_backed_resort_needed || work.search_reapply_needed || work.visible_entries_changed,
+            work.info_pane_changed,
+        )
     }
 
     /// Current archive-entry probe epoch for `archive_path`. Missing entries
@@ -4227,16 +5603,44 @@ impl BrowseState {
         if !entry.is_probeable() {
             return None;
         }
-        self.probe_cache.get(&entry.path)?.as_ref()
+        self.valid_probe_arc_for_entry(entry)
     }
 
     /// Get cached directory stats for the current selection (if it's a directory)
     pub fn current_dir_stats(&self) -> Option<&Arc<DirStats>> {
         let entry = self.entries.get(self.selected_index)?;
+        self.valid_dir_stats_for_entry(entry)
+    }
+
+    pub fn valid_dir_stats_for_entry(&self, entry: &BrowseEntry) -> Option<&Arc<DirStats>> {
         if !matches!(entry.kind, EntryKind::Directory) {
             return None;
         }
-        self.dir_stats_cache.get(&entry.path)
+        let identity = ProbeCacheIdentity::from_entry(entry);
+        self.dir_stats_cache
+            .get(&entry.path)
+            .filter(|cached| cached.is_valid_for(identity))
+            .map(|cached| &cached.stats)
+    }
+
+    pub fn has_valid_dir_stats_for_identity(&self, path: &Path, identity: ProbeCacheIdentity) -> bool {
+        self.dir_stats_cache
+            .get(path)
+            .is_some_and(|cached| cached.is_valid_for(identity))
+    }
+
+    pub fn insert_dir_stats_for_identity(
+        &mut self,
+        path: PathBuf,
+        identity: ProbeCacheIdentity,
+        stats: DirStats,
+    ) {
+        self.dir_stats_cache
+            .insert(path, DirStatsCacheEntry::new(identity, stats));
+    }
+
+    pub fn remove_dir_stats_cache_entry(&mut self, path: &Path) {
+        self.dir_stats_cache.remove(path);
     }
 }
 
@@ -4246,6 +5650,7 @@ impl BrowseState {
 /// message reducers on the TUI thread.
 fn spawn_cached_audio_probe_metadata_completion(
     path: PathBuf,
+    identity: ProbeCacheIdentity,
     mut info: CachedInfo,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
@@ -4264,7 +5669,9 @@ fn spawn_cached_audio_probe_metadata_completion(
         let _ = tx
             .send(crate::tui::message::AppMessage::AudioProbeComplete {
                 path,
-                context: crate::tui::message::AudioProbeContext::Filesystem,
+                context: crate::tui::message::AudioProbeContext::Filesystem {
+                    identity: Some(identity),
+                },
                 result: Box::new(result),
             })
             .await;
@@ -4432,7 +5839,11 @@ async fn extract_archive_entry_to_temp(
 /// performs external pre-emphasis metadata enrichment; only failed metadata
 /// reads get a single fallback PE check so successful fresh probes do not
 /// duplicate tag/CUE/catalog work.
-pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>) {
+pub fn spawn_audio_probe(
+    path: PathBuf,
+    identity: ProbeCacheIdentity,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
     if is_cue_sheet_path(&path) {
         // Defense in depth: callers should route CUE preview through
         // `spawn_cue_proxy_audio_probe`, but never allow a `.cue` text file to
@@ -4460,7 +5871,9 @@ pub fn spawn_audio_probe(path: PathBuf, tx: tokio::sync::mpsc::Sender<crate::tui
         let _ = tx
             .send(crate::tui::message::AppMessage::AudioProbeComplete {
                 path,
-                context: crate::tui::message::AudioProbeContext::Filesystem,
+                context: crate::tui::message::AudioProbeContext::Filesystem {
+                    identity: Some(identity),
+                },
                 result: Box::new(result),
             })
             .await;
@@ -4498,7 +5911,7 @@ pub fn spawn_cue_proxy_audio_probe(
         let _ = tx
             .send(crate::tui::message::AppMessage::AudioProbeComplete {
                 path,
-                context: crate::tui::message::AudioProbeContext::Filesystem,
+                context: crate::tui::message::AudioProbeContext::Filesystem { identity: None },
                 result: Box::new(result),
             })
             .await;
@@ -4511,15 +5924,33 @@ pub fn spawn_cue_proxy_audio_probe(
 /// runs on `spawn_blocking` so it doesn't tie up an async worker thread —
 /// the original sync version was the source of the Phase 4d UI freeze on
 /// large directories like ~/Downloads.
-pub fn spawn_dir_stats(path: PathBuf, tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>) {
+pub fn spawn_dir_stats(
+    path: PathBuf,
+    identity: ProbeCacheIdentity,
+    cancel: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
     tokio::spawn(async move {
         let path_for_task = path.clone();
-        let stats = tokio::task::spawn_blocking(move || compute_dir_stats(&path_for_task))
-            .await
-            .unwrap_or_default();
+        let cancel_for_task = cancel.clone();
+        let stats = tokio::task::spawn_blocking(move || {
+            compute_dir_stats(&path_for_task, &cancel_for_task)
+        })
+        .await
+        .unwrap_or(None);
+
+        let (stats, cancelled) = match stats {
+            Some(stats) => (stats, false),
+            None => (DirStats::default(), true),
+        };
 
         let _ = tx
-            .send(crate::tui::message::AppMessage::DirStatsComplete { path, stats })
+            .send(crate::tui::message::AppMessage::DirStatsComplete {
+                path,
+                identity,
+                stats,
+                cancelled,
+            })
             .await;
     });
 }
@@ -4528,10 +5959,11 @@ pub fn spawn_dir_stats(path: PathBuf, tx: tokio::sync::mpsc::Sender<crate::tui::
 /// entry) runs on `spawn_blocking`. Respects the cancel flag — checks every
 /// 50 entries and aborts early if set. Sends `DirScanComplete` when done.
 /// Wrapped in a 30-second timeout.
-pub fn spawn_dir_scan(
+fn spawn_dir_scan(
     path: PathBuf,
     generation: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    classification_cache: BrowseClassificationCacheSnapshot,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
     tokio::spawn(async move {
@@ -4540,17 +5972,20 @@ pub fn spawn_dir_scan(
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || scan_directory_blocking(&scan_path, &cancel_flag)),
+            tokio::task::spawn_blocking(move || {
+                scan_directory_blocking(&scan_path, &cancel_flag, &classification_cache)
+            }),
         )
         .await;
 
-        let (parent_entry, dirs, files, error) = match result {
-            Ok(Ok(Ok((parent, dirs, files)))) => (parent, dirs, files, None),
-            Ok(Ok(Err(e))) => (None, Vec::new(), Vec::new(), Some(e)),
+        let (parent_entry, dirs, files, classification_updates, error) = match result {
+            Ok(Ok(Ok((parent, dirs, files, updates)))) => (parent, dirs, files, updates, None),
+            Ok(Ok(Err(e))) => (None, Vec::new(), Vec::new(), BrowseClassificationCacheUpdates::default(), Some(e)),
             Ok(Err(join_err)) => (
                 None,
                 Vec::new(),
                 Vec::new(),
+                BrowseClassificationCacheUpdates::default(),
                 Some(format!("scan task panicked: {}", join_err)),
             ),
             Err(_timeout) => {
@@ -4559,6 +5994,7 @@ pub fn spawn_dir_scan(
                     None,
                     Vec::new(),
                     Vec::new(),
+                    BrowseClassificationCacheUpdates::default(),
                     Some("scan timed out (30s)".into()),
                 )
             }
@@ -4571,10 +6007,170 @@ pub fn spawn_dir_scan(
                 parent_entry,
                 dirs,
                 files,
+                classification_updates,
                 error,
             })
             .await;
     });
+}
+
+
+fn classify_scanned_entry_blocking(
+    entry: &mut BrowseEntry,
+    cache: &BrowseClassificationCacheSnapshot,
+    updates: &mut BrowseClassificationCacheUpdates,
+) {
+    if matches!(&entry.kind, EntryKind::Directory) {
+        classify_scanned_directory_entry_blocking(entry, cache, updates);
+    } else if matches!(&entry.kind, EntryKind::Archive) {
+        classify_scanned_iso_entry_blocking(entry, cache, updates);
+    }
+}
+
+fn classify_scanned_iso_entry_blocking(
+    entry: &mut BrowseEntry,
+    cache: &BrowseClassificationCacheSnapshot,
+    updates: &mut BrowseClassificationCacheUpdates,
+) {
+    let is_iso = entry
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("iso"))
+        .unwrap_or(false);
+    if !is_iso {
+        return;
+    }
+
+    let sacd_fingerprint = ClassificationFingerprint::from_entry(entry);
+    let is_sacd = cache
+        .sacd_iso
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == sacd_fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::tui::sacd::is_sacd_iso(&entry.path);
+            if verdict || should_cache_file_classification_negative(&entry.path) {
+                updates
+                    .sacd_iso
+                    .push((entry.path.clone(), sacd_fingerprint.clone(), verdict));
+            }
+            verdict
+        });
+    if is_sacd {
+        entry.kind = EntryKind::SacdIso;
+        return;
+    }
+
+    let fingerprint = ClassificationFingerprint::from_entry(entry);
+    let is_dvda = cache
+        .dvda_iso
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::disc::dvda_utils::is_dvda_iso(&entry.path);
+            if verdict || should_cache_file_classification_negative(&entry.path) {
+                updates.dvda_iso.push((entry.path.clone(), fingerprint.clone(), verdict));
+            }
+            verdict
+        });
+    if is_dvda {
+        entry.kind = EntryKind::DvdAudioIso;
+        return;
+    }
+
+    let is_dvdv = cache
+        .dvdv_iso
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::disc::dvdv_utils::is_dvdv_iso(&entry.path);
+            if verdict || should_cache_file_classification_negative(&entry.path) {
+                updates.dvdv_iso.push((entry.path.clone(), fingerprint.clone(), verdict));
+            }
+            verdict
+        });
+    if is_dvdv {
+        entry.kind = EntryKind::DvdVideoIso;
+        return;
+    }
+
+    let is_bluray = cache
+        .bluray_iso
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::disc::bluray_utils::is_bluray_iso(&entry.path);
+            if verdict || should_cache_file_classification_negative(&entry.path) {
+                updates.bluray_iso.push((entry.path.clone(), fingerprint.clone(), verdict));
+            }
+            verdict
+        });
+    if is_bluray {
+        entry.kind = EntryKind::BlurayIso;
+    }
+}
+
+fn classify_scanned_directory_entry_blocking(
+    entry: &mut BrowseEntry,
+    cache: &BrowseClassificationCacheSnapshot,
+    updates: &mut BrowseClassificationCacheUpdates,
+) {
+    let dvda_fingerprint = dvda_directory_classification_fingerprint(entry);
+    let is_dvda = cache
+        .dvda_dir
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == dvda_fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::disc::dvda_utils::is_dvda_directory(&entry.path);
+            if verdict || should_cache_directory_classification_negative(&entry.path) {
+                updates.dvda_dir.push((entry.path.clone(), dvda_fingerprint.clone(), verdict));
+            }
+            verdict
+        });
+    if is_dvda {
+        entry.kind = EntryKind::DvdAudioDir;
+        return;
+    }
+
+    let dvdv_fingerprint = dvdv_directory_classification_fingerprint(entry);
+    let is_dvdv = cache
+        .dvdv_dir
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == dvdv_fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::disc::dvdv_utils::is_dvdv_directory(&entry.path);
+            if verdict || should_cache_directory_classification_negative(&entry.path) {
+                updates.dvdv_dir.push((entry.path.clone(), dvdv_fingerprint.clone(), verdict));
+            }
+            verdict
+        });
+    if is_dvdv {
+        entry.kind = EntryKind::DvdVideoDir;
+        return;
+    }
+
+    let bluray_fingerprint = bluray_directory_classification_fingerprint(entry);
+    let is_bluray = cache
+        .bluray_dir
+        .get(&entry.path)
+        .filter(|(cached, _)| *cached == bluray_fingerprint)
+        .map(|(_, verdict)| *verdict)
+        .unwrap_or_else(|| {
+            let verdict = crate::disc::bluray_utils::is_bluray_directory(&entry.path);
+            if verdict || should_cache_directory_classification_negative(&entry.path) {
+                updates.bluray_dir.push((entry.path.clone(), bluray_fingerprint.clone(), verdict));
+            }
+            verdict
+        });
+    if is_bluray {
+        entry.kind = EntryKind::BlurayDir;
+    }
 }
 
 /// Blocking directory scan — runs on a `spawn_blocking` thread.
@@ -4582,7 +6178,13 @@ pub fn spawn_dir_scan(
 fn scan_directory_blocking(
     dir: &Path,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<(Option<BrowseEntry>, Vec<BrowseEntry>, Vec<BrowseEntry>), String> {
+    classification_cache: &BrowseClassificationCacheSnapshot,
+) -> Result<(
+    Option<BrowseEntry>,
+    Vec<BrowseEntry>,
+    Vec<BrowseEntry>,
+    BrowseClassificationCacheUpdates,
+), String> {
     use std::sync::atomic::Ordering;
 
     let parent_entry = dir.parent().map(|parent| {
@@ -4599,6 +6201,7 @@ fn scan_directory_blocking(
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
+    let mut classification_updates = BrowseClassificationCacheUpdates::default();
 
     for (i, entry) in read.flatten().enumerate() {
         // Check cancellation every 50 entries.
@@ -4631,20 +6234,12 @@ fn scan_directory_blocking(
         let kind = if is_broken_symlink {
             EntryKind::OtherFile
         } else if effective.is_dir() {
-            if crate::disc::dvda_utils::is_dvda_directory(&path) {
-                EntryKind::DvdAudioDir
-            } else if crate::disc::dvdv_utils::is_dvdv_directory(&path) {
-                EntryKind::DvdVideoDir
-            } else {
-                // Blu-ray directory detection is routed through the
-                // browse-state classification cache after the scan completes.
-                EntryKind::Directory
-            }
+            EntryKind::Directory
         } else {
             classify_file(&path)
         };
 
-        let browse_entry = BrowseEntry::new_with_symlink(
+        let mut browse_entry = BrowseEntry::new_with_symlink(
             path,
             name,
             kind.clone(),
@@ -4652,6 +6247,12 @@ fn scan_directory_blocking(
             modified,
             is_symlink,
             is_broken_symlink,
+        );
+
+        classify_scanned_entry_blocking(
+            &mut browse_entry,
+            classification_cache,
+            &mut classification_updates,
         );
 
         if matches!(
@@ -4667,7 +6268,7 @@ fn scan_directory_blocking(
         }
     }
 
-    Ok((parent_entry, dirs, files))
+    Ok((parent_entry, dirs, files, classification_updates))
 }
 
 fn browse_entry_name_is_hidden(name: &str) -> bool {
@@ -4822,7 +6423,7 @@ fn sort_entries(
     entries: &mut [BrowseEntry],
     by: SortBy,
     dir: SortDir,
-    probe_cache: &HashMap<PathBuf, Option<Arc<CachedInfo>>>,
+    probe_cache: &HashMap<PathBuf, ProbeCacheEntry>,
 ) {
     entries.sort_by(|a, b| {
         let a_info = cached_info_for_sort(probe_cache, a);
@@ -4881,12 +6482,17 @@ fn sort_entries(
 }
 
 fn cached_info_for_sort<'a>(
-    probe_cache: &'a HashMap<PathBuf, Option<Arc<CachedInfo>>>,
+    probe_cache: &'a HashMap<PathBuf, ProbeCacheEntry>,
     entry: &BrowseEntry,
 ) -> Option<&'a CachedInfo> {
-    probe_cache
-        .get(&entry.path)
-        .and_then(|cached| cached.as_ref().map(|info| info.as_ref()))
+    let identity = ProbeCacheIdentity::from_entry(entry);
+    probe_cache.get(&entry.path).and_then(|cached| {
+        if cached.is_valid_for(identity) {
+            cached.info.as_ref().map(|info| info.as_ref())
+        } else {
+            None
+        }
+    })
 }
 
 fn audio_format_sort_value(entry: &BrowseEntry, cached: Option<&CachedInfo>) -> Option<String> {
@@ -4969,13 +6575,20 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
 /// Walks recursively into all subdirectories. Symlinks are skipped (avoids
 /// loops). Bounded by `MAX_WALK_DEPTH` and `MAX_WALK_FILES` to prevent
 /// runaway computation on huge trees. Always called from a background task.
-fn compute_dir_stats(path: &Path) -> DirStats {
+fn compute_dir_stats(path: &Path, cancel: &AtomicBool) -> Option<DirStats> {
     const MAX_WALK_DEPTH: u32 = 20;
     const MAX_WALK_FILES: usize = 1_000_000;
 
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
     let mut stats = DirStats::default();
-    walk_dir_for_stats(path, &mut stats, 0, MAX_WALK_DEPTH, MAX_WALK_FILES);
-    stats
+    if walk_dir_for_stats(path, &mut stats, 0, MAX_WALK_DEPTH, MAX_WALK_FILES, cancel) {
+        Some(stats)
+    } else {
+        None
+    }
 }
 
 /// Recursive helper for `compute_dir_stats`. Stops descending when:
@@ -4990,15 +6603,22 @@ fn walk_dir_for_stats(
     depth: u32,
     max_depth: u32,
     max_files: usize,
-) {
+    cancel: &AtomicBool,
+) -> bool {
+    if cancel.load(Ordering::Relaxed) {
+        return false;
+    }
     if depth >= max_depth || stats.file_count >= max_files {
-        return;
+        return true;
     }
     let read = match fs::read_dir(path) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return true,
     };
     for entry in read.flatten() {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
         let file_type = match entry.file_type() {
             Ok(t) => t,
             Err(_) => continue,
@@ -5014,16 +6634,19 @@ fn walk_dir_for_stats(
                     stats.audio_count += 1;
                 }
                 if stats.file_count >= max_files {
-                    return;
+                    return true;
                 }
             }
         } else if file_type.is_dir() {
-            walk_dir_for_stats(&entry.path(), stats, depth + 1, max_depth, max_files);
+            if !walk_dir_for_stats(&entry.path(), stats, depth + 1, max_depth, max_files, cancel) {
+                return false;
+            }
             if stats.file_count >= max_files {
-                return;
+                return true;
             }
         }
     }
+    true
 }
 
 impl Default for BrowseState {
@@ -5168,7 +6791,13 @@ fn build_tag_search_string_cached(
         }
     }
 
-    let result = read_tags_from_file(path);
+    let result = match read_tags_from_file_checked(path) {
+        Ok(result) => result,
+        Err(_) => {
+            tag_cache.remove(path);
+            return String::new();
+        }
+    };
     tag_cache.insert(
         path.to_path_buf(),
         CachedTagSearchString {
@@ -5245,22 +6874,17 @@ impl TagReadResult {
 }
 
 /// Read tag fields from a file via lofty. Returns concatenated search
-/// string plus individual fields for caching and sorting.
-fn read_tags_from_file(path: &Path) -> TagReadResult {
+/// string plus individual fields for caching and sorting. An empty successful
+/// result means the file was readable but had no usable tags, which is
+/// deterministic for the current identity. A read/open error is transient and
+/// must not be written to SQLite or other long-lived caches.
+fn read_tags_from_file_checked(path: &Path) -> Result<TagReadResult, String> {
     use lofty::file::TaggedFileExt;
     use lofty::tag::Accessor;
 
-    let tagged = match lofty::read_from_path(path) {
-        Ok(t) => t,
-        Err(_) => {
-            return TagReadResult::empty()
-        }
-    };
-    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        Some(t) => t,
-        None => {
-            return TagReadResult::empty()
-        }
+    let tagged = lofty::read_from_path(path).map_err(|err| format!("tag read failed: {err}"))?;
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return Ok(TagReadResult::empty());
     };
 
     let title = tag.title().map(|s| s.to_string());
@@ -5286,14 +6910,18 @@ fn read_tags_from_file(path: &Path) -> TagReadResult {
         parts.push(v);
     }
 
-    TagReadResult {
+    Ok(TagReadResult {
         tag_string: parts.join(" ").to_lowercase(),
         title,
         artist,
         album,
         genre,
         year,
-    }
+    })
+}
+
+fn read_tags_from_file(path: &Path) -> TagReadResult {
+    read_tags_from_file_checked(path).unwrap_or_else(|_| TagReadResult::empty())
 }
 
 fn read_tags_from_archive_entry(
@@ -6476,6 +8104,24 @@ fn is_same_directory_key_for_queue(left_key: &Path, right_file: &Path) -> bool {
 }
 
 
+
+fn dvda_directory_classification_fingerprint(entry: &BrowseEntry) -> ClassificationFingerprint {
+    let marker = entry.path.join("AUDIO_TS").join("AUDIO_TS.IFO");
+    std::fs::metadata(&marker)
+        .ok()
+        .map(|m| ClassificationFingerprint::from_metadata(&m))
+        .unwrap_or_else(|| ClassificationFingerprint::from_entry(entry))
+}
+
+fn dvdv_directory_classification_fingerprint(entry: &BrowseEntry) -> ClassificationFingerprint {
+    let marker = crate::disc::dvdv_utils::directory_video_ts_file_path(&entry.path, "VIDEO_TS.IFO");
+    marker
+        .as_ref()
+        .and_then(|marker| std::fs::metadata(marker).ok())
+        .map(|m| ClassificationFingerprint::from_metadata(&m))
+        .unwrap_or_else(|| ClassificationFingerprint::from_entry(entry))
+}
+
 fn classify_dvda_directory_entry(
     entry: &mut BrowseEntry,
     cache: &mut HashMap<PathBuf, (ClassificationFingerprint, bool)>,
@@ -6483,11 +8129,7 @@ fn classify_dvda_directory_entry(
     if !matches!(entry.kind, EntryKind::Directory | EntryKind::DvdAudioDir) {
         return;
     }
-    let marker = entry.path.join("AUDIO_TS").join("AUDIO_TS.IFO");
-    let fingerprint = std::fs::metadata(&marker)
-        .ok()
-        .map(|m| ClassificationFingerprint::from_metadata(&m))
-        .unwrap_or_else(|| ClassificationFingerprint::from_entry(entry));
+    let fingerprint = dvda_directory_classification_fingerprint(entry);
 
     let is_dvda = cache
         .get(&entry.path)
@@ -6495,7 +8137,9 @@ fn classify_dvda_directory_entry(
         .map(|(_, verdict)| *verdict)
         .unwrap_or_else(|| {
             let verdict = crate::disc::dvda_utils::is_dvda_directory(&entry.path);
-            cache.insert(entry.path.clone(), (fingerprint.clone(), verdict));
+            if verdict || should_cache_directory_classification_negative(&entry.path) {
+                cache.insert(entry.path.clone(), (fingerprint.clone(), verdict));
+            }
             verdict
         });
     if is_dvda {
@@ -6512,12 +8156,7 @@ fn classify_dvdv_directory_entry(
     if !matches!(entry.kind, EntryKind::Directory | EntryKind::DvdVideoDir) {
         return;
     }
-    let marker = crate::disc::dvdv_utils::directory_video_ts_file_path(&entry.path, "VIDEO_TS.IFO");
-    let fingerprint = marker
-        .as_ref()
-        .and_then(|marker| std::fs::metadata(marker).ok())
-        .map(|m| ClassificationFingerprint::from_metadata(&m))
-        .unwrap_or_else(|| ClassificationFingerprint::from_entry(entry));
+    let fingerprint = dvdv_directory_classification_fingerprint(entry);
 
     let is_dvdv = cache
         .get(&entry.path)
@@ -6525,7 +8164,9 @@ fn classify_dvdv_directory_entry(
         .map(|(_, verdict)| *verdict)
         .unwrap_or_else(|| {
             let verdict = crate::disc::dvdv_utils::is_dvdv_directory(&entry.path);
-            cache.insert(entry.path.clone(), (fingerprint.clone(), verdict));
+            if verdict || should_cache_directory_classification_negative(&entry.path) {
+                cache.insert(entry.path.clone(), (fingerprint.clone(), verdict));
+            }
             verdict
         });
     if is_dvdv {
@@ -6550,7 +8191,9 @@ fn classify_bluray_directory_entry(
         .map(|(_, verdict)| *verdict)
         .unwrap_or_else(|| {
             let verdict = crate::disc::bluray_utils::is_bluray_directory(&entry.path);
-            cache.insert(entry.path.clone(), (fingerprint.clone(), verdict));
+            if verdict || should_cache_directory_classification_negative(&entry.path) {
+                cache.insert(entry.path.clone(), (fingerprint.clone(), verdict));
+            }
             verdict
         });
     if is_bluray {
@@ -6624,6 +8267,44 @@ pub(super) fn is_cue_sheet_path(path: &Path) -> bool {
 
 fn is_audio_file_path(path: &Path) -> bool {
     matches!(classify_file(path), EntryKind::AudioFile(_))
+}
+
+
+pub fn classify_probe_failure_for_negative_cache(error: &str) -> NegativeCacheDecision {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("no audio stream found") {
+        NegativeCacheDecision::CacheDeterministic
+    } else {
+        NegativeCacheDecision::DoNotCacheTransient
+    }
+}
+
+fn file_classification_negative_cache_decision(path: &Path) -> NegativeCacheDecision {
+    match std::fs::File::open(path) {
+        Ok(_) => NegativeCacheDecision::CacheDeterministic,
+        Err(_) => NegativeCacheDecision::DoNotCacheTransient,
+    }
+}
+
+fn directory_classification_negative_cache_decision(path: &Path) -> NegativeCacheDecision {
+    match std::fs::read_dir(path) {
+        Ok(_) => NegativeCacheDecision::CacheDeterministic,
+        Err(_) => NegativeCacheDecision::DoNotCacheTransient,
+    }
+}
+
+fn should_cache_file_classification_negative(path: &Path) -> bool {
+    matches!(
+        file_classification_negative_cache_decision(path),
+        NegativeCacheDecision::CacheDeterministic
+    )
+}
+
+fn should_cache_directory_classification_negative(path: &Path) -> bool {
+    matches!(
+        directory_classification_negative_cache_decision(path),
+        NegativeCacheDecision::CacheDeterministic
+    )
 }
 
 /// A file is queueable for conversion if it's an audio file, a CUE sheet,
@@ -6769,6 +8450,714 @@ fn is_tar_compound(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
+    use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+    use std::time::Duration;
+
+    fn test_cached_info(file_size: u64, title: &str) -> CachedInfo {
+        CachedInfo {
+            source: crate::tui::probe::SourceInfo {
+                format_name: "FLAC".to_string(),
+                codec: "flac".to_string(),
+                bit_depth: Some(16),
+                sample_rate: 44_100,
+                channels: 2,
+                channel_layout: "stereo".to_string(),
+                duration_secs: 1.0,
+                file_size,
+            },
+            metadata: crate::tui::probe::SourceMetadata {
+                title: Some(title.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn probe_file_fixture(name: &str, contents: &[u8]) -> (tempfile::TempDir, PathBuf, BrowseEntry, ProbeCacheIdentity, i64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).expect("probe file");
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let identity = ProbeCacheIdentity::from_metadata(&metadata);
+        let mtime_unix = identity
+            .modified
+            .map(crate::db::systemtime_to_unix)
+            .unwrap_or(0);
+        let entry = BrowseEntry::new(
+            path.clone(),
+            name.to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            identity.size,
+            identity.modified,
+        );
+        (dir, path, entry, identity, mtime_unix)
+    }
+
+    #[test]
+    fn filesystem_async_completion_classifier_enforces_accept_changed_missing_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("track.flac");
+        std::fs::write(&path, b"old").expect("write old");
+        let old = ProbeCacheIdentity::from_metadata(&std::fs::metadata(&path).expect("old meta"));
+        let state = BrowseState::new();
+
+        assert_eq!(
+            state.classify_filesystem_async_completion(&path, old),
+            FilesystemAsyncCompletion::Accept
+        );
+
+        std::fs::write(&path, b"new contents with different size").expect("write new");
+        assert_eq!(
+            state.classify_filesystem_async_completion(&path, old),
+            FilesystemAsyncCompletion::Changed
+        );
+
+        std::fs::remove_file(&path).expect("remove");
+        assert_eq!(
+            state.classify_filesystem_async_completion(&path, old),
+            FilesystemAsyncCompletion::MissingOrUnstatable
+        );
+    }
+
+    #[test]
+    fn probe_current_stops_when_selected_file_is_unstatable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deleted.flac");
+        std::fs::write(&path, b"old").expect("write");
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let identity = ProbeCacheIdentity::from_metadata(&meta);
+        let mut state = BrowseState::new();
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "deleted.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            identity.size,
+            identity.modified,
+        )];
+        state.selected_index = 0;
+        state.probe_pending.insert(path.clone());
+        state.insert_probe_miss_for_identity(path.clone(), identity);
+        std::fs::remove_file(&path).expect("delete");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        state.probe_current(&tx);
+
+        assert!(state.probe_debounce.is_none());
+        assert!(!state.probe_pending.contains(&path));
+        assert!(!state.has_probe_cache_entry_for_identity(&path, identity));
+    }
+
+    #[test]
+    fn expired_debounce_stops_when_file_disappeared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deleted.flac");
+        std::fs::write(&path, b"old").expect("write");
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let identity = ProbeCacheIdentity::from_metadata(&meta);
+        let mut state = BrowseState::new();
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "deleted.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            identity.size,
+            identity.modified,
+        )];
+        state.selected_index = 0;
+        state.probe_debounce = Some(BrowseProbeDebounce {
+            path: path.clone(),
+            deadline: Instant::now() - Duration::from_millis(1),
+        });
+        std::fs::remove_file(&path).expect("delete");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        state.check_probe_debounce(&tx);
+
+        assert!(state.probe_debounce.is_none());
+        assert!(!state.probe_pending.contains(&path));
+    }
+
+    #[test]
+    fn current_dir_stats_rejects_stale_directory_identity() {
+        let path = std::path::PathBuf::from("/tmp/tonepoet-stale-dir-stats");
+        let old_identity = ProbeCacheIdentity { modified: None, size: 10 };
+        let new_identity = ProbeCacheIdentity { modified: None, size: 20 };
+
+        let mut state = BrowseState::new();
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "tonepoet-stale-dir-stats".to_string(),
+            EntryKind::Directory,
+            new_identity.size,
+            new_identity.modified,
+        )];
+        state.selected_index = 0;
+        state.insert_dir_stats_for_identity(
+            path.clone(),
+            old_identity,
+            DirStats {
+                file_count: 99,
+                audio_count: 9,
+                total_size: 999,
+            },
+        );
+
+        assert!(
+            state.current_dir_stats().is_none(),
+            "directory stats must not be reused after same-path identity changes"
+        );
+
+        state.insert_dir_stats_for_identity(
+            path,
+            new_identity,
+            DirStats {
+                file_count: 3,
+                audio_count: 2,
+                total_size: 200,
+            },
+        );
+        let stats = state.current_dir_stats().expect("fresh stats");
+        assert_eq!(stats.file_count, 3);
+        assert_eq!(stats.audio_count, 2);
+        assert_eq!(stats.total_size, 200);
+    }
+
+    #[test]
+    fn current_cached_info_rejects_stale_probe_identity() {
+        let path = std::path::PathBuf::from("/tmp/tonepoet-stale-track.flac");
+        let old_identity = ProbeCacheIdentity {
+            modified: Some(std::time::SystemTime::UNIX_EPOCH),
+            size: 100,
+        };
+        let new_identity = ProbeCacheIdentity {
+            modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            size: 200,
+        };
+
+        let mut state = BrowseState::new();
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            new_identity.size,
+            new_identity.modified,
+        )];
+        state.selected_index = 0;
+        state.probe_cache.insert(
+            path,
+            ProbeCacheEntry::hit(old_identity, Arc::new(test_cached_info(100, "stale"))),
+        );
+
+        assert!(state.current_cached_info().is_none());
+    }
+
+    #[test]
+    fn probe_cache_warm_merge_replaces_stale_identity() {
+        let path = std::path::PathBuf::from("/tmp/tonepoet-warmed-track.flac");
+        let old_identity = ProbeCacheIdentity { modified: None, size: 100 };
+        let new_identity = ProbeCacheIdentity { modified: None, size: 200 };
+
+        let mut state = BrowseState::new();
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            new_identity.size,
+            new_identity.modified,
+        )];
+        state.selected_index = 0;
+        state.probe_cache.insert(path.clone(), ProbeCacheEntry::miss(old_identity));
+
+        let merged = state.merge_probe_cache_warm_rows(vec![ProbeCacheWarmRow {
+            path,
+            identity: new_identity,
+            info: test_cached_info(200, "fresh"),
+        }]);
+
+        assert_eq!(merged, 1);
+        assert_eq!(
+            state
+                .current_cached_info()
+                .and_then(|info| info.metadata.title.as_deref()),
+            Some("fresh")
+        );
+    }
+
+    #[test]
+    fn canonical_probe_cache_helpers_validate_identity_and_remove_enrichment() {
+        let path = std::path::PathBuf::from("/tmp/tonepoet-helper-track.flac");
+        let stale = ProbeCacheIdentity { modified: None, size: 100 };
+        let fresh = ProbeCacheIdentity { modified: None, size: 200 };
+        let entry = BrowseEntry::new(
+            path.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            fresh.size,
+            fresh.modified,
+        );
+        let mut state = BrowseState::new();
+
+        state.insert_probe_for_identity(
+            path.clone(),
+            stale,
+            Some(Arc::new(test_cached_info(stale.size, "stale"))),
+        );
+        assert!(state.valid_probe_for_entry(&entry).is_none());
+        assert!(!state.has_probe_cache_entry_for_identity(&path, fresh));
+
+        state.insert_probe_for_identity(
+            path.clone(),
+            fresh,
+            Some(Arc::new(test_cached_info(fresh.size, "fresh"))),
+        );
+        state.probe_cache_needs_metadata_enrichment.insert(path.clone());
+        assert_eq!(
+            state
+                .valid_probe_for_entry(&entry)
+                .and_then(|info| info.metadata.title.as_deref()),
+            Some("fresh")
+        );
+        assert!(state.has_probe_cache_entry_for_identity(&path, fresh));
+
+        state.remove_probe_cache_entry(&path);
+        assert!(state.valid_probe_for_entry(&entry).is_none());
+        assert!(!state.probe_cache_needs_metadata_enrichment.contains(&path));
+    }
+
+    #[test]
+    fn probe_cache_metadata_update_requires_current_identity() {
+        let path = std::path::PathBuf::from("/tmp/tonepoet-update-track.flac");
+        let stale = ProbeCacheIdentity { modified: None, size: 100 };
+        let fresh = ProbeCacheIdentity { modified: None, size: 200 };
+        let mut state = BrowseState::new();
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            fresh.size,
+            fresh.modified,
+        )];
+        state.selected_index = 0;
+        state.insert_probe_for_identity(
+            path.clone(),
+            stale,
+            Some(Arc::new(test_cached_info(stale.size, "stale"))),
+        );
+
+        assert!(!state.update_valid_probe_for_current_path(&path, |cached| {
+            cached.metadata.album = Some("wrong".to_string());
+        }));
+        assert!(state.current_cached_info().is_none());
+
+        state.insert_probe_for_identity(
+            path.clone(),
+            fresh,
+            Some(Arc::new(test_cached_info(fresh.size, "fresh"))),
+        );
+        assert!(state.update_valid_probe_for_current_path(&path, |cached| {
+            cached.metadata.album = Some("album".to_string());
+        }));
+        assert_eq!(
+            state
+                .current_cached_info()
+                .and_then(|info| info.metadata.album.as_deref()),
+            Some("album")
+        );
+    }
+
+
+    #[test]
+    fn cold_probe_scheduler_backpressures_and_drops_stale_cursor_queue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = dir.path().join("stale.flac");
+        let current = dir.path().join("current.flac");
+        std::fs::write(&stale, b"stale").expect("stale");
+        std::fs::write(&current, b"current").expect("current");
+        let stale_identity = ProbeCacheIdentity::from_metadata(&std::fs::metadata(&stale).expect("stale meta"));
+        let current_identity = ProbeCacheIdentity::from_metadata(&std::fs::metadata(&current).expect("current meta"));
+
+        let mut state = BrowseState::new();
+        state.entries = vec![
+            BrowseEntry::new(
+                stale.clone(),
+                "stale.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                stale_identity.size,
+                stale_identity.modified,
+            ),
+            BrowseEntry::new(
+                current.clone(),
+                "current.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                current_identity.size,
+                current_identity.modified,
+            ),
+        ];
+        state.selected_index = 1;
+        for idx in 0..BROWSE_COLD_PROBE_MAX_IN_FLIGHT {
+            state
+                .browse_cold_probe_active
+                .insert(dir.path().join(format!("active-{idx}.flac")));
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        state.schedule_cursor_focused_cold_probe(current.clone(), current_identity, &tx);
+
+        assert_eq!(state.browse_cold_probe_queue.len(), 1);
+        assert_eq!(state.browse_cold_probe_queue.front().map(|request| request.path.as_path()), Some(current.as_path()));
+        assert!(!state.probe_pending.contains(&current));
+
+        state.selected_index = 0;
+        state.complete_browse_cold_probe(&dir.path().join("active-0.flac"), &tx);
+
+        assert!(state.browse_cold_probe_queue.is_empty());
+        assert!(!state.probe_pending.contains(&current));
+        assert!(!state.browse_cold_probe_active.contains(&current));
+    }
+
+    #[tokio::test]
+    async fn queued_cursor_cold_probe_starts_when_slot_opens() {
+        let (_dir, path, entry, identity, _mtime) = probe_file_fixture("queued-current.flac", b"queued");
+        let mut state = BrowseState::new();
+        state.entries = vec![entry];
+        state.selected_index = 0;
+        for idx in 0..BROWSE_COLD_PROBE_MAX_IN_FLIGHT {
+            state
+                .browse_cold_probe_active
+                .insert(PathBuf::from(format!("/tmp/tonepoet-active-{idx}.flac")));
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        state.schedule_cursor_focused_cold_probe(path.clone(), identity, &tx);
+        assert_eq!(state.browse_cold_probe_queue.len(), 1);
+
+        state.complete_browse_cold_probe(Path::new("/tmp/tonepoet-active-0.flac"), &tx);
+
+        assert!(state.browse_cold_probe_active.contains(&path));
+        assert!(state.probe_pending.contains(&path));
+        assert!(state.browse_cold_probe_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cold_probe_miss_is_debounced() {
+        let (_dir, path, entry, _identity, _mtime) = probe_file_fixture("cold.flac", b"not really flac");
+        let db = crate::db::Database::open_memory().expect("db");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut state = BrowseState::new();
+        state.entries = vec![entry];
+        state.selected_index = 0;
+
+        state.probe_current_with_db(&tx, Some(&db));
+
+        assert_eq!(state.probe_debounce.as_ref().map(|d| d.path.as_path()), Some(path.as_path()));
+        assert!(state.probe_pending.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn in_memory_probe_hit_is_immediate() {
+        let (_dir, path, entry, identity, _mtime) = probe_file_fixture("hit.flac", b"cached");
+        let db = crate::db::Database::open_memory().expect("db");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut state = BrowseState::new();
+        state.entries = vec![entry];
+        state.selected_index = 0;
+        state.probe_cache.insert(
+            path.clone(),
+            ProbeCacheEntry::hit(identity, Arc::new(test_cached_info(identity.size, "memory"))),
+        );
+
+        state.probe_current_with_db(&tx, Some(&db));
+
+        assert!(state.probe_debounce.is_none());
+        assert!(state.probe_pending.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            state.current_cached_info().and_then(|info| info.metadata.title.as_deref()),
+            Some("memory")
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_probe_hit_is_immediate_and_enrichment_is_worker_side() {
+        let (_dir, path, entry, identity, mtime) = probe_file_fixture("sqlite.flac", b"cached db");
+        let db = crate::db::Database::open_memory().expect("db");
+        let info = test_cached_info(identity.size, "sqlite");
+        let row = crate::db::CachedProbeRow::from_cached_info(&info);
+        db.store_probe(&path.display().to_string(), mtime, identity.size, &row)
+            .expect("store probe");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = BrowseState::new();
+        state.entries = vec![entry];
+        state.selected_index = 0;
+
+        state.probe_current_with_db(&tx, Some(&db));
+
+        assert!(state.probe_debounce.is_none());
+        assert!(state.probe_pending.contains(&path));
+        assert_eq!(
+            state.current_cached_info().and_then(|info| info.metadata.title.as_deref()),
+            Some("sqlite")
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_movement_replaces_stale_probe_debounce() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first.flac");
+        let second = dir.path().join("second.flac");
+        std::fs::write(&first, b"first").expect("first");
+        std::fs::write(&second, b"second").expect("second");
+        let first_meta = std::fs::metadata(&first).expect("first metadata");
+        let second_meta = std::fs::metadata(&second).expect("second metadata");
+        let db = crate::db::Database::open_memory().expect("db");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = BrowseState::new();
+        state.entries = vec![
+            BrowseEntry::new(
+                first.clone(),
+                "first.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                first_meta.len(),
+                first_meta.modified().ok(),
+            ),
+            BrowseEntry::new(
+                second.clone(),
+                "second.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                second_meta.len(),
+                second_meta.modified().ok(),
+            ),
+        ];
+
+        state.selected_index = 0;
+        state.probe_current_with_db(&tx, Some(&db));
+        assert_eq!(state.probe_debounce.as_ref().map(|d| d.path.as_path()), Some(first.as_path()));
+
+        state.selected_index = 1;
+        state.probe_current_with_db(&tx, Some(&db));
+        assert_eq!(state.probe_debounce.as_ref().map(|d| d.path.as_path()), Some(second.as_path()));
+        assert!(!state.probe_pending.contains(&first));
+    }
+
+    #[tokio::test]
+    async fn stale_cursor_debounce_does_not_fire_after_selection_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first-stale.flac");
+        let second = dir.path().join("second-current.flac");
+        std::fs::write(&first, b"first").expect("first");
+        std::fs::write(&second, b"second").expect("second");
+        let first_meta = std::fs::metadata(&first).expect("first metadata");
+        let second_meta = std::fs::metadata(&second).expect("second metadata");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = BrowseState::new();
+        state.entries = vec![
+            BrowseEntry::new(
+                first.clone(),
+                "first-stale.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                first_meta.len(),
+                first_meta.modified().ok(),
+            ),
+            BrowseEntry::new(
+                second,
+                "second-current.flac".to_string(),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                second_meta.len(),
+                second_meta.modified().ok(),
+            ),
+        ];
+        state.selected_index = 1;
+        state.probe_debounce = Some(BrowseProbeDebounce {
+            path: first.clone(),
+            deadline: std::time::Instant::now() - Duration::from_millis(1),
+        });
+
+        state.check_probe_debounce(&tx);
+
+        assert!(state.probe_debounce.is_none());
+        assert!(!state.probe_pending.contains(&first));
+    }
+
+    #[test]
+    fn directory_navigation_clears_probe_debounce_and_cold_probe_queue() {
+        let mut state = BrowseState::new();
+        let stale = PathBuf::from("/tmp/stale.flac");
+        state.probe_debounce = Some(BrowseProbeDebounce {
+            path: stale.clone(),
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+        });
+        state.browse_cold_probe_queue.push_back(BrowseColdProbeRequest {
+            path: stale,
+            identity: ProbeCacheIdentity { modified: None, size: 1 },
+            scan_generation: state.scan_generation,
+            cursor_focused: true,
+        });
+
+        state.reset_nav_state();
+
+        assert!(state.probe_debounce.is_none());
+        assert!(state.browse_cold_probe_queue.is_empty());
+    }
+
+    #[test]
+    fn batch_warm_merge_ignores_rows_with_stale_listing_identity() {
+        let path = PathBuf::from("/tmp/tonepoet-warm-stale.flac");
+        let fresh = ProbeCacheIdentity { modified: None, size: 200 };
+        let stale = ProbeCacheIdentity { modified: None, size: 100 };
+        let mut state = BrowseState::new();
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            fresh.size,
+            fresh.modified,
+        )];
+
+        let merged = state.merge_probe_cache_warm_rows(vec![ProbeCacheWarmRow {
+            path,
+            identity: stale,
+            info: test_cached_info(stale.size, "stale"),
+        }]);
+
+        assert_eq!(merged, 0);
+        assert!(state.probe_cache.is_empty());
+    }
+
+    #[test]
+    fn warmed_rows_do_not_override_fresher_in_memory_rows() {
+        let path = PathBuf::from("/tmp/tonepoet-warm-fresh.flac");
+        let fresh = ProbeCacheIdentity { modified: None, size: 200 };
+        let stale = ProbeCacheIdentity { modified: None, size: 100 };
+        let mut state = BrowseState::new();
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            fresh.size,
+            fresh.modified,
+        )];
+        state.selected_index = 0;
+        state.probe_cache.insert(
+            path.clone(),
+            ProbeCacheEntry::hit(fresh, Arc::new(test_cached_info(fresh.size, "fresh"))),
+        );
+
+        let merged = state.merge_probe_cache_warm_rows(vec![ProbeCacheWarmRow {
+            path,
+            identity: stale,
+            info: test_cached_info(stale.size, "stale"),
+        }]);
+
+        assert_eq!(merged, 0);
+        assert_eq!(
+            state.current_cached_info().and_then(|info| info.metadata.title.as_deref()),
+            Some("fresh")
+        );
+    }
+
+    #[test]
+    fn probe_cache_update_flags_coalesce_until_taken() {
+        let mut state = BrowseState::new();
+
+        state.mark_probe_cache_update_pending(false);
+        state.mark_probe_cache_update_pending(false);
+        state.mark_probe_cache_update_pending(true);
+
+        assert_eq!(state.take_probe_cache_deferred_work(), (true, true));
+        assert_eq!(state.take_probe_cache_deferred_work(), (false, false));
+    }
+
+    #[test]
+    fn warm_cache_queue_merges_only_bounded_rows_per_frame() {
+        let mut state = BrowseState::new();
+        let count = PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME + 3;
+        let mut rows = Vec::new();
+        let mut entries = Vec::new();
+
+        for idx in 0..count {
+            let path = PathBuf::from(format!("/tmp/tonepoet-bounded-warm-{idx}.flac"));
+            let identity = ProbeCacheIdentity { modified: None, size: idx as u64 + 1 };
+            entries.push(BrowseEntry::new(
+                path.clone(),
+                format!("bounded-warm-{idx}.flac"),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                identity.size,
+                identity.modified,
+            ));
+            rows.push(ProbeCacheWarmRow {
+                path,
+                identity,
+                info: test_cached_info(identity.size, &format!("warm-{idx}")),
+            });
+        }
+
+        state.entries = entries;
+        let generation = state.scan_generation;
+        let directory = state.current_dir.clone();
+        assert_eq!(state.enqueue_probe_cache_warm_rows(generation, directory, rows), count);
+
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame();
+        assert_eq!(merged, PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME);
+        assert!(has_more);
+        assert_eq!(state.probe_cache.len(), PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME);
+        assert!(state.take_browse_deferred_work().probe_backed_resort_needed);
+
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame();
+        assert_eq!(merged, 3);
+        assert!(!has_more);
+        assert_eq!(state.probe_cache.len(), count);
+    }
+
+    #[test]
+    fn warm_cache_queue_drops_stale_generation_before_merge() {
+        let mut state = BrowseState::new();
+        let path = PathBuf::from("/tmp/tonepoet-stale-generation-warm.flac");
+        let identity = ProbeCacheIdentity { modified: None, size: 1 };
+        state.entries = vec![BrowseEntry::new(
+            path.clone(),
+            "stale-generation-warm.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            identity.size,
+            identity.modified,
+        )];
+
+        let generation = state.scan_generation;
+        let directory = state.current_dir.clone();
+        assert_eq!(
+            state.enqueue_probe_cache_warm_rows(
+                generation,
+                directory,
+                vec![ProbeCacheWarmRow {
+                    path,
+                    identity,
+                    info: test_cached_info(identity.size, "stale"),
+                }],
+            ),
+            1,
+        );
+
+        state.scan_generation = state.scan_generation.wrapping_add(1);
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame();
+        assert_eq!(merged, 0);
+        assert!(!has_more);
+        assert!(state.probe_cache.is_empty());
+    }
+
+    #[test]
+    fn browse_deferred_work_flags_coalesce_until_flush() {
+        let mut state = BrowseState::new();
+
+        state.mark_probe_cache_update_pending(false);
+        state.mark_probe_cache_update_pending(true);
+        state.mark_visible_entries_changed_pending();
+        state.mark_classification_changed_pending();
+
+        let work = state.take_browse_deferred_work();
+        assert!(work.probe_backed_resort_needed);
+        assert!(work.visible_entries_changed);
+        assert!(work.info_pane_changed);
+        assert!(work.classification_changed);
+        assert!(!state.take_browse_deferred_work().has_expensive_work());
+    }
 
     #[test]
     fn search_fuzzy_threshold_rejects_garbage_subsequence_matches() {
@@ -7688,6 +10077,117 @@ mod tests {
         assert!(matches!(state.all_files[0].kind, EntryKind::SacdIso));
     }
 
+
+    #[test]
+    fn sacd_negative_cache_is_identity_bound_by_size_and_mtime() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("data.iso");
+        let total = (crate::tui::sacd::MASTER_TOC_LSNS[0] + 1) * crate::tui::sacd::SECTOR_SIZE;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(total).unwrap();
+        drop(f);
+
+        let mut state = make_browse_with_iso(&path);
+        state.upgrade_iso_kinds();
+        let first = state
+            .sacd_classify_cache
+            .get(&path)
+            .expect("first negative")
+            .0
+            .clone();
+        assert_eq!(state.sacd_classify_cache.get(&path).map(|(_, v)| *v), Some(false));
+
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(total + crate::tui::sacd::SECTOR_SIZE).unwrap();
+        drop(f);
+        let meta = std::fs::metadata(&path).expect("metadata after resize");
+        state.all_files[0].size = meta.len();
+        state.all_files[0].modified = meta.modified().ok();
+        state.all_files[0].kind = EntryKind::Archive;
+
+        state.upgrade_iso_kinds();
+        let second = state
+            .sacd_classify_cache
+            .get(&path)
+            .expect("second negative")
+            .0
+            .clone();
+        assert_ne!(first, second, "same-path negative must be invalidated by identity change");
+    }
+
+    #[test]
+    fn probe_failures_cache_only_deterministic_not_audio_negatives() {
+        let mut state = BrowseState::new();
+        let path = PathBuf::from("/tmp/not-audio.flac");
+        let identity = ProbeCacheIdentity { modified: None, size: 123 };
+
+        state.remember_probe_failure_for_identity(
+            path.clone(),
+            identity,
+            "No audio stream found in '/tmp/not-audio.flac'",
+        );
+        assert!(state.has_probe_cache_entry_for_identity(&path, identity));
+
+        let transient = PathBuf::from("/tmp/locked.flac");
+        state.remember_probe_failure_for_identity(
+            transient.clone(),
+            identity,
+            "Failed to open '/tmp/locked.flac': Permission denied",
+        );
+        assert!(!state.has_probe_cache_entry_for_identity(&transient, identity));
+        assert!(state.has_recent_transient_probe_failure(&transient, identity));
+
+        state.insert_probe_for_identity(
+            transient.clone(),
+            identity,
+            Some(Arc::new(test_cached_info(identity.size, "later success"))),
+        );
+        assert!(state.valid_probe_arc_for_identity(&transient, identity).is_some());
+        assert!(!state.has_recent_transient_probe_failure(&transient, identity));
+    }
+
+    #[test]
+    fn scan_worker_applies_cached_iso_classification_before_publication() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("disc.iso");
+        std::fs::write(&path, b"not really an iso").unwrap();
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let fingerprint = ClassificationFingerprint {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            markers: Vec::new(),
+        };
+        let mut snapshot = BrowseClassificationCacheSnapshot::default();
+        snapshot.sacd_iso.insert(path.clone(), (fingerprint, true));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let (_parent, _dirs, files, updates) =
+            scan_directory_blocking(td.path(), &cancel, &snapshot).expect("scan");
+
+        let entry = files.iter().find(|entry| entry.path == path).expect("iso entry");
+        assert!(matches!(entry.kind, EntryKind::SacdIso));
+        assert!(updates.sacd_iso.is_empty(), "cache hit should not emit a cold update");
+    }
+
+    #[test]
+    fn scan_worker_reports_identity_bound_negative_classification_updates() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("data.iso");
+        std::fs::write(&path, b"not really an iso").unwrap();
+        let snapshot = BrowseClassificationCacheSnapshot::default();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let (_parent, _dirs, files, updates) =
+            scan_directory_blocking(td.path(), &cancel, &snapshot).expect("scan");
+
+        let entry = files.iter().find(|entry| entry.path == path).expect("iso entry");
+        assert!(matches!(entry.kind, EntryKind::Archive));
+        assert!(updates
+            .sacd_iso
+            .iter()
+            .any(|(update_path, _fingerprint, verdict)| update_path == &path && !*verdict));
+    }
+
     #[test]
     fn is_probeable_covers_audio_files_and_disc_sources() {
         let entry_with_kind = |kind: EntryKind| {
@@ -8033,24 +10533,25 @@ mod tests {
     }
 
     #[test]
-    fn scan_directory_blocking_leaves_bluray_dirs_for_cached_classifier() {
+    fn scan_directory_blocking_classifies_bluray_dirs_off_ui_path() {
         let td = tempfile::tempdir().expect("tempdir");
         let root = td.path().join("movie");
         make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
 
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let (_parent, mut dirs, _files) = scan_directory_blocking(td.path(), &cancel)
-            .expect("scan directory");
+        let snapshot = BrowseClassificationCacheSnapshot::default();
+        let (_parent, dirs, _files, updates) =
+            scan_directory_blocking(td.path(), &cancel, &snapshot).expect("scan directory");
         let entry = dirs
-            .iter_mut()
+            .iter()
             .find(|entry| entry.path == root)
             .expect("scanned movie dir");
 
-        assert!(matches!(entry.kind, EntryKind::Directory));
-
-        let mut cache = std::collections::HashMap::new();
-        classify_bluray_directory_entry(entry, &mut cache);
         assert!(matches!(entry.kind, EntryKind::BlurayDir));
+        assert!(updates
+            .bluray_dir
+            .iter()
+            .any(|(update_path, _fingerprint, verdict)| update_path == &root && *verdict));
     }
 
     #[test]
@@ -8676,9 +11177,10 @@ FILE "10 - Live Version.wav" WAVE
         let sibling = std::path::PathBuf::from("/tmp/Album.zipx/01.flac");
 
         let mut state = BrowseState::new();
-        state.probe_cache.insert(archive.clone(), None);
-        state.probe_cache.insert(synthetic.clone(), None);
-        state.probe_cache.insert(sibling.clone(), None);
+        let identity = ProbeCacheIdentity { modified: None, size: 0 };
+        state.probe_cache.insert(archive.clone(), ProbeCacheEntry::miss(identity));
+        state.probe_cache.insert(synthetic.clone(), ProbeCacheEntry::miss(identity));
+        state.probe_cache.insert(sibling.clone(), ProbeCacheEntry::miss(identity));
         state.probe_pending.insert(pending.clone());
         state.probe_pending.insert(sibling.clone());
 
@@ -8917,25 +11419,28 @@ FILE "10 - Live Version.wav" WAVE
             .clone();
         state.probe_cache.insert(
             archive_path.join(inner_path),
-            Some(std::sync::Arc::new(CachedInfo {
-                source: crate::tui::probe::SourceInfo {
-                    format_name: "FLAC".to_string(),
-                    codec: "flac".to_string(),
-                    bit_depth: Some(16),
-                    sample_rate: 44_100,
-                    channels: 2,
-                    channel_layout: "stereo".to_string(),
-                    duration_secs: 1.0,
-                    file_size: 4096,
-                },
-                metadata: crate::tui::probe::SourceMetadata {
-                    title: title.map(str::to_string),
-                    artist: artist.map(str::to_string),
-                    album: album.map(str::to_string),
-                    year: year.map(str::to_string),
-                    ..Default::default()
-                },
-            })),
+            ProbeCacheEntry::hit(
+                ProbeCacheIdentity { modified: None, size: 4096 },
+                std::sync::Arc::new(CachedInfo {
+                    source: crate::tui::probe::SourceInfo {
+                        format_name: "FLAC".to_string(),
+                        codec: "flac".to_string(),
+                        bit_depth: Some(16),
+                        sample_rate: 44_100,
+                        channels: 2,
+                        channel_layout: "stereo".to_string(),
+                        duration_secs: 1.0,
+                        file_size: 4096,
+                    },
+                    metadata: crate::tui::probe::SourceMetadata {
+                        title: title.map(str::to_string),
+                        artist: artist.map(str::to_string),
+                        album: album.map(str::to_string),
+                        year: year.map(str::to_string),
+                        ..Default::default()
+                    },
+                }),
+            ),
         );
     }
 
@@ -9542,3 +12047,227 @@ mod archive_edit_log_semantics_tests {
         );
     }
 }
+#[cfg(test)]
+mod browse_perf_followup_v10_tests {
+    use super::*;
+
+    fn scored_entry(name: &str) -> BrowseEntry {
+        BrowseEntry::new(
+            PathBuf::from(format!("/tmp/{name}")),
+            name.to_string(),
+            EntryKind::OtherFile,
+            0,
+            None,
+        )
+    }
+
+    #[test]
+    fn bounded_score_search_matches_full_sort_desc_top_cap() {
+        let mut bounded = BoundedScoreSearchResults::new(3, SortDir::Desc);
+        for (name, score) in [("a", 10), ("b", 40), ("c", 20), ("d", 30), ("e", 50)] {
+            bounded.push(scored_entry(name), score);
+        }
+        let mut retained = bounded.into_vec();
+        sort_search_results(&mut retained, SearchSort::Score, SortDir::Desc);
+        let scores: Vec<i64> = retained.into_iter().map(|(_, score)| score).collect();
+        assert_eq!(scores, vec![50, 40, 30]);
+    }
+
+    #[test]
+    fn bounded_score_search_matches_full_sort_asc_top_cap() {
+        let mut bounded = BoundedScoreSearchResults::new(2, SortDir::Asc);
+        for (name, score) in [("a", 10), ("b", 40), ("c", 20), ("d", 30), ("e", 50)] {
+            bounded.push(scored_entry(name), score);
+        }
+        let mut retained = bounded.into_vec();
+        sort_search_results(&mut retained, SearchSort::Score, SortDir::Asc);
+        let scores: Vec<i64> = retained.into_iter().map(|(_, score)| score).collect();
+        assert_eq!(scores, vec![10, 20]);
+    }
+
+    #[test]
+    fn bounded_score_search_keeps_older_equal_score_matches() {
+        let mut bounded = BoundedScoreSearchResults::new(2, SortDir::Desc);
+        for name in ["first", "second", "third"] {
+            bounded.push(scored_entry(name), 100);
+        }
+        let mut retained = bounded.into_vec();
+        sort_search_results(&mut retained, SearchSort::Score, SortDir::Desc);
+        let names: Vec<String> = retained.into_iter().map(|(entry, _)| entry.name).collect();
+        assert_eq!(names, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn bounded_score_heap_matches_full_sort_for_broad_desc_matches() {
+        let inputs: Vec<(BrowseEntry, i64)> = (0..256)
+            .map(|idx| {
+                let score = ((idx * 37) % 101) as i64;
+                (scored_entry(&format!("item-{idx:03}")), score)
+            })
+            .collect();
+        let mut full = inputs.clone();
+        sort_search_results(&mut full, SearchSort::Score, SortDir::Desc);
+        full.truncate(17);
+
+        let mut bounded = BoundedScoreSearchResults::new(17, SortDir::Desc);
+        for (entry, score) in inputs {
+            bounded.push(entry, score);
+        }
+        let mut retained = bounded.into_vec();
+        sort_search_results(&mut retained, SearchSort::Score, SortDir::Desc);
+
+        let expected: Vec<(String, i64)> = full.into_iter().map(|(entry, score)| (entry.name, score)).collect();
+        let actual: Vec<(String, i64)> = retained.into_iter().map(|(entry, score)| (entry.name, score)).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn disc_probe_launch_error_without_fingerprint_requires_current_disc_selection() {
+        let mut state = BrowseState::new();
+        let disc = BrowseEntry::new(
+            PathBuf::from("/tmp/current.iso"),
+            "current.iso".to_string(),
+            EntryKind::SacdIso,
+            0,
+            None,
+        );
+        let other = BrowseEntry::new(
+            PathBuf::from("/tmp/other.txt"),
+            "other.txt".to_string(),
+            EntryKind::OtherFile,
+            0,
+            None,
+        );
+        state.entries = vec![disc.clone(), other.clone()];
+        state.selected_index = 0;
+        assert!(state.current_selected_disc_source_matches(&disc.path));
+
+        state.selected_index = 1;
+        assert!(!state.current_selected_disc_source_matches(&disc.path));
+        assert!(!state.current_selected_disc_source_matches(&other.path));
+    }
+
+    #[test]
+    fn recursive_dir_stats_queue_is_bounded_and_current_selection_first() {
+        let mut state = BrowseState::new();
+        let active = std::env::temp_dir();
+        let active_identity = std::fs::metadata(&active)
+            .ok()
+            .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+            .unwrap_or(ProbeCacheIdentity { modified: None, size: 0 });
+        state.dir_stats_active.insert(
+            active.clone(),
+            DirStatsActiveJob {
+                identity: active_identity,
+                scan_generation: state.scan_generation,
+                cursor_focused: false,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        state.dir_stats_pending.insert(active);
+
+        let first = BrowseEntry::new(
+            PathBuf::from("/tmp/first-dir"),
+            "first-dir".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        );
+        let second = BrowseEntry::new(
+            PathBuf::from("/tmp/second-dir"),
+            "second-dir".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        );
+        state.entries = vec![first.clone(), second.clone()];
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        state.selected_index = 0;
+        state.schedule_cursor_focused_dir_stats(
+            first.path.clone(),
+            ProbeCacheIdentity::from_entry(&first),
+            &tx,
+        );
+        state.selected_index = 1;
+        state.schedule_cursor_focused_dir_stats(
+            second.path.clone(),
+            ProbeCacheIdentity::from_entry(&second),
+            &tx,
+        );
+
+        assert_eq!(state.dir_stats_queue.len(), 1);
+        assert!(same_path(&state.dir_stats_queue[0].path, &second.path));
+        assert!(!state.dir_stats_pending.contains(&first.path));
+        assert!(state.dir_stats_pending.contains(&second.path));
+    }
+
+    #[test]
+    fn recursive_dir_stats_queue_clears_on_navigation_reset() {
+        let mut state = BrowseState::new();
+        let path = PathBuf::from("/tmp/queued-dir");
+        state.dir_stats_pending.insert(path.clone());
+        state.dir_stats_queue.push_back(DirStatsRequest {
+            path: path.clone(),
+            identity: ProbeCacheIdentity { modified: None, size: 0 },
+            scan_generation: state.scan_generation,
+            cursor_focused: true,
+        });
+        let active = std::env::temp_dir();
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.dir_stats_active.insert(
+            active,
+            DirStatsActiveJob {
+                identity: ProbeCacheIdentity { modified: None, size: 0 },
+                scan_generation: state.scan_generation,
+                cursor_focused: false,
+                cancel: cancel.clone(),
+            },
+        );
+
+        state.reset_nav_state();
+
+        assert!(cancel.load(Ordering::Relaxed));
+
+        assert!(state.dir_stats_queue.is_empty());
+        assert!(state.dir_stats_active.is_empty());
+        assert!(state.dir_stats_pending.is_empty());
+    }
+
+    #[test]
+    fn stale_active_recursive_dir_stats_are_cancelled_before_queueing_current() {
+        let mut state = BrowseState::new();
+        let stale_path = PathBuf::from("/tmp/stale-active-dir");
+        let stale_cancel = Arc::new(AtomicBool::new(false));
+        state.dir_stats_active.insert(
+            stale_path.clone(),
+            DirStatsActiveJob {
+                identity: ProbeCacheIdentity { modified: None, size: 0 },
+                scan_generation: state.scan_generation + 1,
+                cursor_focused: true,
+                cancel: stale_cancel.clone(),
+            },
+        );
+        state.dir_stats_pending.insert(stale_path.clone());
+
+        let current = BrowseEntry::new(
+            std::env::temp_dir(),
+            "current-dir".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        );
+        let current_identity = std::fs::metadata(&current.path)
+            .ok()
+            .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+            .unwrap_or(ProbeCacheIdentity { modified: None, size: 0 });
+        state.entries = vec![current.clone()];
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        state.schedule_cursor_focused_dir_stats(current.path.clone(), current_identity, &tx);
+
+        assert!(stale_cancel.load(Ordering::Relaxed));
+        assert!(!state.dir_stats_pending.contains(&stale_path));
+        assert!(state.dir_stats_active.keys().any(|path| same_path(path, &current.path)));
+    }
+ }

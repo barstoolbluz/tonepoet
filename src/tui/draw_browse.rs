@@ -1,5 +1,7 @@
 //! Browse screen: file browser with directory tree + info pane
 
+use std::borrow::Cow;
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -1673,7 +1675,8 @@ fn draw_browse_list(
     let column_layout = browse_column_layout(inner_w, &browse.columns);
     let name_w = name_column_width(&column_layout);
 
-    let mut lines: Vec<Line> = vec![top_line];
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+    lines.push(top_line);
 
     // Search panel (2 rows when active): input first, then peer controls.
     if browse.search.active {
@@ -1756,7 +1759,7 @@ fn draw_browse_list(
                 Style::default().fg(theme.destructive),
             )], theme));
         for _ in 1..content_height {
-            lines.push(bordered_line(border_color, w, vec![], theme));
+            lines.push(empty_bordered_line(border_color, w, theme));
         }
     } else if browse.entries.is_empty() {
         let msg = if browse.scan_pending.is_some() {
@@ -1769,7 +1772,7 @@ fn draw_browse_list(
             w,
             vec![Span::styled(msg, theme.muted())], theme));
         for _ in 1..content_height {
-            lines.push(bordered_line(border_color, w, vec![], theme));
+            lines.push(empty_bordered_line(border_color, w, theme));
         }
     } else {
         let start = browse.scroll_offset;
@@ -1802,7 +1805,7 @@ fn draw_browse_list(
 
         let rendered = end - start;
         for _ in rendered..content_height {
-            lines.push(bordered_line(border_color, w, vec![], theme));
+            lines.push(empty_bordered_line(border_color, w, theme));
         }
     }
 
@@ -1864,10 +1867,9 @@ fn render_header_row(
         SortDir::Desc => "▼",
     };
 
-    let mut spans = vec![
-        Span::styled("│", theme.border(border_color)),
-        Span::raw(" ".repeat(ROW_PREFIX)),
-    ];
+    let mut spans = Vec::with_capacity(3 + columns.len().saturating_mul(2));
+    spans.push(Span::styled("│", theme.border(border_color)));
+    spans.push(Span::raw(" ".repeat(ROW_PREFIX)));
 
     for (idx, cell) in columns.iter().enumerate() {
         if idx > 0 {
@@ -1935,12 +1937,11 @@ fn render_entry_line(
     };
 
     let cached = cached_info_for_entry(browse, entry);
-    let mut spans = vec![
-        Span::styled("│", theme.border(border_color)),
-        Span::styled(cursor, cursor_style),
-        Span::styled(check, check_style),
-        Span::raw(" "),
-    ];
+    let mut spans = Vec::with_capacity(6 + columns.len().saturating_mul(2));
+    spans.push(Span::styled("│", theme.border(border_color)));
+    spans.push(Span::styled(cursor, cursor_style));
+    spans.push(Span::styled(check, check_style));
+    spans.push(Span::raw(" "));
 
     for (idx, cell) in columns.iter().enumerate() {
         if idx > 0 {
@@ -1955,7 +1956,7 @@ fn render_entry_line(
             }
         } else {
             let value = entry_column_text(entry, cell.column, cached);
-            let display = pad_or_truncate(&value, cell.width, column_right_aligned(cell.column));
+            let display = pad_or_truncate(value.as_ref(), cell.width, column_right_aligned(cell.column));
             spans.push(Span::styled(display, entry_column_style(entry, cell.column, cached, theme)));
         }
     }
@@ -1992,10 +1993,7 @@ fn render_entry_line(
 }
 
 fn cached_info_for_entry<'a>(browse: &'a BrowseState, entry: &BrowseEntry) -> Option<&'a CachedInfo> {
-    browse
-        .probe_cache
-        .get(&entry.path)
-        .and_then(|cached| cached.as_ref().map(|info| info.as_ref()))
+    browse.valid_probe_for_entry(entry)
 }
 
 fn entry_name_style(
@@ -2036,72 +2034,91 @@ fn entry_column_style(
     cached: Option<&CachedInfo>,
     theme: super::theme::Theme,
 ) -> Style {
-    if is_audio_column(column) && !entry.is_audio() {
+    let audio_column = is_audio_column(column);
+    if audio_column && !entry.is_audio() {
         return Style::default().fg(theme.text_dim);
     }
-    if is_audio_column(column) && cached.is_none() {
+    if audio_column && cached.is_none() {
         return Style::default().fg(theme.text_dim);
     }
     theme.muted()
 }
 
-fn entry_column_text(
-    entry: &BrowseEntry,
+fn entry_column_text<'a>(
+    entry: &'a BrowseEntry,
     column: BrowseColumn,
-    cached: Option<&CachedInfo>,
-) -> String {
+    cached: Option<&'a CachedInfo>,
+) -> Cow<'a, str> {
     match column {
-        BrowseColumn::Name => entry.name.clone(),
+        BrowseColumn::Name => Cow::Borrowed(entry.name.as_str()),
         BrowseColumn::Size => match &entry.kind {
-            EntryKind::ParentDir | EntryKind::Directory => String::new(),
-            _ => size_str(entry.size),
+            EntryKind::ParentDir | EntryKind::Directory => Cow::Borrowed(""),
+            _ => Cow::Owned(size_str(entry.size)),
         },
-        BrowseColumn::Date => entry.date_label(),
-        BrowseColumn::Type => entry.type_label(),
+        BrowseColumn::Date => Cow::Owned(entry.date_label()),
+        BrowseColumn::Type => Cow::Owned(entry.type_label()),
         BrowseColumn::Format => audio_column_value(entry, cached, |info| {
-            non_empty(info.source.format_name.clone()).or_else(|| Some(entry.type_label()))
+            non_empty_str(info.source.format_name.as_str())
+                .map(Cow::Borrowed)
+                .or_else(|| Some(Cow::Owned(entry.type_label())))
         }),
         BrowseColumn::Codec => audio_column_value(entry, cached, |info| {
-            non_empty(info.source.codec_display())
+            non_empty_owned(info.source.codec_display())
         }),
         BrowseColumn::SampleRate => audio_column_value(entry, cached, |info| {
-            (info.source.sample_rate > 0).then(|| info.source.sample_rate_display())
+            (info.source.sample_rate > 0).then(|| Cow::Owned(info.source.sample_rate_display()))
         }),
         BrowseColumn::Channels => audio_column_value(entry, cached, |info| {
-            (info.source.channels > 0).then(|| info.source.channels_display())
+            (info.source.channels > 0).then(|| Cow::Owned(info.source.channels_display()))
         }),
         BrowseColumn::Duration => audio_column_value(entry, cached, |info| {
             (info.source.duration_secs.is_finite() && info.source.duration_secs > 0.0)
-                .then(|| info.source.duration_display())
+                .then(|| Cow::Owned(info.source.duration_display()))
         }),
         BrowseColumn::Artist => audio_column_value(entry, cached, |info| {
-            info.metadata.artist.clone().and_then(non_empty)
+            info.metadata
+                .artist
+                .as_deref()
+                .and_then(non_empty_str)
+                .map(Cow::Borrowed)
         }),
         BrowseColumn::Album => audio_column_value(entry, cached, |info| {
-            info.metadata.album.clone().and_then(non_empty)
+            info.metadata
+                .album
+                .as_deref()
+                .and_then(non_empty_str)
+                .map(Cow::Borrowed)
         }),
     }
 }
 
-fn audio_column_value<F>(
+fn audio_column_value<'a, F>(
     entry: &BrowseEntry,
-    cached: Option<&CachedInfo>,
+    cached: Option<&'a CachedInfo>,
     value: F,
-) -> String
+) -> Cow<'a, str>
 where
-    F: FnOnce(&CachedInfo) -> Option<String>,
+    F: FnOnce(&'a CachedInfo) -> Option<Cow<'a, str>>,
 {
     if !entry.is_audio() {
-        return "—".to_string();
+        return Cow::Borrowed("—");
     }
-    cached.and_then(value).unwrap_or_else(|| "—".to_string())
+    cached.and_then(value).unwrap_or(Cow::Borrowed("—"))
 }
 
-fn non_empty(value: String) -> Option<String> {
+fn non_empty_str(value: &str) -> Option<&str> {
     if value.trim().is_empty() {
         None
     } else {
         Some(value)
+    }
+}
+
+fn non_empty_owned<'a>(value: String) -> Option<Cow<'a, str>> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(Cow::Owned(value))
     }
 }
 
@@ -3169,11 +3186,117 @@ fn bordered_line<'a>(
     let content_width: usize = content.iter().map(|s| s.width()).sum();
     let padding = width.saturating_sub(2 + content_width);
 
-    let mut spans = vec![Span::styled("│", theme.border(border_color))];
+    let mut spans = Vec::with_capacity(content.len() + 3);
+    spans.push(Span::styled("│", theme.border(border_color)));
     spans.extend(content);
     spans.push(Span::raw(" ".repeat(padding)));
     spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
+}
+
+fn empty_bordered_line(
+    border_color: ratatui::style::Color,
+    width: usize,
+    theme: super::theme::Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("│", theme.border(border_color)),
+        Span::raw(" ".repeat(width.saturating_sub(2))),
+        Span::styled("│", theme.border(border_color)),
+    ])
+}
+
+#[cfg(test)]
+mod browse_list_render_allocation_tests {
+    use super::*;
+    use crate::convert::formats::AudioFormat;
+    use crate::tui::probe::{SourceInfo, SourceMetadata};
+    use std::path::PathBuf;
+
+    fn audio_entry() -> BrowseEntry {
+        BrowseEntry::new(
+            PathBuf::from("/tmp/track.flac"),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            1024,
+            None,
+        )
+    }
+
+    fn cached_info() -> CachedInfo {
+        CachedInfo {
+            source: SourceInfo {
+                format_name: "FLAC".to_string(),
+                codec: "PCM".to_string(),
+                bit_depth: Some(24),
+                sample_rate: 96_000,
+                channels: 2,
+                channel_layout: "stereo".to_string(),
+                duration_secs: 123.0,
+                file_size: 1024,
+            },
+            metadata: SourceMetadata {
+                artist: Some("Artist".to_string()),
+                album: Some("Album".to_string()),
+                ..SourceMetadata::default()
+            },
+        }
+    }
+
+    #[test]
+    fn audio_columns_preserve_display_values_without_intermediate_clones() {
+        let entry = audio_entry();
+        let cached = cached_info();
+
+        assert!(matches!(
+            entry_column_text(&entry, BrowseColumn::Format, Some(&cached)),
+            Cow::Borrowed("FLAC")
+        ));
+        assert!(matches!(
+            entry_column_text(&entry, BrowseColumn::Artist, Some(&cached)),
+            Cow::Borrowed("Artist")
+        ));
+        assert!(matches!(
+            entry_column_text(&entry, BrowseColumn::Album, Some(&cached)),
+            Cow::Borrowed("Album")
+        ));
+        assert_eq!(
+            pad_or_truncate(
+                entry_column_text(&entry, BrowseColumn::Artist, Some(&cached)).as_ref(),
+                8,
+                false,
+            ),
+            "Artist  "
+        );
+    }
+
+    #[test]
+    fn placeholder_and_padding_output_remain_unchanged() {
+        let other = BrowseEntry::new(
+            PathBuf::from("/tmp/readme.txt"),
+            "readme.txt".to_string(),
+            EntryKind::OtherFile,
+            12,
+            None,
+        );
+
+        assert!(matches!(
+            entry_column_text(&other, BrowseColumn::Artist, None),
+            Cow::Borrowed("—")
+        ));
+        assert_eq!(
+            pad_or_truncate(
+                entry_column_text(&other, BrowseColumn::Artist, None).as_ref(),
+                4,
+                false,
+            ),
+            "—   "
+        );
+        assert_eq!(
+            pad_or_truncate(entry_column_text(&other, BrowseColumn::Size, None).as_ref(), 6, true),
+            "  12 B"
+        );
+    }
 }
 
 /// Format a file size for display
