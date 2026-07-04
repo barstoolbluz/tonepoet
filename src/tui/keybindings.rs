@@ -3206,7 +3206,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 
         // Baseline modal range selection. Movement previews; Enter/Space
         // commits; Esc restores the pre-range mark set.
-        (KeyCode::Char('v'), KeyModifiers::NONE) => {
+        (KeyCode::Char('r'), KeyModifiers::ALT) => {
             app.browse.begin_range_selection();
             app.set_status("Range select: move, Enter/Space commits, Esc cancels");
             selection_may_have_changed = true;
@@ -24337,6 +24337,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 let clicked_path = app.browse.entries[idx].path.clone();
                 let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
                 let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let alt = mouse.modifiers.contains(KeyModifiers::ALT);
                 let now = std::time::Instant::now();
 
                 if ctrl {
@@ -24351,8 +24352,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     return;
                 }
 
-                if shift {
-                    // Shift+click extends from the current anchor to the clicked row.
+                if shift || alt {
+                    // Shift+click or Alt+click extends from the current anchor
+                    // to the clicked row. Alt+click is the baseline-safe form
+                    // (Shift+click may be intercepted by byobu/tmux).
                     app.browse.commit_range_selection();
                     app.browse.selected_index = idx;
                     app.browse.ensure_visible();
