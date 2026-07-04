@@ -487,6 +487,8 @@ pub struct CommitOutcome {
     pub errors: usize,
     /// Files that were previously converted (warning, not blocking).
     pub previously_converted: usize,
+    /// Last error message (for status display when errors > 0).
+    pub last_error: Option<String>,
 }
 
 /// Commit a batch of paths to the queue with the given conversion options.
@@ -599,6 +601,7 @@ pub fn commit_batch_with_cue_artifacts(
             Err(err) => {
                 log::warn!("commit failed for {}: {err}", path.display());
                 outcome.errors += 1;
+                outcome.last_error = Some(format!("{err}"));
             }
         }
     }

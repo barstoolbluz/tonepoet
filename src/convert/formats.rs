@@ -603,13 +603,18 @@ impl FormatDetector {
         }
 
         // Structured disc directories do not necessarily have filename
-        // extensions. Admit recognized Blu-ray roots/BDMV directories before
+        // extensions. Admit recognized disc source directories before
         // extension-based detection so the pipeline source-kind detector can
-        // route them to BlurayMaterializer later. FileFormat has no dedicated
-        // Blu-ray arm today; Archive is the existing container admission class
-        // used for ISOs and other non-audio inputs.
-        if path.is_dir() && crate::disc::bluray_utils::is_bluray_source(path) {
-            return Ok(FileFormat::Archive);
+        // route them to the appropriate materializer. FileFormat::Archive is
+        // the existing container admission class used for ISOs, disc
+        // directories, and other non-audio inputs.
+        if path.is_dir() {
+            if crate::disc::bluray_utils::is_bluray_source(path)
+                || crate::disc::dvdv_utils::is_dvdv_source(path)
+                || crate::disc::dvda_utils::is_dvda_source(path)
+            {
+                return Ok(FileFormat::Archive);
+            }
         }
 
         let Some(extension) = path

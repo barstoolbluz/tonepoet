@@ -4411,6 +4411,11 @@ fn execute_commit_with_source_options_transform(
                 "commit: all {} file(s) already queued",
                 outcome.skipped
             ));
+        } else if let Some(ref err) = outcome.last_error {
+            app.set_status(format!(
+                "commit failed: {}",
+                err
+            ));
         } else {
             app.set_status(format!(
                 "commit failed: {} errors, {} skipped",
