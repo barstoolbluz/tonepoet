@@ -391,7 +391,7 @@ fn check_browse_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>
         app.browse.probe_debounce = None;
         return;
     }
-    app.browse.check_probe_debounce(tx);
+    app.browse.check_probe_debounce_with_db(tx, Some(&app.db));
 }
 
 /// Fire a debounced search if the user has stopped typing for 200ms.
@@ -2642,7 +2642,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
         }
         AppMessage::DiscProbeComplete { path, fingerprint, result } => {
-            app.browse.disc_probe_pending.remove(&path);
+            if !app.browse.complete_disc_probe(&path) {
+                return;
+            }
             match (fingerprint, *result) {
                 (Some(fingerprint), Ok(contents)) => {
                     if crate::tui::disc_browser::disc_probe_fingerprint(&path)
@@ -2653,6 +2655,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             path.clone(),
                             crate::tui::disc_browser::DiscProbeCacheEntry::from_success(fingerprint, contents),
                         );
+                        if app.browse.current_selected_disc_source_matches(&path) {
+                            app.browse.deferred_work.info_pane_changed = true;
+                            app.force_redraw = true;
+                        }
                         if let Some(followup) = app.browse.disc_probe_followup.remove(&path) {
                             super::disc_browser_actions::handle_disc_probe_followup(app, &path, followup);
                         }
@@ -2673,7 +2679,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             path.clone(),
                             crate::tui::disc_browser::DiscProbeCacheEntry::from_error(fingerprint, error.clone()),
                         );
-                        app.set_status(format!("Disc analysis failed: {error}"));
+                        if app.browse.current_selected_disc_source_matches(&path) {
+                            app.browse.deferred_work.info_pane_changed = true;
+                            app.force_redraw = true;
+                            app.set_status(format!("Disc analysis failed: {error}"));
+                        }
                     } else {
                         log::debug!(
                             "discarded stale disc-probe error after fingerprint change: {}",
@@ -2700,6 +2710,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             path.clone(),
                             crate::tui::disc_browser::DiscProbeCacheEntry::from_success(fingerprint, contents),
                         );
+                        if app.browse.current_selected_disc_source_matches(&path) {
+                            app.browse.deferred_work.info_pane_changed = true;
+                            app.force_redraw = true;
+                        }
                     }
                 }
             }
@@ -2715,11 +2729,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
             match app.browse.classify_filesystem_async_completion(&path, identity) {
                 crate::tui::browse::FilesystemAsyncCompletion::Accept => {
-                    app.browse.insert_dir_stats_for_identity(path, identity, stats);
+                    app.browse.insert_dir_stats_for_identity(path.clone(), identity, stats);
+                    app.browse.store_directory_summary_for_identity_best_effort(&path, identity, &app.db);
                 }
                 crate::tui::browse::FilesystemAsyncCompletion::Changed => {
                     log::debug!("dropping stale directory-stats completion after identity change: {}", path.display());
                     app.browse.remove_dir_stats_cache_entry(&path);
+                    app.browse.invalidate_directory_summary_persistent_cache_best_effort(&path, &app.db);
                     if app.browse.current_entry_is_still_statable(&path) {
                         app.browse.probe_current_with_db(tx, Some(&app.db));
                     }
@@ -2727,6 +2743,45 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 crate::tui::browse::FilesystemAsyncCompletion::MissingOrUnstatable => {
                     log::debug!("dropping directory-stats completion for missing/unstatable path: {}", path.display());
                     app.browse.remove_dir_stats_cache_entry(&path);
+                    app.browse.invalidate_directory_summary_persistent_cache_best_effort(&path, &app.db);
+                }
+            }
+        }
+        AppMessage::FolderClassifyComplete { path, identity, classification } => {
+            let was_pending = app.browse.complete_folder_classification(&path);
+            if !was_pending {
+                return;
+            }
+            match app.browse.classify_filesystem_async_completion(&path, identity) {
+                crate::tui::browse::FilesystemAsyncCompletion::Accept => {
+                    let is_current = app.browse.is_current_entry_path(&path);
+                    app.browse.insert_folder_classification_for_identity(path.clone(), identity, classification);
+                    app.browse.store_directory_summary_for_identity_best_effort(&path, identity, &app.db);
+                    if is_current {
+                        // Re-enter the cheap current-entry policy path after
+                        // caching the classification. This lets cached summary
+                        // facts decide what, if any, follow-up work is useful:
+                        // classified Disc probes, Album/MultiDisc recursive
+                        // stats, or no recursive work for Collections.
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                        app.browse.deferred_work.info_pane_changed = true;
+                        app.force_redraw = true;
+                    } else {
+                        log::debug!("cached folder classification for non-current selection: {}", path.display());
+                    }
+                }
+                crate::tui::browse::FilesystemAsyncCompletion::Changed => {
+                    log::debug!("dropping stale folder classification after identity change: {}", path.display());
+                    app.browse.remove_folder_classification_cache_entry(&path);
+                    app.browse.invalidate_directory_summary_persistent_cache_best_effort(&path, &app.db);
+                    if app.browse.current_entry_is_still_statable(&path) {
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                    }
+                }
+                crate::tui::browse::FilesystemAsyncCompletion::MissingOrUnstatable => {
+                    log::debug!("dropping folder classification for missing/unstatable path: {}", path.display());
+                    app.browse.remove_folder_classification_cache_entry(&path);
+                    app.browse.invalidate_directory_summary_persistent_cache_best_effort(&path, &app.db);
                 }
             }
         }
@@ -6659,7 +6714,12 @@ mod async_message_drain_tests {
         );
 
         assert!(app.browse.current_dir_stats().is_none());
-        assert!(app.browse.dir_stats_pending.contains(&path));
+        assert!(!app.browse.dir_stats_pending.contains(&path));
+        assert_eq!(
+            app.browse.probe_debounce.as_ref().map(|pending| pending.path.as_path()),
+            Some(path.as_path()),
+            "a stale stats result should re-enter the settled-focus policy path instead of immediately relaunching recursive stats"
+        );
     }
 
     #[test]
@@ -6739,5 +6799,120 @@ mod async_message_drain_tests {
         assert!(!app.browse.probe_pending.contains(&path));
         assert!(app.browse.probe_debounce.is_none());
         assert!(app.browse.current_cached_info().is_none());
+    }
+
+    fn folder_classification(
+        identity: crate::tui::browse::ProbeCacheIdentity,
+        kind: crate::tui::browse::FolderClassificationKind,
+    ) -> crate::tui::browse::FolderContentClassification {
+        crate::tui::browse::FolderContentClassification {
+            kind,
+            identity,
+            audio: crate::tui::browse::FolderAudioSummary::default(),
+            units: Vec::new(),
+            unit_count: if kind == crate::tui::browse::FolderClassificationKind::Unknown { 0 } else { 1 },
+            collection_many: false,
+            io_budget_exhausted: false,
+            disc_marker: None,
+        }
+    }
+
+    #[test]
+    fn folder_classify_completion_accepts_only_pending_matching_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album");
+        std::fs::create_dir(&path).expect("mkdir");
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
+            &std::fs::metadata(&path).expect("metadata"),
+        );
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            identity.size,
+            identity.modified,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.mark_folder_classification_pending_for_test(path.clone());
+
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::FolderClassifyComplete {
+                path: path.clone(),
+                identity,
+                classification: folder_classification(
+                    identity,
+                    crate::tui::browse::FolderClassificationKind::Album,
+                ),
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.folder_classification_pending_for(&path));
+        assert!(app.browse.has_valid_folder_classification_for_identity(&path, identity));
+        assert_eq!(
+            app.browse.current_folder_classification().map(|classification| classification.kind),
+            Some(crate::tui::browse::FolderClassificationKind::Album),
+        );
+        assert!(app.browse.deferred_work.info_pane_changed);
+    }
+
+    #[test]
+    fn folder_classify_completion_without_pending_marker_is_ignored() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album");
+        std::fs::create_dir(&path).expect("mkdir");
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
+            &std::fs::metadata(&path).expect("metadata"),
+        );
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::FolderClassifyComplete {
+                path: path.clone(),
+                identity,
+                classification: folder_classification(
+                    identity,
+                    crate::tui::browse::FolderClassificationKind::Album,
+                ),
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.has_valid_folder_classification_for_identity(&path, identity));
+    }
+
+    #[test]
+    fn stale_folder_classify_completion_rejects_cache_insert() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album");
+        std::fs::create_dir(&path).expect("mkdir");
+        let stale_identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 };
+
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.browse.mark_folder_classification_pending_for_test(path.clone());
+
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::FolderClassifyComplete {
+                path: path.clone(),
+                identity: stale_identity,
+                classification: folder_classification(
+                    stale_identity,
+                    crate::tui::browse::FolderClassificationKind::Album,
+                ),
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.folder_classification_pending_for(&path));
+        assert!(!app.browse.has_valid_folder_classification_for_identity(&path, stale_identity));
     }
 }

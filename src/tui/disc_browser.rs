@@ -12,6 +12,7 @@
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use tokio::sync::mpsc;
@@ -359,27 +360,53 @@ pub fn scroll_for_viewport(
 }
 
 /// Spawn an asynchronous parse/map probe for a disc source.
-pub fn spawn_disc_probe(path: PathBuf, tx: mpsc::Sender<AppMessage>) {
+pub fn spawn_disc_probe(
+    path: PathBuf,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<AppMessage>,
+) {
     tokio::spawn(async move {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let fingerprint = match disc_probe_fingerprint(&path) {
             Ok(fingerprint) => fingerprint,
             Err(err) => {
-                let _ = tx
-                    .send(AppMessage::DiscProbeComplete {
-                        path,
-                        fingerprint: None,
-                        result: Box::new(Err(err)),
-                    })
-                    .await;
+                if !cancel.load(Ordering::Relaxed) {
+                    let _ = tx
+                        .send(AppMessage::DiscProbeComplete {
+                            path,
+                            fingerprint: None,
+                            result: Box::new(Err(err)),
+                        })
+                        .await;
+                }
                 return;
             }
         };
 
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let probe_path = path.clone();
-        let result = match tokio::task::spawn_blocking(move || probe_disc_contents(&probe_path)).await {
+        let cancel_for_task = cancel.clone();
+        let result = match tokio::task::spawn_blocking(move || {
+            if cancel_for_task.load(Ordering::Relaxed) {
+                return Err("disc probe cancelled".to_string());
+            }
+            let result = probe_disc_contents(&probe_path);
+            if cancel_for_task.load(Ordering::Relaxed) {
+                Err("disc probe cancelled".to_string())
+            } else {
+                result
+            }
+        }).await {
             Ok(result) => result,
             Err(err) => Err(format!("Disc probe task failed: {err}")),
         };
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let _ = tx
             .send(AppMessage::DiscProbeComplete {
                 path,
@@ -419,18 +446,56 @@ fn probe_sacd_contents(path: &Path) -> Result<DiscContents, String> {
     ))
 }
 
-/// One-line disc summary for info panes.
+/// Compact disc summary for info panes.
 pub fn disc_summary(contents: &DiscContents) -> String {
     let stream_count = contents.presentations.len();
     let track_count: usize = contents.presentations.iter().map(|p| p.tracks.len()).sum();
+    let stereo_count = contents
+        .presentations
+        .iter()
+        .filter(|presentation| presentation_is_stereo(presentation))
+        .count();
+    let multichannel_count = stream_count.saturating_sub(stereo_count);
     format!(
-        "{} · {} audio {} · {} {}",
-        contents.format.name(),
+        "{} audio {} · {} {} · {} multichannel · {} stereo",
         stream_count,
         plural(stream_count, "stream", "streams"),
         track_count,
         plural(track_count, "track", "tracks"),
+        multichannel_count,
+        stereo_count,
     )
+}
+
+pub fn disc_content_summary_lines(contents: &DiscContents) -> Vec<String> {
+    let stream_count = contents.presentations.len();
+    let track_count: usize = contents.presentations.iter().map(|p| p.tracks.len()).sum();
+    let stereo_count = contents
+        .presentations
+        .iter()
+        .filter(|presentation| presentation_is_stereo(presentation))
+        .count();
+    let multichannel_count = stream_count.saturating_sub(stereo_count);
+    vec![
+        format!(
+            "content: {} audio {} · {} {}",
+            stream_count,
+            plural(stream_count, "stream", "streams"),
+            track_count,
+            plural(track_count, "track", "tracks"),
+        ),
+        format!("         {multichannel_count} multichannel · {stereo_count} stereo"),
+    ]
+}
+
+pub fn disc_stream_summary_lines(contents: &DiscContents, limit: usize) -> Vec<String> {
+    let mut presentations: Vec<&DiscPresentation> = contents.presentations.iter().collect();
+    presentations.sort_by(|left, right| compare_disc_presentations(left, right));
+    presentations
+        .into_iter()
+        .take(limit)
+        .map(|presentation| disc_stream_display(contents.format, presentation))
+        .collect()
 }
 
 /// Summary row for a single presentation, without the leading row marker.
@@ -441,7 +506,92 @@ pub fn presentation_summary(index: usize, presentation: &DiscPresentation) -> St
         suffix.push_str(", ");
         suffix.push_str(&duration_display(presentation.total_duration_secs));
     }
-    format!("Stream {}: {} ({})", index + 1, presentation.label, suffix)
+    format!("Stream {}: {} ({})", index + 1, format_note(presentation), suffix)
+}
+
+fn compare_disc_presentations(left: &DiscPresentation, right: &DiscPresentation) -> std::cmp::Ordering {
+    disc_codec_priority(left)
+        .cmp(&disc_codec_priority(right))
+        .then_with(|| presentation_channel_priority(left).cmp(&presentation_channel_priority(right)))
+        .then_with(|| presentation_bit_depth_priority(left).cmp(&presentation_bit_depth_priority(right)))
+        .then_with(|| presentation_sample_rate_priority(left).cmp(&presentation_sample_rate_priority(right)))
+        .then_with(|| left.label.cmp(&right.label))
+}
+
+fn disc_codec_priority(presentation: &DiscPresentation) -> u8 {
+    let codec = presentation
+        .format
+        .codec
+        .as_deref()
+        .unwrap_or(&presentation.label)
+        .to_ascii_lowercase();
+    if codec.contains("lpcm") || codec.contains("pcm") {
+        0
+    } else if codec.contains("truehd") {
+        1
+    } else if codec.contains("dts-hd") || codec.contains("dts hd") {
+        2
+    } else if codec.contains("dts") {
+        3
+    } else if codec.contains("ac3") || codec.contains("dolby digital") {
+        4
+    } else {
+        5
+    }
+}
+
+fn presentation_channel_priority(presentation: &DiscPresentation) -> u8 {
+    if presentation_is_stereo(presentation) { 0 } else { 1 }
+}
+
+fn presentation_bit_depth_priority(presentation: &DiscPresentation) -> std::cmp::Reverse<u32> {
+    std::cmp::Reverse(presentation.format.bit_depth.unwrap_or(0).into())
+}
+
+fn presentation_sample_rate_priority(presentation: &DiscPresentation) -> std::cmp::Reverse<u32> {
+    std::cmp::Reverse(presentation.format.sample_rate.unwrap_or(0))
+}
+
+fn presentation_is_stereo(presentation: &DiscPresentation) -> bool {
+    if let Some(layout) = &presentation.format.channel_layout {
+        let lower = layout.to_ascii_lowercase();
+        if lower.contains("stereo") || lower == "2.0" || lower == "2ch" {
+            return true;
+        }
+    }
+    matches!(presentation.format.channels, Some(channels) if channels <= 2)
+}
+
+fn disc_stream_display(format: DiscFormat, presentation: &DiscPresentation) -> String {
+    if matches!(format, DiscFormat::Sacd) {
+        let layout = presentation
+            .format
+            .channel_layout
+            .clone()
+            .or_else(|| presentation.format.channels.map(|channels| format!("{channels}ch")))
+            .unwrap_or_else(|| presentation.label.clone());
+        return format!("DSD 2.8MHz {layout}");
+    }
+
+    let fmt = &presentation.format;
+    let mut parts = Vec::new();
+    if let Some(codec) = &fmt.codec {
+        parts.push(codec.clone());
+    } else {
+        parts.push(presentation.label.clone());
+    }
+    if let Some(bits) = fmt.bit_depth {
+        parts.push(format!("{bits}-bit"));
+    }
+    if let Some(rate) = fmt.sample_rate {
+        parts.push(sample_rate_display(rate));
+    }
+    if let Some(layout) = &fmt.channel_layout {
+        parts.push(layout.clone());
+    } else if let Some(channels) = fmt.channels {
+        parts.push(format!("{channels}ch"));
+    }
+    parts.join(" ")
 }
 
 pub fn format_note(presentation: &DiscPresentation) -> String {
@@ -1113,6 +1263,105 @@ mod cache_tests {
 
 }
 
+
+#[cfg(test)]
+mod disc_stream_summary_tests {
+    use super::*;
+    use crate::disc::model::{
+        AudioPresentationFormat, CopyProtectionSummary, DiscFormat, DiscPresentation,
+        DiscTrack, FormatProvenance, PresentationId,
+    };
+    use std::path::PathBuf;
+
+    fn presentation(
+        label: &str,
+        codec: &str,
+        channels: u32,
+        layout: &str,
+        bit_depth: u32,
+        sample_rate: u32,
+        playlist: u32,
+    ) -> DiscPresentation {
+        DiscPresentation {
+            id: PresentationId::try_blu_ray_title(playlist, 0x1100 + playlist as u16, 0, 1)
+                .expect("valid Blu-ray id"),
+            label: label.to_string(),
+            format: AudioPresentationFormat {
+                codec: Some(codec.to_string()),
+                sample_rate: Some(sample_rate),
+                bit_depth: Some(bit_depth),
+                channels: Some(channels as u8),
+                channel_layout: Some(layout.to_string()),
+                lossless: codec != "AC3",
+                provenance: FormatProvenance::IfoAttributes,
+            },
+            tracks: vec![DiscTrack {
+                number: 1,
+                title: None,
+                performer: None,
+                duration_secs: Some(60.0),
+                format_note: None,
+            }],
+            total_duration_secs: 60.0,
+            album_title: None,
+            album_artist: None,
+            genre: None,
+            year: None,
+        }
+    }
+
+    fn contents(presentations: Vec<DiscPresentation>) -> DiscContents {
+        DiscContents {
+            format: DiscFormat::BluRay,
+            label: "BD".to_string(),
+            source_path: PathBuf::from("disc"),
+            presentations,
+            suppressed: Vec::new(),
+            copy_protection: CopyProtectionSummary { description: "none".to_string() },
+            diagnostics: Vec::new(),
+            album_title: None,
+            album_artist: None,
+            genre: None,
+            year: None,
+        }
+    }
+
+    #[test]
+    fn stream_summary_sorts_by_codec_channels_depth_rate_and_caps_limit() {
+        let contents = contents(vec![
+            presentation("AC3 5.1", "AC3", 6, "5.1", 16, 48_000, 1),
+            presentation("DTS 5.1", "DTS-HD MA", 6, "5.1", 24, 96_000, 2),
+            presentation("TrueHD stereo", "TrueHD", 2, "stereo", 24, 96_000, 3),
+            presentation("LPCM 5.1", "LPCM", 6, "5.1", 24, 96_000, 4),
+            presentation("LPCM stereo 16", "LPCM", 2, "stereo", 16, 44_100, 5),
+            presentation("LPCM stereo 24/96", "LPCM", 2, "stereo", 24, 96_000, 6),
+            presentation("LPCM stereo 24/192", "LPCM", 2, "stereo", 24, 192_000, 7),
+        ]);
+
+        let lines = disc_stream_summary_lines(&contents, 6);
+
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0], "LPCM 24-bit/192kHz stereo");
+        assert_eq!(lines[1], "LPCM 24-bit/96kHz stereo");
+        assert_eq!(lines[2], "LPCM 16-bit/44.1kHz stereo");
+        assert_eq!(lines[3], "LPCM 24-bit/96kHz 5.1");
+        assert_eq!(lines[4], "TrueHD 24-bit/96kHz stereo");
+        assert_eq!(lines[5], "DTS-HD MA 24-bit/96kHz 5.1");
+    }
+
+    #[test]
+    fn sacd_stream_summary_uses_compact_dsd_labels() {
+        let mut contents = contents(vec![
+            presentation("Stereo", "DSD", 2, "stereo", 1, 2_822_400, 1),
+            presentation("Multichannel", "DSD", 6, "5.1", 1, 2_822_400, 2),
+        ]);
+        contents.format = DiscFormat::Sacd;
+
+        let lines = disc_stream_summary_lines(&contents, 6);
+
+        assert_eq!(lines, vec!["DSD 2.8MHz stereo", "DSD 2.8MHz 5.1"]);
+    }
+}
 
 #[cfg(test)]
 mod disc_selection_bridge_tests {

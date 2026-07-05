@@ -570,7 +570,8 @@ pub fn force_disc_reprobe(
 /// Start async probing if this path is not already in flight.
 pub fn request_disc_probe(app: &mut AppState, path: PathBuf, tx: &mpsc::Sender<AppMessage>) {
     if app.browse.disc_probe_pending.insert(path.clone()) {
-        crate::tui::disc_browser::spawn_disc_probe(path, tx.clone());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::tui::disc_browser::spawn_disc_probe(path, cancel, tx.clone());
         app.set_status("Analyzing disc streams...");
     } else {
         app.set_status("Disc analysis already in progress...");

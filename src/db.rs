@@ -8,7 +8,7 @@ use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 20;
+const CURRENT_VERSION: u32 = 21;
 
 // ── CTDB parity matrix cache tunables ─────────────────────────────────
 //
@@ -176,6 +176,9 @@ impl Database {
         }
         if version < 20 {
             self.migrate_v20()?;
+        }
+        if version < 21 {
+            self.migrate_v21()?;
         }
 
         self.conn
@@ -724,6 +727,34 @@ impl Database {
         ",
             )
             .map_err(|e| format!("v20 migration failed: {}", e))?;
+        Ok(())
+    }
+
+    /// v21: identity-keyed Browse directory-summary cache.
+    ///
+    /// These rows cache only scoped directory summary facts. The persisted
+    /// payload carries its own scope semantics: immediate and depth-2 facts are
+    /// valid only for the focused directory identity, while recursive stats are
+    /// explicitly best-effort because ancestor directory mtimes do not reliably
+    /// reflect deep descendant edits on all filesystems.
+    fn migrate_v21(&mut self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "
+            CREATE TABLE IF NOT EXISTS directory_summary_cache (
+                dir_path             TEXT PRIMARY KEY,
+                identity_size        INTEGER NOT NULL,
+                identity_mtime_nanos INTEGER NOT NULL,
+                strongest_scope      TEXT NOT NULL,
+                payload              TEXT NOT NULL,
+                cached_at            TEXT NOT NULL,
+                accessed_at          TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_directory_summary_accessed
+                ON directory_summary_cache (accessed_at);
+        ",
+            )
+            .map_err(|e| format!("v21 migration failed: {}", e))?;
         Ok(())
     }
 
@@ -1832,6 +1863,93 @@ impl Database {
         Ok(entries)
     }
 
+    // ── Browse directory-summary cache ───────────────────────────
+
+    /// Look up a cached Browse directory summary by focused-directory
+    /// identity. Returns None if the row is absent, stale, or corrupt.
+    pub fn get_cached_directory_summary(
+        &self,
+        dir_path: &std::path::Path,
+        identity: crate::tui::browse::ProbeCacheIdentity,
+    ) -> Option<crate::tui::browse::DirectorySummaryCacheEntry> {
+        let dir_path_key = dir_path.display().to_string();
+        let size_i64 = directory_summary_identity_size_i64(identity.size);
+        let mtime_nanos = directory_summary_identity_mtime_nanos(identity);
+        let payload: String = self
+            .conn
+            .query_row(
+                "SELECT payload FROM directory_summary_cache
+                 WHERE dir_path = ?1 AND identity_size = ?2 AND identity_mtime_nanos = ?3",
+                params![dir_path_key, size_i64, mtime_nanos],
+                |row| row.get(0),
+            )
+            .ok()?;
+
+        let (_path, entry) = crate::tui::browse::DirectorySummaryCacheEntry::from_persistent_line(&payload)?;
+        if !entry.is_valid_for(identity) {
+            return None;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE directory_summary_cache SET accessed_at = ?1 WHERE dir_path = ?2",
+            params![now, dir_path.display().to_string()],
+        );
+        Some(entry)
+    }
+
+    /// Store a scoped Browse directory summary. The serialized payload retains
+    /// the cache-scope semantics from `DirectorySummaryFacts`, so future reads
+    /// can distinguish immediate/depth-2 facts from best-effort recursive
+    /// statistics instead of treating all rows as strong subtree fingerprints.
+    pub fn store_directory_summary(
+        &self,
+        dir_path: &std::path::Path,
+        entry: &crate::tui::browse::DirectorySummaryCacheEntry,
+    ) -> Result<(), String> {
+        let dir_path_key = dir_path.display().to_string();
+        let size_i64 = directory_summary_identity_size_i64(entry.identity.size);
+        let mtime_nanos = directory_summary_identity_mtime_nanos(entry.identity);
+        let payload = entry.to_persistent_line(dir_path);
+        let strongest_scope = directory_summary_strongest_scope_code(entry);
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO directory_summary_cache (
+                    dir_path, identity_size, identity_mtime_nanos,
+                    strongest_scope, payload, cached_at, accessed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(dir_path) DO UPDATE SET
+                    identity_size = excluded.identity_size,
+                    identity_mtime_nanos = excluded.identity_mtime_nanos,
+                    strongest_scope = excluded.strongest_scope,
+                    payload = excluded.payload,
+                    cached_at = excluded.cached_at,
+                    accessed_at = excluded.accessed_at",
+                params![
+                    dir_path_key,
+                    size_i64,
+                    mtime_nanos,
+                    strongest_scope,
+                    payload,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("directory summary cache store: {}", e))?;
+        Ok(())
+    }
+
+    /// Remove a persisted Browse directory summary for a path.
+    pub fn invalidate_directory_summary(&self, dir_path: &std::path::Path) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM directory_summary_cache WHERE dir_path = ?1",
+                params![dir_path.display().to_string()],
+            )
+            .map_err(|e| format!("directory summary cache invalidate: {}", e))?;
+        Ok(())
+    }
+
     // ── Probe cache ──────────────────────────────────────────────
 
     /// Look up a cached probe result. Returns None if not cached or
@@ -2234,6 +2352,55 @@ pub struct CachedProbeRow {
     pub rg_album_peak: Option<String>,
     pub r128_track_gain: Option<String>,
     pub r128_album_gain: Option<String>,
+}
+
+fn directory_summary_identity_size_i64(size: u64) -> i64 {
+    i64::try_from(size).unwrap_or(i64::MAX)
+}
+
+fn directory_summary_identity_mtime_nanos(identity: crate::tui::browse::ProbeCacheIdentity) -> i64 {
+    identity
+        .modified
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| {
+            let secs = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX / 1_000_000_000);
+            secs.saturating_mul(1_000_000_000)
+                .saturating_add(i64::from(duration.subsec_nanos()))
+        })
+        .unwrap_or(-1)
+}
+
+fn directory_summary_scope_rank(scope: crate::tui::browse::DirectorySummaryScope) -> u8 {
+    match scope {
+        crate::tui::browse::DirectorySummaryScope::Immediate => 0,
+        crate::tui::browse::DirectorySummaryScope::ShallowDepth2 => 1,
+        crate::tui::browse::DirectorySummaryScope::RecursiveBestEffort => 2,
+    }
+}
+
+fn directory_summary_scope_code(scope: crate::tui::browse::DirectorySummaryScope) -> &'static str {
+    match scope {
+        crate::tui::browse::DirectorySummaryScope::Immediate => "immediate",
+        crate::tui::browse::DirectorySummaryScope::ShallowDepth2 => "shallow2",
+        crate::tui::browse::DirectorySummaryScope::RecursiveBestEffort => "recursive-best-effort",
+    }
+}
+
+fn directory_summary_strongest_scope_code(
+    entry: &crate::tui::browse::DirectorySummaryCacheEntry,
+) -> &'static str {
+    let mut strongest = entry.facts.classification_scope;
+    if let Some(stats_scope) = entry.facts.stats_scope {
+        if strongest
+            .map(|scope| directory_summary_scope_rank(stats_scope) > directory_summary_scope_rank(scope))
+            .unwrap_or(true)
+        {
+            strongest = Some(stats_scope);
+        }
+    }
+    directory_summary_scope_code(
+        strongest.unwrap_or(crate::tui::browse::DirectorySummaryScope::Immediate),
+    )
 }
 
 fn cached_probe_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedProbeRow> {
@@ -2754,6 +2921,80 @@ mod tests {
         db.complete_metadata_write("/music/song.flac").unwrap();
         let stale = db.stale_metadata_writes().unwrap();
         assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn directory_summary_cache_round_trip_and_rejects_stale_identity() {
+        use crate::tui::browse::{
+            DirStats, DirectorySummaryCacheEntry, DirectorySummaryFacts, DirectorySummaryScope,
+            FolderAudioSummary, FolderClassificationKind, FolderContentClassification,
+            ProbeCacheIdentity,
+        };
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::{Duration, SystemTime};
+
+        let db = Database::open_memory().unwrap();
+        let path = PathBuf::from("/music/Persistent Album");
+        let identity = ProbeCacheIdentity {
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            size: 4096,
+        };
+        let mut format_counts = BTreeMap::new();
+        format_counts.insert("FLAC".to_string(), 2usize);
+        let audio = FolderAudioSummary {
+            track_count: 2,
+            format_counts,
+            file_paths: vec![path.join("01.flac"), path.join("02.flac")],
+        };
+        let classification = FolderContentClassification {
+            kind: FolderClassificationKind::Album,
+            identity,
+            audio,
+            units: Vec::new(),
+            unit_count: 1,
+            collection_many: false,
+            io_budget_exhausted: false,
+            disc_marker: None,
+        };
+        let entry = DirectorySummaryCacheEntry {
+            identity,
+            facts: DirectorySummaryFacts {
+                classification: Some(Arc::new(classification)),
+                classification_scope: Some(DirectorySummaryScope::Immediate),
+                stats: Some(Arc::new(DirStats {
+                    file_count: 2,
+                    audio_count: 2,
+                    total_size: 12345,
+                })),
+                stats_scope: Some(DirectorySummaryScope::RecursiveBestEffort),
+            },
+        };
+
+        db.store_directory_summary(&path, &entry).unwrap();
+        let cached = db
+            .get_cached_directory_summary(&path, identity)
+            .expect("fresh identity should hit");
+        assert_eq!(
+            cached.facts.classification.as_ref().map(|classification| classification.kind),
+            Some(FolderClassificationKind::Album),
+        );
+        assert_eq!(cached.facts.classification_scope, Some(DirectorySummaryScope::Immediate));
+        assert_eq!(
+            cached.facts.stats_scope,
+            Some(DirectorySummaryScope::RecursiveBestEffort),
+        );
+        assert_eq!(cached.facts.stats.as_ref().map(|stats| stats.audio_count), Some(2));
+
+        let changed_size = ProbeCacheIdentity { size: identity.size + 1, ..identity };
+        assert!(db.get_cached_directory_summary(&path, changed_size).is_none());
+
+        let changed_mtime = ProbeCacheIdentity {
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001)),
+            ..identity
+        };
+        assert!(db.get_cached_directory_summary(&path, changed_mtime).is_none());
     }
 
     #[test]

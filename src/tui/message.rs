@@ -246,6 +246,15 @@ pub enum AppMessage {
         stats: crate::tui::browse::DirStats,
         cancelled: bool,
     },
+    /// Result of a bounded folder-content classification launched after the
+    /// Browse cursor debounce. The worker performs only directory reads and
+    /// extension checks; reducers still validate the captured directory identity
+    /// and current selection before publishing the cached classification.
+    FolderClassifyComplete {
+        path: std::path::PathBuf,
+        identity: crate::tui::browse::ProbeCacheIdentity,
+        classification: crate::tui::browse::FolderContentClassification,
+    },
     /// Result of an async audio analysis (DR, peak, RMS, etc.).
     /// `result` is Ok on success, Err(message) on failure.
     AnalysisComplete {
