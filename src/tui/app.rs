@@ -1604,11 +1604,20 @@ pub struct ArchiveMetadataEditorPayload {
     pub metadata_errors: Vec<Option<crate::tui::probe::MetadataReadIssue>>,
 }
 
-pub fn cleanup_archive_metadata_staging_dir(staging_dir: &Path) {
+pub fn try_cleanup_archive_metadata_staging_dir(staging_dir: &Path) -> Result<(), String> {
     match std::fs::remove_dir_all(staging_dir) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {}
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "failed to remove archive staging directory {}: {err}",
+            staging_dir.display()
+        )),
+    }
+}
+
+pub fn cleanup_archive_metadata_staging_dir(staging_dir: &Path) {
+    if let Err(err) = try_cleanup_archive_metadata_staging_dir(staging_dir) {
+        log::warn!("{err}");
     }
 }
 
@@ -7480,17 +7489,122 @@ pub enum ConfirmAction {
         context: ArchiveMetadataEditContext,
         quit_after_discard: bool,
     },
-    /// Mouse-accessible destructive discard confirmation for a recovered
-    /// startup archive session.
+    /// Explicit destructive discard confirmation for a recovered startup archive
+    /// session. Opened by keyboard No/D or by the overlay's mouse cancel button.
     ArchiveDiscardStartupRecovery {
         session: crate::db::PendingArchiveSessionRecovery,
     },
     /// Resolve a durable archive staging session found on startup. Confirming
-    /// resumes it in Browse; D discards the staged files; N/Esc keeps it in the
-    /// database for a later startup.
+    /// resumes it in Browse; declining opens an explicit discard confirmation;
+    /// Esc keeps it in the database for a later startup.
     ArchiveStartupRecovery {
         session: crate::db::PendingArchiveSessionRecovery,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfirmationFooterHint {
+    pub label: &'static str,
+    pub key: &'static str,
+}
+
+/// Footer-button labels for confirmation overlays.
+///
+/// The renderer should use this instead of hard-coded `Y yes` / `N no` text so
+/// visible chips, keyboard handlers, and mouse handlers stay aligned for
+/// multi-action confirmations such as archive startup recovery.
+pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [ConfirmationFooterHint] {
+    const DEFAULT: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y yes", key: "y" },
+        ConfirmationFooterHint { label: "N no", key: "n" },
+    ];
+    const ARCHIVE_STARTUP_RECOVERY: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y resume", key: "y" },
+        ConfirmationFooterHint { label: "N discard...", key: "n" },
+        ConfirmationFooterHint { label: "D discard...", key: "d" },
+        ConfirmationFooterHint { label: "Esc later", key: "esc" },
+    ];
+    const ARCHIVE_DISCARD_STARTUP_RECOVERY: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y discard", key: "y" },
+        ConfirmationFooterHint { label: "N keep", key: "n" },
+        ConfirmationFooterHint { label: "Esc keep", key: "esc" },
+    ];
+    const ARCHIVE_RETRY_OR_DISCARD: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y retry", key: "y" },
+        ConfirmationFooterHint { label: "D discard...", key: "d" },
+        ConfirmationFooterHint { label: "N keep", key: "n" },
+        ConfirmationFooterHint { label: "Esc keep", key: "esc" },
+    ];
+    const ARCHIVE_DISCARD_STAGING: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y discard", key: "y" },
+        ConfirmationFooterHint { label: "N keep", key: "n" },
+        ConfirmationFooterHint { label: "Esc keep", key: "esc" },
+    ];
+
+    match action {
+        ConfirmAction::ArchiveStartupRecovery { .. } => ARCHIVE_STARTUP_RECOVERY,
+        ConfirmAction::ArchiveDiscardStartupRecovery { .. } => ARCHIVE_DISCARD_STARTUP_RECOVERY,
+        ConfirmAction::ArchiveExternalConflict { .. }
+        | ConfirmAction::ArchiveRepackageFailure { .. } => ARCHIVE_RETRY_OR_DISCARD,
+        ConfirmAction::ArchiveDiscardStaging { .. } => ARCHIVE_DISCARD_STAGING,
+        _ => DEFAULT,
+    }
+}
+
+/// Human-readable footer hint text for confirmation overlays.
+///
+/// Renderers that cannot or do not want to style each hint individually can
+/// use this string form. Prefer [`confirmation_footer_hints`] when drawing
+/// pill/chip styled footer controls.
+pub fn confirmation_footer_hint_text(action: &ConfirmAction) -> String {
+    confirmation_footer_hints(action)
+        .iter()
+        .map(|hint| hint.label)
+        .collect::<Vec<_>>()
+        .join("     ")
+}
+
+/// User-facing text for the startup archive recovery confirmation.
+///
+/// Keep this in one place so the first prompt opened by `AppState::new*` and
+/// the prompts opened after resolving earlier recovered sessions cannot drift.
+pub fn archive_startup_recovery_prompt_message(
+    session: &crate::db::PendingArchiveSessionRecovery,
+) -> String {
+    let reason = session.conflict_reason.as_deref().unwrap_or("none");
+    let edits = archive_recovery_edits_summary(&session.edits_json);
+    format!(
+        "Recovered staged archive edits from a previous run:\n{}\n\nStaging: {}\nEdits: {}\nConflict: {}\n\nY/Enter resumes the staged archive view. N/No opens a discard confirmation. D also opens discard confirmation. Esc keeps them for next startup.",
+        session.archive_path.display(),
+        session.staging_dir.display(),
+        edits,
+        reason,
+    )
+}
+
+fn archive_recovery_edits_summary(edits_json: &str) -> String {
+    const PREVIEW_LIMIT: usize = 180;
+
+    let compact = edits_json.trim().replace('\n', " ");
+    let mut chars = compact.chars();
+    let mut preview: String = chars.by_ref().take(PREVIEW_LIMIT).collect();
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+
+    match serde_json::from_str::<serde_json::Value>(edits_json) {
+        Ok(serde_json::Value::Array(edits)) => {
+            let count = edits.len();
+            if count == 0 {
+                "0 edit operations".to_string()
+            } else {
+                format!("{count} edit operation(s); preview: {preview}")
+            }
+        }
+        Ok(_) => format!("1 edit payload; preview: {preview}"),
+        Err(_) if preview.is_empty() => "unavailable".to_string(),
+        Err(_) => format!("unparseable edit payload; preview: {preview}"),
+    }
 }
 
 /// Repair parameters parked while AR verification runs to resolve
@@ -8071,15 +8185,8 @@ impl AppState {
         let mut active_overlay = ActiveOverlay::None;
         let mut archive_recovery_prompt_active = false;
         if let Some(session) = pending_archive_recovery.front().cloned() {
-            let reason = session.conflict_reason.as_deref().unwrap_or("none");
             active_overlay = ActiveOverlay::Confirmation {
-                message: format!(
-                    "Recovered staged archive edits from a previous run:\n{}\n\nStaging: {}\nEdits: {}\nConflict: {}\n\nY resumes the staged archive view. D discards staged edits. N/Esc keeps them for next startup.",
-                    session.archive_path.display(),
-                    session.staging_dir.display(),
-                    session.edits_json,
-                    reason,
-                ),
+                message: archive_startup_recovery_prompt_message(&session),
                 action: ConfirmAction::ArchiveStartupRecovery { session },
             };
             archive_recovery_prompt_active = true;

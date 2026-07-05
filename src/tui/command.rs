@@ -6260,9 +6260,6 @@ fn toml_item_to_json_value(item: &Item) -> Option<serde_json::Value> {
     if let Some(value) = item.as_datetime() {
         return Some(serde_json::Value::String(value.to_string()));
     }
-    if let Some(value) = item.as_value() {
-        return Some(toml_value_to_json_value(value));
-    }
     if let Some(table) = item.as_table() {
         let mut out = serde_json::Map::new();
         for (key, value) in table.iter() {

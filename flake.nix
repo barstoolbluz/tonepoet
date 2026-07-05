@@ -137,7 +137,8 @@
 
           shellHook = ''
             # libaacs is loaded by libbluray via dlopen(); ensure it's discoverable
-            export LD_LIBRARY_PATH="${pkgs.libaacs}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            # stdenv.cc.cc.lib provides libstdc++.so.6 for test binaries that spawn dynamically-linked subprocesses
+            export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.libaacs}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             echo "tonepoet development environment"
             echo ""
             echo "  cargo build    - Build the project"

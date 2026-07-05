@@ -4029,14 +4029,21 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.active_overlay = ActiveOverlay::None;
                     execute_confirm_action(app, &action, tx);
                 }
+                KeyCode::Char('n') | KeyCode::Char('N')
+                    if matches!(action, ConfirmAction::ArchiveStartupRecovery { .. }) =>
+                {
+                    let _ = open_archive_staging_discard_confirmation(app, &action);
+                }
+                KeyCode::Char('d') | KeyCode::Char('D')
+                    if matches!(action, ConfirmAction::ArchiveStartupRecovery { .. }) =>
+                {
+                    let _ = open_archive_staging_discard_confirmation(app, &action);
+                }
                 KeyCode::Char('d') | KeyCode::Char('D')
                     if matches!(
                         action,
                         ConfirmAction::ArchiveExternalConflict { .. }
                             | ConfirmAction::ArchiveRepackageFailure { .. }
-                            | ConfirmAction::ArchiveDiscardStaging { .. }
-                            | ConfirmAction::ArchiveStartupRecovery { .. }
-                            | ConfirmAction::ArchiveDiscardStartupRecovery { .. }
                     ) =>
                 {
                     execute_archive_staging_discard_action(app, &action);
@@ -6637,11 +6644,12 @@ mod progress_dialog_theme_tests {
         app.set_ui_theme("tokyo-night");
 
         handle_config_key(&mut app, KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        let target = app.theme_library.choices()
+            .iter()
+            .position(|choice| choice.slug == "gruvbox")
+            .expect("gruvbox choice");
         match &mut app.active_overlay {
-            ActiveOverlay::ThemeBuilder(state) => {
-                state.gallery_filter_input = crate::tui::text_input::TextInputState::new("gruvbox".to_string());
-                state.preset_cursor = 0;
-            }
+            ActiveOverlay::ThemeBuilder(state) => state.preset_cursor = target,
             other => panic!("expected theme gallery overlay, got {:?}", other),
         }
 
@@ -22805,12 +22813,24 @@ fn discard_archive_staging_context(
     context: &ArchiveMetadataEditContext,
     quit_after_discard: bool,
 ) {
+    if let Err(err) = super::app::try_cleanup_archive_metadata_staging_dir(&context.staging_dir) {
+        app.active_overlay = ActiveOverlay::None;
+        app.set_status(format!(
+            "archive discard failed; staged edits kept and recovery row preserved: {err}"
+        ));
+        return;
+    }
+
     let deferred_screen_switch = app.deferred_browse_archive_screen_switch.take();
     let deferred_archive_exit = app.deferred_browse_archive_exit;
     app.deferred_browse_archive_exit = false;
 
-    super::app::cleanup_archive_metadata_staging_dir(&context.staging_dir);
-    let _ = app.db.delete_pending_archive_session(&context.archive_path);
+    if let Err(err) = app.db.delete_pending_archive_session(&context.archive_path) {
+        log::warn!(
+            "failed to delete pending archive session for {} after staging discard: {err}",
+            context.archive_path.display()
+        );
+    }
     if app
         .preserved_editor_archive_repackage
         .as_ref()
@@ -22860,6 +22880,35 @@ fn discard_archive_staging_context(
         } else {
             app.set_status("discarded staged archive changes".to_string());
         }
+    }
+}
+
+fn pending_archive_recovery_session_matches(
+    left: &crate::db::PendingArchiveSessionRecovery,
+    right: &crate::db::PendingArchiveSessionRecovery,
+) -> bool {
+    left.archive_path == right.archive_path && left.staging_dir == right.staging_dir
+}
+
+fn defer_pending_startup_archive_recovery(
+    app: &mut AppState,
+    session: &crate::db::PendingArchiveSessionRecovery,
+) {
+    if app
+        .pending_archive_recovery
+        .front()
+        .is_some_and(|front| pending_archive_recovery_session_matches(front, session))
+    {
+        let _ = app.pending_archive_recovery.pop_front();
+        return;
+    }
+
+    if let Some(position) = app
+        .pending_archive_recovery
+        .iter()
+        .position(|candidate| pending_archive_recovery_session_matches(candidate, session))
+    {
+        let _ = app.pending_archive_recovery.remove(position);
     }
 }
 
@@ -22916,23 +22965,10 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
             app.quit_after_browse_archive_repackage = false;
             app.set_status("archive discard cancelled; staged edits kept".to_string());
         }
-        Some(ConfirmAction::ArchiveDiscardStartupRecovery { session }) => {
+        Some(ConfirmAction::ArchiveDiscardStartupRecovery { session })
+        | Some(ConfirmAction::ArchiveStartupRecovery { session }) => {
             app.archive_recovery_prompt_active = false;
-            app.set_status(format!(
-                "kept recovered archive staging for next startup: {}",
-                session.archive_path.display()
-            ));
-            prompt_next_startup_archive_recovery(app);
-        }
-        Some(ConfirmAction::ArchiveStartupRecovery { session }) => {
-            app.archive_recovery_prompt_active = false;
-            let same_front = app
-                .pending_archive_recovery
-                .front()
-                .is_some_and(|front| front.archive_path == session.archive_path);
-            if same_front {
-                let _ = app.pending_archive_recovery.pop_front();
-            }
+            defer_pending_startup_archive_recovery(app, session);
             app.set_status(format!(
                 "kept recovered archive staging for next startup: {}",
                 session.archive_path.display()
@@ -22950,15 +22986,8 @@ fn prompt_next_startup_archive_recovery(app: &mut AppState) {
     let Some(session) = app.pending_archive_recovery.front().cloned() else {
         return;
     };
-    let reason = session.conflict_reason.as_deref().unwrap_or("none");
     app.active_overlay = ActiveOverlay::Confirmation {
-        message: format!(
-            "Recovered staged archive edits from a previous run:\n{}\n\nStaging: {}\nEdits: {}\nConflict: {}\n\nY resumes the staged archive view. D discards staged edits. N/Esc keeps them for next startup. Mouse Cancel opens an explicit discard confirmation.",
-            session.archive_path.display(),
-            session.staging_dir.display(),
-            session.edits_json,
-            reason,
-        ),
+        message: super::app::archive_startup_recovery_prompt_message(&session),
         action: ConfirmAction::ArchiveStartupRecovery { session },
     };
     app.archive_recovery_prompt_active = true;
@@ -23002,13 +23031,7 @@ fn resume_startup_archive_recovery(
     session: crate::db::PendingArchiveSessionRecovery,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    let same_front = app
-        .pending_archive_recovery
-        .front()
-        .is_some_and(|front| front.archive_path == session.archive_path);
-    if same_front {
-        let _ = app.pending_archive_recovery.pop_front();
-    }
+    defer_pending_startup_archive_recovery(app, &session);
     app.archive_recovery_prompt_active = false;
 
     let mut staging = super::browse::ArchiveStagingSession::new(
@@ -23050,15 +23073,25 @@ fn execute_archive_staging_discard_action(app: &mut AppState, action: &ConfirmAc
         }
         ConfirmAction::ArchiveStartupRecovery { session }
         | ConfirmAction::ArchiveDiscardStartupRecovery { session } => {
-            super::app::cleanup_archive_metadata_staging_dir(&session.staging_dir);
-            let _ = app.db.delete_pending_archive_session(&session.archive_path);
-            let same_front = app
-                .pending_archive_recovery
-                .front()
-                .is_some_and(|front| front.archive_path == session.archive_path);
-            if same_front {
-                let _ = app.pending_archive_recovery.pop_front();
+            match super::app::try_cleanup_archive_metadata_staging_dir(&session.staging_dir) {
+                Ok(()) => {}
+                Err(err) => {
+                    app.archive_recovery_prompt_active = false;
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status(format!(
+                        "archive discard failed; recovered staging kept and recovery row preserved: {err}"
+                    ));
+                    return;
+                }
             }
+
+            if let Err(err) = app.db.delete_pending_archive_session(&session.archive_path) {
+                log::warn!(
+                    "failed to delete pending archive session for {} after staging discard: {err}",
+                    session.archive_path.display()
+                );
+            }
+            defer_pending_startup_archive_recovery(app, session);
             app.archive_recovery_prompt_active = false;
             app.active_overlay = ActiveOverlay::None;
             app.set_status(format!(
@@ -25263,6 +25296,279 @@ mod phase4_tests {
 
         assert!(matches!(app.active_overlay, ActiveOverlay::None));
         assert!(app.pending_metadata_editor.is_none());
+    }
+
+    fn recovered_archive_session(
+        temp: &tempfile::TempDir,
+    ) -> crate::db::PendingArchiveSessionRecovery {
+        let archive = temp.path().join("album.zip");
+        let staging = temp.path().join("tonepoet-archive-rename-staging");
+        std::fs::write(&archive, b"archive").expect("archive");
+        std::fs::create_dir_all(&staging).expect("staging");
+        std::fs::write(staging.join("track.flac"), b"staged edit").expect("staged file");
+        crate::db::PendingArchiveSessionRecovery {
+            archive_path: archive,
+            staging_dir: staging,
+            archive_mtime_secs: 1,
+            archive_mtime_nanos: 2,
+            archive_size: 7,
+            edits_json: "[{\"op\":\"rename\"}]".to_string(),
+            conflicted: false,
+            conflict_reason: None,
+        }
+    }
+
+    fn open_startup_recovery_prompt(
+        app: &mut AppState,
+        session: crate::db::PendingArchiveSessionRecovery,
+    ) {
+        app.pending_archive_recovery.push_back(session.clone());
+        app.archive_recovery_prompt_active = true;
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: crate::tui::app::archive_startup_recovery_prompt_message(&session),
+            action: ConfirmAction::ArchiveStartupRecovery { session },
+        };
+    }
+
+    #[test]
+    fn startup_archive_recovery_prompt_text_matches_key_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = recovered_archive_session(&temp);
+        let message = crate::tui::app::archive_startup_recovery_prompt_message(&session);
+
+        assert!(message.contains("Y/Enter resumes"));
+        assert!(message.contains("N/No opens a discard confirmation"));
+        assert!(message.contains("D also opens discard confirmation"));
+        assert!(message.contains("Esc keeps them for next startup"));
+        assert!(!message.contains("N/Esc keeps"));
+        assert!(!message.contains("D discards staged edits"));
+    }
+
+    #[test]
+    fn startup_archive_recovery_n_opens_explicit_discard_confirmation_without_deleting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = recovered_archive_session(&temp);
+        let staging = session.staging_dir.clone();
+        let archive = session.archive_path.clone();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        open_startup_recovery_prompt(&mut app, session);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { action, message } => {
+                assert!(matches!(action, ConfirmAction::ArchiveDiscardStartupRecovery { .. }));
+                assert!(message.contains("Discard recovered staged archive edits"));
+                assert!(message.contains("Y permanently deletes"));
+                assert!(message.contains("N/Esc keeps"));
+            }
+            other => panic!("expected explicit discard confirmation, got {other:?}"),
+        }
+        assert!(
+            staging.exists(),
+            "No/N must not delete until the explicit discard is confirmed"
+        );
+        assert_eq!(
+            app.pending_archive_recovery.front().map(|row| &row.archive_path),
+            Some(&archive),
+            "the startup row stays queued while the explicit discard confirmation is open"
+        );
+    }
+
+    #[test]
+    fn startup_archive_recovery_d_opens_explicit_discard_confirmation_without_deleting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = recovered_archive_session(&temp);
+        let staging = session.staging_dir.clone();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        open_startup_recovery_prompt(&mut app, session);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Confirmation {
+                action: ConfirmAction::ArchiveDiscardStartupRecovery { .. },
+                ..
+            }
+        ));
+        assert!(
+            staging.exists(),
+            "D from the startup prompt opens the explicit discard confirmation first"
+        );
+    }
+
+    #[test]
+    fn startup_archive_recovery_esc_keeps_for_next_startup_without_deleting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = recovered_archive_session(&temp);
+        let staging = session.staging_dir.clone();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        open_startup_recovery_prompt(&mut app, session);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(staging.exists(), "Esc must keep recovered staged edits on disk");
+        assert!(
+            app.pending_archive_recovery.is_empty(),
+            "kept rows are deferred for the next app startup, not re-prompted in this run"
+        );
+        assert!(app.status_message.as_ref().is_some_and(|(status, _)| {
+            status.contains("kept recovered archive staging for next startup")
+        }));
+    }
+
+    #[test]
+    fn startup_archive_discard_confirmation_cancel_defers_without_reprompting_same_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = recovered_archive_session(&temp);
+        let staging = session.staging_dir.clone();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        open_startup_recovery_prompt(&mut app, session);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Confirmation {
+                action: ConfirmAction::ArchiveDiscardStartupRecovery { .. },
+                ..
+            }
+        ));
+
+        handle_overlay_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(staging.exists(), "canceling explicit discard must keep staged edits");
+        assert!(
+            app.pending_archive_recovery.is_empty(),
+            "canceling explicit discard defers this session for a future startup instead of reopening it immediately"
+        );
+        assert!(app.status_message.as_ref().is_some_and(|(status, _)| {
+            status.contains("kept recovered archive staging for next startup")
+        }));
+    }
+
+    #[test]
+    fn startup_archive_discard_confirmation_cancel_advances_to_next_pending_session() {
+        let first_temp = tempfile::tempdir().expect("first tempdir");
+        let second_temp = tempfile::tempdir().expect("second tempdir");
+        let first = recovered_archive_session(&first_temp);
+        let second = recovered_archive_session(&second_temp);
+        let second_archive = second.archive_path.clone();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        open_startup_recovery_prompt(&mut app, first);
+        app.pending_archive_recovery.push_back(second);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation {
+                action: ConfirmAction::ArchiveStartupRecovery { session },
+                ..
+            } => {
+                assert_eq!(session.archive_path, second_archive);
+            }
+            other => panic!("expected next startup recovery prompt, got {other:?}"),
+        }
+        assert_eq!(
+            app.pending_archive_recovery.front().map(|row| &row.archive_path),
+            Some(&second_archive)
+        );
+    }
+
+    #[test]
+    fn archive_recovery_confirmation_footer_hints_match_key_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = recovered_archive_session(&temp);
+
+        let startup = ConfirmAction::ArchiveStartupRecovery {
+            session: session.clone(),
+        };
+        let startup_labels: Vec<_> = crate::tui::app::confirmation_footer_hints(&startup)
+            .iter()
+            .map(|hint| hint.label)
+            .collect();
+        assert_eq!(
+            startup_labels,
+            vec!["Y resume", "N discard...", "D discard...", "Esc later"]
+        );
+
+        let discard = ConfirmAction::ArchiveDiscardStartupRecovery { session };
+        let discard_labels: Vec<_> = crate::tui::app::confirmation_footer_hints(&discard)
+            .iter()
+            .map(|hint| hint.label)
+            .collect();
+        assert_eq!(discard_labels, vec!["Y discard", "N keep", "Esc keep"]);
+    }
+
+    #[test]
+    fn startup_archive_discard_confirmation_y_deletes_but_d_is_not_a_hidden_confirm() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = recovered_archive_session(&temp);
+        let staging = session.staging_dir.clone();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: "Discard recovered staged archive edits?".to_string(),
+            action: ConfirmAction::ArchiveDiscardStartupRecovery {
+                session: session.clone(),
+            },
+        };
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(
+            staging.exists(),
+            "D is intentionally not a hidden Yes on the explicit discard confirmation"
+        );
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Confirmation {
+                action: ConfirmAction::ArchiveDiscardStartupRecovery { .. },
+                ..
+            }
+        ));
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(
+            !staging.exists(),
+            "Y on the explicit discard confirmation deletes staged edits"
+        );
     }
 
     #[test]
@@ -28555,10 +28861,9 @@ mod artwork_file_picker_handoff_tests {
 
     #[test]
     fn source_tree_has_no_app_local_file_picker_and_uses_crate() {
-        let mod_rs = fs::read_to_string("src/tui/mod.rs").expect("tui module source");
         assert!(
-            !mod_rs.contains("mod file_picker") && !mod_rs.contains("pub mod file_picker"),
-            "old in-app picker module must not be wired into the TUI module tree"
+            !Path::new("src/tui/file_picker.rs").exists(),
+            "old in-app picker module must stay deleted"
         );
         let keybindings = fs::read_to_string("src/tui/keybindings.rs").expect("keybindings source");
         assert!(keybindings.contains("tui_file_picker::FilePickerState::new"));

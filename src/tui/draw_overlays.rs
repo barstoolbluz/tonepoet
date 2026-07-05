@@ -104,9 +104,13 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
     match overlay {
         ActiveOverlay::None => {}
         ActiveOverlay::ThemeBuilder(_) => {}
-        ActiveOverlay::Confirmation { ref message, .. } => {
+        ActiveOverlay::Confirmation {
+            ref message,
+            ref action,
+        } => {
             let message = message.clone();
-            draw_confirmation(f, &message, app, theme);
+            let action = action.clone();
+            draw_confirmation(f, &message, &action, app, theme);
         }
         ActiveOverlay::ErrorDetail { error, .. } => {
             draw_error_detail(f, &error, theme);
@@ -534,10 +538,74 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize, theme: s
     f.render_widget(hint, chunks[1]);
 }
 
+fn confirmation_footer_hint_bg(
+    hint: &super::app::ConfirmationFooterHint,
+    action: &super::app::ConfirmAction,
+    theme: super::theme::Theme,
+) -> Color {
+    match hint.key {
+        "y" => match action {
+            super::app::ConfirmAction::ArchiveDiscardStartupRecovery { .. }
+            | super::app::ConfirmAction::ArchiveDiscardStaging { .. } => theme.destructive,
+            _ => theme.green,
+        },
+        "d" => theme.destructive,
+        "n" => match action {
+            super::app::ConfirmAction::ArchiveStartupRecovery { .. } => theme.destructive,
+            super::app::ConfirmAction::ArchiveDiscardStartupRecovery { .. }
+            | super::app::ConfirmAction::ArchiveExternalConflict { .. }
+            | super::app::ConfirmAction::ArchiveRepackageFailure { .. }
+            | super::app::ConfirmAction::ArchiveDiscardStaging { .. } => theme.purple,
+            _ => theme.destructive,
+        },
+        "esc" => theme.purple,
+        _ => theme.blue,
+    }
+}
+
+fn confirmation_mouse_cancel_hint_key(action: &super::app::ConfirmAction) -> Option<&'static str> {
+    match action {
+        // Mouse cancel is routed through `open_archive_staging_discard_confirmation`
+        // for these first-stage archive dialogs, so make the clickable cancel
+        // chip the visible destructive/discard chip, not the non-destructive
+        // N/Esc keep hint.
+        super::app::ConfirmAction::ArchiveExternalConflict { .. }
+        | super::app::ConfirmAction::ArchiveRepackageFailure { .. } => Some("d"),
+        // Startup recovery intentionally uses N/No as the discard-confirmation
+        // entry point; Esc remains the non-destructive keyboard-only escape.
+        super::app::ConfirmAction::ArchiveStartupRecovery { .. } => Some("n"),
+        // Explicit discard confirmations use N as keep/cancel.
+        super::app::ConfirmAction::ArchiveDiscardStartupRecovery { .. }
+        | super::app::ConfirmAction::ArchiveDiscardStaging { .. } => Some("n"),
+        _ => Some("n"),
+    }
+}
+
+
+fn confirmation_footer_hints_width(hints: &[super::app::ConfirmationFooterHint]) -> u16 {
+    let pill_widths = hints.iter().fold(0u16, |acc, hint| {
+        acc.saturating_add(hint.label.chars().count() as u16)
+            .saturating_add(2)
+    });
+    let gaps = hints.len().saturating_sub(1) as u16;
+    pill_widths.saturating_add(gaps)
+}
+
 /// Draw a confirmation dialog
-fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState, theme: super::theme::Theme) {
+fn draw_confirmation(
+    f: &mut Frame,
+    message: &str,
+    action: &super::app::ConfirmAction,
+    app: &mut AppState,
+    theme: super::theme::Theme,
+) {
     let area = f.size();
-    let popup = centered_rect(50, 9, area);
+    let hints = super::app::confirmation_footer_hints(action);
+    let footer_w = confirmation_footer_hints_width(hints);
+    let popup_w = 50u16
+        .max(footer_w.saturating_add(4))
+        .min(area.width.saturating_sub(2).max(1));
+    let popup = centered_rect(popup_w, 9, area);
 
     f.render_widget(Clear, popup);
     let block = Block::default()
@@ -565,30 +633,59 @@ fn draw_confirmation(f: &mut Frame, message: &str, app: &mut AppState, theme: su
         .alignment(Alignment::Center);
     f.render_widget(msg, chunks[0]);
 
-    // Pill-styled buttons using the standard footer_pill pattern.
-    let yes_pill = footer_pill("Y yes", theme.green, theme);
-    let no_pill = footer_pill("N no", theme.destructive, theme);
-    let gap_span = pill_gap();
-    let yes_w = yes_pill.width() as u16;
-    let gap_w = gap_span.width() as u16;
-    let no_w = no_pill.width() as u16;
-    let total_w = yes_w + gap_w + no_w;
+    // Pill-styled buttons using action-specific labels. Archive recovery has
+    // more than a generic Yes/No decision, so the renderer must derive these
+    // chips from the same ConfirmAction that key and mouse handlers execute.
+    let mouse_cancel_key = confirmation_mouse_cancel_hint_key(action);
+    let mut spans = Vec::new();
+    let mut total_w = 0u16;
+    let mut confirm_rect: Option<(u16, u16)> = None;
+    let mut cancel_rect: Option<(u16, u16)> = None;
 
-    let line = Line::from(vec![yes_pill, gap_span, no_pill]);
+    for (idx, hint) in hints.iter().enumerate() {
+        if idx > 0 {
+            let gap = pill_gap();
+            total_w = total_w.saturating_add(gap.width() as u16);
+            spans.push(gap);
+        }
+
+        let pill = footer_pill(
+            hint.label,
+            confirmation_footer_hint_bg(hint, action, theme),
+            theme,
+        );
+        let width = pill.width() as u16;
+        if hint.key == "y" {
+            confirm_rect = Some((total_w, width));
+        } else if Some(hint.key) == mouse_cancel_key {
+            cancel_rect = Some((total_w, width));
+        }
+        total_w = total_w.saturating_add(width);
+        spans.push(pill);
+    }
+
+    let line = Line::from(spans);
     let buttons = Paragraph::new(line).alignment(Alignment::Center);
     f.render_widget(buttons, chunks[1]);
 
-    // Record button areas matching the centered layout.
+    // Record button areas matching the centered layout. Only the semantic
+    // confirm action and the mouse-accessible cancel/discard action are
+    // clickable because the existing button map has exactly those two overlay
+    // actions; every footer hint remains keyboard-accessible.
     let btn_y = chunks[1].y;
     let start_x = chunks[1].x + chunks[1].width.saturating_sub(total_w) / 2;
-    app.button_map.record_button(
-        TuiButton::OverlayConfirm,
-        Rect::new(start_x, btn_y, yes_w, 1),
-    );
-    app.button_map.record_button(
-        TuiButton::OverlayCancel,
-        Rect::new(start_x + yes_w + gap_w, btn_y, no_w, 1),
-    );
+    if let Some((offset, width)) = confirm_rect {
+        app.button_map.record_button(
+            TuiButton::OverlayConfirm,
+            Rect::new(start_x + offset, btn_y, width, 1),
+        );
+    }
+    if let Some((offset, width)) = cancel_rect {
+        app.button_map.record_button(
+            TuiButton::OverlayCancel,
+            Rect::new(start_x + offset, btn_y, width, 1),
+        );
+    }
 }
 
 /// Draw an error detail popup
