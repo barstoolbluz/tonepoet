@@ -258,7 +258,7 @@ fn open_theme_apply_dialog(app: &mut AppState, forward: bool) {
                 draft,
                 app.theme_library.choices().to_vec(),
             );
-            state.view = super::theme_builder::ThemeBuilderView::Apply;
+            state.overlay = super::theme_builder::BuilderOverlay::Apply;
             state.status = Some("Resolve this theme before applying it".to_string());
             app.active_overlay = ActiveOverlay::ThemeBuilder(Box::new(state));
         }
@@ -267,6 +267,12 @@ fn open_theme_apply_dialog(app: &mut AppState, forward: bool) {
 }
 
 fn save_theme_builder_state(app: &mut AppState, state: &mut super::theme_builder::ThemeBuilderState) {
+    if let Err(err) = state.flush_active_editor_input() {
+        let message = format!("Theme save failed: {err}");
+        state.status = Some(message.clone());
+        app.set_status(message);
+        return;
+    }
     match crate::tui::theme::save_theme_file(&state.palette) {
         Ok(path) => {
             let saved_slug = path.file_stem()
@@ -296,12 +302,31 @@ fn save_theme_builder_state(app: &mut AppState, state: &mut super::theme_builder
     }
 }
 
-fn apply_theme_builder_state(app: &mut AppState, state: &mut super::theme_builder::ThemeBuilderState) {
+fn apply_theme_builder_state(app: &mut AppState, state: &mut super::theme_builder::ThemeBuilderState) -> bool {
+    if let Err(err) = state.flush_active_editor_input() {
+        let message = format!("Theme apply failed: {err}");
+        state.status = Some(message.clone());
+        app.set_status(message);
+        return false;
+    }
     // Apply is intentionally a runtime-only resolution step for the override layer.
-    // User overrides persist only through an explicit save/commit path.
-    app.theme_overrides = state.user_overrides.clone();
+    // User overrides persist only through an explicit save/commit path. Keep the
+    // in-memory override layer in lockstep with the resolution option the user
+    // chose for this apply operation; otherwise the runtime theme and the
+    // AppState override snapshot can disagree until the next full theme load.
+    let apply_options = state.apply_options();
+    app.theme_overrides = if apply_options.keep_user_overrides {
+        state.user_overrides.clone()
+    } else {
+        crate::tui::theme::ThemeOverrides::default()
+    };
 
-    app.theme = state.resolved_theme();
+    app.theme = crate::tui::theme::resolve_theme_draft_for_depth(
+        &state.palette,
+        apply_options,
+        &state.user_overrides,
+        state.depth_mode,
+    );
     app.retheme_open_file_picker_surfaces();
 
     let persisted_library_theme = !state.dirty
@@ -321,6 +346,7 @@ fn apply_theme_builder_state(app: &mut AppState, state: &mut super::theme_builde
         app.set_status(format!("Theme applied for this session: {} (press Ctrl+S in the builder to persist it)", state.palette.name));
     }
     app.force_redraw = true;
+    true
 }
 
 fn reconcile_deleted_theme_config(app: &mut AppState, state: &mut super::theme_builder::ThemeBuilderState) {
@@ -385,8 +411,11 @@ fn complete_theme_builder_action(
             app.active_overlay = ActiveOverlay::ThemeBuilder(state);
         }
         ThemeBuilderAction::Apply => {
-            apply_theme_builder_state(app, &mut *state);
-            app.active_overlay = ActiveOverlay::None;
+            if apply_theme_builder_state(app, &mut *state) {
+                app.active_overlay = ActiveOverlay::None;
+            } else {
+                app.active_overlay = ActiveOverlay::ThemeBuilder(state);
+            }
         }
         ThemeBuilderAction::ApplyPreset(slug) => {
             app.set_ui_theme(&slug);
@@ -6163,7 +6192,7 @@ pub(crate) fn file_picker_theme_from_theme(theme: &super::theme::Theme) -> tui_f
 
 #[cfg(test)]
 mod progress_dialog_theme_tests {
-    use super::{file_picker_theme_from_theme, handle_config_key, handle_overlay_key};
+    use super::{complete_theme_builder_action, file_picker_theme_from_theme, handle_config_key, handle_overlay_key};
     use crate::tui::test_support::XdgConfigHomeGuard;
     use crate::tui::theme;
     use tokio::sync::mpsc;
@@ -6305,7 +6334,7 @@ mod progress_dialog_theme_tests {
     fn config_screen_theme_key_opens_apply_dialog_then_marks_frame_dirty_on_apply() {
         use crate::config::TonepoetConfig;
         use crate::tui::app::{ActiveOverlay, AppScreen, AppState};
-        use crate::tui::theme_builder::ThemeBuilderView;
+        use crate::tui::theme_builder::BuilderOverlay;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-keybindings-theme-test");
@@ -6323,7 +6352,7 @@ mod progress_dialog_theme_tests {
 
         match &app.active_overlay {
             ActiveOverlay::ThemeBuilder(state) => {
-                assert_eq!(state.view, ThemeBuilderView::Apply);
+                assert_eq!(state.overlay, BuilderOverlay::Apply);
                 assert_eq!(state.palette.slug, "gruvbox");
             }
             other => panic!("expected theme apply dialog, got {:?}", other),
@@ -6407,7 +6436,7 @@ mod progress_dialog_theme_tests {
     fn config_theme_keys_only_open_apply_dialog_when_appearance_pane_has_focus() {
         use crate::config::TonepoetConfig;
         use crate::tui::app::{ActiveOverlay, AppScreen, AppState, ConfigFocus};
-        use crate::tui::theme_builder::ThemeBuilderView;
+        use crate::tui::theme_builder::BuilderOverlay;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-keybindings-theme-test");
@@ -6439,7 +6468,7 @@ mod progress_dialog_theme_tests {
         handle_config_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         match &app.active_overlay {
             ActiveOverlay::ThemeBuilder(state) => {
-                assert_eq!(state.view, ThemeBuilderView::Apply);
+                assert_eq!(state.overlay, BuilderOverlay::Apply);
                 assert_eq!(state.palette.slug, "gruvbox");
             }
             other => panic!("expected theme apply dialog, got {:?}", other),
@@ -6485,7 +6514,7 @@ mod progress_dialog_theme_tests {
     fn config_b_opens_direct_apply_theme_gallery() {
         use crate::config::TonepoetConfig;
         use crate::tui::app::{ActiveOverlay, AppScreen, AppState, ConfigFocus};
-        use crate::tui::theme_builder::ThemeBuilderView;
+        use crate::tui::theme_builder::BuilderOverlay;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-config-theme-gallery");
@@ -6498,12 +6527,101 @@ mod progress_dialog_theme_tests {
 
         match &app.active_overlay {
             ActiveOverlay::ThemeBuilder(state) => {
-                assert_eq!(state.view, ThemeBuilderView::Preset);
+                assert_eq!(state.overlay, BuilderOverlay::Gallery);
                 assert!(state.preset_applies_on_select);
-                assert_eq!(state.theme_library[state.preset_cursor].slug, "gruvbox");
+                assert!(state.theme_library.iter().any(|choice| choice.slug == "gruvbox"));
             }
             other => panic!("expected theme gallery overlay, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn complete_theme_builder_action_handles_apply_preset_slug() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{ActiveOverlay, AppState};
+        use crate::tui::theme_builder::{ThemeBuilderAction, ThemeBuilderState};
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-apply-preset-action");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.set_ui_theme("tokyo-night");
+        let state = Box::new(ThemeBuilderState::from_active_theme(app.theme));
+
+        complete_theme_builder_action(&mut app, state, ThemeBuilderAction::ApplyPreset("gruvbox".to_string()));
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(app.config.ui.theme, "gruvbox");
+        assert_eq!(app.theme.slug, "gruvbox");
+    }
+
+    #[test]
+    fn complete_theme_builder_action_keeps_builder_open_when_pending_hex_is_invalid_on_apply() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{ActiveOverlay, AppState};
+        use crate::tui::text_input::TextInputState;
+        use crate::tui::theme_builder::{BuilderEditorFocus, ThemeBuilderAction, ThemeBuilderState};
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-theme-builder-invalid-apply");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.set_ui_theme("tokyo-night");
+        let mut state = ThemeBuilderState::from_active_theme(app.theme);
+        state.editor_focus = BuilderEditorFocus::Hex;
+        state.hex_input = TextInputState::new_selected("#zzzzzz".to_string());
+
+        complete_theme_builder_action(&mut app, Box::new(state), ThemeBuilderAction::Apply);
+
+        match &app.active_overlay {
+            ActiveOverlay::ThemeBuilder(state) => {
+                assert!(state.status.as_deref().unwrap_or_default().starts_with("Theme apply failed:"));
+                assert_eq!(state.hex_input.text, "#zzzzzz");
+            }
+            other => panic!("expected builder to stay open, got {:?}", other),
+        }
+        assert_eq!(app.theme.slug, "tokyo-night");
+    }
+
+    #[test]
+    fn complete_theme_builder_action_applies_dirty_accent_assignment_to_runtime_theme() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{ActiveOverlay, AppState};
+        use crate::tui::button_map::TuiButton;
+        use crate::tui::theme::BuilderSlot;
+        use crate::tui::theme_builder::{handle_theme_builder_mouse, ThemeBuilderAction, ThemeBuilderState};
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::style::Color;
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-theme-builder-apply-dirty-assignment");
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.set_ui_theme("tokyo-night");
+        app.force_redraw = false;
+
+        let mut state = ThemeBuilderState::from_active_theme(app.theme);
+        let target_slot = BuilderSlot::Role(2);
+        let assigned = Color::Rgb(9, 8, 7);
+        state.selected_slot = target_slot;
+        state.last_role_slot = target_slot;
+        state.palette.accents[12] = assigned;
+
+        let action = handle_theme_builder_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            Some(TuiButton::ThemeBuilderSlot(BuilderSlot::Accent(12))),
+        );
+        assert_eq!(action, ThemeBuilderAction::None);
+        assert_eq!(state.palette.title, assigned);
+        assert!(state.dirty);
+
+        complete_theme_builder_action(&mut app, Box::new(state), ThemeBuilderAction::Apply);
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(app.config.ui.theme, "tokyo-night", "dirty apply is session-only until saved");
+        assert_eq!(app.theme.title, assigned);
+        assert_eq!(app.theme.slug, "tokyo-night-custom");
+        assert!(app.force_redraw, "dirty theme apply must force immediate redraw");
     }
 
     #[test]
@@ -24737,24 +24855,24 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::ThemeBuilderHexField
             | TuiButton::ThemeBuilderRgbSlider(_)
             | TuiButton::ThemeBuilderDepth(_)
-            | TuiButton::ThemeBuilderSwatchNameField
+            | TuiButton::ThemeBuilderInlineSwatchName
             | TuiButton::ThemeBuilderSavedSwatch(_)
-            | TuiButton::ThemeBuilderRecentSwatch(_)
             | TuiButton::ThemeBuilderSaveSwatch
-            | TuiButton::ThemeBuilderDeleteSwatch
             | TuiButton::ThemeBuilderSave
             | TuiButton::ThemeBuilderApply
-            | TuiButton::ThemeBuilderDerived
-            | TuiButton::ThemeBuilderRevert
-            | TuiButton::ThemeBuilderDeleteTheme
+            | TuiButton::ThemeBuilderTab(_)
+            | TuiButton::ThemeBuilderMoreMenu
+            | TuiButton::ThemeBuilderMoreMenuItem(_)
+            | TuiButton::ThemeBuilderGalleryMode
+            | TuiButton::ThemeBuilderGalleryFilter
             | TuiButton::ThemeBuilderCancel
             | TuiButton::ThemeBuilderPresetRow(_)
             | TuiButton::ThemeBuilderPresetCancel
             | TuiButton::ThemeBuilderDerivedRow(_)
             | TuiButton::ThemeBuilderDerivedLock
-            | TuiButton::ThemeBuilderDerivedRelease
-            | TuiButton::ThemeBuilderDerivedTarget
-            | TuiButton::ThemeBuilderDerivedDone
+            | TuiButton::ThemeBuilderFilePath
+            | TuiButton::ThemeBuilderFileConfirm
+            | TuiButton::ThemeBuilderFileCancel
             | TuiButton::ThemeBuilderApplyThemeLocks
             | TuiButton::ThemeBuilderApplyUserOverrides
             | TuiButton::ThemeBuilderApplyConfirm

@@ -710,6 +710,7 @@ pub struct DerivedElementSpec {
     pub label: &'static str,
     pub formula: &'static str,
     pub used_by: &'static str,
+    pub group: &'static str,
 }
 
 pub const ROLE_KEYS: [&str; 11] = [
@@ -728,35 +729,35 @@ pub const ACCENT_LABELS: [&str; THEME_ACCENT_COUNT] = [
 ];
 
 const DERIVED_SPECS: &[DerivedElementSpec] = &[
-    DerivedElementSpec { key: "surface", label: "surface", formula: "mix(panel_bg, border, 1:3)", used_by: "secondary panes and elevated surfaces" },
-    DerivedElementSpec { key: "border_dim", label: "border dim", formula: "mix(panel_bg, border, 1:2)", used_by: "subtle borders and inactive dividers" },
-    DerivedElementSpec { key: "text_bright", label: "text bright", formula: "value mixed toward terminal white/black by mode", used_by: "titles, emphasized text, progress percent" },
-    DerivedElementSpec { key: "text_dim", label: "text dim", formula: "mix(label, panel_bg, 1:2)", used_by: "help text, disabled copy, low-emphasis annotations" },
-    DerivedElementSpec { key: "hover_bg", label: "hover bg", formula: "mix(panel_bg, selection_bg, 2:3)", used_by: "hovered rows and mouse targets" },
-    DerivedElementSpec { key: "input_focused_bg", label: "input focused bg", formula: "mix(panel_bg, selection_bg, 3:4)", used_by: "focused text inputs" },
-    DerivedElementSpec { key: "input_unfocused_bg", label: "input unfocused bg", formula: "mix(panel_bg, selection_bg, 1:2)", used_by: "inactive text inputs" },
-    DerivedElementSpec { key: "input_disabled_bg", label: "input disabled bg", formula: "mix(panel_bg, border, 1:5)", used_by: "disabled text inputs" },
-    DerivedElementSpec { key: "dropdown_bg", label: "dropdown bg", formula: "mix(panel_bg, border, 1:4)", used_by: "dropdowns, menus, overlays" },
-    DerivedElementSpec { key: "pill_active_bg", label: "pill active bg", formula: "tab_active", used_by: "active footer/navigation pills" },
-    DerivedElementSpec { key: "pill_active_fg", label: "pill active fg", formula: "panel_bg", used_by: "text inside active pills" },
-    DerivedElementSpec { key: "pill_dim_bg", label: "pill dim bg", formula: "text_dim", used_by: "dimmed footer pills" },
-    DerivedElementSpec { key: "pill_preset_bg", label: "pill preset bg", formula: "mix(panel_bg, chip_go, 1:2)", used_by: "preset-selection pills" },
-    DerivedElementSpec { key: "pill_preset_fg", label: "pill preset fg", formula: "chip_go", used_by: "preset-selection pill text" },
-    DerivedElementSpec { key: "progress_dialog_bg", label: "progress dialog bg", formula: "surface", used_by: "file task progress overlay" },
-    DerivedElementSpec { key: "progress_dialog_border", label: "progress dialog border", formula: "info accent", used_by: "file task progress overlay border" },
-    DerivedElementSpec { key: "progress_dialog_text", label: "progress dialog text", formula: "text_bright", used_by: "progress overlay body text" },
-    DerivedElementSpec { key: "progress_dialog_title", label: "progress dialog title", formula: "text_bright", used_by: "progress overlay title" },
-    DerivedElementSpec { key: "progress_dialog_label", label: "progress dialog label", formula: "label", used_by: "progress overlay labels" },
-    DerivedElementSpec { key: "progress_dialog_current_file", label: "progress current file", formula: "info accent", used_by: "current-file line in progress overlay" },
-    DerivedElementSpec { key: "progress_dialog_dim", label: "progress dialog dim", formula: "text_dim", used_by: "secondary progress text" },
-    DerivedElementSpec { key: "progress_dialog_bar_filled", label: "progress bar filled", formula: "info accent", used_by: "filled progress bar" },
-    DerivedElementSpec { key: "progress_dialog_bar_unfilled", label: "progress bar unfilled", formula: "border_dim", used_by: "unfilled progress bar" },
-    DerivedElementSpec { key: "progress_dialog_percent", label: "progress percent", formula: "text_bright", used_by: "progress percentage" },
-    DerivedElementSpec { key: "progress_dialog_button_bg", label: "progress button bg", formula: "chip_go", used_by: "confirm/continue buttons" },
-    DerivedElementSpec { key: "progress_dialog_button_fg", label: "progress button fg", formula: "panel_bg", used_by: "confirm/continue button text" },
-    DerivedElementSpec { key: "progress_dialog_abort_bg", label: "progress abort bg", formula: "chip_dismiss", used_by: "abort/cancel buttons" },
-    DerivedElementSpec { key: "progress_dialog_abort_fg", label: "progress abort fg", formula: "panel_bg", used_by: "abort/cancel button text" },
-    DerivedElementSpec { key: "error_dim", label: "error dim", formula: "mix(panel_bg, error, 1:2)", used_by: "low-emphasis destructive text" },
+    DerivedElementSpec { key: "surface", label: "surface", formula: "mix(panel_bg, border, 1:3)", used_by: "secondary panes and elevated surfaces", group: "surfaces" },
+    DerivedElementSpec { key: "border_dim", label: "border dim", formula: "mix(panel_bg, border, 1:2)", used_by: "subtle borders and inactive dividers", group: "surfaces" },
+    DerivedElementSpec { key: "text_bright", label: "text bright", formula: "value mixed toward terminal white/black by mode", used_by: "titles, emphasized text, progress percent", group: "text" },
+    DerivedElementSpec { key: "text_dim", label: "text dim", formula: "mix(label, panel_bg, 1:2)", used_by: "help text, disabled copy, low-emphasis annotations", group: "text" },
+    DerivedElementSpec { key: "hover_bg", label: "hover bg", formula: "mix(panel_bg, selection_bg, 2:3)", used_by: "hovered rows and mouse targets", group: "interaction" },
+    DerivedElementSpec { key: "input_focused_bg", label: "input focused bg", formula: "mix(panel_bg, selection_bg, 3:4)", used_by: "focused text inputs", group: "interaction" },
+    DerivedElementSpec { key: "input_unfocused_bg", label: "input unfocused bg", formula: "mix(panel_bg, selection_bg, 1:2)", used_by: "inactive text inputs", group: "interaction" },
+    DerivedElementSpec { key: "input_disabled_bg", label: "input disabled bg", formula: "mix(panel_bg, border, 1:5)", used_by: "disabled text inputs", group: "interaction" },
+    DerivedElementSpec { key: "dropdown_bg", label: "dropdown bg", formula: "mix(panel_bg, border, 1:4)", used_by: "dropdowns, menus, overlays", group: "interaction" },
+    DerivedElementSpec { key: "pill_active_bg", label: "pill active bg", formula: "tab_active", used_by: "active footer/navigation pills", group: "pills" },
+    DerivedElementSpec { key: "pill_active_fg", label: "pill active fg", formula: "panel_bg", used_by: "text inside active pills", group: "pills" },
+    DerivedElementSpec { key: "pill_dim_bg", label: "pill dim bg", formula: "text_dim", used_by: "dimmed footer pills", group: "pills" },
+    DerivedElementSpec { key: "pill_preset_bg", label: "pill preset bg", formula: "mix(panel_bg, chip_go, 1:2)", used_by: "preset-selection pills", group: "pills" },
+    DerivedElementSpec { key: "pill_preset_fg", label: "pill preset fg", formula: "chip_go", used_by: "preset-selection pill text", group: "pills" },
+    DerivedElementSpec { key: "progress_dialog_bg", label: "progress dialog bg", formula: "surface", used_by: "file task progress overlay", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_border", label: "progress dialog border", formula: "info accent", used_by: "file task progress overlay border", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_text", label: "progress dialog text", formula: "text_bright", used_by: "progress overlay body text", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_title", label: "progress dialog title", formula: "text_bright", used_by: "progress overlay title", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_label", label: "progress dialog label", formula: "label", used_by: "progress overlay labels", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_current_file", label: "progress current file", formula: "info accent", used_by: "current-file line in progress overlay", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_dim", label: "progress dialog dim", formula: "text_dim", used_by: "secondary progress text", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_bar_filled", label: "progress bar filled", formula: "info accent", used_by: "filled progress bar", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_bar_unfilled", label: "progress bar unfilled", formula: "border_dim", used_by: "unfilled progress bar", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_percent", label: "progress percent", formula: "text_bright", used_by: "progress percentage", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_button_bg", label: "progress button bg", formula: "chip_go", used_by: "confirm/continue buttons", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_button_fg", label: "progress button fg", formula: "panel_bg", used_by: "confirm/continue button text", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_abort_bg", label: "progress abort bg", formula: "chip_dismiss", used_by: "abort/cancel buttons", group: "progress dialog" },
+    DerivedElementSpec { key: "progress_dialog_abort_fg", label: "progress abort fg", formula: "panel_bg", used_by: "abort/cancel button text", group: "progress dialog" },
+    DerivedElementSpec { key: "error_dim", label: "error dim", formula: "mix(panel_bg, error, 1:2)", used_by: "low-emphasis destructive text", group: "states" },
 ];
 
 pub fn derived_element_specs() -> &'static [DerivedElementSpec] { DERIVED_SPECS }
@@ -1054,7 +1055,7 @@ impl ThemePaletteDraft {
 
     pub fn save_slug(&self) -> anyhow::Result<String> {
         if matches!(self.source, ThemeDraftSource::BuiltIn | ThemeDraftSource::NewCustom) {
-            make_unique_custom_slug(&self.slug)
+            make_unique_custom_slug(&self.slug, None)
         } else {
             validate_theme_slug(&self.slug)
         }
@@ -1515,6 +1516,54 @@ pub fn delete_custom_theme_file(slug: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// Directory where user-authored theme files are stored.
+pub fn custom_theme_dir() -> PathBuf {
+    theme_dir()
+}
+
+/// Return the canonical custom theme path for a validated slug.
+pub fn custom_theme_path_for_slug(slug: &str) -> anyhow::Result<PathBuf> {
+    theme_path_for_slug(slug)
+}
+
+/// Pick a collision-free custom slug immediately, before a UI action exposes it.
+pub fn unique_custom_theme_slug(base: &str) -> anyhow::Result<String> {
+    unique_custom_theme_slug_excluding_path(base, None)
+}
+
+/// Pick a collision-free custom slug while ignoring the file that is about to
+/// be overwritten. This keeps repeated exports to the same explicit path
+/// idempotent: the destination file's current internal slug must not be
+/// treated as a collision with itself.
+pub fn unique_custom_theme_slug_excluding_path(base: &str, exclude_path: Option<&Path>) -> anyhow::Result<String> {
+    make_unique_custom_slug(base, exclude_path)
+}
+
+/// Write a theme draft to an explicit export path using the normal theme-file format.
+pub fn export_theme_file_to_path(draft: &ThemePaletteDraft, path: &Path) -> anyhow::Result<PathBuf> {
+    if palette_by_slug(&draft.slug).is_some() {
+        anyhow::bail!("theme slug '{}' collides with a built-in theme", draft.slug);
+    }
+    let file = ThemeFile::from_draft(draft);
+    let encoded = toml::to_string_pretty(&file)?;
+    atomic_write(path, encoded.as_bytes())?;
+    Ok(path.to_path_buf())
+}
+
+/// Import a theme file into the user's custom theme directory with a collision-free slug.
+pub fn import_theme_file_to_custom_dir(path: &Path) -> anyhow::Result<(ThemePaletteDraft, PathBuf)> {
+    let mut draft = load_theme_file(path)?;
+    let mut base = draft.slug.clone();
+    if palette_by_slug(&base).is_some() {
+        base = format!("{base}-custom");
+    }
+    draft.slug = unique_custom_theme_slug(&base)?;
+    draft.source = ThemeDraftSource::Custom;
+    let saved_path = save_theme_file(&draft)?;
+    let loaded = load_theme_file(&saved_path)?;
+    Ok((loaded, saved_path))
+}
+
 pub fn load_theme_file(path: &Path) -> anyhow::Result<ThemePaletteDraft> {
     let content = std::fs::read_to_string(path)?;
     let file: ThemeFile = toml::from_str(&content)?;
@@ -1664,18 +1713,85 @@ fn intern_runtime_string(value: String) -> &'static str {
     interned
 }
 
-fn make_unique_custom_slug(base: &str) -> anyhow::Result<String> {
+fn make_unique_custom_slug(base: &str, exclude_path: Option<&Path>) -> anyhow::Result<String> {
     let normalized = validate_theme_slug(base)?;
-    if palette_by_slug(&normalized).is_none() && !theme_path_for_slug(&normalized)?.exists() {
+    let existing_internal_slugs = custom_theme_internal_slugs_excluding_path(exclude_path)?;
+    if !custom_theme_candidate_exists(&normalized, &existing_internal_slugs, exclude_path)? {
         return Ok(normalized);
     }
     for idx in 2..10_000usize {
         let candidate = format!("{normalized}-{idx}");
-        if palette_by_slug(&candidate).is_none() && !theme_path_for_slug(&candidate)?.exists() {
+        if !custom_theme_candidate_exists(&candidate, &existing_internal_slugs, exclude_path)? {
             return Ok(candidate);
         }
     }
     Ok(format!("{normalized}-{}", chrono::Utc::now().timestamp()))
+}
+
+fn custom_theme_internal_slugs_excluding_path(exclude_path: Option<&Path>) -> anyhow::Result<BTreeSet<String>> {
+    let dir = theme_dir();
+    if !dir.exists() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut slugs = BTreeSet::new();
+    let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        if exclude_path.map_or(false, |exclude| same_theme_file_path(&path, exclude)) {
+            continue;
+        }
+        match load_theme_file(&path) {
+            Ok(draft) => {
+                if palette_by_slug(&draft.slug).is_none() {
+                    slugs.insert(draft.slug);
+                }
+            }
+            Err(err) => log::warn!("Skipping invalid custom theme {}: {err}", path.display()),
+        }
+    }
+    Ok(slugs)
+}
+
+fn custom_theme_candidate_exists(
+    slug: &str,
+    existing_internal_slugs: &BTreeSet<String>,
+    exclude_path: Option<&Path>,
+) -> anyhow::Result<bool> {
+    let normalized = validate_theme_slug(slug)?;
+    let canonical_path = theme_path_for_slug(&normalized)?;
+    let canonical_collides = canonical_path.exists()
+        && !exclude_path.map_or(false, |exclude| same_theme_file_path(&canonical_path, exclude));
+    Ok(
+        palette_by_slug(&normalized).is_some()
+            || existing_internal_slugs.contains(&normalized)
+            || canonical_collides
+    )
+}
+
+fn same_theme_file_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+pub fn is_canonical_custom_theme_path_for_slug(path: &Path, slug: &str) -> anyhow::Result<bool> {
+    let canonical_path = theme_path_for_slug(slug)?;
+    if path == canonical_path {
+        return Ok(true);
+    }
+    match (path.canonicalize(), canonical_path.canonicalize()) {
+        (Ok(left), Ok(right)) => Ok(left == right),
+        _ => Ok(false),
+    }
 }
 
 fn theme_path_for_slug(slug: &str) -> anyhow::Result<PathBuf> {
@@ -1979,6 +2095,55 @@ mod theme_builder_file_tests {
         let loaded = load_custom_theme_files().expect("load custom themes");
         assert!(loaded.iter().all(|draft| draft.slug != default_theme_slug()));
         assert!(load_custom_theme_by_slug(default_theme_slug()).is_err());
+    }
+
+    #[test]
+    fn unique_custom_slug_checks_internal_slugs_from_noncanonical_files() {
+        let _xdg = XdgConfigHomeGuard::new("tonepoet-theme-noncanonical-slug-unique");
+
+        let mut draft = ThemePaletteDraft::from_palette(default_palette());
+        draft.source = ThemeDraftSource::Custom;
+        draft.slug = "export-me".to_string();
+        draft.name = "Export Me".to_string();
+
+        let noncanonical_path = theme_dir().join("explicit-export.toml");
+        export_theme_file_to_path(&draft, &noncanonical_path).expect("write noncanonical export");
+        assert!(noncanonical_path.exists());
+        assert!(!theme_path_for_slug("export-me").expect("canonical path").exists());
+
+        assert_eq!(unique_custom_theme_slug("export-me").expect("unique slug"), "export-me-2");
+    }
+
+    #[test]
+    fn unique_custom_slug_can_exclude_destination_file_being_overwritten() {
+        let _xdg = XdgConfigHomeGuard::new("tonepoet-theme-noncanonical-slug-exclude-destination");
+
+        let mut draft = ThemePaletteDraft::from_palette(default_palette());
+        draft.source = ThemeDraftSource::Custom;
+        draft.slug = "export-me".to_string();
+        draft.name = "Export Me".to_string();
+
+        let noncanonical_path = theme_dir().join("explicit-export.toml");
+        export_theme_file_to_path(&draft, &noncanonical_path).expect("write noncanonical export");
+        assert_eq!(unique_custom_theme_slug("export-me").expect("without exclusion"), "export-me-2");
+        assert_eq!(
+            unique_custom_theme_slug_excluding_path("export-me", Some(&noncanonical_path))
+                .expect("with destination exclusion"),
+            "export-me"
+        );
+    }
+
+    #[test]
+    fn canonical_custom_theme_path_requires_slug_filename_match() {
+        let _xdg = XdgConfigHomeGuard::new("tonepoet-theme-canonical-path-check");
+        let canonical = theme_path_for_slug("canonical-check").expect("canonical path");
+        let explicit = theme_dir().join("explicit-export.toml");
+        std::fs::create_dir_all(theme_dir()).expect("create theme dir");
+        std::fs::write(&canonical, "").expect("touch canonical");
+        std::fs::write(&explicit, "").expect("touch explicit");
+
+        assert!(is_canonical_custom_theme_path_for_slug(&canonical, "canonical-check").expect("canonical check"));
+        assert!(!is_canonical_custom_theme_path_for_slug(&explicit, "canonical-check").expect("explicit check"));
     }
 
     #[test]

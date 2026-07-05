@@ -276,21 +276,21 @@ pub enum TuiButton {
 
     // Theme Builder overlay.
     ThemeBuilderPreset,
+    ThemeBuilderTab(usize),
+    ThemeBuilderMoreMenu,
+    ThemeBuilderMoreMenuItem(usize),
+    ThemeBuilderGalleryMode,
+    ThemeBuilderGalleryFilter,
     ThemeBuilderMode,
     ThemeBuilderSlot(crate::tui::theme::BuilderSlot),
     ThemeBuilderHexField,
     ThemeBuilderRgbSlider(usize),
     ThemeBuilderDepth(crate::tui::theme::ColorDepth),
-    ThemeBuilderSwatchNameField,
+    ThemeBuilderInlineSwatchName,
     ThemeBuilderSavedSwatch(usize),
-    ThemeBuilderRecentSwatch(usize),
     ThemeBuilderSaveSwatch,
-    ThemeBuilderDeleteSwatch,
     ThemeBuilderSave,
     ThemeBuilderApply,
-    ThemeBuilderDerived,
-    ThemeBuilderRevert,
-    ThemeBuilderDeleteTheme,
     ThemeBuilderDeleteConfirm,
     ThemeBuilderDeleteCancel,
     ThemeBuilderCancel,
@@ -298,13 +298,13 @@ pub enum TuiButton {
     ThemeBuilderPresetCancel,
     ThemeBuilderDerivedRow(usize),
     ThemeBuilderDerivedLock,
-    ThemeBuilderDerivedRelease,
-    ThemeBuilderDerivedTarget,
-    ThemeBuilderDerivedDone,
     ThemeBuilderApplyThemeLocks,
     ThemeBuilderApplyUserOverrides,
     ThemeBuilderApplyConfirm,
     ThemeBuilderApplyCancel,
+    ThemeBuilderFilePath,
+    ThemeBuilderFileConfirm,
+    ThemeBuilderFileCancel,
 }
 
 impl TuiButton {
@@ -356,21 +356,21 @@ impl TuiButton {
             | Self::TemplatePickerDelete
             | Self::TemplatePickerClose
             | Self::ThemeBuilderPreset
+            | Self::ThemeBuilderTab(_)
+            | Self::ThemeBuilderMoreMenu
+            | Self::ThemeBuilderMoreMenuItem(_)
+            | Self::ThemeBuilderGalleryMode
+            | Self::ThemeBuilderGalleryFilter
             | Self::ThemeBuilderMode
             | Self::ThemeBuilderSlot(_)
             | Self::ThemeBuilderHexField
             | Self::ThemeBuilderRgbSlider(_)
             | Self::ThemeBuilderDepth(_)
-            | Self::ThemeBuilderSwatchNameField
+            | Self::ThemeBuilderInlineSwatchName
             | Self::ThemeBuilderSavedSwatch(_)
-            | Self::ThemeBuilderRecentSwatch(_)
             | Self::ThemeBuilderSaveSwatch
-            | Self::ThemeBuilderDeleteSwatch
             | Self::ThemeBuilderSave
             | Self::ThemeBuilderApply
-            | Self::ThemeBuilderDerived
-            | Self::ThemeBuilderRevert
-            | Self::ThemeBuilderDeleteTheme
             | Self::ThemeBuilderDeleteConfirm
             | Self::ThemeBuilderDeleteCancel
             | Self::ThemeBuilderCancel
@@ -378,13 +378,13 @@ impl TuiButton {
             | Self::ThemeBuilderPresetCancel
             | Self::ThemeBuilderDerivedRow(_)
             | Self::ThemeBuilderDerivedLock
-            | Self::ThemeBuilderDerivedRelease
-            | Self::ThemeBuilderDerivedTarget
-            | Self::ThemeBuilderDerivedDone
             | Self::ThemeBuilderApplyThemeLocks
             | Self::ThemeBuilderApplyUserOverrides
             | Self::ThemeBuilderApplyConfirm
             | Self::ThemeBuilderApplyCancel
+            | Self::ThemeBuilderFilePath
+            | Self::ThemeBuilderFileConfirm
+            | Self::ThemeBuilderFileCancel
             | Self::FormatSettingsVerify(_)
             | Self::FormatSettingsMd5(_)
             | Self::FormatSettingsAacProfile(_)
