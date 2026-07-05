@@ -2358,6 +2358,76 @@ fn push_key_value_line(
     ]);
 }
 
+fn push_directory_metric_line(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    key: &'static str,
+    value: impl Into<String>,
+    theme: super::theme::Theme,
+) {
+    lines.push(vec![
+        Span::styled(format!("   {key:<12}"), theme.muted()),
+        Span::styled(value.into(), theme.text_style()),
+    ]);
+}
+
+fn directory_count_label(count: usize, singular: &str, plural: &str) -> String {
+    format!("{} {}", count, if count == 1 { singular } else { plural })
+}
+
+fn append_size_label(mut label: String, size: u64) -> String {
+    if size > 0 {
+        label.push_str(&format!(" ({})", size_str(size)));
+    }
+    label
+}
+
+fn push_directory_stats_lines(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    browse: &BrowseState,
+    entry_path: &Path,
+    entry_date_label: &str,
+    theme: super::theme::Theme,
+) -> bool {
+    if let Some(stats) = browse.current_dir_stats() {
+        push_directory_metric_line(
+            lines,
+            "folders",
+            directory_count_label(stats.folder_count, "folder", "folders"),
+            theme,
+        );
+        push_directory_metric_line(
+            lines,
+            "files",
+            append_size_label(
+                directory_count_label(stats.file_count, "file", "files"),
+                stats.total_size,
+            ),
+            theme,
+        );
+        push_directory_metric_line(
+            lines,
+            "audio files",
+            append_size_label(
+                directory_count_label(stats.audio_count, "audio file", "audio files"),
+                stats.audio_size,
+            ),
+            theme,
+        );
+        if !entry_date_label.is_empty() {
+            push_directory_metric_line(lines, "updated", entry_date_label.to_string(), theme);
+        }
+        true
+    } else if browse.dir_stats_pending.contains(entry_path) {
+        lines.push(vec![
+            Span::styled("   files       ", theme.muted()),
+            Span::styled("computing...", Style::default().fg(theme.text_dim)),
+        ]);
+        true
+    } else {
+        false
+    }
+}
+
 fn folder_audio_headline(
     audio: &FolderAudioSummary,
     browse: &BrowseState,
@@ -2382,7 +2452,10 @@ fn folder_audio_headline(
         parts.push("mixed rates".to_string());
     } else if let Some(profile) = rollup.dominant_profile_label() {
         parts.push(profile.to_string());
-    } else if include_probe_status && audio.track_count > 0 {
+    } else if include_probe_status
+        && audio.track_count > 0
+        && browse.folder_audio_summary_probe_work_in_flight(audio)
+    {
         parts.push("probing...".to_string());
     }
 
@@ -2459,14 +2532,17 @@ fn push_disc_probe_summary_lines(
                 Span::styled(truncate_to(&summary, max_value_chars), theme.text_style()),
             ]);
         }
-        lines.push(vec![
-            Span::styled("   copy protection", theme.muted()),
-            Span::raw(" "),
-            Span::styled(
-                truncate_to(&contents.copy_protection.description, max_value_chars.saturating_sub(18)),
-                theme.text_style(),
-            ),
-        ]);
+        let copy_protection = contents.copy_protection.description.trim();
+        if !copy_protection.eq_ignore_ascii_case("none") {
+            lines.push(vec![
+                Span::styled("   copy protection", theme.muted()),
+                Span::raw(" "),
+                Span::styled(
+                    truncate_to(copy_protection, max_value_chars.saturating_sub(18)),
+                    theme.text_style(),
+                ),
+            ]);
+        }
         lines.push(vec![]);
         lines.push(vec![Span::styled("   streams:", theme.muted())]);
         for stream in crate::tui::disc_browser::disc_stream_summary_lines(contents.as_ref(), 6) {
@@ -2542,6 +2618,7 @@ fn push_folder_classification_lines(
     browse: &BrowseState,
     entry_path: &Path,
     entry_size: u64,
+    entry_date_label: &str,
     content_width: usize,
     audio_streams_hovered: bool,
     audio_streams_pill_row: &mut Option<usize>,
@@ -2549,11 +2626,20 @@ fn push_folder_classification_lines(
 ) {
     match classification.kind {
         FolderClassificationKind::Album => {
-            push_key_value_line(lines, "kind", "album folder", theme.muted(), theme.bold(theme.blue));
+            push_key_value_line(
+                lines,
+                "kind",
+                "album folder",
+                theme.muted(),
+                theme.bold(theme.blue),
+            );
             lines.push(vec![
                 Span::raw("   "),
                 Span::styled(
-                    truncate_to(&folder_audio_headline(&classification.audio, browse, true), content_width.saturating_sub(3)),
+                    truncate_to(
+                        &folder_audio_headline(&classification.audio, browse, true),
+                        content_width.saturating_sub(3),
+                    ),
                     theme.text_style(),
                 ),
             ]);
@@ -2563,9 +2649,20 @@ fn push_folder_classification_lines(
             let marker = classification
                 .disc_marker
                 .map(|marker| marker.label())
-                .or_else(|| classification.units.first().and_then(|unit| unit.disc_marker.map(|marker| marker.label())))
+                .or_else(|| {
+                    classification
+                        .units
+                        .first()
+                        .and_then(|unit| unit.disc_marker.map(|marker| marker.label()))
+                })
                 .unwrap_or("disc");
-            push_key_value_line(lines, "kind", format!("{marker} disc folder"), theme.muted(), theme.bold(theme.purple));
+            push_key_value_line(
+                lines,
+                "kind",
+                format!("{marker} disc folder"),
+                theme.muted(),
+                theme.bold(theme.purple),
+            );
             let source_path = classification.disc_probe_source_path(entry_path);
             push_disc_probe_summary_lines(
                 lines,
@@ -2579,8 +2676,18 @@ fn push_folder_classification_lines(
             );
         }
         FolderClassificationKind::MultiDisc => {
-            push_key_value_line(lines, "kind", "multi-disc album", theme.muted(), theme.bold(theme.blue));
-            let disc_word = if classification.unit_count == 1 { "disc" } else { "discs" };
+            push_key_value_line(
+                lines,
+                "kind",
+                "multi-disc album",
+                theme.muted(),
+                theme.bold(theme.blue),
+            );
+            let disc_word = if classification.unit_count == 1 {
+                "disc"
+            } else {
+                "discs"
+            };
             let mut headline = format!("{} {disc_word}", classification.unit_count);
             if classification.audio.track_count > 0 {
                 headline.push_str(" · ");
@@ -2588,7 +2695,10 @@ fn push_folder_classification_lines(
             }
             lines.push(vec![
                 Span::raw("   "),
-                Span::styled(truncate_to(&headline, content_width.saturating_sub(3)), theme.text_style()),
+                Span::styled(
+                    truncate_to(&headline, content_width.saturating_sub(3)),
+                    theme.text_style(),
+                ),
             ]);
             push_folder_audio_detail_lines(lines, &classification.audio, browse, content_width, theme);
             if classification.audio.track_count > 0 && classification.units.len() <= 6 {
@@ -2600,38 +2710,27 @@ fn push_folder_classification_lines(
                     );
                     lines.push(vec![
                         Span::raw("   "),
-                        Span::styled(truncate_to(&unit_line, content_width.saturating_sub(3)), theme.muted()),
+                        Span::styled(
+                            truncate_to(&unit_line, content_width.saturating_sub(3)),
+                            theme.muted(),
+                        ),
                     ]);
                 }
             }
         }
         FolderClassificationKind::Collection => {
-            let value = if classification.collection_many {
-                "collection · many albums".to_string()
-            } else if classification.unit_count > 0 {
-                format!(
-                    "collection · {} {}",
-                    classification.unit_count,
-                    if classification.unit_count == 1 { "album" } else { "albums" }
-                )
-            } else {
-                "collection".to_string()
-            };
-            push_key_value_line(lines, "kind", value, theme.muted(), theme.text_style());
-            if classification.io_budget_exhausted {
-                lines.push(vec![
-                    Span::raw("   "),
-                    Span::styled("classification budget reached", theme.muted()),
-                ]);
+            if !push_directory_stats_lines(lines, browse, entry_path, entry_date_label, theme) {
+                // Collections are an internal classification signal used to
+                // choose follow-up work. Do not make "collection · many albums"
+                // the primary user-facing summary for ordinary artist/tree
+                // folders; without stats, fall back to the old neutral
+                // directory label until stats are available.
+                push_key_value_line(lines, "kind", "directory", theme.muted(), theme.text_style());
             }
         }
         FolderClassificationKind::Unknown => {
-            push_key_value_line(lines, "kind", "folder", theme.muted(), theme.text_style());
-            if classification.io_budget_exhausted {
-                lines.push(vec![
-                    Span::raw("   "),
-                    Span::styled("classification budget reached", theme.muted()),
-                ]);
+            if !push_directory_stats_lines(lines, browse, entry_path, entry_date_label, theme) {
+                push_key_value_line(lines, "kind", "directory", theme.muted(), theme.text_style());
             }
         }
     }
@@ -2709,6 +2808,8 @@ fn entry_info_lines(
         }
     };
 
+    let entry_date_label = entry.date_label();
+
     // Blank
     lines.push(vec![]);
 
@@ -2732,6 +2833,7 @@ fn entry_info_lines(
                     browse,
                     &entry.path,
                     entry.size,
+                    &entry_date_label,
                     content_width,
                     audio_streams_hovered,
                     &mut audio_streams_pill_row,
@@ -2750,27 +2852,7 @@ fn entry_info_lines(
                 }
                 // Show directory stats if cached, or "computing..." if a stats
                 // task is currently in flight for this directory.
-                if let Some(stats) = browse.current_dir_stats() {
-                    lines.push(vec![
-                        Span::styled("   files   ", theme.muted()),
-                        Span::styled(stats.file_count.to_string(), theme.text_style()),
-                    ]);
-                    if stats.audio_count > 0 {
-                        lines.push(vec![
-                            Span::styled("   audio   ", theme.muted()),
-                            Span::styled(stats.audio_count.to_string(), theme.accent()),
-                        ]);
-                    }
-                    lines.push(vec![
-                        Span::styled("   size    ", theme.muted()),
-                        Span::styled(size_str(stats.total_size), theme.text_style()),
-                    ]);
-                } else if browse.dir_stats_pending.contains(&entry.path) {
-                    lines.push(vec![
-                        Span::styled("   files   ", theme.muted()),
-                        Span::styled("computing...", Style::default().fg(theme.text_dim)),
-                    ]);
-                }
+                push_directory_stats_lines(&mut lines, browse, &entry.path, &entry_date_label, theme);
             }
         }
         EntryKind::AudioFile(fmt) => {
@@ -3552,6 +3634,7 @@ mod folder_classification_info_pane_tests {
     use crate::tui::disc_browser::{disc_probe_fingerprint, DiscProbeCacheEntry};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     fn theme() -> crate::tui::theme::Theme {
         crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug())
@@ -3636,7 +3719,8 @@ mod folder_classification_info_pane_tests {
         let (rendered, info) = render_classification(entry, classification);
 
         assert!(rendered.contains("album folder"));
-        assert!(rendered.contains("2 tracks · FLAC · probing..."));
+        assert!(rendered.contains("2 tracks · FLAC"));
+        assert!(!rendered.contains("probing..."));
         assert!(info.audio_streams_pill_row.is_none());
     }
 
@@ -3692,13 +3776,14 @@ mod folder_classification_info_pane_tests {
         let (rendered, _) = render_classification(entry, classification);
 
         assert!(rendered.contains("multi-disc album"));
-        assert!(rendered.contains("2 discs · 2 tracks · FLAC · probing..."));
+        assert!(rendered.contains("2 discs · 2 tracks · FLAC"));
+        assert!(!rendered.contains("probing..."));
         assert!(rendered.contains("Disc 1: 1 track · FLAC"));
         assert!(rendered.contains("Disc 2: 1 track · FLAC"));
     }
 
     #[test]
-    fn collection_classification_renders_album_count_without_probe_details() {
+    fn collection_classification_without_stats_renders_neutral_directory_label() {
         let entry = BrowseEntry::new(
             PathBuf::from("/music/artist"),
             "artist".to_string(),
@@ -3720,10 +3805,128 @@ mod folder_classification_info_pane_tests {
 
         let (rendered, _) = render_classification(entry, classification);
 
-        assert!(rendered.contains("collection · 24 albums"));
+        assert!(rendered.contains("kind    directory"));
+        assert!(!rendered.contains("collection · 24 albums"));
         assert!(!rendered.contains("probing..."));
         assert!(!rendered.contains("streams:"));
     }
+
+    #[test]
+    fn collection_classification_uses_old_style_directory_stats_as_primary_summary_when_available() {
+        let entry = BrowseEntry::new(
+            PathBuf::from("/music/artist"),
+            "artist".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        );
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let classification = FolderContentClassification {
+            kind: FolderClassificationKind::Collection,
+            identity,
+            audio: FolderAudioSummary::default(),
+            units: Vec::new(),
+            unit_count: 24,
+            collection_many: false,
+            io_budget_exhausted: false,
+            disc_marker: None,
+        };
+
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(entry.path.clone(), identity, classification);
+        browse.insert_dir_stats_for_identity(
+            entry.path.clone(),
+            identity,
+            crate::tui::browse::DirStats {
+                folder_count: 24,
+                file_count: 312,
+                audio_count: 247,
+                audio_size: 12_400_000_000,
+                total_size: 14_100_000_000,
+            },
+        );
+
+        let info = entry_info_lines(
+            &entry,
+            &browse,
+            96,
+            false,
+            false,
+            false,
+            None,
+            None,
+            theme(),
+        );
+        let rendered = flatten(&info);
+
+        assert!(rendered.contains("folders     24 folders"));
+        assert!(rendered.contains("files       312 files (13.1 GB)"));
+        assert!(rendered.contains("audio files 247 audio files (11.5 GB)"));
+        assert!(!rendered.contains("collection · 24 albums"));
+        assert!(!rendered.contains("kind    collection"));
+    }
+
+    #[test]
+    fn directory_only_collection_renders_old_style_stats_not_collection_label() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 * 10);
+        let entry = BrowseEntry::new(
+            PathBuf::from("/music/artist"),
+            "artist".to_string(),
+            EntryKind::Directory,
+            0,
+            Some(modified),
+        );
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let classification = FolderContentClassification {
+            kind: FolderClassificationKind::Collection,
+            identity,
+            audio: FolderAudioSummary::default(),
+            units: Vec::new(),
+            unit_count: 0,
+            collection_many: true,
+            io_budget_exhausted: false,
+            disc_marker: None,
+        };
+
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(entry.path.clone(), identity, classification);
+        browse.insert_dir_stats_for_identity(
+            entry.path.clone(),
+            identity,
+            crate::tui::browse::DirStats {
+                folder_count: 18,
+                file_count: 247,
+                audio_count: 192,
+                audio_size: 42_000_000_000,
+                total_size: 45_000_000_000,
+            },
+        );
+
+        let info = entry_info_lines(
+            &entry,
+            &browse,
+            96,
+            false,
+            false,
+            false,
+            None,
+            None,
+            theme(),
+        );
+        let rendered = flatten(&info);
+
+        assert!(rendered.contains("folders     18 folders"));
+        assert!(rendered.contains("files       247 files (41.9 GB)"));
+        assert!(rendered.contains("audio files 192 audio files (39.1 GB)"));
+        assert!(rendered.contains("updated"));
+        assert!(!rendered.contains("collection · many albums"));
+        assert!(!rendered.contains("kind    collection"));
+    }
+
 
     fn bluray_layout(root: &Path) {
         let bdmv = root.join("BDMV");
@@ -3836,7 +4039,104 @@ mod folder_classification_info_pane_tests {
         assert!(rendered.contains("streams:"));
         assert!(rendered.contains("LPCM 24-bit/96kHz stereo"));
         assert!(rendered.contains("... and 1 more"));
+        assert!(!rendered.contains("copy protection"));
         assert!(info.audio_streams_pill_row.is_some());
+    }
+
+    #[test]
+    fn disc_folder_renders_copy_protection_only_when_not_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("PROTECTED");
+        std::fs::create_dir(&root).expect("disc root");
+        bluray_layout(&root);
+        let metadata = std::fs::metadata(&root).expect("metadata");
+        let identity = ProbeCacheIdentity::from_metadata(&metadata);
+        let entry = directory_entry(&root, "PROTECTED", identity);
+        let classification = FolderContentClassification {
+            kind: FolderClassificationKind::Disc,
+            identity,
+            audio: FolderAudioSummary::default(),
+            units: Vec::new(),
+            unit_count: 1,
+            collection_many: false,
+            io_budget_exhausted: false,
+            disc_marker: Some(FolderDiscMarkerKind::BluRay),
+        };
+        let mut contents = disc_contents(root.clone());
+        contents.copy_protection.description = "  AACS  ".to_string();
+
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(root.clone(), identity, classification);
+        let fingerprint = disc_probe_fingerprint(&root).expect("disc fingerprint");
+        browse.disc_probe_cache.insert(
+            root.clone(),
+            DiscProbeCacheEntry::from_success(fingerprint, contents),
+        );
+
+        let info = entry_info_lines(
+            &entry,
+            &browse,
+            96,
+            false,
+            false,
+            false,
+            None,
+            None,
+            theme(),
+        );
+        let rendered = flatten(&info);
+
+        assert!(rendered.contains("copy protection AACS"));
+    }
+
+    #[test]
+    fn disc_folder_suppresses_whitespace_padded_none_copy_protection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("UNPROTECTED");
+        std::fs::create_dir(&root).expect("disc root");
+        bluray_layout(&root);
+        let metadata = std::fs::metadata(&root).expect("metadata");
+        let identity = ProbeCacheIdentity::from_metadata(&metadata);
+        let entry = directory_entry(&root, "UNPROTECTED", identity);
+        let classification = FolderContentClassification {
+            kind: FolderClassificationKind::Disc,
+            identity,
+            audio: FolderAudioSummary::default(),
+            units: Vec::new(),
+            unit_count: 1,
+            collection_many: false,
+            io_budget_exhausted: false,
+            disc_marker: Some(FolderDiscMarkerKind::BluRay),
+        };
+        let mut contents = disc_contents(root.clone());
+        contents.copy_protection.description = "  none  ".to_string();
+
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(root.clone(), identity, classification);
+        let fingerprint = disc_probe_fingerprint(&root).expect("disc fingerprint");
+        browse.disc_probe_cache.insert(
+            root.clone(),
+            DiscProbeCacheEntry::from_success(fingerprint, contents),
+        );
+
+        let info = entry_info_lines(
+            &entry,
+            &browse,
+            96,
+            false,
+            false,
+            false,
+            None,
+            None,
+            theme(),
+        );
+        let rendered = flatten(&info);
+
+        assert!(!rendered.contains("copy protection"));
     }
 
     #[test]

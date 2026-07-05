@@ -456,15 +456,19 @@ pub fn disc_summary(contents: &DiscContents) -> String {
         .filter(|presentation| presentation_is_stereo(presentation))
         .count();
     let multichannel_count = stream_count.saturating_sub(stereo_count);
-    format!(
-        "{} audio {} · {} {} · {} multichannel · {} stereo",
+
+    let mut parts = vec![format!(
+        "{} audio {}",
         stream_count,
-        plural(stream_count, "stream", "streams"),
+        plural(stream_count, "stream", "streams")
+    )];
+    parts.push(format!(
+        "{} {}",
         track_count,
-        plural(track_count, "track", "tracks"),
-        multichannel_count,
-        stereo_count,
-    )
+        plural(track_count, "track", "tracks")
+    ));
+    append_nonzero_channel_summary_parts(&mut parts, multichannel_count, stereo_count);
+    parts.join(" · ")
 }
 
 pub fn disc_content_summary_lines(contents: &DiscContents) -> Vec<String> {
@@ -476,16 +480,34 @@ pub fn disc_content_summary_lines(contents: &DiscContents) -> Vec<String> {
         .filter(|presentation| presentation_is_stereo(presentation))
         .count();
     let multichannel_count = stream_count.saturating_sub(stereo_count);
-    vec![
-        format!(
-            "content: {} audio {} · {} {}",
-            stream_count,
-            plural(stream_count, "stream", "streams"),
-            track_count,
-            plural(track_count, "track", "tracks"),
-        ),
-        format!("         {multichannel_count} multichannel · {stereo_count} stereo"),
-    ]
+    let mut lines = vec![format!(
+        "content: {} audio {} · {} {}",
+        stream_count,
+        plural(stream_count, "stream", "streams"),
+        track_count,
+        plural(track_count, "track", "tracks"),
+    )];
+
+    let mut channel_parts = Vec::new();
+    append_nonzero_channel_summary_parts(&mut channel_parts, multichannel_count, stereo_count);
+    if !channel_parts.is_empty() {
+        lines.push(format!("         {}", channel_parts.join(" · ")));
+    }
+
+    lines
+}
+
+fn append_nonzero_channel_summary_parts(
+    parts: &mut Vec<String>,
+    multichannel_count: usize,
+    stereo_count: usize,
+) {
+    if multichannel_count > 0 {
+        parts.push(format!("{multichannel_count} multichannel"));
+    }
+    if stereo_count > 0 {
+        parts.push(format!("{stereo_count} stereo"));
+    }
 }
 
 pub fn disc_stream_summary_lines(contents: &DiscContents, limit: usize) -> Vec<String> {
@@ -1360,6 +1382,32 @@ mod disc_stream_summary_tests {
         let lines = disc_stream_summary_lines(&contents, 6);
 
         assert_eq!(lines, vec!["DSD 2.8MHz stereo", "DSD 2.8MHz 5.1"]);
+    }
+
+    #[test]
+    fn disc_summary_suppresses_zero_channel_counts() {
+        let stereo_only = contents(vec![
+            presentation("Stereo A", "LPCM", 2, "stereo", 24, 96_000, 1),
+            presentation("Stereo B", "LPCM", 2, "stereo", 24, 96_000, 2),
+        ]);
+        assert_eq!(disc_summary(&stereo_only), "2 audio streams · 2 tracks · 2 stereo");
+        assert_eq!(
+            disc_content_summary_lines(&stereo_only),
+            vec![
+                "content: 2 audio streams · 2 tracks".to_string(),
+                "         2 stereo".to_string(),
+            ]
+        );
+
+        let multichannel_only = contents(vec![presentation("Surround", "DTS-HD MA", 6, "5.1", 24, 96_000, 1)]);
+        assert_eq!(disc_summary(&multichannel_only), "1 audio stream · 1 track · 1 multichannel");
+        assert_eq!(
+            disc_content_summary_lines(&multichannel_only),
+            vec![
+                "content: 1 audio stream · 1 track".to_string(),
+                "         1 multichannel".to_string(),
+            ]
+        );
     }
 }
 

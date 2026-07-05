@@ -1,5 +1,6 @@
 //! Async event loop: crossterm events + progress messages
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
@@ -8,15 +9,16 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
 use super::app::{ActiveOverlay, AppScreen, AppState, TextEditTarget};
-use super::browse::EntryKind;
+use super::browse::{BrowseDeferredWorkFlags, EntryKind};
 use super::draw::draw_ui;
 use super::keybindings::{handle_key, handle_mouse};
 use super::message::AppMessage;
 use super::text_input::TextInputState;
 
 /// Keep bursty async completions from monopolizing a frame. If more messages
-/// remain, the next loop uses a zero poll timeout so deferred work continues
-/// promptly without making one render absorb an unbounded reducer batch.
+/// or bounded reducer slices remain, the next loop uses a zero poll timeout so
+/// deferred work continues promptly without making one render absorb an
+/// unbounded reducer batch.
 const MAX_ASYNC_MESSAGES_PER_FRAME: usize = 32;
 
 /// Run the main TUI event loop
@@ -30,15 +32,24 @@ pub async fn run_app(
     // spawn async scans. Must happen before the event loop starts.
     app.browse.set_tx(tx.clone());
     app.tui_tx = Some(tx.clone());
+    let mut deferred_browse_visible_messages: VecDeque<AppMessage> = VecDeque::new();
 
     loop {
+        // Check whether terminal input is already queued before firing any
+        // settled-focus Browse work. Key-repeat PgUp/PgDn can otherwise leave
+        // an event waiting while the old debounce expires, causing periodic
+        // folder classification/probe/stat work in the middle of scrolling.
+        let input_waiting_at_frame_start = event::poll(Duration::from_millis(0))?;
+
         // 1. Refresh items from the manager
         app.refresh_items();
         app.clamp_selection();
         app.clear_expired_status();
         check_pending_browse_rename(app);
         check_batch_probe_debounce(app, &tx);
-        check_browse_probe_debounce(app, &tx);
+        if !input_waiting_at_frame_start {
+            check_browse_probe_debounce(app, &tx);
+        }
         check_search_debounce(app, &tx);
         // Close browse-only overlays if the user has left the browse screen.
         if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
@@ -79,6 +90,10 @@ pub async fn run_app(
         // missing frame. The post-draw prepare remains for first-time geometry
         // discovery and resize/layout changes recorded during this draw.
         app.prepare_image_preview_protocols();
+        // `force_redraw` means the terminal diff buffer is suspected to be
+        // invalid and a full clear is required before drawing. Ordinary async
+        // reducer progress must not set it: the loop below uses a zero-timeout
+        // tick for prompt non-clearing redraws instead.
         if app.force_redraw {
             terminal.clear()?;
             app.force_redraw = false;
@@ -124,21 +139,30 @@ pub async fn run_app(
             break;
         }
 
-        // 4. Drain async messages, but cap per-frame reducer work. Probe, scan,
-        // and search completions can arrive in bursts; spreading them across
-        // frames keeps input and redraw latency bounded under heavy I/O.
-        let drained = drain_async_messages_for_frame(app, &mut rx, &tx);
-        let reducer_work_remains = drained == MAX_ASYNC_MESSAGES_PER_FRAME
-            || app.browse.has_probe_cache_warm_backlog();
-        if reducer_work_remains {
-            app.force_redraw = true;
-        }
+        // 4. Drain async messages, but cap per-frame reducer work. While Browse
+        // focus is moving, continue draining lightweight/unrelated messages
+        // (conversion progress, status, analysis, etc.) and hold only messages
+        // whose reducer arms mutate the visible Browse listing/info pane. This
+        // prevents channel backlog and bursty catch-up without letting warm-cache
+        // merges, folder classifications, or probe completions stutter scrolling.
+        let defer_visible_browse_work =
+            browse_visible_work_should_wait(app, input_waiting_at_frame_start);
+        let (drained, reducer_work_ready_remains) = drain_async_messages_for_frame(
+            app,
+            &mut rx,
+            &tx,
+            &mut deferred_browse_visible_messages,
+            defer_visible_browse_work,
+        );
+        let immediate_nonclearing_tick_needed =
+            needs_immediate_nonclearing_tick(drained, reducer_work_ready_remains);
 
-        // 5. Poll for crossterm events. When reducer work was capped, do not
-        // sleep before the next loop; remaining async messages or warm-cache
-        // merge work should continue draining immediately after one render
-        // boundary, while still giving input a chance between slices.
-        let poll_timeout = if reducer_work_remains {
+        // 5. Poll for crossterm events. Async messages and bounded reducer
+        // slices mutate app state after this frame's draw. Use a zero timeout
+        // to render/drain again promptly, but do not map that to
+        // `force_redraw`: a full terminal clear is far more expensive and can
+        // visibly flicker while warm-cache backlogs are being reduced.
+        let poll_timeout = if immediate_nonclearing_tick_needed {
             Duration::from_millis(0)
         } else {
             Duration::from_millis(100)
@@ -158,33 +182,136 @@ pub async fn run_app(
 }
 
 
+fn needs_immediate_nonclearing_tick(drained_messages: usize, reducer_work_remains: bool) -> bool {
+    drained_messages > 0 || reducer_work_remains
+}
+
 fn drain_async_messages_for_frame(
     app: &mut AppState,
     rx: &mut mpsc::Receiver<AppMessage>,
     tx: &mpsc::Sender<AppMessage>,
-) -> usize {
-    let mut drained = 0usize;
-    while drained < MAX_ASYNC_MESSAGES_PER_FRAME {
-        let Ok(msg) = rx.try_recv() else {
+    deferred_browse_visible_messages: &mut VecDeque<AppMessage>,
+    defer_browse_visible_work: bool,
+) -> (usize, bool) {
+    let mut inspected = 0usize;
+    let mut reduced = 0usize;
+
+    while inspected < MAX_ASYNC_MESSAGES_PER_FRAME {
+        let msg = if !defer_browse_visible_work {
+            match deferred_browse_visible_messages.pop_front() {
+                Some(msg) => Some(msg),
+                None => rx.try_recv().ok(),
+            }
+        } else {
+            rx.try_recv().ok()
+        };
+
+        let Some(msg) = msg else {
             break;
         };
+        inspected += 1;
+
+        if defer_browse_visible_work && message_mutates_browse_visible_state(&msg) {
+            deferred_browse_visible_messages.push_back(msg);
+            continue;
+        }
+
         handle_message(app, msg, tx);
-        drained += 1;
+        reduced += 1;
     }
-    if drained == MAX_ASYNC_MESSAGES_PER_FRAME {
-        log::debug!("async message drain cap reached ({} messages); deferring remaining reducer work", drained);
+
+    if inspected == MAX_ASYNC_MESSAGES_PER_FRAME {
+        log::debug!(
+            "async message drain cap reached ({} inspected, {} reduced, {} browse-visible held); deferring remaining reducer work",
+            inspected,
+            reduced,
+            deferred_browse_visible_messages.len()
+        );
     }
-    flush_browse_deferred_work(app, tx);
-    drained
+
+    let reducer_work_ready_remains = if defer_browse_visible_work {
+        false
+    } else {
+        flush_browse_deferred_work(app, tx)
+    };
+
+    let held_browse_work_ready = !defer_browse_visible_work && !deferred_browse_visible_messages.is_empty();
+    let drain_cap_reached = inspected == MAX_ASYNC_MESSAGES_PER_FRAME;
+    (
+        reduced,
+        reducer_work_ready_remains || held_browse_work_ready || drain_cap_reached,
+    )
 }
 
-fn flush_browse_deferred_work(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    // Merge only a small warm-cache slice per frame. The expensive SQLite read
-    // already runs off-thread; this protects the reducer from a 5K-20K row
-    // state-update spike when those rows arrive together.
+fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
+    match msg {
+        AppMessage::ProbeCacheWarmComplete { .. }
+        | AppMessage::AudioProbeComplete { .. }
+        | AppMessage::DiscProbeComplete { .. }
+        | AppMessage::DirStatsComplete { .. }
+        | AppMessage::FolderClassifyComplete { .. }
+        | AppMessage::DirScanComplete { .. }
+        | AppMessage::PathValidationComplete { .. }
+        | AppMessage::SearchComplete { .. }
+        | AppMessage::ArchiveListingComplete { .. }
+        | AppMessage::MetadataWriteComplete { .. }
+        | AppMessage::CtdbRepairComplete { .. } => true,
+        AppMessage::CueWriteComplete { refresh_browse, .. } => *refresh_browse,
+        AppMessage::FilePickerComplete { purpose, .. } => matches!(
+            purpose,
+            super::app::FilePickerPurpose::CopyTo { .. }
+                | super::app::FilePickerPurpose::MoveTo { .. }
+        ),
+        AppMessage::FileTaskProgress { update, .. } => matches!(
+            update,
+            tui_file_picker::FileTaskProgressUpdate::Finished { .. }
+                | tui_file_picker::FileTaskProgressUpdate::Failed { .. }
+                | tui_file_picker::FileTaskProgressUpdate::Aborted { .. }
+        ),
+        _ => false,
+    }
+}
+
+fn browse_visible_work_should_wait(app: &AppState, input_waiting_at_frame_start: bool) -> bool {
+    app.current_screen == AppScreen::Browse
+        && (input_waiting_at_frame_start || app.browse.focus_visible_work_deferred())
+}
+
+fn flush_browse_deferred_work(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
+    // Merge warm-cache rows only from this settled Browse-visible reducer path.
+    // The expensive SQLite read already runs off-thread; the reducer uses a
+    // strict row/time budget so large backlogs drain quickly after scrolling
+    // settles without monopolizing a frame or mutating Browse mid-scroll.
     let (_merged, warm_backlog_remaining) = app.browse.drain_probe_cache_warm_rows_for_frame();
 
-    let work = app.browse.take_browse_deferred_work();
+    let mut work = app.browse.take_browse_deferred_work();
+    if warm_backlog_remaining {
+        // Probe-cache warm rows are merged in bounded slices. If the view is
+        // sorted or filtered by probe-backed metadata, reapplying the listing
+        // after every bounded slice can still produce many non-clearing but
+        // visible reorder ticks. Keep the cheap cache inserts moving, but
+        // coalesce probe-backed listing work until the backlog drains.
+        let postponed = BrowseDeferredWorkFlags {
+            probe_backed_resort_needed: work.probe_backed_resort_needed,
+            search_reapply_needed: work.search_reapply_needed,
+            visible_entries_changed: if work.classification_changed {
+                false
+            } else {
+                work.visible_entries_changed
+            },
+            info_pane_changed: false,
+            classification_changed: false,
+        };
+        if postponed.has_expensive_work() {
+            app.browse.defer_browse_deferred_work(postponed);
+            work.probe_backed_resort_needed = false;
+            work.search_reapply_needed = false;
+            if !work.classification_changed {
+                work.visible_entries_changed = false;
+            }
+        }
+    }
+
     if work.classification_changed || work.visible_entries_changed {
         app.browse.reapply_after_browse_preference_change(Some(tx));
     } else if work.probe_backed_resort_needed || work.search_reapply_needed {
@@ -195,9 +322,11 @@ fn flush_browse_deferred_work(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
         app.browse.probe_current_with_db(tx, Some(&app.db));
     }
 
-    if warm_backlog_remaining {
-        app.force_redraw = true;
-    }
+    // A remaining warm-cache/deferred backlog means the event loop should take
+    // another immediate non-clearing reducer tick. It must not request
+    // `terminal.clear()`; ratatui's normal diff render is sufficient for these
+    // ordinary state changes.
+    warm_backlog_remaining || app.browse.has_browse_deferred_work()
 }
 
 fn defer_quit_for_browse_archive_metadata(
@@ -989,7 +1118,6 @@ fn handle_convert_source_probe_result(
             .refresh_source_constraints_preserving_format_selection();
     }
 
-    app.force_redraw = true;
 
     if let Some(notice) = probe_notice {
         app.set_status(format!("Probe warning: {}", notice));
@@ -1021,7 +1149,6 @@ fn handle_archive_preview_progress(
     {
         if *path == archive_path {
             *probe_notice = Some(message);
-            app.force_redraw = true;
         }
     }
 }
@@ -1091,7 +1218,6 @@ fn handle_archive_preview_result(
                     .refresh_source_constraints_preserving_format_selection();
             }
 
-            app.force_redraw = true;
             app.set_status(format!(
                 "Archive preview loaded: {} track{}",
                 track_count,
@@ -1116,7 +1242,6 @@ fn handle_archive_preview_result(
                     app.convert
                         .refresh_source_constraints_preserving_format_selection();
                 }
-                app.force_redraw = true;
                 app.set_status("Archive preview failed; set format manually");
             }
         }
@@ -1981,7 +2106,6 @@ fn handle_archive_entry_rename_result(
                         app.browse.selected_index = idx;
                         app.browse.ensure_visible();
                     }
-                    app.force_redraw = true;
                     app.set_status(format!(
                         "renamed archive entry in {archive_label}: {old_name} -> {new_name}; archive changes pending"
                     ));
@@ -2134,7 +2258,6 @@ fn handle_archive_entry_delete_result(
                     start_browse_archive_repackage(app, context, tx);
                 } else {
                     app.browse.refresh_with_search(Some(tx));
-                    app.force_redraw = true;
                 }
             } else {
                 // Browse no longer owns the archive view. Do not apply hidden
@@ -2247,7 +2370,6 @@ fn handle_convert_audio_probe_complete(
             .refresh_source_constraints_preserving_format_selection();
     }
 
-    app.force_redraw = true;
 
     if let Some(notice) = probe_notice {
         app.set_status(format!("Probe warning: {}", notice));
@@ -2490,9 +2612,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             // bounded slice, generation/path-checked again, so warm-cache bursts
             // cannot create a long reducer frame.
             let queued = app.browse.enqueue_probe_cache_warm_rows(generation, path.clone(), rows);
-            if queued > 0 {
-                app.force_redraw = true;
-            } else {
+            if queued == 0 {
                 log::debug!("discarded stale or empty probe-cache warm result for generation {} path {}", generation, path.display());
             }
         }
@@ -2657,7 +2777,6 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         );
                         if app.browse.current_selected_disc_source_matches(&path) {
                             app.browse.deferred_work.info_pane_changed = true;
-                            app.force_redraw = true;
                         }
                         if let Some(followup) = app.browse.disc_probe_followup.remove(&path) {
                             super::disc_browser_actions::handle_disc_probe_followup(app, &path, followup);
@@ -2681,7 +2800,6 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         );
                         if app.browse.current_selected_disc_source_matches(&path) {
                             app.browse.deferred_work.info_pane_changed = true;
-                            app.force_redraw = true;
                             app.set_status(format!("Disc analysis failed: {error}"));
                         }
                     } else {
@@ -2712,7 +2830,6 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         );
                         if app.browse.current_selected_disc_source_matches(&path) {
                             app.browse.deferred_work.info_pane_changed = true;
-                            app.force_redraw = true;
                         }
                     }
                 }
@@ -2761,11 +2878,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         // Re-enter the cheap current-entry policy path after
                         // caching the classification. This lets cached summary
                         // facts decide what, if any, follow-up work is useful:
-                        // classified Disc probes, Album/MultiDisc recursive
-                        // stats, or no recursive work for Collections.
+                        // classified Disc probes or recursive directory stats
+                        // for directory-like summaries that need concrete counts.
                         app.browse.probe_current_with_db(tx, Some(&app.db));
                         app.browse.deferred_work.info_pane_changed = true;
-                        app.force_redraw = true;
                     } else {
                         log::debug!("cached folder classification for non-current selection: {}", path.display());
                     }
@@ -3056,9 +3172,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             // preserves the old stable one-batch display semantics without
             // doing ISO/DVD-A/DVD-Video/Blu-ray filesystem I/O in the reducer.
             app.browse.apply_classification_cache_updates(classification_updates);
-            app.browse.parent_entry = parent_entry;
-            app.browse.all_dirs = dirs;
-            app.browse.all_files = files;
+            app.browse.publish_scanned_entries(parent_entry, dirs, files);
 
             // Warm the in-memory probe cache from SQLite off the reducer path.
             // Large folders must publish promptly; warm rows merge later only
@@ -3221,7 +3335,6 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             app.browse.refresh_archive_view_with_search(Some(tx));
                         }
                     }
-                    app.force_redraw = true;
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                     if resumed_recovery {
                         if app.pending_archive_recovery_resume_conflicted {
@@ -3268,7 +3381,6 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                         arc.staging = Some(session);
                                     }
                                     app.browse.refresh_archive_view_with_search(Some(tx));
-                                    app.force_redraw = true;
                                     let conflict_note = if app.pending_archive_recovery_resume_conflicted {
                                         "; original archive needs overwrite/discard review before save"
                                     } else {
@@ -6575,6 +6687,17 @@ mod async_message_drain_tests {
         }
     }
 
+    fn publish_scan_owned_files_for_warm_cache_test(
+        app: &mut AppState,
+        files: Vec<crate::tui::browse::BrowseEntry>,
+    ) {
+        // Warm-cache rows are keyed to scan-owned paths, not just the current
+        // visible list. Tests must publish entries through the same path used
+        // by directory scans so the per-scan identity index is populated.
+        app.browse.publish_scanned_entries(None, Vec::new(), files);
+        app.browse.reapply_after_directory_scan_complete(None);
+    }
+
     #[test]
     fn capped_drain_preserves_order_and_leaves_remainder_for_next_frame() {
         let mut app = AppState::new(TonepoetConfig::default());
@@ -6585,15 +6708,208 @@ mod async_message_drain_tests {
                 .expect("queue message");
         }
 
-        let first = drain_async_messages_for_frame(&mut app, &mut rx, &tx);
+        let mut held = VecDeque::new();
+        let (first, first_more) = drain_async_messages_for_frame(&mut app, &mut rx, &tx, &mut held, false);
         assert_eq!(first, MAX_ASYNC_MESSAGES_PER_FRAME);
+        assert!(first_more, "hitting the per-frame async cap should request one non-clearing follow-up tick");
         let expected_first = format!("msg-{}", MAX_ASYNC_MESSAGES_PER_FRAME - 1);
         assert_eq!(status(&app), Some(expected_first.as_str()));
 
-        let second = drain_async_messages_for_frame(&mut app, &mut rx, &tx);
+        let (second, second_more) = drain_async_messages_for_frame(&mut app, &mut rx, &tx, &mut held, false);
         assert_eq!(second, 4);
+        assert!(!second_more);
         let expected_second = format!("msg-{}", total - 1);
         assert_eq!(status(&app), Some(expected_second.as_str()));
+    }
+
+    #[test]
+    fn immediate_tick_is_separate_from_terminal_clear() {
+        assert!(!needs_immediate_nonclearing_tick(0, false));
+        assert!(needs_immediate_nonclearing_tick(1, false));
+        assert!(needs_immediate_nonclearing_tick(0, true));
+    }
+
+    #[test]
+    fn browse_motion_drain_holds_only_browse_visible_messages() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        let (tx, mut rx) = mpsc::channel(4);
+        let generation = app.browse.scan_generation;
+        let directory = app.browse.current_dir.clone();
+        tx.try_send(AppMessage::ProbeCacheWarmComplete {
+            generation,
+            path: directory,
+            rows: Vec::new(),
+        })
+        .expect("queue browse-visible warm-cache message");
+        tx.try_send(AppMessage::StatusMessage("conversion progress still drains".to_string()))
+            .expect("queue safe message");
+
+        let mut held = VecDeque::new();
+        let (reduced, more) = drain_async_messages_for_frame(
+            &mut app,
+            &mut rx,
+            &tx,
+            &mut held,
+            true,
+        );
+
+        assert_eq!(reduced, 1, "safe messages should still reduce while Browse focus is moving");
+        assert_eq!(held.len(), 1, "Browse-visible reducers should be held, not left to clog the channel");
+        assert_eq!(status(&app), Some("conversion progress still drains"));
+        assert!(!app.force_redraw);
+        assert!(!more, "a held Browse-visible message alone should not spin the event loop while motion deferral remains active");
+
+        let (reduced_after_settle, more_after_settle) = drain_async_messages_for_frame(
+            &mut app,
+            &mut rx,
+            &tx,
+            &mut held,
+            false,
+        );
+        assert_eq!(reduced_after_settle, 1);
+        assert!(held.is_empty());
+        assert!(!more_after_settle);
+        assert!(!app.force_redraw);
+    }
+
+    #[test]
+    fn input_waiting_defers_existing_warm_backlog_without_merging() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        assert!(browse_visible_work_should_wait(&app, true));
+
+        let path = std::path::PathBuf::from("/tmp/tonepoet-input-wait-warm.flac");
+        let identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 1 };
+        publish_scan_owned_files_for_warm_cache_test(
+            &mut app,
+            vec![crate::tui::browse::BrowseEntry::new(
+                path.clone(),
+                "tonepoet-input-wait-warm.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                identity.size,
+                identity.modified,
+            )],
+        );
+        let generation = app.browse.scan_generation;
+        let directory = app.browse.current_dir.clone();
+        assert_eq!(
+            app.browse.enqueue_probe_cache_warm_rows(
+                generation,
+                directory,
+                vec![crate::tui::browse::ProbeCacheWarmRow {
+                    path,
+                    identity,
+                    info: test_cached_info(identity.size, "warm"),
+                }],
+            ),
+            1,
+        );
+
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(AppMessage::StatusMessage("safe progress".to_string()))
+            .expect("queue safe message");
+        let mut held = VecDeque::new();
+        let (reduced, more) = drain_async_messages_for_frame(
+            &mut app,
+            &mut rx,
+            &tx,
+            &mut held,
+            true,
+        );
+
+        assert_eq!(reduced, 1);
+        assert!(!more);
+        assert_eq!(status(&app), Some("safe progress"));
+        assert!(app.browse.has_probe_cache_warm_backlog());
+        assert!(app.browse.current_cached_info().is_none());
+        assert!(!app.force_redraw);
+    }
+
+    #[test]
+    fn warm_cache_message_queues_without_requesting_terminal_clear() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let path = std::path::PathBuf::from("/tmp/tonepoet-warm-no-clear.flac");
+        let identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 1 };
+        publish_scan_owned_files_for_warm_cache_test(
+            &mut app,
+            vec![crate::tui::browse::BrowseEntry::new(
+                path.clone(),
+                "tonepoet-warm-no-clear.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                identity.size,
+                identity.modified,
+            )],
+        );
+        let generation = app.browse.scan_generation;
+        let directory = app.browse.current_dir.clone();
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_message(
+            &mut app,
+            AppMessage::ProbeCacheWarmComplete {
+                generation,
+                path: directory,
+                rows: vec![crate::tui::browse::ProbeCacheWarmRow {
+                    path,
+                    identity,
+                    info: test_cached_info(identity.size, "warm"),
+                }],
+            },
+            &tx,
+        );
+
+        assert!(app.browse.has_probe_cache_warm_backlog());
+        assert!(
+            !app.force_redraw,
+            "queued warm-cache rows are ordinary reducer work, not terminal damage"
+        );
+    }
+
+    #[test]
+    fn warm_cache_backlog_requests_nonclearing_reducer_tick_only() {
+        let mut app = AppState::new(TonepoetConfig::default());
+        let count = 4096usize;
+        let mut entries = Vec::new();
+        let mut rows = Vec::new();
+        for idx in 0..count {
+            let path = std::path::PathBuf::from(format!("/tmp/tonepoet-warm-backlog-no-clear-{idx}.flac"));
+            let identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: idx as u64 + 1 };
+            entries.push(crate::tui::browse::BrowseEntry::new(
+                path.clone(),
+                format!("tonepoet-warm-backlog-no-clear-{idx}.flac"),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                identity.size,
+                identity.modified,
+            ));
+            rows.push(crate::tui::browse::ProbeCacheWarmRow {
+                path,
+                identity,
+                info: test_cached_info(identity.size, &format!("warm-{idx}")),
+            });
+        }
+        publish_scan_owned_files_for_warm_cache_test(&mut app, entries);
+        let generation = app.browse.scan_generation;
+        let directory = app.browse.current_dir.clone();
+        assert_eq!(app.browse.enqueue_probe_cache_warm_rows(generation, directory, rows), count);
+        let (tx, _rx) = mpsc::channel(4);
+
+        let work_remains = flush_browse_deferred_work(&mut app, &tx);
+
+        assert!(work_remains, "large warm-cache backlogs should keep reducer slices ticking");
+        assert!(
+            !app.force_redraw,
+            "warm-cache backlog ticks must not map to terminal.clear()"
+        );
+        let deferred = app.browse.take_browse_deferred_work();
+        assert!(
+            deferred.probe_backed_resort_needed,
+            "probe-backed listing work should be coalesced until the warm backlog drains"
+        );
+        assert!(
+            !deferred.info_pane_changed,
+            "current-row refresh should wait for the final warm-cache slice"
+        );
     }
 
     #[test]
@@ -6704,8 +7020,10 @@ mod async_message_drain_tests {
                 path: path.clone(),
                 identity: stale_identity,
                 stats: crate::tui::browse::DirStats {
+                    folder_count: 0,
                     file_count: 99,
                     audio_count: 99,
+                    audio_size: 0,
                     total_size: 99,
                 },
                 cancelled: false,
@@ -6751,8 +7069,10 @@ mod async_message_drain_tests {
                 path: path.clone(),
                 identity,
                 stats: crate::tui::browse::DirStats {
+                    folder_count: 0,
                     file_count: 1,
                     audio_count: 1,
+                    audio_size: 0,
                     total_size: 1,
                 },
                 cancelled: false,
@@ -6859,6 +7179,10 @@ mod async_message_drain_tests {
             Some(crate::tui::browse::FolderClassificationKind::Album),
         );
         assert!(app.browse.deferred_work.info_pane_changed);
+        assert!(
+            !app.force_redraw,
+            "current classification completion is reducer state, not terminal damage"
+        );
     }
 
     #[test]

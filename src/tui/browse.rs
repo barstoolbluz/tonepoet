@@ -28,7 +28,10 @@ pub const FOLDER_CLASSIFY_MAX_DEPTH: usize = 2;
 /// fall back to per-file SQLite/fresh probes for entries beyond the warm set.
 const PROBE_CACHE_WARM_MAX_CANDIDATES: usize = 4096;
 const PROBE_CACHE_WARM_MESSAGE_CHUNK: usize = 128;
-const PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME: usize = 128;
+const PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK: usize = 128;
+const PROBE_CACHE_WARM_MERGE_MAX_ROWS_PER_TICK: usize = 2048;
+const PROBE_CACHE_WARM_MERGE_TIME_BUDGET: Duration = Duration::from_millis(2);
+const PROBE_CACHE_WARM_MERGE_TIME_CHECK_INTERVAL: usize = 64;
 /// Cold filesystem probes are expensive and cannot be cancelled once the
 /// blocking ffmpeg/lofty work has started. Keep only a tiny number in flight
 /// and queue the cursor-focused request ahead of any stale pre-start work.
@@ -225,6 +228,41 @@ impl ProbeCacheEntry {
     }
 }
 
+/// Reducer-side budget for merging SQLite probe-cache warm rows.
+///
+/// The reducer may process many more than the historical 128 rows after Browse
+/// focus has settled, but it must stay bounded by both rows and wall time so a
+/// huge cache-warm backlog cannot monopolize the UI thread. Time is checked only
+/// at chunk boundaries to avoid paying an `Instant::now()` cost for every row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProbeCacheWarmDrainBudget {
+    pub min_rows: usize,
+    pub max_rows: usize,
+    pub time_budget: Duration,
+    pub time_check_interval: usize,
+}
+
+impl ProbeCacheWarmDrainBudget {
+    pub(crate) const fn settled_focus() -> Self {
+        Self {
+            min_rows: PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK,
+            max_rows: PROBE_CACHE_WARM_MERGE_MAX_ROWS_PER_TICK,
+            time_budget: PROBE_CACHE_WARM_MERGE_TIME_BUDGET,
+            time_check_interval: PROBE_CACHE_WARM_MERGE_TIME_CHECK_INTERVAL,
+        }
+    }
+
+    fn normalized(self) -> Self {
+        let max_rows = self.max_rows.max(1);
+        Self {
+            min_rows: self.min_rows.min(max_rows),
+            max_rows,
+            time_budget: self.time_budget,
+            time_check_interval: self.time_check_interval.max(1),
+        }
+    }
+}
+
 /// Row emitted by the asynchronous SQLite probe-cache warmer. Rows carry the
 /// scan-time identity they were validated against; the reducer checks the
 /// directory generation/path before merging them into `probe_cache`.
@@ -314,6 +352,14 @@ impl BrowseDeferredWorkFlags {
             || self.info_pane_changed
             || self.classification_changed
     }
+
+    pub fn merge(&mut self, other: Self) {
+        self.probe_backed_resort_needed |= other.probe_backed_resort_needed;
+        self.search_reapply_needed |= other.search_reapply_needed;
+        self.visible_entries_changed |= other.visible_entries_changed;
+        self.info_pane_changed |= other.info_pane_changed;
+        self.classification_changed |= other.classification_changed;
+    }
 }
 
 /// Reducer decision for filesystem-backed async completions. Every Browse
@@ -338,8 +384,15 @@ pub enum FilesystemAsyncCompletion {
 /// Cached statistics for a directory
 #[derive(Debug, Clone, Default)]
 pub struct DirStats {
+    /// Number of child directories encountered during the bounded recursive
+    /// walk. This intentionally excludes the focused directory itself and
+    /// matches the old info-pane behavior of describing the directory's
+    /// contents rather than the selected node.
+    pub folder_count: usize,
     pub file_count: usize,
     pub audio_count: usize,
+    /// Total bytes attributable to audio files in this directory walk.
+    pub audio_size: u64,
     pub total_size: u64,
 }
 
@@ -377,8 +430,8 @@ impl DirStatsCacheEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowseDirectorySummaryColdWorkPolicy {
     /// Default behavior: cold shallow classification may run after the Browse
-    /// probe debounce; recursive stats may run only after classification says
-    /// the focused directory is one logical album/disc rather than a collection.
+    /// probe debounce; bounded recursive stats may then run after classification
+    /// so the info pane can restore concrete file/audio/size counts.
     DebouncedHighlight,
     /// Performance mode: render only identity-valid cached directory/disc
     /// summaries while hovering. The user must descend/refresh or use another
@@ -517,7 +570,7 @@ impl Default for DirectorySummaryPersistentCacheMode {
     }
 }
 
-const DIRECTORY_SUMMARY_PERSISTENCE_VERSION: u32 = 1;
+const DIRECTORY_SUMMARY_PERSISTENCE_VERSION: u32 = 3;
 
 fn directory_summary_encode_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
@@ -783,12 +836,14 @@ impl DirectorySummaryCacheEntry {
                 .unwrap_or(DirectorySummaryScope::RecursiveBestEffort);
             fields.extend([
                 directory_summary_scope_code(scope).to_string(),
+                stats.folder_count.to_string(),
                 stats.file_count.to_string(),
                 stats.audio_count.to_string(),
+                stats.audio_size.to_string(),
                 stats.total_size.to_string(),
             ]);
         } else {
-            fields.extend(["-", "0", "0", "0"].into_iter().map(|value| value.to_string()));
+            fields.extend(["-", "0", "0", "0", "0", "0"].into_iter().map(|value| value.to_string()));
         }
 
         fields.join("\t")
@@ -796,10 +851,17 @@ impl DirectorySummaryCacheEntry {
 
     pub(crate) fn from_persistent_line(line: &str) -> Option<(PathBuf, DirectorySummaryCacheEntry)> {
         let fields: Vec<&str> = line.trim_end_matches('\n').split('\t').collect();
-        if fields.len() != 19 || fields[0] != "DIRSUM" {
+        if fields.first().copied() != Some("DIRSUM") {
             return None;
         }
-        if fields[1].parse::<u32>().ok()? != DIRECTORY_SUMMARY_PERSISTENCE_VERSION {
+        let version = fields.get(1)?.parse::<u32>().ok()?;
+        let expected_len = match version {
+            1 => 19,
+            2 => 20,
+            DIRECTORY_SUMMARY_PERSISTENCE_VERSION => 21,
+            _ => return None,
+        };
+        if fields.len() != expected_len {
             return None;
         }
         let path = directory_summary_decode_path(fields[2])?;
@@ -829,11 +891,21 @@ impl DirectorySummaryCacheEntry {
         }
 
         if fields[15] != "-" {
+            if version < 3 {
+                // v1/v2 rows predate folder_count. A missing folder count is
+                // unknown, not zero; keep any restored classification facts,
+                // but refuse to render incomplete old stats. A settled v3 stats
+                // pass can repopulate the cache with truthful folder totals.
+                return Some((path, entry));
+            }
+
             entry.facts.stats_scope = Some(directory_summary_scope_from_code(fields[15])?);
             entry.facts.stats = Some(Arc::new(DirStats {
-                file_count: fields[16].parse().ok()?,
-                audio_count: fields[17].parse().ok()?,
-                total_size: fields[18].parse().ok()?,
+                folder_count: fields[16].parse().ok()?,
+                file_count: fields[17].parse().ok()?,
+                audio_count: fields[18].parse().ok()?,
+                audio_size: fields[19].parse().ok()?,
+                total_size: fields[20].parse().ok()?,
             }));
         }
 
@@ -943,7 +1015,11 @@ fn classification_summary_scope(classification: &FolderContentClassification) ->
 fn classification_allows_recursive_stats(classification: &FolderContentClassification) -> bool {
     matches!(
         classification.kind,
-        FolderClassificationKind::Album | FolderClassificationKind::Disc | FolderClassificationKind::MultiDisc
+        FolderClassificationKind::Album
+            | FolderClassificationKind::Disc
+            | FolderClassificationKind::MultiDisc
+            | FolderClassificationKind::Collection
+            | FolderClassificationKind::Unknown
     )
 }
 
@@ -2090,6 +2166,12 @@ pub struct BrowseState {
     /// All file entries from current_dir, unfiltered (including hidden).
     pub(super) all_files: Vec<BrowseEntry>,
 
+    /// Exact path → identity index for entries owned by the current directory
+    /// scan. SQLite warm-cache rows are emitted from these scan-owned paths,
+    /// so reducer-side validation must be an O(1), filesystem-free exact-path
+    /// lookup rather than a visible-list scan or canonicalizing comparison.
+    probe_cache_scan_identity_index: HashMap<PathBuf, ProbeCacheIdentity>,
+
     // ── View result (refilled by apply_view from scan results) ───────
     pub entries: Vec<BrowseEntry>,
     pub selected_index: usize,
@@ -2153,6 +2235,17 @@ pub struct BrowseState {
 
     /// Pending cold filesystem probe for Browse cursor debouncing.
     pub probe_debounce: Option<BrowseProbeDebounce>,
+
+    /// Last focused row path observed by `probe_current_with_db()`. This lets
+    /// the event loop distinguish a genuinely settled focus from rapid cursor
+    /// movement across rows that do not themselves need a cold probe.
+    last_focus_path: Option<PathBuf>,
+
+    /// Timestamp of the most recent focused-row path change. While this short
+    /// cooldown is active, background Browse completions and warm-cache merges
+    /// are deferred so PgUp/PgDn/key-repeat scrolling cannot periodically
+    /// rebuild the visible list or info pane.
+    last_focus_movement_at: Option<Instant>,
 
     /// Coalesced expensive work requested by async completions during the
     /// current reducer batch. The event loop flushes these flags once after
@@ -2547,6 +2640,7 @@ impl BrowseState {
             parent_entry: None,
             all_dirs: Vec::new(),
             all_files: Vec::new(),
+            probe_cache_scan_identity_index: HashMap::new(),
             entries: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
@@ -2570,6 +2664,8 @@ impl BrowseState {
             probe_cache: HashMap::new(),
             probe_cache_needs_metadata_enrichment: HashSet::new(),
             probe_debounce: None,
+            last_focus_path: None,
+            last_focus_movement_at: None,
             deferred_work: BrowseDeferredWorkFlags::default(),
             probe_cache_warm_pending: VecDeque::new(),
             browse_cold_probe_queue: VecDeque::new(),
@@ -2955,6 +3051,7 @@ impl BrowseState {
         self.parent_entry = None;
         self.all_dirs.clear();
         self.all_files.clear();
+        self.probe_cache_scan_identity_index.clear();
         self.entries.clear();
         self.error = None;
         self.selected_index = 0;
@@ -2982,6 +3079,33 @@ impl BrowseState {
     /// Whether we're currently browsing inside an archive.
     pub fn is_in_archive(&self) -> bool {
         self.archive.is_some()
+    }
+
+    fn rebuild_probe_cache_scan_identity_index(&mut self) {
+        let mut index = HashMap::with_capacity(
+            self.parent_entry.iter().count()
+                + self.all_dirs.len()
+                + self.all_files.len(),
+        );
+        if let Some(parent) = &self.parent_entry {
+            index.insert(parent.path.clone(), ProbeCacheIdentity::from_entry(parent));
+        }
+        for entry in self.all_dirs.iter().chain(self.all_files.iter()) {
+            index.insert(entry.path.clone(), ProbeCacheIdentity::from_entry(entry));
+        }
+        self.probe_cache_scan_identity_index = index;
+    }
+
+    pub(super) fn publish_scanned_entries(
+        &mut self,
+        parent_entry: Option<BrowseEntry>,
+        dirs: Vec<BrowseEntry>,
+        files: Vec<BrowseEntry>,
+    ) {
+        self.parent_entry = parent_entry;
+        self.all_dirs = dirs;
+        self.all_files = files;
+        self.rebuild_probe_cache_scan_identity_index();
     }
 
     /// Enter an archive: set archive state and populate entries from listing.
@@ -3208,6 +3332,7 @@ impl BrowseState {
         self.parent_entry = None;
         self.all_dirs.clear();
         self.all_files.clear();
+        self.probe_cache_scan_identity_index.clear();
         self.entries.clear();
 
         let arc = match &self.archive {
@@ -3278,6 +3403,7 @@ impl BrowseState {
 
         self.all_dirs = dirs;
         self.all_files = files;
+        self.rebuild_probe_cache_scan_identity_index();
     }
 
     /// Read the directory from disk into `parent_entry` / `all_dirs` / `all_files`.
@@ -3287,6 +3413,7 @@ impl BrowseState {
         self.parent_entry = None;
         self.all_dirs.clear();
         self.all_files.clear();
+        self.probe_cache_scan_identity_index.clear();
         self.error = None;
 
         // Capture parent entry if not at root.
@@ -3368,6 +3495,8 @@ impl BrowseState {
                 self.error = Some(format!("Cannot read directory: {}", e));
             }
         }
+
+        self.rebuild_probe_cache_scan_identity_index();
     }
 
     /// Walk `all_files` and upgrade any `EntryKind::Archive` entry
@@ -5922,6 +6051,36 @@ impl BrowseState {
         self.update_valid_probe_for_identity(path, identity, update)
     }
 
+    fn record_focus_path_for_visible_work_debounce(&mut self, path: &Path) {
+        if self
+            .last_focus_path
+            .as_ref()
+            .is_some_and(|focused| same_scanned_path(focused, path))
+        {
+            return;
+        }
+        self.last_focus_path = Some(path.to_path_buf());
+        self.last_focus_movement_at = Some(Instant::now());
+    }
+
+    pub fn focus_visible_work_deferred(&self) -> bool {
+        let now = Instant::now();
+        let focus_recently_moved = self
+            .last_focus_movement_at
+            .is_some_and(|moved_at| {
+                now.saturating_duration_since(moved_at) < BROWSE_PROBE_DEBOUNCE
+            });
+        let focus_debounce_pending = self
+            .probe_debounce
+            .as_ref()
+            .is_some_and(|pending| now < pending.deadline);
+        focus_recently_moved || focus_debounce_pending
+    }
+
+    pub fn has_browse_deferred_work(&self) -> bool {
+        self.deferred_work.has_expensive_work()
+    }
+
     /// Refresh cheap cache/identity state for the currently selected entry and
     /// arm debounced expensive work when needed.
     ///
@@ -6026,6 +6185,7 @@ impl BrowseState {
             Some(e) => e,
             None => return,
         };
+        self.record_focus_path_for_visible_work_debounce(&entry.path);
 
         // Raw cursor movement is the earliest point where we know a previous
         // cursor-focused job has become stale. Cancel what can be cancelled and
@@ -6052,7 +6212,7 @@ impl BrowseState {
         }
 
         let scanned_identity = ProbeCacheIdentity::from_entry(&entry);
-        entry = self.lazy_promote_native_disc_source_for_focus(&entry, scanned_identity, false);
+        entry = self.lazy_promote_native_disc_source_for_focus(&entry, scanned_identity, false, false);
 
         if entry.is_probeable() {
             let path = entry.path.clone();
@@ -6500,6 +6660,7 @@ impl BrowseState {
         entry: &BrowseEntry,
         identity: ProbeCacheIdentity,
         allow_cold_detection: bool,
+        allow_visible_mutation: bool,
     ) -> BrowseEntry {
         if entry.is_disc_source() {
             return entry.clone();
@@ -6521,7 +6682,7 @@ impl BrowseState {
             classify_scanned_entry_from_cache_only(&mut promoted, self);
         }
 
-        if promoted.kind != entry.kind {
+        if allow_visible_mutation && promoted.kind != entry.kind {
             self.replace_entry_kind_for_path(&promoted.path, promoted.kind.clone());
             self.mark_visible_entries_changed_pending();
             self.deferred_work.info_pane_changed = true;
@@ -6838,6 +6999,7 @@ impl BrowseState {
             &entry,
             identity,
             self.native_disc_cold_work_allowed_for_focus(),
+            true,
         );
 
         if entry.is_child_dir() {
@@ -7017,8 +7179,19 @@ impl BrowseState {
             .map(ProbeCacheIdentity::from_entry)
     }
 
+    fn probe_identity_for_current_scanned_entry_path(
+        &self,
+        path: &Path,
+    ) -> Option<ProbeCacheIdentity> {
+        self.probe_cache_scan_identity_index.get(path).copied()
+    }
+
     fn merge_probe_cache_warm_row(&mut self, row: ProbeCacheWarmRow) -> bool {
-        let Some(current_identity) = self.probe_identity_for_current_entry_path(&row.path) else {
+        // Warm rows are consumed by the reducer during large backlog drains; do
+        // not use `same_path()` here. The rows were created from scan-owned
+        // paths, so exact path identity is both the stale-safe contract and the
+        // only acceptable performance profile for aggressive post-scroll drains.
+        let Some(current_identity) = self.probe_identity_for_current_scanned_entry_path(&row.path) else {
             return false;
         };
         if current_identity != row.identity {
@@ -7067,10 +7240,23 @@ impl BrowseState {
     }
 
     pub fn drain_probe_cache_warm_rows_for_frame(&mut self) -> (usize, bool) {
-        let mut inspected = 0usize;
-        let mut merged = 0usize;
+        self.drain_probe_cache_warm_rows_for_frame_with_budget(
+            ProbeCacheWarmDrainBudget::settled_focus(),
+        )
+    }
 
-        while inspected < PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME {
+    pub(crate) fn drain_probe_cache_warm_rows_for_frame_with_budget(
+        &mut self,
+        budget: ProbeCacheWarmDrainBudget,
+    ) -> (usize, bool) {
+        let budget = budget.normalized();
+        let started = Instant::now();
+        let mut inspected = 0usize;
+        let mut inspected_since_time_check = 0usize;
+        let mut merged = 0usize;
+        let mut stop_for_budget = false;
+
+        while inspected < budget.max_rows && !stop_for_budget {
             let Some(mut batch) = self.probe_cache_warm_pending.pop_front() else {
                 break;
             };
@@ -7079,13 +7265,25 @@ impl BrowseState {
                 continue;
             }
 
-            while inspected < PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME {
+            while inspected < budget.max_rows {
                 let Some(row) = batch.rows.pop_front() else {
                     break;
                 };
+
                 inspected = inspected.saturating_add(1);
+                inspected_since_time_check = inspected_since_time_check.saturating_add(1);
                 if self.merge_probe_cache_warm_row(row) {
                     merged = merged.saturating_add(1);
+                }
+
+                if inspected >= budget.min_rows
+                    && inspected_since_time_check >= budget.time_check_interval
+                {
+                    inspected_since_time_check = 0;
+                    if started.elapsed() >= budget.time_budget {
+                        stop_for_budget = true;
+                        break;
+                    }
                 }
             }
 
@@ -7095,11 +7293,16 @@ impl BrowseState {
             }
         }
 
+        let backlog_remaining = !self.probe_cache_warm_pending.is_empty();
         if merged > 0 {
-            self.mark_probe_cache_update_pending(true);
+            // Warm-cache rows can arrive in very large batches. They should make
+            // probe-backed sorting/searching accurate, but not force the info
+            // pane to refresh once per bounded merge slice; refresh the current
+            // row when the backlog drains and the merged facts are coherent.
+            self.mark_probe_cache_update_pending(!backlog_remaining);
         }
 
-        (merged, !self.probe_cache_warm_pending.is_empty())
+        (merged, backlog_remaining)
     }
 
     pub fn has_probe_cache_warm_backlog(&self) -> bool {
@@ -7134,6 +7337,10 @@ impl BrowseState {
 
     pub fn take_browse_deferred_work(&mut self) -> BrowseDeferredWorkFlags {
         std::mem::take(&mut self.deferred_work)
+    }
+
+    pub fn defer_browse_deferred_work(&mut self, work: BrowseDeferredWorkFlags) {
+        self.deferred_work.merge(work);
     }
 
     pub fn take_probe_cache_deferred_work(&mut self) -> (bool, bool) {
@@ -7486,6 +7693,20 @@ impl BrowseState {
     #[cfg(test)]
     pub fn mark_folder_classification_pending_for_test(&mut self, path: PathBuf) {
         self.folder_classification_pending.insert(path);
+    }
+
+    pub fn folder_audio_summary_probe_work_in_flight(&self, audio: &FolderAudioSummary) -> bool {
+        audio.file_paths.iter().any(|path| {
+            self.probe_pending.contains(path)
+                || self
+                    .browse_cold_probe_active
+                    .keys()
+                    .any(|active| same_scanned_path(active, path))
+                || self
+                    .browse_cold_probe_queue
+                    .iter()
+                    .any(|request| same_scanned_path(&request.path, path))
+        })
     }
 
     pub fn folder_probe_rollup(&self, audio: &FolderAudioSummary) -> FolderProbeRollup {
@@ -9280,12 +9501,15 @@ fn compute_dir_stats_with_budget(
             if file_type.is_file() {
                 if let Ok(meta) = entry.metadata() {
                     stats.file_count = stats.file_count.saturating_add(1);
-                    stats.total_size = stats.total_size.saturating_add(meta.len());
+                    let file_len = meta.len();
+                    stats.total_size = stats.total_size.saturating_add(file_len);
                     if matches!(classify_file(&entry.path()), EntryKind::AudioFile(_)) {
                         stats.audio_count = stats.audio_count.saturating_add(1);
+                        stats.audio_size = stats.audio_size.saturating_add(file_len);
                     }
                 }
             } else if file_type.is_dir() {
+                stats.folder_count = stats.folder_count.saturating_add(1);
                 queue.push_back((entry.path(), depth + 1));
             }
         }
@@ -11234,6 +11458,44 @@ mod tests {
         }
     }
 
+    fn set_scan_files_for_test(state: &mut BrowseState, files: Vec<BrowseEntry>) {
+        state.all_files = files.clone();
+        state.entries = files;
+        state.rebuild_probe_cache_scan_identity_index();
+    }
+
+    fn enqueue_test_warm_rows(state: &mut BrowseState, count: usize, prefix: &str) -> Vec<PathBuf> {
+        let mut rows = Vec::new();
+        let mut paths = Vec::new();
+
+        for idx in 0..count {
+            let path = PathBuf::from(format!("/tmp/{prefix}-{idx}.flac"));
+            let identity = ProbeCacheIdentity { modified: None, size: idx as u64 + 1 };
+            let entry = BrowseEntry::new(
+                path.clone(),
+                format!("{prefix}-{idx}.flac"),
+                EntryKind::AudioFile(AudioFormat::Flac),
+                identity.size,
+                identity.modified,
+            );
+            state.all_files.push(entry.clone());
+            state.entries.push(entry);
+            rows.push(ProbeCacheWarmRow {
+                path: path.clone(),
+                identity,
+                info: test_cached_info(identity.size, &format!("{prefix}-{idx}")),
+            });
+            paths.push(path);
+        }
+
+        state.rebuild_probe_cache_scan_identity_index();
+
+        let generation = state.scan_generation;
+        let directory = state.current_dir.clone();
+        assert_eq!(state.enqueue_probe_cache_warm_rows(generation, directory, rows), count);
+        paths
+    }
+
     fn probe_file_fixture(name: &str, contents: &[u8]) -> (tempfile::TempDir, PathBuf, BrowseEntry, ProbeCacheIdentity, i64) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(name);
@@ -11356,8 +11618,10 @@ mod tests {
             path.clone(),
             old_identity,
             DirStats {
+                folder_count: 0,
                 file_count: 99,
                 audio_count: 9,
+                audio_size: 0,
                 total_size: 999,
             },
         );
@@ -11371,8 +11635,10 @@ mod tests {
             path,
             new_identity,
             DirStats {
+                folder_count: 0,
                 file_count: 3,
                 audio_count: 2,
+                audio_size: 0,
                 total_size: 200,
             },
         );
@@ -11395,13 +11661,13 @@ mod tests {
         };
 
         let mut state = BrowseState::new();
-        state.entries = vec![BrowseEntry::new(
+        set_scan_files_for_test(&mut state, vec![BrowseEntry::new(
             path.clone(),
             "track.flac".to_string(),
             EntryKind::AudioFile(AudioFormat::Flac),
             new_identity.size,
             new_identity.modified,
-        )];
+        )]);
         state.selected_index = 0;
         state.probe_cache.insert(
             path,
@@ -11418,13 +11684,13 @@ mod tests {
         let new_identity = ProbeCacheIdentity { modified: None, size: 200 };
 
         let mut state = BrowseState::new();
-        state.entries = vec![BrowseEntry::new(
+        set_scan_files_for_test(&mut state, vec![BrowseEntry::new(
             path.clone(),
             "track.flac".to_string(),
             EntryKind::AudioFile(AudioFormat::Flac),
             new_identity.size,
             new_identity.modified,
-        )];
+        )]);
         state.selected_index = 0;
         state.probe_cache.insert(path.clone(), ProbeCacheEntry::miss(old_identity));
 
@@ -11490,13 +11756,13 @@ mod tests {
         let stale = ProbeCacheIdentity { modified: None, size: 100 };
         let fresh = ProbeCacheIdentity { modified: None, size: 200 };
         let mut state = BrowseState::new();
-        state.entries = vec![BrowseEntry::new(
+        set_scan_files_for_test(&mut state, vec![BrowseEntry::new(
             path.clone(),
             "track.flac".to_string(),
             EntryKind::AudioFile(AudioFormat::Flac),
             fresh.size,
             fresh.modified,
-        )];
+        )]);
         state.selected_index = 0;
         state.insert_probe_for_identity(
             path.clone(),
@@ -11812,18 +12078,96 @@ mod tests {
     }
 
     #[test]
+    fn warm_cache_merge_uses_scan_owned_exact_path_identity_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_path = temp.path().join("warm-identity.flac");
+        std::fs::write(&real_path, b"warm cache identity fixture").expect("fixture");
+        let scanned_path = canonical_equivalent_focus_path(&real_path);
+        assert!(same_path(&scanned_path, &real_path), "fixture must be canonical-equivalent");
+        assert!(
+            !same_scanned_path(&scanned_path, &real_path),
+            "fixture must be syntactically distinct so warm-row merge proves it does not canonicalize",
+        );
+
+        let metadata = std::fs::metadata(&real_path).expect("metadata");
+        let identity = ProbeCacheIdentity::from_metadata(&metadata);
+        let mut state = BrowseState::new();
+        set_scan_files_for_test(&mut state, vec![BrowseEntry::new(
+            scanned_path.clone(),
+            "warm-identity.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            identity.size,
+            identity.modified,
+        )]);
+
+        let merged = state.merge_probe_cache_warm_rows(vec![ProbeCacheWarmRow {
+            path: real_path.clone(),
+            identity,
+            info: test_cached_info(identity.size, "canonical-equivalent but not scan-owned"),
+        }]);
+        assert_eq!(
+            merged, 0,
+            "warm-cache merge must not canonicalize row paths to find current scan identity",
+        );
+        assert!(state.probe_cache.is_empty());
+
+        let merged = state.merge_probe_cache_warm_rows(vec![ProbeCacheWarmRow {
+            path: scanned_path.clone(),
+            identity,
+            info: test_cached_info(identity.size, "scan-owned exact path"),
+        }]);
+        assert_eq!(merged, 1);
+        assert!(state.probe_cache.contains_key(&scanned_path));
+        assert!(!state.probe_cache.contains_key(&real_path));
+    }
+
+    #[test]
+    fn warm_cache_merge_uses_scan_owned_exact_path_identity_index() {
+        let path = PathBuf::from("/tmp/tonepoet-indexed-warm.flac");
+        let identity = ProbeCacheIdentity { modified: None, size: 4096 };
+        let entry = BrowseEntry::new(
+            path.clone(),
+            "tonepoet-indexed-warm.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            identity.size,
+            identity.modified,
+        );
+
+        let mut state = BrowseState::new();
+        state.entries = vec![entry.clone()];
+        let merged = state.merge_probe_cache_warm_rows(vec![ProbeCacheWarmRow {
+            path: path.clone(),
+            identity,
+            info: test_cached_info(identity.size, "visible-only"),
+        }]);
+        assert_eq!(
+            merged, 0,
+            "warm-cache identity validation must not fall back to scanning the visible entries vector",
+        );
+
+        set_scan_files_for_test(&mut state, vec![entry]);
+        let merged = state.merge_probe_cache_warm_rows(vec![ProbeCacheWarmRow {
+            path: path.clone(),
+            identity,
+            info: test_cached_info(identity.size, "scan-indexed"),
+        }]);
+        assert_eq!(merged, 1);
+        assert!(state.probe_cache.contains_key(&path));
+    }
+
+    #[test]
     fn batch_warm_merge_ignores_rows_with_stale_listing_identity() {
         let path = PathBuf::from("/tmp/tonepoet-warm-stale.flac");
         let fresh = ProbeCacheIdentity { modified: None, size: 200 };
         let stale = ProbeCacheIdentity { modified: None, size: 100 };
         let mut state = BrowseState::new();
-        state.entries = vec![BrowseEntry::new(
+        set_scan_files_for_test(&mut state, vec![BrowseEntry::new(
             path.clone(),
             "track.flac".to_string(),
             EntryKind::AudioFile(AudioFormat::Flac),
             fresh.size,
             fresh.modified,
-        )];
+        )]);
 
         let merged = state.merge_probe_cache_warm_rows(vec![ProbeCacheWarmRow {
             path,
@@ -11841,13 +12185,13 @@ mod tests {
         let fresh = ProbeCacheIdentity { modified: None, size: 200 };
         let stale = ProbeCacheIdentity { modified: None, size: 100 };
         let mut state = BrowseState::new();
-        state.entries = vec![BrowseEntry::new(
+        set_scan_files_for_test(&mut state, vec![BrowseEntry::new(
             path.clone(),
             "track.flac".to_string(),
             EntryKind::AudioFile(AudioFormat::Flac),
             fresh.size,
             fresh.modified,
-        )];
+        )]);
         state.selected_index = 0;
         state.probe_cache.insert(
             path.clone(),
@@ -11880,44 +12224,109 @@ mod tests {
     }
 
     #[test]
-    fn warm_cache_queue_merges_only_bounded_rows_per_frame() {
+    fn settled_warm_cache_drain_can_exceed_legacy_slice_but_obeys_row_cap() {
         let mut state = BrowseState::new();
-        let count = PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME + 3;
-        let mut rows = Vec::new();
-        let mut entries = Vec::new();
+        let row_cap = PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK * 3;
+        let count = row_cap + 7;
+        enqueue_test_warm_rows(&mut state, count, "tonepoet-aggressive-warm");
 
-        for idx in 0..count {
-            let path = PathBuf::from(format!("/tmp/tonepoet-bounded-warm-{idx}.flac"));
-            let identity = ProbeCacheIdentity { modified: None, size: idx as u64 + 1 };
-            entries.push(BrowseEntry::new(
-                path.clone(),
-                format!("bounded-warm-{idx}.flac"),
-                EntryKind::AudioFile(AudioFormat::Flac),
-                identity.size,
-                identity.modified,
-            ));
-            rows.push(ProbeCacheWarmRow {
-                path,
-                identity,
-                info: test_cached_info(identity.size, &format!("warm-{idx}")),
-            });
-        }
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame_with_budget(
+            ProbeCacheWarmDrainBudget {
+                min_rows: PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK,
+                max_rows: row_cap,
+                time_budget: Duration::from_secs(60),
+                time_check_interval: PROBE_CACHE_WARM_MERGE_TIME_CHECK_INTERVAL,
+            },
+        );
 
-        state.entries = entries;
-        let generation = state.scan_generation;
-        let directory = state.current_dir.clone();
-        assert_eq!(state.enqueue_probe_cache_warm_rows(generation, directory, rows), count);
-
-        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame();
-        assert_eq!(merged, PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME);
+        assert!(
+            merged > PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK,
+            "settled warm-cache draining should process more than the legacy 128-row slice when budget allows"
+        );
+        assert_eq!(merged, row_cap);
         assert!(has_more);
-        assert_eq!(state.probe_cache.len(), PROBE_CACHE_WARM_MERGE_MAX_PER_FRAME);
-        assert!(state.take_browse_deferred_work().probe_backed_resort_needed);
+        assert_eq!(state.probe_cache.len(), row_cap);
+    }
 
-        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame();
+    #[test]
+    fn tiny_time_budget_still_merges_minimum_warm_rows() {
+        let mut state = BrowseState::new();
+        let count = PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK + 10;
+        enqueue_test_warm_rows(&mut state, count, "tonepoet-minimum-warm");
+
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame_with_budget(
+            ProbeCacheWarmDrainBudget {
+                min_rows: PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK,
+                max_rows: PROBE_CACHE_WARM_MERGE_MAX_ROWS_PER_TICK,
+                time_budget: Duration::from_nanos(0),
+                time_check_interval: 1,
+            },
+        );
+
+        assert_eq!(merged, PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK);
+        assert!(has_more);
+        assert_eq!(state.probe_cache.len(), PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK);
+    }
+
+    #[test]
+    fn partially_consumed_warm_batch_is_requeued_at_front() {
+        let mut state = BrowseState::new();
+        let first_batch = enqueue_test_warm_rows(&mut state, 5, "tonepoet-front-warm-a");
+        let second_batch = enqueue_test_warm_rows(&mut state, 2, "tonepoet-front-warm-b");
+        let budget = ProbeCacheWarmDrainBudget {
+            min_rows: 3,
+            max_rows: 3,
+            time_budget: Duration::from_secs(60),
+            time_check_interval: 64,
+        };
+
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame_with_budget(budget);
+        assert_eq!(merged, 3);
+        assert!(has_more);
+        assert!(state.probe_cache.contains_key(&first_batch[0]));
+        assert!(state.probe_cache.contains_key(&first_batch[2]));
+        assert!(!state.probe_cache.contains_key(&first_batch[3]));
+        assert!(
+            !state.probe_cache.contains_key(&second_batch[0]),
+            "a partially consumed first batch must remain at the front ahead of later batches"
+        );
+
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame_with_budget(budget);
+        assert_eq!(merged, 3);
+        assert!(has_more);
+        assert!(state.probe_cache.contains_key(&first_batch[3]));
+        assert!(state.probe_cache.contains_key(&first_batch[4]));
+        assert!(state.probe_cache.contains_key(&second_batch[0]));
+    }
+
+    #[test]
+    fn warm_cache_probe_backed_refresh_remains_coalesced_until_backlog_drains() {
+        let mut state = BrowseState::new();
+        let count = PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK + 3;
+        enqueue_test_warm_rows(&mut state, count, "tonepoet-coalesced-warm");
+        let budget = ProbeCacheWarmDrainBudget {
+            min_rows: PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK,
+            max_rows: PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK,
+            time_budget: Duration::from_secs(60),
+            time_check_interval: PROBE_CACHE_WARM_MERGE_TIME_CHECK_INTERVAL,
+        };
+
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame_with_budget(budget);
+        assert_eq!(merged, PROBE_CACHE_WARM_MERGE_MIN_ROWS_PER_TICK);
+        assert!(has_more);
+        let work = state.take_browse_deferred_work();
+        assert!(work.probe_backed_resort_needed);
+        assert!(
+            !work.info_pane_changed,
+            "warm-cache backlog should refresh the current info pane only once the backlog drains"
+        );
+
+        let (merged, has_more) = state.drain_probe_cache_warm_rows_for_frame_with_budget(budget);
         assert_eq!(merged, 3);
         assert!(!has_more);
-        assert_eq!(state.probe_cache.len(), count);
+        let work = state.take_browse_deferred_work();
+        assert!(work.probe_backed_resort_needed);
+        assert!(work.info_pane_changed);
     }
 
     #[test]
@@ -11925,13 +12334,13 @@ mod tests {
         let mut state = BrowseState::new();
         let path = PathBuf::from("/tmp/tonepoet-stale-generation-warm.flac");
         let identity = ProbeCacheIdentity { modified: None, size: 1 };
-        state.entries = vec![BrowseEntry::new(
+        set_scan_files_for_test(&mut state, vec![BrowseEntry::new(
             path.clone(),
             "stale-generation-warm.flac".to_string(),
             EntryKind::AudioFile(AudioFormat::Flac),
             identity.size,
             identity.modified,
-        )];
+        )]);
 
         let generation = state.scan_generation;
         let directory = state.current_dir.clone();
@@ -13451,6 +13860,29 @@ mod tests {
             compute_dir_stats_with_budget(td.path(), &cancel, budget).is_none(),
             "stats walks should stop at the hard entry budget instead of traversing everything"
         );
+    }
+
+    #[test]
+    fn compute_dir_stats_tracks_folder_count_and_audio_size_separately_from_total_size() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join("nested")).expect("nested dir");
+        std::fs::write(td.path().join("nested").join("track.flac"), b"audio-bytes").expect("audio file");
+        std::fs::write(td.path().join("cover.jpg"), b"art").expect("non-audio file");
+        let cancel = AtomicBool::new(false);
+        let budget = DirStatsWalkBudget {
+            max_depth: 4,
+            max_files: 100,
+            max_entries: 100,
+            max_millis: 1_000,
+        };
+
+        let stats = compute_dir_stats_with_budget(td.path(), &cancel, budget).expect("stats");
+
+        assert_eq!(stats.folder_count, 1);
+        assert_eq!(stats.file_count, 2);
+        assert_eq!(stats.audio_count, 1);
+        assert_eq!(stats.audio_size, b"audio-bytes".len() as u64);
+        assert_eq!(stats.total_size, (b"audio-bytes".len() + b"art".len()) as u64);
     }
 
     #[test]
@@ -15223,8 +15655,10 @@ mod browse_perf_followup_v10_tests {
             album.clone(),
             identity,
             DirStats {
+                folder_count: 0,
                 file_count: 1,
                 audio_count: 1,
+                audio_size: 0,
                 total_size: 123,
             },
         );
@@ -15255,6 +15689,84 @@ mod browse_perf_followup_v10_tests {
         assert_eq!(facts.stats.as_ref().map(|stats| stats.audio_count), Some(1));
     }
 
+    #[test]
+    fn v2_directory_summary_cache_does_not_render_unknown_folder_count_as_zero() {
+        let path = PathBuf::from("/music/legacy-artist");
+        let identity = ProbeCacheIdentity { modified: None, size: 42 };
+        let mut entry = DirectorySummaryCacheEntry::new(identity);
+        entry.facts.classification_scope = Some(DirectorySummaryScope::Immediate);
+        entry.facts.classification = Some(Arc::new(FolderContentClassification {
+            kind: FolderClassificationKind::Collection,
+            identity,
+            audio: FolderAudioSummary::default(),
+            units: Vec::new(),
+            unit_count: 24,
+            collection_many: true,
+            io_budget_exhausted: false,
+            disc_marker: None,
+        }));
+        entry.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
+        entry.facts.stats = Some(Arc::new(DirStats {
+            folder_count: 24,
+            file_count: 312,
+            audio_count: 247,
+            audio_size: 12_400_000_000,
+            total_size: 14_100_000_000,
+        }));
+
+        let mut fields: Vec<String> = entry
+            .to_persistent_line(&path)
+            .split('\t')
+            .map(ToString::to_string)
+            .collect();
+        fields[1] = "2".to_string();
+        fields.remove(16); // v2 did not record folder_count.
+        let legacy_v2_line = fields.join("\t");
+
+        let (restored_path, restored) = DirectorySummaryCacheEntry::from_persistent_line(&legacy_v2_line)
+            .expect("v2 row should still restore classification facts");
+
+        assert_eq!(restored_path, path);
+        assert_eq!(
+            restored.facts.classification.as_ref().map(|classification| classification.kind),
+            Some(FolderClassificationKind::Collection)
+        );
+        assert!(
+            restored.facts.stats.is_none(),
+            "v2 stats must not be restored as folder_count = 0 because folder_count was unknown"
+        );
+        assert_eq!(restored.facts.stats_scope, None);
+    }
+
+    #[test]
+    fn v3_directory_summary_cache_round_trips_folder_count() {
+        let path = PathBuf::from("/music/v3-artist");
+        let identity = ProbeCacheIdentity { modified: None, size: 42 };
+        let mut entry = DirectorySummaryCacheEntry::new(identity);
+        entry.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
+        entry.facts.stats = Some(Arc::new(DirStats {
+            folder_count: 24,
+            file_count: 312,
+            audio_count: 247,
+            audio_size: 12_400_000_000,
+            total_size: 14_100_000_000,
+        }));
+
+        let (restored_path, restored) = DirectorySummaryCacheEntry::from_persistent_line(
+            &entry.to_persistent_line(&path),
+        )
+        .expect("v3 row should restore stats");
+        let stats = restored.facts.stats.as_ref().expect("v3 stats");
+
+        assert_eq!(restored_path, path);
+        assert_eq!(restored.facts.stats_scope, Some(DirectorySummaryScope::RecursiveBestEffort));
+        assert_eq!(stats.folder_count, 24);
+        assert_eq!(stats.file_count, 312);
+        assert_eq!(stats.audio_count, 247);
+        assert_eq!(stats.audio_size, 12_400_000_000);
+        assert_eq!(stats.total_size, 14_100_000_000);
+    }
+
     #[tokio::test]
     async fn database_directory_summary_cache_restores_after_debounce_in_cached_only_policy() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -15273,8 +15785,10 @@ mod browse_perf_followup_v10_tests {
             album.clone(),
             identity,
             DirStats {
+                folder_count: 0,
                 file_count: 1,
                 audio_count: 1,
+                audio_size: 0,
                 total_size: 123,
             },
         );
@@ -16028,8 +16542,10 @@ mod disc_directory_navigation_tests {
                 entry.path.clone(),
                 identity,
                 DirStats {
+                    folder_count: 0,
                     file_count: 7,
                     audio_count: 2,
+                    audio_size: 0,
                     total_size: 4096,
                 },
             );
@@ -16048,8 +16564,10 @@ mod disc_directory_navigation_tests {
             parent.path.clone(),
             ProbeCacheIdentity::from_entry(&parent),
             DirStats {
+                folder_count: 0,
                 file_count: 1,
                 audio_count: 0,
+                audio_size: 0,
                 total_size: 1,
             },
         );
@@ -16193,6 +16711,42 @@ mod disc_directory_navigation_tests {
                 .map(|(_, verdict)| *verdict)
                 .unwrap_or(false),
             "lazy promotion should populate the identity-bound native-disc cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_cursor_cached_native_disc_promotion_does_not_mutate_visible_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("cached-movie");
+        make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = focused_state_for_existing_entry(
+            root.clone(),
+            "cached-movie",
+            EntryKind::Directory,
+        );
+        let fingerprint = bluray_directory_classification_fingerprint(&state.entries[0]);
+        state
+            .bluray_dir_classify_cache
+            .insert(root.clone(), (fingerprint, true));
+
+        state.probe_current_with_db(&tx, None);
+
+        assert!(matches!(state.entries[0].kind, EntryKind::Directory));
+        assert!(
+            !state.deferred_work.visible_entries_changed && !state.deferred_work.info_pane_changed,
+            "raw cursor movement may consult cached disc classification for policy decisions, but must not mutate visible Browse state"
+        );
+        assert!(!state.disc_probe_pending.contains(&root));
+
+        state.probe_debounce.as_mut().expect("debounce").deadline =
+            Instant::now() - Duration::from_millis(1);
+        state.check_probe_debounce(&tx);
+
+        assert!(matches!(state.entries[0].kind, EntryKind::BlurayDir));
+        assert!(
+            state.deferred_work.visible_entries_changed && state.deferred_work.info_pane_changed,
+            "settled focus may publish cached promotion as a visible state change"
         );
     }
 
@@ -16359,12 +16913,12 @@ mod disc_directory_navigation_tests {
 
         assert!(
             state.dir_stats_pending.contains(&album),
-            "recursive stats should be allowed only after a valid cached/shallow Album classification"
+            "recursive stats should be allowed after a valid cached/shallow Album classification"
         );
     }
 
     #[tokio::test]
-    async fn cached_collection_classification_suppresses_recursive_stats() {
+    async fn cached_collection_classification_allows_bounded_recursive_stats_after_debounce() {
         let temp = tempfile::tempdir().expect("tempdir");
         let artist = temp.path().join("Artist");
         std::fs::create_dir_all(&artist).expect("artist fixture");
@@ -16388,11 +16942,19 @@ mod disc_directory_navigation_tests {
 
         state.probe_current_with_db(&tx, None);
 
-        assert!(
-            state.probe_debounce.is_none(),
-            "a cached Collection summary is already enough for the info pane and must not arm recursive stats"
+        assert_eq!(
+            state.probe_debounce.as_ref().map(|d| d.path.as_path()),
+            Some(artist.as_path())
         );
         assert!(!state.dir_stats_pending.contains(&artist));
+
+        state.probe_debounce.as_mut().expect("debounce").deadline = Instant::now() - Duration::from_millis(1);
+        state.check_probe_debounce(&tx);
+
+        assert!(
+            state.dir_stats_pending.contains(&artist),
+            "Collection folders use bounded recursive stats as the primary info-pane summary"
+        );
     }
 
     #[test]
@@ -16427,8 +16989,10 @@ mod disc_directory_navigation_tests {
             album.clone(),
             identity,
             DirStats {
+                folder_count: 0,
                 file_count: 1,
                 audio_count: 1,
+                audio_size: 0,
                 total_size: 128,
             },
         );
