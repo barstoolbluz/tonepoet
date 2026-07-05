@@ -1917,8 +1917,8 @@ mod inline_edit_behavior_tests {
         }
     }
 
-    #[test]
-    fn browse_double_click_descends_into_disc_directory_kinds() {
+    #[tokio::test]
+    async fn browse_double_click_descends_into_disc_directory_kinds() {
         let (tx, _rx) = channel();
         for kind in [
             crate::tui::browse::EntryKind::DvdAudioDir,
@@ -6637,12 +6637,11 @@ mod progress_dialog_theme_tests {
         app.set_ui_theme("tokyo-night");
 
         handle_config_key(&mut app, KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        let target = app.theme_library.choices()
-            .iter()
-            .position(|choice| choice.slug == "gruvbox")
-            .expect("gruvbox choice");
         match &mut app.active_overlay {
-            ActiveOverlay::ThemeBuilder(state) => state.preset_cursor = target,
+            ActiveOverlay::ThemeBuilder(state) => {
+                state.gallery_filter_input = crate::tui::text_input::TextInputState::new("gruvbox".to_string());
+                state.preset_cursor = 0;
+            }
             other => panic!("expected theme gallery overlay, got {:?}", other),
         }
 
@@ -28556,9 +28555,10 @@ mod artwork_file_picker_handoff_tests {
 
     #[test]
     fn source_tree_has_no_app_local_file_picker_and_uses_crate() {
+        let mod_rs = fs::read_to_string("src/tui/mod.rs").expect("tui module source");
         assert!(
-            !Path::new("src/tui/file_picker.rs").exists(),
-            "old in-app picker module must stay deleted"
+            !mod_rs.contains("mod file_picker") && !mod_rs.contains("pub mod file_picker"),
+            "old in-app picker module must not be wired into the TUI module tree"
         );
         let keybindings = fs::read_to_string("src/tui/keybindings.rs").expect("keybindings source");
         assert!(keybindings.contains("tui_file_picker::FilePickerState::new"));

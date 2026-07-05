@@ -6020,6 +6020,7 @@ fn stage_pre_materialization_conversion_log_fragment(
         stages: outcome_stage_records(outcome).to_vec(),
     };
 
+    fs::create_dir_all(&staging.root)?;
     let fragment_staged = staging.root.join(".conversion-log-fragment.json");
     let bytes = serde_json::to_vec_pretty(&fragment).map_err(|err| {
         io::Error::new(
@@ -6679,6 +6680,7 @@ fn stage_conversion_log_fragment(
         summary: ConversionLogTrackSummary::from_track_record(track_record),
         stages: outcome_stage_records(outcome).to_vec(),
     };
+    fs::create_dir_all(&staging.root)?;
     let fragment_staged = staging.root.join(".conversion-log-fragment.json");
     let bytes = serde_json::to_vec_pretty(&fragment).map_err(|err| {
         io::Error::new(
@@ -8949,7 +8951,7 @@ fn conversion_summary(track: &PreparedTrack, req: &PipelineRequest) -> String {
         resolved_target_bit_depth(track, req.settings.target_bit_depth)
     };
     let mut summary = format!(
-        "{} {} -> {} {}",
+        "{} {} → {} {}",
         stream_description(source_depth, source_rate, Some(&source_format)),
         source_format,
         target_stream_description(track, target_depth, target_rate, &req.settings),
@@ -9121,7 +9123,17 @@ fn source_audio_description(track: &PreparedTrack) -> String {
         return label;
     }
 
-    let mut label = stream_description(track.bit_depth, track.scalar_sample_rate(), Some(&source_track_format_label(track)));
+    let rate = track
+        .scalar_sample_rate()
+        .map(format_sample_rate)
+        .unwrap_or_else(|| "unknown rate".to_string());
+    let mut parts = vec![rate];
+    if let Some(bits) = track.bit_depth {
+        parts.push(format!("{bits}-bit"));
+    } else {
+        parts.push("unknown depth".to_string());
+    }
+    let mut label = parts.join(", ");
     if let Some(expected_samples) = track.expected_samples {
         label.push_str(&format!(", {expected_samples} expected samples"));
     }
@@ -10227,6 +10239,7 @@ pub fn publish_album_output(
     let fragment_batch_identity = plan_conversion_log_fragment_batch_identity(plan)?;
 
     let final_parent = parent_dir_or_current(&plan.album_dir);
+    fs::create_dir_all(final_parent).map_err(PublishError::Io)?;
     let _publish_lock = acquire_publish_lock(&plan.album_dir)?;
 
     let album_name = plan
@@ -10439,8 +10452,7 @@ fn is_incremental_single_audio_publish(plan: &PublishPlan) -> bool {
     // whole album directory atomically with a sidecar-only directory. The
     // fragment itself, not a staged standalone conversion.log, triggers the
     // count-and-maybe-assemble step while the publish lock is held.
-    (audio_entry_count == 1 && (plan.source_audio_track_count == 1 || has_fragment))
-        || (audio_entry_count == 0 && has_fragment)
+    has_fragment && audio_entry_count <= 1
 }
 
 fn publish_incremental_album_output(
@@ -16172,7 +16184,11 @@ fn acquire_publish_lock(album_dir: &Path) -> Result<AlbumPublishLock, PublishErr
     let hidden_lock_path = album_lock_path(album_dir);
     let legacy_lock_path = legacy_album_lock_path(album_dir);
 
-    let hidden = acquire_blocking_file_lock(&hidden_lock_path, true).map_err(PublishError::Io)?;
+    // The album publish lock intentionally uses a stable hidden path.  The
+    // filesystem entry is the rendezvous point for later publishers; only the
+    // OS-level advisory lock is released on drop.  Legacy visible locks are
+    // still best-effort cleaned up after the hidden lock has been acquired.
+    let hidden = acquire_blocking_file_lock(&hidden_lock_path, false).map_err(PublishError::Io)?;
     remove_lock_path_best_effort(&legacy_lock_path);
 
     Ok(AlbumPublishLock { hidden: Some(hidden) })

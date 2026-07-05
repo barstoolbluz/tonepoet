@@ -1293,9 +1293,14 @@ mod tests {
     fn fixture_bluray_root(temp: &tempfile::TempDir) -> PathBuf {
         let root = temp.path().join("disc-root");
         let bdmv = root.join("BDMV");
-        fs::create_dir_all(&bdmv).expect("create BDMV directory");
+        let playlist = bdmv.join("PLAYLIST");
+        let stream = bdmv.join("STREAM");
+        fs::create_dir_all(&playlist).expect("create PLAYLIST directory");
+        fs::create_dir_all(&stream).expect("create STREAM directory");
         fs::write(bdmv.join("index.bdmv"), []).expect("create index.bdmv sentinel");
         fs::write(bdmv.join("MovieObject.bdmv"), []).expect("create MovieObject.bdmv sentinel");
+        fs::write(playlist.join("00012.mpls"), []).expect("create playlist sentinel");
+        fs::write(stream.join("00012.m2ts"), []).expect("create stream sentinel");
         root
     }
 

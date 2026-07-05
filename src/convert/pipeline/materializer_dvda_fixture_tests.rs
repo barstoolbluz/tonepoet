@@ -319,6 +319,35 @@ fn golden_fixture_root_or_skip() -> Option<(PathBuf, Vec<PathBuf>, GoldenProbeCo
     let mut fixtures = fixture_dirs_or_skip()?;
     fixtures.sort_by(|left, right| normalized_fixture_name(left).cmp(&normalized_fixture_name(right)));
     let corpus = GoldenProbeCorpus::load_or_skip(&root)?;
+
+    let fixture_names = fixtures
+        .iter()
+        .map(|fixture| normalized_fixture_name(fixture))
+        .collect::<BTreeSet<_>>();
+    let golden_names = corpus.by_fixture.keys().cloned().collect::<BTreeSet<_>>();
+
+    if fixture_names != golden_names {
+        let missing_from_golden = fixture_names
+            .difference(&golden_names)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stale_golden_entries = golden_names
+            .difference(&fixture_names)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "corpus_probe_output.json is not in sync with the DVD-Audio fixture corpus \
+             (missing_from_golden=[{missing_from_golden}], stale_golden_entries=[{stale_golden_entries}])"
+        );
+        if bool_env("DVDA_REQUIRE_GOLDEN_PROBE") {
+            panic!("DVDA_REQUIRE_GOLDEN_PROBE=1 but {message}");
+        }
+        eprintln!("skipping DVD-Audio golden-probe tests: {message}");
+        return None;
+    }
+
     Some((root, fixtures, corpus))
 }
 

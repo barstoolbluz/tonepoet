@@ -6977,10 +6977,12 @@ mod tests {
             return;
         }
 
+        let mut saw_available_iso = false;
         for disc in PHASE3_CORPUS_DISCS {
             let Some(iso_path) = find_corpus_iso_or_skip(disc) else {
                 continue;
             };
+            saw_available_iso = true;
 
             let temp = tempfile::tempdir().expect("DVD-Audio boundary corpus temp dir");
             let staging = StagingDir::borrowed(
@@ -7052,6 +7054,13 @@ mod tests {
                 validate_phase3_corpus_wav_probe(disc, track, &probe);
                 return;
             }
+        }
+
+        if !saw_available_iso {
+            eprintln!(
+                "skipping DVD-Audio Phase 3 boundary-crossing corpus test: no matching ISO was available"
+            );
+            return;
         }
 
         panic!(

@@ -329,7 +329,7 @@ async fn repair_unverified_audio_facts_from_realized_wav(
 }
 
 fn track_needs_realized_wav_audio_facts_validation(track: &PreparedTrack) -> bool {
-    if !matches!(track.source_ref, TrackSourceRef::DvdaTrack { .. }) {
+    if !track_can_attempt_realized_wav_audio_facts_validation(track) {
         return false;
     }
 
@@ -338,6 +338,30 @@ fn track_needs_realized_wav_audio_facts_validation(track: &PreparedTrack) -> boo
     }
 
     !track_has_stream_authoritative_audio_facts(track)
+}
+
+fn track_can_attempt_realized_wav_audio_facts_validation(track: &PreparedTrack) -> bool {
+    let TrackSourceRef::DvdaTrack {
+        volume_source,
+        sector_address_space,
+        ..
+    } = &track.source_ref
+    else {
+        return false;
+    };
+
+    // Disc-absolute and SAMG-absolute sector addresses require a raw ISO image
+    // because ordinary copied directory trees do not preserve DVD logical block
+    // addresses.  Those tracks may still be valid for structure/materialization
+    // tests and for later ISO-backed realization, but attempting a repair probe
+    // here converts an unverifiable hint into a hard materialization failure.
+    !matches!(
+        (volume_source, sector_address_space),
+        (
+            DvdaVolumeSourceRef::Directory { .. },
+            DvdaSectorAddressSpace::DiscAbsolute { .. } | DvdaSectorAddressSpace::SamgAbsolute
+        )
+    )
 }
 
 fn track_has_stream_authoritative_audio_facts(track: &PreparedTrack) -> bool {
@@ -1539,7 +1563,7 @@ fn probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
         chapter,
         aob_resolution,
     )? {
-        let outcome = probe_title_chapter_aob_format_with_path_outcome_with_origin(
+        let mut outcome = probe_title_chapter_aob_format_with_path_outcome_with_origin(
             volume,
             disc,
             group,
@@ -1553,6 +1577,16 @@ fn probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
                 aob_resolution.resolved_title_set_nr,
             ),
         );
+
+        if let Some(outcome) = outcome.as_mut() {
+            synthesize_cross_ats_mlp_probe_from_backing_facts_if_needed(
+                outcome,
+                disc,
+                group,
+                context.title_set,
+                &context.chapter,
+            );
+        }
 
         match outcome.as_ref().and_then(|outcome| outcome.result.as_ref()) {
             Some(probe) => {
@@ -1601,6 +1635,40 @@ fn probe_title_chapter_aob_format_with_resolved_aob_path_outcome(
         chapter,
         source_path,
     ))
+}
+
+fn synthesize_cross_ats_mlp_probe_from_backing_facts_if_needed(
+    outcome: &mut AobProbeOutcome,
+    disc: &DvdaDisc,
+    source_group: &DvdaGroup,
+    backing_title_set: &TitleSet,
+    backing_chapter: &AudioChapter,
+) {
+    if outcome.result.is_some() || !outcome.saw_mlp_packets || outcome.saw_lpcm_packets {
+        return;
+    }
+
+    let facts = audio_facts_for_title_chapter(backing_title_set, backing_chapter);
+    let (Some(sample_rate), Some(bit_depth), Some(channels), Some(channel_assignment_code)) = (
+        facts.sample_rate,
+        facts.bit_depth,
+        expected_channel_count_for_facts(facts),
+        expected_channel_assignment_code_for_facts(facts),
+    ) else {
+        return;
+    };
+
+    let channels_u8: u8 = channels.try_into().unwrap_or(2);
+    outcome.result = Some(AobProbeResult {
+        codec: "MLP",
+        sample_rate,
+        bit_depth: bit_depth.into(),
+        channels: channels_u8,
+        channel_assignment_code,
+        channel_label: channel_layout_for_facts(facts).unwrap_or_else(|| format!("{channels}ch")),
+        stereo_downmix_source_label: Some(multichannel_group_label(disc, source_group, Some(channels_u8))),
+        mlp_num_substreams: None,
+    });
 }
 
 #[allow(dead_code)]
@@ -4461,8 +4529,8 @@ mod tests {
                 group2_bits: Some(24),
                 group1_sample_rate: Some(48_000),
                 group2_sample_rate: Some(48_000),
-                assignment_code: 1,
-                raw: [0, 0, 1],
+                assignment_code: 12,
+                raw: [0, 0, 12],
             },
             channel_assignment: None,
             abs_first_sector: 100,

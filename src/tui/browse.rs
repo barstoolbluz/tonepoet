@@ -4474,17 +4474,12 @@ impl BrowseState {
         tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
     ) {
         if self.archive.is_some() {
-            if self.archive_search_requires_async(self.search.mode, self.search.sort) && tx.is_none() {
-                if let Some(ref flag) = self.search.cancel {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                self.search.cancel = None;
-                self.search.searching = false;
-                self.search.generation = self.search.generation.wrapping_add(1);
-                self.search.last_keystroke = Some(std::time::Instant::now());
-            } else {
-                self.execute_search(tx);
-            }
+            // With an app message channel, tag-aware archive searches run on the
+            // async extraction worker. Without one (unit tests and explicit
+            // synchronous callers), `execute_search` already uses its bounded
+            // synchronous fallback; do not merely mark a debounce timestamp and
+            // leave stale results visible after probe metadata arrives.
+            self.execute_search(tx);
             return;
         }
 
@@ -9812,6 +9807,12 @@ fn read_tags_from_archive_entry(
     inner_path: &str,
     password: Option<&str>,
 ) -> TagReadResult {
+    #[cfg(test)]
+    if let Some(tags) = test_archive_tag_fixture(archive_path, inner_path) {
+        let _ = password;
+        return tags;
+    }
+
     let staging_dir = std::env::temp_dir().join(format!(
         "tonepoet-archive-tag-search-{}",
         uuid::Uuid::new_v4()
@@ -14636,8 +14637,13 @@ FILE "10 - Live Version.wav" WAVE
             source.matches("preemphasis_metadata_check_blocking").count() >= 1,
             "probe-cache hits and failed fresh metadata reads should enrich PE metadata only on blocking workers"
         );
+        let forbidden_fresh_probe_drop = format!(
+            "{}{}",
+            "read_metadata(&path_for_task)",
+            ".unwrap_or_default()"
+        );
         assert!(
-            !source.contains("read_metadata(&path_for_task).unwrap_or_default()"),
+            !source.contains(&forbidden_fresh_probe_drop),
             "fresh browse probes must not drop read_metadata errors and then repeat PE checks unconditionally"
         );
 

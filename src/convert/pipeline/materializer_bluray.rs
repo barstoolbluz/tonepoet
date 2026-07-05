@@ -181,6 +181,15 @@ where
 {
     if options.explicit_bluray_requested() {
         let request = BlurayPresentationRequest::from_source_options(options);
+        if request.playlist_number.is_some() {
+            // Explicit playlist selections are user intent, not browser auto-selection.
+            // Keep them independent of browse-only suppression rules such as
+            // short-menu filtering, and avoid spending a bounded media probe in
+            // the mapper only to discard the presentation and probe again during
+            // materialization.  The materialization-facts gate below remains the
+            // single source of truth for required LPCM/compressed decoded facts.
+            return select_bluray_program_direct::<B>(disc, request);
+        }
         match select_filtered_bluray_program_from_mapper_with_audio_probe::<B, P>(
             disc,
             source,
@@ -189,9 +198,6 @@ where
             probe_control,
         ) {
             Ok(selection) => return Ok(selection),
-            Err(MaterializeError::InvalidTrackSelection(_)) if request.playlist_number.is_some() => {
-                return select_bluray_program_direct::<B>(disc, request);
-            }
             Err(err) => return Err(err),
         }
     }
@@ -581,6 +587,10 @@ where
     P: crate::disc::bluray_mapper::BlurayCompressedAudioProbe + ?Sized,
 {
     let protection_status = B::protection_status(disc);
+
+    if selection.stream.coding == BluRayAudioCoding::Lpcm && selection.stream.bit_depth.is_probed() {
+        return Ok(selection.stream.clone());
+    }
 
     if selection.stream.coding.is_compressed() {
         let mut stream = selection.stream.clone();
@@ -2077,9 +2087,9 @@ mod tests {
         let disc = fake_disc(vec![fake_title(
             12,
             0,
-            180_000,
+            3_600_000,
             1,
-            &[0, 90_000],
+            &[0, 1_800_000],
             vec![compressed_stream(
                 0x1102,
                 2,
@@ -2091,7 +2101,7 @@ mod tests {
         let source = existing_source_path(
             "materializer_reuses_mapper_probed_compressed_bit_depth_without_reprobe",
         );
-        let options = explicit_options(12, 0x1102, 2, 1);
+        let options = source_options();
         let probe = FakeCompressedAudioProbe::success(vec![probed_fact(
             Some(0x1102),
             Some(2),
@@ -2201,7 +2211,7 @@ mod tests {
             fake_title(
                 10,
                 0,
-                90_000,
+                3_600_000,
                 1,
                 &[0],
                 vec![compressed_stream(0x1100, 0, BluRayAudioCoding::Ac3, Some(48_000), Some(2))],
@@ -2209,9 +2219,9 @@ mod tests {
             fake_title(
                 12,
                 1,
-                270_000,
+                3_600_000,
                 1,
-                &[0, 90_000, 180_000],
+                &[0, 1_200_000, 2_400_000],
                 vec![compressed_stream(
                     0x1101,
                     1,
@@ -2223,9 +2233,9 @@ mod tests {
             fake_title(
                 14,
                 2,
-                270_000,
+                3_600_000,
                 1,
-                &[0, 90_000, 180_000],
+                &[0, 1_200_000, 2_400_000],
                 vec![compressed_stream(
                     0x1102,
                     0,
