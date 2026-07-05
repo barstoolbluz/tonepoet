@@ -10093,7 +10093,7 @@ fn run_archive_search_worker(
         }
 
         let mut best_score: Option<i64> = None;
-        if search_filename || matches!(&e.kind, EntryKind::Directory) {
+        if search_filename || e.is_navigable_dir() {
             if let Some(s) = matcher.fuzzy_match(&e.name_lower, &query) {
                 best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
             }

@@ -593,6 +593,22 @@ enum LpcmGroup {
     Group2,
 }
 
+fn packed_nibble_offset_20bit(block: &[u8], channels: u32) -> usize {
+    let compact_offset = 4 * channels as usize;
+    let foo_input_dvda_offset = block.len().saturating_sub(2 * channels as usize);
+
+    // The production packet decoder passes compact per-group blocks
+    // (`high16... + one low-nibble byte per channel`).  Some reference fixtures
+    // mirror foo_input_dvda's wider two-group scratch layout, where the low
+    // nibbles for the addressed group live at the end of the group pair.  Accept
+    // both layouts without changing the compact packet path.
+    if block.len() >= compact_offset + (2 * channels as usize) {
+        foo_input_dvda_offset
+    } else {
+        compact_offset
+    }
+}
+
 fn decode_group_samples(
     block: &[u8],
     channels: u32,
@@ -609,7 +625,7 @@ fn decode_group_samples(
             }
         }
         20 => {
-            let packed_offset = 4 * channels as usize;
+            let packed_offset = packed_nibble_offset_20bit(block, channels);
             for i in 0..sample_count {
                 let high = [block[2 * i], block[2 * i + 1]];
                 let packed = block[packed_offset + i / 2];

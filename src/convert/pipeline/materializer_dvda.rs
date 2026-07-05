@@ -190,7 +190,7 @@ async fn materialize_prepared_source(
     )?;
     tracks = apply_track_selection(tracks, &req.source.track_selection)?;
 
-    if disc.copy_protection.cppm_detected {
+    if dvda_copy_protection_should_block(&disc) {
         let block = dvda_copy_protection_block(&disc);
         mark_tracks_blocked_for_copy_protection(&mut tracks, &block);
         let source = prepared_source(
@@ -333,7 +333,13 @@ fn track_needs_realized_wav_audio_facts_validation(track: &PreparedTrack) -> boo
         return false;
     }
 
-    if track.scalar_sample_rate().is_none() {
+    // `scalar_sample_rate()` may fall back to `source_audio.primary_sample_rate`
+    // for compatibility with older prepared-track shapes.  For DVD-Audio
+    // repair, however, a missing canonical `PreparedTrack::sample_rate` still
+    // leaves downstream planner checks without the scalar fact they consume.
+    // Realize the WAV carrier whenever that canonical field is absent/zero,
+    // even if previous stream probing supplied a descriptor-level hint.
+    if track.sample_rate.filter(|hz| *hz != 0).is_none() {
         return true;
     }
 
@@ -538,6 +544,22 @@ fn rewrite_realized_wav_carrier_metadata(
     if let Some(bits) = source_bit_depth {
         insert_nonempty(extra, "dvda_group1_bit_depth", bits.to_string());
     }
+}
+
+fn dvda_copy_protection_should_block(disc: &DvdaDisc) -> bool {
+    if matches!(
+        disc.copy_protection.source,
+        CopyProtectionSource::AssumeDecryptedOverride
+    ) {
+        return false;
+    }
+
+    // A present MKB is the DVD-Audio copy-protection control file.  Some
+    // fixtures expose parseable AOB structure even when the disc is protected,
+    // so structure parsing alone must not downgrade MKB evidence into an
+    // unprotected realization path.  The explicit assume-decrypted override is
+    // the only supported way to proceed with such a source.
+    disc.copy_protection.cppm_detected || disc.copy_protection.mkb_present
 }
 
 fn dvda_copy_protection_block(disc: &DvdaDisc) -> DvdaCopyProtectionBlock {

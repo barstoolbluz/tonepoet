@@ -10444,15 +10444,32 @@ fn is_incremental_single_audio_publish(plan: &PublishPlan) -> bool {
         .iter()
         .filter(|entry| matches!(&entry.role, PublishRole::Audio))
         .count();
-    let has_fragment = plan_has_conversion_log_fragment(plan);
+    if audio_entry_count > 1 {
+        return false;
+    }
 
-    // Successful independent track jobs publish one audio payload plus a log
-    // fragment. Failed independent track jobs may publish only the log fragment.
-    // Both must use the incremental path so a failed track cannot replace the
-    // whole album directory atomically with a sidecar-only directory. The
-    // fragment itself, not a staged standalone conversion.log, triggers the
-    // count-and-maybe-assemble step while the publish lock is held.
-    has_fragment && audio_entry_count <= 1
+    // Incremental publish is deliberately limited to one source track per job.
+    // A merged multi-track source can have only one output audio file, but it
+    // is still an album-level payload and must keep the normal destination
+    // directory collision protection.
+    if plan.source_audio_track_count > 1 {
+        return false;
+    }
+
+    let has_fragment = plan_has_conversion_log_fragment(plan);
+    let has_standalone_conversion_log = plan.entries.iter().any(|entry| {
+        matches!(
+            &entry.role,
+            PublishRole::Sidecar(SidecarKind::ConversionLog)
+        )
+    });
+
+    // Successful independent track jobs may publish one audio payload plus
+    // either the legacy standalone conversion.log append or the newer hidden
+    // ordered fragment. Failed independent track jobs may publish only the
+    // hidden fragment. All of those cases must append into an existing album
+    // directory instead of treating the directory itself as a collision.
+    has_fragment || (audio_entry_count == 1 && has_standalone_conversion_log)
 }
 
 fn publish_incremental_album_output(
@@ -21322,9 +21339,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
     #[test]
     fn album_batch_context_rejects_empty_or_zero_identity_fields() {
-        let mut invalid = fragment_test_album_batch(Path::new("/out/Album"), "", 2);
+        let mut invalid = fragment_test_album_batch(Path::new("/out/Album"), "valid", 2);
+        invalid.conversion_log_batch_id.clear();
         assert!(validate_album_batch_context(&invalid).is_err());
-        invalid.conversion_log_batch_id = "batch".to_string();
+
+        invalid.conversion_log_batch_id = generated_test_batch_id("batch");
         invalid.expected_track_count = 0;
         assert!(validate_album_batch_context(&invalid).is_err());
     }
