@@ -260,6 +260,17 @@ fn separator() -> ContextMenuEntry {
     ContextMenuEntry::Separator
 }
 
+/// Build the disc stream-conversion submenu from the probed disc model.
+///
+/// Blu-ray presentations are intentionally treated as first-class conversion
+/// targets here. An older regression test asserted that Blu-ray streams should
+/// stay hidden until an external `SourceOptions` object already existed; that
+/// guard is now obsolete because `disc_browser::apply_presentation_to_source_options`
+/// is the single bridge that maps a selected Blu-ray presentation id into the
+/// pipeline fields (`bluray_playlist`, `bluray_audio_pid`, stream index, and
+/// angle) at commit time. Keeping menu eligibility tied to
+/// `presentation_supports_stream_conversion` prevents the UI from exposing a
+/// stream identity the conversion bridge cannot honor.
 fn build_disc_convert_stream_submenu(
     contents: &crate::disc::DiscContents,
 ) -> Option<ContextMenuEntry> {
@@ -273,7 +284,7 @@ fn build_disc_convert_stream_submenu(
         .map(|(idx, presentation)| {
             item(
                 &format!("Stream {}: {}", idx + 1, presentation.label),
-                ContextAction::ConvertDiscStream(presentation.id.clone()),
+                ContextAction::ConvertDiscStream(presentation.id),
             )
         })
         .collect();
@@ -1831,14 +1842,37 @@ mod tests {
     }
 
     #[test]
-    fn convert_stream_submenu_excludes_bluray_presentations_until_source_options_exist() {
+    fn convert_stream_submenu_includes_supported_bluray_presentations_once_bridge_can_honor_them() {
+        let id = crate::disc::model::PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
+            .expect("valid Blu-ray presentation id");
         let contents = disc_contents_for_context_menu(
             crate::disc::model::DiscFormat::BluRay,
-            crate::disc::model::PresentationId::try_blu_ray_title(12, 0x1100, 0, 1)
-                .expect("valid Blu-ray presentation id"),
+            id,
         );
 
-        assert!(build_disc_convert_stream_submenu(&contents).is_none());
+        assert!(
+            crate::tui::disc_browser::presentation_id_supports_stream_conversion(&id),
+            "menu exposure must stay coupled to the SourceOptions bridge, not to a stale UI-only guard",
+        );
+        let submenu = build_disc_convert_stream_submenu(&contents)
+            .expect("Blu-ray stream conversion submenu");
+
+        let ContextMenuEntry::Submenu { label, children } = submenu else {
+            panic!("expected Convert Stream submenu");
+        };
+        assert_eq!(label, "Convert Stream");
+        assert_eq!(children.len(), 1);
+        let ContextMenuEntry::Item(item) = &children[0] else {
+            panic!("expected stream menu item");
+        };
+        let ContextAction::ConvertDiscStream(actual_id) = &item.action else {
+            panic!("expected stream conversion action");
+        };
+        assert_eq!(
+            *actual_id,
+            id,
+            "the submenu must preserve the exact Blu-ray playlist/PID/stream/angle identity",
+        );
     }
 
     #[test]

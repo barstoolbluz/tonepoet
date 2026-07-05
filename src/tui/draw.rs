@@ -301,7 +301,7 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
             Span::styled(timeout_label, theme.bright()),
         ]),
         Line::from(Span::styled(
-            "  h/l changes mode, +/- changes timeout, 0 disables",
+            "  Left/Right changes mode, +/- changes timeout, 0 disables",
             theme.muted(),
         )),
     ];
@@ -428,7 +428,7 @@ mod theme_render_tests {
     #[test]
     fn draw_ui_uses_app_theme_on_the_next_frame() {
         let _xdg = XdgConfigHomeGuard::new("tonepoet-draw-ui-theme");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Library;
         app.theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
         app.config.ui.theme = app.theme.slug.to_string();
@@ -444,7 +444,7 @@ mod theme_render_tests {
     #[test]
     fn wizard_fallback_uses_app_theme() {
         let _xdg = XdgConfigHomeGuard::new("tonepoet-wizard-theme");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Wizard;
         app.wizard = None;
         app.theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
@@ -462,7 +462,7 @@ mod theme_render_tests {
     #[test]
     fn active_wizard_uses_app_theme() {
         let _xdg = XdgConfigHomeGuard::new("tonepoet-active-wizard-theme");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Wizard;
         app.wizard = Some(tonepoet_wizard::SimpleWizard::new());
         app.theme = crate::tui::theme::theme_by_slug("catppuccin-latte").expect("theme");
@@ -572,7 +572,7 @@ mod theme_render_tests {
     #[test]
     fn appearance_pane_renders_mockup_content_without_old_clutter() {
         let _xdg = XdgConfigHomeGuard::new("tonepoet-appearance-pane-render");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.set_config_focus(crate::tui::app::ConfigFocus::Appearance);
         app.theme = crate::tui::theme::theme_by_slug("gruvbox").expect("theme");
@@ -608,7 +608,7 @@ mod theme_render_tests {
     #[test]
     fn appearance_theme_name_clips_before_palette_ribbon() {
         let _xdg = XdgConfigHomeGuard::new("tonepoet-appearance-long-theme-name");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.set_config_focus(crate::tui::app::ConfigFocus::Appearance);
         app.theme = crate::tui::theme::theme_by_slug("gruvbox").expect("theme");
@@ -631,7 +631,7 @@ mod theme_render_tests {
     #[test]
     fn appearance_renderer_uses_injected_cached_theme_library() {
         let _xdg = XdgConfigHomeGuard::new("tonepoet-appearance-cache-injection");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.set_config_focus(crate::tui::app::ConfigFocus::Appearance);
         app.theme = crate::tui::theme::theme_by_slug("gruvbox").expect("theme");

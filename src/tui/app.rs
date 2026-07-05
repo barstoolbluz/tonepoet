@@ -7966,8 +7966,42 @@ fn lower_env_value(value: Option<&std::ffi::OsStr>) -> Option<String> {
 
 const KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Startup behaviors whose defaults must match production.
+///
+/// Tests that are not explicitly about startup recovery should opt out through
+/// `AppState::new_for_test()` or `new_with_startup_options()` rather than
+/// relying on a `cfg!(test)` branch inside the production constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppStartupOptions {
+    pub recover_pending_archives: bool,
+}
+
+impl Default for AppStartupOptions {
+    fn default() -> Self {
+        Self {
+            recover_pending_archives: true,
+        }
+    }
+}
+
+impl AppStartupOptions {
+    #[cfg(test)]
+    pub fn without_archive_recovery_for_tests() -> Self {
+        Self {
+            recover_pending_archives: false,
+        }
+    }
+}
+
 impl AppState {
     pub fn new(config: TonepoetConfig) -> Self {
+        Self::new_with_startup_options(config, AppStartupOptions::default())
+    }
+
+    pub fn new_with_startup_options(
+        config: TonepoetConfig,
+        startup_options: AppStartupOptions,
+    ) -> Self {
         let mut config = config;
         let configured_theme_slug = config.ui.theme.clone();
         let theme_overrides = crate::tui::theme::ThemeOverrides::load_default().unwrap_or_default();
@@ -8015,20 +8049,22 @@ impl AppState {
 
         let mut pending_archive_recovery: std::collections::VecDeque<crate::db::PendingArchiveSessionRecovery> =
             std::collections::VecDeque::new();
-        if let Ok(sessions) = db.recover_pending_archive_sessions_at_startup() {
-            if !sessions.is_empty() {
-                let valid = sessions.iter().filter(|session| !session.conflicted).count();
-                let conflicted = sessions.len().saturating_sub(valid);
-                pending_archive_recovery = sessions.into();
-                let archive_status = if conflicted > 0 {
-                    format!("archive recovery: {valid} resumable staged session(s), {conflicted} conflict(s) need review")
-                } else {
-                    format!("archive recovery: {valid} resumable staged session(s)")
-                };
-                theme_startup_status = Some(match theme_startup_status.take() {
-                    Some(existing) => format!("{existing}; {archive_status}"),
-                    None => archive_status,
-                });
+        if startup_options.recover_pending_archives {
+            if let Ok(sessions) = db.recover_pending_archive_sessions_at_startup() {
+                if !sessions.is_empty() {
+                    let valid = sessions.iter().filter(|session| !session.conflicted).count();
+                    let conflicted = sessions.len().saturating_sub(valid);
+                    pending_archive_recovery = sessions.into();
+                    let archive_status = if conflicted > 0 {
+                        format!("archive recovery: {valid} resumable staged session(s), {conflicted} conflict(s) need review")
+                    } else {
+                        format!("archive recovery: {valid} resumable staged session(s)")
+                    };
+                    theme_startup_status = Some(match theme_startup_status.take() {
+                        Some(existing) => format!("{existing}; {archive_status}"),
+                        None => archive_status,
+                    });
+                }
             }
         }
 
@@ -8187,6 +8223,14 @@ impl AppState {
             compare_pending: 0,
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(config: TonepoetConfig) -> Self {
+        Self::new_with_startup_options(
+            config,
+            AppStartupOptions::without_archive_recovery_for_tests(),
+        )
     }
 
     pub fn set_config_focus(&mut self, focus: ConfigFocus) {
@@ -9925,6 +9969,21 @@ mod ssrc_format_settings_handler_tests {
 
 
 #[cfg(test)]
+mod app_startup_options_tests {
+    use super::*;
+
+    #[test]
+    fn production_startup_options_enable_archive_recovery_by_default() {
+        assert!(AppStartupOptions::default().recover_pending_archives);
+    }
+
+    #[test]
+    fn test_constructor_options_explicitly_disable_archive_recovery() {
+        assert!(!AppStartupOptions::without_archive_recovery_for_tests().recover_pending_archives);
+    }
+}
+
+#[cfg(test)]
 mod dsd_gain_format_state_tests {
     use super::*;
 
@@ -10049,7 +10108,7 @@ mod archive_listing_cache_tests {
 
     #[test]
     fn archive_listing_cache_evicts_lru_entry() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         for idx in 0..ARCHIVE_LISTING_CACHE_MAX_ENTRIES {
             assert!(app.insert_archive_listing_cache(cache_key(idx), listing(idx)));
         }
@@ -10070,7 +10129,7 @@ mod archive_listing_cache_tests {
 
     #[test]
     fn archive_listing_cache_replaces_without_duplicate_lru_keys() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let key = cache_key(7);
         assert!(app.insert_archive_listing_cache(key.clone(), listing(7)));
         assert!(app.insert_archive_listing_cache(key.clone(), listing(8)));
@@ -10628,7 +10687,7 @@ FILE "02.flac" WAVE
             .insert(image_path.clone(), Ok(source_info(96_000, Some(24), 2)));
 
         let ((), hook) = with_cue_proxy_probe_test_hook(hook, || {
-            let mut app = AppState::new(TonepoetConfig::default());
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
             app.seed_from_cli_paths(vec![cue_path.clone()]);
 
             assert_eq!(app.current_screen, AppScreen::Convert);
@@ -10689,7 +10748,7 @@ PERFORMER "Nobody"
         }
         assert_eq!(mode.persistent_probe_notice(), Some(notice.as_str()));
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.convert.set_source_mode(SourceMode::Single {
             path: PathBuf::from("/tmp/highres.flac"),
             info: Some(source_info(96_000, Some(24), 2)),
@@ -12179,7 +12238,7 @@ mod app_state_theme_ownership_tests {
     fn app_state_new_resolves_configured_theme() {
         let _home = isolated_config_home();
 
-        let app = AppState::new(config_with_theme("rose-pine-dawn"));
+        let app = AppState::new_for_test(config_with_theme("rose-pine-dawn"));
 
         assert_eq!(app.theme.slug, "rose-pine-dawn");
         assert_eq!(app.config.ui.theme, "rose-pine-dawn");
@@ -12189,7 +12248,7 @@ mod app_state_theme_ownership_tests {
     fn unknown_theme_slug_falls_back_at_startup_and_canonicalizes_config() {
         let _home = isolated_config_home();
 
-        let app = AppState::new(config_with_theme("not-a-theme"));
+        let app = AppState::new_for_test(config_with_theme("not-a-theme"));
 
         assert_eq!(app.theme.slug, crate::tui::theme::default_theme_slug());
         assert_eq!(app.config.ui.theme, crate::tui::theme::default_theme_slug());
@@ -12203,7 +12262,7 @@ mod app_state_theme_ownership_tests {
     #[test]
     fn set_ui_theme_updates_runtime_theme_and_config_slug_together() {
         let home = isolated_config_home();
-        let mut app = AppState::new(config_with_theme("tokyo-night"));
+        let mut app = AppState::new_for_test(config_with_theme("tokyo-night"));
 
         app.set_ui_theme("kanagawa-lotus");
 
@@ -12219,7 +12278,7 @@ mod app_state_theme_ownership_tests {
     #[test]
     fn set_ui_theme_rejects_unknown_slugs_without_mutating_theme_or_config() {
         let _home = isolated_config_home();
-        let mut app = AppState::new(config_with_theme("catppuccin"));
+        let mut app = AppState::new_for_test(config_with_theme("catppuccin"));
         app.force_redraw = false;
 
         app.set_ui_theme("not-a-theme");
@@ -12239,7 +12298,7 @@ mod app_state_theme_ownership_tests {
     #[test]
     fn unknown_theme_slug_is_not_persisted_through_ui_actions() {
         let home = isolated_config_home();
-        let mut app = AppState::new(config_with_theme("tokyo-night"));
+        let mut app = AppState::new_for_test(config_with_theme("tokyo-night"));
 
         app.set_ui_theme("gruvbox");
         let before = std::fs::read_to_string(home.path().join("tonepoet/config.toml"))
@@ -12261,7 +12320,7 @@ mod app_state_theme_ownership_tests {
     fn set_ui_theme_rethemes_existing_active_file_picker() {
         let _home = isolated_config_home();
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut app = AppState::new(config_with_theme("tokyo-night"));
+        let mut app = AppState::new_for_test(config_with_theme("tokyo-night"));
         let initial_picker_theme = crate::tui::keybindings::file_picker_theme_from_theme(&app.theme);
         let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
             start_dir: temp.path().to_path_buf(),
@@ -12289,7 +12348,7 @@ mod app_state_theme_ownership_tests {
     #[test]
     fn set_ui_theme_rethemes_existing_active_file_task_progress() {
         let _home = isolated_config_home();
-        let mut app = AppState::new(config_with_theme("tokyo-night"));
+        let mut app = AppState::new_for_test(config_with_theme("tokyo-night"));
         let initial_picker_theme = crate::tui::keybindings::file_picker_theme_from_theme(&app.theme);
         let progress = tui_file_picker::FileTaskProgressState::new(
             tui_file_picker::FileTaskKind::Copy,
@@ -12316,7 +12375,7 @@ mod app_state_theme_ownership_tests {
     fn new_file_picker_after_set_ui_theme_uses_app_theme() {
         let _home = isolated_config_home();
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut app = AppState::new(config_with_theme("tokyo-night"));
+        let mut app = AppState::new_for_test(config_with_theme("tokyo-night"));
 
         app.set_ui_theme("kanagawa-lotus");
         let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
@@ -12334,7 +12393,7 @@ mod app_state_theme_ownership_tests {
     fn tokyo_night_remains_the_default_runtime_theme() {
         let _home = isolated_config_home();
 
-        let app = AppState::new(TonepoetConfig::default());
+        let app = AppState::new_for_test(TonepoetConfig::default());
 
         assert_eq!(app.config.ui.theme, crate::tui::theme::default_theme_slug());
         assert_eq!(app.theme.slug, crate::tui::theme::default_theme_slug());

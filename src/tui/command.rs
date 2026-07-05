@@ -7248,7 +7248,10 @@ fn bluray_editor_field_scope(
     // to album scope. Edits that make per-file values differ move to track
     // scope above. Known album and known track keys return above and never use
     // this inference path.
-    if existing_track && !existing_album && !bluray_editor_entry_value_changed(entry) {
+    if existing_track
+        && !existing_album
+        && (!bluray_editor_entry_value_changed(entry) || entry.is_mixed)
+    {
         BluRayEditorFieldScope::Track
     } else {
         BluRayEditorFieldScope::Album
@@ -11110,7 +11113,12 @@ MUSICBRAINZ_TRACKID = "recording-id"
 
         assert_eq!(parsed.len(), 1);
         let sidecar = &parsed[0];
-        assert_eq!(sidecar.source.presentation, Some(identity(Some("fp-a"))));
+        let mut expected_identity = identity(Some("fp-a"));
+        expected_identity.extra.insert(
+            "presentation_extension".to_string(),
+            serde_json::json!("keep-presentation"),
+        );
+        assert_eq!(sidecar.source.presentation, Some(expected_identity));
         assert_eq!(sidecar.album.get("ALBUM").map(String::as_str), Some("Sidecar Album"));
         assert_eq!(sidecar.album.get("MUSICBRAINZ_RELEASEGROUPID").map(String::as_str), Some("rgid"));
         assert_eq!(sidecar.tracks[0].source_chapter, Some(1));
@@ -12562,9 +12570,6 @@ mod execute_queue_state_consistency_tests {
         let local_capture = browse_arm
             .find("let cue_artifact_audio = expansion.cue_artifact_audio.clone();")
             .expect("queue expansion metadata should first be captured locally");
-        let probe_error_return = browse_arm
-            .find("app.set_status(format!(\"probe error: {}\", e));")
-            .expect("probe failure branch should still return before Convert source publication");
         let preset_error_return = browse_arm
             .find("if let Err(msg) = load_preset_into_pills(app, name)")
             .expect("preset failure branch should still return before Convert source publication");
@@ -12574,14 +12579,13 @@ mod execute_queue_state_consistency_tests {
         let cue_metadata_publish = browse_arm
             .find("app.convert.source.cue_artifact_audio = cue_artifact_audio;")
             .expect("CUE artifact metadata should be published explicitly");
+        let probe_baseline_capture = browse_arm
+            .find("let probe_baseline = ConvertProbeBaseline::capture(&app.convert);")
+            .expect("probe baseline should be captured after the successful publication boundary");
 
         assert!(
-            local_capture < probe_error_return,
-            "metadata should be captured locally before fallible probe work"
-        );
-        assert!(
-            probe_error_return < source_mode_publish,
-            "probe failure must return before source mode publication"
+            local_capture < source_mode_publish,
+            "metadata should be captured locally before source publication"
         );
         assert!(
             preset_error_return < source_mode_publish,
@@ -12590,6 +12594,10 @@ mod execute_queue_state_consistency_tests {
         assert!(
             source_mode_publish < cue_metadata_publish,
             "CUE artifact metadata must be published at the same success boundary as the source mode"
+        );
+        assert!(
+            cue_metadata_publish < probe_baseline_capture,
+            "probe/default follow-up work must observe CUE metadata after publication"
         );
 
         let before_source_mode_publish = &browse_arm[..source_mode_publish];
@@ -12786,7 +12794,7 @@ mod bulk_guard_behavior_tests {
     #[test]
     fn bulk_guard_threshold_opens_confirmation_only_above_threshold() {
         let (_small_temp, small_album) = audio_tree(BULK_AUDIO_GUARD_THRESHOLD);
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         assert!(!maybe_confirm_bulk_operation(
             &mut app,
             BulkOperationKind::Analyze,
@@ -12827,7 +12835,7 @@ mod bulk_guard_behavior_tests {
     fn frozen_guard_paths_override_later_browse_selection_for_replay() {
         let (_temp, frozen_album) = audio_tree(BULK_AUDIO_GUARD_THRESHOLD + 1);
         let later_path = PathBuf::from("/tmp/later-selection.flac");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.browse.multi_selected = vec![later_path];
         app.bulk_guard_frozen_paths = Some(vec![frozen_album.clone()]);
 

@@ -1328,7 +1328,7 @@ impl std::fmt::Display for LibblurayEventError {
             ),
             BD_EVENT_ENCRYPTED => write!(
                 f,
-                "Blu-ray stream is encrypted and not usable in Phase 0"
+                "libbluray event ENCRYPTED: Blu-ray stream is encrypted and not usable in Phase 0"
             ),
             _ => write!(
                 f,
@@ -1869,7 +1869,7 @@ mod tests {
 
         match &report.pid_failures[0].reason {
             BlurayLpcmPidProbeFailureReason::InvalidLpcmHeader { message } => {
-                assert!(message.contains("reserved Blu-ray LPCM channel code"));
+                assert!(message.contains("unsupported Blu-ray LPCM channel assignment code"));
             }
             other => panic!("expected invalid LPCM header, got {other:?}"),
         }

@@ -1377,8 +1377,8 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
 
 /// Priority order for standard fields (displayed first, in this order).
 pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
-    "ARTIST",
     "TITLE",
+    "ARTIST",
     "ALBUM",
     "DATE",
     "GENRE",
@@ -1451,15 +1451,7 @@ pub fn ensure_standard_fields_present(entries: &mut Vec<TagEntry>, n_files: usiz
     }
 }
 
-/// Sort `entries` so STANDARD_KEY_ORDER fields lead in their listed
-/// order, with the remainder sorted alphabetically by display key.
-/// Also ensures core editor fields are present (empty if not already
-/// populated). Used by `read_all_tags_merged` and the MusicBrainz /
-/// GNUDB populate paths so post-populate entries fall into their
-/// logical positions instead of trailing.
-pub fn sort_entries_standard_first(entries: &mut Vec<TagEntry>) {
-    let n_files = entries.first().map(|e| e.per_file_values.len()).unwrap_or(1);
-    ensure_standard_fields_present(entries, n_files);
+fn sort_entries_by_standard_order(entries: &mut Vec<TagEntry>) {
     entries.sort_by(|a, b| {
         let a_upper = a.display_key.to_ascii_uppercase();
         let b_upper = b.display_key.to_ascii_uppercase();
@@ -1472,6 +1464,25 @@ pub fn sort_entries_standard_first(entries: &mut Vec<TagEntry>) {
             (None, None) => a_upper.cmp(&b_upper),
         }
     });
+}
+
+/// Sort `entries` so STANDARD_KEY_ORDER fields lead in their listed
+/// order, with the remainder sorted alphabetically by display key.
+/// Also ensures core editor fields are present (empty if not already
+/// populated). Used by `read_all_tags_merged` and the main MusicBrainz /
+/// GNUDB populate paths so post-populate entries fall into their
+/// logical positions instead of trailing.
+pub fn sort_entries_standard_first(entries: &mut Vec<TagEntry>) {
+    let n_files = entries.first().map(|e| e.per_file_values.len()).unwrap_or(1);
+    ensure_standard_fields_present(entries, n_files);
+    sort_entries_by_standard_order(entries);
+}
+
+/// Sort existing entries without synthesizing missing core editor fields.
+/// Supplemental MusicBrainz metadata uses this so enrichment cannot create
+/// empty TITLE/ALBUM rows or inflate an album-level field into per-track shape.
+pub fn sort_entries_standard_first_existing_only(entries: &mut Vec<TagEntry>) {
+    sort_entries_by_standard_order(entries);
 }
 
 /// Map an ItemKey to a human-readable display name using the tag's

@@ -3192,6 +3192,22 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
 ///   4. Multi-file non-SACD edit: `" Metadata Editor: <N> files "`.
 pub(super) fn editor_title(state: &super::app::MetadataEditorState) -> String {
     let read_only = if state.read_only { " · read-only" } else { "" };
+
+    if let Some(area) = state.active_surface().sacd_area_kind {
+        let name = state
+            .active_surface()
+            .paths
+            .first()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "SACD source".to_string());
+        let area_label = match area {
+            crate::tui::sacd::AreaKind::Stereo => "stereo",
+            crate::tui::sacd::AreaKind::MultiChannel => "MCH",
+        };
+        return format!(" SACD: {} [{}{}] ", name, area_label, read_only);
+    }
+
     if state.shows_presentation_control() {
         let indicator = if state.presentation_selector_open { "▴" } else { "▾" };
         let label = state

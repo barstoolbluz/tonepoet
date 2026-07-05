@@ -24,7 +24,7 @@ impl XdgConfigHomeGuard {
         let lock = LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .expect("XDG_CONFIG_HOME test lock");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         let previous_thread_override = test_config_home_override();
         let tempdir = tempfile::Builder::new()

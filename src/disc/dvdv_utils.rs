@@ -284,8 +284,26 @@ fn probe_lpcm_format_from_iso_vob(
     substream_id: u8,
 ) -> std::io::Result<Option<DvdVideoLpcmProbeFormat>> {
     let mut probe_reader = reader.try_clone()?;
-    probe_reader.seek(SeekFrom::Start(vob_offset))?;
-    probe_lpcm_format_from_reader(&mut probe_reader, substream_id)
+    let original_position = probe_reader.stream_position()?;
+
+    let probe_result = (|| {
+        probe_reader.seek(SeekFrom::Start(vob_offset))?;
+        probe_lpcm_format_from_reader(&mut probe_reader, substream_id)
+    })();
+
+    let restore_result = probe_reader.seek(SeekFrom::Start(original_position));
+    match (probe_result, restore_result) {
+        (Ok(format), Ok(_)) => Ok(format),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(_)) => Err(err),
+        (Err(err), Err(restore_err)) => {
+            log::debug!(
+                "DVD-Video LPCM ISO probe failed and original reader position restore also failed: {}",
+                restore_err
+            );
+            Err(err)
+        }
+    }
 }
 
 fn probe_lpcm_format_from_reader<R: Read>(

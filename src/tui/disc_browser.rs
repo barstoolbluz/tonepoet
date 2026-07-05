@@ -597,17 +597,23 @@ fn disc_stream_display(format: DiscFormat, presentation: &DiscPresentation) -> S
 
     let fmt = &presentation.format;
     let mut parts = Vec::new();
-    if let Some(codec) = &fmt.codec {
-        parts.push(codec.clone());
-    } else {
-        parts.push(presentation.label.clone());
-    }
+    parts.push(
+        fmt.codec
+            .clone()
+            .unwrap_or_else(|| presentation.label.clone()),
+    );
+
+    let mut technical = Vec::new();
     if let Some(bits) = fmt.bit_depth {
-        parts.push(format!("{bits}-bit"));
+        technical.push(format!("{bits}-bit"));
     }
     if let Some(rate) = fmt.sample_rate {
-        parts.push(sample_rate_display(rate));
+        technical.push(sample_rate_display(rate));
     }
+    if !technical.is_empty() {
+        parts.push(technical.join("/"));
+    }
+
     if let Some(layout) = &fmt.channel_layout {
         parts.push(layout.clone());
     } else if let Some(channels) = fmt.channels {
@@ -1418,14 +1424,18 @@ mod disc_selection_bridge_tests {
     use crate::convert::pipeline::{CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, SourceOptions, TrackSelection};
     use std::path::PathBuf;
 
-    fn dvdv_contents() -> DiscContents {
+    fn disc_contents(
+        format: DiscFormat,
+        id: PresentationId,
+        label: &str,
+    ) -> DiscContents {
         DiscContents {
-            format: DiscFormat::DvdVideo,
-            label: "DVDV".to_string(),
+            format,
+            label: "Disc".to_string(),
             source_path: PathBuf::from("disc.iso"),
             presentations: vec![DiscPresentation {
-                id: PresentationId::dvd_video(2, 3, 1),
-                label: "VTS 02 Title 03 Stream 2".to_string(),
+                id,
+                label: label.to_string(),
                 format: AudioPresentationFormat {
                     codec: Some("LPCM".to_string()),
                     sample_rate: Some(96_000),
@@ -1458,14 +1468,8 @@ mod disc_selection_bridge_tests {
         }
     }
 
-    #[test]
-    fn source_mode_disc_selection_bridge_applies_selected_presentation() {
-        let mode = source_mode_for_presentation(
-            dvdv_contents(),
-            0,
-            SourceMetadata::default(),
-        ).expect("source mode");
-        let mut options = SourceOptions {
+    fn blank_source_options() -> SourceOptions {
+        SourceOptions {
             archive_password: None,
             sacd_area: None,
             dvda_group_selection: DvdaGroupSelection::Default,
@@ -1482,7 +1486,21 @@ mod disc_selection_bridge_tests {
             bluray_angle: None,
             cue_sidecar: CueSidecarPolicy::PreferSidecar,
             track_selection: TrackSelection::All,
-        };
+        }
+    }
+
+    #[test]
+    fn source_mode_disc_selection_bridge_applies_selected_dvd_video_presentation() {
+        let mode = source_mode_for_presentation(
+            disc_contents(
+                DiscFormat::DvdVideo,
+                PresentationId::dvd_video(2, 3, 1),
+                "VTS 02 Title 03 Stream 2",
+            ),
+            0,
+            SourceMetadata::default(),
+        ).expect("source mode");
+        let mut options = blank_source_options();
 
         assert!(apply_source_mode_disc_selection_to_source_options(&mode, &mut options));
 
@@ -1490,5 +1508,24 @@ mod disc_selection_bridge_tests {
         assert_eq!(options.dvdv_title, Some(3));
         assert_eq!(options.dvdv_audio_stream, Some(1));
         assert_eq!(options.dvdv_angle, Some(1));
+    }
+
+    #[test]
+    fn source_mode_disc_selection_bridge_applies_selected_bluray_presentation() {
+        let id = PresentationId::try_blu_ray_title(12, 0x1100, 0, 2)
+            .expect("valid Blu-ray presentation id");
+        let mode = source_mode_for_presentation(
+            disc_contents(DiscFormat::BluRay, id, "Playlist 00012 Stream 1"),
+            0,
+            SourceMetadata::default(),
+        ).expect("source mode");
+        let mut options = blank_source_options();
+
+        assert!(apply_source_mode_disc_selection_to_source_options(&mode, &mut options));
+
+        assert_eq!(options.bluray_playlist, Some(12));
+        assert_eq!(options.bluray_audio_pid, Some(0x1100));
+        assert_eq!(options.bluray_audio_stream, Some(0));
+        assert_eq!(options.bluray_angle, Some(2));
     }
 }

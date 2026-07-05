@@ -519,18 +519,6 @@ impl ThemeBuilderState {
         self.derived_hex_input = TextInputState::new_selected(theme::color_to_hex(color));
     }
 
-    fn lock_selected_derived(&mut self) {
-        let key = self.selected_derived_key().to_string();
-        let color = theme::parse_hex_color(&self.derived_hex_input.text)
-            .unwrap_or_else(|_| self.selected_derived_display_color());
-        let previous = self.palette.derived_locks.insert(key, color);
-        if previous != Some(color) {
-            self.dirty = true;
-        }
-        self.editor_focus = BuilderEditorFocus::Hex;
-        self.sync_derived_hex_from_selected();
-    }
-
     fn release_selected_derived(&mut self) {
         let key = self.selected_derived_key().to_string();
         if self.palette.derived_locks.remove(&key).is_some() {
@@ -681,18 +669,6 @@ impl ThemeBuilderState {
         self.dirty = true;
     }
 
-    fn delete_selected_swatch(&mut self) {
-        if self.palette.swatches.is_empty() {
-            self.status = Some("No saved swatch to delete".to_string());
-            return;
-        }
-        let index = self.saved_swatch_cursor.min(self.palette.swatches.len() - 1);
-        let removed = self.palette.remove_swatch_at(index).expect("index checked above");
-        self.saved_swatch_cursor = self.saved_swatch_cursor.min(self.palette.swatches.len().saturating_sub(1));
-        self.status = Some(format!("Deleted swatch {}; existing bound slots kept their current colors", removed.name));
-        self.dirty = true;
-    }
-
     fn apply_saved_swatch(&mut self, index: usize) {
         if let Some(swatch) = self.palette.swatches.get(index).cloned() {
             let previous = self.selected_color();
@@ -713,15 +689,6 @@ impl ThemeBuilderState {
                 }
                 Err(err) => self.status = Some(format!("Swatch bind failed: {err}")),
             }
-        }
-    }
-
-    fn apply_recent_swatch(&mut self, index: usize) {
-        if let Some(color) = self.recent_colors.get(index).copied() {
-            self.recent_swatch_cursor = index;
-            self.swatch_naming_active = false;
-            self.set_selected_color(color);
-            self.status = Some(format!("Applied recent color {}", theme::color_to_hex(color)));
         }
     }
 
@@ -2030,7 +1997,6 @@ fn preview_lines(state: &ThemeBuilderState, _theme: theme::Theme, max_rows: usiz
             Span::raw(" "),
             Span::styled(" Esc ", Style::default().fg(preview.progress_dialog_abort_fg).bg(preview.progress_dialog_abort_bg)),
         ]),
-        Line::raw(""),
         Line::from(vec![
             Span::styled("  selected ", Style::default().fg(preview.label)),
             Span::styled(state.selected_slot.label(), Style::default().fg(preview.value).add_modifier(Modifier::BOLD)),
@@ -2673,7 +2639,7 @@ fn record_editor_buttons(button_map: &mut ButtonRenderMap, area: Rect, state: &T
     if !derived {
         let swatch_y = area.y.saturating_add(10);
         if state.swatch_naming_active {
-            record_rect(button_map, TuiButton::ThemeBuilderInlineSwatchName, area.x.saturating_add(17), swatch_y, area.width.saturating_sub(17).min(24), 1);
+            record_rect(button_map, TuiButton::ThemeBuilderInlineSwatchName, area.x.saturating_add(16), swatch_y, area.width.saturating_sub(16).min(24), 1);
             record_rect(button_map, TuiButton::ThemeBuilderSaveSwatch, area.x.saturating_add(area.width.saturating_sub(18)), swatch_y, 11, 1);
         } else {
             let visible = state.palette.swatches.len().min(12);
@@ -3377,7 +3343,7 @@ mod tests {
     fn derived_keyboard_scroll_uses_rendered_visible_rows() {
         let mut state = ThemeBuilderState::from_palette(ThemePaletteDraft::from_palette(theme::default_palette()));
         state.tab = BuilderTab::Derived;
-        state.derived_visible_rows.set(30);
+        state.derived_visible_rows.set(derived_list_rows().len());
 
         for _ in 0..28 {
             assert_eq!(handle_theme_builder_key(&mut state, key(KeyCode::Down)), ThemeBuilderAction::None);

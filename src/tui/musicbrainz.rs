@@ -1226,7 +1226,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
         recompute_and_stamp_mb_proposed(&mut state.active_surface_mut().entries[idx], n);
     }
 
-    crate::tui::probe::sort_entries_standard_first(&mut state.active_surface_mut().entries);
+    crate::tui::probe::sort_entries_standard_first_existing_only(&mut state.active_surface_mut().entries);
     state.active_surface_mut().dirty = true;
 }
 

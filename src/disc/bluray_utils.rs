@@ -256,6 +256,14 @@ fn overlay_bluray_sidecar_metadata_with_fingerprint_lookup<F>(
         for warning in &match_report.warnings {
             log_bluray_sidecar_match_warning(&sidecar_path, &identity, warning);
         }
+        if match_report.warnings.iter().any(|warning| {
+            matches!(
+                warning,
+                crate::tui::command::BluRaySidecarMatchWarning::DurationFingerprintUnavailable { .. }
+            )
+        }) {
+            continue;
+        }
         let Some(sidecar) = match_report.selected else {
             continue;
         };
@@ -1107,14 +1115,17 @@ fn parse_lpcm_header_from_pes_prefix(
 }
 
 fn parse_lpcm_prefix_state(payload: &[u8]) -> PesPrefixParseState {
+    const PES_PRIVATE_STREAM_1_PREFIX: [u8; 4] = [0x00, 0x00, 0x01, 0xbd];
+
     if payload.len() < 9 {
-        if [0x00, 0x00, 0x01].starts_with(payload) {
+        let checked = payload.len().min(PES_PRIVATE_STREAM_1_PREFIX.len());
+        if payload[..checked] == PES_PRIVATE_STREAM_1_PREFIX[..checked] {
             return PesPrefixParseState::NeedMore;
         }
         return PesPrefixParseState::Failure(BlurayLpcmPesProbeFailureReason::InvalidPesPrefix);
     }
 
-    if payload[0..3] != [0x00, 0x00, 0x01] {
+    if payload[0..4] != PES_PRIVATE_STREAM_1_PREFIX[..] {
         return PesPrefixParseState::Failure(BlurayLpcmPesProbeFailureReason::InvalidPesPrefix);
     }
 

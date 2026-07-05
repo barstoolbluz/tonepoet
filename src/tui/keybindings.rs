@@ -1854,7 +1854,7 @@ mod inline_edit_behavior_tests {
     }
 
     fn convert_output_app() -> AppState {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::OutputOptions;
         app
@@ -1869,7 +1869,7 @@ mod inline_edit_behavior_tests {
         std::fs::create_dir_all(disc_dir.join("artwork")).expect("disc directory fixture");
         let metadata = std::fs::metadata(&disc_dir).expect("disc metadata");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = root;
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
@@ -1950,7 +1950,7 @@ mod inline_edit_behavior_tests {
         let file = temp.path().join("track.flac");
         std::fs::write(&file, b"not real audio; activation only needs a path").expect("file");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = temp.path().to_path_buf();
         app.browse.entries = vec![browse_file_entry(file.clone())];
@@ -1973,7 +1973,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn browse_gutter_click_toggles_without_moving_cursor() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.entries = vec![
             browse_file_entry(std::path::PathBuf::from("/tmp/a.flac")),
@@ -2001,7 +2001,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn browse_drag_previews_and_commits_range_selection() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.entries = vec![
             browse_file_entry(std::path::PathBuf::from("/tmp/a.flac")),
@@ -2071,7 +2071,7 @@ mod inline_edit_behavior_tests {
                 .expect("audio fixture");
         }
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = temp.path().to_path_buf();
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
@@ -2190,7 +2190,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn convert_metadata_click_starts_inline_edit_without_textedit_overlay() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::Source;
         app.convert.metadata.title = Some("Old Title".to_string());
@@ -2220,7 +2220,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn convert_metadata_inline_printable_key_starts_edit_and_enter_commits() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::Metadata;
         app.convert.metadata.field_focus = ConvertMetadataField::Artist;
@@ -2238,7 +2238,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn convert_metadata_inline_escape_cancels_without_mutating_value() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::Metadata;
         app.convert.metadata.album = Some("Original".to_string());
@@ -2254,7 +2254,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn convert_metadata_inline_mouse_blur_commits_before_focus_change() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::Metadata;
         app.convert.metadata.genre = Some("Before".to_string());
@@ -2281,7 +2281,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn convert_metadata_same_field_click_preserves_active_editor() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         begin_convert_metadata_inline_edit(&mut app, ConvertMetadataField::Year, None);
         app.convert.metadata.edit_input.set_text_and_cursor("1999".to_string(), "1999".len());
 
@@ -2299,7 +2299,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn convert_metadata_field_double_click_commits_inline_edit_then_opens_overlay_path() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::Metadata;
         app.convert.metadata.title = Some("Before".to_string());
@@ -2340,7 +2340,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn convert_metadata_ctrl_e_opens_full_editor_escape_hatch_without_inline_editing() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::Metadata;
         app.convert.metadata.field_focus = ConvertMetadataField::Artist;
@@ -2363,7 +2363,7 @@ mod inline_edit_behavior_tests {
         let renamed = temp.path().join("new.flac");
         std::fs::write(&original, b"audio").expect("fixture");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = temp.path().to_path_buf();
         app.browse.entries = vec![browse_file_entry(original.clone())];
@@ -2420,7 +2420,7 @@ mod inline_edit_behavior_tests {
 
     #[test]
     fn browse_archive_info_metadata_inline_edit_is_disabled() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         let archive_path = std::path::PathBuf::from("/tmp/album.zip");
         app.browse.enter_archive(
@@ -2478,7 +2478,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn browse_metadata_text_edit_refuses_non_filesystem_paths() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let synthetic_path = std::path::PathBuf::from("/tmp/album.zip/track.flac");
 
         apply_text_edit(
@@ -2525,7 +2525,7 @@ mod inline_edit_behavior_tests {
         std::fs::write(&next, b"b").expect("b");
         std::fs::write(&last, b"c").expect("c");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = temp.path().to_path_buf();
         app.browse.entries = vec![
@@ -2584,7 +2584,7 @@ mod inline_edit_behavior_tests {
         std::fs::write(&previous, b"b").expect("b");
         std::fs::write(&original, b"c").expect("c");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = temp.path().to_path_buf();
         app.browse.entries = vec![
@@ -2634,7 +2634,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn browse_inline_tab_rejected_archive_rename_does_not_advance() {
         let (tx, _rx) = channel();
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
 
         let archive_path = std::path::PathBuf::from("/tmp/album.zip");
@@ -2696,7 +2696,7 @@ mod inline_edit_behavior_tests {
         let target = temp.path().join("b.txt");
         std::fs::write(&target, b"b").expect("target");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = temp.path().to_path_buf();
         app.browse.set_tx(tx.clone());
@@ -2738,7 +2738,7 @@ mod inline_edit_behavior_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("b.txt");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = temp.path().to_path_buf();
         app.browse.set_tx(tx.clone());
@@ -6339,7 +6339,7 @@ mod progress_dialog_theme_tests {
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-keybindings-theme-test");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.config.ui.theme = "tokyo-night".to_string();
         app.theme = theme::theme_by_slug("tokyo-night").expect("tokyo night");
@@ -6380,7 +6380,7 @@ mod progress_dialog_theme_tests {
         use crate::tui::app::{AppScreen, AppState, ConfigFocus};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         assert_eq!(app.config_focus, ConfigFocus::Appearance);
         assert!(!app.keychain.focused);
@@ -6415,7 +6415,7 @@ mod progress_dialog_theme_tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-performance-config-test");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.set_config_focus(ConfigFocus::Performance);
 
@@ -6441,7 +6441,7 @@ mod progress_dialog_theme_tests {
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-keybindings-theme-test");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.config.ui.theme = "tokyo-night".to_string();
         app.theme = theme::theme_by_slug("tokyo-night").expect("tokyo night");
@@ -6494,7 +6494,7 @@ mod progress_dialog_theme_tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-config-mode-toggle");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.set_config_focus(ConfigFocus::Appearance);
         app.set_ui_theme("gruvbox");
@@ -6518,7 +6518,7 @@ mod progress_dialog_theme_tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-config-theme-gallery");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.set_config_focus(ConfigFocus::Appearance);
         app.set_ui_theme("gruvbox");
@@ -6542,7 +6542,7 @@ mod progress_dialog_theme_tests {
         use crate::tui::theme_builder::{ThemeBuilderAction, ThemeBuilderState};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-apply-preset-action");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.set_ui_theme("tokyo-night");
         let state = Box::new(ThemeBuilderState::from_active_theme(app.theme));
 
@@ -6561,7 +6561,7 @@ mod progress_dialog_theme_tests {
         use crate::tui::theme_builder::{BuilderEditorFocus, ThemeBuilderAction, ThemeBuilderState};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-theme-builder-invalid-apply");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.set_ui_theme("tokyo-night");
         let mut state = ThemeBuilderState::from_active_theme(app.theme);
         state.editor_focus = BuilderEditorFocus::Hex;
@@ -6590,7 +6590,7 @@ mod progress_dialog_theme_tests {
         use ratatui::style::Color;
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-theme-builder-apply-dirty-assignment");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.set_ui_theme("tokyo-night");
         app.force_redraw = false;
 
@@ -6631,7 +6631,7 @@ mod progress_dialog_theme_tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let _config_home = XdgConfigHomeGuard::new("tonepoet-gallery-apply-built-in");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.set_config_focus(ConfigFocus::Appearance);
         app.set_ui_theme("tokyo-night");
@@ -6665,7 +6665,7 @@ mod progress_dialog_theme_tests {
         use crate::tui::app::{AppScreen, AppState, ConfigFocus};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Config;
         app.set_config_focus(ConfigFocus::Conversion);
 
@@ -25192,7 +25192,7 @@ mod phase4_tests {
 
     #[test]
     fn metadata_editor_esc_with_dirty_state_prompts_before_closing() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
         ])));
@@ -25216,7 +25216,7 @@ mod phase4_tests {
 
     #[test]
     fn metadata_editor_discard_cancel_restores_dirty_editor() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
         ])));
@@ -25245,7 +25245,7 @@ mod phase4_tests {
 
     #[test]
     fn metadata_editor_discard_confirm_closes_dirty_editor() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
         ])));
@@ -25293,7 +25293,7 @@ mod phase4_tests {
             to: "track.flac".to_string(),
         });
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.enter_archive(listing, None);
         app.browse.archive.as_mut().expect("archive").staging = Some(staging_session);
@@ -25328,7 +25328,7 @@ mod phase4_tests {
 
     #[test]
     fn metadata_editor_esc_with_clean_state_closes_without_confirmation() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = single_image_state(vec![entry(
             "TITLE",
             ItemKey::TrackTitle,
@@ -25415,7 +25415,7 @@ mod phase4_tests {
 
     #[test]
     fn metadata_editor_footer_close_with_dirty_state_prompts_before_closing() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
         ])));
@@ -25428,7 +25428,7 @@ mod phase4_tests {
 
     #[test]
     fn metadata_editor_left_click_outside_dirty_popup_prompts_before_closing() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
         ])));
@@ -25441,7 +25441,7 @@ mod phase4_tests {
 
     #[test]
     fn metadata_editor_right_click_outside_content_dirty_popup_prompts_before_closing() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
         ])));
@@ -25454,7 +25454,7 @@ mod phase4_tests {
 
     #[test]
     fn metadata_editor_esc_while_saving_keeps_editor_open() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = single_image_state(vec![entry(
             "TITLE",
             ItemKey::TrackTitle,
@@ -25489,7 +25489,7 @@ mod phase4_tests {
 
     #[test]
     fn mb_back_checks_dirty_sibling_presentations() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = clean_active_dirty_sibling_state();
         state.mb_back = Some(crate::tui::app::MbBackCache {
             releases: Vec::new(),
@@ -25513,7 +25513,7 @@ mod phase4_tests {
 
     #[test]
     fn gnudb_back_checks_dirty_sibling_presentations() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = clean_active_dirty_sibling_state();
         state.gnudb_back = Some(Box::new(crate::tui::app::GnudbReviewState {
             pages: Vec::new(),
@@ -25596,7 +25596,7 @@ mod phase4_tests {
     fn closed_presentation_dropdown_space_opens_but_enter_edits_grid() {
         let (tx, _rx) = mpsc::channel(1);
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut enter_state = Box::new(dvda_multitab_state(selector_test_tabs()));
         handle_metadata_editor_key(
             &mut app,
@@ -25608,7 +25608,7 @@ mod phase4_tests {
         assert_eq!(enter_state.phase, MetadataEditorPhase::DetailEdit);
         assert_eq!(enter_state.active_tab, 0);
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut space_state = Box::new(dvda_multitab_state(selector_test_tabs()));
         handle_metadata_editor_key(
             &mut app,
@@ -25623,7 +25623,7 @@ mod phase4_tests {
 
     #[test]
     fn presentation_selector_mouse_row_click_selects_row() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = dvda_multitab_state(selector_test_tabs());
         assert!(state.open_presentation_selector());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
@@ -25656,7 +25656,7 @@ mod phase4_tests {
 
     #[test]
     fn presentation_selector_mouse_wheel_scrolls_without_selecting() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = dvda_multitab_state(selector_test_tabs());
         assert!(state.open_presentation_selector());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
@@ -25685,7 +25685,7 @@ mod phase4_tests {
 
     #[test]
     fn musicbrainz_reopen_does_not_prompt_for_single_presentation_control() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let tabs = vec![dvda_save_tab(
             1,
             vec![entry(
@@ -25705,7 +25705,7 @@ mod phase4_tests {
 
     #[test]
     fn mouse_cancel_apply_mb_to_all_restores_parked_editor() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let tabs = vec![
             dvda_save_tab(
                 1,
@@ -28570,7 +28570,7 @@ mod artwork_file_picker_handoff_tests {
     fn artwork_plus_opens_crate_picker_with_images_and_explicit_non_mutating_policy() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("cover.png"), b"png").expect("image fixture");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.last_artwork_picker_dir = Some(temp.path().to_path_buf());
         let (tx, _rx) = channel();
         let mut state = make_editor_fixture(temp.path());
@@ -28603,7 +28603,7 @@ mod artwork_file_picker_handoff_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("cover.png");
         fs::write(&image, b"png").expect("image fixture");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.last_artwork_picker_dir = Some(temp.path().to_path_buf());
         let (tx, mut rx) = channel();
         let mut state = make_editor_fixture(temp.path());
@@ -28643,7 +28643,7 @@ mod artwork_file_picker_handoff_tests {
     #[test]
     fn escape_from_artwork_picker_sends_cancel_completion_without_leaving_artwork_tab() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.last_artwork_picker_dir = Some(temp.path().to_path_buf());
         let (tx, mut rx) = channel();
         let mut state = make_editor_fixture(temp.path());
@@ -28906,7 +28906,7 @@ mod staged_archive_metadata_path_tests {
         );
         assert!(!context.editor_owns_staging);
 
-        let mut app = AppState::new(crate::config::TonepoetConfig::default());
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
         app.preserved_editor_archive_repackage = Some(context);
 
         open_browse_archive_metadata_editor_for_entries(&mut app, archive.clone(), None);
@@ -28935,7 +28935,7 @@ mod staged_archive_metadata_path_tests {
         let context = ArchiveMetadataEditContext::browse(archive.clone(), staging.clone());
         assert!(context.editor_owns_staging);
 
-        let mut app = AppState::new(crate::config::TonepoetConfig::default());
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
         app.preserved_editor_archive_repackage = Some(context);
 
         open_browse_archive_metadata_editor_for_entries(&mut app, archive.clone(), None);
@@ -28970,7 +28970,7 @@ mod staged_archive_metadata_path_tests {
         fs::create_dir_all(&staging).expect("staging");
         let context = ArchiveMetadataEditContext::browse(archive.clone(), staging.clone());
 
-        let mut app = AppState::new(crate::config::TonepoetConfig::default());
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
         app.preserved_editor_archive_repackage = Some(context.clone());
 
         discard_archive_staging_context(&mut app, &context, false);

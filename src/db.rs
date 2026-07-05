@@ -2964,8 +2964,10 @@ mod tests {
                 classification: Some(Arc::new(classification)),
                 classification_scope: Some(DirectorySummaryScope::Immediate),
                 stats: Some(Arc::new(DirStats {
+                    folder_count: 0,
                     file_count: 2,
                     audio_count: 2,
+                    audio_size: 12345,
                     total_size: 12345,
                 })),
                 stats_scope: Some(DirectorySummaryScope::RecursiveBestEffort),

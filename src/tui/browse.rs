@@ -6214,6 +6214,19 @@ impl BrowseState {
         let scanned_identity = ProbeCacheIdentity::from_entry(&entry);
         entry = self.lazy_promote_native_disc_source_for_focus(&entry, scanned_identity, false, false);
 
+        if self.archive.is_none()
+            && self.probe_pending.contains(&entry.path)
+            && std::fs::metadata(&entry.path).is_err()
+        {
+            let path = entry.path.clone();
+            self.remove_probe_cache_entry(&path);
+            self.probe_pending.remove(&path);
+            self.probe_cancel.remove(&path);
+            self.clear_browse_cold_probe_tracking_for(&path);
+            self.probe_debounce = None;
+            return;
+        }
+
         if entry.is_probeable() {
             let path = entry.path.clone();
             let identity = ProbeCacheIdentity::from_entry(&entry);
@@ -11439,6 +11452,15 @@ mod tests {
     use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
     use std::time::Duration;
 
+    fn canonical_equivalent_focus_path(real_path: &Path) -> PathBuf {
+        let parent = real_path.parent().expect("fixture parent");
+        let alias_dir = parent.join("alias-for-canonicalize-test");
+        std::fs::create_dir_all(&alias_dir).expect("alias fixture dir");
+        alias_dir
+            .join("..")
+            .join(real_path.file_name().expect("fixture file name"))
+    }
+
     fn test_cached_info(file_size: u64, title: &str) -> CachedInfo {
         CachedInfo {
             source: crate::tui::probe::SourceInfo {
@@ -14767,10 +14789,18 @@ FILE "10 - Live Version.wav" WAVE
             .listing
             .archive_path
             .clone();
+        let synthetic_path = archive_path.join(inner_path);
+        let identity = state
+            .all_files
+            .iter()
+            .chain(state.all_dirs.iter())
+            .find(|entry| entry.path == synthetic_path)
+            .map(ProbeCacheIdentity::from_entry)
+            .unwrap_or(ProbeCacheIdentity { modified: None, size: 4096 });
         state.probe_cache.insert(
-            archive_path.join(inner_path),
+            synthetic_path,
             ProbeCacheEntry::hit(
-                ProbeCacheIdentity { modified: None, size: 4096 },
+                identity,
                 std::sync::Arc::new(CachedInfo {
                     source: crate::tui::probe::SourceInfo {
                         format_name: "FLAC".to_string(),
@@ -14780,7 +14810,7 @@ FILE "10 - Live Version.wav" WAVE
                         channels: 2,
                         channel_layout: "stereo".to_string(),
                         duration_secs: 1.0,
-                        file_size: 4096,
+                        file_size: identity.size,
                     },
                     metadata: crate::tui::probe::SourceMetadata {
                         title: title.map(str::to_string),
@@ -15598,8 +15628,8 @@ mod browse_perf_followup_v10_tests {
         assert!(state.dir_stats_pending.is_empty());
     }
 
-    #[test]
-    fn stale_active_recursive_dir_stats_are_cancelled_before_queueing_current() {
+    #[tokio::test]
+    async fn stale_active_recursive_dir_stats_are_cancelled_before_queueing_current() {
         let mut state = BrowseState::new();
         let stale_path = PathBuf::from("/tmp/stale-active-dir");
         let stale_cancel = Arc::new(AtomicBool::new(false));

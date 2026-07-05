@@ -532,22 +532,22 @@ pub fn handle_text_input_key(input: &mut TextInputState, key: &KeyEvent) -> bool
     }
 
     match (ctrl, alt, shift, key.code) {
-        // Clipboard/select commands.
+        // Readline-style home. Bulk replacement uses `new_selected`/mouse focus paths,
+        // not Ctrl+A, so terminal users keep the conventional shell binding.
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'a') => {
-            input.select_all_text();
+            input.cursor_home();
             true
         }
+
+        // Clipboard commands.
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'c') => {
-            input.copy_selection();
-            true
+            input.copy_selection()
         }
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'x') => {
-            input.cut_selection();
-            true
+            input.cut_selection()
         }
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'v') => {
-            input.paste_clipboard();
-            true
+            input.paste_clipboard()
         }
 
         // Readline-style movement/editing.

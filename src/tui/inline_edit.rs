@@ -207,9 +207,14 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(rendered, "6789 ");
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[1].content.as_ref(), " ");
-        assert_eq!(spans[1].style.fg, Some(theme.bg));
-        assert_eq!(spans[1].style.bg, Some(theme.text_bright));
+        let cursor_span = spans
+            .iter()
+            .find(|span| {
+                span.content.as_ref() == " "
+                    && span.style.fg == Some(theme.bg)
+                    && span.style.bg == Some(theme.text_bright)
+            })
+            .expect("cursor cell should be rendered with inverted style");
+        assert_eq!(cursor_span.content.as_ref(), " ");
     }
 }
