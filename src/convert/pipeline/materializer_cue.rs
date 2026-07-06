@@ -2780,6 +2780,7 @@ FILE "album.flac" WAVE
             },
             settings: tonepoet_pipeline::PipelineSettings::default(),
             worker_count: None,
+            scratch_staging: None,
             merge: false,
             output_root: container.parent().unwrap_or(Path::new(".")).to_path_buf(),
             naming: NamingPolicy {

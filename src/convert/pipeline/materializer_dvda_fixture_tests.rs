@@ -120,6 +120,7 @@ fn request_for_fixture(
         // settings-sentinel-allow: fixture-only default for DVD-Audio materialization tests
         settings: tonepoet_pipeline::PipelineSettings::default(),
         worker_count: Some(1),
+        scratch_staging: None,
         merge: false,
         output_root: root.join("out"),
         naming: NamingPolicy {

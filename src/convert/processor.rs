@@ -3983,6 +3983,7 @@ mod tests {
                 &cancel,
                 1,
                 Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
+                None,
             );
         })
         .await
@@ -4019,6 +4020,7 @@ mod tests {
             &cancel,
             1,
             Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
+            None,
         );
         submissions.record_backlog(pool.metrics(), &pending_albums);
         let resumed = pool.metrics().snapshot();

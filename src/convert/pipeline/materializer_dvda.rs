@@ -5920,6 +5920,7 @@ mod tests {
             },
             settings: tonepoet_pipeline::PipelineSettings::default(),
             worker_count: Some(1),
+            scratch_staging: None,
             merge: false,
             output_root: root.join("out"),
             naming: NamingPolicy {
