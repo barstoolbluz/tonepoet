@@ -36,6 +36,7 @@ pub mod materializer_dvdv;
 pub mod materializer_bluray;
 pub mod materializer_sacd;
 pub mod materializer_single;
+pub mod memory_budget;
 pub mod orchestrator_rerun_gate;
 pub mod plan_bridge;
 pub mod planned_adapter;
@@ -54,6 +55,7 @@ pub mod unified_request;
 pub use errors::*;
 pub use label_resolver::*;
 pub use materializer_single::*;
+pub use memory_budget::*;
 pub use plan_bridge::*;
 pub use planned_adapter::*;
 pub use progress::*;
@@ -104,6 +106,7 @@ mod tests {
             },
             settings: tonepoet_pipeline::PipelineSettings::default(),
             worker_count: Some(2),
+            scratch_staging: None,
             merge: false,
             output_root: PathBuf::from("/tmp/out"),
             naming: NamingPolicy {

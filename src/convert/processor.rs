@@ -15,9 +15,13 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::OnceLock;
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::PipelineSettings;
+
+use crate::config::DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT;
 
 use crate::convert::pipeline::{
     boxed_work, build_pipeline_request, build_pipeline_request_from_settings, detect_source_kind,
@@ -25,21 +29,60 @@ use crate::convert::pipeline::{
     encode_realized_track_for_scheduler_with_tool_limits_and_version_cache,
     encode_track_for_scheduler_with_tool_limits_and_version_cache,
     finish_pipeline_album_for_scheduler_with_tool_limits, map_album_outcome,
-    prepare_pipeline_item_for_scheduler, realize_track_for_scheduler_with_tool_limits_and_version_cache,
-    run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_worker_failure_output,
+    pipeline_report_has_scratch_scoped_storage_exhaustion_for_retry, prepare_pipeline_item_for_scheduler,
+    realize_track_for_scheduler_with_tool_limits_and_version_cache,
+    run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry,
+    scheduled_worker_failure_output,
     AlbumBatchTrackContext, AlbumCompletionTracker,
     AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, PipelineRequest, PoolLimits,
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
-    SharedWorkerPool, SourceKind, ToolBinary, ToolConcurrencyLimits,
+    ScratchStagingConfig, SharedWorkerPool, SourceKind, ToolBinary, ToolConcurrencyLimits,
     TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
 };
 #[cfg(test)]
 use crate::convert::pipeline::{
-    CueSidecarPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy, NamingCollisionPolicy,
-    NamingPolicy, OverwritePolicy, PreparedTrack, PublishPolicy, SourceAudioDescriptor,
-    SourceOptions, StagePolicy, StageRequirement, TrackId, TrackMetadata, TrackSelection,
+    AlbumMetadata, AlbumOutcome, AlbumPlan, CueSidecarPolicy, DvdaGroupSelection,
+    ExtractionProvenance, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
+    OverwritePolicy, PlannedTrackOutput, PreparedSource, PreparedTrack, PublishedAlbum,
+    PublishPolicy, RedactedPipelineRequest, scheduled_album_for_test,
+    SourceAudioDescriptor,
+    SourceAudioCoding, SourceOptions, StagePolicy, StageRequirement, StagingDir,
+    TrackId, TrackMetadata, TrackOutcome, TrackRecord, TrackSelection,
 };
+
+/// Scratch-staging policy for direct single-item API calls.
+///
+/// Keeping this as an options struct avoids repeatedly bolting scratch-policy
+/// fields onto public helper signatures as the staging policy evolves.
+#[derive(Debug, Clone)]
+pub struct ScratchStagingPolicy {
+    pub directory: Option<PathBuf>,
+    pub memory_limit_percent: u8,
+}
+
+impl ScratchStagingPolicy {
+    #[must_use]
+    pub fn new(directory: Option<PathBuf>, memory_limit_percent: u8) -> Self {
+        Self {
+            directory,
+            memory_limit_percent,
+        }
+    }
+
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            directory: None,
+            memory_limit_percent: DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT,
+        }
+    }
+
+    #[must_use]
+    pub fn with_default_memory_limit(directory: Option<PathBuf>) -> Self {
+        Self::new(directory, DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT)
+    }
+}
 
 /// Configuration for the conversion processor.
 pub struct ProcessorConfig {
@@ -51,6 +94,8 @@ pub struct ProcessorConfig {
     pub default_destination_directory: Option<PathBuf>,
     /// Local scratch directory for extraction.
     pub scratch_directory: Option<PathBuf>,
+    /// Maximum percentage of total RAM scratch staging may reserve (0-90).
+    pub scratch_memory_limit_percent: u8,
 }
 
 /// Handles the actual conversion of audio files.
@@ -161,6 +206,22 @@ fn companion_policy_from_item(item: &ConversionItem) -> CompanionCopyPolicy {
 
 fn apply_companion_policy_from_item(request: &mut PipelineRequest, item: &ConversionItem) {
     request.companion = companion_policy_from_item(item);
+}
+
+fn apply_scratch_staging_from_run(
+    request: &mut PipelineRequest,
+    scratch_staging: &Option<ScratchStagingConfig>,
+) {
+    request.scratch_staging = scratch_staging.clone();
+}
+
+fn scratch_staging_config_for_run(
+    scratch_directory: Option<PathBuf>,
+    scratch_memory_limit_percent: u8,
+) -> Option<ScratchStagingConfig> {
+    scratch_directory
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| ScratchStagingConfig::new(path, scratch_memory_limit_percent))
 }
 
 /// Attach the conversion-log album-batch contract at the real queue dispatch
@@ -1106,6 +1167,8 @@ impl ConversionProcessor {
             self.pool_limits,
             self.scheduler_metrics.clone(),
             self.tool_concurrency_limits.clone(),
+            self.config.scratch_directory.clone(),
+            self.config.scratch_memory_limit_percent,
             self.external_cancel.take(),
         )
         .await;
@@ -1364,6 +1427,7 @@ impl SubmissionPump {
         _cancel: &CancellationToken,
         worker_count: usize,
         tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
+        scratch_staging: Option<ScratchStagingConfig>,
     ) {
         self.retry_after_busy = false;
         loop {
@@ -1442,6 +1506,7 @@ impl SubmissionPump {
                     lifecycle_tx,
                     worker_count,
                     tool_concurrency_limits.clone(),
+                    scratch_staging.clone(),
                 ) {
                     if !self.try_submit_unit(pool, unit, false) {
                         return;
@@ -1535,6 +1600,8 @@ async fn run_queue_with_shared_orchestrator(
     pool_limits: PoolLimits,
     metrics: Arc<SchedulerMetrics>,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
+    scratch_directory: Option<PathBuf>,
+    scratch_memory_limit_percent: u8,
     external_cancel: Option<CancellationToken>,
 ) -> Vec<(String, ConversionStatus, Option<f32>)> {
     let cancel = external_cancel.unwrap_or_else(CancellationToken::new);
@@ -1545,6 +1612,10 @@ async fn run_queue_with_shared_orchestrator(
         metrics,
     );
     let total_items = queued_items.len();
+    let scratch_staging = scratch_staging_config_for_run(
+        scratch_directory,
+        scratch_memory_limit_percent,
+    );
     let mut submissions = SubmissionPump::new(queued_items);
     let version_cache = Arc::new(Mutex::new(HashMap::new()));
     let mut run = pool.start();
@@ -1568,6 +1639,7 @@ async fn run_queue_with_shared_orchestrator(
             &cancel,
             worker_count.max(1),
             tool_concurrency_limits.clone(),
+            scratch_staging.clone(),
         );
         submissions.record_backlog(pool.metrics(), &pending_albums);
         if terminal.len() >= total_items {
@@ -1758,6 +1830,7 @@ fn build_initial_work(
     lifecycle_tx: Option<&mpsc::UnboundedSender<LifecycleEvent>>,
     worker_count: usize,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
+    scratch_staging: Option<ScratchStagingConfig>,
 ) -> Option<WorkUnit<QueueWorkOutput>> {
     let item_id = item.id.clone();
     if !item.input_path.exists() {
@@ -1775,6 +1848,7 @@ fn build_initial_work(
     let request = match build_pipeline_request(&item) {
         Ok(mut req) => {
             apply_companion_policy_from_item(&mut req, &item);
+            apply_scratch_staging_from_run(&mut req, &scratch_staging);
             req.worker_count = Some(worker_count.max(1));
             req
         }
@@ -2190,23 +2264,73 @@ fn build_album_postprocess_work(
 ) -> WorkUnit<QueueWorkOutput> {
     let item_id = album.req.item_id.clone();
     let job_id = album.req.job_id.clone();
+    let unit_id = format!("album-postprocess:{item_id}");
     let tool_paths = tool_paths.clone();
     let version_cache = version_cache.clone();
     let progress_tx = progress_tx.clone();
     let tool_concurrency_limits = tool_concurrency_limits.clone();
     WorkUnit {
         job_id,
-        unit_id: format!("album-postprocess:{item_id}"),
+        unit_id,
         kind: WorkKind::AlbumPostProcess,
         task: boxed_work(move |worker_cancel| async move {
-            let runner = RealToolRunner::with_version_cache(tool_paths, version_cache.clone());
-            let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
-            let report = finish_pipeline_album_for_scheduler_with_tool_limits(
+            Ok(run_album_postprocess_work(
                 album,
                 outputs,
+                tool_paths,
+                version_cache,
+                progress_tx,
+                tool_concurrency_limits,
+                worker_cancel,
+            )
+            .await)
+        }),
+    }
+}
+
+async fn run_album_postprocess_work(
+    album: ScheduledAlbum,
+    outputs: Vec<ScheduledTrackOutput>,
+    tool_paths: HashMap<String, PathBuf>,
+    version_cache: Arc<Mutex<HashMap<ToolBinary, String>>>,
+    progress_tx: broadcast::Sender<ProgressUpdate>,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
+    worker_cancel: CancellationToken,
+) -> QueueWorkOutput {
+    let item_id = album.req.item_id.clone();
+    let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone());
+    let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
+    let scratch_retry_context = if album.staging.is_scratch_staging() {
+        Some((
+            album.req.clone(),
+            album.staging.root.clone(),
+            album.req.output_root.clone(),
+        ))
+    } else {
+        None
+    };
+
+    if let Some((mut retry_req, staging_root, output_root)) = scratch_retry_context.clone() {
+        if !worker_cancel.is_cancelled()
+            && scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry(
+                &outputs,
+                &staging_root,
+                &output_root,
+            )
+        {
+            retry_req.scratch_staging = None;
+            log::warn!(
+                "scratch-backed item {} had scratch-scoped track storage exhaustion; retrying the whole item once on disk before terminal failure publication",
+                item_id
+            );
+            drop(outputs);
+            drop(album);
+            let report = retry_scratch_backed_item_once_on_disk_for_scheduler(
+                retry_req,
                 &runner,
                 &reporter,
                 &worker_cancel,
+                &tool_paths,
                 Some(tool_concurrency_limits),
             )
             .await;
@@ -2215,9 +2339,124 @@ fn build_album_postprocess_work(
                 report.published.as_ref(),
                 report.durable_log.as_deref(),
             );
-            Ok(QueueWorkOutput::PostProcessed { item_id, status })
-        }),
+            return QueueWorkOutput::PostProcessed { item_id, status };
+        }
     }
+
+    let report = finish_pipeline_album_for_scheduler_with_tool_limits(
+        album,
+        outputs,
+        &runner,
+        &reporter,
+        &worker_cancel,
+        Some(tool_concurrency_limits.clone()),
+    )
+    .await;
+    let report = if let Some((mut retry_req, staging_root, output_root)) = scratch_retry_context {
+        if !worker_cancel.is_cancelled()
+            && report.published.is_none()
+            && pipeline_report_has_scratch_scoped_storage_exhaustion_for_retry(
+                &report,
+                Some(&staging_root),
+                &output_root,
+            )
+        {
+            retry_req.scratch_staging = None;
+            log::warn!(
+                "scratch-backed item {} failed after materialization with scratch-scoped storage exhaustion; retrying the whole item once on disk before terminal failure publication",
+                item_id
+            );
+            retry_scratch_backed_item_once_on_disk_for_scheduler(
+                retry_req,
+                &runner,
+                &reporter,
+                &worker_cancel,
+                &tool_paths,
+                Some(tool_concurrency_limits),
+            )
+            .await
+        } else {
+            report
+        }
+    } else {
+        report
+    };
+    let status = map_album_outcome(
+        &report.outcome,
+        report.published.as_ref(),
+        report.durable_log.as_deref(),
+    );
+    QueueWorkOutput::PostProcessed { item_id, status }
+}
+
+async fn retry_scratch_backed_item_once_on_disk_for_scheduler(
+    retry_req: PipelineRequest,
+    runner: &dyn crate::convert::pipeline::ToolRunner,
+    reporter: &dyn crate::convert::pipeline::PipelineReporter,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> crate::convert::pipeline::PipelineReport {
+    #[cfg(test)]
+    if let Some(report) = call_scheduler_disk_retry_hook_for_test(&retry_req) {
+        return report;
+    }
+
+    run_pipeline_item_with_tool_paths_and_tool_limits(
+        retry_req,
+        runner,
+        reporter,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits,
+    )
+    .await
+}
+
+#[cfg(test)]
+type SchedulerDiskRetryHook = dyn Fn(&PipelineRequest) -> Option<crate::convert::pipeline::PipelineReport> + Send + Sync + 'static;
+
+#[cfg(test)]
+static SCHEDULER_DISK_RETRY_HOOK: OnceLock<Mutex<Option<Box<SchedulerDiskRetryHook>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn scheduler_disk_retry_hook_cell() -> &'static Mutex<Option<Box<SchedulerDiskRetryHook>>> {
+    SCHEDULER_DISK_RETRY_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn call_scheduler_disk_retry_hook_for_test(
+    req: &PipelineRequest,
+) -> Option<crate::convert::pipeline::PipelineReport> {
+    let guard = scheduler_disk_retry_hook_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.as_ref().and_then(|hook| hook(req))
+}
+
+#[cfg(test)]
+struct SchedulerDiskRetryHookGuard;
+
+#[cfg(test)]
+impl Drop for SchedulerDiskRetryHookGuard {
+    fn drop(&mut self) {
+        let mut guard = scheduler_disk_retry_hook_cell()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
+    }
+}
+
+#[cfg(test)]
+fn set_scheduler_disk_retry_hook_for_test(
+    hook: Box<SchedulerDiskRetryHook>,
+) -> SchedulerDiskRetryHookGuard {
+    let mut guard = scheduler_disk_retry_hook_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(guard.is_none(), "scheduler disk retry test hook already installed");
+    *guard = Some(hook);
+    SchedulerDiskRetryHookGuard
 }
 
 /// Run one conversion item through the shared scheduler graph.
@@ -2231,6 +2470,7 @@ async fn run_single_item_with_shared_scheduler(
     progress_tx: broadcast::Sender<ProgressUpdate>,
     tool_paths: HashMap<String, PathBuf>,
     worker_count: usize,
+    scratch_staging: ScratchStagingPolicy,
 ) -> ConversionResult<(String, ConversionStatus)> {
     let item_id = item.id.clone();
     let tool_concurrency_limits = Arc::new(ToolConcurrencyLimits::from_available_parallelism());
@@ -2248,6 +2488,8 @@ async fn run_single_item_with_shared_scheduler(
         PoolLimits::default(),
         Arc::new(SchedulerMetrics::default()),
         tool_concurrency_limits,
+        scratch_staging.directory,
+        scratch_staging.memory_limit_percent,
         None,
     )
     .await;
@@ -2267,13 +2509,36 @@ async fn run_single_item_with_shared_scheduler(
 /// planner settings should call this API instead of relying on legacy
 /// `ConversionOptions` projection.
 pub async fn process_item_with_pipeline_settings(
+    item: ConversionItem,
+    settings: PipelineSettings,
+    progress_tx: broadcast::Sender<ProgressUpdate>,
+    tool_paths: HashMap<String, PathBuf>,
+    file_semaphore: Arc<Semaphore>,
+    worker_count: usize,
+    scratch_directory: Option<PathBuf>,
+) -> ConversionResult<(String, ConversionStatus)> {
+    process_item_with_pipeline_settings_and_scratch_policy(
+        item,
+        settings,
+        progress_tx,
+        tool_paths,
+        file_semaphore,
+        worker_count,
+        ScratchStagingPolicy::with_default_memory_limit(scratch_directory),
+    )
+    .await
+}
+
+/// Policy-aware variant of `process_item_with_pipeline_settings`. New call sites
+/// should use this when they have the configured scratch memory limit available.
+pub async fn process_item_with_pipeline_settings_and_scratch_policy(
     mut item: ConversionItem,
     settings: PipelineSettings,
     progress_tx: broadcast::Sender<ProgressUpdate>,
     tool_paths: HashMap<String, PathBuf>,
     _file_semaphore: Arc<Semaphore>,
     worker_count: usize,
-    _scratch_directory: Option<PathBuf>,
+    scratch_staging: ScratchStagingPolicy,
 ) -> ConversionResult<(String, ConversionStatus)> {
     if !item.input_path.exists() {
         let error_msg = format!("Source file not found: {}", item.input_path.display());
@@ -2293,7 +2558,15 @@ pub async fn process_item_with_pipeline_settings(
     apply_companion_policy_from_item(&mut request, &item);
     request.worker_count = Some(worker_count.max(1));
     item.pipeline_request = Some(request);
-    process_item(item, progress_tx, tool_paths, _file_semaphore, worker_count, _scratch_directory).await
+    process_item_with_scratch_policy(
+        item,
+        progress_tx,
+        tool_paths,
+        _file_semaphore,
+        worker_count,
+        scratch_staging,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2330,9 +2603,31 @@ pub async fn process_item(
     item: ConversionItem,
     progress_tx: broadcast::Sender<ProgressUpdate>,
     tool_paths: HashMap<String, PathBuf>,
+    file_semaphore: Arc<Semaphore>,
+    worker_count: usize,
+    scratch_directory: Option<PathBuf>,
+) -> ConversionResult<(String, ConversionStatus)> {
+    process_item_with_scratch_policy(
+        item,
+        progress_tx,
+        tool_paths,
+        file_semaphore,
+        worker_count,
+        ScratchStagingPolicy::with_default_memory_limit(scratch_directory),
+    )
+    .await
+}
+
+/// Policy-aware variant of `process_item`. This is the direct single-item path
+/// that preserves configured scratch memory limits instead of silently using
+/// `DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT`.
+pub async fn process_item_with_scratch_policy(
+    item: ConversionItem,
+    progress_tx: broadcast::Sender<ProgressUpdate>,
+    tool_paths: HashMap<String, PathBuf>,
     _file_semaphore: Arc<Semaphore>,
     worker_count: usize,
-    _scratch_directory: Option<PathBuf>,
+    scratch_staging: ScratchStagingPolicy,
 ) -> ConversionResult<(String, ConversionStatus)> {
     if !item.input_path.exists() {
         let error_msg = format!("Source file not found: {}", item.input_path.display());
@@ -2360,7 +2655,14 @@ pub async fn process_item(
         },
     });
 
-    run_single_item_with_shared_scheduler(item, progress_tx, tool_paths, worker_count).await
+    run_single_item_with_shared_scheduler(
+        item,
+        progress_tx,
+        tool_paths,
+        worker_count,
+        scratch_staging,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2454,6 +2756,7 @@ mod tests {
             },
             settings: PipelineSettings::default(),
             worker_count: Some(1),
+            scratch_staging: None,
             merge: false,
             output_root: root.join("out"),
             naming: NamingPolicy {
@@ -2497,6 +2800,232 @@ mod tests {
         item.input_path = request.container.clone();
         item.pipeline_request = Some(request);
         item
+    }
+
+    #[tokio::test]
+    async fn scratch_queued_track_enospc_retries_disk_before_terminal_failure_publication() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scratch_root = temp.path().join("scratch");
+        let scratch_parent = scratch_root.join(".tonepoet-staging");
+        let output_root = temp.path().join("out");
+        let log_root = temp.path().join("logs");
+        std::fs::create_dir_all(&scratch_parent).expect("scratch parent");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&log_root).expect("log root");
+        let container = temp.path().join("input.flac");
+        std::fs::write(&container, b"synthetic input").expect("container");
+
+        let scratch_config = ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+            scratch_root.clone(),
+            50,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        );
+        scratch_config
+            .ensure_usable(&scratch_parent)
+            .expect("scratch usable");
+        let reservation = scratch_config.try_reserve(4096).expect("scratch reservation");
+        assert_eq!(scratch_config.active_reserved_bytes_for_test(), 4096);
+
+        let mut req = pipeline_request_for_processor_limit_test(temp.path());
+        req.job_id = "scratch-retry-job".to_string();
+        req.item_id = "scratch-retry-item".to_string();
+        req.container = container.clone();
+        req.output_root = output_root.clone();
+        req.log.root = log_root.clone();
+        req.scratch_staging = Some(scratch_config.clone());
+
+        let staging_root = scratch_parent.join("scratch-retry-job-scratch-retry-item");
+        let converted_root = staging_root.join("converted");
+        let realized_root = staging_root.join("realized");
+        std::fs::create_dir_all(&converted_root).expect("converted root");
+        std::fs::create_dir_all(&realized_root).expect("realized root");
+        let staging = StagingDir::new_with_scratch_reservation(
+            staging_root.clone(),
+            req.job_id.clone(),
+            reservation,
+        );
+
+        let track_id = TrackId {
+            source_ordinal: 0,
+            disc_number: None,
+            track_number: 1,
+        };
+        let realized_path = realized_root.join("01.wav");
+        let failed_staged_path = converted_root.join("01.flac");
+        let source = PreparedSource {
+            container: container.clone(),
+            kind: SourceKind::SingleFile,
+            tracks: vec![PreparedTrack {
+                id: track_id.clone(),
+                source_ref: TrackSourceRef::StagedFile(realized_path.clone()),
+                metadata: TrackMetadata {
+                    title: Some("Scratch Retry".to_string()),
+                    track_number: Some(1),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(44_100),
+                sample_rate: Some(44_100),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(44_100),
+                    Some(16),
+                    Some(SourceAudioCoding::Pcm),
+                ),
+                bit_depth: Some(16),
+            }],
+            album_metadata: AlbumMetadata {
+                album: Some("Scratch Retry Album".to_string()),
+                total_tracks: 1,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SingleFile,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        };
+        let disk_album_dir = output_root.join("disk-attempt-complete");
+        let plan = AlbumPlan {
+            album_dir: disk_album_dir.clone(),
+            entries: vec![PlannedTrackOutput {
+                track_id: track_id.clone(),
+                final_path: disk_album_dir.join("01.flac"),
+            }],
+        };
+        let album = scheduled_album_for_test(
+            req.clone(),
+            req.item_id.clone(),
+            staging,
+            source,
+            plan,
+            Vec::new(),
+            &scratch_parent,
+        );
+        let scratch_failed_output = ScheduledTrackOutput {
+            index: 0,
+            record: TrackRecord {
+                track_id,
+                outcome: TrackOutcome::Err(format!(
+                    "No space left on device while writing {}",
+                    failed_staged_path.display()
+                )),
+                source_ref: TrackSourceRef::StagedFile(realized_path.clone()),
+                realized_input: Some(realized_path),
+                output_file: Some(failed_staged_path),
+                commands: Vec::new(),
+                bytes_in: None,
+                bytes_out: None,
+                duration: None,
+                dsd_dst_stats: None,
+            },
+            artifact: None,
+            ok: false,
+            metadata_satisfaction: crate::convert::pipeline::PlannedMetadataSatisfaction::none(),
+        };
+
+        let retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_retry_count = retry_count.clone();
+        let hook_scratch_config = scratch_config.clone();
+        let hook_staging_root = staging_root.clone();
+        let hook_disk_album_dir = disk_album_dir.clone();
+        let hook_log_root = log_root.clone();
+        let _hook_guard = set_scheduler_disk_retry_hook_for_test(Box::new(move |disk_req| {
+            if disk_req.item_id != "scratch-retry-item" {
+                return None;
+            }
+            hook_retry_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                disk_req.scratch_staging.is_none(),
+                "disk retry request must disable scratch staging"
+            );
+            assert!(
+                !hook_staging_root.exists(),
+                "scratch staging root must be dropped before disk retry starts"
+            );
+            assert_eq!(
+                hook_scratch_config.active_reserved_bytes_for_test(),
+                0,
+                "scratch reservation must be released before disk retry starts"
+            );
+            let pre_retry_fragment_count = std::fs::read_dir(&hook_log_root)
+                .expect("log root exists before disk retry")
+                .count();
+            assert_eq!(
+                pre_retry_fragment_count, 0,
+                "scratch failure artifacts must not be published before the disk retry starts"
+            );
+            Some(crate::convert::pipeline::PipelineReport {
+                request: RedactedPipelineRequest::from(disk_req),
+                source: None,
+                plan: None,
+                artifacts: None,
+                published: Some(PublishedAlbum {
+                    album_dir: hook_disk_album_dir.clone(),
+                    entries: Vec::new(),
+                    manifest_path: None,
+                }),
+                outcome: AlbumOutcome::Complete {
+                    tracks: Vec::new(),
+                    stages: Vec::new(),
+                },
+                durable_log: None,
+                settings_fingerprint: Some(tonepoet_pipeline::fingerprint::settings_fingerprint(
+                    &disk_req.settings,
+                )),
+                manifest_path: None,
+            })
+        }));
+
+        let (progress_tx, _progress_rx) = broadcast::channel(8);
+        let result = run_album_postprocess_work(
+            album,
+            vec![scratch_failed_output],
+            HashMap::new(),
+            Arc::new(Mutex::new(HashMap::new())),
+            progress_tx,
+            Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
+            CancellationToken::new(),
+        )
+        .await;
+
+        match result {
+            QueueWorkOutput::PostProcessed { item_id, status } => {
+                assert_eq!(item_id, "scratch-retry-item");
+                match status {
+                    ConversionStatus::Completed { output_path, log_path } => {
+                        assert_eq!(output_path, disk_album_dir);
+                        assert!(log_path.is_none(), "disk retry hook returned no durable log");
+                    }
+                    other => panic!("terminal status should come from disk retry attempt, got {other:?}"),
+                }
+            }
+            _ => panic!("album postprocess should produce one terminal postprocess result"),
+        }
+
+        assert_eq!(
+            retry_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "scratch ENOSPC should trigger exactly one disk retry"
+        );
+        assert!(
+            !staging_root.exists(),
+            "scratch staging should stay cleaned after retry"
+        );
+        assert_eq!(
+            scratch_config.active_reserved_bytes_for_test(),
+            0,
+            "scratch reservation should remain released after retry"
+        );
+        let terminal_fragment_count = std::fs::read_dir(&log_root)
+            .expect("log root exists")
+            .count();
+        assert_eq!(
+            terminal_fragment_count, 0,
+            "scratch first attempt must not publish terminal failure fragments before disk retry"
+        );
     }
 
     fn processor_dispatch_request_for_path(
@@ -3190,6 +3719,7 @@ mod tests {
             None,
             2,
             Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
+            None,
         )
         .expect("prepared single-file item produces scheduler work");
 
@@ -3606,6 +4136,7 @@ mod tests {
             tool_paths: HashMap::new(),
             default_destination_directory: None,
             scratch_directory: None,
+            scratch_memory_limit_percent: DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT,
         });
 
         let metrics = processor.scheduler_metrics();

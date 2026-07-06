@@ -257,6 +257,13 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
             Span::styled("  Scratch directory:    ", theme.muted()),
             Span::styled(scratch_str, theme.bright()),
         ]),
+        Line::from(vec![
+            Span::styled("  Scratch memory limit: ", theme.muted()),
+            Span::styled(
+                format!("{}%", cfg.scratch_memory_limit_percent.min(90)),
+                theme.bright(),
+            ),
+        ]),
     ];
 
     f.render_widget(Paragraph::new(settings_lines), settings_inner);

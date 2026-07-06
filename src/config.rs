@@ -301,10 +301,19 @@ pub struct ConversionSettings {
     pub default_destination: Option<PathBuf>,
     /// Scratch/temp directory for extraction
     pub scratch_directory: Option<PathBuf>,
+    /// Maximum percentage of total RAM that scratch/tmpfs staging may reserve (0-90).
+    #[serde(default = "default_scratch_memory_limit_percent")]
+    pub scratch_memory_limit_percent: u8,
     /// Default archive password
     pub archive_password: Option<String>,
     /// Append content from Lineage.txt to COMMENT tag
     pub append_lineage_to_comment: bool,
+}
+
+pub const DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT: u8 = 50;
+
+fn default_scratch_memory_limit_percent() -> u8 {
+    DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT
 }
 
 fn default_worker_count() -> usize {
@@ -328,6 +337,7 @@ impl Default for ConversionSettings {
             persist_queue: true,
             default_destination: None,
             scratch_directory: None,
+            scratch_memory_limit_percent: default_scratch_memory_limit_percent(),
             archive_password: None,
             append_lineage_to_comment: false,
         }
@@ -434,6 +444,31 @@ compare_keep_reference = false
 
         assert_eq!(config.performance.browsing.archive_listing, "auto");
         assert_eq!(config.performance.browsing.archive_listing_timeout, 30);
+    }
+
+
+    #[test]
+    fn conversion_scratch_memory_limit_defaults_when_missing_from_toml() {
+        let config: TonepoetConfig = toml::from_str(
+            r#"
+[conversion]
+preferred_backend = "ffmpeg"
+worker_count = 2
+process_priority = 0
+calculate_replaygain = true
+generate_cue_files = false
+cue_generation_mode = "IfMerging"
+write_log_file = false
+persist_queue = true
+append_lineage_to_comment = false
+"#,
+        )
+        .expect("config parses without scratch memory limit");
+
+        assert_eq!(
+            config.conversion.scratch_memory_limit_percent,
+            DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT
+        );
     }
 
     #[test]

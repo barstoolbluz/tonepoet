@@ -14,6 +14,8 @@ use tonepoet_pipeline::PipelineSettings;
 
 use crate::disc::bluray_backend::BluRayAudioCoding;
 
+use super::memory_budget::{ScratchReservation, ScratchStagingConfig};
+
 fn deserialize_optional_nonzero_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -357,6 +359,13 @@ pub struct PipelineRequest {
     pub settings: PipelineSettings,
     /// Worker pool size for this job. None means cores-1.
     pub worker_count: Option<usize>,
+    /// Optional RAM/scratch staging configuration injected by processor entry points.
+    ///
+    /// This is intentionally not serialized: persisted requests remain portable,
+    /// and old/default behavior is preserved unless the current process explicitly
+    /// supplies a scratch staging policy.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub scratch_staging: Option<ScratchStagingConfig>,
     pub merge: bool,
     pub output_root: PathBuf,
     pub naming: NamingPolicy,
@@ -2059,6 +2068,7 @@ pub struct StagingDir {
     pub root: PathBuf,
     pub job_id: String,
     armed: bool,
+    scratch_reservation: Option<ScratchReservation>,
 }
 
 impl StagingDir {
@@ -2067,11 +2077,30 @@ impl StagingDir {
             root,
             job_id,
             armed: true,
+            scratch_reservation: None,
+        }
+    }
+
+    pub fn new_with_scratch_reservation(
+        root: PathBuf,
+        job_id: String,
+        scratch_reservation: ScratchReservation,
+    ) -> Self {
+        Self {
+            root,
+            job_id,
+            armed: true,
+            scratch_reservation: Some(scratch_reservation),
         }
     }
 
     pub fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    #[must_use]
+    pub fn is_scratch_staging(&self) -> bool {
+        self.scratch_reservation.is_some()
     }
 
     /// Construct a non-owning staging handle for worker tasks that need the
@@ -2081,6 +2110,7 @@ impl StagingDir {
             root,
             job_id,
             armed: false,
+            scratch_reservation: None,
         }
     }
 }

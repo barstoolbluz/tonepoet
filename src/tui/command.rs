@@ -4653,6 +4653,7 @@ fn execute_commit_with_source_options_transform(
                         });
                     item.pipeline_request = Some(PipelineRequest {
                         worker_count: None,
+                        scratch_staging: None,
                         job_id: format!("job-{}", item.id),
                         item_id: item.id.clone(),
                         container: item.input_path.clone(),

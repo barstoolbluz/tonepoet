@@ -635,6 +635,7 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         tool_paths: std::collections::HashMap::new(),
         default_destination_directory: app.config.conversion.default_destination.clone(),
         scratch_directory: app.config.conversion.scratch_directory.clone(),
+        scratch_memory_limit_percent: app.config.conversion.scratch_memory_limit_percent,
     };
 
     let tx_clone = tx.clone();

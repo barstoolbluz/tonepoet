@@ -751,6 +751,7 @@ async fn run_convert(
             .clone()
             .or_else(|| config.conversion.default_destination.clone()),
         scratch_directory: config.conversion.scratch_directory.clone(),
+        scratch_memory_limit_percent: config.conversion.scratch_memory_limit_percent,
     };
 
     let mut processor = ConversionProcessor::new(processor_config);
@@ -1025,6 +1026,7 @@ fn build_pipeline_request_template(
 
     Some(PipelineRequest {
         worker_count: None,
+        scratch_staging: None,
         job_id: String::new(),     // filled per-item
         item_id: String::new(),    // filled per-item
         container: PathBuf::new(), // filled per-item

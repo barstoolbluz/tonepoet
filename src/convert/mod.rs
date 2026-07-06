@@ -464,6 +464,7 @@ impl ConversionManager {
             tool_paths: config.tool_paths.clone(),
             default_destination_directory: None,
             scratch_directory: None,
+            scratch_memory_limit_percent: crate::config::DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT,
         });
 
         Self {
@@ -1336,6 +1337,7 @@ mod bluray_queue_admission_tests {
             },
             settings: tonepoet_pipeline::PipelineSettings::default(),
             worker_count: None,
+            scratch_staging: None,
             merge: false,
             output_root: path
                 .parent()

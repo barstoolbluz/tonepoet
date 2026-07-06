@@ -125,6 +125,7 @@ pub fn build_pipeline_request_from_settings(
         },
         settings,
         worker_count: None,
+        scratch_staging: None,
         merge: item.options.merge_to_single,
         output_root: output_root.clone(),
         naming: NamingPolicy {

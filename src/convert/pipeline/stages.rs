@@ -33,6 +33,7 @@ use super::materializer_bluray::{is_bluray_candidate, BlurayMaterializer};
 use super::dvdv_realize::realize_dvdv_track;
 use super::bluray_realize::realize_bluray_track;
 use super::materializer_single::SingleFileMaterializer;
+use super::memory_budget::{estimate_job_peak_bytes, write_staging_owner_marker, ScratchReservation};
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
     execute_planned_track_conversion, run_tool_command_with_concurrency,
@@ -4821,6 +4822,7 @@ FILE "album.flac" WAVE
             },
             settings,
             worker_count: Some(1),
+            scratch_staging: None,
             merge: false,
             output_root: root.join("out"),
             naming: NamingPolicy {
@@ -5838,6 +5840,14 @@ fn publish_terminal_conversion_log_fragment_if_needed(
     }
 }
 
+enum PreMaterializationLogFragmentAttempt {
+    Published(PublishedAlbum),
+    Skipped {
+        storage_exhaustion: bool,
+        context: &'static str,
+    },
+}
+
 fn publish_pre_materialization_conversion_log_fragment_without_existing_staging(
     req: &PipelineRequest,
     outcome: &AlbumOutcome,
@@ -5846,13 +5856,56 @@ fn publish_pre_materialization_conversion_log_fragment_without_existing_staging(
         return None;
     }
 
-    let staging_parent = staging_parent_for(req);
+    let initial_selection = select_staging_parent_for(req);
+    let initial_was_scratch = initial_selection.is_scratch();
+    match publish_pre_materialization_conversion_log_fragment_with_selection(
+        req,
+        outcome,
+        initial_selection,
+    ) {
+        PreMaterializationLogFragmentAttempt::Published(album) => Some(album),
+        PreMaterializationLogFragmentAttempt::Skipped {
+            storage_exhaustion,
+            context,
+        } if initial_was_scratch && storage_exhaustion => {
+            log::warn!(
+                "scratch pre-materialization conversion-log fragment publish for item {} failed with storage exhaustion during {context}; retrying once with disk staging",
+                req.item_id
+            );
+            match publish_pre_materialization_conversion_log_fragment_with_selection(
+                req,
+                outcome,
+                StagingParentSelection::disk(disk_staging_parent_for(req)),
+            ) {
+                PreMaterializationLogFragmentAttempt::Published(album) => Some(album),
+                PreMaterializationLogFragmentAttempt::Skipped { context, .. } => {
+                    log::warn!(
+                        "disk fallback pre-materialization conversion-log fragment publish for item {} also skipped during {context}",
+                        req.item_id
+                    );
+                    None
+                }
+            }
+        }
+        PreMaterializationLogFragmentAttempt::Skipped { .. } => None,
+    }
+}
+
+fn publish_pre_materialization_conversion_log_fragment_with_selection(
+    req: &PipelineRequest,
+    outcome: &AlbumOutcome,
+    staging_allocation: StagingParentSelection,
+) -> PreMaterializationLogFragmentAttempt {
+    let staging_parent = staging_allocation.parent.clone();
     if let Err(err) = fs::create_dir_all(&staging_parent) {
         log::warn!(
             "pre-materialization conversion log fragment staging parent creation skipped for {}: {err}",
             req.item_id
         );
-        return None;
+        return PreMaterializationLogFragmentAttempt::Skipped {
+            storage_exhaustion: is_storage_exhaustion_io_error(&err),
+            context: "staging parent creation",
+        };
     }
 
     let _run_lock = match acquire_run_lock(&staging_parent, &req.job_id, &req.item_id) {
@@ -5862,7 +5915,10 @@ fn publish_pre_materialization_conversion_log_fragment_without_existing_staging(
                 "pre-materialization conversion log fragment run lock skipped for {}: {err}",
                 req.item_id
             );
-            return None;
+            return PreMaterializationLogFragmentAttempt::Skipped {
+                storage_exhaustion: materialize_error_is_storage_exhaustion(&err),
+                context: "run lock acquisition",
+            };
         }
     };
 
@@ -5872,15 +5928,63 @@ fn publish_pre_materialization_conversion_log_fragment_without_existing_staging(
         sanitize_component(&req.item_id)
     ));
     let _ = delete_stale_staging_dir(&staging_root);
+    let using_scratch_staging = staging_allocation.is_scratch();
     if let Err(err) = fs::create_dir_all(&staging_root) {
         log::warn!(
             "pre-materialization conversion log fragment staging directory creation skipped for {}: {err}",
             req.item_id
         );
-        return None;
+        return PreMaterializationLogFragmentAttempt::Skipped {
+            storage_exhaustion: is_storage_exhaustion_io_error(&err),
+            context: "staging directory creation",
+        };
     }
-    let staging = StagingDir::new(staging_root, req.job_id.clone());
-    publish_pre_materialization_conversion_log_fragment_if_needed(req, outcome, staging)
+    if using_scratch_staging {
+        mark_staging_root_best_effort(&staging_root, req);
+    }
+    let staging = staging_allocation.into_staging_dir(staging_root, req.job_id.clone());
+
+    let staged_artifacts = match stage_pre_materialization_conversion_log_fragment(outcome, req, &staging) {
+        Ok(artifacts) => artifacts,
+        Err(err) => {
+            log::warn!(
+                "pre-materialization conversion log fragment staging skipped for {}: {err}",
+                req.item_id
+            );
+            return PreMaterializationLogFragmentAttempt::Skipped {
+                storage_exhaustion: is_storage_exhaustion_io_error(&err),
+                context: "fragment staging write",
+            };
+        }
+    };
+
+    let publish_plan = match build_publish_plan_for_fragment_or_fallback(&staged_artifacts, req) {
+        Ok(plan) => plan,
+        Err(err) => {
+            log::warn!(
+                "pre-materialization conversion log fragment publish plan skipped for {}: {err}",
+                req.item_id
+            );
+            return PreMaterializationLogFragmentAttempt::Skipped {
+                storage_exhaustion: false,
+                context: "publish plan construction",
+            };
+        }
+    };
+
+    match publish_album_output(staging, &publish_plan, req.publish.clone(), None) {
+        Ok(album) => PreMaterializationLogFragmentAttempt::Published(album),
+        Err(err) => {
+            log::warn!(
+                "pre-materialization conversion log fragment publish skipped for {}: {err}",
+                req.item_id
+            );
+            PreMaterializationLogFragmentAttempt::Skipped {
+                storage_exhaustion: false,
+                context: "publish",
+            }
+        }
+    }
 }
 
 fn publish_pre_materialization_conversion_log_fragment_if_needed(
@@ -11269,6 +11373,29 @@ impl ScheduledAlbum {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn scheduled_album_for_test(
+    req: PipelineRequest,
+    item_id: String,
+    staging: StagingDir,
+    source: PreparedSource,
+    plan: AlbumPlan,
+    stages: Vec<StageRecord>,
+    run_lock_parent: &Path,
+) -> ScheduledAlbum {
+    let run_lock = acquire_run_lock(run_lock_parent, &req.job_id, &req.item_id)
+        .expect("scheduled album test run lock");
+    ScheduledAlbum {
+        req,
+        item_id,
+        staging,
+        source,
+        plan,
+        stages,
+        _run_lock: run_lock,
+    }
+}
+
 /// Run validation, staging setup, source materialization, and output planning.
 /// Track conversion is intentionally not performed here; the caller submits
 /// each ready track as an independent shared-pool work unit.
@@ -11316,34 +11443,20 @@ pub async fn prepare_pipeline_item_for_scheduler(
         );
     }
 
-    let staging_parent = staging_parent_for(&req);
-    if let Err(err) = fs::create_dir_all(&staging_parent) {
-        let record = stage_record(
-            PipelineStage::Materialize,
-            StageOutcome::Failed(format!("could not create staging parent directory: {err}")),
-        );
-        emit_stage_finished(reporter, &item_id, record.clone()).await;
-        stages.push(record);
-        let outcome = AlbumOutcome::Blocked {
-            successful: Vec::new(),
-            failed: Vec::new(),
-            stages,
-            reason: BlockReason::MaterializeFailed,
-        };
-        let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
-            &req,
-            &outcome,
-            "staging parent creation failed",
-        );
-        return ScheduledMaterialization::Finished(
-            finalize_report(&req, reporter, source, plan, None, published, outcome).await,
-        );
-    }
-
-    let run_lock = match acquire_run_lock(&staging_parent, &req.job_id, &req.item_id) {
-        Ok(lock) => lock,
-        Err(err) => {
-            let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(err.to_string()));
+    emit_stage_started(reporter, &item_id, PipelineStage::Materialize).await;
+    let materialization = materialize_with_optional_disk_retry(
+        &req,
+        select_staging_parent_for(&req),
+        runner,
+        Some(reporter),
+        tool_paths,
+        cancel,
+    )
+    .await;
+    let (attempt, materialized) = match materialization {
+        MaterializationRun::Attempted { attempt, result } => (attempt, result),
+        MaterializationRun::FailedBeforeAttempt { error, context } => {
+            let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(error.to_string()));
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
             let outcome = AlbumOutcome::Blocked {
@@ -11355,57 +11468,14 @@ pub async fn prepare_pipeline_item_for_scheduler(
             let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
                 &req,
                 &outcome,
-                "run lock acquisition failed",
+                context,
             );
             return ScheduledMaterialization::Finished(
                 finalize_report(&req, reporter, source, plan, None, published, outcome).await,
             );
         }
     };
-
-    let staging_root = staging_parent.join(format!(
-        "{}-{}",
-        sanitize_component(&req.job_id),
-        sanitize_component(&req.item_id)
-    ));
-    let _ = delete_stale_staging_dir(&staging_root);
-    let staging = StagingDir::new(staging_root, req.job_id.clone());
-
-    if let Err(err) = fs::create_dir_all(&staging.root) {
-        let record = stage_record(
-            PipelineStage::Materialize,
-            StageOutcome::Failed(format!("could not create staging directory: {err}")),
-        );
-        emit_stage_finished(reporter, &item_id, record.clone()).await;
-        stages.push(record);
-        let outcome = AlbumOutcome::Blocked {
-            successful: Vec::new(),
-            failed: Vec::new(),
-            stages,
-            reason: BlockReason::MaterializeFailed,
-        };
-        let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
-            &req,
-            &outcome,
-            "staging directory creation failed",
-        );
-        return ScheduledMaterialization::Finished(
-            finalize_report(&req, reporter, source, plan, None, published, outcome).await,
-        );
-    }
-
-    emit_stage_started(reporter, &item_id, PipelineStage::Materialize).await;
-    let materialized = match detect_source_kind(&req) {
-        Ok(kind) => match materializer_for(kind) {
-            Ok(materializer) => {
-                materializer
-                    .materialize(&req, &staging, runner, Some(reporter), tool_paths, cancel)
-                    .await
-            }
-            Err(err) => Err(MaterializeError::Parse(err.to_string())),
-        },
-        Err(err) => Err(MaterializeError::Parse(err.to_string())),
-    };
+    let (_run_lock, staging) = attempt.into_parts();
 
     let mut prepared = match materialized {
         Ok(prepared) => {
@@ -11540,7 +11610,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
         source: prepared,
         plan: album_plan,
         stages,
-        _run_lock: run_lock,
+        _run_lock,
     })
 }
 
@@ -12033,6 +12103,32 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     stages.push(converted.record.clone());
     let tracks = converted.tracks.clone();
     let mut artifacts = Some(converted.artifacts);
+    let staging_is_scratch = staging.is_scratch_staging();
+    let staging_root_for_retry = staging.root.clone();
+
+    macro_rules! return_before_failure_publication_if_retryable_scratch {
+        ($outcome:expr) => {{
+            let outcome_for_retry = $outcome;
+            if should_defer_terminal_failure_publication_for_scratch_retry_with_root(
+                &req,
+                staging_is_scratch,
+                &staging_root_for_retry,
+                &outcome_for_retry,
+            ) {
+                log::warn!(
+                    "scratch-backed item {} hit scratch-scoped storage exhaustion during postprocess; deferring terminal failure publication for one disk retry",
+                    item_id
+                );
+                return retryable_scratch_failure_report_without_publication(
+                    &req,
+                    source,
+                    plan,
+                    artifacts,
+                    outcome_for_retry,
+                );
+            }
+        }};
+    }
 
     let mut current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if cancel.is_cancelled() {
@@ -12058,7 +12154,8 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         };
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        published = publish_terminal_conversion_log_fragment_if_needed(
+        return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+                published = publish_terminal_conversion_log_fragment_if_needed(
             &req,
             source.as_ref(),
             artifacts.as_ref(),
@@ -12091,6 +12188,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
                 current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
                 published = publish_terminal_conversion_log_fragment_if_needed(
                     &req,
                     source.as_ref(),
@@ -12141,7 +12239,8 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                     emit_stage_finished(reporter, &item_id, record.clone()).await;
                     stages.push(record);
                     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                    published = publish_terminal_conversion_log_fragment_if_needed(
+                    return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+                published = publish_terminal_conversion_log_fragment_if_needed(
                         &req,
                         source.as_ref(),
                         artifacts.as_ref(),
@@ -12179,6 +12278,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
                 current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
                 published = publish_terminal_conversion_log_fragment_if_needed(
                     &req,
                     source.as_ref(),
@@ -12198,7 +12298,8 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
 
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        published = publish_terminal_conversion_log_fragment_if_needed(
+        return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+                published = publish_terminal_conversion_log_fragment_if_needed(
             &req,
             source.as_ref(),
             artifacts.as_ref(),
@@ -12232,6 +12333,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
                 current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
                 published = publish_terminal_conversion_log_fragment_if_needed(
                     &req,
                     source.as_ref(),
@@ -12263,7 +12365,8 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        published = publish_terminal_conversion_log_fragment_if_needed(
+        return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+                published = publish_terminal_conversion_log_fragment_if_needed(
             &req,
             source.as_ref(),
             artifacts.as_ref(),
@@ -12313,6 +12416,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 stages: stages_from(&current_outcome),
                 reason: BlockReason::PublishFailed,
             };
+            return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
             return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
         }
     }
@@ -12351,6 +12455,59 @@ pub async fn run_pipeline_item_with_tool_paths(
 }
 
 pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
+    req: PipelineRequest,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> PipelineReport {
+    let scratch_retry_root = req.scratch_staging.as_ref().map(|scratch| scratch.root().to_path_buf());
+    let output_root = req.output_root.clone();
+    let retry_on_disk = scratch_retry_root.is_some();
+    let disk_retry_req = retry_on_disk.then(|| request_without_scratch_staging(&req));
+    let item_id = req.item_id.clone();
+
+    let report = run_pipeline_item_with_tool_paths_and_tool_limits_once(
+        req,
+        runner,
+        reporter,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits.clone(),
+    )
+    .await;
+
+    let Some(disk_req) = disk_retry_req else {
+        return report;
+    };
+    if cancel.is_cancelled()
+        || report.published.is_some()
+        || !pipeline_report_has_scratch_scoped_storage_exhaustion_for_retry(
+            &report,
+            scratch_retry_root.as_deref(),
+            &output_root,
+        )
+    {
+        return report;
+    }
+
+    log::warn!(
+        "scratch-backed item {} failed after admission with scratch-scoped storage exhaustion before terminal failure publication; retrying the whole item once on disk",
+        item_id
+    );
+    run_pipeline_item_with_tool_paths_and_tool_limits_once(
+        disk_req,
+        runner,
+        reporter,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits,
+    )
+    .await
+}
+
+async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     req: PipelineRequest,
     runner: &dyn ToolRunner,
     reporter: &dyn PipelineReporter,
@@ -12398,33 +12555,22 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
         return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
     }
 
-    let staging_parent = staging_parent_for(&req);
-    if let Err(err) = fs::create_dir_all(&staging_parent) {
-        let record = stage_record(
-            PipelineStage::Materialize,
-            StageOutcome::Failed(format!("could not create staging parent directory: {err}")),
-        );
-        emit_stage_finished(reporter, &item_id, record.clone()).await;
-        stages.push(record);
-        let outcome = AlbumOutcome::Blocked {
-            successful: Vec::new(),
-            failed: Vec::new(),
-            stages,
-            reason: BlockReason::MaterializeFailed,
-        };
-        let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
-            &req,
-            &outcome,
-            "staging parent creation failed",
-        );
-        return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
-    }
-    let _run_lock = match acquire_run_lock(&staging_parent, &req.job_id, &req.item_id) {
-        Ok(lock) => lock,
-        Err(err) => {
+    emit_stage_started(reporter, &item_id, PipelineStage::Materialize).await;
+    let materialization = materialize_with_optional_disk_retry(
+        &req,
+        select_staging_parent_for(&req),
+        runner,
+        Some(reporter),
+        tool_paths,
+        cancel,
+    )
+    .await;
+    let (attempt, materialized) = match materialization {
+        MaterializationRun::Attempted { attempt, result } => (attempt, result),
+        MaterializationRun::FailedBeforeAttempt { error, context } => {
             let record = stage_record(
                 PipelineStage::Materialize,
-                StageOutcome::Failed(err.to_string()),
+                StageOutcome::Failed(error.to_string()),
             );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
@@ -12437,53 +12583,40 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
                 &req,
                 &outcome,
-                "run lock acquisition failed",
+                context,
             );
             return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
                 .await;
         }
     };
-    let staging_root = staging_parent.join(format!(
-        "{}-{}",
-        sanitize_component(&req.job_id),
-        sanitize_component(&req.item_id)
-    ));
-    let _ = delete_stale_staging_dir(&staging_root);
-    let staging = StagingDir::new(staging_root, req.job_id.clone());
+    let (_run_lock, staging) = attempt.into_parts();
+    let staging_root_for_retry = staging.root.clone();
+    let staging_was_scratch_for_retry = staging.is_scratch_staging();
 
-    if let Err(err) = fs::create_dir_all(&staging.root) {
-        let record = stage_record(
-            PipelineStage::Materialize,
-            StageOutcome::Failed(format!("could not create staging directory: {err}")),
-        );
-        emit_stage_finished(reporter, &item_id, record.clone()).await;
-        stages.push(record);
-        let outcome = AlbumOutcome::Blocked {
-            successful: Vec::new(),
-            failed: Vec::new(),
-            stages,
-            reason: BlockReason::MaterializeFailed,
-        };
-        let published = publish_pre_materialization_terminal_batch_failure_or_finalize(
-            &req,
-            &outcome,
-            "staging directory creation failed",
-        );
-        return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
+    macro_rules! return_before_failure_publication_if_retryable_scratch {
+        ($outcome:expr) => {{
+            let outcome_for_retry = $outcome;
+            if should_defer_terminal_failure_publication_for_scratch_retry_with_root(
+                &req,
+                staging_was_scratch_for_retry,
+                &staging_root_for_retry,
+                &outcome_for_retry,
+            ) {
+                log::warn!(
+                    "scratch-backed item {} hit scratch-scoped storage exhaustion; deferring terminal failure publication for one disk retry",
+                    item_id
+                );
+                return retryable_scratch_failure_report_without_publication(
+                    &req,
+                    source,
+                    plan,
+                    artifacts,
+                    outcome_for_retry,
+                );
+            }
+        }};
     }
 
-    emit_stage_started(reporter, &item_id, PipelineStage::Materialize).await;
-    let materialized = match detect_source_kind(&req) {
-        Ok(kind) => match materializer_for(kind) {
-            Ok(materializer) => {
-                materializer
-                    .materialize(&req, &staging, runner, Some(reporter), tool_paths, cancel)
-                    .await
-            }
-            Err(err) => Err(MaterializeError::Parse(err.to_string())),
-        },
-        Err(err) => Err(MaterializeError::Parse(err.to_string())),
-    };
     match materialized {
         Ok(prepared) => {
             let record = stage_record(PipelineStage::Materialize, StageOutcome::Ok);
@@ -12507,6 +12640,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 reason: BlockReason::EncryptedSource,
             };
             let source = Some(blocked.source);
+            return_before_failure_publication_if_retryable_scratch!(outcome.clone());
             let published = publish_terminal_conversion_log_fragment_if_needed(
                 &req,
                 source.as_ref(),
@@ -12548,6 +12682,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             let published = if cancelled {
                 finalize_cancelled_conversion_log_batch_if_needed(&req)
             } else {
+                return_before_failure_publication_if_retryable_scratch!(outcome.clone());
                 publish_terminal_conversion_log_fragment_if_needed(
                     &req,
                     None,
@@ -12605,6 +12740,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages,
                 reason: BlockReason::PlanFailed,
             };
+            return_before_failure_publication_if_retryable_scratch!(outcome.clone());
             published = publish_terminal_conversion_log_fragment_if_needed(
                 &req,
                 source.as_ref(),
@@ -12670,7 +12806,8 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
         };
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        published = publish_terminal_conversion_log_fragment_if_needed(
+        return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            published = publish_terminal_conversion_log_fragment_if_needed(
             &req,
             source.as_ref(),
             artifacts.as_ref(),
@@ -12714,7 +12851,8 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages.push(record);
                 current_outcome =
                     aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                published = publish_terminal_conversion_log_fragment_if_needed(
+                return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            published = publish_terminal_conversion_log_fragment_if_needed(
                     &req,
                     source.as_ref(),
                     artifacts.as_ref(),
@@ -12774,7 +12912,8 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                     stages.push(record);
                     current_outcome =
                         aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                    published = publish_terminal_conversion_log_fragment_if_needed(
+                    return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            published = publish_terminal_conversion_log_fragment_if_needed(
                         &req,
                         source.as_ref(),
                         artifacts.as_ref(),
@@ -12825,7 +12964,8 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages.push(record);
                 current_outcome =
                     aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                published = publish_terminal_conversion_log_fragment_if_needed(
+                return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            published = publish_terminal_conversion_log_fragment_if_needed(
                     &req,
                     source.as_ref(),
                     artifacts.as_ref(),
@@ -12853,7 +12993,8 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
 
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        published = publish_terminal_conversion_log_fragment_if_needed(
+        return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            published = publish_terminal_conversion_log_fragment_if_needed(
             &req,
             source.as_ref(),
             artifacts.as_ref(),
@@ -12900,7 +13041,8 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages.push(record);
                 current_outcome =
                     aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
-                published = publish_terminal_conversion_log_fragment_if_needed(
+                return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            published = publish_terminal_conversion_log_fragment_if_needed(
                     &req,
                     source.as_ref(),
                     artifacts.as_ref(),
@@ -12949,7 +13091,8 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
         .await;
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
-        published = publish_terminal_conversion_log_fragment_if_needed(
+        return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            published = publish_terminal_conversion_log_fragment_if_needed(
             &req,
             source.as_ref(),
             artifacts.as_ref(),
@@ -13004,6 +13147,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
                 stages,
                 reason: BlockReason::PublishFailed,
             };
+            return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
             return finalize_report(
                 &req,
                 reporter,
@@ -13909,6 +14053,7 @@ mod companion_copy_hardening_tests {
             },
             settings: tonepoet_pipeline::PipelineSettings::default(),
             worker_count: Some(1),
+            scratch_staging: None,
             merge: false,
             output_root: root.join("out"),
             naming: NamingPolicy {
@@ -16183,7 +16328,19 @@ fn copy_or_rename_into_publish_temp(
     dst: &Path,
     same_filesystem_required: bool,
 ) -> Result<(), PublishError> {
-    match fs::rename(src, dst) {
+    copy_or_rename_into_publish_temp_with(src, dst, same_filesystem_required, |from, to| fs::rename(from, to))
+}
+
+fn copy_or_rename_into_publish_temp_with<F>(
+    src: &Path,
+    dst: &Path,
+    same_filesystem_required: bool,
+    rename: F,
+) -> Result<(), PublishError>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    match rename(src, dst) {
         Ok(()) => Ok(()),
         Err(err) if is_cross_device_error(&err) => {
             if same_filesystem_required {
@@ -16245,15 +16402,30 @@ fn acquire_run_lock(
     job_id: &str,
     item_id: &str,
 ) -> Result<FileLock, MaterializeError> {
-    let lock_path = staging_parent.join(format!(
-        ".{}-{}.run.lock",
-        sanitize_component(job_id),
-        sanitize_component(item_id)
-    ));
+    let lock_path = staging_parent.join(run_lock_file_name(job_id, item_id));
     acquire_file_lock(&lock_path, "pipeline item is already running").map_err(|err| match err {
         LockAcquireError::Busy(message) => MaterializeError::Parse(message),
         LockAcquireError::Io(err) => MaterializeError::Io(err),
     })
+}
+
+fn run_lock_file_name(job_id: &str, item_id: &str) -> String {
+    format!(
+        ".{}-{}.run.lock",
+        sanitize_component(job_id),
+        sanitize_component(item_id)
+    )
+}
+
+fn mark_staging_root_best_effort(staging_root: &Path, req: &PipelineRequest) {
+    let lock_file_name = run_lock_file_name(&req.job_id, &req.item_id);
+    if let Err(err) = write_staging_owner_marker(staging_root, &lock_file_name) {
+        log::warn!(
+            "could not write scratch staging owner marker for {} at {}: {err}",
+            req.item_id,
+            staging_root.display()
+        );
+    }
 }
 
 fn acquire_file_lock(lock_path: &Path, busy_message: &str) -> Result<FileLock, LockAcquireError> {
@@ -16426,7 +16598,591 @@ fn unique_path(parent: &Path, prefix: &str) -> PathBuf {
     parent.join(format!("{prefix}-{nanos}-fallback"))
 }
 
+#[derive(Debug)]
+struct StagingParentSelection {
+    parent: PathBuf,
+    scratch_reservation: Option<ScratchReservation>,
+}
+
+impl StagingParentSelection {
+    fn disk(parent: PathBuf) -> Self {
+        Self {
+            parent,
+            scratch_reservation: None,
+        }
+    }
+
+    fn scratch(parent: PathBuf, scratch_reservation: ScratchReservation) -> Self {
+        Self {
+            parent,
+            scratch_reservation: Some(scratch_reservation),
+        }
+    }
+
+    fn is_scratch(&self) -> bool {
+        self.scratch_reservation.is_some()
+    }
+
+    fn into_staging_dir(self, staging_root: PathBuf, job_id: String) -> StagingDir {
+        match self.scratch_reservation {
+            Some(reservation) => {
+                StagingDir::new_with_scratch_reservation(staging_root, job_id, reservation)
+            }
+            None => StagingDir::new(staging_root, job_id),
+        }
+    }
+}
+
+struct MaterializationAttempt {
+    staging: StagingDir,
+    _run_lock: FileLock,
+    used_scratch: bool,
+}
+
+impl MaterializationAttempt {
+    fn into_parts(self) -> (FileLock, StagingDir) {
+        (self._run_lock, self.staging)
+    }
+}
+
+enum MaterializationRun {
+    Attempted {
+        attempt: MaterializationAttempt,
+        result: Result<PreparedSource, MaterializeError>,
+    },
+    FailedBeforeAttempt {
+        error: MaterializeError,
+        context: &'static str,
+    },
+}
+
+async fn materialize_with_optional_disk_retry(
+    req: &PipelineRequest,
+    initial_selection: StagingParentSelection,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+) -> MaterializationRun {
+    let initial_was_scratch = initial_selection.is_scratch();
+    let mut attempt = match prepare_materialization_attempt(req, initial_selection) {
+        Ok(attempt) => attempt,
+        Err(err) if initial_was_scratch
+            && !cancel.is_cancelled()
+            && materialize_error_is_storage_exhaustion(&err) => {
+            log::warn!(
+                "scratch staging setup for item {} exhausted scratch storage ({}); retrying materialization once on disk",
+                req.item_id,
+                err
+            );
+            match prepare_disk_materialization_attempt(req) {
+                Ok(attempt) => attempt,
+                Err(disk_err) => {
+                    return MaterializationRun::FailedBeforeAttempt {
+                        error: MaterializeError::Parse(format!(
+                            "scratch staging setup exhausted storage ({err}); disk fallback setup also failed: {disk_err}"
+                        )),
+                        context: "scratch staging setup exhausted storage and disk fallback setup failed",
+                    };
+                }
+            }
+        }
+        Err(err) => {
+            return MaterializationRun::FailedBeforeAttempt {
+                error: err,
+                context: "staging preparation failed",
+            };
+        }
+    };
+
+    let mut result = materialize_source_once(
+        req,
+        &attempt.staging,
+        runner,
+        reporter,
+        tool_paths,
+        cancel,
+    )
+    .await;
+
+    if attempt.used_scratch {
+        let should_retry = !cancel.is_cancelled()
+            && result
+                .as_ref()
+                .err()
+                .map(materialize_error_is_storage_exhaustion)
+                .unwrap_or(false);
+
+        if should_retry {
+            let scratch_error = result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unknown scratch storage exhaustion".to_string());
+            log::warn!(
+                "scratch materialization for item {} failed with storage exhaustion ({}); releasing scratch reservation and retrying once on disk",
+                req.item_id,
+                scratch_error
+            );
+
+            drop(attempt);
+            attempt = match prepare_disk_materialization_attempt(req) {
+                Ok(disk_attempt) => disk_attempt,
+                Err(disk_err) => {
+                    return MaterializationRun::FailedBeforeAttempt {
+                        error: MaterializeError::Parse(format!(
+                            "scratch materialization exhausted storage ({scratch_error}); disk fallback setup failed: {disk_err}"
+                        )),
+                        context: "scratch materialization exhausted storage and disk fallback setup failed",
+                    };
+                }
+            };
+
+            result = materialize_source_once(
+                req,
+                &attempt.staging,
+                runner,
+                reporter,
+                tool_paths,
+                cancel,
+            )
+            .await;
+
+            match &result {
+                Ok(_) => log::info!(
+                    "disk fallback materialization succeeded for item {} after scratch storage exhaustion",
+                    req.item_id
+                ),
+                Err(err) => log::warn!(
+                    "disk fallback materialization also failed for item {} after scratch storage exhaustion: {}",
+                    req.item_id,
+                    err
+                ),
+            }
+        } else if let Err(err) = &result {
+            log::debug!(
+                "scratch materialization for item {} failed without storage-exhaustion classification; not retrying on disk: {}",
+                req.item_id,
+                err
+            );
+        }
+    }
+
+    MaterializationRun::Attempted { attempt, result }
+}
+
+async fn materialize_source_once(
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+) -> Result<PreparedSource, MaterializeError> {
+    match detect_source_kind(req) {
+        Ok(kind) => match materializer_for(kind) {
+            Ok(materializer) => {
+                materializer
+                    .materialize(req, staging, runner, reporter, tool_paths, cancel)
+                    .await
+            }
+            Err(err) => Err(MaterializeError::Parse(err.to_string())),
+        },
+        Err(err) => Err(MaterializeError::Parse(err.to_string())),
+    }
+}
+
+fn prepare_disk_materialization_attempt(req: &PipelineRequest) -> Result<MaterializationAttempt, MaterializeError> {
+    prepare_materialization_attempt(req, StagingParentSelection::disk(disk_staging_parent_for(req)))
+}
+
+fn prepare_materialization_attempt(
+    req: &PipelineRequest,
+    selection: StagingParentSelection,
+) -> Result<MaterializationAttempt, MaterializeError> {
+    let staging_parent = selection.parent.clone();
+    fs::create_dir_all(&staging_parent).map_err(MaterializeError::Io)?;
+    let run_lock = acquire_run_lock(&staging_parent, &req.job_id, &req.item_id)?;
+    let staging_root = staging_parent.join(format!(
+        "{}-{}",
+        sanitize_component(&req.job_id),
+        sanitize_component(&req.item_id)
+    ));
+    let _ = delete_stale_staging_dir(&staging_root);
+    let used_scratch = selection.is_scratch();
+    let staging = selection.into_staging_dir(staging_root, req.job_id.clone());
+    fs::create_dir_all(&staging.root).map_err(MaterializeError::Io)?;
+    if used_scratch {
+        mark_staging_root_best_effort(&staging.root, req);
+    }
+
+    Ok(MaterializationAttempt {
+        staging,
+        _run_lock: run_lock,
+        used_scratch,
+    })
+}
+
+fn request_without_scratch_staging(req: &PipelineRequest) -> PipelineRequest {
+    let mut disk_req = req.clone();
+    disk_req.scratch_staging = None;
+    disk_req
+}
+
+pub fn scheduled_track_outputs_have_storage_exhaustion_for_scratch_retry(
+    outputs: &[ScheduledTrackOutput],
+) -> bool {
+    outputs
+        .iter()
+        .any(|output| track_record_has_storage_exhaustion_for_scratch_retry(&output.record))
+}
+
+pub(crate) fn scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry(
+    outputs: &[ScheduledTrackOutput],
+    staging_root: &Path,
+    output_root: &Path,
+) -> bool {
+    outputs.iter().any(|output| {
+        track_record_has_scratch_scoped_storage_exhaustion_for_retry(
+            &output.record,
+            staging_root,
+            output_root,
+        )
+    })
+}
+
+pub fn pipeline_report_has_storage_exhaustion_for_scratch_retry(report: &PipelineReport) -> bool {
+    album_outcome_has_storage_exhaustion_for_scratch_retry(&report.outcome)
+}
+
+pub(crate) fn pipeline_report_has_scratch_scoped_storage_exhaustion_for_retry(
+    report: &PipelineReport,
+    scratch_root: Option<&Path>,
+    output_root: &Path,
+) -> bool {
+    let Some(scratch_root) = scratch_root else {
+        return false;
+    };
+    album_outcome_has_scratch_scoped_storage_exhaustion_for_retry(
+        &report.outcome,
+        scratch_root,
+        output_root,
+    )
+}
+
+fn album_outcome_has_storage_exhaustion_for_scratch_retry(outcome: &AlbumOutcome) -> bool {
+    let empty_tracks: &[TrackRecord] = &[];
+    let (successful, failed, stages) = match outcome {
+        AlbumOutcome::Complete { tracks, stages } => (tracks.as_slice(), empty_tracks, stages.as_slice()),
+        AlbumOutcome::Partial {
+            successful,
+            failed,
+            stages,
+        } => (successful.as_slice(), failed.as_slice(), stages.as_slice()),
+        AlbumOutcome::Blocked {
+            successful,
+            failed,
+            stages,
+            ..
+        } => (successful.as_slice(), failed.as_slice(), stages.as_slice()),
+    };
+
+    successful
+        .iter()
+        .chain(failed.iter())
+        .any(track_record_has_storage_exhaustion_for_scratch_retry)
+        || stages.iter().any(stage_record_has_storage_exhaustion_for_scratch_retry)
+}
+
+fn track_record_has_storage_exhaustion_for_scratch_retry(record: &TrackRecord) -> bool {
+    match &record.outcome {
+        TrackOutcome::Ok => false,
+        TrackOutcome::Err(message) | TrackOutcome::Blocked(message) => {
+            storage_exhaustion_message_looks_like(message)
+        }
+    }
+}
+
+fn stage_record_has_storage_exhaustion_for_scratch_retry(record: &StageRecord) -> bool {
+    match &record.outcome {
+        StageOutcome::Failed(message) => storage_exhaustion_message_looks_like(message),
+        StageOutcome::Ok | StageOutcome::Skipped => false,
+    }
+}
+
+fn album_outcome_has_scratch_scoped_storage_exhaustion_for_retry(
+    outcome: &AlbumOutcome,
+    staging_root: &Path,
+    output_root: &Path,
+) -> bool {
+    let empty_tracks: &[TrackRecord] = &[];
+    let (successful, failed, stages) = match outcome {
+        AlbumOutcome::Complete { tracks, stages } => (tracks.as_slice(), empty_tracks, stages.as_slice()),
+        AlbumOutcome::Partial {
+            successful,
+            failed,
+            stages,
+        } => (successful.as_slice(), failed.as_slice(), stages.as_slice()),
+        AlbumOutcome::Blocked {
+            successful,
+            failed,
+            stages,
+            ..
+        } => (successful.as_slice(), failed.as_slice(), stages.as_slice()),
+    };
+
+    successful.iter().chain(failed.iter()).any(|record| {
+        track_record_has_scratch_scoped_storage_exhaustion_for_retry(
+            record,
+            staging_root,
+            output_root,
+        )
+    }) || stages.iter().any(|record| {
+        stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
+            record,
+            staging_root,
+            output_root,
+        )
+    })
+}
+
+fn track_record_has_scratch_scoped_storage_exhaustion_for_retry(
+    record: &TrackRecord,
+    staging_root: &Path,
+    output_root: &Path,
+) -> bool {
+    let message = match &record.outcome {
+        TrackOutcome::Ok => return false,
+        TrackOutcome::Err(message) | TrackOutcome::Blocked(message) => message,
+    };
+    if !storage_exhaustion_message_looks_like(message) {
+        return false;
+    }
+
+    let output_path_is_scratch = record
+        .output_file
+        .as_ref()
+        .map(|path| path_is_under(path, staging_root))
+        .unwrap_or(false);
+    let realized_path_is_scratch = record
+        .realized_input
+        .as_ref()
+        .map(|path| path_is_under(path, staging_root))
+        .unwrap_or(false);
+    if output_path_is_scratch || realized_path_is_scratch || message_mentions_path(message, staging_root) {
+        return true;
+    }
+
+    let output_path_is_final = record
+        .output_file
+        .as_ref()
+        .map(|path| path_is_under(path, output_root))
+        .unwrap_or(false);
+    if output_path_is_final || message_mentions_path(message, output_root) {
+        return false;
+    }
+
+    // Track realization and encode workers write their intermediates and outputs
+    // under staging.root. When a CLI reports ENOSPC without echoing a path, a
+    // scratch-backed first attempt should be retried on disk before publishing
+    // a terminal failure fragment.
+    true
+}
+
+fn stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
+    record: &StageRecord,
+    staging_root: &Path,
+    output_root: &Path,
+) -> bool {
+    let message = match &record.outcome {
+        StageOutcome::Failed(message) => message,
+        StageOutcome::Ok | StageOutcome::Skipped => return false,
+    };
+    if !storage_exhaustion_message_looks_like(message) {
+        return false;
+    }
+    if message_mentions_path(message, staging_root) {
+        return true;
+    }
+    if message_mentions_path(message, output_root) {
+        return false;
+    }
+
+    match record.stage {
+        PipelineStage::Materialize
+        | PipelineStage::Convert
+        | PipelineStage::Merge
+        | PipelineStage::Metadata
+        | PipelineStage::ReplayGain
+        | PipelineStage::Features => true,
+        // Publish writes to output_root. A generic publish ENOSPC is therefore
+        // much more likely to be the final output filesystem, not scratch. Only
+        // retry publish failures when the message explicitly names staging.root
+        // above. Durable-log and output-planning failures are outside scratch.
+        PipelineStage::Publish | PipelineStage::DurableLog | PipelineStage::PlanOutputs => false,
+    }
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return path.starts_with(root);
+    };
+    let Ok(root) = root.canonicalize() else {
+        return path.starts_with(root);
+    };
+    path.starts_with(root)
+}
+
+fn message_mentions_path(message: &str, path: &Path) -> bool {
+    let rendered = path.to_string_lossy();
+    !rendered.is_empty() && message.contains(rendered.as_ref())
+}
+
+
+fn should_defer_terminal_failure_publication_for_scratch_retry_with_root(
+    req: &PipelineRequest,
+    staging_is_scratch: bool,
+    staging_root: &Path,
+    outcome: &AlbumOutcome,
+) -> bool {
+    staging_is_scratch
+        && album_outcome_has_scratch_scoped_storage_exhaustion_for_retry(
+            outcome,
+            staging_root,
+            &req.output_root,
+        )
+}
+
+fn retryable_scratch_failure_report_without_publication(
+    req: &PipelineRequest,
+    source: Option<PreparedSource>,
+    plan: Option<AlbumPlan>,
+    artifacts: Option<ArtifactSet>,
+    outcome: AlbumOutcome,
+) -> PipelineReport {
+    PipelineReport {
+        request: RedactedPipelineRequest::from(req),
+        source,
+        plan,
+        artifacts,
+        published: None,
+        outcome,
+        durable_log: None,
+        settings_fingerprint: Some(tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings)),
+        manifest_path: None,
+    }
+}
+
+fn materialize_error_is_storage_exhaustion(err: &MaterializeError) -> bool {
+    match err {
+        MaterializeError::Io(io_err) => is_storage_exhaustion_io_error(io_err),
+        MaterializeError::Cancelled | MaterializeError::BlockedSource { .. } => false,
+        _ => storage_exhaustion_message_looks_like(&err.to_string()),
+    }
+}
+
+#[cfg(test)]
+fn publish_error_is_storage_exhaustion(err: &PublishError) -> bool {
+    match err {
+        PublishError::Io(io_err) => is_storage_exhaustion_io_error(io_err),
+        _ => storage_exhaustion_message_looks_like(&err.to_string()),
+    }
+}
+
+fn is_storage_exhaustion_io_error(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::WriteZero {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        // Linux/macOS: ENOSPC, EDQUOT, EFBIG. Treat these as scratch-capacity
+        // failures eligible for one disk retry when the first attempt used
+        // scratch staging.
+        if matches!(err.raw_os_error(), Some(28) | Some(122) | Some(27)) {
+            return true;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL.
+        if matches!(err.raw_os_error(), Some(112) | Some(39)) {
+            return true;
+        }
+    }
+
+    storage_exhaustion_message_looks_like(&err.to_string())
+}
+
+fn storage_exhaustion_message_looks_like(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "no space left on device",
+        "enospc",
+        "disk full",
+        "not enough space",
+        "quota exceeded",
+        "edquot",
+        "file too large",
+        "efbig",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn select_staging_parent_for(req: &PipelineRequest) -> StagingParentSelection {
+    let disk_parent = disk_staging_parent_for(req);
+    let Some(scratch) = req.scratch_staging.as_ref() else {
+        return StagingParentSelection::disk(disk_parent);
+    };
+
+    let scratch_parent = scratch.root().join(STAGING_PARENT_NAME);
+    if let Err(err) = scratch.ensure_usable(&scratch_parent) {
+        log::warn!(
+            "scratch staging unavailable for item {} at {}; falling back to disk staging at {}: {err}",
+            req.item_id,
+            scratch_parent.display(),
+            disk_parent.display(),
+        );
+        return StagingParentSelection::disk(disk_parent);
+    }
+
+    let source_kind = detect_source_kind(req).ok();
+    let estimated_bytes = estimate_job_peak_bytes(&req.container, source_kind);
+    match scratch.try_reserve(estimated_bytes) {
+        Ok(reservation) => {
+            log::info!(
+                "using scratch staging for item {} at {} (estimated peak {}; {})",
+                req.item_id,
+                scratch_parent.display(),
+                format_bytes(reservation.bytes()),
+                reservation.admission_summary(),
+            );
+            StagingParentSelection::scratch(scratch_parent, reservation)
+        }
+        Err(err) => {
+            log::info!(
+                "falling back to disk staging for item {} at {} because scratch staging at {} was not admitted: {}",
+                req.item_id,
+                disk_parent.display(),
+                scratch_parent.display(),
+                err.reason(),
+            );
+            StagingParentSelection::disk(disk_parent)
+        }
+    }
+}
+
+#[cfg(test)]
 fn staging_parent_for(req: &PipelineRequest) -> PathBuf {
+    // Legacy/test helper: returns the deterministic disk-backed staging parent.
+    // Production scratch decisions must flow through `select_staging_parent_for`,
+    // because scratch requires validation, admission, and reservation ownership.
+    disk_staging_parent_for(req)
+}
+
+fn disk_staging_parent_for(req: &PipelineRequest) -> PathBuf {
     if req.naming.per_album_subdir {
         return req.output_root.join(STAGING_PARENT_NAME);
     }
@@ -16437,6 +17193,345 @@ fn staging_parent_for(req: &PipelineRequest) -> PathBuf {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     parent.join(STAGING_PARENT_NAME)
+}
+
+#[cfg(test)]
+mod scratch_staging_parent_tests {
+    use super::*;
+    use super::super::memory_budget::ScratchStagingConfig;
+
+    #[test]
+    fn select_staging_parent_prefers_admitted_configured_scratch_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let input = temp.path().join("input.flac");
+        std::fs::write(&input, b"fake flac").expect("input");
+
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.container = input;
+        req.output_root = temp.path().join("out");
+        req.scratch_staging = Some(ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+            temp.path().join("scratch"),
+            50,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+        ));
+
+        let selection = select_staging_parent_for(&req);
+        assert_eq!(
+            selection.parent,
+            temp.path().join("scratch").join(STAGING_PARENT_NAME),
+        );
+        assert!(selection.is_scratch());
+    }
+
+    #[test]
+    fn zero_percent_scratch_budget_falls_back_to_disk_parent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let input = temp.path().join("input.flac");
+        std::fs::write(&input, b"fake flac").expect("input");
+
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.container = input;
+        req.output_root = temp.path().join("out");
+        req.scratch_staging = Some(ScratchStagingConfig::new(temp.path().join("scratch"), 0));
+
+        let selection = select_staging_parent_for(&req);
+        assert_eq!(selection.parent, disk_staging_parent_for(&req));
+        assert!(selection.scratch_reservation.is_none());
+    }
+
+    #[test]
+    fn scratch_space_shortfall_falls_back_to_disk_before_materialization() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let input = temp.path().join("input.flac");
+        std::fs::write(&input, b"fake flac").expect("input");
+
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.container = input;
+        req.output_root = temp.path().join("out");
+        req.scratch_staging = Some(ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+            temp.path().join("scratch"),
+            90,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+            64 * 1024 * 1024,
+        ));
+
+        let selection = select_staging_parent_for(&req);
+
+        assert_eq!(selection.parent, disk_staging_parent_for(&req));
+        assert!(selection.scratch_reservation.is_none());
+    }
+
+    #[test]
+    fn scratch_materialization_attempt_creates_intermediate_root_under_scratch_and_drop_cleans_it() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let input = temp.path().join("input.flac");
+        std::fs::write(&input, b"fake flac").expect("input");
+
+        let scratch = ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+            temp.path().join("scratch"),
+            90,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+        );
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.container = input;
+        req.output_root = temp.path().join("out");
+        req.scratch_staging = Some(scratch.clone());
+
+        let selection = select_staging_parent_for(&req);
+        assert!(selection.is_scratch(), "ample memory and scratch filesystem space should admit scratch staging");
+        let scratch_parent = selection.parent.clone();
+        let attempt = prepare_materialization_attempt(&req, selection).expect("scratch materialization attempt");
+        let staging_root = attempt.staging.root.clone();
+
+        assert!(staging_root.starts_with(&scratch_parent));
+        assert!(staging_root.exists(), "scratch staging root should exist during materialization");
+        assert!(
+            staging_root.join(".tonepoet-staging-owner").exists(),
+            "scratch staging roots should carry an ownership marker for precise stale cleanup"
+        );
+        assert!(scratch.active_reserved_bytes_for_test() > 0);
+
+        drop(attempt);
+
+        assert!(!staging_root.exists(), "dropping the owning staging dir should clean scratch intermediates");
+        assert_eq!(scratch.active_reserved_bytes_for_test(), 0);
+    }
+
+    #[test]
+    fn zero_percent_disk_fallback_materialization_creates_output_relative_staging() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let input = temp.path().join("input.flac");
+        std::fs::write(&input, b"fake flac").expect("input");
+
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.container = input;
+        req.output_root = temp.path().join("out");
+        req.scratch_staging = Some(ScratchStagingConfig::new(temp.path().join("scratch"), 0));
+
+        let selection = select_staging_parent_for(&req);
+        assert!(!selection.is_scratch());
+        let disk_parent = disk_staging_parent_for(&req);
+        assert_eq!(selection.parent, disk_parent);
+
+        let attempt = prepare_materialization_attempt(&req, selection).expect("disk materialization attempt");
+        let staging_root = attempt.staging.root.clone();
+        assert!(staging_root.starts_with(&disk_parent));
+        assert!(staging_root.exists());
+        assert!(
+            !staging_root.starts_with(temp.path().join("scratch")),
+            "0% scratch budget must not create a scratch-backed materialization attempt"
+        );
+        drop(attempt);
+        assert!(!staging_root.exists());
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn cross_device_publish_copy_fallback_copies_payload_when_rename_reports_exdev() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scratch_parent = temp.path().join("scratch");
+        let output_parent = temp.path().join("out");
+        std::fs::create_dir_all(&scratch_parent).expect("scratch parent");
+        std::fs::create_dir_all(&output_parent).expect("output parent");
+
+        let src = scratch_parent.join("01.flac");
+        let dst = output_parent.join("01.flac");
+        std::fs::write(&src, b"published audio bytes").expect("source payload");
+
+        copy_or_rename_into_publish_temp_with(&src, &dst, false, |_src, _dst| {
+            #[cfg(unix)]
+            {
+                Err(io::Error::from_raw_os_error(18))
+            }
+            #[cfg(windows)]
+            {
+                Err(io::Error::from_raw_os_error(17))
+            }
+        })
+        .expect("EXDEV should fall back to copy when same_filesystem_required=false");
+
+        assert_eq!(std::fs::read(&dst).expect("copied output"), b"published audio bytes");
+        assert!(src.exists(), "cross-device copy leaves cleanup to staging drop");
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn cross_device_publish_respects_same_filesystem_required_guardrail() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("scratch.flac");
+        let dst = temp.path().join("out.flac");
+        std::fs::write(&src, b"audio").expect("source payload");
+
+        let err = copy_or_rename_into_publish_temp_with(&src, &dst, true, |_src, _dst| {
+            #[cfg(unix)]
+            {
+                Err(io::Error::from_raw_os_error(18))
+            }
+            #[cfg(windows)]
+            {
+                Err(io::Error::from_raw_os_error(17))
+            }
+        })
+        .expect_err("same_filesystem_required=true must reject cross-device publish");
+
+        assert!(matches!(err, PublishError::CrossDeviceCopy(_)));
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    fn scratch_retry_classifiers_cover_post_materialization_stage_and_track_failures() {
+        let stage = StageRecord {
+            stage: PipelineStage::Merge,
+            outcome: StageOutcome::Failed("merge failed: No space left on device".to_string()),
+            dsd_dst_stats: None,
+        };
+        assert!(stage_record_has_storage_exhaustion_for_scratch_retry(&stage));
+
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages: vec![stage],
+            reason: BlockReason::RequiredStageFailure(PipelineStage::Merge),
+        };
+        assert!(album_outcome_has_storage_exhaustion_for_scratch_retry(&outcome));
+
+        let track = pipeline_test_helpers::log_test_source()
+            .tracks
+            .into_iter()
+            .next()
+            .expect("test track");
+        let output = scheduled_worker_failure_output(
+            0,
+            &track,
+            None,
+            None,
+            "encoder failed: quota exceeded".to_string(),
+        );
+        assert!(scheduled_track_outputs_have_storage_exhaustion_for_scratch_retry(&[output]));
+    }
+
+
+    #[test]
+    fn scratch_scoped_retry_classifier_does_not_misclassify_output_publish_enospc() {
+        let scratch_root = PathBuf::from("/dev/shm/tonepoet/.tonepoet-staging/job-1-item-1");
+        let output_root = PathBuf::from("/music/output");
+
+        let merge = StageRecord {
+            stage: PipelineStage::Merge,
+            outcome: StageOutcome::Failed("merge failed: No space left on device".to_string()),
+            dsd_dst_stats: None,
+        };
+        assert!(stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
+            &merge,
+            &scratch_root,
+            &output_root,
+        ));
+
+        let generic_publish = StageRecord {
+            stage: PipelineStage::Publish,
+            outcome: StageOutcome::Failed("publish failed: No space left on device".to_string()),
+            dsd_dst_stats: None,
+        };
+        assert!(
+            !stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
+                &generic_publish,
+                &scratch_root,
+                &output_root,
+            ),
+            "generic publish ENOSPC should be treated as output filesystem exhaustion, not scratch"
+        );
+
+        let output_publish = StageRecord {
+            stage: PipelineStage::Publish,
+            outcome: StageOutcome::Failed(format!(
+                "copy to {} failed: No space left on device",
+                output_root.join("Album/.Album.tmp/01.flac").display(),
+            )),
+            dsd_dst_stats: None,
+        };
+        assert!(!stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
+            &output_publish,
+            &scratch_root,
+            &output_root,
+        ));
+
+        let scratch_publish = StageRecord {
+            stage: PipelineStage::Publish,
+            outcome: StageOutcome::Failed(format!(
+                "read from {} failed: No space left on device",
+                scratch_root.join("converted/01.flac").display(),
+            )),
+            dsd_dst_stats: None,
+        };
+        assert!(stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
+            &scratch_publish,
+            &scratch_root,
+            &output_root,
+        ));
+    }
+
+    #[test]
+    fn queued_track_scratch_exhaustion_is_detected_before_album_finalization() {
+        let scratch_root = PathBuf::from("/dev/shm/tonepoet/.tonepoet-staging/job-1-item-1");
+        let output_root = PathBuf::from("/music/output");
+        let track = pipeline_test_helpers::log_test_source()
+            .tracks
+            .into_iter()
+            .next()
+            .expect("test track");
+
+        let scratch_output = scheduled_worker_failure_output(
+            0,
+            &track,
+            Some(scratch_root.join("converted/.track-0000.work/input.wav")),
+            Some(scratch_root.join("converted/01.flac")),
+            "encoder failed: No space left on device".to_string(),
+        );
+        assert!(scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry(
+            &[scratch_output],
+            &scratch_root,
+            &output_root,
+        ));
+
+        let output_failure = scheduled_worker_failure_output(
+            0,
+            &track,
+            None,
+            Some(output_root.join("Album/01.flac")),
+            "encoder failed: No space left on device".to_string(),
+        );
+        assert!(!scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry(
+            &[output_failure],
+            &scratch_root,
+            &output_root,
+        ));
+    }
+
+    #[test]
+    fn storage_exhaustion_classifier_recognizes_capacity_failures_only() {
+        #[cfg(unix)]
+        assert!(materialize_error_is_storage_exhaustion(&MaterializeError::Io(
+            io::Error::from_raw_os_error(28),
+        )));
+        assert!(materialize_error_is_storage_exhaustion(&MaterializeError::Parse(
+            "ffmpeg failed: No space left on device".to_string(),
+        )));
+        assert!(publish_error_is_storage_exhaustion(&PublishError::Io(
+            io::Error::new(io::ErrorKind::WriteZero, "short write")
+        )));
+        assert!(!materialize_error_is_storage_exhaustion(&MaterializeError::Parse(
+            "ffmpeg failed: invalid data found when processing input".to_string(),
+        )));
+        assert!(!materialize_error_is_storage_exhaustion(&MaterializeError::Cancelled));
+    }
 }
 
 /// Build a conversion manifest from audio artifacts and source metadata.
@@ -16682,6 +17777,7 @@ mod pipeline_test_helpers {
             },
             settings: tonepoet_pipeline::PipelineSettings::default(),
             worker_count: None,
+            scratch_staging: None,
             merge: false,
             output_root: PathBuf::from("/out"),
             naming: NamingPolicy {
@@ -17790,6 +18886,7 @@ mod naming_template_tests {
             },
             settings: tonepoet_pipeline::PipelineSettings::default(),
             worker_count: None,
+            scratch_staging: None,
             merge: false,
             output_root: PathBuf::from("/out"),
             naming: NamingPolicy {
@@ -18547,6 +19644,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             },
             settings: PipelineSettings::default(),
             worker_count: Some(2),
+            scratch_staging: None,
             merge: false,
             output_root: root.join("out"),
             naming: NamingPolicy {
