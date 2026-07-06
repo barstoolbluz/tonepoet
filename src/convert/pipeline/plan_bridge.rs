@@ -65,15 +65,15 @@ pub fn plan_request_for_track(
             log::warn!(
                 "metadata.transfer_tags requested for a CUE PCM segment carrier; source-container tag transfer from the original image is unsupported on this path and will be skipped"
             );
-            settings.metadata.transfer_tags = false;
+            disable_planner_source_tag_transfer(&mut settings);
         }
         if settings.metadata.preserve_artwork {
             log::warn!(
                 "metadata.preserve_artwork requested for a CUE PCM segment carrier; planner artwork transfer from the audio-only carrier is disabled; original image artwork, when extracted by the CUE materializer, is handled by the post-encode metadata/artwork stage"
             );
-            settings.metadata.preserve_artwork = false;
+            disable_planner_artwork_transfer(&mut settings);
         }
-        settings.metadata.store_source_audio_md5 = false;
+        disable_planner_source_audio_md5(&mut settings);
     }
     for message in apply_unsupported_target_metadata_policy_downgrades(&mut settings) {
         log::warn!("{message}");
@@ -93,8 +93,8 @@ pub fn plan_request_for_track(
         &track.source_ref,
         TrackSourceRef::SacdTrack { .. } | TrackSourceRef::DvdVideoTrack { .. }
     ) {
-        settings.metadata.transfer_tags = false;
-        settings.metadata.preserve_artwork = false;
+        disable_planner_source_tag_transfer(&mut settings);
+        disable_planner_artwork_transfer(&mut settings);
     }
     // Source-audio MD5 can only be planned when the realized input actually
     // exposed a value. Today this bridge obtains that value from FLAC
@@ -105,7 +105,7 @@ pub fn plan_request_for_track(
     // source-kind-based: standalone FLAC can keep the policy; standalone DSD
     // cannot.
     if source.audio_md5.is_none() {
-        settings.metadata.store_source_audio_md5 = false;
+        disable_planner_source_audio_md5(&mut settings);
     }
     // ReplayGain remains orchestrator-owned because album mode requires all
     // completed tracks.
@@ -134,6 +134,30 @@ pub fn plan_request_for_track(
     })
 }
 
+/// Disable planner-owned source tag transfer through one named policy gate.
+///
+/// The bridge is allowed to downgrade impossible per-track metadata policies
+/// when the realized carrier or target format cannot support them, but raw field
+/// writes are deliberately centralized here so future planner-disposition changes
+/// cannot silently fork the policy across call sites.
+fn disable_planner_source_tag_transfer(settings: &mut PipelineSettings) {
+    let metadata = &mut settings.metadata;
+    metadata.transfer_tags = false;
+}
+
+/// Disable planner-owned embedded artwork transfer through the same named policy
+/// gate used for source tag transfer.
+fn disable_planner_artwork_transfer(settings: &mut PipelineSettings) {
+    let metadata = &mut settings.metadata;
+    metadata.preserve_artwork = false;
+}
+
+/// Disable planner-owned source-audio MD5 storage when source facts prove that
+/// no authoritative MD5 is available for the realized track.
+fn disable_planner_source_audio_md5(settings: &mut PipelineSettings) {
+    let metadata = &mut settings.metadata;
+    metadata.store_source_audio_md5 = false;
+}
 
 /// Return a user-visible warning when a requested source-audio MD5 policy must
 /// be disabled for a concrete realized track.
@@ -192,7 +216,7 @@ pub fn apply_unsupported_target_metadata_policy_downgrades(
             "metadata.transfer_tags requested for target format {:?}, but the planner/plugin metadata path cannot represent source tags for that target; source tag transfer is unsupported for this track and will be skipped",
             settings.target_format
         ));
-        settings.metadata.transfer_tags = false;
+        disable_planner_source_tag_transfer(settings);
     }
 
     if settings.metadata.preserve_artwork
@@ -202,7 +226,7 @@ pub fn apply_unsupported_target_metadata_policy_downgrades(
             "metadata.preserve_artwork requested for target format {:?}, but the planner/plugin metadata path cannot preserve embedded artwork for that target; artwork preservation is unsupported for this track and will be skipped",
             settings.target_format
         ));
-        settings.metadata.preserve_artwork = false;
+        disable_planner_artwork_transfer(settings);
     }
 
     messages

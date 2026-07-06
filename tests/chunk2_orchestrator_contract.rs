@@ -5,6 +5,54 @@
 //! not replace end-to-end conversion tests, but they prevent regressions that
 //! would split the unified path, bypass ToolRunner, or fake metadata ownership.
 
+fn source_without_cfg_test_items(contents: &str) -> String {
+    let mut kept = String::with_capacity(contents.len());
+    let mut lines = contents.lines();
+
+    while let Some(line) = lines.next() {
+        if line.trim() != "#[cfg(test)]" {
+            kept.push_str(line);
+            kept.push('\n');
+            continue;
+        }
+
+        let Some(next) = lines.next() else {
+            break;
+        };
+
+        if next.trim_start().starts_with("mod ") {
+            let mut depth = brace_delta(next);
+            while depth > 0 {
+                let Some(block_line) = lines.next() else {
+                    break;
+                };
+                depth += brace_delta(block_line);
+            }
+        }
+    }
+
+    kept
+}
+
+fn brace_delta(line: &str) -> i32 {
+    line.chars().fold(0, |depth, ch| match ch {
+        '{' => depth + 1,
+        '}' => depth - 1,
+        _ => depth,
+    })
+}
+
+fn source_between<'a>(contents: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = contents
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("missing start marker {start_marker}"));
+    let rest = &contents[start..];
+    let end = rest
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("missing end marker {end_marker}"));
+    &rest[..end]
+}
+
 #[test]
 fn single_files_enter_the_shared_pool_as_immediate_work_units() {
     let processor = include_str!("../src/convert/processor.rs");
@@ -93,18 +141,20 @@ fn scheduler_has_one_shared_work_graph_for_source_and_track_units() {
 }
 
 #[test]
-fn planner_metadata_disposition_is_consulted_after_topology_planning() {
+fn planner_metadata_satisfaction_is_derived_from_planner_owned_effects() {
     let bridge = include_str!("../src/convert/pipeline/plan_bridge.rs");
     let executor = include_str!("../src/convert/pipeline/track_executor.rs");
     let stages = include_str!("../src/convert/pipeline/stages.rs");
 
     assert!(bridge.contains("orchestrator_metadata_stage_required"));
+    assert!(bridge.contains("disable_planner_source_tag_transfer"));
     assert!(!bridge.contains("settings.metadata.transfer_tags = false"));
-    assert!(executor.contains("plan_topology"));
-    assert!(executor.contains("ToolRegistry::with_builtin_tools"));
-    assert!(executor.contains("metadata_disposition_for_step"));
-    assert!(executor.contains("PlanOperation::MetadataTransfer"));
-    assert!(executor.contains("PlanOperation::StoreSourceAudioMd5"));
+    assert!(executor.contains("let plan = plan_conversion(&plan_request)"));
+    assert!(executor.contains("let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan)"));
+    assert!(executor.contains("let metadata_required = planner_metadata_obligations_for_track(request, &plan_request)"));
+    assert!(executor.contains("command.metadata_effect"));
+    assert!(executor.contains("source_tags_transferred_from_original_source"));
+    assert!(executor.contains("source_audio_md5_written"));
     assert!(stages.contains("orchestrator_metadata_stage_required"));
 }
 
@@ -171,8 +221,15 @@ fn every_external_process_boundary_runs_through_tool_runner_modules() {
         ("track_executor.rs", include_str!("../src/convert/pipeline/track_executor.rs")),
         ("planned_adapter.rs", include_str!("../src/convert/pipeline/planned_adapter.rs")),
     ] {
-        assert!(!contents.contains("std::process::Command"), "{path} spawns directly");
-        assert!(!contents.contains("tokio::process::Command"), "{path} spawns directly");
+        let production_contents = source_without_cfg_test_items(contents);
+        assert!(
+            !production_contents.contains("std::process::Command"),
+            "{path} production code spawns directly"
+        );
+        assert!(
+            !production_contents.contains("tokio::process::Command"),
+            "{path} production code spawns directly"
+        );
     }
 }
 
@@ -180,10 +237,38 @@ fn every_external_process_boundary_runs_through_tool_runner_modules() {
 #[test]
 fn compatibility_orchestrator_metadata_gate_matches_scheduler_gate() {
     let stages = include_str!("../src/convert/pipeline/stages.rs");
-    assert!(
-        stages.matches("planner_metadata_already_satisfied(artifacts.as_ref().expect(\"artifacts present\"), &req)").count() >= 2,
-        "both scheduler and compatibility orchestrator paths must honor planner metadata completion"
+    let scheduler_finish = source_between(
+        stages,
+        "pub async fn finish_pipeline_album_for_scheduler_with_tool_limits",
+        "pub async fn run_pipeline_item(",
     );
+    let compatibility_orchestrator = source_between(
+        stages,
+        "pub async fn run_pipeline_item_with_tool_paths_and_tool_limits",
+        "#[derive(Debug, Default)]",
+    );
+
+    for (name, body) in [
+        ("scheduler post-processing path", scheduler_finish),
+        ("compatibility orchestrator path", compatibility_orchestrator),
+    ] {
+        assert!(
+            body.contains("planner_metadata_already_satisfied("),
+            "{name} must honor planner metadata completion"
+        );
+        assert!(
+            body.contains("artifacts.as_ref().expect(\"artifacts present\")"),
+            "{name} must gate against the current artifact set"
+        );
+        assert!(
+            body.contains("source.as_ref().expect(\"source present\")"),
+            "{name} must pass prepared-source metadata context to the gate"
+        );
+        assert!(
+            body.contains("&req"),
+            "{name} must use the active pipeline request for the metadata gate"
+        );
+    }
 }
 
 #[test]

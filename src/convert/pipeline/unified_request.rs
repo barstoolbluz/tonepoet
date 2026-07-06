@@ -407,13 +407,21 @@ fn apply_quality_settings(settings: &mut PipelineSettings, quality: &QualitySett
             settings.target_bit_depth = bit_depth_target(Some(u32::from(*bit_depth)));
             settings.target_sample_rate = sample_rate_target_for_format(&settings.target_format, Some(*sample_rate))?;
         }
-        QualitySettings::WavPack { compression_mode, .. } => {
+        QualitySettings::WavPack {
+            compression_mode,
+            hybrid_mode,
+            correction_file,
+        } => {
             settings.wavpack.mode = match compression_mode {
                 WavPackMode::Fast => PlannerWavPackMode::Fast,
                 WavPackMode::Normal => PlannerWavPackMode::Normal,
                 WavPackMode::High => PlannerWavPackMode::High,
                 WavPackMode::VeryHigh => PlannerWavPackMode::VeryHigh,
             };
+            settings.wavpack.hybrid = *hybrid_mode;
+            // wavpack.hybrid_bitrate_kbps is not carried by QualitySettings;
+            // keep the planner default (set during PipelineSettings::default()).
+            settings.wavpack.correction_file = *correction_file;
         }
         QualitySettings::Mp3 { bitrate_mode, quality } => match bitrate_mode {
             Mp3BitrateMode::Cbr { bitrate } => {
