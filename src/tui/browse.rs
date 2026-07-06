@@ -64,6 +64,15 @@ fn search_fuzzy_score_passes_threshold(score: i64, min_score: i64) -> bool {
     score >= min_score
 }
 
+fn search_exact_substring_score(haystack_lower: &str, query_lower: &str) -> Option<i64> {
+    if query_lower.is_empty() {
+        return None;
+    }
+    haystack_lower.contains(query_lower).then_some(
+        search_fuzzy_min_score(query_lower).saturating_add(query_lower.len() as i64),
+    )
+}
+
 fn search_score_better(candidate: i64, incumbent: i64, dir: SortDir) -> bool {
     match dir {
         SortDir::Asc => candidate < incumbent,
@@ -4879,7 +4888,7 @@ impl BrowseState {
                 let inner_path = self.archive_inner_path_for_entry(&entry);
                 let staged_path = self.archive_staged_path_for_entry(&entry);
                 let fallback_metadata = self
-                    .valid_probe_for_entry(&entry)
+                    .valid_archive_probe_for_entry(&entry)
                     .map(|cached| cached.metadata.clone());
                 ArchiveSearchCandidate {
                     entry,
@@ -4984,7 +4993,7 @@ impl BrowseState {
     fn tag_source_for_entry(&self, entry: &BrowseEntry) -> TagSearchSource {
         if let Some(arc) = self.archive.as_ref() {
             let fallback_metadata = self
-                .valid_probe_for_entry(entry)
+                .valid_archive_probe_for_entry(entry)
                 .map(|cached| cached.metadata.clone());
 
             if let Some(staged_path) = self.archive_staged_path_for_entry(entry) {
@@ -5168,6 +5177,7 @@ impl BrowseState {
         use fuzzy_matcher::FuzzyMatcher;
 
         let matcher = SkimMatcherV2::default();
+        let query_lower = query.to_lowercase();
         let min_score = search_fuzzy_min_score(query);
         let bounded_filename_score_results = matches!(mode, SearchMode::Filename)
             && matches!(self.search.sort, SearchSort::Score);
@@ -5192,7 +5202,9 @@ impl BrowseState {
             // Directories always match on filename (for navigation), even in
             // tags-only mode.
             if search_filename || e.is_navigable_dir() {
-                if let Some(s) = matcher.fuzzy_match(&e.name_lower, query) {
+                if let Some(s) = search_exact_substring_score(&e.name_lower, &query_lower)
+                    .or_else(|| matcher.fuzzy_match(&e.name_lower, query))
+                {
                     best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                 }
             }
@@ -5343,6 +5355,7 @@ impl BrowseState {
                     use walkdir::WalkDir;
 
                     let matcher = SkimMatcherV2::default();
+                    let query_lower = query_for_worker.to_lowercase();
                     let min_score = search_fuzzy_min_score(&query_for_worker);
                     let mut scored: Vec<(BrowseEntry, i64)> = Vec::new();
                     let bounded_filename_score_results = matches!(mode, SearchMode::Filename)
@@ -5408,9 +5421,11 @@ impl BrowseState {
 
                         let mut best_score: Option<i64> = None;
 
-                        if search_filename {
-                            if let Some(s) = matcher.fuzzy_match(&candidate.name_lower, &query_for_worker) {
-                                best_score = Some(s);
+                        if search_filename || candidate.is_navigable_dir() {
+                            if let Some(s) = search_exact_substring_score(&candidate.name_lower, &query_lower)
+                                .or_else(|| matcher.fuzzy_match(&candidate.name_lower, &query_for_worker))
+                            {
+                                best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                             }
                         }
 
@@ -5721,6 +5736,33 @@ impl BrowseState {
     /// read path for rendering, search, sorting, and info-pane consumers.
     pub fn valid_probe_for_entry(&self, entry: &BrowseEntry) -> Option<&CachedInfo> {
         self.valid_probe_arc_for_entry(entry).map(|info| info.as_ref())
+    }
+
+    /// Identity-checked probe info for an archive entry. Archive staging can
+    /// expose a temporary filesystem copy whose size/mtime differs from the
+    /// logical archive member; tag search must keep using the synthetic archive
+    /// path and archive-member identity rather than the staging-file identity.
+    fn valid_archive_probe_for_entry(&self, entry: &BrowseEntry) -> Option<&CachedInfo> {
+        if self.archive.is_none() {
+            return self.valid_probe_for_entry(entry);
+        }
+        if let Some(info) = self.valid_probe_for_entry(entry) {
+            return Some(info);
+        }
+        let inner = self.archive_inner_path_for_entry(entry)?;
+        let archive_entry = self
+            .archive
+            .as_ref()?
+            .listing
+            .entries
+            .iter()
+            .find(|candidate| candidate.path == inner)?;
+        let archive_identity = ProbeCacheIdentity {
+            modified: None,
+            size: archive_entry.size,
+        };
+        self.valid_probe_arc_for_identity(&entry.path, archive_identity)
+            .map(|info| info.as_ref())
     }
 
     /// Identity-checked probe info as an `Arc`, for callers that must keep the
@@ -8588,7 +8630,7 @@ fn entry_passes_search_effective_filters(
     if !show_hidden && browse_entry_name_is_hidden(&entry.name) {
         return false;
     }
-    if audio_only && !is_audio_filter_visible_entry(entry) {
+    if audio_only && !entry.is_navigable_dir() && !is_audio_filter_visible_entry(entry) {
         return false;
     }
     if !entry.is_navigable_dir() && !format_filter.allows_entry(entry) {
@@ -10071,6 +10113,7 @@ fn run_archive_search_worker(
     use fuzzy_matcher::FuzzyMatcher;
 
     let matcher = SkimMatcherV2::default();
+    let query_lower = query.to_lowercase();
     let min_score = search_fuzzy_min_score(&query);
     let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
     let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
@@ -10094,7 +10137,9 @@ fn run_archive_search_worker(
 
         let mut best_score: Option<i64> = None;
         if search_filename || e.is_navigable_dir() {
-            if let Some(s) = matcher.fuzzy_match(&e.name_lower, &query) {
+            if let Some(s) = search_exact_substring_score(&e.name_lower, &query_lower)
+                .or_else(|| matcher.fuzzy_match(&e.name_lower, &query))
+            {
                 best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
             }
         }

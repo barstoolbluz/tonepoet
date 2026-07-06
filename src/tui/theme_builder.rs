@@ -292,11 +292,22 @@ impl ThemeBuilderState {
         state.preset_applies_on_select = true;
         if let Some(selected_slug) = selected_slug {
             let families = visible_gallery_families(&state);
-            state.preset_cursor = families.iter().position(|family| {
-                family.dark.as_ref().map(|choice| &choice.slug) == Some(&selected_slug)
-                    || family.light.as_ref().map(|choice| &choice.slug) == Some(&selected_slug)
-                    || family.fallback.slug == selected_slug
-            }).unwrap_or(0);
+            if let Some((index, dark_variant)) = families.iter().enumerate().find_map(|(index, family)| {
+                if family.dark.as_ref().map(|choice| choice.slug.as_str()) == Some(selected_slug.as_str()) {
+                    Some((index, true))
+                } else if family.light.as_ref().map(|choice| choice.slug.as_str()) == Some(selected_slug.as_str()) {
+                    Some((index, false))
+                } else if family.fallback.slug == selected_slug {
+                    Some((index, family.fallback.dark))
+                } else {
+                    None
+                }
+            }) {
+                state.preset_cursor = index;
+                state.gallery_dark = dark_variant;
+            } else {
+                state.preset_cursor = 0;
+            }
         } else {
             state.preset_cursor = 0;
         }
@@ -305,6 +316,39 @@ impl ThemeBuilderState {
         sync_gallery_scroll(&mut state, DEFAULT_GALLERY_VISIBLE_ROWS);
         state.status = Some("Select a theme to apply it".to_string());
         state
+    }
+
+    pub fn set_gallery_cursor_to_slug(&mut self, slug: &str) -> bool {
+        let families = visible_gallery_families(self);
+        if let Some((index, dark_variant)) = families.iter().enumerate().find_map(|(index, family)| {
+            if family.dark.as_ref().map(|choice| choice.slug.as_str()) == Some(slug) {
+                Some((index, true))
+            } else if family.light.as_ref().map(|choice| choice.slug.as_str()) == Some(slug) {
+                Some((index, false))
+            } else if family.fallback.slug == slug {
+                Some((index, family.fallback.dark))
+            } else {
+                None
+            }
+        }) {
+            self.preset_cursor = index;
+            self.gallery_dark = dark_variant;
+            sync_gallery_scroll(self, gallery_visible_rows_for_state(self));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn selected_gallery_family_contains_slug(&self, slug: &str) -> bool {
+        let families = visible_gallery_families(self);
+        families.get(self.preset_cursor.min(families.len().saturating_sub(1)))
+            .map(|family| {
+                family.dark.as_ref().map(|choice| choice.slug.as_str()) == Some(slug)
+                    || family.light.as_ref().map(|choice| choice.slug.as_str()) == Some(slug)
+                    || family.fallback.slug == slug
+            })
+            .unwrap_or(false)
     }
 
     pub fn from_palette(palette: ThemePaletteDraft) -> Self {

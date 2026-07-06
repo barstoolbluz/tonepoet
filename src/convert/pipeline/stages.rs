@@ -8164,6 +8164,14 @@ fn cleanup_complete_conversion_log_fragments(
     };
 
     if files.is_empty() {
+        let log_path = album_dir.join("conversion.log");
+        if log_path.is_file() {
+            cleanup_conversion_log_fragment_quarantine_after_finalization(
+                album_dir,
+                Some(target_identity),
+                "authoritative final assembly",
+            );
+        }
         return;
     }
 
@@ -20176,6 +20184,23 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
+    fn fragment_test_identity_for_request(
+        req: &PipelineRequest,
+        album_dir: &Path,
+        settings_fingerprint: Option<&str>,
+    ) -> ConversionLogBatchIdentity {
+        conversion_log_batch_identity(req, album_dir, settings_fingerprint)
+            .expect("fragment fixture identity must follow production batch identity derivation")
+    }
+
+    fn rebind_fragment_test_identity(
+        fragment: &mut ConversionLogFragment,
+        identity: ConversionLogBatchIdentity,
+    ) {
+        fragment.settings_fingerprint = identity.settings_fingerprint.clone();
+        fragment.batch_identity = identity;
+    }
+
     #[test]
     fn provisional_album_batch_output_dir_binds_to_planner_album_dir() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -20643,7 +20668,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             .expect("batch context")
             .expected_track_count;
         let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
-        let fragment = fragment_test_fragment(
+        let mut fragment = fragment_test_fragment(
             album_dir,
             batch_id,
             Some(settings_fingerprint.as_str()),
@@ -20653,12 +20678,16 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             ConversionLogTrackOutcome::Success,
             fragment_test_time(1),
         );
+        rebind_fragment_test_identity(
+            &mut fragment,
+            fragment_test_identity_for_request(req, album_dir, Some(settings_fingerprint.as_str())),
+        );
         write_album_fragment(album_dir, "cancelled-existing-track-1.json", &fragment);
     }
 
     fn canonical_fragment_from_record(
         album_dir: &Path,
-        batch_id: &str,
+        _batch_id: &str,
         source: &PreparedSource,
         req: &PipelineRequest,
         artifacts: &ArtifactSet,
@@ -20692,7 +20721,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 .expect("dispatcher track context supplies canonical fragment sort key"),
             generated_at,
             settings_fingerprint: None,
-            batch_identity: fragment_test_identity(album_dir, batch_id, None),
+            batch_identity: fragment_test_identity_for_request(req, album_dir, None),
             common: build_conversion_log_common_fragment(outcome, source, req, artifacts),
             track: ConversionLogTrackFragment { section },
             summary: ConversionLogTrackSummary::from_track_record(record),
@@ -22047,7 +22076,7 @@ Source-aware setting: yes
         req.album_batch_track = Some(AlbumBatchTrackContext::new(2, None, 2));
         let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
 
-        let ok_track = fragment_test_fragment(
+        let mut ok_track = fragment_test_fragment(
             &album_dir,
             &batch_id,
             Some(settings_fingerprint.as_str()),
@@ -22058,6 +22087,10 @@ Source-aware setting: yes
 ",
             ConversionLogTrackOutcome::Success,
             fragment_test_time(1),
+        );
+        rebind_fragment_test_identity(
+            &mut ok_track,
+            fragment_test_identity_for_request(&req, &album_dir, Some(settings_fingerprint.as_str())),
         );
         let (ok_stage, ok_plan) = incremental_fragment_test_plan(
             temp.path(),
@@ -22414,9 +22447,22 @@ Source-aware setting: yes
         let temp = tempfile::tempdir().expect("temp dir");
         let album_dir = temp.path().join("Album");
         std::fs::create_dir_all(&album_dir).expect("album dir");
-        let identity = fragment_test_identity(&album_dir, "batch-clean-quarantine", Some("settings-current"));
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id("batch-clean-quarantine"),
+            2,
+            album_dir.clone(),
+            album_dir.join("source-root"),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let identity = fragment_test_identity_for_request(&req, &album_dir, Some("settings-current"));
 
-        let current_track = fragment_test_fragment(
+        let mut current_track = fragment_test_fragment(
             &album_dir,
             "batch-clean-quarantine",
             Some("settings-current"),
@@ -22426,6 +22472,7 @@ Source-aware setting: yes
             ConversionLogTrackOutcome::Success,
             fragment_test_time(1),
         );
+        rebind_fragment_test_identity(&mut current_track, identity.clone());
         write_album_fragment(&album_dir, "current-track-1.json", &current_track);
 
         let stale_track = fragment_test_fragment(
@@ -22447,7 +22494,7 @@ Source-aware setting: yes
         assert!(assembled.is_none());
         assert!(album_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR).is_dir());
 
-        let current_track_two = fragment_test_fragment(
+        let mut current_track_two = fragment_test_fragment(
             &album_dir,
             "batch-clean-quarantine",
             Some("settings-current"),
@@ -22457,6 +22504,7 @@ Source-aware setting: yes
             ConversionLogTrackOutcome::Success,
             fragment_test_time(3),
         );
+        rebind_fragment_test_identity(&mut current_track_two, identity.clone());
         write_album_fragment(&album_dir, "current-track-2.json", &current_track_two);
         let final_log = assemble_conversion_log_from_fragments(&album_dir, 2, Some(&identity))
             .expect("complete current batch assembles")
@@ -23023,11 +23071,10 @@ Source-aware setting: yes
         );
 
         let mut failed_req = real_fragment_request(temp.path(), batch_id, 2, "plan-failed-track");
-        failed_req.settings.target_format = PlannerAudioFormat::Aac;
-        failed_req.container_extension = Some("flac".to_string());
+        failed_req.naming.template = "../escaped-plan-output".to_string();
         let failed_source = real_fragment_source(temp.path(), Some(1), 2, 2, 2);
         let plan_error = plan_outputs(&failed_source, &failed_req)
-            .expect_err("the invalid AAC container extension should fail during output planning")
+            .expect_err("the path-escaping template should fail during output planning")
             .to_string();
         let failed_outcome = AlbumOutcome::Blocked {
             successful: Vec::new(),

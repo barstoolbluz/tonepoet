@@ -6644,12 +6644,14 @@ mod progress_dialog_theme_tests {
         app.set_ui_theme("tokyo-night");
 
         handle_config_key(&mut app, KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        let target = app.theme_library.choices()
-            .iter()
-            .position(|choice| choice.slug == "gruvbox")
-            .expect("gruvbox choice");
         match &mut app.active_overlay {
-            ActiveOverlay::ThemeBuilder(state) => state.preset_cursor = target,
+            ActiveOverlay::ThemeBuilder(state) => {
+                assert!(
+                    state.selected_gallery_family_contains_slug("tokyo-night"),
+                    "gallery should initialize cursor from the active theme slug"
+                );
+                assert!(state.set_gallery_cursor_to_slug("gruvbox"), "gruvbox choice");
+            }
             other => panic!("expected theme gallery overlay, got {:?}", other),
         }
 
