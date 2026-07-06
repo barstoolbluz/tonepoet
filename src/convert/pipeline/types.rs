@@ -2046,6 +2046,13 @@ pub enum AlbumOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchRetryIntent {
+    /// Human-readable storage-exhaustion detail captured at the scratch-backed
+    /// attempt before terminal failure publication was intentionally deferred.
+    pub original_error: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineReport {
     pub request: RedactedPipelineRequest,
@@ -2055,6 +2062,12 @@ pub struct PipelineReport {
     pub published: Option<PublishedAlbum>,
     pub outcome: AlbumOutcome,
     pub durable_log: Option<PathBuf>,
+    /// Explicit marker set only when a scratch-backed attempt intentionally
+    /// suppresses terminal failure publication so its caller may retry once on
+    /// disk. Outer retry decisions must use this marker instead of re-inferring
+    /// retry intent from configured scratch roots plus error strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_retry_intent: Option<ScratchRetryIntent>,
     /// Settings fingerprint for conversion identity tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_fingerprint: Option<tonepoet_pipeline::SettingsFingerprint>,
@@ -2172,6 +2185,34 @@ mod chunk_2_1_3_staging_cleanup_tests {
         drop(staging);
 
         assert!(staging_root.exists());
+    }
+
+    #[test]
+    fn scratch_staging_dir_drop_releases_reservation_even_when_cleanup_is_best_effort() {
+        use super::super::memory_budget::ScratchMemoryBudget;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let budget = std::sync::Arc::new(ScratchMemoryBudget::with_fixed_total_memory(90, 1_000));
+        let reservation = budget
+            .try_reserve(250, temp.path())
+            .expect("scratch reservation");
+        assert_eq!(budget.active_reserved_bytes(), 250);
+
+        let staging_root = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_root).expect("staging root");
+        {
+            let _staging = StagingDir::new_with_scratch_reservation(
+                staging_root,
+                "job".to_string(),
+                reservation,
+            );
+        }
+
+        assert_eq!(
+            budget.active_reserved_bytes(),
+            0,
+            "StagingDir owns the scratch reservation and must release it on drop"
+        );
     }
 }
 

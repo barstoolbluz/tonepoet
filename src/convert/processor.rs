@@ -16,6 +16,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::OnceLock;
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -29,26 +31,33 @@ use crate::convert::pipeline::{
     encode_realized_track_for_scheduler_with_tool_limits_and_version_cache,
     encode_track_for_scheduler_with_tool_limits_and_version_cache,
     finish_pipeline_album_for_scheduler_with_tool_limits, map_album_outcome,
-    pipeline_report_has_scratch_scoped_storage_exhaustion_for_retry, prepare_pipeline_item_for_scheduler,
+    prepare_pipeline_item_for_scheduler,
     realize_track_for_scheduler_with_tool_limits_and_version_cache,
     run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry,
     scheduled_worker_failure_output,
     AlbumBatchTrackContext, AlbumCompletionTracker,
-    AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, PipelineRequest, PoolLimits,
+    AlbumOutcome, AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, PipelineReport, PipelineRequest, PoolLimits,
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
-    ScratchStagingConfig, SharedWorkerPool, SourceKind, ToolBinary, ToolConcurrencyLimits,
-    TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
+    ScratchStagingConfig, SharedWorkerPool, SourceKind, StageOutcome, ToolBinary, ToolConcurrencyLimits,
+    TrackOutcome, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
+};
+use crate::convert::pipeline::stages::{
+    disk_staging_parent_for, pipeline_report_requests_scratch_disk_retry,
+};
+#[cfg(test)]
+use crate::convert::pipeline::stages::{
+    set_post_materialization_stage_fault_hook_for_test, set_publish_fault_hook_for_test,
 };
 #[cfg(test)]
 use crate::convert::pipeline::{
-    AlbumMetadata, AlbumOutcome, AlbumPlan, CueSidecarPolicy, DvdaGroupSelection,
+    AlbumMetadata, AlbumPlan, CueSidecarPolicy, DvdaGroupSelection,
     ExtractionProvenance, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
-    OverwritePolicy, PlannedTrackOutput, PreparedSource, PreparedTrack, PublishedAlbum,
+    OverwritePolicy, PipelineStage, PlannedMetadataSatisfaction, PlannedTrackOutput, PreparedSource, PreparedTrack, PublishedAlbum,
     PublishPolicy, RedactedPipelineRequest, scheduled_album_for_test,
     SourceAudioDescriptor,
     SourceAudioCoding, SourceOptions, StagePolicy, StageRequirement, StagingDir,
-    TrackId, TrackMetadata, TrackOutcome, TrackRecord, TrackSelection,
+    TrackArtifact, TrackId, TrackMetadata, TrackRecord, TrackSelection,
 };
 
 /// Scratch-staging policy for direct single-item API calls.
@@ -2288,6 +2297,42 @@ fn build_album_postprocess_work(
     }
 }
 
+
+fn scratch_track_retry_original_error(outputs: &[ScheduledTrackOutput]) -> String {
+    outputs
+        .iter()
+        .find_map(|output| match &output.record.outcome {
+            TrackOutcome::Err(error) | TrackOutcome::Blocked(error) => Some(error.clone()),
+            TrackOutcome::Ok => None,
+        })
+        .unwrap_or_else(|| "scratch-scoped track storage exhaustion".to_string())
+}
+
+fn scratch_postprocess_retry_original_error(report: &PipelineReport) -> String {
+    fn stage_error(stages: &[crate::convert::pipeline::StageRecord]) -> Option<String> {
+        stages.iter().rev().find_map(|stage| match &stage.outcome {
+            StageOutcome::Failed(error) => Some(format!("{:?}: {}", stage.stage, error)),
+            StageOutcome::Ok | StageOutcome::Skipped => None,
+        })
+    }
+
+    fn track_error(records: &[crate::convert::pipeline::TrackRecord]) -> Option<String> {
+        records.iter().rev().find_map(|record| match &record.outcome {
+            TrackOutcome::Err(error) | TrackOutcome::Blocked(error) => Some(error.clone()),
+            TrackOutcome::Ok => None,
+        })
+    }
+
+    match &report.outcome {
+        AlbumOutcome::Complete { stages, .. } => stage_error(stages),
+        AlbumOutcome::Partial { failed, stages, .. }
+        | AlbumOutcome::Blocked { failed, stages, .. } => {
+            stage_error(stages).or_else(|| track_error(failed))
+        }
+    }
+    .unwrap_or_else(|| "scratch-scoped postprocess storage exhaustion".to_string())
+}
+
 async fn run_album_postprocess_work(
     album: ScheduledAlbum,
     outputs: Vec<ScheduledTrackOutput>,
@@ -2318,10 +2363,14 @@ async fn run_album_postprocess_work(
                 &output_root,
             )
         {
+            let original_error = scratch_track_retry_original_error(&outputs);
             retry_req.scratch_staging = None;
             log::warn!(
-                "scratch-backed item {} had scratch-scoped track storage exhaustion; retrying the whole item once on disk before terminal failure publication",
-                item_id
+                "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
+                retry_req.job_id,
+                item_id,
+                disk_staging_parent_for(&retry_req).display(),
+                original_error
             );
             drop(outputs);
             drop(album);
@@ -2352,19 +2401,20 @@ async fn run_album_postprocess_work(
         Some(tool_concurrency_limits.clone()),
     )
     .await;
-    let report = if let Some((mut retry_req, staging_root, output_root)) = scratch_retry_context {
-        if !worker_cancel.is_cancelled()
-            && report.published.is_none()
-            && pipeline_report_has_scratch_scoped_storage_exhaustion_for_retry(
-                &report,
-                Some(&staging_root),
-                &output_root,
-            )
-        {
+    let report = if let Some((mut retry_req, _staging_root, _output_root)) = scratch_retry_context {
+        if !worker_cancel.is_cancelled() && pipeline_report_requests_scratch_disk_retry(&report) {
+            let original_error = report
+                .scratch_retry_intent
+                .as_ref()
+                .map(|intent| intent.original_error.clone())
+                .unwrap_or_else(|| scratch_postprocess_retry_original_error(&report));
             retry_req.scratch_staging = None;
             log::warn!(
-                "scratch-backed item {} failed after materialization with scratch-scoped storage exhaustion; retrying the whole item once on disk before terminal failure publication",
-                item_id
+                "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
+                retry_req.job_id,
+                item_id,
+                disk_staging_parent_for(&retry_req).display(),
+                original_error
             );
             retry_scratch_backed_item_once_on_disk_for_scheduler(
                 retry_req,
@@ -2414,36 +2464,44 @@ async fn retry_scratch_backed_item_once_on_disk_for_scheduler(
 }
 
 #[cfg(test)]
-type SchedulerDiskRetryHook = dyn Fn(&PipelineRequest) -> Option<crate::convert::pipeline::PipelineReport> + Send + Sync + 'static;
+type SchedulerDiskRetryHook = dyn Fn(&PipelineRequest) -> Option<crate::convert::pipeline::PipelineReport>
+    + Send
+    + Sync
+    + 'static;
 
 #[cfg(test)]
-static SCHEDULER_DISK_RETRY_HOOK: OnceLock<Mutex<Option<Box<SchedulerDiskRetryHook>>>> = OnceLock::new();
+static SCHEDULER_DISK_RETRY_HOOKS: OnceLock<Mutex<Vec<(u64, Box<SchedulerDiskRetryHook>)>>> =
+    OnceLock::new();
+#[cfg(test)]
+static SCHEDULER_DISK_RETRY_HOOK_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
-fn scheduler_disk_retry_hook_cell() -> &'static Mutex<Option<Box<SchedulerDiskRetryHook>>> {
-    SCHEDULER_DISK_RETRY_HOOK.get_or_init(|| Mutex::new(None))
+fn scheduler_disk_retry_hooks() -> &'static Mutex<Vec<(u64, Box<SchedulerDiskRetryHook>)>> {
+    SCHEDULER_DISK_RETRY_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 #[cfg(test)]
 fn call_scheduler_disk_retry_hook_for_test(
     req: &PipelineRequest,
 ) -> Option<crate::convert::pipeline::PipelineReport> {
-    let guard = scheduler_disk_retry_hook_cell()
+    let guard = scheduler_disk_retry_hooks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.as_ref().and_then(|hook| hook(req))
+    guard.iter().find_map(|(_, hook)| hook(req))
 }
 
 #[cfg(test)]
-struct SchedulerDiskRetryHookGuard;
+struct SchedulerDiskRetryHookGuard {
+    id: u64,
+}
 
 #[cfg(test)]
 impl Drop for SchedulerDiskRetryHookGuard {
     fn drop(&mut self) {
-        let mut guard = scheduler_disk_retry_hook_cell()
+        let mut guard = scheduler_disk_retry_hooks()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = None;
+        guard.retain(|(id, _)| *id != self.id);
     }
 }
 
@@ -2451,12 +2509,12 @@ impl Drop for SchedulerDiskRetryHookGuard {
 fn set_scheduler_disk_retry_hook_for_test(
     hook: Box<SchedulerDiskRetryHook>,
 ) -> SchedulerDiskRetryHookGuard {
-    let mut guard = scheduler_disk_retry_hook_cell()
+    let id = SCHEDULER_DISK_RETRY_HOOK_ID.fetch_add(1, Ordering::Relaxed);
+    let mut guard = scheduler_disk_retry_hooks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert!(guard.is_none(), "scheduler disk retry test hook already installed");
-    *guard = Some(hook);
-    SchedulerDiskRetryHookGuard
+    guard.push((id, hook));
+    SchedulerDiskRetryHookGuard { id }
 }
 
 /// Run one conversion item through the shared scheduler graph.
@@ -2669,6 +2727,62 @@ pub async fn process_item_with_scratch_policy(
 mod tests {
     use super::*;
     use crate::convert::pipeline::DvdaDownmixPolicy;
+
+    struct CapturingTestLogger;
+
+    static TEST_LOGGER: CapturingTestLogger = CapturingTestLogger;
+    static TEST_LOG_LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+    impl log::Log for CapturingTestLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let mut guard = TEST_LOG_LINES
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.push(format!("{}:{}", record.level(), record.args()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn install_test_logger() {
+        let _ = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
+        let _ = TEST_LOG_LINES.get_or_init(|| Mutex::new(Vec::new()));
+    }
+
+    fn test_log_cursor() -> usize {
+        TEST_LOG_LINES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    fn captured_test_logs_since(cursor: usize) -> Vec<String> {
+        TEST_LOG_LINES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .skip(cursor)
+            .cloned()
+            .collect()
+    }
+
+    fn captured_test_logs_since_for_item(cursor: usize, item_id: &str) -> Vec<String> {
+        captured_test_logs_since(cursor)
+            .into_iter()
+            .filter(|line| line.contains(&format!("item_id={item_id}")))
+            .collect()
+    }
 
     fn synthetic_queue_work_unit(job_id: &str, unit_id: String) -> WorkUnit<QueueWorkOutput> {
         let item_id = unit_id.clone();
@@ -2972,6 +3086,7 @@ mod tests {
                     stages: Vec::new(),
                 },
                 durable_log: None,
+                scratch_retry_intent: None,
                 settings_fingerprint: Some(tonepoet_pipeline::fingerprint::settings_fingerprint(
                     &disk_req.settings,
                 )),
@@ -3025,6 +3140,585 @@ mod tests {
         assert_eq!(
             terminal_fragment_count, 0,
             "scratch first attempt must not publish terminal failure fragments before disk retry"
+        );
+    }
+
+
+
+    #[tokio::test]
+    async fn scratch_post_materialization_stage_enospc_retries_disk_before_terminal_failure_publication() {
+        for retry_stage in [
+            PipelineStage::Merge,
+            PipelineStage::Metadata,
+            PipelineStage::ReplayGain,
+            PipelineStage::Features,
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let scratch_root = temp.path().join("scratch");
+            let scratch_parent = scratch_root.join(".tonepoet-staging");
+            let output_root = temp.path().join("out");
+            let log_root = temp.path().join("logs");
+            std::fs::create_dir_all(&scratch_parent).expect("scratch parent");
+            std::fs::create_dir_all(&output_root).expect("output root");
+            std::fs::create_dir_all(&log_root).expect("log root");
+            let container = temp.path().join("input.flac");
+            std::fs::write(&container, b"synthetic input").expect("container");
+
+            let scratch_config = ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+                scratch_root.clone(),
+                50,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+            );
+            scratch_config
+                .ensure_usable(&scratch_parent)
+                .expect("scratch usable");
+            let reservation = scratch_config.try_reserve(8192).expect("scratch reservation");
+            assert_eq!(scratch_config.active_reserved_bytes_for_test(), 8192);
+
+            let item_id = format!("scratch-postprocess-{retry_stage:?}");
+            let job_id = format!("scratch-postprocess-job-{retry_stage:?}");
+            install_test_logger();
+            let log_cursor = test_log_cursor();
+            let mut req = pipeline_request_for_processor_limit_test(temp.path());
+            req.job_id = job_id.clone();
+            req.item_id = item_id.clone();
+            req.container = container.clone();
+            req.output_root = output_root.clone();
+            req.log.root = log_root.clone();
+            req.scratch_staging = Some(scratch_config.clone());
+            req.merge = retry_stage == PipelineStage::Merge;
+            req.stages = StagePolicy {
+                metadata: if retry_stage == PipelineStage::Metadata {
+                    StageRequirement::Enabled
+                } else {
+                    StageRequirement::Disabled
+                },
+                replaygain: if retry_stage == PipelineStage::ReplayGain {
+                    StageRequirement::Enabled
+                } else {
+                    StageRequirement::Disabled
+                },
+                features: if retry_stage == PipelineStage::Features {
+                    StageRequirement::Enabled
+                } else {
+                    StageRequirement::Disabled
+                },
+                generate_cue: false,
+            };
+
+            let staging_root = scratch_parent.join(format!("{job_id}-{item_id}"));
+            let converted_root = staging_root.join("converted");
+            let realized_root = staging_root.join("realized");
+            std::fs::create_dir_all(&converted_root).expect("converted root");
+            std::fs::create_dir_all(&realized_root).expect("realized root");
+            let staging = StagingDir::new_with_scratch_reservation(
+                staging_root.clone(),
+                req.job_id.clone(),
+                reservation,
+            );
+
+            let track_count = if retry_stage == PipelineStage::Merge { 2 } else { 1 };
+            let mut tracks = Vec::new();
+            let mut plan_entries = Vec::new();
+            let mut outputs = Vec::new();
+            let album_dir = output_root.join(format!("disk-attempt-complete-{retry_stage:?}"));
+
+            for index in 0..track_count {
+                let track_id = TrackId {
+                    source_ordinal: index as u32,
+                    disc_number: None,
+                    track_number: index as u32 + 1,
+                };
+                let realized_path = realized_root.join(format!("{:02}.wav", index + 1));
+                let staged_path = converted_root.join(format!("{:02}.flac", index + 1));
+                let final_path = album_dir.join(format!("{:02}.flac", index + 1));
+                std::fs::write(&realized_path, b"realized audio").expect("realized track");
+                std::fs::write(&staged_path, b"encoded audio").expect("staged track");
+                let metadata_required = if retry_stage == PipelineStage::Metadata {
+                    PlannedMetadataSatisfaction {
+                        authoritative_tags_applied: true,
+                        ..PlannedMetadataSatisfaction::none()
+                    }
+                } else {
+                    PlannedMetadataSatisfaction::none()
+                };
+
+                tracks.push(PreparedTrack {
+                    id: track_id.clone(),
+                    source_ref: TrackSourceRef::StagedFile(realized_path.clone()),
+                    metadata: TrackMetadata {
+                        title: Some(format!("Scratch Retry {}", index + 1)),
+                        track_number: Some(index as u32 + 1),
+                        ..TrackMetadata::default()
+                    },
+                    expected_samples: Some(44_100),
+                    sample_rate: Some(44_100),
+                    source_audio: SourceAudioDescriptor::from_scalar(
+                        Some(44_100),
+                        Some(16),
+                        Some(SourceAudioCoding::Pcm),
+                    ),
+                    bit_depth: Some(16),
+                });
+                plan_entries.push(PlannedTrackOutput {
+                    track_id: track_id.clone(),
+                    final_path: final_path.clone(),
+                });
+                outputs.push(ScheduledTrackOutput {
+                    index,
+                    record: TrackRecord {
+                        track_id: track_id.clone(),
+                        outcome: TrackOutcome::Ok,
+                        source_ref: TrackSourceRef::StagedFile(realized_path.clone()),
+                        realized_input: Some(realized_path.clone()),
+                        output_file: Some(staged_path.clone()),
+                        commands: Vec::new(),
+                        bytes_in: Some(1024),
+                        bytes_out: Some(1024),
+                        duration: None,
+                        dsd_dst_stats: None,
+                    },
+                    artifact: Some(TrackArtifact {
+                        track_id,
+                        staged_path,
+                        final_path,
+                        samples: Some(44_100),
+                        metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                        metadata_required,
+                        planned_command_hash: None,
+                    }),
+                    ok: true,
+                    metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                });
+            }
+
+            let source = PreparedSource {
+                container: container.clone(),
+                kind: SourceKind::SingleFile,
+                tracks,
+                album_metadata: AlbumMetadata {
+                    album: Some("Scratch Retry Album".to_string()),
+                    total_tracks: track_count as u32,
+                    ..AlbumMetadata::default()
+                },
+                provenance: ExtractionProvenance {
+                    source_kind: SourceKind::SingleFile,
+                    source_sha256: None,
+                    tool_versions: BTreeMap::new(),
+                    extracted_at: chrono::Utc::now(),
+                },
+            };
+            let plan = AlbumPlan {
+                album_dir: album_dir.clone(),
+                entries: plan_entries,
+            };
+            let album = scheduled_album_for_test(
+                req.clone(),
+                req.item_id.clone(),
+                staging,
+                source,
+                plan,
+                Vec::new(),
+                &scratch_parent,
+            );
+
+            let expected_stage = retry_stage;
+            let expected_item_id = item_id.clone();
+            let expected_staging_root = staging_root.clone();
+            let _stage_fault_guard = set_post_materialization_stage_fault_hook_for_test(Box::new(
+                move |stage, hook_req, observed_path| {
+                    if stage != expected_stage || hook_req.item_id != expected_item_id {
+                        return None;
+                    }
+                    if let Some(path) = observed_path {
+                        assert!(
+                            path.starts_with(&expected_staging_root),
+                            "fault hook should observe scratch staging path, got {}",
+                            path.display()
+                        );
+                    }
+                    Some(format!(
+                        "injected {stage:?} ENOSPC while writing {}: No space left on device",
+                        expected_staging_root.join("postprocess-stage.tmp").display()
+                    ))
+                },
+            ));
+
+            let retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hook_retry_count = retry_count.clone();
+            let hook_scratch_config = scratch_config.clone();
+            let hook_staging_root = staging_root.clone();
+            let hook_album_dir = album_dir.clone();
+            let hook_log_root = log_root.clone();
+            let hook_item_id = item_id.clone();
+            let _retry_hook_guard = set_scheduler_disk_retry_hook_for_test(Box::new(move |disk_req| {
+                if disk_req.item_id != hook_item_id {
+                    return None;
+                }
+                hook_retry_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    disk_req.scratch_staging.is_none(),
+                    "disk retry request must disable scratch staging"
+                );
+                assert!(
+                    !hook_staging_root.exists(),
+                    "scratch staging root must be dropped before disk retry starts"
+                );
+                assert_eq!(
+                    hook_scratch_config.active_reserved_bytes_for_test(),
+                    0,
+                    "scratch reservation must be released before disk retry starts"
+                );
+                let pre_retry_fragment_count = std::fs::read_dir(&hook_log_root)
+                    .expect("log root exists before disk retry")
+                    .count();
+                assert_eq!(
+                    pre_retry_fragment_count,
+                    0,
+                    "scratch postprocess failure must not publish terminal fragments before disk retry"
+                );
+                Some(crate::convert::pipeline::PipelineReport {
+                    request: RedactedPipelineRequest::from(disk_req),
+                    source: None,
+                    plan: None,
+                    artifacts: None,
+                    published: Some(PublishedAlbum {
+                        album_dir: hook_album_dir.clone(),
+                        entries: Vec::new(),
+                        manifest_path: None,
+                    }),
+                    outcome: AlbumOutcome::Complete {
+                        tracks: Vec::new(),
+                        stages: Vec::new(),
+                    },
+                    durable_log: None,
+                    scratch_retry_intent: None,
+                    settings_fingerprint: Some(tonepoet_pipeline::fingerprint::settings_fingerprint(
+                        &disk_req.settings,
+                    )),
+                    manifest_path: None,
+                })
+            }));
+
+            let (progress_tx, _progress_rx) = broadcast::channel(8);
+            let result = run_album_postprocess_work(
+                album,
+                outputs,
+                HashMap::new(),
+                Arc::new(Mutex::new(HashMap::new())),
+                progress_tx,
+                Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
+                CancellationToken::new(),
+            )
+            .await;
+
+            match result {
+                QueueWorkOutput::PostProcessed { item_id: actual_item_id, status } => {
+                    assert_eq!(actual_item_id, item_id);
+                    match status {
+                        ConversionStatus::Completed { output_path, log_path } => {
+                            assert_eq!(output_path, album_dir);
+                            assert!(log_path.is_none(), "disk retry hook returned no durable log");
+                        }
+                        other => panic!(
+                            "terminal status for {retry_stage:?} should come from disk retry attempt, got {other:?}"
+                        ),
+                    }
+                }
+                _ => panic!("album postprocess should produce one terminal postprocess result"),
+            }
+
+            assert_eq!(
+                retry_count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{retry_stage:?} ENOSPC should trigger exactly one disk retry"
+            );
+            let expected_disk_staging_path = output_root.join(".tonepoet-staging");
+            let retry_logs = captured_test_logs_since_for_item(log_cursor, &item_id);
+            assert!(
+                retry_logs.iter().any(|line| {
+                    line.contains("WARN:scratch retrying on disk")
+                        && line.contains(&format!("job_id={job_id}"))
+                        && line.contains(&format!("item_id={item_id}"))
+                        && line.contains(&format!(
+                            "disk_staging_path={}",
+                            expected_disk_staging_path.display()
+                        ))
+                        && line.contains("original_error=")
+                        && line.contains(&format!("{retry_stage:?}"))
+                        && line.contains("No space left on device")
+                }),
+                "scratch retry log for {retry_stage:?} must include job_id, item_id, disk staging path, and original error; logs were {retry_logs:?}"
+            );
+            assert!(
+                retry_logs.iter().any(|line| {
+                    line.contains("WARN:scratch failure eligible for disk retry; deferring terminal failure publication")
+                        && line.contains(&format!("job_id={job_id}"))
+                        && line.contains(&format!("item_id={item_id}"))
+                        && line.contains("original_error=")
+                        && line.contains(&format!("{retry_stage:?}"))
+                        && line.contains("No space left on device")
+                }),
+                "inner retry-intent log for {retry_stage:?} must distinguish eligibility/deferral from the actual retry; logs were {retry_logs:?}"
+            );
+            assert!(
+                !staging_root.exists(),
+                "scratch staging should stay cleaned after retry"
+            );
+            assert_eq!(
+                scratch_config.active_reserved_bytes_for_test(),
+                0,
+                "scratch reservation should remain released after retry"
+            );
+            let terminal_fragment_count = std::fs::read_dir(&log_root)
+                .expect("log root exists")
+                .count();
+            assert_eq!(
+                terminal_fragment_count,
+                0,
+                "scratch postprocess attempt must not publish terminal failure fragments before disk retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scratch_output_publish_enospc_does_not_retry_on_disk_and_publishes_terminal_failure() {
+        install_test_logger();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scratch_root = temp.path().join("scratch");
+        let scratch_parent = scratch_root.join(".tonepoet-staging");
+        let output_root = temp.path().join("out");
+        let log_root = temp.path().join("logs");
+        std::fs::create_dir_all(&scratch_parent).expect("scratch parent");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&log_root).expect("log root");
+        let container = temp.path().join("input.flac");
+        std::fs::write(&container, b"synthetic input").expect("container");
+
+        let scratch_config = ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+            scratch_root.clone(),
+            50,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        );
+        scratch_config
+            .ensure_usable(&scratch_parent)
+            .expect("scratch usable");
+        let reservation = scratch_config.try_reserve(4096).expect("scratch reservation");
+        assert_eq!(scratch_config.active_reserved_bytes_for_test(), 4096);
+
+        let mut req = pipeline_request_for_processor_limit_test(temp.path());
+        req.job_id = "scratch-output-publish-job".to_string();
+        req.item_id = "scratch-output-publish-item".to_string();
+        let log_cursor = test_log_cursor();
+        req.container = container.clone();
+        req.output_root = output_root.clone();
+        req.log.root = log_root.clone();
+        req.scratch_staging = Some(scratch_config.clone());
+        req.stages = StagePolicy {
+            metadata: StageRequirement::Disabled,
+            replaygain: StageRequirement::Disabled,
+            features: StageRequirement::Disabled,
+            generate_cue: false,
+        };
+
+        let staging_root = scratch_parent.join(format!("{}-{}", req.job_id, req.item_id));
+        let converted_root = staging_root.join("converted");
+        let realized_root = staging_root.join("realized");
+        std::fs::create_dir_all(&converted_root).expect("converted root");
+        std::fs::create_dir_all(&realized_root).expect("realized root");
+        let staging = StagingDir::new_with_scratch_reservation(
+            staging_root.clone(),
+            req.job_id.clone(),
+            reservation,
+        );
+
+        let track_id = TrackId {
+            source_ordinal: 0,
+            disc_number: None,
+            track_number: 1,
+        };
+        let realized_path = realized_root.join("01.wav");
+        let staged_path = converted_root.join("01.flac");
+        let album_dir = output_root.join("output-capacity-failure");
+        let final_path = album_dir.join("01.flac");
+        std::fs::write(&realized_path, b"realized audio").expect("realized track");
+        std::fs::write(&staged_path, b"encoded audio").expect("staged track");
+
+        let source = PreparedSource {
+            container: container.clone(),
+            kind: SourceKind::SingleFile,
+            tracks: vec![PreparedTrack {
+                id: track_id.clone(),
+                source_ref: TrackSourceRef::StagedFile(realized_path.clone()),
+                metadata: TrackMetadata {
+                    title: Some("Output Capacity".to_string()),
+                    track_number: Some(1),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(44_100),
+                sample_rate: Some(44_100),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(44_100),
+                    Some(16),
+                    Some(SourceAudioCoding::Pcm),
+                ),
+                bit_depth: Some(16),
+            }],
+            album_metadata: AlbumMetadata {
+                album: Some("Output Capacity Album".to_string()),
+                total_tracks: 1,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SingleFile,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        };
+        let plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            entries: vec![PlannedTrackOutput {
+                track_id: track_id.clone(),
+                final_path: final_path.clone(),
+            }],
+        };
+        let album = scheduled_album_for_test(
+            req.clone(),
+            req.item_id.clone(),
+            staging,
+            source,
+            plan,
+            Vec::new(),
+            &scratch_parent,
+        );
+        let outputs = vec![ScheduledTrackOutput {
+            index: 0,
+            record: TrackRecord {
+                track_id: track_id.clone(),
+                outcome: TrackOutcome::Ok,
+                source_ref: TrackSourceRef::StagedFile(realized_path.clone()),
+                realized_input: Some(realized_path),
+                output_file: Some(staged_path.clone()),
+                commands: Vec::new(),
+                bytes_in: Some(1024),
+                bytes_out: Some(1024),
+                duration: None,
+                dsd_dst_stats: None,
+            },
+            artifact: Some(TrackArtifact {
+                track_id,
+                staged_path,
+                final_path,
+                samples: Some(44_100),
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                metadata_required: PlannedMetadataSatisfaction::none(),
+                planned_command_hash: None,
+            }),
+            ok: true,
+            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+        }];
+
+        let hook_album_dir = album_dir.clone();
+        let hook_output_root = output_root.clone();
+        let _publish_fault_guard = set_publish_fault_hook_for_test(Box::new(move |_staging, plan| {
+            if plan.album_dir != hook_album_dir {
+                return None;
+            }
+            Some(format!(
+                "No space left on device while publishing final output under {}",
+                hook_output_root.display()
+            ))
+        }));
+
+        let retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_retry_count = retry_count.clone();
+        let _retry_hook_guard = set_scheduler_disk_retry_hook_for_test(Box::new(move |disk_req| {
+            if disk_req.item_id != "scratch-output-publish-item" {
+                return None;
+            }
+            hook_retry_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(crate::convert::pipeline::PipelineReport {
+                request: RedactedPipelineRequest::from(disk_req),
+                source: None,
+                plan: None,
+                artifacts: None,
+                published: Some(PublishedAlbum {
+                    album_dir: disk_req.output_root.join("unexpected-disk-retry"),
+                    entries: Vec::new(),
+                    manifest_path: None,
+                }),
+                outcome: AlbumOutcome::Complete {
+                    tracks: Vec::new(),
+                    stages: Vec::new(),
+                },
+                durable_log: None,
+                scratch_retry_intent: None,
+                settings_fingerprint: Some(tonepoet_pipeline::fingerprint::settings_fingerprint(
+                    &disk_req.settings,
+                )),
+                manifest_path: None,
+            })
+        }));
+
+        let (progress_tx, _progress_rx) = broadcast::channel(8);
+        let result = run_album_postprocess_work(
+            album,
+            outputs,
+            HashMap::new(),
+            Arc::new(Mutex::new(HashMap::new())),
+            progress_tx,
+            Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
+            CancellationToken::new(),
+        )
+        .await;
+
+        match result {
+            QueueWorkOutput::PostProcessed { item_id, status } => {
+                assert_eq!(item_id, "scratch-output-publish-item");
+                match status {
+                    ConversionStatus::Failed { error, log_path } => {
+                        assert!(
+                            error.contains("Publish") && error.contains("No space left on device"),
+                            "terminal failure should remain a publish/output capacity failure, got {error}"
+                        );
+                        assert!(
+                            error.contains(&output_root.to_string_lossy().to_string()),
+                            "publish failure should name the output filesystem path, got {error}"
+                        );
+                        let log_path = log_path.expect("blocked publish failure should write a durable log");
+                        assert!(log_path.exists(), "durable terminal failure log should exist");
+                    }
+                    other => panic!("output ENOSPC must fail terminally without disk retry, got {other:?}"),
+                }
+            }
+            _ => panic!("album postprocess should produce one terminal postprocess result"),
+        }
+
+        assert_eq!(
+            retry_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "publish/output ENOSPC must not trigger scratch disk retry"
+        );
+        assert!(
+            !staging_root.exists(),
+            "scratch staging should still be cleaned after terminal output publish failure"
+        );
+        assert_eq!(
+            scratch_config.active_reserved_bytes_for_test(),
+            0,
+            "scratch reservation should be released after terminal output publish failure"
+        );
+        let logs = captured_test_logs_since_for_item(log_cursor, "scratch-output-publish-item");
+        assert!(
+            !logs.iter().any(|line| line.contains("scratch retrying on disk")),
+            "output publish exhaustion must not be logged as a scratch retry; logs were {logs:?}"
         );
     }
 

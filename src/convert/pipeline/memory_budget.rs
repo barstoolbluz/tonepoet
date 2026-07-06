@@ -220,20 +220,27 @@ impl ScratchMemoryBudget {
         let estimated_bytes = estimated_bytes.max(1);
         if self.memory_limit_percent == 0 {
             return Err(ScratchAdmissionError::new(
+                ScratchAdmissionFailureKind::Disabled,
                 "scratch staging is disabled by scratch_memory_limit_percent=0",
             ));
         }
 
         let filesystem = self.filesystem_source.snapshot(scratch_root).map_err(|err| {
-            ScratchAdmissionError::new(format!(
-                "could not read scratch filesystem capacity for {}: {err}",
-                scratch_root.display()
-            ))
+            ScratchAdmissionError::new(
+                ScratchAdmissionFailureKind::FilesystemCapacity,
+                format!(
+                    "could not read scratch filesystem capacity for {}: {err}",
+                    scratch_root.display()
+                ),
+            )
         })?;
 
         let memory = if enforce_ram_budget {
             Some(self.memory_source.snapshot().map_err(|err| {
-                ScratchAdmissionError::new(format!("could not read system memory budget: {err}"))
+                ScratchAdmissionError::new(
+                    ScratchAdmissionFailureKind::AvailableMemory,
+                    format!("could not read system memory budget: {err}"),
+                )
             })?)
         } else {
             None
@@ -244,6 +251,7 @@ impl ScratchMemoryBudget {
             .unwrap_or(u64::MAX);
         if enforce_ram_budget && configured_limit == 0 {
             return Err(ScratchAdmissionError::new(
+                ScratchAdmissionFailureKind::MemoryBudget,
                 "scratch memory budget rounds down to zero bytes",
             ));
         }
@@ -272,12 +280,21 @@ impl ScratchMemoryBudget {
         };
 
         if estimated_bytes > admission_ceiling {
-            let bottleneck = if filesystem_usable_remaining < ram_gate_remaining || !enforce_ram_budget {
-                "scratch filesystem usable free space"
-            } else if mem_available_remaining < ram_budget_remaining {
-                "currently available memory"
+            let (bottleneck, failure_kind) = if filesystem_usable_remaining <= ram_gate_remaining || !enforce_ram_budget {
+                (
+                    "scratch filesystem usable free space",
+                    ScratchAdmissionFailureKind::FilesystemCapacity,
+                )
+            } else if mem_available_remaining <= ram_budget_remaining {
+                (
+                    "currently available memory",
+                    ScratchAdmissionFailureKind::AvailableMemory,
+                )
             } else {
-                "configured RAM budget"
+                (
+                    "configured RAM budget",
+                    ScratchAdmissionFailureKind::MemoryBudget,
+                )
             };
             let ram_description = if enforce_ram_budget {
                 format!(
@@ -288,18 +305,21 @@ impl ScratchMemoryBudget {
             } else {
                 "RAM budget gate disabled for non-tmpfs scratch, ".to_string()
             };
-            return Err(ScratchAdmissionError::new(format!(
-                "estimated scratch peak {} exceeds admission ceiling {} ({bottleneck}; {}scratch filesystem usable remaining {}; scratch filesystem available {}, scratch filesystem headroom {}, scratch filesystem total {}, active reservations {}, scratch_memory_limit_percent={})",
-                format_bytes(estimated_bytes),
-                format_bytes(admission_ceiling),
-                ram_description,
-                format_bytes(filesystem_usable_remaining),
-                format_bytes(filesystem.available_bytes),
-                format_bytes(filesystem.headroom_bytes),
-                format_bytes(filesystem.total_bytes),
-                format_bytes(active_before),
-                self.memory_limit_percent,
-            )));
+            return Err(ScratchAdmissionError::new(
+                failure_kind,
+                format!(
+                    "estimated scratch peak {} exceeds admission ceiling {} ({bottleneck}; {}scratch filesystem usable remaining {}; scratch filesystem available {}, scratch filesystem headroom {}, scratch filesystem total {}, active reservations {}, scratch_memory_limit_percent={})",
+                    format_bytes(estimated_bytes),
+                    format_bytes(admission_ceiling),
+                    ram_description,
+                    format_bytes(filesystem_usable_remaining),
+                    format_bytes(filesystem.available_bytes),
+                    format_bytes(filesystem.headroom_bytes),
+                    format_bytes(filesystem.total_bytes),
+                    format_bytes(active_before),
+                    self.memory_limit_percent,
+                ),
+            ));
         }
 
         *active = active_before.saturating_add(estimated_bytes);
@@ -319,16 +339,19 @@ impl ScratchMemoryBudget {
                 filesystem_available_bytes: filesystem.available_bytes,
                 filesystem_headroom_bytes: filesystem.headroom_bytes,
                 filesystem_usable_remaining_bytes: filesystem_usable_remaining,
+                admission_ceiling_before_bytes: admission_ceiling,
             },
+            log_context: None,
         })
     }
 
-    fn release(&self, bytes: u64) {
+    fn release(&self, bytes: u64) -> u64 {
         let mut active = self
             .active_reserved_bytes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *active = active.saturating_sub(bytes);
+        *active
     }
 
     #[cfg(test)]
@@ -434,6 +457,7 @@ struct ScratchAdmissionSummary {
     filesystem_available_bytes: u64,
     filesystem_headroom_bytes: u64,
     filesystem_usable_remaining_bytes: u64,
+    admission_ceiling_before_bytes: u64,
 }
 
 impl ScratchAdmissionSummary {
@@ -460,6 +484,17 @@ impl ScratchAdmissionSummary {
             format_bytes(self.filesystem_total_bytes),
         )
     }
+
+    fn remaining_after_reservation(&self, reserved_bytes: u64) -> u64 {
+        self.admission_ceiling_before_bytes.saturating_sub(reserved_bytes)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScratchReservationLogContext {
+    job_id: String,
+    item_id: String,
+    scratch_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -467,6 +502,7 @@ pub struct ScratchReservation {
     budget: Arc<ScratchMemoryBudget>,
     bytes: u64,
     admission: ScratchAdmissionSummary,
+    log_context: Option<ScratchReservationLogContext>,
 }
 
 impl ScratchReservation {
@@ -479,24 +515,84 @@ impl ScratchReservation {
     pub fn admission_summary(&self) -> String {
         self.admission.describe()
     }
+
+    #[must_use]
+    pub fn remaining_after_reservation_bytes(&self) -> u64 {
+        self.admission.remaining_after_reservation(self.bytes)
+    }
+
+    #[must_use]
+    pub fn active_after_reservation_bytes(&self) -> u64 {
+        self.admission.active_before_bytes.saturating_add(self.bytes)
+    }
+
+    #[must_use]
+    pub fn with_log_context(
+        mut self,
+        job_id: impl Into<String>,
+        item_id: impl Into<String>,
+        scratch_path: PathBuf,
+    ) -> Self {
+        self.log_context = Some(ScratchReservationLogContext {
+            job_id: job_id.into(),
+            item_id: item_id.into(),
+            scratch_path,
+        });
+        if let Some(context) = &self.log_context {
+            log::debug!(
+                "scratch reservation acquired: job_id={}, item_id={}, bytes_reserved={}, active_reserved_after={}, scratch_path={}",
+                context.job_id,
+                context.item_id,
+                format_bytes(self.bytes),
+                format_bytes(self.active_after_reservation_bytes()),
+                context.scratch_path.display(),
+            );
+        }
+        self
+    }
 }
 
 impl Drop for ScratchReservation {
     fn drop(&mut self) {
-        self.budget.release(self.bytes);
+        let active_after_release = self.budget.release(self.bytes);
+        if let Some(context) = &self.log_context {
+            log::debug!(
+                "scratch reservation released: job_id={}, item_id={}, bytes_released={}, active_reserved_after={}, scratch_path={}",
+                context.job_id,
+                context.item_id,
+                format_bytes(self.bytes),
+                format_bytes(active_after_release),
+                context.scratch_path.display(),
+            );
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScratchAdmissionFailureKind {
+    Disabled,
+    MemoryBudget,
+    FilesystemCapacity,
+    AvailableMemory,
 }
 
 #[derive(Debug, Clone)]
 pub struct ScratchAdmissionError {
+    kind: ScratchAdmissionFailureKind,
     reason: String,
 }
 
 impl ScratchAdmissionError {
-    fn new(reason: impl Into<String>) -> Self {
+    fn new(kind: ScratchAdmissionFailureKind, reason: impl Into<String>) -> Self {
         Self {
+            kind,
             reason: reason.into(),
         }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> ScratchAdmissionFailureKind {
+        self.kind
     }
 
     #[must_use]
@@ -767,7 +863,7 @@ fn cleanup_stale_staging_dir(staging_parent: &Path, staging_dir: &Path) {
     match probe_existing_run_lock(&lock_path) {
         Ok(RunLockProbe::Held) => {
             log::debug!(
-                "scratch staging tree {} is still protected by active run lock {}; skipping cleanup",
+                "scratch stale cleanup: skipped active lock: staging_path={}, lock_holder={}",
                 staging_dir.display(),
                 lock_path.display()
             );
@@ -812,7 +908,7 @@ fn cleanup_orphaned_run_lock(staging_parent: &Path, lock_path: &Path) {
 fn remove_stale_staging_tree(path: &Path) -> bool {
     match fs::remove_dir_all(path) {
         Ok(()) => {
-            log::info!("removed stale scratch staging tree {}", path.display());
+            log::info!("scratch stale cleanup: removed tree: staging_path={}", path.display());
             true
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => true,
@@ -1030,7 +1126,10 @@ mod tests {
         assert_eq!(budget.active_reserved_bytes(), 300);
         let second = budget.try_reserve(200, temp.path()).expect("second reservation");
         assert_eq!(budget.active_reserved_bytes(), 500);
-        assert!(budget.try_reserve(1, temp.path()).is_err());
+        let err = budget
+            .try_reserve(1, temp.path())
+            .expect_err("configured memory budget should be exhausted");
+        assert_eq!(err.kind(), ScratchAdmissionFailureKind::MemoryBudget);
         drop(first);
         assert_eq!(budget.active_reserved_bytes(), 200);
         drop(second);
@@ -1041,7 +1140,10 @@ mod tests {
     fn zero_percent_disables_scratch_reservations() {
         let temp = tempfile::tempdir().expect("temp dir");
         let budget = Arc::new(ScratchMemoryBudget::with_fixed_total_memory(0, 1_000));
-        assert!(budget.try_reserve(1, temp.path()).is_err());
+        let err = budget
+            .try_reserve(1, temp.path())
+            .expect_err("zero percent disables scratch reservations");
+        assert_eq!(err.kind(), ScratchAdmissionFailureKind::Disabled);
         assert_eq!(budget.active_reserved_bytes(), 0);
     }
 
@@ -1050,7 +1152,28 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let budget = Arc::new(ScratchMemoryBudget::with_fixed_total_memory(100, 1_000));
         let _held = budget.try_reserve(900, temp.path()).expect("first reservation within clamped 90% budget");
-        assert!(budget.try_reserve(1, temp.path()).is_err(), "budget should be exhausted after reserving 90% of total");
+        let err = budget
+            .try_reserve(1, temp.path())
+            .expect_err("budget should be exhausted after reserving 90% of total");
+        assert_eq!(err.kind(), ScratchAdmissionFailureKind::MemoryBudget);
+    }
+
+    #[test]
+    fn available_memory_is_part_of_admission_gate() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let budget = Arc::new(ScratchMemoryBudget::with_fixed_memory_and_filesystem(
+            90,
+            10_000,
+            399,
+            10_000,
+            10_000,
+        ));
+        let err = budget
+            .try_reserve(400, temp.path())
+            .expect_err("MemAvailable must gate tmpfs admission independently of configured budget");
+        assert_eq!(err.kind(), ScratchAdmissionFailureKind::AvailableMemory);
+        assert!(err.reason().contains("available memory") || err.reason().contains("MemAvailable"), "{err}");
+        assert_eq!(budget.active_reserved_bytes(), 0);
     }
 
     #[test]
@@ -1066,6 +1189,7 @@ mod tests {
         let err = budget
             .try_reserve(401, temp.path())
             .expect_err("scratch filesystem free space must gate admission");
+        assert_eq!(err.kind(), ScratchAdmissionFailureKind::FilesystemCapacity);
         assert!(err.reason().contains("scratch filesystem"), "{err}");
         assert_eq!(budget.active_reserved_bytes(), 0);
     }
@@ -1232,6 +1356,7 @@ mod tests {
             .try_reserve(257 * MIB, temp.path())
             .expect_err("mount free space must cap admission even when RAM budget is ample");
 
+        assert_eq!(err.kind(), ScratchAdmissionFailureKind::FilesystemCapacity);
         assert!(err.reason().contains("scratch filesystem"), "{err}");
         assert_eq!(budget.active_reserved_bytes(), 0);
     }
