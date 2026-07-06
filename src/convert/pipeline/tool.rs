@@ -653,6 +653,7 @@ impl ToolRunner for RealToolRunner {
         // Build the process command.
         let mut proc = tokio::process::Command::new(&binary_path);
         proc.args(&cmd.args)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
