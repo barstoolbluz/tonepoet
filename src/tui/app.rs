@@ -7489,8 +7489,8 @@ pub enum ConfirmAction {
     },
     /// Overwrite the currently active preset after user confirmation.
     SavePresetOverwrite { name: String, path: PathBuf },
-    /// Move the given paths to the system trash (XDG Trash / Finder Trash).
-    TrashSelection(Vec<PathBuf>),
+    /// Permanently delete the given filesystem paths after explicit confirmation.
+    DeleteSelection(Vec<PathBuf>),
     /// Apply AccurateRip offset correction to a set of tracks.
     OffsetCorrection {
         paths: Vec<PathBuf>,

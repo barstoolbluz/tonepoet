@@ -160,7 +160,6 @@ pub const COMMAND_NAMES: &[&str] = &[
     "rename",
     "del",
     "delete",
-    "trash",
     "cp",
     "cp!",
     "copy",
@@ -415,8 +414,7 @@ pub enum Command {
     /// Rename the current browse selection to the given name.
     /// Empty arg opens the rename overlay seeded with the current name.
     Rename(String),
-    /// Move selected browse file(s) to the system trash (XDG Trash on
-    /// Linux, Finder Trash on macOS). Shows confirmation first.
+    /// Permanently delete selected browse file(s). Shows confirmation first.
     Delete,
     /// Copy selected file(s) to a destination. Empty arg opens a directory
     /// picker. `:cp!` variant replaces existing files.
@@ -740,7 +738,7 @@ pub fn parse_command(input: &str) -> Command {
         // replaced have been removed (no-bare-char-keys rule);
         // KeyCode::Delete remains as a convenience shortcut for :d.
         // Editor `:w` save lives in Command::Write (overlay-aware).
-        // `delete` (without short alias) is taken by browse trash;
+        // `delete` (without short alias) is taken by browse file deletion;
         // editor delete is `:d` only. `add` overlaps with bookmarks
         // sub-args but bookmarks parses its own `add` inside the
         // execute_bookmarks helper (top-level `:add` here is safe).
@@ -838,7 +836,7 @@ pub fn parse_command(input: &str) -> Command {
             Command::Filter(arg)
         }
         "refresh" => Command::Refresh,
-        "del" | "delete" | "trash" => Command::Delete,
+        "del" | "delete" => Command::Delete,
         "rename" => Command::Rename(args.to_string()),
         "cp" | "copy" => Command::Copy {
             dest: args.to_string(),
@@ -1534,7 +1532,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::Delete => {
-            execute_delete(app);
+            execute_delete(app, tx);
         }
         Command::Rename(new_name) => {
             execute_rename(app, &new_name, tx);
@@ -4787,25 +4785,86 @@ fn execute_go(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     super::convert_actions::start_processing(app, tx);
 }
 
-/// Execute `:del` / `:delete` / `:trash` — show confirmation, then move
-/// selected browse entries to the system trash.
-fn execute_delete(app: &mut AppState) {
-    if app.current_screen != AppScreen::Browse {
-        app.set_status(":del only works on the Browse screen");
-        return;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteCommandDispatch {
+    NotBrowse,
+    ArchiveStagedDelete,
+    FilesystemPermanentDelete,
+}
+
+fn delete_command_dispatch_for(
+    current_screen: AppScreen,
+    is_in_archive: bool,
+) -> DeleteCommandDispatch {
+    if current_screen != AppScreen::Browse {
+        DeleteCommandDispatch::NotBrowse
+    } else if is_in_archive {
+        DeleteCommandDispatch::ArchiveStagedDelete
+    } else {
+        DeleteCommandDispatch::FilesystemPermanentDelete
+    }
+}
+
+fn delete_command_dispatch(app: &AppState) -> DeleteCommandDispatch {
+    delete_command_dispatch_for(app.current_screen, app.browse.is_in_archive())
+}
+
+/// Execute `:del` / `:delete`. Filesystem browsing uses a permanent-delete
+/// confirmation; archive browsing uses the archive-aware staged edit path.
+fn execute_delete(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    match delete_command_dispatch(app) {
+        DeleteCommandDispatch::NotBrowse => {
+            app.set_status(":del only works on the Browse screen");
+        }
+        DeleteCommandDispatch::ArchiveStagedDelete => {
+            super::keybindings::start_browse_archive_entry_delete(app, tx);
+        }
+        DeleteCommandDispatch::FilesystemPermanentDelete => {
+            let paths = collect_selection_for_file_ops(app);
+            if paths.is_empty() {
+                app.set_status("no files selected");
+                return;
+            }
+
+            let count = paths.len();
+            app.active_overlay = ActiveOverlay::Confirmation {
+                message: format!(
+                    "Permanently delete {} item(s)?\n\nThis cannot be undone.",
+                    count
+                ),
+                action: ConfirmAction::DeleteSelection(paths),
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_command_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn archive_del_uses_staged_archive_delete_not_filesystem_confirmation() {
+        let dispatch = delete_command_dispatch_for(AppScreen::Browse, true);
+
+        assert_eq!(dispatch, DeleteCommandDispatch::ArchiveStagedDelete);
+        assert_ne!(dispatch, DeleteCommandDispatch::FilesystemPermanentDelete);
     }
 
-    let paths = collect_selection_for_file_ops(app);
-    if paths.is_empty() {
-        app.set_status("no files selected");
-        return;
+    #[test]
+    fn filesystem_del_still_uses_permanent_delete_confirmation() {
+        assert_eq!(
+            delete_command_dispatch_for(AppScreen::Browse, false),
+            DeleteCommandDispatch::FilesystemPermanentDelete
+        );
     }
 
-    let count = paths.len();
-    app.active_overlay = ActiveOverlay::Confirmation {
-        message: format!("Move {} item(s) to trash?", count),
-        action: ConfirmAction::TrashSelection(paths),
-    };
+    #[test]
+    fn del_is_rejected_outside_browse() {
+        assert_eq!(
+            delete_command_dispatch_for(AppScreen::Queue, false),
+            DeleteCommandDispatch::NotBrowse
+        );
+    }
 }
 
 /// Execute a `:cp` / `:mv` command. Collects selected files on Browse,

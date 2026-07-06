@@ -98,8 +98,8 @@ pub enum ContextAction {
     Deselect,
     /// Rename the selected file (`:rename` or context menu).
     RenameEntry,
-    /// Move selected file(s) to the system trash.
-    MoveToTrash,
+    /// Permanently delete selected filesystem path(s).
+    DeletePermanently,
     /// Copy the full path of the selected entry to the clipboard.
     CopyPath(PathBuf),
     /// Edit a metadata field on the selected audio file (legacy single-field).
@@ -337,7 +337,7 @@ fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
 }
 
 /// Build the "File operations" submenu (Rename, Bulk Rename, Copy/Move,
-/// Trash). `include_bulk_rename` adds the Bulk Rename option for audio files.
+/// Delete). `include_bulk_rename` adds the Bulk Rename option for audio files.
 fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
     let mut children = vec![item("Rename", ContextAction::RenameEntry)];
     if include_bulk_rename {
@@ -345,7 +345,7 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
     }
     children.push(item("Copy to...", ContextAction::CopyTo));
     children.push(item("Move to...", ContextAction::MoveTo));
-    children.push(item("Move to Trash", ContextAction::MoveToTrash));
+    children.push(item("Delete permanently", ContextAction::DeletePermanently));
     ContextMenuEntry::Submenu {
         label: "File operations".to_string(),
         children,
@@ -356,7 +356,7 @@ fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
 /// Archive browse entries use synthetic paths (`archive/inner`) that do not
 /// exist on the host filesystem. Only expose actions here that either navigate
 /// the in-memory archive listing or have an explicit archive-aware staging path.
-/// Generic file operations (bulk rename, copy/move, trash, text view/edit,
+/// Generic file operations (bulk rename, copy/move, delete, text view/edit,
 /// tagging utilities, analysis) must stay hidden so they cannot feed synthetic
 /// paths into filesystem code.
 fn archive_entry_can_rename(entry: &BrowseEntry) -> bool {
@@ -858,6 +858,13 @@ pub fn build_queue_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 }
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveContextDispatch {
+    Continue,
+    ArchiveAwareDelete,
+    RequiresRealPaths(&'static str),
+}
+
 fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<&'static str> {
     match action {
         ContextAction::ConvertCustom
@@ -865,7 +872,6 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         | ContextAction::ConvertWithPreset(_) => Some("conversion"),
         ContextAction::EditMetadata(_) => Some("inline metadata editing"),
         ContextAction::CopyTo | ContextAction::MoveTo => Some("copy/move"),
-        ContextAction::MoveToTrash => Some("trash"),
         ContextAction::BulkRename => Some("bulk rename"),
         ContextAction::Analyze => Some("analysis"),
         ContextAction::SetArchivePassword => Some("archive password editing"),
@@ -892,6 +898,17 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
     }
 }
 
+fn archive_context_dispatch_for_action(action: &ContextAction) -> ArchiveContextDispatch {
+    match action {
+        // Archive-member deletion is not a generic filesystem delete. It is a
+        // staged archive edit and must dispatch to start_browse_archive_entry_delete.
+        ContextAction::DeletePermanently => ArchiveContextDispatch::ArchiveAwareDelete,
+        _ => archive_context_action_requires_real_paths(action)
+            .map(ArchiveContextDispatch::RequiresRealPaths)
+            .unwrap_or(ArchiveContextDispatch::Continue),
+    }
+}
+
 // ── Action dispatch ─────────────────────────────────────────────────
 
 /// Execute a context action. Delegates to existing command/action
@@ -906,9 +923,16 @@ pub fn execute_context_action(
         return;
     }
     if app.current_screen == AppScreen::Browse && app.browse.is_in_archive() {
-        if let Some(operation) = archive_context_action_requires_real_paths(&action) {
-            archive_synthetic_file_op_status(app, operation);
-            return;
+        match archive_context_dispatch_for_action(&action) {
+            ArchiveContextDispatch::ArchiveAwareDelete => {
+                super::keybindings::start_browse_archive_entry_delete(app, tx);
+                return;
+            }
+            ArchiveContextDispatch::RequiresRealPaths(operation) => {
+                archive_synthetic_file_op_status(app, operation);
+                return;
+            }
+            ArchiveContextDispatch::Continue => {}
         }
     }
     match action {
@@ -1041,11 +1065,10 @@ pub fn execute_context_action(
             }
             super::keybindings::open_metadata_editor(app);
         }
-        ContextAction::MoveToTrash => {
-            if app.browse.is_in_archive() {
-                super::keybindings::start_browse_archive_entry_delete(app, tx);
-                return;
-            }
+        ContextAction::DeletePermanently => {
+            // Browse-archive deletion is handled above by
+            // archive_context_dispatch_for_action, because archive entries are
+            // staged edits rather than direct filesystem paths.
             let cmd = super::command::Command::Delete;
             super::command::execute_command(app, cmd, tx);
         }
@@ -1773,6 +1796,20 @@ mod tests {
     }
 
     #[test]
+    fn archive_delete_permanently_reaches_archive_aware_dispatch_path() {
+        assert_eq!(
+            archive_context_dispatch_for_action(&ContextAction::DeletePermanently),
+            ArchiveContextDispatch::ArchiveAwareDelete,
+            "archive delete must dispatch to the staged archive-entry delete path, not the generic real-path guard"
+        );
+        assert_eq!(
+            archive_context_action_requires_real_paths(&ContextAction::DeletePermanently),
+            None,
+            "archive delete must not be classified as a generic filesystem operation"
+        );
+    }
+
+    #[test]
     fn archive_audio_menu_hides_generic_filesystem_operations() {
         let entry = archive_test_entry(EntryKind::AudioFile(
             crate::convert::formats::AudioFormat::Flac,
@@ -1785,7 +1822,7 @@ mod tests {
             "Bulk Rename",
             "Copy to...",
             "Move to...",
-            "Move to Trash",
+            "Delete permanently",
             "Analyze",
             "Tagging",
             "Utilities",
@@ -1811,7 +1848,7 @@ mod tests {
             "Bulk Rename",
             "Copy to...",
             "Move to...",
-            "Move to Trash",
+            "Delete permanently",
         ] {
             assert!(
                 !labels.iter().any(|label| label == forbidden),

@@ -81,7 +81,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     (":rename-all", "Bulk rename wizard"),
                     (":cp <dest>", "Copy selected to destination"),
                     (":mv <dest>", "Move selected to destination"),
-                    (":del", "Move selected to trash"),
+                    (":del", "Permanently delete selected entry"),
                     (":pw", "Set archive password"),
                     (":analyze", "Audio analysis (DR, peak, clipping, etc.)"),
                     (":ar", "AccurateRip verify (common offsets)"),

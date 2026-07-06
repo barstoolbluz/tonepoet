@@ -3092,9 +3092,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
         }
 
-        // Delete: filesystem entries go to trash; archive entries are removed
-        // from deferred-save staging and repackaged later when the user leaves
-        // the archive/screen/quits.
+        // Delete: filesystem entries are permanently deleted after confirmation;
+        // archive entries are removed from deferred-save staging and repackaged
+        // later when the user leaves the archive/screen/quits.
         (KeyCode::Delete, KeyModifiers::NONE) => {
             app.browse.commit_range_selection();
             if app.browse.is_in_archive() {
@@ -9979,7 +9979,7 @@ fn rollback_staged_archive_delete_moves(
     moved: &[(std::path::PathBuf, std::path::PathBuf)],
 ) -> Result<(), String> {
     let mut failures = Vec::new();
-    for (trash_path, original_path) in moved.iter().rev() {
+    for (removed_path, original_path) in moved.iter().rev() {
         if let Some(parent) = original_path.parent() {
             if let Err(err) = std::fs::create_dir_all(parent) {
                 failures.push(format!(
@@ -9989,11 +9989,11 @@ fn rollback_staged_archive_delete_moves(
                 continue;
             }
         }
-        if let Err(err) = std::fs::rename(trash_path, original_path) {
+        if let Err(err) = std::fs::rename(removed_path, original_path) {
             failures.push(format!(
                 "restore {} from {} failed: {err}",
                 original_path.display(),
-                trash_path.display()
+                removed_path.display()
             ));
         }
     }
@@ -10031,8 +10031,8 @@ where
 
     let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::with_capacity(targets.len());
     for (idx, target) in targets.iter().enumerate() {
-        let trash_parent = txn_dir.join(format!("{idx:08}"));
-        std::fs::create_dir(&trash_parent).map_err(|err| {
+        let delete_slot_dir = txn_dir.join(format!("{idx:08}"));
+        std::fs::create_dir(&delete_slot_dir).map_err(|err| {
             let rollback = rollback_staged_archive_delete_moves(&moved)
                 .err()
                 .map(|msg| format!("; rollback also failed: {msg}"))
@@ -10043,24 +10043,24 @@ where
                 target.inner_path
             )
         })?;
-        let trash_path = trash_parent.join(
+        let removed_path = delete_slot_dir.join(
             target
                 .staged_path
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("entry")),
         );
-        if let Err(err) = std::fs::rename(&target.staged_path, &trash_path) {
+        if let Err(err) = std::fs::rename(&target.staged_path, &removed_path) {
             let rollback = rollback_staged_archive_delete_moves(&moved)
                 .err()
                 .map(|msg| format!("; rollback also failed: {msg}"))
                 .unwrap_or_default();
             let _ = std::fs::remove_dir_all(&txn_dir);
             return Err(format!(
-                "archive delete failed for {}: move into transaction trash failed: {err}{rollback}",
+                "archive delete failed for {}: move into transaction staging failed: {err}{rollback}",
                 target.inner_path
             ));
         }
-        moved.push((trash_path, target.staged_path.clone()));
+        moved.push((removed_path, target.staged_path.clone()));
     }
 
     if let Err(err) = commit() {
@@ -23106,6 +23106,165 @@ fn execute_archive_staging_discard_action(app: &mut AppState, action: &ConfirmAc
     }
 }
 
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PermanentDeleteSummary {
+    deleted: usize,
+    already_missing: usize,
+    errors: usize,
+}
+
+fn path_component_count(path: &std::path::Path) -> usize {
+    path.components().count()
+}
+
+fn is_filesystem_root(path: &std::path::Path) -> bool {
+    path.has_root() && path.parent().is_none()
+}
+
+fn has_unstable_path_components(path: &std::path::Path) -> bool {
+    // Path::components() normalises `.` away, so also check the raw string
+    // for `/./` or trailing `/.` patterns that would survive on-disk but not
+    // in the parsed component iterator.
+    let raw = path.as_os_str().to_string_lossy();
+    if raw.contains("/./") || raw.contains("/../") || raw.ends_with("/.") || raw.ends_with("/..") {
+        return true;
+    }
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    })
+}
+
+fn delete_path_permanently(path: &std::path::Path) -> std::io::Result<bool> {
+    if path.as_os_str().is_empty()
+        || is_filesystem_root(path)
+        || has_unstable_path_components(path)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing unsafe permanent-delete path",
+        ));
+    }
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    let file_type = metadata.file_type();
+    if file_type.is_dir() && !file_type.is_symlink() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(true)
+}
+
+fn permanently_delete_paths(paths: &[std::path::PathBuf]) -> PermanentDeleteSummary {
+    let mut ordered = paths.to_vec();
+    ordered.sort();
+    ordered.dedup();
+    ordered.sort_by(|left, right| {
+        path_component_count(right)
+            .cmp(&path_component_count(left))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut summary = PermanentDeleteSummary::default();
+    for path in ordered {
+        match delete_path_permanently(&path) {
+            Ok(true) => summary.deleted += 1,
+            Ok(false) => summary.already_missing += 1,
+            Err(err) => {
+                log::warn!("delete: {}: {}", path.display(), err);
+                summary.errors += 1;
+            }
+        }
+    }
+    summary
+}
+
+
+#[cfg(test)]
+mod permanent_delete_tests {
+    use super::*;
+
+    #[test]
+    fn delete_path_permanently_removes_file_and_missing_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("fixture");
+
+        assert_eq!(delete_path_permanently(&file).expect("delete file"), true);
+        assert!(!file.exists(), "file should be permanently removed");
+        assert_eq!(
+            delete_path_permanently(&file).expect("missing is idempotent"),
+            false
+        );
+    }
+
+    #[test]
+    fn delete_path_permanently_removes_directory_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("album");
+        std::fs::create_dir_all(dir.join("disc-1")).expect("fixture dir");
+        std::fs::write(dir.join("disc-1").join("track.flac"), b"audio").expect("fixture");
+
+        assert_eq!(delete_path_permanently(&dir).expect("delete dir"), true);
+        assert!(!dir.exists(), "directory tree should be permanently removed");
+    }
+
+    #[test]
+    fn permanently_delete_paths_deduplicates_and_deletes_children_before_parents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("album");
+        let nested = dir.join("disc-1");
+        let file = nested.join("track.flac");
+        std::fs::create_dir_all(&nested).expect("fixture dir");
+        std::fs::write(&file, b"audio").expect("fixture");
+
+        let summary = permanently_delete_paths(&[dir.clone(), file.clone(), file]);
+
+        assert_eq!(summary.deleted, 2);
+        assert_eq!(summary.already_missing, 0);
+        assert_eq!(summary.errors, 0);
+        assert!(!dir.exists(), "parent directory should be removed");
+    }
+
+    #[test]
+    fn delete_path_permanently_rejects_unstable_dot_components() {
+        for unsafe_path in [
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from(".."),
+            std::path::PathBuf::from("album/../track.flac"),
+            std::path::PathBuf::from("album/./track.flac"),
+        ] {
+            let err = delete_path_permanently(&unsafe_path)
+                .expect_err("dot-component paths must be rejected before deletion");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_path_permanently_removes_symlink_not_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::fs::create_dir_all(&target).expect("target dir");
+        std::fs::write(target.join("track.flac"), b"audio").expect("fixture");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        assert_eq!(delete_path_permanently(&link).expect("delete symlink"), true);
+        assert!(!link.exists(), "symlink should be removed");
+        assert!(target.exists(), "symlink target must not be followed/deleted");
+    }
+}
+
 fn execute_confirm_action(
     app: &mut AppState,
     action: &ConfirmAction,
@@ -23320,25 +23479,20 @@ fn execute_confirm_action(
                 }
             }
         }
-        ConfirmAction::TrashSelection(paths) => {
-            let mut trashed = 0usize;
-            let mut errors = 0usize;
-            for path in paths {
-                match trash::delete(path) {
-                    Ok(()) => trashed += 1,
-                    Err(e) => {
-                        log::warn!("trash: {}: {}", path.display(), e);
-                        errors += 1;
-                    }
-                }
-            }
+        ConfirmAction::DeleteSelection(paths) => {
+            let summary = permanently_delete_paths(paths);
+
             app.browse.clear_multi_selection();
             app.browse.refresh_with_search(Some(tx));
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-            let mut parts = vec![format!("trashed {} item(s)", trashed)];
-            if errors > 0 {
-                parts.push(format!("{} errors", errors));
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+
+            let mut parts = vec![format!("deleted {} item(s)", summary.deleted)];
+            if summary.already_missing > 0 {
+                parts.push(format!("{} already gone", summary.already_missing));
+            }
+            if summary.errors > 0 {
+                parts.push(format!("{} errors", summary.errors));
             }
             app.set_status(parts.join(", "));
         }

@@ -50,7 +50,6 @@ crossterm = "0.27"
 ratatui-image = { version = "=1.0.5", default-features = false, features = ["crossterm", "rustix"] }
 image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 once_cell = "1"
-trash = "4"
 humansize = "2"
 ffmpeg-next = "7.1"
 rusqlite = { version = "0.39", features = ["bundled"] }
