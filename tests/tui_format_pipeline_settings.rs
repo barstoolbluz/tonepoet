@@ -120,6 +120,39 @@ fn format_navigation_skips_hidden_rows() {
 }
 
 #[test]
+fn format_pill_contains_distinct_dsf_and_dff_targets() {
+    let mut state = FormatState::new();
+    state.format.select_value(&AudioFormat::Dsf);
+    assert_eq!(*state.format.selected_value(), AudioFormat::Dsf);
+    assert!(state.is_dsd_selected());
+
+    state.format.select_value(&AudioFormat::Dff);
+    assert_eq!(*state.format.selected_value(), AudioFormat::Dff);
+    assert!(state.is_dsd_selected());
+}
+
+#[test]
+fn preset_uses_stable_dsf_and_dff_format_keys_not_display_labels() {
+    for format in [AudioFormat::Dsf, AudioFormat::Dff] {
+        let mut format_state = FormatState::new();
+        format_state.format.select_value(&format);
+        format_state.apply_format_constraints();
+
+        let output = OutputOptionsState::new();
+        let preset = TuiPreset::from_pill_state("stable-format-key", &format_state, &output);
+        assert_eq!(preset.format, format.extension());
+
+        let encoded = toml::to_string(&preset).unwrap();
+        let decoded: TuiPreset = toml::from_str(&encoded).unwrap();
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        decoded.apply_to_pills(&mut restored_format, &mut restored_output);
+        assert_eq!(*restored_format.format.selected_value(), format);
+        assert!(restored_format.is_dsd_selected());
+    }
+}
+
+#[test]
 fn preset_v3_round_trips_new_format_fields() {
     let mut format = FormatState::new();
     format.format.select_value(&AudioFormat::Dsf);

@@ -66,7 +66,11 @@ impl TuiPreset {
             name: name.to_string(),
             description: None,
             version: 3,
-            format: format.format.selected_label().to_lowercase(),
+            // Store a stable, canonical key rather than the UI label. Labels are
+            // presentation strings and may change (for example, DSF was previously
+            // displayed as a generic "DSD" family label), while preset files need
+            // durable, unambiguous identifiers.
+            format: format_key(*format.format.selected_value()).to_string(),
             sample_rate: *format.sample_rate.selected_value(),
             bit_depth: format.bit_depth.selected_label().to_string(),
             dither: format.dither.selected_label().to_lowercase(),
@@ -302,9 +306,15 @@ pub fn list_presets_by_format() -> Vec<(Option<AudioFormat>, Vec<String>)> {
         AudioFormat::WavPack,
         AudioFormat::Aiff,
         AudioFormat::Alac,
+        AudioFormat::Dsf,
+        AudioFormat::Dff,
         AudioFormat::Opus,
         AudioFormat::Aac,
         AudioFormat::Mp3,
+        AudioFormat::Dts,
+        AudioFormat::Ac3,
+        AudioFormat::Ape,
+        AudioFormat::Lpcm,
     ];
     for fmt in &display_order {
         if let Some(names) = groups.remove(&Some(*fmt)) {
@@ -484,22 +494,28 @@ pub fn list_presets_by_format_db(
         AudioFormat::WavPack,
         AudioFormat::Aiff,
         AudioFormat::Alac,
+        AudioFormat::Dsf,
+        AudioFormat::Dff,
         AudioFormat::Opus,
         AudioFormat::Aac,
         AudioFormat::Mp3,
+        AudioFormat::Dts,
+        AudioFormat::Ac3,
+        AudioFormat::Ape,
+        AudioFormat::Lpcm,
     ];
     let mut result = Vec::new();
     for fmt in &display_order {
-        let fmt_str = fmt.name().to_lowercase();
-        if let Some((_, names)) = groups.iter().find(|(f, _)| f.to_lowercase() == fmt_str) {
+        if let Some((_, names)) = groups
+            .iter()
+            .find(|(stored, _)| parse_format(stored) == Some(*fmt))
+        {
             result.push((Some(*fmt), names.clone()));
         }
     }
     // Unknown formats at the end.
     for (fmt_str, names) in &groups {
-        let is_known = display_order
-            .iter()
-            .any(|f| f.name().to_lowercase() == fmt_str.to_lowercase());
+        let is_known = matches!(parse_format(fmt_str), Some(fmt) if display_order.contains(&fmt));
         if !is_known {
             result.push((None, names.clone()));
         }
@@ -509,18 +525,45 @@ pub fn list_presets_by_format_db(
 
 // ── String → type parsers ────────────────────────────────────────────
 
+fn format_key(format: AudioFormat) -> &'static str {
+    match format {
+        AudioFormat::Flac => "flac",
+        AudioFormat::Wav => "wav",
+        AudioFormat::Aiff => "aiff",
+        AudioFormat::WavPack => "wavpack",
+        AudioFormat::Mp3 => "mp3",
+        AudioFormat::Aac => "aac",
+        AudioFormat::Opus => "opus",
+        AudioFormat::Alac => "alac",
+        AudioFormat::Dsf => "dsf",
+        AudioFormat::Dff => "dff",
+        AudioFormat::Dts => "dts",
+        AudioFormat::Ac3 => "ac3",
+        AudioFormat::Ape => "ape",
+        AudioFormat::Lpcm => "lpcm",
+    }
+}
+
 fn parse_format(s: &str) -> Option<AudioFormat> {
-    match s {
+    let normalized = s.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
         "flac" => Some(AudioFormat::Flac),
-        "wav" => Some(AudioFormat::Wav),
-        "aiff" => Some(AudioFormat::Aiff),
-        "wavpack" => Some(AudioFormat::WavPack),
+        "wav" | "wave" => Some(AudioFormat::Wav),
+        "aiff" | "aif" => Some(AudioFormat::Aiff),
+        "wavpack" | "wav-pack" | "wv" => Some(AudioFormat::WavPack),
         "mp3" => Some(AudioFormat::Mp3),
-        "aac" => Some(AudioFormat::Aac),
+        "aac" | "m4a-aac" => Some(AudioFormat::Aac),
         "opus" => Some(AudioFormat::Opus),
-        "alac" => Some(AudioFormat::Alac),
+        "alac" | "m4a-alac" => Some(AudioFormat::Alac),
         "dsf" => Some(AudioFormat::Dsf),
-        "dff" => Some(AudioFormat::Dff),
+        // Backward compatibility for presets captured while the DSF pill was
+        // labeled generically as "DSD".
+        "dsd" => Some(AudioFormat::Dsf),
+        "dff" | "dsdiff" => Some(AudioFormat::Dff),
+        "dts" => Some(AudioFormat::Dts),
+        "ac3" | "ac-3" => Some(AudioFormat::Ac3),
+        "ape" => Some(AudioFormat::Ape),
+        "lpcm" | "pcm" => Some(AudioFormat::Lpcm),
         _ => None,
     }
 }

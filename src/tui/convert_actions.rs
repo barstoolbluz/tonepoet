@@ -432,8 +432,9 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
 
 fn map_audio_format(format: AudioFormat, container_ext: Option<&str>) -> pipeline_enums::AudioFormat {
     match (format, container_ext) {
-        // DSD container routing: "DSD" pill is internally Dsf;
-        // selecting DFF container maps to the pipeline's Dff variant.
+        // Backward-compatible DSD container routing: a DSF target with the
+        // DFF container override should still route to the pipeline's Dff
+        // variant. The distinct DFF format pill maps directly below.
         (AudioFormat::Dsf, Some("dff")) => pipeline_enums::AudioFormat::Dff,
         // All other formats map 1:1.
         (AudioFormat::Flac, _) => pipeline_enums::AudioFormat::Flac,

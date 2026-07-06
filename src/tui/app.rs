@@ -2193,9 +2193,10 @@ fn compute_format_histogram(paths: &[PathBuf]) -> Vec<(AudioFormat, usize)> {
 /// Mappings pick the closest existing `AudioFormat` variant; some are
 /// best-effort (e.g. `.ogg` is typically Vorbis but could also be Opus
 /// or FLAC — we map to Opus as the most common modern case). Extensions
-/// without a reasonable variant (dsf/dff for DSD, ape/wma/shn/tta/amr
-/// for formats we don't represent) return `None` and fall through to
-/// "(no recognised audio extensions)" if the whole batch is unrecognised.
+/// without a reasonable represented histogram bucket (ape/wma/shn/tta/amr,
+/// and other unsupported or decode-only formats) return `None` and fall
+/// through to "(no recognised audio extensions)" if the whole batch is
+/// unrecognised.
 fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
     let ext = path.extension().and_then(|e| e.to_str())?;
     match ext.to_lowercase().as_str() {
@@ -2216,7 +2217,46 @@ fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
         // Opus (.opus is unambiguous; .oga is Ogg Opus; .ogg is
         // ambiguous but maps here as best-effort)
         "opus" | "oga" | "ogg" => Some(AudioFormat::Opus),
+        // DSD family. Keep this cheap extension path aligned with
+        // FormatDetector so batch histograms do not silently drop DSD-only
+        // selections.
+        "dsf" => Some(AudioFormat::Dsf),
+        "dff" => Some(AudioFormat::Dff),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod batch_format_extension_tests {
+    use super::{compute_format_histogram, detect_format_from_extension};
+    use crate::convert::formats::AudioFormat;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn cheap_extension_detector_recognizes_dsf_and_dff() {
+        assert_eq!(
+            detect_format_from_extension(Path::new("Album.DSF")),
+            Some(AudioFormat::Dsf)
+        );
+        assert_eq!(
+            detect_format_from_extension(Path::new("Album.DFF")),
+            Some(AudioFormat::Dff)
+        );
+    }
+
+    #[test]
+    fn cheap_batch_histogram_counts_dsd_sources() {
+        let paths = vec![
+            PathBuf::from("a.dsf"),
+            PathBuf::from("b.dff"),
+            PathBuf::from("c.dff"),
+            PathBuf::from("cover.jpg"),
+        ];
+
+        let histogram = compute_format_histogram(&paths);
+
+        assert!(histogram.contains(&(AudioFormat::Dsf, 1)));
+        assert!(histogram.contains(&(AudioFormat::Dff, 2)));
     }
 }
 
