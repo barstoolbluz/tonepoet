@@ -43,8 +43,9 @@ use tonepoet_pipeline::{
 /// - dither_type: Gesemann
 /// - preferred_tool: Custom("sentinel-tool")
 /// - force_encode: true
-/// - flac.compression_level: 8
+/// - flac.compression_level: 5
 /// - flac.verify: true
+/// - flac.write_md5: false
 /// - mp3.mode: Abr
 /// - mp3.bitrate_kbps: 257
 /// - mp3.vbr_quality: 7
@@ -118,9 +119,9 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
         preferred_tool: PreferredTool::Custom("sentinel-tool".to_string()),
         force_encode: true,
         flac: FlacSettings {
-            compression_level: 8,
+            compression_level: 5,
             verify: true,
-            write_md5: true,
+            write_md5: false,
         },
         mp3: Mp3Settings {
             mode: Mp3Mode::Abr,
@@ -269,6 +270,7 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.force_encode, &expected.force_encode, "force_encode");
     assert_eq!(&actual.flac.compression_level, &expected.flac.compression_level, "flac.compression_level");
     assert_eq!(&actual.flac.verify, &expected.flac.verify, "flac.verify");
+    assert_eq!(&actual.flac.write_md5, &expected.flac.write_md5, "flac.write_md5");
     assert_eq!(&actual.mp3.mode, &expected.mp3.mode, "mp3.mode");
     assert_eq!(&actual.mp3.bitrate_kbps, &expected.mp3.bitrate_kbps, "mp3.bitrate_kbps");
     assert_eq!(&actual.mp3.vbr_quality, &expected.mp3.vbr_quality, "mp3.vbr_quality");
@@ -365,6 +367,7 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "force_encode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "flac.compression_level", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "flac.verify", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[CONFLICT_FLAC_VERIFY_REQUIRES_FLAC_OUTPUT] },
+    SentinelFieldInventoryRow { path: "flac.write_md5", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "mp3.mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "mp3.bitrate_kbps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "mp3.vbr_quality", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
@@ -442,6 +445,7 @@ fn field_differs_from_default(
         "force_encode" => settings.force_encode != default.force_encode,
         "flac.compression_level" => settings.flac.compression_level != default.flac.compression_level,
         "flac.verify" => settings.flac.verify != default.flac.verify,
+        "flac.write_md5" => settings.flac.write_md5 != default.flac.write_md5,
         "mp3.mode" => settings.mp3.mode != default.mp3.mode,
         "mp3.bitrate_kbps" => settings.mp3.bitrate_kbps != default.mp3.bitrate_kbps,
         "mp3.vbr_quality" => settings.mp3.vbr_quality != default.mp3.vbr_quality,
@@ -581,6 +585,7 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, force_encode, "force_encode");
     assert_covered_by_non_default!(default, raw, raw, flac.compression_level, "flac.compression_level");
     assert_covered_by_non_default!(default, raw, raw, flac.verify, "flac.verify");
+    assert_covered_by_non_default!(default, raw, raw, flac.write_md5, "flac.write_md5");
     assert_covered_by_non_default!(default, raw, raw, mp3.mode, "mp3.mode");
     assert_covered_by_non_default!(default, raw, raw, mp3.bitrate_kbps, "mp3.bitrate_kbps");
     assert_covered_by_non_default!(default, raw, raw, mp3.vbr_quality, "mp3.vbr_quality");
@@ -660,6 +665,7 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, force_encode, "force_encode");
     assert_covered_by_non_default!(default, flac, custom, flac.compression_level, "flac.compression_level");
     assert_covered_by_non_default!(default, flac, custom, flac.verify, "flac.verify");
+    assert_covered_by_non_default!(default, flac, custom, flac.write_md5, "flac.write_md5");
     assert_covered_by_non_default!(default, flac, custom, mp3.mode, "mp3.mode");
     assert_covered_by_non_default!(default, flac, custom, mp3.bitrate_kbps, "mp3.bitrate_kbps");
     assert_covered_by_non_default!(default, flac, custom, mp3.vbr_quality, "mp3.vbr_quality");
@@ -812,6 +818,7 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("force_encode", LegacyProjectionStatus::Translated),
     ("flac.compression_level", LegacyProjectionStatus::Translated),
     ("flac.verify", LegacyProjectionStatus::Derived),
+    ("flac.write_md5", LegacyProjectionStatus::Defaulted),
     ("mp3.mode", LegacyProjectionStatus::Translated),
     ("mp3.bitrate_kbps", LegacyProjectionStatus::Translated),
     ("mp3.vbr_quality", LegacyProjectionStatus::Translated),
@@ -821,9 +828,9 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("opus.bitrate_kbps", LegacyProjectionStatus::Translated),
     ("opus.complexity", LegacyProjectionStatus::Translated),
     ("wavpack.mode", LegacyProjectionStatus::Translated),
-    ("wavpack.hybrid", LegacyProjectionStatus::Defaulted),
+    ("wavpack.hybrid", LegacyProjectionStatus::Translated),
     ("wavpack.hybrid_bitrate_kbps", LegacyProjectionStatus::Defaulted),
-    ("wavpack.correction_file", LegacyProjectionStatus::Defaulted),
+    ("wavpack.correction_file", LegacyProjectionStatus::Translated),
     ("ssrc.force", LegacyProjectionStatus::Derived),
 
     ("ssrc.insane_mode", LegacyProjectionStatus::Translated),
@@ -841,10 +848,10 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("soxr_resampler.cutoff", LegacyProjectionStatus::Defaulted),
     ("soxr_resampler.phase", LegacyProjectionStatus::Defaulted),
     ("ssrc.profile", LegacyProjectionStatus::Derived),
-    ("ssrc.attenuation_db", LegacyProjectionStatus::Derived),
-    ("ssrc.min_phase", LegacyProjectionStatus::Derived),
-    ("ssrc.dither_id", LegacyProjectionStatus::Derived),
-    ("ssrc.pdf_type", LegacyProjectionStatus::Derived),
+    ("ssrc.attenuation_db", LegacyProjectionStatus::Unrepresentable),
+    ("ssrc.min_phase", LegacyProjectionStatus::Unrepresentable),
+    ("ssrc.dither_id", LegacyProjectionStatus::Unrepresentable),
+    ("ssrc.pdf_type", LegacyProjectionStatus::Unrepresentable),
     ("dsd.noise_shaper", LegacyProjectionStatus::Unrepresentable),
     ("dsd.modulator_order", LegacyProjectionStatus::Unrepresentable),
     ("dsd.trellis", LegacyProjectionStatus::Unrepresentable),
@@ -980,7 +987,7 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
         QualitySettings::WavPack {
             compression_mode: QueueWavPackMode::VeryHigh,
             hybrid_mode: true,
-            correction_file: true,
+            correction_file: false,
         },
     )))
     .settings;
@@ -999,6 +1006,7 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "force_encode", flac.force_encode, true);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "flac.compression_level", flac.flac.compression_level, 8);
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "flac.verify", flac.flac.verify, false);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "flac.write_md5", flac.flac.write_md5, default.flac.write_md5);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "mp3.mode", mp3.mp3.mode, Mp3Mode::Cbr);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "mp3.bitrate_kbps", mp3.mp3.bitrate_kbps, 192);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "mp3.vbr_quality", mp3.mp3.vbr_quality, Mp3Settings::default().vbr_quality);
@@ -1008,25 +1016,25 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "opus.bitrate_kbps", opus.opus.bitrate_kbps, 160);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "opus.complexity", opus.opus.complexity, 5);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "wavpack.mode", wavpack.wavpack.mode, WavPackMode::VeryHigh);
-    assert_legacy_unrepresentable!(covered, "wavpack.hybrid", wavpack.wavpack.hybrid, default.wavpack.hybrid, sentinel.wavpack.hybrid);
-    assert_legacy_unrepresentable!(covered, "wavpack.hybrid_bitrate_kbps", wavpack.wavpack.hybrid_bitrate_kbps, default.wavpack.hybrid_bitrate_kbps, sentinel.wavpack.hybrid_bitrate_kbps);
-    assert_legacy_unrepresentable!(covered, "wavpack.correction_file", wavpack.wavpack.correction_file, default.wavpack.correction_file, sentinel.wavpack.correction_file);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "wavpack.hybrid", wavpack.wavpack.hybrid, true);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "wavpack.hybrid_bitrate_kbps", wavpack.wavpack.hybrid_bitrate_kbps, default.wavpack.hybrid_bitrate_kbps);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "wavpack.correction_file", wavpack.wavpack.correction_file, false);
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.force", flac.ssrc.force, true);
 
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "ssrc.insane_mode", flac.ssrc.insane_mode, true);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.chebyshev", flac.sox_resampler.chebyshev, default.sox_resampler.chebyshev, sentinel.sox_resampler.chebyshev);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.bandwidth_pct", flac.sox_resampler.bandwidth_pct, default.sox_resampler.bandwidth_pct, sentinel.sox_resampler.bandwidth_pct);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.phase", flac.sox_resampler.phase, default.sox_resampler.phase, sentinel.sox_resampler.phase);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.allow_aliasing", flac.sox_resampler.allow_aliasing, default.sox_resampler.allow_aliasing, sentinel.sox_resampler.allow_aliasing);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_taps", flac.sox_resampler.sinc_taps, default.sox_resampler.sinc_taps, sentinel.sox_resampler.sinc_taps);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_attenuation_db", flac.sox_resampler.sinc_attenuation_db, default.sox_resampler.sinc_attenuation_db, sentinel.sox_resampler.sinc_attenuation_db);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_passband_hz", flac.sox_resampler.sinc_passband_hz, default.sox_resampler.sinc_passband_hz, sentinel.sox_resampler.sinc_passband_hz);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_transition_hz", flac.sox_resampler.sinc_transition_hz, default.sox_resampler.sinc_transition_hz, sentinel.sox_resampler.sinc_transition_hz);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_kaiser_beta", flac.sox_resampler.sinc_kaiser_beta, default.sox_resampler.sinc_kaiser_beta, sentinel.sox_resampler.sinc_kaiser_beta);
-    assert_legacy_unrepresentable!(covered, "sox_resampler.sinc_phase", flac.sox_resampler.sinc_phase, default.sox_resampler.sinc_phase, sentinel.sox_resampler.sinc_phase);
-    assert_legacy_unrepresentable!(covered, "soxr_resampler.chebyshev", flac.soxr_resampler.chebyshev, default.soxr_resampler.chebyshev, sentinel.soxr_resampler.chebyshev);
-    assert_legacy_unrepresentable!(covered, "soxr_resampler.cutoff", flac.soxr_resampler.cutoff, default.soxr_resampler.cutoff, sentinel.soxr_resampler.cutoff);
-    assert_legacy_unrepresentable!(covered, "soxr_resampler.phase", flac.soxr_resampler.phase, default.soxr_resampler.phase, sentinel.soxr_resampler.phase);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.chebyshev", flac.sox_resampler.chebyshev, default.sox_resampler.chebyshev);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.bandwidth_pct", flac.sox_resampler.bandwidth_pct, default.sox_resampler.bandwidth_pct);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.phase", flac.sox_resampler.phase, default.sox_resampler.phase);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.allow_aliasing", flac.sox_resampler.allow_aliasing, default.sox_resampler.allow_aliasing);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_taps", flac.sox_resampler.sinc_taps, default.sox_resampler.sinc_taps);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_attenuation_db", flac.sox_resampler.sinc_attenuation_db, default.sox_resampler.sinc_attenuation_db);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_passband_hz", flac.sox_resampler.sinc_passband_hz, default.sox_resampler.sinc_passband_hz);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_transition_hz", flac.sox_resampler.sinc_transition_hz, default.sox_resampler.sinc_transition_hz);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_kaiser_beta", flac.sox_resampler.sinc_kaiser_beta, default.sox_resampler.sinc_kaiser_beta);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_phase", flac.sox_resampler.sinc_phase, default.sox_resampler.sinc_phase);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "soxr_resampler.chebyshev", flac.soxr_resampler.chebyshev, default.soxr_resampler.chebyshev);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "soxr_resampler.cutoff", flac.soxr_resampler.cutoff, default.soxr_resampler.cutoff);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "soxr_resampler.phase", flac.soxr_resampler.phase, default.soxr_resampler.phase);
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.profile", flac.ssrc.profile, Some(SsrcProfile::Insane));
     assert_legacy_unrepresentable!(covered, "ssrc.attenuation_db", flac.ssrc.attenuation_db, default.ssrc.attenuation_db, sentinel.ssrc.attenuation_db);
     assert_legacy_unrepresentable!(covered, "ssrc.min_phase", flac.ssrc.min_phase, default.ssrc.min_phase, sentinel.ssrc.min_phase);

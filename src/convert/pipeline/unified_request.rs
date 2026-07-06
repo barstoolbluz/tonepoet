@@ -256,6 +256,7 @@ pub fn pipeline_settings_from_legacy_options(options: &crate::convert::formats::
             }
         });
     }
+    apply_legacy_resampler_defaults(&mut settings);
     settings
 }
 
@@ -499,7 +500,48 @@ fn apply_explicit_pipeline_defaults(settings: &mut PipelineSettings, item: &Conv
         }
     }
 
+    apply_legacy_resampler_defaults(settings);
+
     settings.replay_gain.prevent_clipping = true;
+}
+
+/// Make the lossy legacy bridge explicit for resampler controls that legacy
+/// `ConversionOptions`/`QualitySettings` cannot express.
+///
+/// Broad resampling intent is mapped elsewhere via `resample_quality` and
+/// `nyquist_transition`. These field-level SoX/SoXR overrides are available
+/// only on full `PipelineSettings`, so the compatibility builder deliberately
+/// leaves each override at its planner default instead of silently inheriting an
+/// implicit value. Full-fidelity callers must attach a complete
+/// `PipelineSettings`/`PipelineRequest`, which bypasses this legacy projection.
+fn apply_legacy_resampler_defaults(settings: &mut PipelineSettings) {
+    // sox_resampler.chebyshev has no legacy source field.
+    settings.sox_resampler.chebyshev = false;
+    // sox_resampler.bandwidth_pct has no legacy source field.
+    settings.sox_resampler.bandwidth_pct = None;
+    // sox_resampler.phase has no legacy source field.
+    settings.sox_resampler.phase = None;
+    // sox_resampler.allow_aliasing has no legacy source field.
+    settings.sox_resampler.allow_aliasing = false;
+    // sox_resampler.sinc_taps has no legacy source field.
+    settings.sox_resampler.sinc_taps = None;
+    // sox_resampler.sinc_attenuation_db has no legacy source field.
+    settings.sox_resampler.sinc_attenuation_db = None;
+    // sox_resampler.sinc_passband_hz has no legacy source field.
+    settings.sox_resampler.sinc_passband_hz = None;
+    // sox_resampler.sinc_transition_hz has no legacy source field.
+    settings.sox_resampler.sinc_transition_hz = None;
+    // sox_resampler.sinc_kaiser_beta has no legacy source field.
+    settings.sox_resampler.sinc_kaiser_beta = None;
+    // sox_resampler.sinc_phase has no legacy source field.
+    settings.sox_resampler.sinc_phase = None;
+
+    // soxr_resampler.chebyshev has no legacy source field.
+    settings.soxr_resampler.chebyshev = false;
+    // soxr_resampler.cutoff has no legacy source field.
+    settings.soxr_resampler.cutoff = None;
+    // soxr_resampler.phase has no legacy source field.
+    settings.soxr_resampler.phase = None;
 }
 
 fn sample_rate_target_for_format(

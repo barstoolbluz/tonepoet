@@ -117,6 +117,7 @@ fn request_for_fixture(
             cue_sidecar: CueSidecarPolicy::PreferSidecar,
             track_selection,
         },
+        // settings-sentinel-allow: fixture-only default for DVD-Audio materialization tests
         settings: tonepoet_pipeline::PipelineSettings::default(),
         worker_count: Some(1),
         merge: false,
