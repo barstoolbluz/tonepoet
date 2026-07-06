@@ -8000,10 +8000,19 @@ fn cleanup_conversion_log_fragment_quarantine_after_finalization(
                 stack.push(path);
                 continue;
             }
-            if !file_type.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !file_type.is_file() {
                 continue;
             }
 
+            // Quarantined fragments are written through `unique_path()`, which
+            // appends a uniqueness suffix after the original file name. A file
+            // that entered quarantine as `track.json` therefore becomes, for
+            // example, `track.json-<nanos>-0`; relying on `Path::extension()`
+            // here silently skips exactly the stale/corrupt fragments this
+            // cleanup pass is responsible for removing. The quarantine tree is
+            // private to conversion-log fragments, so attempt to parse every
+            // regular file and remove unreadable entries once an authoritative
+            // final or cancelled partial log exists for the album batch.
             match read_conversion_log_fragment_file(&path) {
                 Ok(fragment) if quarantined_conversion_log_fragment_belongs_to_finalized_album(
                     &fragment,
