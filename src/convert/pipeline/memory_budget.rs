@@ -1049,8 +1049,8 @@ mod tests {
     fn memory_limit_percent_is_clamped_to_ninety() {
         let temp = tempfile::tempdir().expect("temp dir");
         let budget = Arc::new(ScratchMemoryBudget::with_fixed_total_memory(100, 1_000));
-        assert!(budget.try_reserve(900, temp.path()).is_ok());
-        assert!(budget.try_reserve(1, temp.path()).is_err());
+        let _held = budget.try_reserve(900, temp.path()).expect("first reservation within clamped 90% budget");
+        assert!(budget.try_reserve(1, temp.path()).is_err(), "budget should be exhausted after reserving 90% of total");
     }
 
     #[test]
