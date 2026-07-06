@@ -2548,6 +2548,29 @@ impl ArchiveStagingSession {
         }
     }
 
+    /// Construct a staging session wrapped in a panic-safe cleanup guard.
+    ///
+    /// This constructor is intentionally available in normal library builds:
+    /// Rust integration tests link this crate as a dependency rather than
+    /// compiling the library with the crate's internal `cfg(test)` items. Tests
+    /// that create archive staging outside `AppState` should use this guard so
+    /// panic/unwind paths do not orphan `tonepoet-archive-*` directories.
+    pub fn new_test_owned(
+        staging_dir: PathBuf,
+        archive_path: PathBuf,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> TestArchiveStagingSession {
+        TestArchiveStagingSession::new(Self::new(
+            staging_dir,
+            archive_path,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+        ))
+    }
+
     pub fn append_edit(&mut self, edit: ArchiveEdit) {
         self.edits.push(edit);
         self.dirty = true;
@@ -2596,6 +2619,95 @@ impl ArchiveStagingSession {
 
         self.edits.push(ArchiveEdit::ContentModified { inner_path, kind });
         self.dirty = true;
+    }
+}
+
+/// Panic-safe owner for archive staging sessions created by tests.
+///
+/// This intentionally wraps rather than changes `ArchiveStagingSession` itself:
+/// production recovery must be able to preserve dirty staging directories across
+/// process exit, while tests need a local RAII owner at the true Browse staging
+/// boundary. Use `into_inner()` only when handing the session to production app
+/// state or recovery code that assumes responsibility for the staging tree.
+#[must_use = "hold this guard for the full test scope so panic paths remove the staging directory"]
+#[derive(Debug)]
+pub struct TestArchiveStagingSession {
+    session: Option<ArchiveStagingSession>,
+    staging_dir: PathBuf,
+}
+
+impl TestArchiveStagingSession {
+    pub fn new(session: ArchiveStagingSession) -> Self {
+        let staging_dir = session.staging_dir.clone();
+        Self {
+            session: Some(session),
+            staging_dir,
+        }
+    }
+
+    /// Hand the session to a longer-lived production owner and disarm cleanup.
+    pub fn into_inner(mut self) -> ArchiveStagingSession {
+        self.session
+            .take()
+            .expect("test archive staging guard consumed at most once")
+    }
+
+    pub fn staging_dir(&self) -> &Path {
+        &self.staging_dir
+    }
+
+    /// Clone the wrapped session while keeping this guard armed.
+    ///
+    /// This is the right tool for BrowseState-only tests: install the clone
+    /// into `BrowseState`, keep the guard in scope until the assertion block
+    /// ends, and the guard will remove the staging tree even if the test
+    /// panics before explicit Browse cleanup runs.
+    pub fn clone_session(&self) -> ArchiveStagingSession {
+        self.session
+            .as_ref()
+            .expect("test archive staging guard has not been consumed")
+            .clone()
+    }
+
+    /// Install a clone into an already-entered Browse archive without
+    /// transferring cleanup ownership away from this guard.
+    pub fn install_clone_into_browse_state(&self, state: &mut BrowseState) -> Result<(), &'static str> {
+        let archive = state.archive.as_mut().ok_or("BrowseState is not inside an archive")?;
+        archive.staging = Some(self.clone_session());
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for TestArchiveStagingSession {
+    type Target = ArchiveStagingSession;
+
+    fn deref(&self) -> &Self::Target {
+        self.session
+            .as_ref()
+            .expect("test archive staging guard has not been consumed")
+    }
+}
+
+impl std::ops::DerefMut for TestArchiveStagingSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.session
+            .as_mut()
+            .expect("test archive staging guard has not been consumed")
+    }
+}
+
+impl Drop for TestArchiveStagingSession {
+    fn drop(&mut self) {
+        if self.session.is_some() {
+            match fs::remove_dir_all(&self.staging_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => log::debug!(
+                    "test cleanup failed to remove archive staging dir {}: {err}",
+                    self.staging_dir.display()
+                ),
+            }
+        }
     }
 }
 
@@ -12827,6 +12939,13 @@ mod tests {
         let fingerprint = TagCacheFingerprint::for_path(&staged_file).expect("fingerprint");
         let synthetic = archive_path.join("Disc 1").join("01.flac");
 
+        let staging_guard = ArchiveStagingSession::new_test_owned(
+            staging_dir.clone(),
+            archive_path.clone(),
+            0,
+            0,
+            0,
+        );
         let mut state = BrowseState::new();
         state.archive = Some(ArchiveBrowseState {
             listing: crate::tui::archive_listing::ArchiveListing {
@@ -12837,13 +12956,7 @@ mod tests {
             },
             inner_path: String::new(),
             password: None,
-            staging: Some(ArchiveStagingSession::new(
-                staging_dir.clone(),
-                archive_path.clone(),
-                0,
-                0,
-                0,
-            )),
+            staging: Some(staging_guard.clone_session()),
         });
         state.search.tag_cache.insert(
             synthetic.clone(),
@@ -12856,7 +12969,6 @@ mod tests {
         state.invalidate_search_tag_cache_for_metadata_path(&staged_file);
         assert!(!state.search.tag_cache.contains_key(&synthetic));
 
-        let _ = std::fs::remove_dir_all(&staging_dir);
     }
 
 
@@ -15392,13 +15504,16 @@ FILE "10 - Live Version.wav" WAVE
             None,
         );
         let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
-        state.archive.as_mut().expect("archive").staging = Some(ArchiveStagingSession::new(
+        let staging_guard = ArchiveStagingSession::new_test_owned(
             staging_dir.clone(),
             archive_path,
             0,
             0,
             0,
-        ));
+        );
+        staging_guard
+            .install_clone_into_browse_state(&mut state)
+            .expect("archive entered");
         cache_archive_probe_metadata(
             &mut state,
             "Disc 1/01.flac",
@@ -15415,7 +15530,6 @@ FILE "10 - Live Version.wav" WAVE
 
         let names = result_names_without_parent(&state);
         assert_eq!(names, vec!["Disc 1/01.flac".to_string()]);
-        let _ = std::fs::remove_dir_all(&staging_dir);
     }
 
     #[tokio::test]
@@ -15559,13 +15673,57 @@ mod archive_edit_log_semantics_tests {
     use super::*;
 
     fn session() -> ArchiveStagingSession {
-        ArchiveStagingSession::new(
+        // Log-coalescing tests do not create a real staging directory, but use
+        // the test-owned constructor anyway so the test surface consistently
+        // avoids direct staging construction.
+        ArchiveStagingSession::new_test_owned(
             std::path::PathBuf::from("/tmp/staging"),
             std::path::PathBuf::from("/tmp/archive.zip"),
             1,
             2,
             3,
         )
+        .into_inner()
+    }
+
+    #[test]
+    fn test_owned_archive_staging_removes_directory_on_drop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("tonepoet-archive-rename-owned");
+        std::fs::create_dir_all(staging_dir.join("nested")).expect("create staging");
+        std::fs::write(staging_dir.join("nested/file.flac"), b"fixture").expect("write fixture");
+
+        {
+            let _guard = ArchiveStagingSession::new_test_owned(
+                staging_dir.clone(),
+                temp.path().join("album.zip"),
+                1,
+                2,
+                3,
+            );
+            assert!(staging_dir.exists());
+        }
+
+        assert!(!staging_dir.exists());
+    }
+
+    #[test]
+    fn test_owned_archive_staging_into_inner_disarms_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("tonepoet-archive-rename-handoff");
+        std::fs::create_dir_all(&staging_dir).expect("create staging");
+
+        let session = ArchiveStagingSession::new_test_owned(
+            staging_dir.clone(),
+            temp.path().join("album.zip"),
+            1,
+            2,
+            3,
+        )
+        .into_inner();
+        drop(session);
+
+        assert!(staging_dir.exists());
     }
 
     #[test]

@@ -5330,7 +5330,7 @@ mod browse_archive_quit_lifecycle_tests {
         fs::write(&archive, b"archive").expect("archive");
         fs::create_dir(&staging).expect("staging");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.should_quit = true;
 
@@ -5356,7 +5356,7 @@ mod browse_archive_quit_lifecycle_tests {
         fs::write(&archive, b"archive").expect("archive");
         fs::create_dir(&staging).expect("staging");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.should_quit = true;
         app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
@@ -5390,18 +5390,21 @@ mod browse_archive_quit_lifecycle_tests {
         };
         app.browse.enter_archive(listing, None);
         let (secs, nanos, size) = crate::tui::app::archive_fingerprint(&archive).expect("fingerprint");
-        let mut session = crate::tui::browse::ArchiveStagingSession::new(
+        let mut session_guard = crate::tui::browse::ArchiveStagingSession::new_test_owned(
             staging,
             archive,
             secs,
             nanos,
             size,
         );
-        session.append_edit(crate::tui::browse::ArchiveEdit::Rename {
+        session_guard.append_edit(crate::tui::browse::ArchiveEdit::Rename {
             from: "old.flac".to_string(),
             to: "new.flac".to_string(),
         });
-        app.browse.archive.as_mut().expect("archive").staging = Some(session);
+        // The guard owns cleanup until the exact handoff point. If any setup
+        // above panics, the staging tree is removed; after this assignment,
+        // AppState's test Drop owns cleanup.
+        app.browse.archive.as_mut().expect("archive").staging = Some(session_guard.into_inner());
     }
 
     #[tokio::test]
@@ -5412,7 +5415,7 @@ mod browse_archive_quit_lifecycle_tests {
         fs::write(&archive, b"archive").expect("archive");
         fs::create_dir(&staging).expect("staging");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.should_quit = true;
         install_dirty_archive_staging(&mut app, archive.clone(), staging.clone());
@@ -5440,7 +5443,7 @@ mod browse_archive_quit_lifecycle_tests {
         fs::write(&archive, b"archive").expect("archive");
         fs::create_dir(&staging).expect("staging");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.should_quit = true;
         install_dirty_archive_staging(&mut app, archive.clone(), staging.clone());
@@ -5496,7 +5499,7 @@ mod browse_archive_quit_lifecycle_tests {
         fs::write(&archive, b"archive").expect("archive");
         fs::create_dir(&staging).expect("staging");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         install_dirty_archive_staging(&mut app, archive.clone(), staging.clone());
 
@@ -5546,7 +5549,7 @@ mod browse_archive_quit_lifecycle_tests {
             entries: Vec::new(),
         };
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.deferred_browse_archive_screen_switch = Some(AppScreen::Convert);
         app.browse.enter_archive(listing, None);
@@ -5593,7 +5596,7 @@ mod browse_archive_quit_lifecycle_tests {
         fs::write(&archive, b"archive").expect("archive");
         fs::create_dir(&staging).expect("staging");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
             archive.clone(),
@@ -5626,7 +5629,7 @@ mod browse_archive_quit_lifecycle_tests {
         fs::write(&archive, b"archive").expect("archive");
         fs::create_dir(&staging).expect("staging");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
             archive.clone(),
@@ -5675,7 +5678,7 @@ mod browse_archive_quit_lifecycle_tests {
         fs::create_dir_all(&staging).expect("staging");
         fs::write(staging.join("track.flac"), b"audio").expect("track");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         install_dirty_archive_staging(&mut app, archive.clone(), staging.clone());
         assert!(
@@ -5733,7 +5736,7 @@ mod browse_archive_quit_lifecycle_tests {
         let context = ArchiveMetadataEditContext::browse(archive.clone(), staging.clone());
         assert!(context.editor_owns_staging, "test must cover parent-directory editor-owned staging");
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse_archive_repackage = Some(context);
         app.quit_after_browse_archive_repackage = true;
@@ -5788,7 +5791,7 @@ mod browse_archive_quit_lifecycle_tests {
         );
         assert!(context.editor_owns_staging);
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         assert!(app.browse.archive.is_none(), "test must cover parent-directory archive editing");
 
@@ -5980,7 +5983,7 @@ mod musicbrainz_completion_dispatch_tests {
 
     #[test]
     fn tags_from_mb_complete_message_dispatch_sets_lookup_error_status() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let tx = tx();
         let msg = AppMessage::TagsFromMbComplete {
             outcome: crate::tui::message::MbOutcome::Toc {
@@ -6001,7 +6004,7 @@ mod musicbrainz_completion_dispatch_tests {
 
     #[test]
     fn multi_match_completion_parks_open_editor_and_restores_it_on_cancel_path() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let tx = tx();
         let editor = editor_with_tabs(0, 2);
         let editor_paths = editor.active_surface().paths.clone();
@@ -6048,7 +6051,7 @@ mod musicbrainz_completion_dispatch_tests {
 
     #[test]
     fn single_match_completion_from_message_opens_apply_all_confirmation() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let tx = tx();
         let editor = editor_with_tabs(0, 2);
         let editor_paths = editor.active_surface().paths.clone();
@@ -6080,7 +6083,7 @@ mod musicbrainz_completion_dispatch_tests {
 
     #[test]
     fn search_single_match_completion_uses_same_apply_all_handoff() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let tx = tx();
         let editor = editor_with_tabs(0, 2);
         let editor_paths = editor.active_surface().paths.clone();
@@ -6106,7 +6109,7 @@ mod musicbrainz_completion_dispatch_tests {
 
     #[test]
     fn picked_mb_select_release_uses_parked_editor_and_caches_picker_back_state() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let editor = editor_with_tabs(0, 2);
         let editor_paths = editor.active_surface().paths.clone();
         app.pending_metadata_editor = Some(editor);
@@ -6196,7 +6199,7 @@ mod artwork_file_picker_completion_tests {
         let picture_type = lofty::picture::PictureType::CoverBack;
         let (state, _audio_path) = editor_with_picker(temp.path(), picture_type.clone());
         let session_id = state.file_picker.as_ref().expect("picker").session_id;
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(state);
 
         handle_message(
@@ -6227,7 +6230,7 @@ mod artwork_file_picker_completion_tests {
         let picture_type = lofty::picture::PictureType::CoverBack;
         let (state, audio_path) = editor_with_picker(temp.path(), picture_type.clone());
         let session_id = state.file_picker.as_ref().expect("picker").session_id;
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(state);
         test_probe::clear_artwork_dispatches();
 
@@ -6263,7 +6266,7 @@ mod artwork_file_picker_completion_tests {
         let (state, _audio_path) = editor_with_picker(temp.path(), picture_type.clone());
         let active_session_id = state.file_picker.as_ref().expect("picker").session_id;
         let stale_session_id = active_session_id.saturating_add(10_000);
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(state);
         test_probe::clear_artwork_dispatches();
 
@@ -6306,7 +6309,7 @@ mod copy_move_file_picker_flow_tests {
     }
 
     fn app_with_selected_path(current_dir: &Path, path: PathBuf, kind: EntryKind) -> AppState {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = current_dir.to_path_buf();
         let name = path
@@ -6700,7 +6703,7 @@ mod async_message_drain_tests {
 
     #[test]
     fn capped_drain_preserves_order_and_leaves_remainder_for_next_frame() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let (tx, mut rx) = mpsc::channel(MAX_ASYNC_MESSAGES_PER_FRAME + 8);
         let total = MAX_ASYNC_MESSAGES_PER_FRAME + 4;
         for i in 0..total {
@@ -6731,7 +6734,7 @@ mod async_message_drain_tests {
 
     #[test]
     fn browse_motion_drain_holds_only_browse_visible_messages() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         let (tx, mut rx) = mpsc::channel(4);
         let generation = app.browse.scan_generation;
@@ -6775,7 +6778,7 @@ mod async_message_drain_tests {
 
     #[test]
     fn input_waiting_defers_existing_warm_backlog_without_merging() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         assert!(browse_visible_work_should_wait(&app, true));
 
@@ -6828,7 +6831,7 @@ mod async_message_drain_tests {
 
     #[test]
     fn warm_cache_message_queues_without_requesting_terminal_clear() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let path = std::path::PathBuf::from("/tmp/tonepoet-warm-no-clear.flac");
         let identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 1 };
         publish_scan_owned_files_for_warm_cache_test(
@@ -6868,7 +6871,7 @@ mod async_message_drain_tests {
 
     #[test]
     fn warm_cache_backlog_requests_nonclearing_reducer_tick_only() {
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let count = 4096usize;
         let mut entries = Vec::new();
         let mut rows = Vec::new();
@@ -6921,7 +6924,7 @@ mod async_message_drain_tests {
             &std::fs::metadata(&path).expect("old metadata"),
         );
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
             path.clone(),
@@ -6962,7 +6965,7 @@ mod async_message_drain_tests {
             &std::fs::metadata(&path).expect("old metadata"),
         );
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
             path.clone(),
@@ -7001,7 +7004,7 @@ mod async_message_drain_tests {
         std::fs::create_dir(&path).expect("mkdir");
         let stale_identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 };
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
             path.clone(),
@@ -7049,7 +7052,7 @@ mod async_message_drain_tests {
             &std::fs::metadata(&path).expect("metadata"),
         );
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
             path.clone(),
@@ -7092,7 +7095,7 @@ mod async_message_drain_tests {
         let meta = std::fs::metadata(&path).expect("metadata");
         let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(&meta);
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
             path.clone(),
@@ -7146,7 +7149,7 @@ mod async_message_drain_tests {
             &std::fs::metadata(&path).expect("metadata"),
         );
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
             path.clone(),
@@ -7194,7 +7197,7 @@ mod async_message_drain_tests {
             &std::fs::metadata(&path).expect("metadata"),
         );
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         let (tx, _rx) = mpsc::channel(4);
         handle_message(
             &mut app,
@@ -7219,7 +7222,7 @@ mod async_message_drain_tests {
         std::fs::create_dir(&path).expect("mkdir");
         let stale_identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 };
 
-        let mut app = AppState::new(TonepoetConfig::default());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.browse.mark_folder_classification_pending_for_test(path.clone());
 
         let (tx, _rx) = mpsc::channel(4);

@@ -5,7 +5,7 @@
 //! user_version with forward migrations on open.
 
 use rusqlite::{params, Connection};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
 const CURRENT_VERSION: u32 = 21;
@@ -57,6 +57,12 @@ pub struct Database {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabasePragmaProfile {
+    FileBacked,
+    InMemory,
+}
+
 /// Return the database file path.
 pub fn db_path() -> PathBuf {
     dirs::data_dir()
@@ -65,46 +71,112 @@ pub fn db_path() -> PathBuf {
         .join("tonepoet.db")
 }
 
-impl Database {
-    /// Open (or create) the database, run migrations, enable WAL.
-    pub fn open() -> Result<Self, String> {
-        let path = db_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create DB directory: {}", e))?;
-        }
+fn path_has_component_with_prefix(path: &std::path::Path, prefix: &str) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with(prefix)
+    })
+}
 
-        let conn =
-            Connection::open(&path).map_err(|e| format!("failed to open database: {}", e))?;
+fn path_file_name_starts_with(path: &std::path::Path, prefix: &str) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().starts_with(prefix))
+        .unwrap_or(false)
+}
 
-        // WAL mode for crash safety + concurrent reads.
-        conn.execute_batch("PRAGMA journal_mode = WAL;")
-            .map_err(|e| format!("WAL pragma failed: {}", e))?;
+fn looks_like_archive_staging_dir(path: &std::path::Path) -> bool {
+    path_file_name_starts_with(path, "tonepoet-archive-metadata-")
+        || path_file_name_starts_with(path, "tonepoet-archive-rename-")
+        || path_file_name_starts_with(path, "tonepoet-archive-delete-")
+}
 
-        // Foreign keys (for future use).
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(|e| format!("foreign_keys pragma failed: {}", e))?;
-
-        // Browse performs many small cache reads during navigation. A larger
-        // page cache and mmap window reduce syscall churn without changing
-        // schema or transaction semantics; unsupported platforms simply clamp
-        // mmap_size to SQLite's accepted value.
-        conn.execute_batch("PRAGMA cache_size = -65536; PRAGMA mmap_size = 268435456;")
-            .map_err(|e| format!("performance pragmas failed: {}", e))?;
-
-        let mut db = Self { conn };
-        db.migrate()?;
-        Ok(db)
+fn looks_like_test_archive_session_artifact(
+    archive_path: &std::path::Path,
+    staging_dir: &std::path::Path,
+) -> bool {
+    if !looks_like_archive_staging_dir(staging_dir)
+        || !path_has_component_with_prefix(staging_dir, "nix-shell.")
+    {
+        return false;
     }
 
-    /// Open an in-memory database (for tests and fallback).
+    // Test fixtures created by tempfile::tempdir() inside a nix dev shell look
+    // like `/tmp/nix-shell.XXXX/.tmpYYYY/album.zip`, while their archive-edit
+    // staging directory is a sibling `/tmp/nix-shell.XXXX/tonepoet-archive-*`.
+    // These rows are not recoverable user state and should never drive the
+    // startup recovery dialog, even while the nix shell keeps /tmp alive.
+    let archive_is_tempfile_fixture = path_has_component_with_prefix(archive_path, "nix-shell.")
+        && path_has_component_with_prefix(archive_path, ".tmp");
+    let archive_is_missing_nix_shell_temp = !archive_path.exists()
+        && path_has_component_with_prefix(archive_path, "nix-shell.");
+
+    archive_is_tempfile_fixture || archive_is_missing_nix_shell_temp
+}
+
+impl Database {
+    /// Open (or create) the production database, run migrations, and enable the
+    /// same durability/performance pragmas used by ordinary application starts.
+    pub fn open() -> Result<Self, String> {
+        Self::open_path(db_path())
+    }
+
+    /// Open (or create) a database at an explicit path.
+    ///
+    /// This is intentionally available outside `cfg(test)` so integration tests
+    /// and harnesses that link the crate as a normal dependency can inject a
+    /// per-test SQLite file instead of touching the user's XDG production DB.
+    /// It also exercises production-like behavior that an in-memory connection
+    /// cannot: parent directory creation, file-backed locking, WAL sidecars, and
+    /// migrations against a persistent database file.
+    pub fn open_path(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create DB directory {}: {e}", parent.display()))?;
+        }
+
+        let conn = Connection::open(path)
+            .map_err(|e| format!("failed to open database {}: {e}", path.display()))?;
+        Self::from_connection(conn, DatabasePragmaProfile::FileBacked)
+    }
+
+    /// Open an in-memory database (for explicit lightweight tests and fallback).
+    /// Prefer `open_path` for tests that should cover file-backed SQLite/WAL
+    /// semantics.
     pub fn open_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory()
             .map_err(|e| format!("failed to open in-memory DB: {}", e))?;
-        conn.execute_batch("PRAGMA journal_mode = WAL;")
-            .map_err(|e| format!("WAL pragma failed: {}", e))?;
-        conn.execute_batch("PRAGMA cache_size = -32768;")
-            .map_err(|e| format!("cache_size pragma failed: {}", e))?;
+        Self::from_connection(conn, DatabasePragmaProfile::InMemory)
+    }
+
+    fn from_connection(
+        conn: Connection,
+        profile: DatabasePragmaProfile,
+    ) -> Result<Self, String> {
+        match profile {
+            DatabasePragmaProfile::FileBacked => {
+                // WAL mode for crash safety + concurrent reads. This is part of
+                // the production behavior and must be exercised by temp-file DB
+                // tests too.
+                conn.execute_batch("PRAGMA journal_mode = WAL;")
+                    .map_err(|e| format!("WAL pragma failed: {}", e))?;
+                conn.execute_batch("PRAGMA foreign_keys = ON;")
+                    .map_err(|e| format!("foreign_keys pragma failed: {}", e))?;
+                // Browse performs many small cache reads during navigation. A
+                // larger page cache and mmap window reduce syscall churn without
+                // changing schema or transaction semantics; unsupported platforms
+                // simply clamp mmap_size to SQLite's accepted value.
+                conn.execute_batch("PRAGMA cache_size = -65536; PRAGMA mmap_size = 268435456;")
+                    .map_err(|e| format!("performance pragmas failed: {}", e))?;
+            }
+            DatabasePragmaProfile::InMemory => {
+                conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA cache_size = -32768;")
+                    .map_err(|e| format!("in-memory pragmas failed: {}", e))?;
+            }
+        }
+
         let mut db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -825,6 +897,12 @@ impl Database {
             let archive = std::path::PathBuf::from(&archive_path);
             let staging = std::path::PathBuf::from(&staging_dir);
 
+            if looks_like_test_archive_session_artifact(&archive, &staging) {
+                let _ = std::fs::remove_dir_all(&staging);
+                let _ = self.delete_pending_archive_session(&archive);
+                continue;
+            }
+
             if !staging.is_dir() {
                 let _ = self.delete_pending_archive_session(&archive);
                 continue;
@@ -860,8 +938,8 @@ impl Database {
                 archive_path: archive,
                 staging_dir: staging,
                 archive_mtime_secs: mtime_secs,
-                archive_mtime_nanos: mtime_nanos as u32,
-                archive_size: archive_size as u64,
+                archive_mtime_nanos: u32::try_from(mtime_nanos).unwrap_or_default(),
+                archive_size: u64::try_from(archive_size).unwrap_or_default(),
                 edits_json,
                 conflicted,
                 conflict_reason,
@@ -876,6 +954,16 @@ impl Database {
         let valid = sessions.iter().filter(|session| !session.conflicted).count();
         let conflicted = sessions.len().saturating_sub(valid);
         Ok((valid, conflicted))
+    }
+
+    #[cfg(test)]
+    pub fn pending_archive_session_count_for_tests(&self) -> Result<usize, String> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM pending_archive_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count as usize)
+            .map_err(|e| format!("pending archive session count: {e}"))
     }
 
     // ── AccurateRip cache ───────────────────────────────────────
@@ -2924,6 +3012,61 @@ mod tests {
     }
 
     #[test]
+    fn pending_archive_recovery_round_trip_uses_existing_staging() {
+        let db = Database::open_memory().unwrap();
+        // Use a path that won't be caught by the nix-shell test-artifact
+        // filter. The filter checks for "nix-shell." in path components,
+        // so we create a dedicated dir under /tmp with a non-matching name.
+        let base = std::path::PathBuf::from("/tmp/tonepoet-db-roundtrip-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let archive = base.join("album.zip");
+        let staging = base.join("tonepoet-archive-rename-test");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+
+        db.upsert_pending_archive_session(&archive, &staging, 0, 0, 13, "[]")
+            .unwrap();
+        let sessions = db.recover_pending_archive_sessions_at_startup().unwrap();
+
+        // Clean up before asserting so the dir doesn't linger on failure.
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].archive_path, archive);
+        assert_eq!(sessions[0].staging_dir, staging);
+    }
+
+    #[test]
+    fn pending_archive_recovery_prunes_nix_shell_test_artifacts() {
+        let db = Database::open_memory().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "nix-shell.{}",
+            uuid::Uuid::new_v4()
+        ));
+        let archive_parent = root.join(format!(".tmp{}", uuid::Uuid::new_v4()));
+        let archive = archive_parent.join("album.zip");
+        let staging = root.join(format!(
+            "tonepoet-archive-rename-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&archive_parent).unwrap();
+        std::fs::write(&archive, b"test fixture").unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+
+        db.upsert_pending_archive_session(&archive, &staging, 0, 0, 12, "[]")
+            .unwrap();
+        assert_eq!(db.pending_archive_session_count_for_tests().unwrap(), 1);
+
+        let sessions = db.recover_pending_archive_sessions_at_startup().unwrap();
+        assert!(sessions.is_empty());
+        assert_eq!(db.pending_archive_session_count_for_tests().unwrap(), 0);
+        assert!(!staging.exists(), "test artifact staging dir should be cleaned");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn directory_summary_cache_round_trip_and_rejects_stale_identity() {
         use crate::tui::browse::{
             DirStats, DirectorySummaryCacheEntry, DirectorySummaryFacts, DirectorySummaryScope,
@@ -2931,7 +3074,7 @@ mod tests {
             ProbeCacheIdentity,
         };
         use std::collections::BTreeMap;
-        use std::path::PathBuf;
+        use std::path::{Path, PathBuf};
         use std::sync::Arc;
         use std::time::{Duration, SystemTime};
 

@@ -25588,14 +25588,14 @@ mod phase4_tests {
             physical_size: 7,
             entries: Vec::new(),
         };
-        let mut staging_session = crate::tui::browse::ArchiveStagingSession::new(
+        let mut staging_session_guard = crate::tui::browse::ArchiveStagingSession::new_test_owned(
             staging.clone(),
             archive.clone(),
             0,
             0,
             7,
         );
-        staging_session.append_edit(crate::tui::browse::ArchiveEdit::Rename {
+        staging_session_guard.append_edit(crate::tui::browse::ArchiveEdit::Rename {
             from: "old.flac".to_string(),
             to: "track.flac".to_string(),
         });
@@ -25603,7 +25603,9 @@ mod phase4_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.enter_archive(listing, None);
-        app.browse.archive.as_mut().expect("archive").staging = Some(staging_session);
+        // Keep the guard armed until the handoff into AppState. If setup
+        // panics before this point, the staging tree is still removed.
+        app.browse.archive.as_mut().expect("archive").staging = Some(staging_session_guard.into_inner());
         app.deferred_browse_archive_screen_switch = Some(AppScreen::Convert);
         app.active_overlay = ActiveOverlay::Confirmation {
             message: "archive conflict".to_string(),

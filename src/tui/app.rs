@@ -1416,6 +1416,11 @@ impl PendingBrowseArchiveRename {
     pub fn matches(&self, archive_path: &Path, staging_dir: &Path) -> bool {
         self.archive_path.as_path() == archive_path && self.staging_dir.as_path() == staging_dir
     }
+
+    pub fn cancel_and_cleanup(self) {
+        self.cancel.cancel();
+        cleanup_archive_metadata_staging_dir(&self.staging_dir);
+    }
 }
 
 /// Lifecycle handle for Browse-screen archive-entry delete. The operation
@@ -1471,6 +1476,11 @@ impl PendingBrowseArchiveDelete {
 
     pub fn matches(&self, archive_path: &Path, staging_dir: &Path) -> bool {
         self.archive_path.as_path() == archive_path && self.staging_dir.as_path() == staging_dir
+    }
+
+    pub fn cancel_and_cleanup(self) {
+        self.cancel.cancel();
+        cleanup_archive_metadata_staging_dir(&self.staging_dir);
     }
 }
 
@@ -7640,6 +7650,7 @@ pub struct AppState {
     pub theme_library: crate::tui::theme::ThemeLibrarySnapshot,
     pub manager: ConversionManager,
     pub db: crate::db::Database,
+    _owned_database_dir: AppOwnedDatabaseDir,
 
     /// The button currently under the mouse cursor (updated on MouseEventKind::Moved).
     /// Renderers check this to apply hover highlighting.
@@ -8080,41 +8091,308 @@ fn lower_env_value(value: Option<&std::ffi::OsStr>) -> Option<String> {
 
 const KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
-/// Startup behaviors whose defaults must match production.
+/// Database source used while constructing [`AppState`].
 ///
-/// Tests that are not explicitly about startup recovery should opt out through
-/// `AppState::new_for_test()` or `new_with_startup_options()` rather than
-/// relying on a `cfg!(test)` branch inside the production constructor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Production remains explicit and file-backed. Tests and integration tests can
+/// inject either a concrete SQLite path or an isolated temp-file database without
+/// relying on `cfg(test)` behavior in this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppDatabaseSource {
+    Production,
+    InMemory,
+    File(std::path::PathBuf),
+    IsolatedTempFile,
+}
+
+impl Default for AppDatabaseSource {
+    fn default() -> Self {
+        #[cfg(test)]
+        {
+            Self::IsolatedTempFile
+        }
+        #[cfg(not(test))]
+        {
+            Self::Production
+        }
+    }
+}
+
+/// Startup behaviors whose production defaults must remain explicit.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStartupOptions {
     pub recover_pending_archives: bool,
+    pub database_source: AppDatabaseSource,
 }
 
 impl Default for AppStartupOptions {
     fn default() -> Self {
         Self {
             recover_pending_archives: true,
+            database_source: AppDatabaseSource::default(),
         }
     }
 }
 
 impl AppStartupOptions {
-    #[cfg(test)]
-    pub fn without_archive_recovery_for_tests() -> Self {
+    pub fn without_archive_recovery() -> Self {
         Self {
             recover_pending_archives: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_archive_recovery() -> Self {
+        Self {
+            recover_pending_archives: true,
+            ..Self::default()
+        }
+    }
+
+    /// Use an explicitly supplied SQLite file. This is intentionally available
+    /// outside `cfg(test)` so external integration tests can use production-like
+    /// file-backed DB behavior without touching the user's XDG database.
+    pub fn with_database_path(mut self, database_path: impl Into<std::path::PathBuf>) -> Self {
+        self.database_source = AppDatabaseSource::File(database_path.into());
+        self
+    }
+
+    /// Use an isolated SQLite temp-file database owned by the constructed
+    /// AppState. This exercises path creation and file-backed SQLite behavior
+    /// while still cleaning up on drop.
+    pub fn with_isolated_temp_database(mut self) -> Self {
+        self.database_source = AppDatabaseSource::IsolatedTempFile;
+        self
+    }
+
+    /// Use in-memory SQLite. Kept for fast smoke tests that do not need
+    /// file-backed persistence, WAL, or migration-on-file behavior.
+    pub fn with_in_memory_database(mut self) -> Self {
+        self.database_source = AppDatabaseSource::InMemory;
+        self
+    }
+
+    /// Explicitly opt into the production XDG database. Tests should almost
+    /// never use this; the method is named to make such use obvious in review.
+    pub fn with_production_database(mut self) -> Self {
+        self.database_source = AppDatabaseSource::Production;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn without_archive_recovery_for_tests() -> Self {
+        Self::without_archive_recovery().with_isolated_temp_database()
+    }
+
+    #[cfg(test)]
+    pub fn with_archive_recovery_for_tests() -> Self {
+        Self::with_archive_recovery().with_isolated_temp_database()
+    }
+}
+
+#[derive(Debug, Default)]
+struct AppOwnedDatabaseDir(Option<std::path::PathBuf>);
+
+impl AppOwnedDatabaseDir {
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn new(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+}
+
+impl Drop for AppOwnedDatabaseDir {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    log::debug!("failed to remove isolated AppState database dir {}: {err}", path.display());
+                }
+            }
         }
     }
 }
 
+struct OpenedAppDatabase {
+    db: crate::db::Database,
+    owned_database_dir: AppOwnedDatabaseDir,
+}
+
+fn open_app_startup_database(startup_options: &AppStartupOptions) -> OpenedAppDatabase {
+    let opened = match &startup_options.database_source {
+        AppDatabaseSource::Production => crate::db::Database::open()
+            .map(|db| OpenedAppDatabase { db, owned_database_dir: AppOwnedDatabaseDir::none() }),
+        AppDatabaseSource::InMemory => crate::db::Database::open_memory()
+            .map(|db| OpenedAppDatabase { db, owned_database_dir: AppOwnedDatabaseDir::none() }),
+        AppDatabaseSource::File(path) => crate::db::Database::open_path(path)
+            .map(|db| OpenedAppDatabase { db, owned_database_dir: AppOwnedDatabaseDir::none() }),
+        AppDatabaseSource::IsolatedTempFile => open_isolated_app_database(),
+    };
+
+    match opened {
+        Ok(opened) => {
+            opened.db.prune_search_tag_cache(30);
+            opened
+        }
+        Err(err) => {
+            log::warn!("failed to open SQLite database ({err}); falling back to in-memory DB");
+            let db = crate::db::Database::open_memory().unwrap_or_else(|memory_err| {
+                panic!("failed to open fallback in-memory SQLite database: {memory_err}")
+            });
+            OpenedAppDatabase {
+                db,
+                owned_database_dir: AppOwnedDatabaseDir::none(),
+            }
+        }
+    }
+}
+
+fn open_isolated_app_database() -> Result<OpenedAppDatabase, String> {
+    let base = std::env::temp_dir().join(format!(
+        "tonepoet-test-db-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base)
+        .map_err(|err| format!("create isolated AppState database dir {}: {err}", base.display()))?;
+    let db_path = base.join("tonepoet.db");
+    match crate::db::Database::open_path(&db_path) {
+        Ok(db) => Ok(OpenedAppDatabase {
+            db,
+            owned_database_dir: AppOwnedDatabaseDir::new(base),
+        }),
+        Err(err) => {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&base) {
+                if cleanup_err.kind() != std::io::ErrorKind::NotFound {
+                    log::debug!(
+                        "failed to remove isolated AppState database dir after open failure {}: {cleanup_err}",
+                        base.display()
+                    );
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    fn cleanup_test_archive_staging_on_drop(&mut self) {
+        if let Some(pending) = self.pending_browse_archive_metadata.take() {
+            pending.cancel_and_cleanup();
+        }
+        if let Some(pending) = self.pending_browse_archive_rename.take() {
+            pending.cancel_and_cleanup();
+        }
+        if let Some(pending) = self.pending_browse_archive_delete.take() {
+            pending.cancel_and_cleanup();
+        }
+        if let Some(context) = self.preserved_editor_archive_repackage.take() {
+            context.cleanup_staging();
+            if let Err(err) = self.db.delete_pending_archive_session(&context.archive_path) {
+                log::warn!(
+                    "test cleanup failed to delete pending archive session for {}: {err}",
+                    context.archive_path.display()
+                );
+            }
+        }
+        if let Some(staging) = self.pending_archive_recovery_resume.take() {
+            cleanup_archive_metadata_staging_dir(&staging.staging_dir);
+            if let Err(err) = self.db.delete_pending_archive_session(&staging.archive_path) {
+                log::warn!(
+                    "test cleanup failed to delete recovered archive session for {}: {err}",
+                    staging.archive_path.display()
+                );
+            }
+        }
+        self.pending_archive_recovery.clear();
+    }
+}
+
+#[cfg(test)]
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.cleanup_test_archive_staging_on_drop();
+    }
+}
+
+fn app_state_default_startup_options() -> AppStartupOptions {
+    // Keep `AppState::new(...)` as the production-default constructor. Unit-test
+    // builds still inherit isolated database defaults through
+    // `AppDatabaseSource::default()` under `cfg(test)`, but integration tests
+    // link this library as normal production code. Those tests must call
+    // `AppState::new_for_test(...)`, `new_for_test_with_db_path(...)`,
+    // `new_with_database_path(...)`, or `new_with_database(...)` explicitly
+    // instead of relying on process-path heuristics such as `target/.../deps`.
+    AppStartupOptions::default()
+}
+
 impl AppState {
     pub fn new(config: TonepoetConfig) -> Self {
-        Self::new_with_startup_options(config, AppStartupOptions::default())
+        Self::new_with_startup_options(config, app_state_default_startup_options())
     }
 
     pub fn new_with_startup_options(
         config: TonepoetConfig,
         startup_options: AppStartupOptions,
+    ) -> Self {
+        let opened = open_app_startup_database(&startup_options);
+        Self::new_with_open_database(
+            config,
+            startup_options,
+            opened.db,
+            opened.owned_database_dir,
+        )
+    }
+
+    /// Construct AppState with an already-open database. This is the most direct
+    /// injection seam for integration tests and specialized harnesses; callers
+    /// own any tempdir lifetime required by the supplied database path.
+    pub fn new_with_database(config: TonepoetConfig, db: crate::db::Database) -> Self {
+        Self::new_with_open_database(
+            config,
+            AppStartupOptions::default(),
+            db,
+            AppOwnedDatabaseDir::none(),
+        )
+    }
+
+    /// Construct AppState with a production-like file-backed SQLite database at
+    /// a caller-supplied path. This is available to integration tests because it
+    /// is not hidden behind `cfg(test)`.
+    pub fn new_with_database_path(
+        config: TonepoetConfig,
+        database_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self::new_with_startup_options(
+            config,
+            AppStartupOptions::default().with_database_path(database_path),
+        )
+    }
+
+    pub fn new_for_test_with_db_path(
+        config: TonepoetConfig,
+        database_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self::new_with_startup_options(
+            config,
+            AppStartupOptions::without_archive_recovery().with_database_path(database_path),
+        )
+    }
+
+    pub fn new_for_test_with_isolated_db(config: TonepoetConfig) -> Self {
+        Self::new_with_startup_options(
+            config,
+            AppStartupOptions::without_archive_recovery().with_isolated_temp_database(),
+        )
+    }
+
+    fn new_with_open_database(
+        config: TonepoetConfig,
+        startup_options: AppStartupOptions,
+        db: crate::db::Database,
+        owned_database_dir: AppOwnedDatabaseDir,
     ) -> Self {
         let mut config = config;
         let configured_theme_slug = config.ui.theme.clone();
@@ -8148,19 +8426,6 @@ impl AppState {
                 )
             }
         };
-        // Open the SQLite database FIRST — needed for queue load + other init.
-        let db = match crate::db::Database::open() {
-            Ok(db) => {
-                // Prune stale search tag cache entries (>30 days old).
-                db.prune_search_tag_cache(30);
-                db
-            }
-            Err(e) => {
-                log::error!("Failed to open database: {}. Using in-memory fallback.", e);
-                crate::db::Database::open_memory().expect("in-memory DB should never fail")
-            }
-        };
-
         let mut pending_archive_recovery: std::collections::VecDeque<crate::db::PendingArchiveSessionRecovery> =
             std::collections::VecDeque::new();
         if startup_options.recover_pending_archives {
@@ -8239,6 +8504,7 @@ impl AppState {
             theme_library,
             manager,
             db,
+            _owned_database_dir: owned_database_dir,
             current_screen: initial_screen,
             previous_screen: None,
             convert: ConvertState {
@@ -8332,12 +8598,12 @@ impl AppState {
         }
     }
 
-    #[cfg(test)]
+    /// Construct AppState with test-safe defaults in normal and integration-test
+    /// builds. This is intentionally not gated by `cfg(test)`: Rust integration
+    /// tests link the library as an ordinary dependency, so their harnesses need
+    /// an explicit constructor that cannot touch the user's production XDG DB.
     pub fn new_for_test(config: TonepoetConfig) -> Self {
-        Self::new_with_startup_options(
-            config,
-            AppStartupOptions::without_archive_recovery_for_tests(),
-        )
+        Self::new_for_test_with_isolated_db(config)
     }
 
     pub fn set_config_focus(&mut self, focus: ConfigFocus) {
@@ -10085,8 +10351,66 @@ mod app_startup_options_tests {
     }
 
     #[test]
+    fn test_startup_options_use_isolated_temp_database_by_default() {
+        assert_eq!(
+            AppStartupOptions::default().database_source,
+            AppDatabaseSource::IsolatedTempFile
+        );
+        assert_eq!(
+            AppStartupOptions::with_archive_recovery_for_tests().database_source,
+            AppDatabaseSource::IsolatedTempFile
+        );
+    }
+
+    #[test]
     fn test_constructor_options_explicitly_disable_archive_recovery() {
-        assert!(!AppStartupOptions::without_archive_recovery_for_tests().recover_pending_archives);
+        let options = AppStartupOptions::without_archive_recovery_for_tests();
+        assert!(!options.recover_pending_archives);
+        assert_eq!(options.database_source, AppDatabaseSource::IsolatedTempFile);
+    }
+
+    #[test]
+    fn app_state_instances_do_not_share_pending_archive_session_rows_in_tests() {
+        let app = AppState::new_for_test(TonepoetConfig::default());
+        let temp = tempfile::tempdir().expect("temp dir");
+        let archive = temp.path().join("album.zip");
+        let staging = temp.path().join("tonepoet-archive-rename-test");
+        std::fs::write(&archive, b"archive bytes").expect("archive fixture");
+        std::fs::create_dir_all(&staging).expect("staging fixture");
+        app.db
+            .upsert_pending_archive_session(&archive, &staging, 0, 0, 13, "[]")
+            .expect("upsert pending archive session");
+        assert_eq!(app.db.pending_archive_session_count_for_tests().unwrap(), 1);
+
+        let other = AppState::new_for_test(TonepoetConfig::default());
+        assert_eq!(other.db.pending_archive_session_count_for_tests().unwrap(), 0);
+    }
+
+
+    #[test]
+    fn explicit_test_database_path_is_file_backed_and_reusable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db_path = temp.path().join("state").join("tonepoet.db");
+        let archive = temp.path().join("album.zip");
+        let staging = temp.path().join("tonepoet-archive-rename-explicit-db");
+        std::fs::write(&archive, b"archive bytes").expect("archive fixture");
+        std::fs::create_dir_all(&staging).expect("staging fixture");
+
+        {
+            let app = AppState::new_for_test_with_db_path(TonepoetConfig::default(), &db_path);
+            app.db
+                .upsert_pending_archive_session(&archive, &staging, 0, 0, 13, "[]")
+                .expect("upsert pending archive session");
+            assert_eq!(app.db.pending_archive_session_count_for_tests().unwrap(), 1);
+            assert!(db_path.exists(), "explicit test DB should be file-backed");
+        }
+
+        let reopened = AppState::new_for_test_with_db_path(TonepoetConfig::default(), &db_path);
+        assert_eq!(
+            reopened.db.pending_archive_session_count_for_tests().unwrap(),
+            1,
+            "explicit file-backed test DB should persist across AppState instances"
+        );
     }
 }
 
