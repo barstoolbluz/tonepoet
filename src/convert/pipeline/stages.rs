@@ -2047,13 +2047,17 @@ pub fn scheduled_worker_failure_output(
     }
 }
 
-fn blocked_track_records(source: &PreparedSource, reason: &str) -> Vec<TrackRecord> {
+fn track_records_for_terminal_source_issue(
+    source: &PreparedSource,
+    reason: &str,
+    outcome_for_track: impl Fn(String) -> TrackOutcome,
+) -> Vec<TrackRecord> {
     source
         .tracks
         .iter()
         .map(|track| TrackRecord {
             track_id: track.id.clone(),
-            outcome: TrackOutcome::Blocked(reason.to_string()),
+            outcome: outcome_for_track(reason.to_string()),
             source_ref: track.source_ref.clone(),
             realized_input: None,
             output_file: None,
@@ -2064,6 +2068,14 @@ fn blocked_track_records(source: &PreparedSource, reason: &str) -> Vec<TrackReco
             dsd_dst_stats: None,
         })
         .collect()
+}
+
+fn blocked_track_records(source: &PreparedSource, reason: &str) -> Vec<TrackRecord> {
+    track_records_for_terminal_source_issue(source, reason, TrackOutcome::Blocked)
+}
+
+fn failed_track_records(source: &PreparedSource, error: &str) -> Vec<TrackRecord> {
+    track_records_for_terminal_source_issue(source, error, TrackOutcome::Err)
 }
 
 pub async fn convert_tracks(
@@ -11488,7 +11500,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
             let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(plan_error.clone()));
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
-            let failed = blocked_track_records(
+            let failed = failed_track_records(
                 &prepared,
                 &format!("output planning failed: {plan_error}"),
             );
@@ -12574,7 +12586,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
             );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
-            let failed = blocked_track_records(
+            let failed = failed_track_records(
                 source.as_ref().expect("materialized source present"),
                 &format!("output planning failed: {plan_error}"),
             );
@@ -20189,8 +20201,41 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         album_dir: &Path,
         settings_fingerprint: Option<&str>,
     ) -> ConversionLogBatchIdentity {
-        conversion_log_batch_identity(req, album_dir, settings_fingerprint)
-            .expect("fragment fixture identity must follow production batch identity derivation")
+        let album_batch = req
+            .album_batch
+            .as_ref()
+            .expect("fragment fixture requests must carry an album batch context");
+        let source_context = album_batch.source_context();
+        let source_context_kind = source_context.source_kind.trim();
+        assert!(
+            is_generated_conversion_log_batch_id(album_batch.conversion_log_batch_id.trim()),
+            "fragment fixture album batch ids must use the generated per-attempt shape"
+        );
+        assert!(
+            !source_context_kind.is_empty(),
+            "fragment fixture source context kind must not be empty"
+        );
+
+        // Synthetic unit fixtures intentionally use convenient source paths such
+        // as `/tmp/input.7z` while binding fragments to an album batch rooted at
+        // `/out/Artist/Album/source-root`. That is valid fixture data: the helper
+        // is constructing the exact identity the test wants to seed, not accepting
+        // an external production request. Keep production validation in
+        // `conversion_log_batch_identity()` intact and avoid smuggling its
+        // source-under-grouping-root invariant into hand-authored test fragments.
+        ConversionLogBatchIdentity {
+            conversion_log_batch_id: album_batch.conversion_log_batch_id.trim().to_string(),
+            settings_fingerprint: settings_fingerprint.map(str::to_string),
+            output_album_dir: normalize_path(album_dir).display().to_string(),
+            source_grouping_root: normalize_path(&album_batch.source_grouping_root)
+                .display()
+                .to_string(),
+            source_context_path: normalize_path(&source_context.container_path)
+                .display()
+                .to_string(),
+            source_context_kind: source_context_kind.to_string(),
+            target_format: req.settings.target_format.display_name().to_string(),
+        }
     }
 
     fn rebind_fragment_test_identity(
@@ -22289,7 +22334,10 @@ Source-aware setting: yes
             ConversionLogTrackOutcome::Success,
             fragment_test_time(1),
         );
-        track_one.batch_identity.source_grouping_root = normalize_path(temp.path()).display().to_string();
+        rebind_fragment_test_identity(
+            &mut track_one,
+            fragment_test_identity_for_request(&req, &album_dir, Some(settings_fingerprint.as_str())),
+        );
         let (stage_one, plan_one) = incremental_fragment_test_plan(
             temp.path(),
             &album_dir,
@@ -22315,7 +22363,13 @@ Source-aware setting: yes
             ConversionLogTrackOutcome::Success,
             fragment_test_time(2),
         );
-        stale_track.batch_identity.source_grouping_root = normalize_path(temp.path()).display().to_string();
+        let mut stale_identity = fragment_test_identity_for_request(
+            &req,
+            &album_dir,
+            Some(settings_fingerprint.as_str()),
+        );
+        stale_identity.conversion_log_batch_id = generated_test_batch_id("batch-cancelled-old-run");
+        rebind_fragment_test_identity(&mut stale_track, stale_identity);
         write_album_fragment(&album_dir, "stale-cancelled-track-2.json", &stale_track);
         std::fs::write(conversion_log_fragment_dir(&album_dir).join("corrupt-cancelled.json"), b"not json")
             .expect("corrupt cancelled fragment");
@@ -23078,7 +23132,7 @@ Source-aware setting: yes
             .to_string();
         let failed_outcome = AlbumOutcome::Blocked {
             successful: Vec::new(),
-            failed: blocked_track_records(
+            failed: failed_track_records(
                 &failed_source,
                 &format!("output planning failed: {plan_error}"),
             ),

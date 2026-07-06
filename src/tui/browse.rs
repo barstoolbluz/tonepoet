@@ -3362,50 +3362,85 @@ impl BrowseState {
 
         let mut dirs = Vec::new();
         let mut files = Vec::new();
+        let items = arc.listing.entries_at(&arc.inner_path);
+        let mut listing_paths = HashSet::new();
+        for item in &items {
+            listing_paths.insert(item.full_path.clone());
+            let staged_metadata = arc
+                .staging
+                .as_ref()
+                .and_then(|staging| {
+                    staging_path_for_archive_inner(&staging.staging_dir, &item.full_path).ok()
+                })
+                .and_then(|path| fs::metadata(path).ok());
+            let kind = if item.is_dir {
+                EntryKind::Directory
+            } else if staged_metadata.as_ref().is_some_and(|metadata| metadata.is_dir()) {
+                EntryKind::Directory
+            } else if let Some(staging) = arc.staging.as_ref() {
+                staging_path_for_archive_inner(&staging.staging_dir, &item.full_path)
+                    .ok()
+                    .map(|path| classify_file(&path))
+                    .unwrap_or_else(|| classify_file(Path::new(&item.name)))
+            } else {
+                classify_file(Path::new(&item.name))
+            };
+            let size = if matches!(kind, EntryKind::Directory) {
+                0
+            } else {
+                staged_metadata.as_ref().map_or(item.size, |metadata| metadata.len())
+            };
+            let modified = staged_metadata.and_then(|metadata| metadata.modified().ok());
+            let entry_is_dir = item.is_dir || matches!(kind, EntryKind::Directory);
+            let entry = BrowseEntry::new(
+                arc.listing.archive_path.join(&item.full_path),
+                item.name.clone(),
+                kind,
+                size,
+                modified,
+            );
+            if entry_is_dir {
+                dirs.push(entry);
+            } else {
+                files.push(entry);
+            }
+        }
+
         if let Some(staging) = arc.staging.as_ref() {
             let current_dir = staging.staging_dir.join(&arc.inner_path);
             if let Ok(read_dir) = fs::read_dir(&current_dir) {
                 for child in read_dir.flatten() {
                     let path = child.path();
-                    let Ok(meta) = child.metadata() else { continue };
-                    let is_dir = meta.is_dir();
+                    let Ok(meta) = child.metadata() else {
+                        continue;
+                    };
                     let name = child.file_name().to_string_lossy().into_owned();
                     let inner = if arc.inner_path.is_empty() {
                         name.clone()
                     } else {
                         format!("{}/{}", arc.inner_path, name)
                     };
-                    let kind = if is_dir { EntryKind::Directory } else { classify_file(&path) };
-                    let modified = meta.modified().ok();
+                    if listing_paths.contains(&inner) {
+                        continue;
+                    }
+                    let is_dir = meta.is_dir();
+                    let kind = if is_dir {
+                        EntryKind::Directory
+                    } else {
+                        classify_file(&path)
+                    };
                     let entry = BrowseEntry::new(
                         arc.listing.archive_path.join(inner),
                         name,
                         kind,
                         if is_dir { 0 } else { meta.len() },
-                        modified,
+                        meta.modified().ok(),
                     );
-                    if is_dir { dirs.push(entry); } else { files.push(entry); }
-                }
-            }
-        } else {
-            let items = arc.listing.entries_at(&arc.inner_path);
-            for item in &items {
-                let kind = if item.is_dir {
-                    EntryKind::Directory
-                } else {
-                    classify_file(Path::new(&item.name))
-                };
-                let entry = BrowseEntry::new(
-                    arc.listing.archive_path.join(&item.full_path),
-                    item.name.clone(),
-                    kind,
-                    item.size,
-                    None,
-                );
-                if item.is_dir {
-                    dirs.push(entry);
-                } else {
-                    files.push(entry);
+                    if is_dir {
+                        dirs.push(entry);
+                    } else {
+                        files.push(entry);
+                    }
                 }
             }
         }
@@ -4839,7 +4874,14 @@ impl BrowseState {
         let mut sources = Vec::with_capacity(self.all_dirs.len() + self.all_files.len());
         sources.extend(self.all_dirs.iter().cloned());
         sources.extend(self.all_files.iter().cloned());
-        self.execute_search_over_entries(query, show_hidden, audio_only, format_filter, mode, sources);
+        self.execute_search_over_entries(
+            query,
+            show_hidden,
+            audio_only,
+            format_filter,
+            mode,
+            sources,
+        );
     }
 
     /// Archive search never falls back to the parent filesystem directory.
@@ -4855,32 +4897,67 @@ impl BrowseState {
         mode: SearchMode,
         recursive: bool,
     ) {
-        let sources = if recursive {
-            self.archive_recursive_search_entries()
-        } else {
-            let mut entries = Vec::with_capacity(self.all_dirs.len() + self.all_files.len());
-            entries.extend(self.all_dirs.iter().cloned());
-            entries.extend(self.all_files.iter().cloned());
-            entries
-        };
+        // Staging sessions can be attached after the archive listing was first
+        // rendered (for example by recovery or metadata-edit reducers). Rebuild
+        // the raw archive model before synchronous search so tag fallback sees
+        // the synthetic archive-member entries and their archive identities, not
+        // only the transient staging directory shape.
+        if self.archive.as_ref().and_then(|arc| arc.staging.as_ref()).is_some() {
+            self.rebuild_archive_raw_entries();
+        }
+
+        let sources = self.archive_search_source_entries(recursive, mode);
         self.search.searching = false;
         self.search.cancel = None;
-        self.execute_search_over_entries(query, show_hidden, audio_only, format_filter, mode, sources);
+        self.execute_search_over_entries(
+            query,
+            show_hidden,
+            audio_only,
+            format_filter,
+            mode,
+            sources,
+        );
     }
 
     fn archive_search_requires_async(&self, mode: SearchMode, sort: SearchSort) -> bool {
-        self.archive.is_some() && (matches!(mode, SearchMode::Tags | SearchMode::Both) || sort.is_tag_sort())
+        self.archive.is_some()
+            && (matches!(mode, SearchMode::Tags | SearchMode::Both) || sort.is_tag_sort())
     }
 
-    fn archive_search_candidates(&self, recursive: bool) -> Vec<ArchiveSearchCandidate> {
-        let sources = if recursive {
-            self.archive_recursive_search_entries()
-        } else {
-            let mut entries = Vec::with_capacity(self.all_dirs.len() + self.all_files.len());
-            entries.extend(self.all_dirs.iter().cloned());
-            entries.extend(self.all_files.iter().cloned());
-            entries
-        };
+    fn archive_search_source_entries(&self, recursive: bool, mode: SearchMode) -> Vec<BrowseEntry> {
+        if recursive {
+            return self.archive_recursive_search_entries();
+        }
+
+        let mut entries = Vec::with_capacity(self.all_dirs.len() + self.all_files.len());
+        entries.extend(self.all_dirs.iter().cloned());
+        entries.extend(self.all_files.iter().cloned());
+
+        // Archive staging exposes a filesystem tree whose immediate root may be
+        // only synthetic directories while the archive listing/probe cache owns
+        // the real audio-member identities below them. In that exact tag-search
+        // case, widen the candidate set to listing descendants so metadata
+        // fallback remains useful without weakening ordinary filename browsing.
+        let staged_archive_tag_search_without_current_audio = self
+            .archive
+            .as_ref()
+            .and_then(|arc| arc.staging.as_ref())
+            .is_some()
+            && matches!(mode, SearchMode::Tags | SearchMode::Both)
+            && entries.iter().all(|entry| !entry.is_audio());
+        if staged_archive_tag_search_without_current_audio {
+            return self.archive_recursive_search_entries();
+        }
+
+        entries
+    }
+
+    fn archive_search_candidates(
+        &self,
+        recursive: bool,
+        mode: SearchMode,
+    ) -> Vec<ArchiveSearchCandidate> {
+        let sources = self.archive_search_source_entries(recursive, mode);
 
         sources
             .into_iter()
@@ -4929,7 +5006,10 @@ impl BrowseState {
         let password = arc.password.clone();
         let archive_fingerprint = TagCacheFingerprint::for_path(&archive_path);
         let cached_archive_tags = self.search.archive_tag_cache.clone();
-        let candidates = self.archive_search_candidates(recursive);
+        if self.archive.as_ref().and_then(|arc| arc.staging.as_ref()).is_some() {
+            self.rebuild_archive_raw_entries();
+        }
+        let candidates = self.archive_search_candidates(recursive, mode);
         let query = query.to_string();
 
         tokio::spawn(async move {
@@ -5258,23 +5338,97 @@ impl BrowseState {
         };
         let mut dirs = Vec::new();
         let mut files = Vec::new();
+        let mut listing_paths = HashSet::new();
+
+        for item in &arc.listing.entries {
+            if !prefix.is_empty() && !item.path.starts_with(&prefix) {
+                continue;
+            }
+            if item.path == arc.inner_path {
+                continue;
+            }
+            let display_name = item
+                .path
+                .strip_prefix(&prefix)
+                .unwrap_or(&item.path)
+                .to_string();
+            if display_name.is_empty() {
+                continue;
+            }
+            listing_paths.insert(item.path.clone());
+            let staged_metadata = arc
+                .staging
+                .as_ref()
+                .and_then(|staging| {
+                    staging_path_for_archive_inner(&staging.staging_dir, &item.path).ok()
+                })
+                .and_then(|path| fs::metadata(path).ok());
+            let kind = if item.is_dir {
+                EntryKind::Directory
+            } else if staged_metadata.as_ref().is_some_and(|metadata| metadata.is_dir()) {
+                EntryKind::Directory
+            } else if let Some(staging) = arc.staging.as_ref() {
+                staging_path_for_archive_inner(&staging.staging_dir, &item.path)
+                    .ok()
+                    .map(|path| classify_file(&path))
+                    .unwrap_or_else(|| classify_file(Path::new(&item.path)))
+            } else {
+                classify_file(Path::new(&item.path))
+            };
+            let size = if matches!(kind, EntryKind::Directory) {
+                0
+            } else {
+                staged_metadata.as_ref().map_or(item.size, |metadata| metadata.len())
+            };
+            let modified = staged_metadata.and_then(|metadata| metadata.modified().ok());
+            let entry_is_dir = item.is_dir || matches!(kind, EntryKind::Directory);
+            let entry = BrowseEntry::new(
+                arc.listing.archive_path.join(&item.path),
+                display_name,
+                kind,
+                size,
+                modified,
+            );
+            if entry_is_dir {
+                dirs.push(entry);
+            } else {
+                files.push(entry);
+            }
+        }
 
         if let Some(staging) = arc.staging.as_ref() {
             let root = staging.staging_dir.join(&arc.inner_path);
-            for entry in walkdir::WalkDir::new(&root).min_depth(1).into_iter().filter_map(Result::ok) {
+            for entry in walkdir::WalkDir::new(&root)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
                 let path = entry.path().to_path_buf();
-                let Ok(meta) = entry.metadata() else { continue };
-                let is_dir = meta.is_dir();
-                let Ok(relative_to_staging) = path.strip_prefix(&staging.staging_dir) else { continue };
-                let Some(inner) = normalize_archive_relative_path(relative_to_staging) else { continue };
-                if inner.is_empty() {
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let Ok(relative_to_staging) = path.strip_prefix(&staging.staging_dir) else {
+                    continue;
+                };
+                let Some(inner) = normalize_archive_relative_path(relative_to_staging) else {
+                    continue;
+                };
+                if inner.is_empty() || listing_paths.contains(&inner) {
                     continue;
                 }
                 let display_name = inner
                     .strip_prefix(&prefix)
                     .unwrap_or(&inner)
                     .to_string();
-                let kind = if is_dir { EntryKind::Directory } else { classify_file(&path) };
+                if display_name.is_empty() {
+                    continue;
+                }
+                let is_dir = meta.is_dir();
+                let kind = if is_dir {
+                    EntryKind::Directory
+                } else {
+                    classify_file(&path)
+                };
                 let entry = BrowseEntry::new(
                     arc.listing.archive_path.join(&inner),
                     display_name,
@@ -5282,37 +5436,11 @@ impl BrowseState {
                     if is_dir { 0 } else { meta.len() },
                     meta.modified().ok(),
                 );
-                if is_dir { dirs.push(entry); } else { files.push(entry); }
-            }
-        } else {
-            for item in &arc.listing.entries {
-                if !prefix.is_empty() && !item.path.starts_with(&prefix) {
-                    continue;
-                }
-                if item.path == arc.inner_path {
-                    continue;
-                }
-                let display_name = item
-                    .path
-                    .strip_prefix(&prefix)
-                    .unwrap_or(&item.path)
-                    .to_string();
-                if display_name.is_empty() {
-                    continue;
-                }
-                let kind = if item.is_dir {
-                    EntryKind::Directory
+                if is_dir {
+                    dirs.push(entry);
                 } else {
-                    classify_file(Path::new(&item.path))
-                };
-                let entry = BrowseEntry::new(
-                    arc.listing.archive_path.join(&item.path),
-                    display_name,
-                    kind,
-                    item.size,
-                    None,
-                );
-                if item.is_dir { dirs.push(entry); } else { files.push(entry); }
+                    files.push(entry);
+                }
             }
         }
 
@@ -5743,16 +5871,12 @@ impl BrowseState {
     /// logical archive member; tag search must keep using the synthetic archive
     /// path and archive-member identity rather than the staging-file identity.
     fn valid_archive_probe_for_entry(&self, entry: &BrowseEntry) -> Option<&CachedInfo> {
-        if self.archive.is_none() {
+        let Some(archive) = self.archive.as_ref() else {
             return self.valid_probe_for_entry(entry);
-        }
-        if let Some(info) = self.valid_probe_for_entry(entry) {
-            return Some(info);
-        }
+        };
+
         let inner = self.archive_inner_path_for_entry(entry)?;
-        let archive_entry = self
-            .archive
-            .as_ref()?
+        let archive_entry = archive
             .listing
             .entries
             .iter()
@@ -5761,7 +5885,9 @@ impl BrowseState {
             modified: None,
             size: archive_entry.size,
         };
+
         self.valid_probe_arc_for_identity(&entry.path, archive_identity)
+            .or_else(|| self.valid_probe_arc_for_entry(entry))
             .map(|info| info.as_ref())
     }
 
@@ -14847,6 +14973,21 @@ FILE "10 - Live Version.wav" WAVE
             .chain(state.all_dirs.iter())
             .find(|entry| entry.path == synthetic_path)
             .map(ProbeCacheIdentity::from_entry)
+            .or_else(|| {
+                state
+                    .archive
+                    .as_ref()
+                    .and_then(|arc| {
+                        arc.listing
+                            .entries
+                            .iter()
+                            .find(|entry| entry.path == inner_path)
+                    })
+                    .map(|entry| ProbeCacheIdentity {
+                        modified: None,
+                        size: entry.size,
+                    })
+            })
             .unwrap_or(ProbeCacheIdentity { modified: None, size: 4096 });
         state.probe_cache.insert(
             synthetic_path,
