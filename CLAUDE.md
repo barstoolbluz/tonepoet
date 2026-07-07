@@ -97,17 +97,19 @@ tonepoet/
 
 ```
 tonepoet (main binary + lib)
-├── tonepoet-backend     (no internal deps)
-├── tonepoet-features    (depends on tonepoet-backend)
-├── tonepoet-pipeline    (pipeline settings, enums, planning)
-├── tonepoet-wizard      (no internal deps)
-├── sacd-rs              (SACD ISO parsing)
-├── dvda-demuxer         (DVD-Audio demuxing)
-├── dvdvideo             (DVD-Video parsing)
-├── tui-file-picker      (file/directory picker widget)
-├── libbluray-sys        (FFI bindings for libbluray)
+├── tonepoet-backend     (workspace: FFmpeg/SoX command builders, metadata I/O)
+├── tonepoet-features    (workspace: log file writer, CUE sheet generator; depends on tonepoet-backend)
+├── tonepoet-pipeline    (workspace: pipeline settings, enums, planning)
+├── tonepoet-wizard      (workspace: legacy ratatui TUI wizard)
+├── sacd-rs              (workspace: SACD ISO parsing)
+├── dvda-demuxer         (workspace: DVD-Audio demuxing)
+├── dvdvideo             (workspace: DVD-Video parsing)
+├── tui-file-picker      (workspace: file/directory picker widget)
+│
+│ Notable external dependencies:
 ├── ffmpeg-next          (in-process audio probing via FFmpeg 7.1 bindings)
-└── lofty                (audio metadata/tag reading)
+├── lofty                (audio metadata/tag reading)
+└── libbluray-sys        (FFI bindings for libbluray)
 ```
 
 ## Key Types & Entry Points
@@ -228,7 +230,7 @@ The flake provides:
 
 ## Important Notes
 
-- **stages.rs is the largest file** (~920KB / ~24K LOC) — it contains the full pipeline stage functions, publish logic, template rendering, and conversion log assembly. processor.rs (~4K LOC) orchestrates the shared scheduler and queue processing.
+- **stages.rs is the largest file** (~1MB / ~27K LOC) — it contains the full pipeline stage functions, publish logic, template rendering, and conversion log assembly. processor.rs (~4K LOC) orchestrates the shared scheduler and queue processing.
 - The wizard crate has its own `main.rs` for standalone use but tonepoet's `main.rs` embeds the wizard directly
 - The new TUI (`src/tui/`) is the primary interface; the wizard crate is kept as-is for legacy/preset access
 - Archive passwords are configurable via `--archive-password` flag or `config.toml` — no hardcoded defaults
