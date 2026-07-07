@@ -967,6 +967,7 @@ fn active_inline_edit_matches_button(app: &AppState, button: Option<&TuiButton>)
         TuiButton::FolderTemplateField => Some(OutputOptionsField::FolderTemplate),
         TuiButton::FilenameTemplateField => Some(OutputOptionsField::FilenameTemplate),
         TuiButton::CompanionExtensionsField => Some(OutputOptionsField::CompanionExtensions),
+        TuiButton::ExcludeFilesField => Some(OutputOptionsField::ExcludeFiles),
         TuiButton::CompanionFoldersField => Some(OutputOptionsField::CompanionFolders),
         _ => None,
     };
@@ -1586,6 +1587,7 @@ fn output_options_field_value(app: &AppState, field: OutputOptionsField) -> Stri
         OutputOptionsField::FilenameTemplate => app.convert.output_options.filename_template.clone(),
         OutputOptionsField::CompanionExtensions => app.convert.output_options.companion_extensions.clone(),
         OutputOptionsField::CompanionFolders => app.convert.output_options.companion_folders.clone(),
+        OutputOptionsField::ExcludeFiles => app.convert.output_options.companion_exclude_files.clone(),
         OutputOptionsField::MergeMode
         | OutputOptionsField::ForceEncode
         | OutputOptionsField::DiscSubfolders
@@ -1645,6 +1647,10 @@ fn commit_output_options_inline_edit(app: &mut AppState) {
         }
         OutputOptionsField::CompanionFolders => {
             app.convert.output_options.companion_folders = trimmed.to_string();
+            app.preset.mark_modified();
+        }
+        OutputOptionsField::ExcludeFiles => {
+            app.convert.output_options.companion_exclude_files = trimmed.to_string();
             app.preset.mark_modified();
         }
         OutputOptionsField::MergeMode
@@ -24709,6 +24715,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::CompanionFoldersField => {
                 app.convert.focus = ConvertFocus::OutputOptions;
                 begin_output_options_inline_edit(app, OutputOptionsField::CompanionFolders, None);
+            }
+            TuiButton::ExcludeFilesField => {
+                app.convert.focus = ConvertFocus::OutputOptions;
+                begin_output_options_inline_edit(app, OutputOptionsField::ExcludeFiles, None);
             }
             TuiButton::SourceBrowseButton => {
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;

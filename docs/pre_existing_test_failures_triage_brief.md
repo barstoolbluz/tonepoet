@@ -37,7 +37,7 @@ Assertion: "failed publish keeps staging root for diagnostics/retry". After a fo
 The test expects a path-escaping naming template (one that would escape the destination root) to fail during output planning; `plan_outputs` now succeeds and returns a sanitized in-root path (`.../Test Album/escaped-plan-output.flac`). Either the planner's escape handling changed from fail to sanitize (then the test should assert sanitization), or the sanitization silently swallows what should be a planning error.
 
 ### 9. `output_options_companion_projection_tests::output_options_field_cycle_includes_companion_fields_when_maximized` (src/tui/app.rs:3828)
-From `e606eda` (companion copying), broken by later feature work: `CompanionFolders.next_for(true)` now returns `ForceEncode`, test expects `WriteLog`. `MAXIMIZED_FIELDS` (src/tui/app.rs:2448) now inserts `ForceEncode` and `DiscSubfolders` between `CompanionFolders` and `WriteLog`; the test predates both. Almost certainly a stale test: update the expected cycle to walk `CompanionFolders → ForceEncode → DiscSubfolders → WriteLog` (also check the `prev_for` assertions' symmetry).
+From `e606eda` (companion copying), broken by later feature work: `MAXIMIZED_FIELDS` now inserts `ExcludeFiles`, `ForceEncode`, and `DiscSubfolders` between `CompanionFolders` and `WriteLog`; the test predates all three. Almost certainly a stale test: update the expected cycle to walk `CompanionFolders → ExcludeFiles → ForceEncode → DiscSubfolders → WriteLog` (also check the `prev_for` assertions' symmetry). Note the src/tui/app.rs line references drift as fields are added — locate `MAXIMIZED_FIELDS` by name.
 
 ## Real-world failure: folder album batch loses disc 1's subfolder
 

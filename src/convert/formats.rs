@@ -255,13 +255,14 @@ impl std::fmt::Display for AudioFormat {
 }
 
 
-/// Default loose companion-file extensions copied with conversions.
+/// Default loose companion-file extensions copied with conversions, as the
+/// comma-separated display form of `default_companion_extensions()`.
 ///
-/// The product default is intentionally empty: companion copying is opt-in
-/// through the TUI, presets, or explicit `ConversionOptions` values. Keeping
-/// this constant empty prevents non-UI call paths from silently resurrecting
-/// the pre-inline-editing companion-copy behavior.
-pub const DEFAULT_COMPANION_EXTENSIONS: &str = "";
+/// Companion copying is on by default for the conventional album extras below;
+/// users opt out by blanking the include field (the TUI treats a non-empty
+/// include list as the on/off switch) or disabling `copy_auxiliary_files`.
+pub const DEFAULT_COMPANION_EXTENSIONS: &str =
+    ".png, .bmp, .jpeg, .jpg, .gif, .webp, .log, .cue, .txt, .nfo, .pdf, .m3u, .m3u8";
 
 /// Parse a comma-separated extension list into normalized, de-duplicated values.
 ///
@@ -316,8 +317,45 @@ pub fn parse_companion_folders(input: &str) -> Vec<String> {
     out
 }
 
+/// Default loose companion-file extensions: common artwork, rip documentation,
+/// and playlist sidecars. Companion copying only runs when the include list is
+/// non-empty (the TUI treats the field as the on/off switch), so these defaults
+/// make a fresh install copy the conventional album extras out of the box.
 pub fn default_companion_extensions() -> Vec<String> {
-    Vec::new()
+    [
+        "png", "bmp", "jpeg", "jpg", "gif", "webp", "log", "cue", "txt", "nfo", "pdf", "m3u",
+        "m3u8",
+    ]
+    .iter()
+    .map(|ext| format!(".{ext}"))
+    .collect()
+}
+
+/// Parse a comma-separated list of exact companion file names to exclude from
+/// loose-file copying.
+///
+/// Include is extension-based, so exclusion works at file-name granularity: an
+/// extension the user does not include is never copied in the first place.
+/// Tokens that look like paths are dropped defensively. Matching at the copy
+/// stage is case-insensitive; tokens are normalized to lowercase here.
+pub fn parse_companion_exclude_files(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in input.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+        {
+            continue;
+        }
+        let normalized = trimmed.to_lowercase();
+        if !out.iter().any(|existing| existing == &normalized) {
+            out.push(normalized);
+        }
+    }
+    out
 }
 
 /// Options for audio conversion
@@ -388,6 +426,11 @@ pub struct ConversionOptions {
     /// after publish. Empty means copy no folders.
     #[serde(default)]
     pub companion_folders: Vec<String>,
+
+    /// Exact companion file names (case-insensitive) that loose-file copying
+    /// must skip even when their extension is included. Empty excludes nothing.
+    #[serde(default)]
+    pub companion_exclude_files: Vec<String>,
 
     /// Force same-format re-encoding instead of passthrough - defaults to false
     #[serde(default)]
@@ -472,6 +515,7 @@ impl Default for ConversionOptions {
             copy_subdirectories: true,
             companion_extensions: default_companion_extensions(),
             companion_folders: Vec::new(),
+            companion_exclude_files: Vec::new(),
             force_encode: false,
             create_disc_subfolders: false,
             reencode_flac: false,       // Match wizard default (don't re-encode, copy is default)
@@ -522,6 +566,16 @@ impl ConversionOptions {
             return Vec::new();
         }
         parse_companion_folders(&self.companion_folders.join(","))
+    }
+
+    /// Effective, normalized companion file names excluded from loose-file
+    /// copying. Only meaningful when loose-file copying is active.
+    #[must_use]
+    pub fn effective_companion_exclude_files(&self) -> Vec<String> {
+        if !self.copy_auxiliary_files {
+            return Vec::new();
+        }
+        parse_companion_exclude_files(&self.companion_exclude_files.join(","))
     }
 }
 
@@ -813,7 +867,10 @@ fn default_cue_generation_mode() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_companion_extensions, parse_companion_folders, AudioFormat, FileFormat, FormatDetector};
+    use super::{
+        default_companion_extensions, parse_companion_exclude_files, parse_companion_extensions,
+        parse_companion_folders, AudioFormat, FileFormat, FormatDetector,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -927,13 +984,20 @@ mod tests {
     }
 
     #[test]
-    fn companion_extension_defaults_are_empty_and_opt_in() {
-        assert_eq!(super::DEFAULT_COMPANION_EXTENSIONS, "");
-        assert!(super::default_companion_extensions().is_empty());
+    fn companion_extension_defaults_cover_album_extras_and_stay_consistent() {
+        // The const is the display form of the canonical default list; parsing
+        // it must round-trip to the same normalized extensions.
+        assert_eq!(
+            parse_companion_extensions(super::DEFAULT_COMPANION_EXTENSIONS),
+            super::default_companion_extensions()
+        );
 
         let options = super::ConversionOptions::default();
-        assert!(options.companion_extensions.is_empty());
-        assert!(options.effective_companion_extensions().is_empty());
+        assert_eq!(options.companion_extensions, super::default_companion_extensions());
+        assert_eq!(
+            options.effective_companion_extensions(),
+            super::default_companion_extensions()
+        );
     }
 
     #[test]
@@ -966,5 +1030,38 @@ mod tests {
             FormatDetector::detect_audio(Path::new("track.DFF")).expect("uppercase DFF is supported"),
             AudioFormat::Dff
         );
+    }
+
+    #[test]
+    fn default_companion_extensions_cover_conventional_album_extras() {
+        let defaults = default_companion_extensions();
+        for ext in [
+            ".png", ".bmp", ".jpeg", ".jpg", ".gif", ".webp", ".log", ".cue", ".txt", ".nfo",
+            ".pdf", ".m3u", ".m3u8",
+        ] {
+            assert!(defaults.iter().any(|entry| entry == ext), "missing {ext}");
+        }
+        assert_eq!(defaults.len(), 13);
+    }
+
+    #[test]
+    fn parse_companion_exclude_files_normalizes_and_rejects_paths() {
+        assert_eq!(
+            parse_companion_exclude_files("Foo_DR.txt, cover.JPG , foo_dr.txt,, ../evil.txt, a/b.txt"),
+            vec!["foo_dr.txt".to_string(), "cover.jpg".to_string()]
+        );
+        assert!(parse_companion_exclude_files("").is_empty());
+    }
+
+    #[test]
+    fn effective_companion_exclude_files_gated_by_copy_toggle() {
+        let mut options = super::ConversionOptions::default();
+        options.companion_exclude_files = vec!["Foo_DR.txt".to_string()];
+        assert_eq!(
+            options.effective_companion_exclude_files(),
+            vec!["foo_dr.txt".to_string()]
+        );
+        options.copy_auxiliary_files = false;
+        assert!(options.effective_companion_exclude_files().is_empty());
     }
 }

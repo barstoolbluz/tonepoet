@@ -254,6 +254,10 @@ pub struct CompanionCopyPolicy {
     /// Empty means copy no folders.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<String>,
+    /// Lowercased exact file names that loose-file copying must skip even when
+    /// their extension is included. Empty excludes nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_files: Vec<String>,
 }
 
 impl CompanionCopyPolicy {

@@ -17,9 +17,9 @@ use crate::convert::formats::AudioFormat;
 /// Row offsets, relative to the output-options pane top, for the below-the-fold
 /// conversion option pills. These are shared with mouse hit registration so the
 /// rendered rows and clickable rows cannot drift independently.
-pub const OUTPUT_OPTIONS_FORCE_ENCODE_ROW: u16 = 12;
-pub const OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW: u16 = 13;
-pub const OUTPUT_OPTIONS_WRITE_LOG_ROW: u16 = 14;
+pub const OUTPUT_OPTIONS_FORCE_ENCODE_ROW: u16 = 13;
+pub const OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW: u16 = 14;
+pub const OUTPUT_OPTIONS_WRITE_LOG_ROW: u16 = 15;
 
 /// Draw the output options pane with cyan border
 pub fn draw_output_options_pane(
@@ -58,6 +58,7 @@ pub fn draw_output_options_pane(
     let is_merge_focused = focused && opts.field_focus == OutputOptionsField::MergeMode;
     let is_extensions_focused = focused && opts.field_focus == OutputOptionsField::CompanionExtensions;
     let is_folders_focused = focused && opts.field_focus == OutputOptionsField::CompanionFolders;
+    let is_exclude_files_focused = focused && opts.field_focus == OutputOptionsField::ExcludeFiles;
     let is_force_encode_focused = focused && opts.field_focus == OutputOptionsField::ForceEncode;
     let is_disc_subfolders_focused = focused && opts.field_focus == OutputOptionsField::DiscSubfolders;
     let is_write_log_focused = focused && opts.field_focus == OutputOptionsField::WriteLog;
@@ -204,9 +205,21 @@ pub fn draw_output_options_pane(
             is_folders_focused,
             theme,
         ));
+        if area.height >= 12 {
+            lines.push(field_row(
+                border_color,
+                w,
+                "   exclude     ",
+                &opts.companion_exclude_files,
+                is_editing(OutputOptionsField::ExcludeFiles),
+                &opts.edit_input,
+                is_exclude_files_focused,
+                theme,
+            ));
+        }
     }
 
-    if maximized && area.height >= 16 {
+    if maximized && area.height >= 17 {
         lines.push(bordered_line(border_color, w, vec![], theme));
         lines.push(bordered_line(
             border_color,
@@ -325,6 +338,9 @@ fn output_options_edit_cursor(
         }
         OutputOptionsField::CompanionFolders if maximized && area_height >= 11 => {
             Some((9, label_w, pane_width.saturating_sub(2 + label_w)))
+        }
+        OutputOptionsField::ExcludeFiles if maximized && area_height >= 12 => {
+            Some((10, label_w, pane_width.saturating_sub(2 + label_w)))
         }
         _ => None,
     }

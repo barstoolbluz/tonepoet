@@ -213,6 +213,7 @@ fn companion_policy_from_item(item: &ConversionItem) -> CompanionCopyPolicy {
     CompanionCopyPolicy {
         extensions: item.options.effective_companion_extensions(),
         folders: item.options.effective_companion_folders(),
+        exclude_files: item.options.effective_companion_exclude_files(),
     }
 }
 

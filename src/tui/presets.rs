@@ -16,7 +16,7 @@ fn default_resampler() -> String {
 }
 
 fn default_companion_extensions() -> String {
-    String::new()
+    crate::convert::formats::default_companion_extensions().join(", ")
 }
 
 /// A TUI-native preset that stores pill values directly
@@ -51,6 +51,8 @@ pub struct TuiPreset {
     pub companion_extensions: String,
     #[serde(default)]
     pub companion_folders: String,
+    #[serde(default)]
+    pub companion_exclude_files: String,
     #[serde(default)]
     pub force_encode: bool,
     #[serde(default)]
@@ -95,6 +97,7 @@ impl TuiPreset {
             },
             companion_extensions: output_opts.companion_extensions.clone(),
             companion_folders: output_opts.companion_folders.clone(),
+            companion_exclude_files: output_opts.companion_exclude_files.clone(),
             force_encode: *output_opts.force_encode.selected_value(),
             disc_subfolders: *output_opts.disc_subfolders.selected_value(),
             write_log: *output_opts.write_log.selected_value(),
@@ -156,6 +159,7 @@ impl TuiPreset {
         output_opts.filename_template = self.filename_template.clone();
         output_opts.companion_extensions = self.companion_extensions.clone();
         output_opts.companion_folders = self.companion_folders.clone();
+        output_opts.companion_exclude_files = self.companion_exclude_files.clone();
         output_opts.force_encode.select_value(&self.force_encode);
         output_opts.disc_subfolders.select_value(&self.disc_subfolders);
         output_opts.write_log.select_value(&self.write_log);
@@ -244,6 +248,7 @@ impl TuiPreset {
             merge: merge.to_string(),
             companion_extensions: default_companion_extensions(),
             companion_folders: String::new(),
+            companion_exclude_files: String::new(),
             force_encode: false,
             disc_subfolders: false,
             write_log: false,
@@ -680,8 +685,15 @@ merge = "multi-file"
         )
         .expect("preset without companion fields should deserialize");
 
-        assert!(preset.companion_extensions.is_empty());
+        // Presets that predate the companion fields inherit the product
+        // default include list (companion copying on for conventional album
+        // extras); folders and exclusions stay empty.
+        assert_eq!(
+            preset.companion_extensions,
+            crate::convert::formats::default_companion_extensions().join(", ")
+        );
         assert!(preset.companion_folders.is_empty());
+        assert!(preset.companion_exclude_files.is_empty());
         assert!(!preset.force_encode);
         assert!(!preset.write_log);
     }

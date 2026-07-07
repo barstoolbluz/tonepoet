@@ -177,6 +177,7 @@ pub fn build_pipeline_request_from_settings(
         companion: super::types::CompanionCopyPolicy {
             extensions: item.options.effective_companion_extensions(),
             folders: item.options.effective_companion_folders(),
+            exclude_files: item.options.effective_companion_exclude_files(),
         },
         pre_extracted_staging: item.pre_extracted_staging.clone(),
         archive_metadata_overrides: Vec::new(),

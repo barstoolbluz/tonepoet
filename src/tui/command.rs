@@ -4852,6 +4852,7 @@ fn companion_copy_policy_from_conversion_options(
     crate::convert::pipeline::CompanionCopyPolicy {
         extensions: options.effective_companion_extensions(),
         folders: options.effective_companion_folders(),
+        exclude_files: options.effective_companion_exclude_files(),
     }
 }
 

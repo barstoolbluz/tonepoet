@@ -392,8 +392,14 @@ fn register_output_options_buttons(app: &mut AppState, area: Rect) {
             TuiButton::CompanionFoldersField,
             Rect::new(inner_x, area.y + 9, inner_w, 1),
         );
+        if area.height >= 12 {
+            buttons.record_button(
+                TuiButton::ExcludeFilesField,
+                Rect::new(inner_x, area.y + 10, inner_w, 1),
+            );
+        }
     }
-    if app.convert.is_maximized(ConvertFocus::OutputOptions) && area.height >= 16 {
+    if app.convert.is_maximized(ConvertFocus::OutputOptions) && area.height >= 17 {
         register_pill_row(
             buttons,
             &state.force_encode,

@@ -243,6 +243,7 @@ pub fn extract_wizard_settings(
             Vec::new()
         },
         companion_folders: Vec::new(),
+        companion_exclude_files: Vec::new(),
         reencode_flac: wizard.get_effective_reencode_flac(),
         merge_to_single: wizard.merge_to_single.unwrap_or(false),
         preferred_backend: None, // Old wizard doesn't support backend selection
@@ -602,6 +603,7 @@ pub fn preset_to_conversion_options(
             Vec::new()
         },
         companion_folders: Vec::new(),
+        companion_exclude_files: Vec::new(),
         reencode_flac: settings.reencode_flac.unwrap_or(false),
         merge_to_single: false,
         preferred_backend: None, // Presets don't store backend selection - that's a runtime config

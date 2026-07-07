@@ -13484,6 +13484,7 @@ fn copy_companion_artifacts_best_effort(
         return;
     }
 
+    let exclude_files = normalized_companion_exclude_file_set(&req.companion.exclude_files);
     let source_file_skip_set = companion_source_file_skip_set(req, source);
     let mut stats = CompanionCopyStats::default();
 
@@ -13492,6 +13493,7 @@ fn copy_companion_artifacts_best_effort(
             &source_dir,
             &published.album_dir,
             &extensions,
+            &exclude_files,
             &source_file_skip_set,
             &mut stats,
         );
@@ -13499,6 +13501,7 @@ fn copy_companion_artifacts_best_effort(
             &source_dir,
             &published.album_dir,
             &extensions,
+            &exclude_files,
             &folders,
             &source_file_skip_set,
             &mut stats,
@@ -13524,6 +13527,16 @@ fn normalized_companion_extension_set(values: &[String]) -> BTreeSet<String> {
     values
         .iter()
         .flat_map(|value| crate::convert::formats::parse_companion_extensions(value))
+        .collect()
+}
+
+/// Lowercased exact file names excluded from loose companion copying. Matching
+/// is case-insensitive by comparing lowercased names on every platform: an
+/// exclusion is a user veto, not a filesystem identity question.
+fn normalized_companion_exclude_file_set(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .flat_map(|value| crate::convert::formats::parse_companion_exclude_files(value))
         .collect()
 }
 
@@ -13723,6 +13736,7 @@ fn copy_loose_companion_files(
     source_dir: &Path,
     dest_dir: &Path,
     extensions: &BTreeSet<String>,
+    exclude_files: &BTreeSet<String>,
     source_file_skip_set: &BTreeSet<PathBuf>,
     stats: &mut CompanionCopyStats,
 ) {
@@ -13770,6 +13784,12 @@ fn copy_loose_companion_files(
         if !extensions.contains(&key) {
             continue;
         }
+        if let Some(name) = entry.file_name().to_str() {
+            if exclude_files.contains(&name.to_lowercase()) {
+                stats.skipped();
+                continue;
+            }
+        }
         let dest = dest_dir.join(entry.file_name());
         copy_regular_companion_file(&path, &dest, stats);
     }
@@ -13792,6 +13812,7 @@ fn copy_nested_companion_files(
     source_dir: &Path,
     dest_dir: &Path,
     extensions: &BTreeSet<String>,
+    exclude_files: &BTreeSet<String>,
     companion_folders: &BTreeSet<String>,
     source_file_skip_set: &BTreeSet<PathBuf>,
     stats: &mut CompanionCopyStats,
@@ -13853,6 +13874,7 @@ fn copy_nested_companion_files(
             &path,
             &dest_dir.join(dest_component),
             extensions,
+            exclude_files,
             source_file_skip_set,
             stats,
         );
@@ -14804,7 +14826,7 @@ mod companion_copy_hardening_tests {
         skip_set.insert(normalize_path(&audio));
         let mut stats = CompanionCopyStats::default();
 
-        copy_loose_companion_files(&src, &dst, &extensions, &skip_set, &mut stats);
+        copy_loose_companion_files(&src, &dst, &extensions, &BTreeSet::new(), &skip_set, &mut stats);
 
         assert_eq!(stats.copied, 2);
         assert!(dst.join("cover.JPG").is_file());
@@ -14842,6 +14864,7 @@ mod companion_copy_hardening_tests {
             &dst,
             &extensions,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &skip_set,
             &mut stats,
         );
@@ -14866,6 +14889,50 @@ mod companion_copy_hardening_tests {
     }
 
     #[test]
+    fn loose_companion_copy_skips_excluded_file_names_case_insensitively() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(src.join("disc 1")).expect("disc 1");
+        std::fs::create_dir_all(&dst).expect("dst");
+        std::fs::write(src.join("keep.log"), b"keep").expect("keep");
+        std::fs::write(src.join("OMFG_Exigo_Only_Please.txt"), b"clutter").expect("clutter");
+        std::fs::write(src.join("disc 1").join("foo_dr.txt"), b"dr").expect("nested clutter");
+        std::fs::write(src.join("disc 1").join("rip.log"), b"log").expect("nested keep");
+
+        let extensions = [".log".to_string(), ".txt".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let exclude = normalized_companion_exclude_file_set(&[
+            "omfg_exigo_only_please.TXT".to_string(),
+            "FOO_DR.txt".to_string(),
+        ]);
+        let mut stats = CompanionCopyStats::default();
+
+        copy_loose_companion_files(&src, &dst, &extensions, &exclude, &BTreeSet::new(), &mut stats);
+        copy_nested_companion_files(
+            &src,
+            &dst,
+            &extensions,
+            &exclude,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut stats,
+        );
+
+        assert!(dst.join("keep.log").is_file());
+        assert!(dst.join("disc 01").join("rip.log").is_file());
+        assert!(
+            !dst.join("OMFG_Exigo_Only_Please.txt").exists(),
+            "excluded names are vetoed case-insensitively at the album root"
+        );
+        assert!(
+            !dst.join("disc 01").join("foo_dr.txt").exists(),
+            "excluded names are vetoed inside disc directories too"
+        );
+    }
+
+    #[test]
     fn nested_companion_copy_skips_directories_covered_by_folder_copy() {
         let temp = tempfile::tempdir().expect("temp dir");
         let src = temp.path().join("src");
@@ -14882,6 +14949,7 @@ mod companion_copy_hardening_tests {
             &src,
             &dst,
             &extensions,
+            &BTreeSet::new(),
             &folders,
             &BTreeSet::new(),
             &mut stats,

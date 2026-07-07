@@ -1111,6 +1111,7 @@ fn build_pipeline_request_template(
         companion: tonepoet::convert::pipeline::CompanionCopyPolicy {
             extensions: options.effective_companion_extensions(),
             folders: options.effective_companion_folders(),
+            exclude_files: options.effective_companion_exclude_files(),
         },
         pre_extracted_staging: None,
         archive_metadata_overrides: Vec::new(),

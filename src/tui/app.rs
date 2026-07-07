@@ -2433,6 +2433,7 @@ pub enum OutputOptionsField {
     MergeMode,
     CompanionExtensions,
     CompanionFolders,
+    ExcludeFiles,
     ForceEncode,
     DiscSubfolders,
     WriteLog,
@@ -2445,13 +2446,14 @@ impl OutputOptionsField {
         Self::FilenameTemplate,
         Self::MergeMode,
     ];
-    const MAXIMIZED_FIELDS: [Self; 9] = [
+    const MAXIMIZED_FIELDS: [Self; 10] = [
         Self::DestPath,
         Self::FolderTemplate,
         Self::FilenameTemplate,
         Self::MergeMode,
         Self::CompanionExtensions,
         Self::CompanionFolders,
+        Self::ExcludeFiles,
         Self::ForceEncode,
         Self::DiscSubfolders,
         Self::WriteLog,
@@ -2501,6 +2503,7 @@ impl OutputOptionsField {
                 | Self::FilenameTemplate
                 | Self::CompanionExtensions
                 | Self::CompanionFolders
+                | Self::ExcludeFiles
         )
     }
 
@@ -2513,7 +2516,7 @@ impl OutputOptionsField {
             // Companion folders are logical source-relative names, not an
             // editable absolute/relative filesystem path from the current CWD.
             // Leave completion off rather than suggesting misleading paths.
-            Self::CompanionFolders | Self::CompanionExtensions => {
+            Self::CompanionFolders | Self::CompanionExtensions | Self::ExcludeFiles => {
                 crate::tui::text_input::CompletionMode::None
             }
             _ => crate::tui::text_input::CompletionMode::None,
@@ -3674,6 +3677,7 @@ pub struct OutputOptionsState {
     pub merge: PillState<MergeMode>,
     pub companion_extensions: String,
     pub companion_folders: String,
+    pub companion_exclude_files: String,
     pub force_encode: PillState<bool>,
     pub disc_subfolders: PillState<bool>,
     pub write_log: PillState<bool>,
@@ -3701,8 +3705,9 @@ impl OutputOptionsState {
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
             merge,
-            companion_extensions: String::new(),
+            companion_extensions: crate::convert::formats::default_companion_extensions().join(", "),
             companion_folders: String::new(),
+            companion_exclude_files: String::new(),
             force_encode,
             disc_subfolders,
             write_log,
@@ -3728,6 +3733,13 @@ impl OutputOptionsState {
         crate::convert::formats::parse_companion_folders(&self.companion_folders)
     }
 
+    /// Return the normalized exact file names excluded from loose companion
+    /// copying. Empty input intentionally excludes nothing.
+    #[must_use]
+    pub fn parsed_companion_exclude_files(&self) -> Vec<String> {
+        crate::convert::formats::parse_companion_exclude_files(&self.companion_exclude_files)
+    }
+
     /// Apply the output-options companion-copy fields to a queued conversion.
     ///
     /// The copy stage reads `ConversionOptions::effective_companion_*()`, so the
@@ -3749,6 +3761,7 @@ impl OutputOptionsState {
         options.copy_subdirectories = !folders.is_empty();
         options.companion_extensions = extensions;
         options.companion_folders = folders;
+        options.companion_exclude_files = self.parsed_companion_exclude_files();
         options.force_encode = *self.force_encode.selected_value();
         options.create_disc_subfolders = *self.disc_subfolders.selected_value();
         // Do not mutate the raw naming template here. Disc subfolders are a
