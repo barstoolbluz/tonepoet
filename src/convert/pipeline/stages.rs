@@ -7322,7 +7322,7 @@ fn conversion_log_fragment_dir_contains_batch(fragment_dir: &Path, batch_id: &st
 }
 
 fn read_conversion_log_fragment_file(path: &Path) -> Result<ConversionLogFragment, PublishError> {
-    let bytes = fs::read(path).map_err(PublishError::Io)?;
+    let bytes = fs::read(path).map_err(PublishError::io_at("reading conversion log fragment", path))?;
     let fragment: ConversionLogFragment = serde_json::from_slice(&bytes).map_err(|err| {
         PublishError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -7405,7 +7405,7 @@ fn read_matching_conversion_log_fragment_files(
 
     let mut paths = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(PublishError::Io)?;
+        let entry = entry.map_err(PublishError::io_at("listing conversion log fragment dir", &dir))?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
             paths.push(path);
@@ -8000,7 +8000,7 @@ fn write_assembled_conversion_log_from_fragments(
     let Some(log) = assemble_conversion_log_from_fragments(album_dir, expected_track_count, target_identity)? else {
         return Ok(false);
     };
-    write_bytes_atomically(log_path, log.as_bytes()).map_err(PublishError::Io)?;
+    write_bytes_atomically(log_path, log.as_bytes()).map_err(PublishError::io_at("writing assembled conversion log", log_path))?;
     Ok(true)
 }
 
@@ -8048,7 +8048,7 @@ fn finalize_staged_conversion_log_for_publish(
         // The user disabled the conversion log: never assemble the visible
         // file, but still report batch completion so post-publish cleanup can
         // consume the hidden fragments once the album batch is complete.
-        remove_file_if_exists(&staged_log_path).map_err(PublishError::Io)?;
+        remove_file_if_exists(&staged_log_path).map_err(PublishError::io_at("removing staged conversion log", &staged_log_path))?;
         published_entries.retain(|entry| !conversion_log_entry_predicate(entry));
         let complete = complete_conversion_log_fragments(
             work_album_dir,
@@ -8066,12 +8066,12 @@ fn finalize_staged_conversion_log_for_publish(
         target_identity,
     )? {
         true => {
-            let bytes = fs::metadata(&staged_log_path).map_err(PublishError::Io)?.len();
+            let bytes = fs::metadata(&staged_log_path).map_err(PublishError::io_at("reading staged conversion log metadata", &staged_log_path))?.len();
             record_assembled_conversion_log_entry(published_entries, &final_log_path, bytes);
             Ok(true)
         }
         false => {
-            remove_file_if_exists(&staged_log_path).map_err(PublishError::Io)?;
+            remove_file_if_exists(&staged_log_path).map_err(PublishError::io_at("removing staged conversion log", &staged_log_path))?;
             published_entries.retain(|entry| !conversion_log_entry_predicate(entry));
             Ok(false)
         }
@@ -8103,7 +8103,7 @@ fn publish_incremental_assembled_conversion_log_from_fragments(
     let log_path = album_dir.join("conversion.log");
     rollback.snapshot_destination(&log_path)?;
     let log = build_conversion_log_from_fragments(&fragments);
-    write_bytes_atomically(&log_path, log.as_bytes()).map_err(PublishError::Io)?;
+    write_bytes_atomically(&log_path, log.as_bytes()).map_err(PublishError::io_at("writing assembled conversion log", &log_path))?;
     sync_parent_dir_best_effort(&log_path);
     Ok(true)
 }
@@ -10595,7 +10595,7 @@ pub fn publish_album_output(
     let fragment_batch_identity = plan_conversion_log_fragment_batch_identity(plan)?;
 
     let final_parent = parent_dir_or_current(&plan.album_dir);
-    fs::create_dir_all(final_parent).map_err(PublishError::Io)?;
+    fs::create_dir_all(final_parent).map_err(PublishError::io_at("creating publish parent dir", final_parent))?;
 
     let album_name = plan
         .album_dir
@@ -10929,7 +10929,7 @@ fn publish_incremental_album_output(
                     // conversion.log as an assembly trigger. If an older caller
                     // still staged one, discard it and let the fragment-count
                     // path below decide whether the unified log is ready.
-                    remove_file_if_exists(&entry.temp_path).map_err(PublishError::Io)?;
+                    remove_file_if_exists(&entry.temp_path).map_err(PublishError::io_at("removing incremental temp entry", &entry.temp_path))?;
                 }
                 PublishRole::Sidecar(SidecarKind::ConversionLog) => {
                     publish_incremental_conversion_log(
@@ -11131,7 +11131,18 @@ impl IncrementalPublishRollback {
     fn snapshot_destination(&mut self, final_path: &Path) -> Result<(), PublishError> {
         if final_path.exists() {
             let backup_path = unique_path(&self.temp_dir, ".incremental-rollback");
-            copy_incremental_backup_snapshot(final_path, &backup_path)?;
+            // The exists() check above is advisory: another actor (companion
+            // copying, fragment cleanup, the user) can remove the destination
+            // between the check and the snapshot copy. A vanished destination
+            // is the not-exists case, not a publish failure.
+            match copy_incremental_backup_snapshot(final_path, &backup_path) {
+                Ok(()) => {}
+                Err(_) if !final_path.exists() => {
+                    let _ = remove_file_if_exists(&backup_path);
+                    return self.record_created_file(final_path);
+                }
+                Err(err) => return Err(err),
+            }
             let final_rel = checked_relative_path(&self.album_dir, final_path)?;
             let backup_rel = checked_relative_path(&self.temp_dir, &backup_path)?;
             self.actions.push(IncrementalRollbackAction::RestoreOriginalFile {
@@ -11303,13 +11314,13 @@ fn publish_incremental_audio_entry(
         return Err(PublishError::DestinationExists(dst.display().to_string()));
     }
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(PublishError::Io)?;
+        fs::create_dir_all(parent).map_err(PublishError::io_at("creating destination parent dir", parent))?;
     }
     rollback.record_created_file(dst)?;
 
     match fs::hard_link(src, dst) {
         Ok(()) => {
-            fs::remove_file(src).map_err(PublishError::Io)?;
+            fs::remove_file(src).map_err(PublishError::io_at("removing source after copy", src))?;
             sync_parent_dir_best_effort(dst);
             Ok(())
         }
@@ -11322,7 +11333,7 @@ fn publish_incremental_audio_entry(
 
 fn copy_incremental_audio_create_new(src: &Path, dst: &Path) -> Result<(), PublishError> {
     copy_file_create_new_synced(src, dst)?;
-    fs::remove_file(src).map_err(PublishError::Io)?;
+    fs::remove_file(src).map_err(PublishError::io_at("removing source after copy", src))?;
     Ok(())
 }
 
@@ -11399,11 +11410,11 @@ fn append_incremental_conversion_log(
         return Err(PublishError::DestinationExists(dst.display().to_string()));
     }
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(PublishError::Io)?;
+        fs::create_dir_all(parent).map_err(PublishError::io_at("creating copy destination parent dir", parent))?;
     }
     rollback.snapshot_destination(dst)?;
 
-    let src_len = fs::metadata(src).map_err(PublishError::Io)?.len();
+    let src_len = fs::metadata(src).map_err(PublishError::io_at("reading copy source metadata", src))?.len();
     let dst_len = match fs::metadata(dst) {
         Ok(metadata) => metadata.len(),
         Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
@@ -11411,19 +11422,19 @@ fn append_incremental_conversion_log(
     };
     let needs_separator = dst_len > 0 && src_len > 0 && !file_ends_with_newline(dst)?;
 
-    let mut input = fs::File::open(src).map_err(PublishError::Io)?;
+    let mut input = fs::File::open(src).map_err(PublishError::io_at("opening copy source", src))?;
     let mut output = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dst)
-        .map_err(PublishError::Io)?;
+        .map_err(PublishError::io_at("creating copy destination", dst))?;
     if needs_separator {
         use std::io::Write;
-        output.write_all(b"\n").map_err(PublishError::Io)?;
+        output.write_all(b"\n").map_err(PublishError::io_at("writing copy destination", dst))?;
     }
-    io::copy(&mut input, &mut output).map_err(PublishError::Io)?;
-    output.sync_all().map_err(PublishError::Io)?;
-    fs::remove_file(src).map_err(PublishError::Io)?;
+    io::copy(&mut input, &mut output).map_err(PublishError::io_at("copying file contents to", dst))?;
+    output.sync_all().map_err(PublishError::io_at("syncing copy destination", dst))?;
+    fs::remove_file(src).map_err(PublishError::io_at("removing source after copy", src))?;
     sync_parent_dir_best_effort(dst);
     Ok(())
 }
@@ -11431,14 +11442,14 @@ fn append_incremental_conversion_log(
 fn file_ends_with_newline(path: &Path) -> Result<bool, PublishError> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = fs::File::open(path).map_err(PublishError::Io)?;
-    let len = file.metadata().map_err(PublishError::Io)?.len();
+    let mut file = fs::File::open(path).map_err(PublishError::io_at("opening file for newline check", path))?;
+    let len = file.metadata().map_err(PublishError::io_at("reading metadata for newline check", path))?.len();
     if len == 0 {
         return Ok(true);
     }
-    file.seek(SeekFrom::End(-1)).map_err(PublishError::Io)?;
+    file.seek(SeekFrom::End(-1)).map_err(PublishError::io_at("seeking for newline check", path))?;
     let mut byte = [0_u8; 1];
-    file.read_exact(&mut byte).map_err(PublishError::Io)?;
+    file.read_exact(&mut byte).map_err(PublishError::io_at("reading for newline check", path))?;
     Ok(byte[0] == b'\n')
 }
 
@@ -11451,7 +11462,7 @@ fn replace_incremental_sidecar_entry(
         return Err(PublishError::DestinationExists(dst.display().to_string()));
     }
     let parent = parent_dir_or_current(dst);
-    fs::create_dir_all(parent).map_err(PublishError::Io)?;
+    fs::create_dir_all(parent).map_err(PublishError::io_at("creating sidecar destination parent dir", parent))?;
 
     // Stage the replacement in the destination directory and record it in the
     // durable rollback marker before creating it. That gives recovery a concrete
@@ -11467,7 +11478,7 @@ fn replace_incremental_sidecar_entry(
     // durable backup/restore marker used for crash recovery.
     rollback.snapshot_destination(dst)?;
     install_incremental_sidecar_replacement(&replacement_path, dst)?;
-    fs::remove_file(src).map_err(PublishError::Io)?;
+    fs::remove_file(src).map_err(PublishError::io_at("removing staged sidecar after replace", src))?;
     Ok(())
 }
 
@@ -11481,8 +11492,8 @@ fn install_incremental_sidecar_replacement(
             Ok(())
         }
         Err(err) if should_fallback_to_remove_then_rename_for_replace(&err, dst) => {
-            remove_file_if_exists(dst).map_err(PublishError::Io)?;
-            fs::rename(replacement_path, dst).map_err(PublishError::Io)?;
+            remove_file_if_exists(dst).map_err(PublishError::io_at("removing existing sidecar destination", dst))?;
+            fs::rename(replacement_path, dst).map_err(PublishError::io_at("renaming replacement sidecar into place", dst))?;
             sync_parent_dir_best_effort(dst);
             Ok(())
         }
@@ -17319,7 +17330,7 @@ fn repair_interrupted_publish(album_dir: &Path, marker_path: &Path) -> Result<()
         return Ok(());
     }
 
-    let marker_text = fs::read_to_string(marker_path).map_err(PublishError::Io)?;
+    let marker_text = fs::read_to_string(marker_path).map_err(PublishError::io_at("reading recovery marker", marker_path))?;
     let backup_dir = backup_dir_from_marker(album_dir, marker_path, &marker_text)?;
 
     if backup_dir.exists() {
@@ -17350,7 +17361,7 @@ fn repair_interrupted_incremental_publish(
         return Ok(());
     }
 
-    let marker_text = fs::read_to_string(marker_path).map_err(PublishError::Io)?;
+    let marker_text = fs::read_to_string(marker_path).map_err(PublishError::io_at("reading recovery marker", marker_path))?;
     let marker = serde_json::from_str::<IncrementalPublishRecoveryMarker>(&marker_text).map_err(|err| {
         PublishError::RollbackFailed(format!(
             "could not parse incremental publish recovery marker {}: {err}",
@@ -17401,12 +17412,12 @@ fn repair_interrupted_incremental_publish(
 
     if temp_dir.exists() {
         if temp_dir.is_dir() {
-            fs::remove_dir_all(&temp_dir).map_err(PublishError::Io)?;
+            fs::remove_dir_all(&temp_dir).map_err(PublishError::io_at("removing recovery temp dir", &temp_dir))?;
         } else {
-            fs::remove_file(&temp_dir).map_err(PublishError::Io)?;
+            fs::remove_file(&temp_dir).map_err(PublishError::io_at("removing recovery temp file", &temp_dir))?;
         }
     }
-    remove_file_if_exists(marker_path).map_err(PublishError::Io)?;
+    remove_file_if_exists(marker_path).map_err(PublishError::io_at("removing recovery marker", marker_path))?;
     sync_parent_dir_best_effort(marker_path);
     Ok(())
 }
@@ -17577,7 +17588,7 @@ fn cleanup_orphan_publish_temps(parent: &Path, album_name: &str) -> Result<(), P
     };
 
     for entry in entries {
-        let entry = entry.map_err(PublishError::Io)?;
+        let entry = entry.map_err(PublishError::io_at("listing publish parent dir", parent))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -17587,9 +17598,9 @@ fn cleanup_orphan_publish_temps(parent: &Path, album_name: &str) -> Result<(), P
         }
         let path = entry.path();
         if path.is_dir() {
-            fs::remove_dir_all(&path).map_err(PublishError::Io)?;
+            fs::remove_dir_all(&path).map_err(PublishError::io_at("removing stale publish artifact dir", &path))?;
         } else {
-            fs::remove_file(&path).map_err(PublishError::Io)?;
+            fs::remove_file(&path).map_err(PublishError::io_at("removing stale publish artifact", &path))?;
         }
     }
     Ok(())

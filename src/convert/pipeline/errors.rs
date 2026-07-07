@@ -173,6 +173,24 @@ pub enum PublishError {
     RollbackFailed(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// An IO failure with the operation and path attached. Publish runs many
+    /// small filesystem steps across staging, temp, and album directories; a
+    /// bare "No such file or directory" is undiagnosable without knowing which
+    /// step and which path failed.
+    #[error("{op} {path}: {source}")]
+    IoAt {
+        op: &'static str,
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl PublishError {
+    /// Build a `map_err` closure that attaches the failing operation and path.
+    pub fn io_at(op: &'static str, path: &std::path::Path) -> impl FnOnce(std::io::Error) -> Self {
+        let path = path.to_path_buf();
+        move |source| Self::IoAt { op, path, source }
+    }
 }
 
 #[derive(Debug, Error)]
