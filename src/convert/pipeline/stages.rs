@@ -17830,44 +17830,93 @@ fn mark_staging_root_best_effort(staging_root: &Path, req: &PipelineRequest) {
     }
 }
 
+/// True when `held` (the fstat of a locked file handle) is the same filesystem
+/// object as whatever currently sits at the lock path.
+///
+/// Lock files here are removed on drop to avoid leaving artifacts, which makes
+/// the classic unlink race possible: a waiter blocked on an inode whose path
+/// was unlinked acquires a lock nobody else can see, while a newcomer creates
+/// and locks a fresh file at the same path — two "holders" at once. Album
+/// publishes then delete each other's live `.tmp-` directories. A lock is only
+/// authoritative if, after acquisition, the handle still is the file at the
+/// path.
+#[cfg(unix)]
+fn lock_handle_is_current(held: &fs::Metadata, lock_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(lock_path) {
+        Ok(current) => current.dev() == held.dev() && current.ino() == held.ino(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_handle_is_current(_held: &fs::Metadata, lock_path: &Path) -> bool {
+    // Without stable file identity, fall back to path existence. The unlink
+    // race window is then only narrowed, not closed; supported targets are
+    // unix.
+    lock_path.exists()
+}
+
 fn acquire_file_lock(lock_path: &Path, busy_message: &str) -> Result<FileLock, LockAcquireError> {
     let parent = parent_dir_or_current(lock_path);
     fs::create_dir_all(parent).map_err(LockAcquireError::Io)?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(lock_path)
-        .map_err(LockAcquireError::Io)?;
+    loop {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(lock_path)
+            .map_err(LockAcquireError::Io)?;
 
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(FileLock {
-            file: Some(file),
-            path: lock_path.to_path_buf(),
-            remove_on_drop: true,
-        }),
-        Err(err) if is_lock_contention(&err) => {
-            Err(LockAcquireError::Busy(busy_message.to_string()))
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let held = file.metadata().map_err(LockAcquireError::Io)?;
+                if !lock_handle_is_current(&held, lock_path) {
+                    // The path was unlinked or replaced while this handle was
+                    // opened; a lock on an orphaned inode is not a lock.
+                    drop(file);
+                    continue;
+                }
+                return Ok(FileLock {
+                    file: Some(file),
+                    path: lock_path.to_path_buf(),
+                    remove_on_drop: true,
+                });
+            }
+            Err(err) if is_lock_contention(&err) => {
+                return Err(LockAcquireError::Busy(busy_message.to_string()))
+            }
+            Err(err) => return Err(LockAcquireError::Io(err)),
         }
-        Err(err) => Err(LockAcquireError::Io(err)),
     }
 }
 
 fn acquire_blocking_file_lock(lock_path: &Path, remove_on_drop: bool) -> io::Result<FileLock> {
     let parent = parent_dir_or_current(lock_path);
     fs::create_dir_all(parent)?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(lock_path)?;
+    loop {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(lock_path)?;
 
-    file.lock_exclusive()?;
-    Ok(FileLock {
-        file: Some(file),
-        path: lock_path.to_path_buf(),
-        remove_on_drop,
-    })
+        file.lock_exclusive()?;
+        let held = file.metadata()?;
+        if !lock_handle_is_current(&held, lock_path) {
+            // The previous holder removed the lock file on drop while this
+            // waiter was blocked on the now-orphaned inode, or a stale-lock
+            // sweep unlinked the path between open and flock. Only a lock on
+            // the file currently at lock_path grants exclusion; retry on it.
+            drop(file);
+            continue;
+        }
+        return Ok(FileLock {
+            file: Some(file),
+            path: lock_path.to_path_buf(),
+            remove_on_drop,
+        });
+    }
 }
 
 fn album_lock_path(album_dir: &Path) -> PathBuf {
@@ -17935,12 +17984,19 @@ impl Drop for FileLock {
             .remove_on_drop
             .then(|| self.path.parent().map(|path| path.to_path_buf()))
             .flatten();
+        // Unlink while the exclusive flock is still held. Releasing first
+        // opens a window where a waiter blocked on this inode acquires the
+        // lock and passes the path-identity check — and then loses its lock
+        // path when this (former) holder unlinks it, letting a third party
+        // create and lock a fresh file at the same path. Unlink-then-release
+        // guarantees late waiters wake on an orphaned inode, fail the
+        // identity re-check, and retry on the current file.
+        if self.remove_on_drop {
+            remove_lock_path_best_effort(&self.path);
+        }
         if let Some(file) = self.file.take() {
             let _ = file.unlock();
             drop(file);
-        }
-        if self.remove_on_drop {
-            remove_lock_path_best_effort(&self.path);
         }
         if let Some(parent) = cleanup_parent {
             cleanup_empty_staging_parent_best_effort(&parent);
@@ -28215,5 +28271,89 @@ mod validate_encoded_output_tests {
         .await;
 
         assert!(matches!(result, Err(ConvertError::TrackValidation(message)) if message.contains("post-encode sample drift")));
+    }
+}
+
+#[cfg(test)]
+mod publish_lock_soundness_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The unlink-on-drop pattern must never leave a waiter holding a lock on
+    /// an orphaned inode: after acquisition, the held handle must be the file
+    /// currently at the lock path. Regression test for the split-brain that
+    /// let concurrent album publishes delete each other's live temp dirs.
+    #[test]
+    fn blocking_lock_acquired_after_holder_drop_owns_the_current_lock_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lock_path = temp.path().join(".Album.lock");
+
+        let holder = acquire_blocking_file_lock(&lock_path, true).expect("first acquire");
+
+        let waiter_path = lock_path.clone();
+        let waiter = std::thread::spawn(move || {
+            acquire_blocking_file_lock(&waiter_path, true).expect("waiter acquire")
+        });
+
+        // Give the waiter time to block on the holder's inode, then drop the
+        // holder, which unlinks the path and releases the flock.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(holder);
+
+        let waiter_lock = waiter.join().expect("waiter thread");
+        assert!(
+            lock_path.exists(),
+            "the waiter's lock must be backed by a file at the lock path, not an orphaned inode"
+        );
+        let held = waiter_lock
+            .file
+            .as_ref()
+            .expect("held file")
+            .metadata()
+            .expect("held metadata");
+        assert!(
+            lock_handle_is_current(&held, &lock_path),
+            "the waiter's handle must be the file currently at the lock path"
+        );
+        drop(waiter_lock);
+        assert!(!lock_path.exists(), "drop removes the lock artifact");
+    }
+
+    /// Many threads hammering the same lock path must observe strict mutual
+    /// exclusion even though every drop unlinks the lock file. Before the
+    /// identity re-check, this reliably produced overlapping "holders".
+    #[test]
+    fn blocking_lock_contention_with_unlink_on_drop_is_mutually_exclusive() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lock_path = temp.path().join(".Album.lock");
+        let inside = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let lock_path = lock_path.clone();
+            let inside = Arc::clone(&inside);
+            let max_seen = Arc::clone(&max_seen);
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let guard = acquire_blocking_file_lock(&lock_path, true).expect("acquire");
+                    let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(now, Ordering::SeqCst);
+                    std::thread::yield_now();
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                    drop(guard);
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("locker thread");
+        }
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "more than one thread held the publish lock at once"
+        );
     }
 }
