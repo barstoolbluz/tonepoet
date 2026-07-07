@@ -19,38 +19,6 @@ fn default_companion_extensions() -> String {
     String::new()
 }
 
-fn default_mp3_mode() -> String {
-    "vbr".to_string()
-}
-
-fn default_mp3_vbr_quality() -> u8 {
-    0
-}
-
-fn default_mp3_bitrate_kbps() -> u32 {
-    320
-}
-
-fn default_aac_profile() -> String {
-    "lc".to_string()
-}
-
-fn default_aac_bitrate_kbps() -> u32 {
-    256
-}
-
-fn default_opus_content_type() -> String {
-    "auto".to_string()
-}
-
-fn default_opus_bitrate_kbps() -> u32 {
-    192
-}
-
-fn default_opus_complexity() -> u8 {
-    10
-}
-
 /// A TUI-native preset that stores pill values directly
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiPreset {
@@ -72,43 +40,6 @@ pub struct TuiPreset {
     pub modulator_order: Option<u8>, // 4-8
     #[serde(default)]
     pub dsd_filter_preset: Option<String>, // "auto", "sinc"
-
-    // Above-the-fold lossy preset row state. Named values round-trip as stable
-    // keys; explicit custom is serialized as "custom" so a restored preset does
-    // not silently relabel exact-match manual settings as a named preset. Missing
-    // keys from older presets are inferred from the numeric codec settings.
-    #[serde(default)]
-    pub mp3_lossy_preset: Option<String>, // "v0", "v2", "320-cbr", "custom"
-    #[serde(default)]
-    pub aac_lossy_preset: Option<String>, // "256-vbr", "192-vbr", "128-vbr", "custom"
-    #[serde(default)]
-    pub opus_lossy_preset: Option<String>, // "128", "96", "64", "custom"
-
-    // Lossy codec settings. These are persisted independently of the visible
-    // lossy preset label so custom/manual settings round-trip exactly. Defaults
-    // preserve compatibility with presets saved before the lossy rows existed.
-    #[serde(default = "default_mp3_mode")]
-    pub mp3_mode: String, // "vbr", "cbr", "abr"
-    #[serde(default)]
-    pub mp3_quality_preset: Option<usize>,
-    #[serde(default = "default_mp3_vbr_quality")]
-    pub mp3_vbr_quality: u8,
-    #[serde(default = "default_mp3_bitrate_kbps")]
-    pub mp3_bitrate_kbps: u32,
-    #[serde(default = "default_aac_profile")]
-    pub aac_profile: String, // "lc", "he", "hev2"
-    #[serde(default)]
-    pub aac_quality_preset: Option<usize>,
-    #[serde(default = "default_aac_bitrate_kbps")]
-    pub aac_bitrate_kbps: u32,
-    #[serde(default = "default_opus_content_type")]
-    pub opus_content_type: String, // "auto", "music", "speech"
-    #[serde(default)]
-    pub opus_quality_preset: Option<usize>,
-    #[serde(default = "default_opus_bitrate_kbps")]
-    pub opus_bitrate_kbps: u32,
-    #[serde(default = "default_opus_complexity")]
-    pub opus_complexity: u8,
 
     // Output options pane
     #[serde(default)]
@@ -152,20 +83,6 @@ impl TuiPreset {
             noise_shaper: Some(format.noise_shaper.selected_label().to_lowercase()),
             modulator_order: Some(format.modulator_order.selected_value().value()),
             dsd_filter_preset: Some(format.conversion_preset.selected_label().to_lowercase()),
-            mp3_lossy_preset: Some(format.mp3_lossy_preset_key().to_string()),
-            aac_lossy_preset: Some(format.aac_lossy_preset_key().to_string()),
-            opus_lossy_preset: Some(format.opus_lossy_preset_key().to_string()),
-            mp3_mode: mp3_mode_key(format.mp3_mode).to_string(),
-            mp3_quality_preset: format.mp3_quality_preset,
-            mp3_vbr_quality: format.mp3_vbr_quality,
-            mp3_bitrate_kbps: format.mp3_bitrate_kbps,
-            aac_profile: aac_profile_key(format.aac_profile).to_string(),
-            aac_quality_preset: format.aac_quality_preset,
-            aac_bitrate_kbps: format.aac_bitrate_kbps,
-            opus_content_type: opus_content_type_key(format.opus_content_type).to_string(),
-            opus_quality_preset: format.opus_quality_preset,
-            opus_bitrate_kbps: format.opus_bitrate_kbps,
-            opus_complexity: format.opus_complexity,
             dest_path: output_opts
                 .dest_path
                 .as_ref()
@@ -230,36 +147,6 @@ impl TuiPreset {
                 format_state.conversion_preset.select_value(&value);
             }
         }
-
-        if let Some(value) = parse_mp3_mode(&self.mp3_mode) {
-            format_state.mp3_mode = value;
-        }
-        format_state.mp3_quality_preset = self
-            .mp3_quality_preset
-            .filter(|idx| *idx < MP3_BITRATE_PRESETS.len());
-        format_state.mp3_vbr_quality = self.mp3_vbr_quality.min(9);
-        format_state.mp3_bitrate_kbps = self.mp3_bitrate_kbps.clamp(8, 1000);
-
-        if let Some(value) = parse_aac_profile(&self.aac_profile) {
-            format_state.aac_profile = value;
-        }
-        format_state.aac_quality_preset = self
-            .aac_quality_preset
-            .filter(|idx| *idx < aac_presets_for_profile(format_state.aac_profile).len());
-        format_state.aac_bitrate_kbps = self.aac_bitrate_kbps.clamp(8, 1024);
-
-        if let Some(value) = parse_opus_content_type(&self.opus_content_type) {
-            format_state.opus_content_type = value;
-        }
-        format_state.opus_quality_preset = self
-            .opus_quality_preset
-            .filter(|idx| *idx < OPUS_PRESETS.len());
-        format_state.opus_bitrate_kbps = self.opus_bitrate_kbps.clamp(6, 510);
-        format_state.opus_complexity = self.opus_complexity.min(10);
-
-        format_state.set_mp3_lossy_preset_from_key(self.mp3_lossy_preset.as_deref());
-        format_state.set_aac_lossy_preset_from_key(self.aac_lossy_preset.as_deref());
-        format_state.set_opus_lossy_preset_from_key(self.opus_lossy_preset.as_deref());
 
         // Output options
         if let Some(ref p) = self.dest_path {
@@ -351,20 +238,6 @@ impl TuiPreset {
             noise_shaper: Some("clans".to_string()),
             modulator_order: Some(8),
             dsd_filter_preset: Some("auto".to_string()),
-            mp3_lossy_preset: None,
-            aac_lossy_preset: None,
-            opus_lossy_preset: None,
-            mp3_mode: default_mp3_mode(),
-            mp3_quality_preset: None,
-            mp3_vbr_quality: default_mp3_vbr_quality(),
-            mp3_bitrate_kbps: default_mp3_bitrate_kbps(),
-            aac_profile: default_aac_profile(),
-            aac_quality_preset: Some(1),
-            aac_bitrate_kbps: default_aac_bitrate_kbps(),
-            opus_content_type: default_opus_content_type(),
-            opus_quality_preset: Some(1),
-            opus_bitrate_kbps: default_opus_bitrate_kbps(),
-            opus_complexity: default_opus_complexity(),
             dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
@@ -766,63 +639,6 @@ fn parse_dsd_filter_preset(s: &str) -> Option<DsdFilterPreset> {
     }
 }
 
-fn mp3_mode_key(mode: tonepoet_pipeline::enums::Mp3Mode) -> &'static str {
-    use tonepoet_pipeline::enums::Mp3Mode;
-    match mode {
-        Mp3Mode::Vbr => "vbr",
-        Mp3Mode::Cbr => "cbr",
-        Mp3Mode::Abr => "abr",
-    }
-}
-
-fn parse_mp3_mode(s: &str) -> Option<tonepoet_pipeline::enums::Mp3Mode> {
-    use tonepoet_pipeline::enums::Mp3Mode;
-    match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "vbr" | "variable" | "variable-bitrate" => Some(Mp3Mode::Vbr),
-        "cbr" | "constant" | "constant-bitrate" => Some(Mp3Mode::Cbr),
-        "abr" | "average" | "average-bitrate" => Some(Mp3Mode::Abr),
-        _ => None,
-    }
-}
-
-fn aac_profile_key(profile: tonepoet_pipeline::enums::AacProfile) -> &'static str {
-    use tonepoet_pipeline::enums::AacProfile;
-    match profile {
-        AacProfile::LcAac => "lc",
-        AacProfile::HeAac => "he",
-        AacProfile::HeAacV2 => "hev2",
-    }
-}
-
-fn parse_aac_profile(s: &str) -> Option<tonepoet_pipeline::enums::AacProfile> {
-    use tonepoet_pipeline::enums::AacProfile;
-    match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "lc" | "lc-aac" | "aac-lc" => Some(AacProfile::LcAac),
-        "he" | "he-aac" | "aac-he" => Some(AacProfile::HeAac),
-        "hev2" | "he-v2" | "he-aac-v2" | "aac-he-v2" => Some(AacProfile::HeAacV2),
-        _ => None,
-    }
-}
-
-fn opus_content_type_key(content_type: tonepoet_pipeline::enums::OpusContentType) -> &'static str {
-    use tonepoet_pipeline::enums::OpusContentType;
-    match content_type {
-        OpusContentType::Auto => "auto",
-        OpusContentType::Music => "music",
-        OpusContentType::Speech => "speech",
-    }
-}
-
-fn parse_opus_content_type(s: &str) -> Option<tonepoet_pipeline::enums::OpusContentType> {
-    use tonepoet_pipeline::enums::OpusContentType;
-    match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "auto" => Some(OpusContentType::Auto),
-        "music" => Some(OpusContentType::Music),
-        "speech" | "voice" => Some(OpusContentType::Speech),
-        _ => None,
-    }
-}
-
 fn parse_replaygain(s: &str) -> Option<ReplayGainChoice> {
     match s {
         "album" => Some(ReplayGainChoice::Album),
@@ -891,156 +707,5 @@ merge = "multi-file"
         assert_eq!(restored_output.companion_folders, "Scans, Artwork");
         assert!(*restored_output.force_encode.selected_value());
         assert!(*restored_output.write_log.selected_value());
-    }
-
-    #[test]
-    fn lossy_codec_settings_round_trip_through_preset_capture_and_apply() {
-        use tonepoet_pipeline::enums::{AacProfile, Mp3Mode, OpusContentType};
-
-        let mut format = FormatState::new();
-        format.mp3_mode = Mp3Mode::Vbr;
-        format.mp3_quality_preset = None;
-        format.mp3_lossy_preset = None;
-        format.mp3_vbr_quality = 2;
-        format.mp3_bitrate_kbps = 190;
-        format.aac_profile = AacProfile::HeAac;
-        format.aac_quality_preset = Some(1);
-        format.aac_lossy_preset = None;
-        format.aac_bitrate_kbps = 80;
-        format.opus_content_type = OpusContentType::Speech;
-        format.opus_quality_preset = Some(4);
-        format.opus_lossy_preset = Some(2);
-        format.opus_bitrate_kbps = 64;
-        format.opus_complexity = 6;
-
-        let output = OutputOptionsState::new();
-        let preset = TuiPreset::from_pill_state("lossy", &format, &output);
-
-        assert_eq!(preset.mp3_lossy_preset.as_deref(), Some("custom"));
-        assert_eq!(preset.aac_lossy_preset.as_deref(), Some("custom"));
-        assert_eq!(preset.opus_lossy_preset.as_deref(), Some("64"));
-        assert_eq!(preset.mp3_mode, "vbr");
-        assert_eq!(preset.mp3_vbr_quality, 2);
-        assert_eq!(preset.mp3_bitrate_kbps, 190);
-        assert_eq!(preset.aac_profile, "he");
-        assert_eq!(preset.aac_bitrate_kbps, 80);
-        assert_eq!(preset.opus_content_type, "speech");
-        assert_eq!(preset.opus_bitrate_kbps, 64);
-        assert_eq!(preset.opus_complexity, 6);
-
-        let mut restored_format = FormatState::new();
-        let mut restored_output = OutputOptionsState::new();
-        preset.apply_to_pills(&mut restored_format, &mut restored_output);
-
-        assert_eq!(restored_format.mp3_lossy_preset, None);
-        assert_eq!(restored_format.aac_lossy_preset, None);
-        assert_eq!(restored_format.opus_lossy_preset, Some(2));
-        assert_eq!(restored_format.mp3_mode, Mp3Mode::Vbr);
-        assert_eq!(restored_format.mp3_quality_preset, None);
-        assert_eq!(restored_format.mp3_vbr_quality, 2);
-        assert_eq!(restored_format.mp3_bitrate_kbps, 190);
-        assert_eq!(restored_format.aac_profile, AacProfile::HeAac);
-        assert_eq!(restored_format.aac_quality_preset, Some(1));
-        assert_eq!(restored_format.aac_bitrate_kbps, 80);
-        assert_eq!(restored_format.opus_content_type, OpusContentType::Speech);
-        assert_eq!(restored_format.opus_quality_preset, Some(4));
-        assert_eq!(restored_format.opus_bitrate_kbps, 64);
-        assert_eq!(restored_format.opus_complexity, 6);
-    }
-
-    #[test]
-    fn named_lossy_preset_keys_round_trip_through_toml() {
-        let mut format = FormatState::new();
-        let output = OutputOptionsState::new();
-
-        format.format.select_value(&AudioFormat::Mp3);
-        assert!(format.select_lossy_preset_index(1));
-        format.format.select_value(&AudioFormat::Aac);
-        assert!(format.select_lossy_preset_index(0));
-        format.format.select_value(&AudioFormat::Opus);
-        assert!(format.select_lossy_preset_index(2));
-
-        let preset = TuiPreset::from_pill_state("named-lossy", &format, &output);
-        let toml = toml::to_string(&preset).expect("serialize preset");
-        assert!(toml.contains("mp3_lossy_preset = \"v2\""));
-        assert!(toml.contains("aac_lossy_preset = \"256-vbr\""));
-        assert!(toml.contains("opus_lossy_preset = \"64\""));
-
-        let restored: TuiPreset = toml::from_str(&toml).expect("deserialize preset");
-        let mut restored_format = FormatState::new();
-        let mut restored_output = OutputOptionsState::new();
-        restored.apply_to_pills(&mut restored_format, &mut restored_output);
-
-        restored_format.format.select_value(&AudioFormat::Mp3);
-        assert_eq!(restored_format.lossy_preset_index(), Some(1));
-        restored_format.format.select_value(&AudioFormat::Aac);
-        assert_eq!(restored_format.lossy_preset_index(), Some(0));
-        restored_format.format.select_value(&AudioFormat::Opus);
-        assert_eq!(restored_format.lossy_preset_index(), Some(2));
-    }
-
-    #[test]
-    fn explicit_custom_lossy_preset_keys_round_trip_through_toml() {
-        let mut format = FormatState::new();
-        let output = OutputOptionsState::new();
-
-        format.format.select_value(&AudioFormat::Mp3);
-        assert!(format.select_lossy_preset_index(0));
-        assert!(format.select_lossy_preset_index(3));
-        format.format.select_value(&AudioFormat::Aac);
-        assert!(format.select_lossy_preset_index(0));
-        assert!(format.select_lossy_preset_index(3));
-        format.format.select_value(&AudioFormat::Opus);
-        assert!(format.select_lossy_preset_index(0));
-        assert!(format.select_lossy_preset_index(3));
-
-        let preset = TuiPreset::from_pill_state("custom-lossy", &format, &output);
-        let toml = toml::to_string(&preset).expect("serialize preset");
-        assert!(toml.contains("mp3_lossy_preset = \"custom\""));
-        assert!(toml.contains("aac_lossy_preset = \"custom\""));
-        assert!(toml.contains("opus_lossy_preset = \"custom\""));
-
-        let restored: TuiPreset = toml::from_str(&toml).expect("deserialize preset");
-        let mut restored_format = FormatState::new();
-        let mut restored_output = OutputOptionsState::new();
-        restored.apply_to_pills(&mut restored_format, &mut restored_output);
-
-        restored_format.format.select_value(&AudioFormat::Mp3);
-        assert_eq!(restored_format.lossy_preset_index(), Some(3));
-        restored_format.format.select_value(&AudioFormat::Aac);
-        assert_eq!(restored_format.lossy_preset_index(), Some(3));
-        restored_format.format.select_value(&AudioFormat::Opus);
-        assert_eq!(restored_format.lossy_preset_index(), Some(3));
-    }
-
-    #[test]
-    fn older_tui_presets_get_lossy_codec_defaults() {
-        let preset: TuiPreset = toml::from_str(
-            r#"
-name = "legacy-lossy"
-version = 3
-format = "mp3"
-sample_rate = 44100
-bit_depth = "24"
-dither = "tpdf"
-replaygain = "off"
-folder_template = "%ARTIST%/%ALBUM%"
-filename_template = "%TRACKNN% - %TITLE%.%EXT%"
-merge = "multi-file"
-"#,
-        )
-        .expect("preset without lossy codec fields should deserialize");
-
-        assert_eq!(preset.mp3_lossy_preset, None);
-        assert_eq!(preset.aac_lossy_preset, None);
-        assert_eq!(preset.opus_lossy_preset, None);
-        assert_eq!(preset.mp3_mode, "vbr");
-        assert_eq!(preset.mp3_vbr_quality, 0);
-        assert_eq!(preset.mp3_bitrate_kbps, 320);
-        assert_eq!(preset.aac_profile, "lc");
-        assert_eq!(preset.aac_bitrate_kbps, 256);
-        assert_eq!(preset.opus_content_type, "auto");
-        assert_eq!(preset.opus_bitrate_kbps, 192);
-        assert_eq!(preset.opus_complexity, 10);
     }
 }

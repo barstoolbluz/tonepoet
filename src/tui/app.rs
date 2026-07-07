@@ -1529,6 +1529,8 @@ pub struct ArchiveMetadataEditContext {
     pub archive_mtime_secs: Option<i64>,
     pub archive_mtime_nanos: Option<u32>,
     pub archive_size: Option<u64>,
+    /// Archive-member subset requested when the editor was opened for selected
+    /// entries rather than for every audio file in the extracted archive.
     pub target_inner_paths: Option<Vec<String>>,
     /// True only when the metadata editor created this staging tree for its
     /// own transient Browse archive edit. When the editor opens against an
@@ -2523,34 +2525,23 @@ pub struct FormatState {
     pub flac_md5: PillState<bool>,
     /// AAC profile (LC, HE, HEv2). Default: LC.
     pub aac_profile: tonepoet_pipeline::enums::AacProfile,
-    /// AAC quality preset index into the profile-specific codec-settings table.
-    /// None = custom/manual settings within the codec-settings overlay.
+    /// AAC quality preset index into the profile-specific preset table.
+    /// None = custom (user manually entered a bitrate).
     pub aac_quality_preset: Option<usize>,
-    /// Explicit above-the-fold lossy preset row state: Some(0..=2) = named
-    /// preset, None = explicit custom. This is intentionally separate from the
-    /// codec-settings table so selecting `custom` can be preserved even when
-    /// the numeric settings happen to match a named preset.
-    pub aac_lossy_preset: Option<usize>,
     /// AAC bitrate in kbps (8-1024). Default: 256.
     pub aac_bitrate_kbps: u32,
     /// Opus content type (Auto, Music, Speech). Default: Auto.
     pub opus_content_type: tonepoet_pipeline::enums::OpusContentType,
-    /// Opus quality preset index into OPUS_PRESETS. None = custom/manual
-    /// settings within the codec-settings overlay.
+    /// Opus quality preset index into OPUS_PRESETS. None = custom.
     pub opus_quality_preset: Option<usize>,
-    /// Explicit above-the-fold Opus lossy preset row state.
-    pub opus_lossy_preset: Option<usize>,
     /// Opus bitrate in kbps (6-510). Default: 192.
     pub opus_bitrate_kbps: u32,
     /// Opus encoder complexity (0-10). Default: 10.
     pub opus_complexity: u8,
     /// MP3 encoding mode (VBR, CBR, ABR). Default: VBR.
     pub mp3_mode: tonepoet_pipeline::enums::Mp3Mode,
-    /// MP3 bitrate preset index into MP3_BITRATE_PRESETS. None = custom/manual
-    /// settings within the codec-settings overlay.
+    /// MP3 bitrate preset index into MP3_BITRATE_PRESETS. None = custom.
     pub mp3_quality_preset: Option<usize>,
-    /// Explicit above-the-fold MP3 lossy preset row state.
-    pub mp3_lossy_preset: Option<usize>,
     /// MP3 VBR quality (0-9, 0=best). Default: 0.
     pub mp3_vbr_quality: u8,
     /// MP3 CBR/ABR bitrate in kbps (8-1000). Default: 320.
@@ -2763,18 +2754,15 @@ impl FormatState {
             ]),
             aac_profile: tonepoet_pipeline::enums::AacProfile::LcAac,
             aac_quality_preset: Some(1), // "high" = index 1 in LC presets
-            aac_lossy_preset: Some(0), // above-the-fold "256 VBR"
             aac_bitrate_kbps: 256,
             opus_content_type: tonepoet_pipeline::enums::OpusContentType::Auto,
             opus_quality_preset: Some(1), // "high" = index 1 (192 kbps)
-            opus_lossy_preset: None, // 192 kbps is intentionally an advanced/custom default
             opus_bitrate_kbps: 192,
             opus_complexity: 10,
             mp3_mode: tonepoet_pipeline::enums::Mp3Mode::Vbr,
             mp3_quality_preset: Some(0), // "insane" = index 0 (320 kbps)
-            mp3_lossy_preset: Some(0), // above-the-fold "V0"
             mp3_vbr_quality: 0,
-            mp3_bitrate_kbps: 245,
+            mp3_bitrate_kbps: 320,
             wavpack_mode: tonepoet_pipeline::enums::WavPackMode::Normal,
             wavpack_hybrid: false,
             wavpack_bitrate_kbps: 320,
@@ -2928,124 +2916,33 @@ impl FormatState {
     }
 
     pub fn lossy_preset_index(&self) -> Option<usize> {
-        const CUSTOM: usize = 3;
-        match *self.format.selected_value() {
-            // The row reflects the user's explicit choice, not just a reverse
-            // lookup of numeric settings. If a user chooses `custom` and then
-            // happens to set values equal to V0/V2/etc., the row remains
-            // `custom` until they explicitly choose a named preset again.
-            AudioFormat::Mp3 => Some(match self.mp3_lossy_preset.filter(|idx| *idx < CUSTOM) {
-                Some(idx) if Some(idx) == self.infer_mp3_lossy_preset_index() => idx,
-                _ => CUSTOM,
-            }),
-            AudioFormat::Aac => Some(match self.aac_lossy_preset.filter(|idx| *idx < CUSTOM) {
-                Some(idx) if Some(idx) == self.infer_aac_lossy_preset_index() => idx,
-                _ => CUSTOM,
-            }),
-            AudioFormat::Opus => Some(match self.opus_lossy_preset.filter(|idx| *idx < CUSTOM) {
-                Some(idx) if Some(idx) == self.infer_opus_lossy_preset_index() => idx,
-                _ => CUSTOM,
-            }),
-            _ => None,
-        }
-    }
-
-    pub fn mp3_lossy_preset_key(&self) -> &'static str {
-        match self.mp3_lossy_preset {
-            Some(0) if self.infer_mp3_lossy_preset_index() == Some(0) => "v0",
-            Some(1) if self.infer_mp3_lossy_preset_index() == Some(1) => "v2",
-            Some(2) if self.infer_mp3_lossy_preset_index() == Some(2) => "320-cbr",
-            _ => "custom",
-        }
-    }
-
-    pub fn aac_lossy_preset_key(&self) -> &'static str {
-        match self.aac_lossy_preset {
-            Some(0) if self.infer_aac_lossy_preset_index() == Some(0) => "256-vbr",
-            Some(1) if self.infer_aac_lossy_preset_index() == Some(1) => "192-vbr",
-            Some(2) if self.infer_aac_lossy_preset_index() == Some(2) => "128-vbr",
-            _ => "custom",
-        }
-    }
-
-    pub fn opus_lossy_preset_key(&self) -> &'static str {
-        match self.opus_lossy_preset {
-            Some(0) if self.infer_opus_lossy_preset_index() == Some(0) => "128",
-            Some(1) if self.infer_opus_lossy_preset_index() == Some(1) => "96",
-            Some(2) if self.infer_opus_lossy_preset_index() == Some(2) => "64",
-            _ => "custom",
-        }
-    }
-
-    pub fn infer_mp3_lossy_preset_index(&self) -> Option<usize> {
         use tonepoet_pipeline::enums::Mp3Mode;
-        if self.mp3_mode == Mp3Mode::Vbr
-            && self.mp3_vbr_quality == 0
-            && self.mp3_bitrate_kbps == 245
-        {
-            Some(0)
-        } else if self.mp3_mode == Mp3Mode::Vbr
-            && self.mp3_vbr_quality == 2
-            && self.mp3_bitrate_kbps == 190
-        {
-            Some(1)
-        } else if self.mp3_mode == Mp3Mode::Cbr && self.mp3_bitrate_kbps == 320 {
-            Some(2)
-        } else {
-            None
-        }
-    }
-
-    pub fn infer_aac_lossy_preset_index(&self) -> Option<usize> {
-        use tonepoet_pipeline::enums::AacProfile;
-        match (self.aac_profile, self.aac_bitrate_kbps) {
-            (AacProfile::LcAac, 256) => Some(0),
-            (AacProfile::LcAac, 192) => Some(1),
-            (AacProfile::LcAac, 128) => Some(2),
+        match *self.format.selected_value() {
+            AudioFormat::Mp3 => {
+                if self.mp3_mode == Mp3Mode::Vbr && self.mp3_vbr_quality == 0 {
+                    Some(0)
+                } else if self.mp3_mode == Mp3Mode::Vbr && self.mp3_vbr_quality == 2 {
+                    Some(1)
+                } else if self.mp3_mode == Mp3Mode::Cbr && self.mp3_bitrate_kbps == 320 {
+                    Some(2)
+                } else {
+                    Some(3)
+                }
+            }
+            AudioFormat::Aac => match self.aac_bitrate_kbps {
+                256 if self.aac_profile == tonepoet_pipeline::enums::AacProfile::LcAac => Some(0),
+                192 if self.aac_profile == tonepoet_pipeline::enums::AacProfile::LcAac => Some(1),
+                128 if self.aac_profile == tonepoet_pipeline::enums::AacProfile::LcAac => Some(2),
+                _ => Some(3),
+            },
+            AudioFormat::Opus => match self.opus_bitrate_kbps {
+                128 => Some(0),
+                96 => Some(1),
+                64 => Some(2),
+                _ => Some(3),
+            },
             _ => None,
         }
-    }
-
-    pub fn infer_opus_lossy_preset_index(&self) -> Option<usize> {
-        match self.opus_bitrate_kbps {
-            128 => Some(0),
-            96 => Some(1),
-            64 => Some(2),
-            _ => None,
-        }
-    }
-
-    pub fn set_mp3_lossy_preset_from_key(&mut self, key: Option<&str>) {
-        self.mp3_lossy_preset = match key {
-            Some("v0") => Some(0),
-            Some("v2") => Some(1),
-            Some("320-cbr") | Some("320") => Some(2),
-            Some("custom") => None,
-            None => self.infer_mp3_lossy_preset_index(),
-            Some(_) => None,
-        };
-    }
-
-    pub fn set_aac_lossy_preset_from_key(&mut self, key: Option<&str>) {
-        self.aac_lossy_preset = match key {
-            Some("256-vbr") | Some("256") => Some(0),
-            Some("192-vbr") | Some("192") => Some(1),
-            Some("128-vbr") | Some("128") => Some(2),
-            Some("custom") => None,
-            None => self.infer_aac_lossy_preset_index(),
-            Some(_) => None,
-        };
-    }
-
-    pub fn set_opus_lossy_preset_from_key(&mut self, key: Option<&str>) {
-        self.opus_lossy_preset = match key {
-            Some("128") => Some(0),
-            Some("96") => Some(1),
-            Some("64") => Some(2),
-            Some("custom") => None,
-            None => self.infer_opus_lossy_preset_index(),
-            Some(_) => None,
-        };
     }
 
     pub fn select_lossy_preset_index(&mut self, index: usize) -> bool {
@@ -3057,7 +2954,6 @@ impl FormatState {
                     self.mp3_vbr_quality = 0;
                     self.mp3_bitrate_kbps = 245;
                     self.mp3_quality_preset = None;
-                    self.mp3_lossy_preset = Some(0);
                     true
                 }
                 1 => {
@@ -3065,71 +2961,54 @@ impl FormatState {
                     self.mp3_vbr_quality = 2;
                     self.mp3_bitrate_kbps = 190;
                     self.mp3_quality_preset = None;
-                    self.mp3_lossy_preset = Some(1);
                     true
                 }
                 2 => {
                     self.mp3_mode = Mp3Mode::Cbr;
                     self.mp3_bitrate_kbps = 320;
                     self.mp3_quality_preset = Some(0);
-                    self.mp3_lossy_preset = Some(2);
                     true
                 }
-                _ => {
-                    self.mp3_lossy_preset = None;
-                    true
-                }
+                _ => false,
             },
             AudioFormat::Aac => match index.min(3) {
                 0 => {
                     self.aac_profile = AacProfile::LcAac;
                     self.aac_bitrate_kbps = 256;
                     self.aac_quality_preset = Some(1);
-                    self.aac_lossy_preset = Some(0);
                     true
                 }
                 1 => {
                     self.aac_profile = AacProfile::LcAac;
                     self.aac_bitrate_kbps = 192;
                     self.aac_quality_preset = Some(2);
-                    self.aac_lossy_preset = Some(1);
                     true
                 }
                 2 => {
                     self.aac_profile = AacProfile::LcAac;
                     self.aac_bitrate_kbps = 128;
                     self.aac_quality_preset = Some(3);
-                    self.aac_lossy_preset = Some(2);
                     true
                 }
-                _ => {
-                    self.aac_lossy_preset = None;
-                    true
-                }
+                _ => false,
             },
             AudioFormat::Opus => match index.min(3) {
                 0 => {
                     self.opus_bitrate_kbps = 128;
                     self.opus_quality_preset = Some(2);
-                    self.opus_lossy_preset = Some(0);
                     true
                 }
                 1 => {
                     self.opus_bitrate_kbps = 96;
                     self.opus_quality_preset = Some(3);
-                    self.opus_lossy_preset = Some(1);
                     true
                 }
                 2 => {
                     self.opus_bitrate_kbps = 64;
                     self.opus_quality_preset = Some(4);
-                    self.opus_lossy_preset = Some(2);
                     true
                 }
-                _ => {
-                    self.opus_lossy_preset = None;
-                    true
-                }
+                _ => false,
             },
             _ => false,
         }
@@ -3838,15 +3717,12 @@ impl OutputOptionsState {
         options.companion_folders = folders;
         options.force_encode = *self.force_encode.selected_value();
         options.create_disc_subfolders = *self.disc_subfolders.selected_value();
-        if *self.disc_subfolders.selected_value() {
-            let current = options
-                .naming_template
-                .clone()
-                .unwrap_or_else(|| self.filename_template.clone());
-            if !current.contains("%DISC_FOLDER%") {
-                options.naming_template = Some(format!("{{%DISC_FOLDER%/}}{current}"));
-            }
-        }
+        // Do not mutate the raw naming template here. Disc subfolders are a
+        // first-class ConversionOptions flag and are projected canonically by
+        // ConversionOptions::effective_naming_template at the request-building
+        // boundary. Keeping this helper side-effect-free prevents double-prefix
+        // bugs when presets, queue reloads, or non-TUI entrypoints reuse the
+        // same options.
         if let Some(settings) = options.pipeline_settings.as_mut() {
             settings.force_encode = *self.force_encode.selected_value();
         }
@@ -3915,12 +3791,10 @@ mod output_options_companion_projection_tests {
 
         assert_eq!(MergeMode.next_for(true), CompanionExtensions);
         assert_eq!(CompanionExtensions.next_for(true), CompanionFolders);
-        assert_eq!(CompanionFolders.next_for(true), ForceEncode);
-        assert_eq!(ForceEncode.next_for(true), DiscSubfolders);
-        assert_eq!(DiscSubfolders.next_for(true), WriteLog);
+        assert_eq!(CompanionFolders.next_for(true), WriteLog);
         assert_eq!(WriteLog.next_for(true), DestPath);
         assert_eq!(DestPath.prev_for(true), WriteLog);
-        assert_eq!(WriteLog.prev_for(true), DiscSubfolders);
+        assert_eq!(WriteLog.prev_for(true), CompanionFolders);
         assert_eq!(CompanionExtensions.clamp_for(true), CompanionExtensions);
     }
 }
@@ -10003,13 +9877,9 @@ pub fn apply_format_settings_kind(
             quality_preset,
             bitrate_input,
         } => {
-            let before = (format.aac_profile, format.aac_quality_preset, format.aac_bitrate_kbps);
             format.aac_profile = profile;
             format.aac_quality_preset = quality_preset;
             format.aac_bitrate_kbps = parse_required_u32("AAC bitrate", &bitrate_input.text, 8, 1024)?;
-            if before != (format.aac_profile, format.aac_quality_preset, format.aac_bitrate_kbps) {
-                format.aac_lossy_preset = None;
-            }
         }
         FormatSettingsKind::Opus {
             content_type,
@@ -10017,24 +9887,10 @@ pub fn apply_format_settings_kind(
             bitrate_input,
             complexity_input,
         } => {
-            let before = (
-                format.opus_content_type,
-                format.opus_quality_preset,
-                format.opus_bitrate_kbps,
-                format.opus_complexity,
-            );
             format.opus_content_type = content_type;
             format.opus_quality_preset = quality_preset;
             format.opus_bitrate_kbps = parse_required_u32("Opus bitrate", &bitrate_input.text, 6, 510)?;
             format.opus_complexity = parse_required_u8("Opus complexity", &complexity_input.text, 0, 10)?;
-            if before != (
-                format.opus_content_type,
-                format.opus_quality_preset,
-                format.opus_bitrate_kbps,
-                format.opus_complexity,
-            ) {
-                format.opus_lossy_preset = None;
-            }
         }
         FormatSettingsKind::Mp3 {
             mode,
@@ -10042,24 +9898,10 @@ pub fn apply_format_settings_kind(
             quality_preset,
             bitrate_input,
         } => {
-            let before = (
-                format.mp3_mode,
-                format.mp3_quality_preset,
-                format.mp3_vbr_quality,
-                format.mp3_bitrate_kbps,
-            );
             format.mp3_mode = mode;
             format.mp3_quality_preset = quality_preset;
             format.mp3_vbr_quality = parse_required_u8("MP3 VBR quality", &vbr_quality_input.text, 0, 9)?;
             format.mp3_bitrate_kbps = parse_required_u32("MP3 bitrate", &bitrate_input.text, 8, 1000)?;
-            if before != (
-                format.mp3_mode,
-                format.mp3_quality_preset,
-                format.mp3_vbr_quality,
-                format.mp3_bitrate_kbps,
-            ) {
-                format.mp3_lossy_preset = None;
-            }
         }
         FormatSettingsKind::WavPack {
             mode,
@@ -12894,120 +12736,6 @@ mod metadata_presentation_tab_tests {
         assert!(matches!(details.details_probe_state, MetadataDetailsProbeState::Unloaded));
     }
 
-}
-
-#[cfg(test)]
-mod lossy_custom_preset_state_tests {
-    use super::*;
-    use tonepoet_pipeline::enums::{AacProfile, Mp3Mode, OpusContentType};
-
-    #[test]
-    fn selecting_named_lossy_presets_applies_expected_codec_settings() {
-        let mut format = FormatState::new();
-
-        format.format.select_value(&AudioFormat::Mp3);
-        assert!(format.select_lossy_preset_index(1));
-        assert_eq!(format.lossy_preset_index(), Some(1));
-        assert_eq!(format.mp3_mode, Mp3Mode::Vbr);
-        assert_eq!(format.mp3_vbr_quality, 2);
-        assert_eq!(format.mp3_bitrate_kbps, 190);
-
-        format.format.select_value(&AudioFormat::Aac);
-        assert!(format.select_lossy_preset_index(2));
-        assert_eq!(format.lossy_preset_index(), Some(2));
-        assert_eq!(format.aac_profile, AacProfile::LcAac);
-        assert_eq!(format.aac_bitrate_kbps, 128);
-
-        format.format.select_value(&AudioFormat::Opus);
-        assert!(format.select_lossy_preset_index(0));
-        assert_eq!(format.lossy_preset_index(), Some(0));
-        assert_eq!(format.opus_bitrate_kbps, 128);
-    }
-
-    #[test]
-    fn custom_lossy_preset_is_selectable_and_preserves_current_settings() {
-        let mut format = FormatState::new();
-        format.format.select_value(&AudioFormat::Mp3);
-        assert!(format.select_lossy_preset_index(0));
-        let before = (format.mp3_mode, format.mp3_vbr_quality, format.mp3_bitrate_kbps);
-
-        assert!(format.select_lossy_preset_index(3));
-
-        assert_eq!(format.lossy_preset_index(), Some(3));
-        assert_eq!((format.mp3_mode, format.mp3_vbr_quality, format.mp3_bitrate_kbps), before);
-    }
-
-    #[test]
-    fn explicit_custom_display_is_preserved_even_when_settings_match_named_preset() {
-        let mut format = FormatState::new();
-        format.format.select_value(&AudioFormat::Aac);
-        assert!(format.select_lossy_preset_index(0));
-        assert_eq!(format.lossy_preset_index(), Some(0));
-
-        assert!(format.select_lossy_preset_index(3));
-
-        assert_eq!(format.aac_bitrate_kbps, 256);
-        assert_eq!(format.infer_aac_lossy_preset_index(), Some(0));
-        assert_eq!(format.lossy_preset_index(), Some(3));
-    }
-
-    #[test]
-    fn stale_named_lossy_preset_state_displays_custom_when_values_no_longer_match() {
-        let mut format = FormatState::new();
-
-        format.format.select_value(&AudioFormat::Mp3);
-        assert!(format.select_lossy_preset_index(0));
-        format.mp3_bitrate_kbps = 320;
-        assert_eq!(format.lossy_preset_index(), Some(3));
-
-        format.format.select_value(&AudioFormat::Opus);
-        assert!(format.select_lossy_preset_index(0));
-        format.opus_bitrate_kbps = 192;
-
-        assert_eq!(format.lossy_preset_index(), Some(3));
-    }
-
-    #[test]
-    fn manual_codec_settings_edit_switches_named_lossy_preset_to_custom() {
-        let mut format = FormatState::new();
-        format.format.select_value(&AudioFormat::Opus);
-        assert!(format.select_lossy_preset_index(0));
-        assert_eq!(format.lossy_preset_index(), Some(0));
-
-        apply_format_settings_kind(&mut format, FormatSettingsKind::Opus {
-            content_type: OpusContentType::Speech,
-            quality_preset: Some(2),
-            bitrate_input: crate::tui::text_input::TextInputState::new("128".to_string()),
-            complexity_input: crate::tui::text_input::TextInputState::new("10".to_string()),
-        }).expect("valid opus settings");
-
-        assert_eq!(format.lossy_preset_index(), Some(3));
-        assert_eq!(format.opus_bitrate_kbps, 128);
-    }
-
-    #[test]
-    fn lossy_preset_state_is_kept_per_codec_without_cross_codec_leakage() {
-        let mut format = FormatState::new();
-
-        format.format.select_value(&AudioFormat::Mp3);
-        assert!(format.select_lossy_preset_index(3));
-        assert_eq!(format.lossy_preset_index(), Some(3));
-
-        format.format.select_value(&AudioFormat::Aac);
-        assert!(format.select_lossy_preset_index(1));
-        assert_eq!(format.lossy_preset_index(), Some(1));
-
-        format.format.select_value(&AudioFormat::Opus);
-        assert!(format.select_lossy_preset_index(2));
-        assert_eq!(format.lossy_preset_index(), Some(2));
-
-        format.format.select_value(&AudioFormat::Mp3);
-        assert_eq!(format.lossy_preset_index(), Some(3));
-        format.format.select_value(&AudioFormat::Aac);
-        assert_eq!(format.lossy_preset_index(), Some(1));
-        format.format.select_value(&AudioFormat::Opus);
-        assert_eq!(format.lossy_preset_index(), Some(2));
-    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,11 @@ use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
 use super::draw_metadata::{draw_metadata_pane, draw_metadata_title_bar};
 use super::draw_output::{draw_format_pane, draw_format_title_bar};
-use super::draw_output_options::{draw_output_options_pane, draw_output_options_title_bar};
+use super::draw_output_options::{
+    draw_output_options_pane, draw_output_options_title_bar,
+    OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW, OUTPUT_OPTIONS_FORCE_ENCODE_ROW,
+    OUTPUT_OPTIONS_WRITE_LOG_ROW,
+};
 use super::draw_preset_bar::draw_preset_bar;
 use super::draw_source::{draw_source_pane, draw_source_title_bar};
 use super::pill::PillState;
@@ -389,11 +393,25 @@ fn register_output_options_buttons(app: &mut AppState, area: Rect) {
             Rect::new(inner_x, area.y + 9, inner_w, 1),
         );
     }
-    if app.convert.is_maximized(ConvertFocus::OutputOptions) && area.height >= 14 {
+    if app.convert.is_maximized(ConvertFocus::OutputOptions) && area.height >= 16 {
+        register_pill_row(
+            buttons,
+            &state.force_encode,
+            area.y + OUTPUT_OPTIONS_FORCE_ENCODE_ROW,
+            label_col,
+            |i| TuiButton::ForceEncodePill(i),
+        );
+        register_pill_row(
+            buttons,
+            &state.disc_subfolders,
+            area.y + OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW,
+            label_col,
+            |i| TuiButton::DiscSubfoldersPill(i),
+        );
         register_pill_row(
             buttons,
             &state.write_log,
-            area.y + 12,
+            area.y + OUTPUT_OPTIONS_WRITE_LOG_ROW,
             label_col,
             |i| TuiButton::WriteLogPill(i),
         );
@@ -534,4 +552,59 @@ fn draw_convert_action_bar(f: &mut Frame, area: Rect, buttons: &mut ButtonRender
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+
+#[cfg(test)]
+mod output_options_button_map_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::AppScreen;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn rendered_output_options_registers_below_fold_pill_hit_rows() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::OutputOptions;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::OutputOptions);
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                draw_convert_screen(frame, Rect::new(0, 0, 100, 40), &mut app, theme);
+            })
+            .expect("draw convert screen");
+
+        let dest_rect = app
+            .button_map
+            .find_button_rect(&TuiButton::DestPathField)
+            .expect("destination field should be registered for visible output options pane");
+        let pane_x = dest_rect.x.saturating_sub(1);
+        let pane_y = dest_rect.y.saturating_sub(1);
+        let label_col = pane_x + 17;
+
+        assert_eq!(
+            app.button_map
+                .find_button_at(label_col, pane_y + OUTPUT_OPTIONS_FORCE_ENCODE_ROW),
+            Some(TuiButton::ForceEncodePill(0)),
+            "force-encode pill hit row must match the rendered force enc row",
+        );
+        assert_eq!(
+            app.button_map
+                .find_button_at(label_col, pane_y + OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW),
+            Some(TuiButton::DiscSubfoldersPill(0)),
+            "disc-dirs pill hit row must match the rendered disc dirs row",
+        );
+        assert_eq!(
+            app.button_map
+                .find_button_at(label_col, pane_y + OUTPUT_OPTIONS_WRITE_LOG_ROW),
+            Some(TuiButton::WriteLogPill(0)),
+            "write-log pill hit row must match the rendered write log row",
+        );
+    }
 }

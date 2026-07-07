@@ -10536,7 +10536,6 @@ pub fn publish_album_output(
 
     let final_parent = parent_dir_or_current(&plan.album_dir);
     fs::create_dir_all(final_parent).map_err(PublishError::Io)?;
-    let _publish_lock = acquire_publish_lock(&plan.album_dir)?;
 
     let album_name = plan
         .album_dir
@@ -10544,6 +10543,8 @@ pub fn publish_album_output(
         .and_then(|s| s.to_str())
         .map(sanitize_component)
         .unwrap_or_else(|| "album".to_string());
+    cleanup_stale_publish_lock_artifacts(final_parent, &album_name);
+    let _publish_lock = acquire_publish_lock(&plan.album_dir)?;
     let marker_path = final_parent.join(format!(".{album_name}.publish-in-progress"));
     let incremental_marker_path = final_parent.join(format!(
         ".{album_name}.incremental-publish-in-progress"
@@ -10615,7 +10616,7 @@ pub fn publish_album_output(
                         fragment_batch_identity.as_ref(),
                         &mut published_entries,
                     )?;
-                    drop(staging);
+                    cleanup_successful_staging(staging);
                     return Ok(PublishedAlbum {
                         album_dir: plan.album_dir.clone(),
                         entries: published_entries,
@@ -10721,7 +10722,8 @@ pub fn publish_album_output(
         );
     }
 
-    drop(staging);
+    cleanup_successful_staging(staging);
+    cleanup_stale_publish_lock_artifacts(final_parent, &album_name);
 
     Ok(PublishedAlbum {
         album_dir: plan.album_dir.clone(),
@@ -15225,11 +15227,11 @@ fn render_track_template<T: TemplateRenderTarget + ?Sized>(
         .as_deref()
         .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| artist.clone());
-    let disc = resolved_track_disc_number(track).unwrap_or(1);
-    let disc_folder = source_multi_disc_folder_token(source, disc)
+    let disc = track_disc_number_hint(track).filter(|disc| *disc > 0).unwrap_or(1);
+    let disc_folder = source_disc_folder_token(source, track)
         .map(|value| sanitize_component(&value))
         .unwrap_or_default();
-    let n = track.metadata.track_number.unwrap_or(track.id.track_number);
+    let n = template_track_number(track);
     let year = source
         .album_metadata
         .date
@@ -15301,7 +15303,7 @@ fn render_track_template<T: TemplateRenderTarget + ?Sized>(
         &source.album_metadata.extra,
     );
 
-    let rel = PathBuf::from(rendered);
+    let rel = path_from_template_components(&rendered);
     if rel.as_os_str().is_empty() {
         return Err(PlanError::InvalidTemplate(
             "template rendered empty".to_string(),
@@ -15389,74 +15391,93 @@ fn album_and_title_extra_for_template(
         Some((clean, extra)) => {
             let strip_resolution = template.contains("%BITDEPTH%") || template.contains("%SAMPLERATE%");
             let normalized = normalize_title_extra_for_template(&extra, source, strip_resolution);
-            (sanitize_component(&clean), sanitize_optional_component(&normalized))
+            (sanitize_component(&clean), sanitize_component(&normalized))
         }
         None => (sanitize_component(raw_album), String::new()),
     }
 }
 
 
-fn source_multi_disc_folder_token(source: &PreparedSource, disc_number: u32) -> Option<String> {
-    if source_is_multi_disc_for_template(source) {
-        Some(format!("Disc {disc_number:02}"))
-    } else {
-        None
+fn source_disc_folder_token(source: &PreparedSource, track: &PreparedTrack) -> Option<String> {
+    if !source_is_multi_disc_for_template(source) {
+        return None;
     }
+    let disc_number = track_disc_number_hint(track)
+        .filter(|disc| *disc > 0)
+        .or_else(|| infer_disc_number_from_duplicate_track_numbers(source, track))
+        .unwrap_or(1);
+    Some(format!("disc {disc_number:02}"))
 }
 
 fn source_is_multi_disc_for_template(source: &PreparedSource) -> bool {
     let mut disc_numbers = BTreeSet::new();
     let mut max_disc_total = 0_u32;
     for track in &source.tracks {
-        if let Some(disc) = resolved_track_disc_number(track) {
+        if let Some(disc) = track_disc_number_hint(track).filter(|disc| *disc > 0) {
             disc_numbers.insert(disc);
         }
-        for key in ["disctotal", "disc_total", "totaldiscs", "total_discs"] {
-            if let Some(total) = track
-                .metadata
-                .extra
-                .get(key)
-                .and_then(|raw| parse_disc_total_hint(raw))
-                .filter(|total| *total > 0)
-            {
-                max_disc_total = max_disc_total.max(total);
-            }
-        }
-        for key in ["discnumber", "disc_number", "disc"] {
-            if let Some((_, Some(total))) = track
-                .metadata
-                .extra
-                .get(key)
-                .and_then(|raw| parse_disc_number_hint(raw))
-            {
-                max_disc_total = max_disc_total.max(total);
-            }
-        }
+        max_disc_total = max_disc_total.max(track_disc_total_hint(track).unwrap_or(0));
     }
-    disc_numbers.len() > 1 || max_disc_total > 1
+    disc_numbers.len() > 1 || max_disc_total > 1 || source_has_duplicate_track_numbers(source)
 }
 
-fn resolved_track_disc_number(track: &PreparedTrack) -> Option<u32> {
+fn template_track_number(track: &PreparedTrack) -> u32 {
+    track.metadata.track_number.unwrap_or(track.id.track_number)
+}
+
+fn track_disc_number_hint(track: &PreparedTrack) -> Option<u32> {
     track
         .id
         .disc_number
         .or(track.metadata.disc_number)
-        .or_else(|| {
-            ["discnumber", "disc_number", "disc"]
-                .iter()
-                .find_map(|key| {
-                    track
-                        .metadata
-                        .extra
-                        .get(*key)
-                        .and_then(|raw| parse_disc_number_hint(raw))
-                        .and_then(|(disc, _)| disc)
-                })
-        })
-        .filter(|disc| *disc > 0)
+        .or_else(|| track_disc_number_extra_hint(track))
 }
 
-fn parse_disc_number_hint(value: &str) -> Option<(Option<u32>, Option<u32>)> {
+fn track_disc_total_hint(track: &PreparedTrack) -> Option<u32> {
+    track_disc_total_extra_hint(track)
+}
+
+fn track_disc_number_extra_hint(track: &PreparedTrack) -> Option<u32> {
+    for key in ["discnumber", "disc_number", "disc"] {
+        let Some(raw) = extra_value_case_insensitive(&track.metadata.extra, key) else {
+            continue;
+        };
+        if let Some((disc, _)) = parse_disc_number_hint_for_key(key, raw) {
+            if disc.is_some() {
+                return disc;
+            }
+        }
+    }
+    None
+}
+
+fn track_disc_total_extra_hint(track: &PreparedTrack) -> Option<u32> {
+    for key in ["disctotal", "disc_total", "discnumber", "disc_number", "disc"] {
+        let Some(raw) = extra_value_case_insensitive(&track.metadata.extra, key) else {
+            continue;
+        };
+        if let Some((_, total)) = parse_disc_number_hint_for_key(key, raw) {
+            if total.is_some() {
+                return total;
+            }
+        }
+    }
+    None
+}
+
+fn extra_value_case_insensitive<'a>(extra: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+    extra
+        .get(key)
+        .map(String::as_str)
+        .or_else(|| {
+            extra
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value.as_str())
+        })
+}
+
+fn parse_disc_number_hint_for_key(key: &str, value: &str) -> Option<(Option<u32>, Option<u32>)> {
     let mut nums = value
         .split(|ch: char| !ch.is_ascii_digit())
         .filter(|part| !part.is_empty())
@@ -15464,17 +15485,54 @@ fn parse_disc_number_hint(value: &str) -> Option<(Option<u32>, Option<u32>)> {
     let first = nums.next();
     let second = nums.next();
     match (first, second) {
-        (None, None) => None,
+        (None, _) => None,
+        (Some(total), None) if key.contains("total") => Some((None, Some(total))),
         (Some(disc), None) => Some((Some(disc), None)),
         (disc, total) => Some((disc, total)),
     }
 }
 
-fn parse_disc_total_hint(value: &str) -> Option<u32> {
-    value
-        .split(|ch: char| !ch.is_ascii_digit())
-        .filter(|part| !part.is_empty())
-        .find_map(|part| part.parse::<u32>().ok())
+fn source_has_duplicate_track_numbers(source: &PreparedSource) -> bool {
+    let mut seen = BTreeSet::new();
+    for track in &source.tracks {
+        let n = template_track_number(track);
+        if n == 0 {
+            continue;
+        }
+        if !seen.insert(n) {
+            return true;
+        }
+    }
+    false
+}
+
+fn infer_disc_number_from_duplicate_track_numbers(
+    source: &PreparedSource,
+    target: &PreparedTrack,
+) -> Option<u32> {
+    if !source_has_duplicate_track_numbers(source) {
+        return None;
+    }
+    let target_number = template_track_number(target);
+    if target_number == 0 {
+        return None;
+    }
+
+    let mut occurrence = 0_u32;
+    let mut total_occurrences = 0_u32;
+    for track in &source.tracks {
+        if template_track_number(track) == target_number {
+            total_occurrences += 1;
+            if track.id.source_ordinal == target.id.source_ordinal
+                && track.id.track_number == target.id.track_number
+                && track.id.disc_number == target.id.disc_number
+            {
+                occurrence = total_occurrences;
+            }
+        }
+    }
+
+    (occurrence > 0 && total_occurrences > 1).then_some(occurrence)
 }
 
 fn render_template_with_tokens(
@@ -15495,8 +15553,17 @@ fn render_conditional_template_blocks(
 ) -> String {
     let mut output = String::with_capacity(template.len());
     let mut rest = template;
+    let mut suppress_leading_whitespace_after_dropped_block = false;
+
     while let Some(open) = rest.find('{') {
-        output.push_str(&rest[..open]);
+        let prefix = &rest[..open];
+        if suppress_leading_whitespace_after_dropped_block && output.ends_with(char::is_whitespace) {
+            output.push_str(prefix.trim_start_matches(char::is_whitespace));
+        } else {
+            output.push_str(prefix);
+        }
+        suppress_leading_whitespace_after_dropped_block = false;
+
         let after_open = &rest[open + 1..];
         let Some(close) = after_open.find('}') else {
             output.push('{');
@@ -15505,25 +15572,34 @@ fn render_conditional_template_blocks(
         };
         let block = &after_open[..close];
         let variables = template_tokens_in(block);
-        if variables.is_empty() {
-            // Literal braces are not conditional syntax unless the block contains
-            // at least one template token. Preserve them exactly rather than
-            // silently deleting user-authored text.
+        let block_resolves = !variables.is_empty()
+            && variables.iter().all(|token| {
+                !resolve_template_token(token, tokens, track_extra, album_extra)
+                    .trim()
+                    .is_empty()
+            });
+
+        if block_resolves {
+            // Braces are conditional delimiters, but they are also literal
+            // output when the guarded content resolves successfully.
             output.push('{');
             output.push_str(block);
             output.push('}');
-        } else if variables.iter().all(|token| {
-            !resolve_template_token(token, tokens, track_extra, album_extra)
-                .trim()
-                .is_empty()
-        }) {
-            // All variables resolved: emit the block contents and only remove
-            // the conditional delimiters. The outer render pass expands tokens.
-            output.push_str(block);
+        } else {
+            // The whole block is omitted. If the template had a space before
+            // and after the conditional, e.g. `Album {%EXTRA%} (%YEAR%)`,
+            // omitting the middle block should leave exactly one separator:
+            // `Album (%YEAR%)`, not `Album  (%YEAR%)`.
+            suppress_leading_whitespace_after_dropped_block = true;
         }
         rest = &after_open[close + 1..];
     }
-    output.push_str(rest);
+
+    if suppress_leading_whitespace_after_dropped_block && output.ends_with(char::is_whitespace) {
+        output.push_str(rest.trim_start_matches(char::is_whitespace));
+    } else {
+        output.push_str(rest);
+    }
     output
 }
 
@@ -15581,7 +15657,7 @@ fn resolve_template_token(
     track_extra
         .and_then(|extra| extra.get(&key))
         .or_else(|| album_extra.get(&key))
-        .map(|value| sanitize_optional_component(value))
+        .map(|value| sanitize_component(value))
         .unwrap_or_default()
 }
 
@@ -15734,30 +15810,18 @@ fn strip_resolution_from_title_extra(extra: &str) -> String {
 
 fn looks_like_title_extra_metadata(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
-    let words: Vec<&str> = lower
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
-        .filter(|word| !word.is_empty())
-        .collect();
-
-    let has_release_format = [
+    let has_format_or_region = [
         "blu-ray", "bluray", "dvd-a", "dvda", "dvd-v", "dvdv", "sacd", "shm", "shm-cd",
-        "iso", "lp", "cd",
+        "iso", "japan", "us", "usa", "uk", "eu", "lp", "cd", "mfsl", "mofi",
+        "mobile", "fidelity", "first-press", "pressing",
     ]
     .iter()
-    .any(|needle| words.iter().any(|word| word == needle));
+    .any(|needle| lower.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-').any(|word| word == *needle));
     let has_resolution = content
         .split(|ch: char| ch.is_whitespace() || ch == '/' || ch == ',' || ch == ';')
         .any(looks_like_resolution_fragment);
     let has_catalog = content.split_whitespace().any(looks_like_catalog_fragment);
-
-    // Policy: region-only parentheticals such as "(US)" or "(Japan)" are
-    // commonly part of an album/release title and are too ambiguous to strip
-    // by themselves. Regional tokens are preserved unless the same
-    // parenthetical also contains a non-regional release-metadata signal such
-    // as a format marker, ISO marker, catalog number, label identifier, or
-    // resolution. The label-identifier case is handled by the caller via
-    // label_resolver::contains_metadata_identifier().
-    has_release_format || has_resolution || has_catalog
+    has_format_or_region || has_resolution || has_catalog
 }
 
 fn looks_like_catalog_fragment(fragment: &str) -> bool {
@@ -15835,7 +15899,7 @@ fn format_sample_rate(hz: u32) -> String {
     format!("{khz}kHz")
 }
 
-fn sanitize_optional_component(value: &str) -> String {
+fn sanitize_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
         .map(|ch| match ch {
@@ -15844,11 +15908,7 @@ fn sanitize_optional_component(value: &str) -> String {
             ch => ch,
         })
         .collect();
-    sanitized.trim().trim_matches('.').to_string()
-}
-
-fn sanitize_component(value: &str) -> String {
-    let trimmed = sanitize_optional_component(value);
+    let trimmed = sanitized.trim().trim_matches('.').to_string();
     if trimmed.is_empty() {
         "untitled".to_string()
     } else {
@@ -16885,15 +16945,129 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Remove internal staging artifacts after a durable successful publish.
+///
+/// This is intentionally success-only. Failed or cancelled jobs keep their
+/// staging roots for diagnostics/retry unless a higher-level processor cleanup
+/// policy explicitly decides otherwise. We still remove unheld lock files from
+/// the staging parent so successful runs do not leave `.tonepoet-staging/`
+/// visible solely because of a stale lock from an older crashed run.
+fn cleanup_successful_staging(staging: StagingDir) {
+    let root = staging.root.clone();
+    let parent = root.parent().map(|path| path.to_path_buf());
+    drop(staging);
+
+    if let Err(err) = fs::remove_dir_all(&root) {
+        if err.kind() != io::ErrorKind::NotFound {
+            log::warn!("could not remove successful staging directory {}: {err}", root.display());
+        }
+    }
+
+    if let Some(parent) = parent {
+        cleanup_empty_staging_parent_best_effort(&parent);
+    }
+}
+
+fn cleanup_empty_staging_parent_best_effort(parent: &Path) {
+    if parent.file_name().and_then(|name| name.to_str()) != Some(STAGING_PARENT_NAME) {
+        return;
+    }
+    cleanup_unheld_staging_parent_locks(parent);
+    match fs::remove_dir(parent) {
+        Ok(()) => sync_parent_dir_best_effort(parent),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            let has_entries = parent
+                .read_dir()
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+            if !has_entries {
+                log::warn!(
+                    "could not remove empty staging parent {}: {err}",
+                    parent.display()
+                );
+            }
+        }
+    }
+}
+
+
+fn cleanup_unheld_staging_parent_locks(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.ends_with(".run.lock") {
+            remove_unheld_lock_file_best_effort(&entry.path());
+        }
+    }
+}
+
+fn cleanup_stale_publish_lock_artifacts(parent: &Path, album_name: &str) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let hidden_current = format!(".{album_name}.lock");
+    let legacy_current = format!("{album_name}.lock");
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_stale_publish_lock_candidate(name, &hidden_current, &legacy_current) {
+            remove_unheld_lock_file_best_effort(&entry.path());
+        }
+    }
+}
+
+fn is_stale_publish_lock_candidate(name: &str, hidden_current: &str, legacy_current: &str) -> bool {
+    if name == hidden_current || name == legacy_current {
+        return true;
+    }
+
+    // Previous broken conditional-template renders could leave orphan album
+    // locks such as `.Album [FLAC] {}.lock`. Remove only if the file is not
+    // currently locked, and only for the known broken conditional artifact.
+    name.ends_with(".lock") && name.contains("{}")
+}
+
+fn remove_unheld_lock_file_best_effort(path: &Path) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+
+    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(path) else {
+        return;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            drop(file);
+            remove_lock_path_best_effort(path);
+        }
+        Err(err) if is_lock_contention(&err) => {}
+        Err(err) => {
+            log::debug!("could not check stale lock {}: {err}", path.display());
+        }
+    }
+}
+
 fn acquire_publish_lock(album_dir: &Path) -> Result<AlbumPublishLock, PublishError> {
     let hidden_lock_path = album_lock_path(album_dir);
     let legacy_lock_path = legacy_album_lock_path(album_dir);
 
-    // The album publish lock intentionally uses a stable hidden path.  The
-    // filesystem entry is the rendezvous point for later publishers; only the
-    // OS-level advisory lock is released on drop.  Legacy visible locks are
-    // still best-effort cleaned up after the hidden lock has been acquired.
-    let hidden = acquire_blocking_file_lock(&hidden_lock_path, false).map_err(PublishError::Io)?;
+    // The album publish lock uses a stable hidden path only while publish is
+    // active. The path is removed when the guard drops so successful conversions
+    // do not leave user-visible internal artifacts behind.
+    let hidden = acquire_blocking_file_lock(&hidden_lock_path, true).map_err(PublishError::Io)?;
     remove_lock_path_best_effort(&legacy_lock_path);
 
     Ok(AlbumPublishLock { hidden: Some(hidden) })
@@ -17031,25 +17205,19 @@ impl Drop for AlbumPublishLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            if self.remove_on_drop {
-                remove_lock_path_best_effort(&self.path);
-            }
-            if let Some(file) = self.file.take() {
-                let _ = file.unlock();
-            }
+        let cleanup_parent = self
+            .remove_on_drop
+            .then(|| self.path.parent().map(|path| path.to_path_buf()))
+            .flatten();
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+            drop(file);
         }
-
-        #[cfg(not(unix))]
-        {
-            if let Some(file) = self.file.take() {
-                let _ = file.unlock();
-                drop(file);
-            }
-            if self.remove_on_drop {
-                remove_lock_path_best_effort(&self.path);
-            }
+        if self.remove_on_drop {
+            remove_lock_path_best_effort(&self.path);
+        }
+        if let Some(parent) = cleanup_parent {
+            cleanup_empty_staging_parent_best_effort(&parent);
         }
     }
 }
@@ -20238,20 +20406,6 @@ mod title_extra_tests {
     }
 
     #[test]
-    fn preserves_region_only_parenthetical() {
-        assert!(extract_title_extra("Aja (Japan)").is_none());
-        assert!(extract_title_extra("Abbey Road (UK)").is_none());
-        assert!(extract_title_extra("Kind of Blue (EU)").is_none());
-    }
-
-    #[test]
-    fn strips_region_when_combined_with_release_metadata() {
-        let (album, extra) = extract_title_extra("Aftermath (US CTI 6015 LP)").unwrap();
-        assert_eq!(album, "Aftermath");
-        assert_eq!(extra, "US CTI 6015 LP");
-    }
-
-    #[test]
     fn preserves_leading_parenthetical() {
         assert!(extract_title_extra("(Ain't That) Good News").is_none());
     }
@@ -20316,108 +20470,173 @@ mod title_extra_tests {
         .unwrap();
         let s = result.to_string_lossy();
         assert!(s.contains("Dark Side of the Moon"), "album stripped: {s}");
-        assert!(s.contains("MFSL SACD"), "extra populated: {s}");
+        assert!(s.contains("{MFSL SACD}"), "extra populated and braced: {s}");
         assert!(!s.contains("[ISO]"), "bracket stripped: {s}");
     }
 
     #[test]
-    fn title_extra_stripped_to_empty_stays_empty_not_untitled() {
+    fn conditional_template_preserves_literal_braces_when_block_resolves() {
         let mut source = template_source();
-        source.album_metadata.album = Some("Aja (ISO)".to_string());
-        let result = render_folder_template(
-            "%ALBUM%{ (%TITLE_EXTRA%)}",
+        source.album_metadata.album = Some("At Fillmore East (MFSL)".to_string());
+        let rendered = render_folder_template(
+            "%ARTIST% - %ALBUM% (%YEAR%) [%FORMAT%] {%TITLE_EXTRA%}",
             &source,
             &tonepoet_pipeline::AudioFormat::Flac,
         );
-        let s = result.to_string_lossy();
-        assert_eq!(s, "Aja");
-        assert!(!s.contains("untitled"), "empty optional extra must not be sanitized to untitled: {s}");
-    }
-
-    #[test]
-    fn resolution_only_title_extra_stripped_to_empty_stays_empty() {
-        let source = template_source();
-        let (_album, extra) = album_and_title_extra_for_template(
-            "%ALBUM%{ (%TITLE_EXTRA% %BITDEPTH%-%SAMPLERATE%)}",
-            "Aja (24-96)",
-            &source,
+        assert_eq!(
+            rendered,
+            PathBuf::from("Miles Davis - At Fillmore East () [FLAC] {MFSL}")
         );
-        assert_eq!(extra, "");
     }
 
     #[test]
-    fn conditional_disc_folder_prefix_does_not_make_single_disc_path_absolute() {
+    fn conditional_template_drops_empty_block_without_rendering_empty_braces() {
+        let source = template_source();
+        let rendered = render_folder_template(
+            "%ARTIST% - %ALBUM% [%FORMAT%] {%TITLE_EXTRA%}",
+            &source,
+            &tonepoet_pipeline::AudioFormat::Flac,
+        );
+        assert_eq!(
+            rendered,
+            PathBuf::from("Miles Davis - A Tribute to Jack Johnson [FLAC]")
+        );
+    }
+
+
+    #[test]
+    fn conditional_template_drops_middle_block_without_double_spacing() {
         let mut source = template_source();
-        source.tracks[0].metadata.title = Some("Right Off".to_string());
-        let result = render_track_template(
-            "{%DISC_FOLDER%/}%NN% - %TITLE%",
+        source.album_metadata.date = Some("1971".to_string());
+        let rendered = render_folder_template(
+            "%ALBUM% {%TITLE_EXTRA%} (%YEAR%)",
+            &source,
+            &tonepoet_pipeline::AudioFormat::Flac,
+        );
+        assert_eq!(
+            rendered,
+            PathBuf::from("A Tribute to Jack Johnson (1971)")
+        );
+    }
+
+    #[test]
+    fn disc_folder_token_infers_discs_from_duplicate_track_numbers() {
+        let mut source = template_source();
+        let base = source.tracks[0].clone();
+        let make_track = |source_ordinal: u32, track_number: u32, title: &str| {
+            let mut track = base.clone();
+            track.id.source_ordinal = source_ordinal;
+            track.id.disc_number = None;
+            track.id.track_number = track_number;
+            track.metadata.track_number = Some(track_number);
+            track.metadata.disc_number = None;
+            track.metadata.title = Some(title.to_string());
+            track
+        };
+        source.tracks = vec![
+            make_track(1, 1, "Statesboro Blues"),
+            make_track(2, 1, "Hot 'Lanta"),
+            make_track(3, 2, "Done Somebody Wrong"),
+            make_track(4, 2, "In Memory of Elizabeth Reed"),
+            make_track(5, 3, "Stormy Monday"),
+            make_track(6, 3, "Whipping Post"),
+            make_track(7, 4, "You Don't Love Me"),
+        ];
+        source.album_metadata.total_tracks = source.tracks.len() as u32;
+
+        let rels = source
+            .tracks
+            .iter()
+            .map(|track| {
+                render_track_template(
+                    "%DISC_FOLDER%/%NN% - %TITLE%",
+                    &source,
+                    track,
+                    &tonepoet_pipeline::AudioFormat::Flac,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rels[0], PathBuf::from("disc 01/01 - Statesboro Blues"));
+        assert_eq!(rels[1], PathBuf::from("disc 02/01 - Hot 'Lanta"));
+        assert_eq!(rels[2], PathBuf::from("disc 01/02 - Done Somebody Wrong"));
+        assert_eq!(rels[3], PathBuf::from("disc 02/02 - In Memory of Elizabeth Reed"));
+        assert_eq!(rels[6], PathBuf::from("disc 01/04 - You Don't Love Me"));
+    }
+
+
+    #[test]
+    fn create_disc_subfolders_option_reaches_planned_final_paths() {
+        let mut source = template_source();
+        let base = source.tracks[0].clone();
+        let make_track = |source_ordinal: u32, track_number: u32, title: &str| {
+            let mut track = base.clone();
+            track.id.source_ordinal = source_ordinal;
+            track.id.disc_number = None;
+            track.id.track_number = track_number;
+            track.metadata.track_number = Some(track_number);
+            track.metadata.disc_number = None;
+            track.metadata.title = Some(title.to_string());
+            track
+        };
+        source.tracks = vec![
+            make_track(1, 1, "Statesboro Blues"),
+            make_track(2, 1, "Hot 'Lanta"),
+            make_track(3, 2, "Done Somebody Wrong"),
+            make_track(4, 2, "In Memory of Elizabeth Reed"),
+            make_track(5, 3, "Stormy Monday"),
+            make_track(6, 3, "Whipping Post"),
+            make_track(7, 4, "You Don't Love Me"),
+        ];
+        source.album_metadata.total_tracks = source.tracks.len() as u32;
+
+        let mut options = crate::convert::formats::ConversionOptions::default();
+        options.create_disc_subfolders = true;
+        options.naming_template = Some("%ARTIST%/%TRACK% - %TITLE%".to_string());
+
+        let mut req = template_request(None);
+        req.naming.per_album_subdir = false;
+        // This mirrors the processor/queue handoff into PipelineRequest. The
+        // invariant is not just that the UI can prepend a token, but that the
+        // first-class ConversionOptions flag reaches the planner's final paths
+        // while preserving the user's arbitrary filename template.
+        req.naming.template = options.effective_naming_template("%NN% - %TITLE%");
+
+        let plan = plan_outputs(&source, &req).expect("disc-subfolder planning");
+        assert_eq!(
+            plan.entries[0].final_path,
+            PathBuf::from("/out/disc 01/Miles Davis/1 - Statesboro Blues.flac")
+        );
+        assert_eq!(
+            plan.entries[1].final_path,
+            PathBuf::from("/out/disc 02/Miles Davis/1 - Hot 'Lanta.flac")
+        );
+        assert_eq!(
+            plan.entries[2].final_path,
+            PathBuf::from("/out/disc 01/Miles Davis/2 - Done Somebody Wrong.flac")
+        );
+        assert_eq!(
+            plan.entries[3].final_path,
+            PathBuf::from("/out/disc 02/Miles Davis/2 - In Memory of Elizabeth Reed.flac")
+        );
+        assert_eq!(
+            plan.entries[6].final_path,
+            PathBuf::from("/out/disc 01/Miles Davis/4 - You Don't Love Me.flac")
+        );
+    }
+
+    #[test]
+    fn empty_disc_folder_token_does_not_make_track_template_absolute() {
+        let source = template_source();
+        let rel = render_track_template(
+            "%DISC_FOLDER%/%NN% - %TITLE%",
             &source,
             &source.tracks[0],
             &tonepoet_pipeline::AudioFormat::Flac,
         )
-        .unwrap();
-        let s = result.to_string_lossy();
-        assert_eq!(s, "01 - Right Off");
-        assert!(!result.is_absolute(), "single-disc conditional prefix must not render an absolute path: {s}");
-    }
-
-
-    #[test]
-    fn conditional_title_extra_keeps_block_content_when_resolved() {
-        let mut source = template_source();
-        source.album_metadata.album = Some("At Fillmore East (MFSL)".to_string());
-        let result = render_folder_template(
-            "%ARTIST% - %ALBUM% {%TITLE_EXTRA%}",
-            &source,
-            &tonepoet_pipeline::AudioFormat::Flac,
-        );
-        let s = result.to_string_lossy();
-        assert!(s.contains("At Fillmore East MFSL"), "resolved block content should remain without braces: {s}");
-        assert!(!s.contains('{') && !s.contains('}'), "conditional delimiters should be removed: {s}");
-    }
-
-    #[test]
-    fn conditional_title_extra_drops_entire_block_when_unresolved() {
-        let mut source = template_source();
-        source.album_metadata.album = Some("At Fillmore East".to_string());
-        let result = render_folder_template(
-            "%ARTIST% - %ALBUM% {%TITLE_EXTRA%}",
-            &source,
-            &tonepoet_pipeline::AudioFormat::Flac,
-        );
-        let s = result.to_string_lossy();
-        assert_eq!(s, "Miles Davis - At Fillmore East");
-    }
-
-    #[test]
-    fn conditional_literal_braces_without_tokens_are_preserved() {
-        let source = template_source();
-        let result = render_folder_template(
-            "%ARTIST% - {literal} - %ALBUM%",
-            &source,
-            &tonepoet_pipeline::AudioFormat::Flac,
-        );
-        assert_eq!(result.to_string_lossy(), "Miles Davis - {literal} - A Tribute to Jack Johnson");
-    }
-
-    #[test]
-    fn disc_folder_uses_discnumber_extra_when_struct_field_is_missing() {
-        let mut source = template_source();
-        source.tracks.push(source.tracks[0].clone());
-        source.tracks[0].metadata.title = Some("Disc One Track".to_string());
-        source.tracks[0].metadata.extra.insert("discnumber".to_string(), "1/2".to_string());
-        source.tracks[1].metadata.title = Some("Disc Two Track".to_string());
-        source.tracks[1].id.track_number = 1;
-        source.tracks[1].metadata.extra.insert("discnumber".to_string(), "2/2".to_string());
-
-        let result = render_track_template(
-            "{%DISC_FOLDER%/}%NN% - %TITLE%",
-            &source,
-            &source.tracks[1],
-            &tonepoet_pipeline::AudioFormat::Flac,
-        )
-        .unwrap();
-        assert_eq!(result.to_string_lossy(), "Disc 02/01 - Disc Two Track");
+        .expect("empty disc folder component is omitted");
+        assert_eq!(rel, PathBuf::from("01 - Right Off"));
     }
 
     fn template_source() -> PreparedSource {
@@ -21951,7 +22170,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             ))
         })?;
         sync_parent_dir_best_effort(&plan.album_dir);
-        drop(staging);
+        cleanup_successful_staging(staging);
         Ok(PublishedAlbum {
             album_dir: plan.album_dir.clone(),
             entries: published_entries,
@@ -23135,6 +23354,69 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         let published = publish_album_output(feature_staging, &plan, req.publish.clone(), None)
             .expect("real fragment publish succeeds");
         (req, plan, published)
+    }
+
+
+    #[tokio::test]
+    async fn successful_real_conversion_publish_removes_staging_parent_and_locks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging_parent = temp.path().join(STAGING_PARENT_NAME);
+        std::fs::create_dir_all(&staging_parent).expect("processor-like staging parent");
+        let stale_run_lock = staging_parent.join(".old-job-old-item.run.lock");
+        std::fs::write(&stale_run_lock, b"old unheld run lock").expect("stale run lock");
+
+        let album_dir = real_fragment_album_dir(temp.path());
+        let legacy_lock = legacy_album_lock_path(&album_dir);
+        std::fs::create_dir_all(legacy_lock.parent().expect("legacy lock parent"))
+            .expect("legacy lock parent dir");
+        std::fs::write(&legacy_lock, b"legacy publish lock").expect("legacy lock");
+
+        let mut req = real_fragment_request(temp.path(), "processor-cleanup", 1, "success");
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let source = real_fragment_source(temp.path(), Some(1), 1, 1, 1);
+        let artifact_staging = StagingDir::new(
+            temp.path().join("artifact-source"),
+            "artifact-source".to_string(),
+        );
+        std::fs::create_dir_all(&artifact_staging.root).expect("artifact source staging root");
+        let artifacts = real_fragment_audio_artifacts(
+            &artifact_staging,
+            &album_dir,
+            Some(1),
+            1,
+            1,
+            "01.flac",
+            b"real-audio",
+        );
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![real_fragment_record(
+                Some(1),
+                1,
+                1,
+                true,
+                Some(album_dir.join("01.flac")),
+            )],
+            stages: stage_records(),
+        };
+        let (feature_staging, plan) = real_fragment_plan_through_features(
+            temp.path(),
+            ".tonepoet-staging/job-success-item-success",
+            &req,
+            &source,
+            &outcome,
+            artifacts,
+        )
+        .await;
+        let published = publish_album_output(feature_staging, &plan, req.publish.clone(), None)
+            .expect("real conversion publish succeeds");
+
+        assert!(published.album_dir.join("01.flac").exists());
+        assert!(!album_lock_path(&album_dir).exists(), "hidden publish lock is removed");
+        assert!(!legacy_lock.exists(), "legacy publish lock is removed");
+        assert!(
+            !staging_parent.exists(),
+            "processor-like successful conversion leaves no empty .tonepoet-staging directory"
+        );
     }
 
     #[test]
@@ -25572,7 +25854,10 @@ Source-aware setting: yes
         assert_eq!(log.matches("first concurrent log\n").count(), 1);
         assert_eq!(log.matches("second concurrent log\n").count(), 1);
         assert_eq!(conversion_related_file_names(&album_dir), vec!["conversion.log".to_string()]);
-        assert!(album_lock_path(&album_dir).exists(), "publish lock uses a hidden stable file");
+        assert!(
+            !album_lock_path(&album_dir).exists(),
+            "publish must remove the hidden album lock after successful publish"
+        );
         assert!(
             !legacy_album_lock_path(&album_dir).exists(),
             "publish must not leave a visible Album.lock file"
@@ -25580,7 +25865,7 @@ Source-aware setting: yes
     }
 
     #[test]
-    fn publish_lock_uses_hidden_stable_file_and_removes_stale_visible_lock() {
+    fn publish_lock_removes_hidden_and_stale_visible_lock_files() {
         let temp = tempfile::tempdir().expect("temp dir");
         let out = temp.path().join("out");
         let album_dir = out.join("Album");
@@ -25600,12 +25885,110 @@ Source-aware setting: yes
         let plan = incremental_single_track_plan(&album_dir, staged_audio, "01.flac", staged_log);
         publish_album_output(staging, &plan, publish, None).expect("publish succeeds");
 
-        assert!(hidden_lock.exists(), "publish lock uses the hidden stable lock path");
+        assert!(
+            !hidden_lock.exists(),
+            "publish removes the hidden lock path after successful publish"
+        );
         assert!(
             !legacy_lock.exists(),
             "publish removes stale visible Album.lock files because old-build compatibility is not supported"
         );
         assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-one");
+    }
+
+
+    #[test]
+    fn successful_publish_removes_staging_parent_and_lock_artifacts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        let staging_parent = out.join(STAGING_PARENT_NAME);
+        let staging_root = staging_parent.join("job-success-item-success");
+        std::fs::create_dir_all(&out).expect("output root");
+        std::fs::create_dir_all(&staging_parent).expect("staging parent");
+
+        let stale_run_lock = staging_parent.join(".stale-job-stale-item.run.lock");
+        std::fs::write(&stale_run_lock, b"old unheld run lock").expect("stale run lock");
+        let stale_broken_album_lock = out.join(".Album [FLAC] {}.lock");
+        std::fs::write(&stale_broken_album_lock, b"old broken template lock")
+            .expect("stale broken album lock");
+        let legacy_lock = legacy_album_lock_path(&album_dir);
+        std::fs::write(&legacy_lock, b"legacy visible album lock").expect("legacy lock");
+
+        let staging = StagingDir::new(staging_root.clone(), "job-success-item-success".to_string());
+        let staged_audio = staging.root.join("01.flac");
+        let staged_log = staging.root.join("conversion.log");
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        std::fs::write(&staged_audio, b"audio-one").expect("staged audio");
+        std::fs::write(&staged_log, b"successful conversion log\n").expect("staged log");
+
+        let plan = incremental_single_track_plan(&album_dir, staged_audio, "01.flac", staged_log);
+        publish_album_output(staging, &plan, incremental_test_publish_policy(), None)
+            .expect("publish succeeds");
+
+        assert!(album_dir.join("01.flac").exists(), "final audio is published");
+        assert!(!album_lock_path(&album_dir).exists(), "hidden album lock is removed");
+        assert!(!legacy_lock.exists(), "legacy visible album lock is removed");
+        assert!(
+            !stale_broken_album_lock.exists(),
+            "old lock files from broken empty conditional templates are swept once unheld"
+        );
+        assert!(!staging_root.exists(), "successful staging root is removed");
+        assert!(
+            !staging_parent.exists(),
+            "empty .tonepoet-staging parent is removed after successful publish"
+        );
+        let remaining_locks = std::fs::read_dir(&out)
+            .expect("output root exists")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".lock"))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert!(remaining_locks.is_empty(), "unexpected output lock files: {remaining_locks:?}");
+    }
+
+    #[test]
+    fn failed_publish_preserves_staging_parent_for_diagnostics() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("out");
+        let album_dir = out.join("Album");
+        let staging_parent = out.join(STAGING_PARENT_NAME);
+        let staging_root = staging_parent.join("job-failed-item-failed");
+        std::fs::create_dir_all(&out).expect("output root");
+        std::fs::create_dir_all(&staging_parent).expect("staging parent");
+
+        let run_lock = staging_parent.join(".failed-job-failed-item.run.lock");
+        std::fs::write(&run_lock, b"diagnostic run lock").expect("diagnostic run lock");
+
+        let staging = StagingDir::new(staging_root.clone(), "job-failed-item-failed".to_string());
+        let staged_audio = staging.root.join("01.flac");
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        std::fs::write(&staged_audio, b"audio-one").expect("staged audio");
+
+        let plan = PublishPlan {
+            album_dir: album_dir.clone(),
+            entries: vec![PublishEntry {
+                staged_path: staged_audio,
+                final_path: out.join("outside-album.flac"),
+                role: PublishRole::Audio,
+            }],
+            source_audio_track_count: 1,
+            expected_album_track_count: 1,
+            suppress_incremental_conversion_log_append: false,
+        };
+
+        let err = publish_album_output(staging, &plan, incremental_test_publish_policy(), None)
+            .expect_err("invalid final path fails before successful cleanup");
+        assert!(matches!(err, PublishError::PathOutsideOutputRoot(_)));
+        assert!(
+            staging_root.exists(),
+            "failed publish keeps staging root for diagnostics/retry"
+        );
+        assert!(
+            staging_parent.exists(),
+            "failed publish keeps .tonepoet-staging while diagnostic staging remains"
+        );
+        assert!(run_lock.exists(), "failed publish does not sweep diagnostic run locks");
     }
 
     #[test]

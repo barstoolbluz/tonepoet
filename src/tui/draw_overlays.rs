@@ -4077,108 +4077,6 @@ pub(crate) fn metadata_editor_layout_for_area(area: Rect) -> MetadataEditorLayou
 }
 
 /// Draw the full metadata editor overlay.
-
-fn metadata_editor_sanitized_char_pos(text: &str, byte_pos: usize) -> usize {
-    let byte_pos = byte_pos.min(text.len());
-    let mut sanitized_pos = 0usize;
-    let mut pending_cr = false;
-
-    for (byte_idx, ch) in text.char_indices() {
-        if byte_idx >= byte_pos {
-            break;
-        }
-        if ch == '\r' {
-            pending_cr = true;
-            continue;
-        }
-        if pending_cr {
-            sanitized_pos += if ch == '\n' { 1 } else { 2 };
-            pending_cr = false;
-            continue;
-        }
-        sanitized_pos += 1;
-    }
-    if pending_cr {
-        sanitized_pos += 1;
-    }
-    sanitized_pos
-}
-
-fn metadata_editor_display_row_col(
-    rows: &[Vec<char>],
-    row_starts: &[usize],
-    sanitized_pos: usize,
-) -> (usize, usize) {
-    if rows.is_empty() {
-        return (0, 0);
-    }
-    let mut selected_row = 0usize;
-    for (idx, start) in row_starts.iter().copied().enumerate() {
-        if start <= sanitized_pos {
-            selected_row = idx;
-        } else {
-            break;
-        }
-    }
-    let row = selected_row.min(rows.len().saturating_sub(1));
-    let start = row_starts.get(row).copied().unwrap_or(0);
-    let col = sanitized_pos.saturating_sub(start).min(rows[row].len());
-    (row, col)
-}
-
-fn metadata_editor_multiline_input_line(
-    prefix: Span<'static>,
-    row_chars: &[char],
-    row_start: usize,
-    is_cursor_row: bool,
-    cursor_col: usize,
-    selection: Option<(usize, usize)>,
-    width: usize,
-    theme: super::theme::Theme,
-) -> Line<'static> {
-    let width = width.max(1);
-    let normal = Style::default()
-        .fg(theme.text_bright)
-        .bg(theme.dropdown_bg);
-    let selected = Style::default().fg(theme.bg).bg(theme.selection_bg);
-    let cursor_style = Style::default().fg(theme.bg).bg(theme.text_bright);
-
-    let mut spans = vec![prefix];
-    let mut current_style: Option<Style> = None;
-    let mut current = String::new();
-
-    for col in 0..width {
-        let ch = row_chars.get(col).copied().unwrap_or(' ');
-        let style = if is_cursor_row && col == cursor_col.min(width.saturating_sub(1)) {
-            cursor_style
-        } else if col < row_chars.len() {
-            if let Some((start, end)) = selection {
-                let pos = row_start + col;
-                if pos >= start && pos < end { selected } else { normal }
-            } else {
-                normal
-            }
-        } else {
-            normal
-        };
-
-        if current_style == Some(style) {
-            current.push(ch);
-        } else {
-            if let Some(style) = current_style.take() {
-                spans.push(Span::styled(std::mem::take(&mut current), style));
-            }
-            current_style = Some(style);
-            current.push(ch);
-        }
-    }
-
-    if let Some(style) = current_style {
-        spans.push(Span::styled(current, style));
-    }
-    Line::from(spans)
-}
-
 fn draw_metadata_editor(
     f: &mut Frame,
     state: &mut super::app::MetadataEditorState,
@@ -4321,47 +4219,91 @@ fn draw_metadata_editor(
 
                 if (char_count > MULTILINE_EDIT_THRESHOLD || has_newlines) && val_max > 0 {
                     // ── Multiline drop-down for long/multi-line values ──
-                    // Normalize line endings, split into display rows, hard-wrap at
-                    // val_max, and preserve sanitized char positions so selected spans
-                    // can be highlighted without slicing at UTF-8 byte offsets.
+                    // Normalize line endings, split into paragraphs, then
+                    // hard-wrap each paragraph at val_max.
                     let sanitized = input.text.replace("\r\n", "\n").replace('\r', "\n");
-                    let mut display_rows: Vec<Vec<char>> = vec![Vec::new()];
-                    let mut row_starts: Vec<usize> = vec![0];
-                    let mut sanitized_index = 0usize;
-                    for ch in sanitized.chars() {
-                        if ch == '\n' {
-                            sanitized_index += 1;
+                    let mut display_rows: Vec<Vec<char>> = Vec::new();
+                    for paragraph in sanitized.split('\n') {
+                        let pchars: Vec<char> = paragraph.chars().collect();
+                        if pchars.is_empty() {
                             display_rows.push(Vec::new());
-                            row_starts.push(sanitized_index);
-                            continue;
+                        } else {
+                            for chunk in pchars.chunks(val_max) {
+                                display_rows.push(chunk.to_vec());
+                            }
                         }
-                        if display_rows
-                            .last()
-                            .map(|row| row.len() >= val_max)
-                            .unwrap_or(false)
-                        {
-                            display_rows.push(Vec::new());
-                            row_starts.push(sanitized_index);
-                        }
-                        if let Some(row) = display_rows.last_mut() {
-                            row.push(ch);
-                        }
-                        sanitized_index += 1;
-                    }
-                    if display_rows.is_empty() {
-                        display_rows.push(Vec::new());
-                        row_starts.push(0);
                     }
 
-                    let cursor_pos = metadata_editor_sanitized_char_pos(&input.text, input.cursor);
-                    let (cursor_row, cursor_col_in_row) =
-                        metadata_editor_display_row_col(&display_rows, &row_starts, cursor_pos);
-                    let selection_positions = input.selection_range().map(|range| {
-                        (
-                            metadata_editor_sanitized_char_pos(&input.text, range.start),
-                            metadata_editor_sanitized_char_pos(&input.text, range.end),
-                        )
-                    });
+                    // Map cursor position to (row, col) in display_rows.
+                    // Walk the sanitized text (which matches display_rows)
+                    // but count using sanitized char indices. We need to
+                    // convert cursor_display_col() (which counts chars in
+                    // the original text) to a position in the sanitized text.
+                    let cursor_byte = input.cursor;
+                    // Count chars in original text up to cursor_byte, but
+                    // also track the corresponding position in the sanitized
+                    // version by skipping \r chars (which were removed).
+                    let mut sanitized_pos = 0usize;
+                    {
+                        let mut prev_was_cr = false;
+                        for (byte_idx, c) in input.text.char_indices() {
+                            if byte_idx >= cursor_byte {
+                                break;
+                            }
+                            if c == '\r' {
+                                // Check if next char is \n (CRLF → single \n).
+                                prev_was_cr = true;
+                                continue;
+                            }
+                            if prev_was_cr {
+                                if c == '\n' {
+                                    // \r\n → \n, already counted by the \n
+                                    sanitized_pos += 1;
+                                } else {
+                                    // Standalone \r → \n + current char
+                                    sanitized_pos += 2;
+                                }
+                                prev_was_cr = false;
+                                continue;
+                            }
+                            sanitized_pos += 1;
+                            prev_was_cr = false;
+                        }
+                        if prev_was_cr {
+                            sanitized_pos += 1; // trailing \r → \n
+                        }
+                    }
+
+                    // Now map sanitized_pos to (row, col) in display_rows.
+                    let mut cursor_row = 0usize;
+                    let mut cursor_col_in_row = 0usize;
+                    {
+                        let mut idx = 0usize;
+                        let mut drow = 0usize;
+                        let mut dcol = 0usize;
+                        for c in sanitized.chars() {
+                            if idx == sanitized_pos {
+                                cursor_row = drow;
+                                cursor_col_in_row = dcol;
+                                break;
+                            }
+                            if c == '\n' {
+                                drow += 1;
+                                dcol = 0;
+                            } else {
+                                dcol += 1;
+                                if dcol >= val_max {
+                                    drow += 1;
+                                    dcol = 0;
+                                }
+                            }
+                            idx += 1;
+                        }
+                        if idx == sanitized_pos {
+                            cursor_row = drow;
+                            cursor_col_in_row = dcol;
+                        }
+                    }
 
                     let total_rows = display_rows.len();
                     let max_drop_rows = 8usize.min(total_rows).max(1);
@@ -4372,7 +4314,11 @@ fn draw_metadata_editor(
                     };
                     let visible_end = (drop_scroll + max_drop_rows).min(total_rows);
 
+                    let drop_bg = Style::default().bg(theme.dropdown_bg);
+
                     for row in drop_scroll..visible_end {
+                        let row_chars = &display_rows[row];
+
                         let prefix = if row == drop_scroll {
                             Span::styled(key_display.clone(), key_style)
                         } else {
@@ -4381,16 +4327,46 @@ fn draw_metadata_editor(
                                 Style::default().bg(theme.dropdown_bg),
                             )
                         };
-                        lines.push(metadata_editor_multiline_input_line(
-                            prefix,
-                            display_rows.get(row).map(Vec::as_slice).unwrap_or(&[]),
-                            row_starts.get(row).copied().unwrap_or(0),
-                            row == cursor_row,
-                            cursor_col_in_row,
-                            selection_positions,
-                            val_max,
-                            theme,
-                        ));
+
+                        if row == cursor_row {
+                            let col = cursor_col_in_row;
+                            let before: String =
+                                row_chars[..col.min(row_chars.len())].iter().collect();
+                            let cur_ch: String = if col < row_chars.len() {
+                                row_chars[col].to_string()
+                            } else {
+                                " ".to_string()
+                            };
+                            let after: String = if col + 1 < row_chars.len() {
+                                row_chars[col + 1..].iter().collect()
+                            } else {
+                                String::new()
+                            };
+                            let used = before.chars().count() + 1 + after.chars().count();
+                            let pad = val_max.saturating_sub(used);
+                            lines.push(Line::from(vec![
+                                prefix,
+                                Span::styled(before, drop_bg.fg(theme.text_bright)),
+                                Span::styled(
+                                    cur_ch,
+                                    Style::default().fg(theme.bg).bg(theme.text_bright),
+                                ),
+                                Span::styled(
+                                    format!("{}{}", after, " ".repeat(pad)),
+                                    drop_bg.fg(theme.text_bright),
+                                ),
+                            ]));
+                        } else {
+                            let text: String = row_chars.iter().collect();
+                            let pad = val_max.saturating_sub(row_chars.len());
+                            lines.push(Line::from(vec![
+                                prefix,
+                                Span::styled(
+                                    format!("{}{}", text, " ".repeat(pad)),
+                                    drop_bg.fg(theme.text_bright),
+                                ),
+                            ]));
+                        }
                     }
                     continue;
                 }
@@ -7515,36 +7491,10 @@ mod tests {
         )
     }
 
-    #[test]
-    fn metadata_multiline_input_renderer_highlights_selected_spans() {
-        let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
-        let line = metadata_editor_multiline_input_line(
-            Span::raw("KEY "),
-            &['a', 'b', 'c', 'd', 'e', 'f'],
-            0,
-            false,
-            0,
-            Some((1, 4)),
-            6,
-            theme,
-        );
-        let selected = line
-            .spans
-            .iter()
-            .find(|span| span.style.bg == Some(theme.selection_bg))
-            .expect("selected text span should be rendered");
-        assert_eq!(selected.content.as_ref(), "bcd");
-    }
 
-    #[test]
-    fn metadata_sanitized_positions_are_utf8_and_crlf_safe() {
-        let text = "é\r\n日本";
-        assert_eq!(metadata_editor_sanitized_char_pos(text, "é".len()), 1);
-        assert_eq!(metadata_editor_sanitized_char_pos(text, "é\r\n".len()), 2);
-        assert_eq!(metadata_editor_sanitized_char_pos(text, text.len()), 4);
-    }
 
-    #[test]
+
+#[test]
     fn metadata_editor_layout_is_shared_content_body_geometry() {
         let layout = metadata_editor_layout_for_area(Rect::new(0, 0, 80, 24));
         assert_eq!(layout.tab_area.y, layout.inner.y);

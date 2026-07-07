@@ -125,7 +125,7 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
     options.merge_to_single = matches!(*output_opts.merge.selected_value(), MergeMode::SingleImage);
     options.preserve_metadata = true;
     options.append_lineage_to_comment = config.conversion.append_lineage_to_comment;
-    options.write_log_file = *output_opts.write_log.selected_value();
+    options.write_log_file = config.conversion.write_log_file;
     options.generate_cue_files = config.conversion.generate_cue_files;
     options.cue_generation_mode = config.conversion.cue_generation_mode.clone();
     options.force_encode = *output_opts.force_encode.selected_value();
@@ -137,10 +137,11 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
     if let Some(settings) = options.pipeline_settings.as_mut() {
         settings.force_encode = *output_opts.force_encode.selected_value();
     }
-    options.naming_template = Some(naming_template_with_disc_subfolder(
-        output_opts.filename_template.clone(),
-        options.create_disc_subfolders,
-    ));
+    // Keep the raw user template here. The conversion/request construction
+    // boundary is responsible for applying `create_disc_subfolders` through
+    // `ConversionOptions::effective_naming_template`, so every entrypoint uses
+    // one canonical projection.
+    options.naming_template = Some(output_opts.filename_template.clone());
     options
 }
 
@@ -238,16 +239,16 @@ pub fn try_pills_to_options(
         dither_type,
         calculate_replaygain,
         replaygain_mode,
-        naming_template: Some(naming_template_with_disc_subfolder(
-            output_opts.filename_template.clone(),
-            *output_opts.disc_subfolders.selected_value(),
-        )),
+        // Store the raw editable template. `create_disc_subfolders` is applied
+        // exactly once by `ConversionOptions::effective_naming_template` when
+        // building the real PipelineRequest/NamingPolicy.
+        naming_template: Some(output_opts.filename_template.clone()),
         folder_template: Some(output_opts.folder_template.clone()),
         output_dir: output_opts.dest_path.clone(),
         merge_to_single: matches!(merge, MergeMode::SingleImage),
         preserve_metadata: true,
         append_lineage_to_comment: config.conversion.append_lineage_to_comment,
-        write_log_file: *output_opts.write_log.selected_value(),
+        write_log_file: config.conversion.write_log_file,
         generate_cue_files: config.conversion.generate_cue_files,
         cue_generation_mode: config.conversion.cue_generation_mode.clone(),
         force_encode: *output_opts.force_encode.selected_value(),
@@ -270,52 +271,6 @@ pub fn try_pills_to_options(
     })
 }
 
-
-fn naming_template_with_disc_subfolder(template: String, enabled: bool) -> String {
-    if !enabled || template.contains("%DISC_FOLDER%") {
-        return template;
-    }
-    format!("{{%DISC_FOLDER%/}}{template}")
-}
-
-#[cfg(test)]
-mod naming_template_tests {
-    use super::{naming_template_with_disc_subfolder, try_pills_to_options};
-
-    #[test]
-    fn disc_subfolder_option_uses_conditional_prefix() {
-        assert_eq!(
-            naming_template_with_disc_subfolder("%NN% - %TITLE%".to_string(), true),
-            "{%DISC_FOLDER%/}%NN% - %TITLE%"
-        );
-    }
-
-    #[test]
-    fn disc_subfolder_option_does_not_duplicate_existing_token() {
-        let template = "{%DISC_FOLDER%/}%NN% - %TITLE%".to_string();
-        assert_eq!(
-            naming_template_with_disc_subfolder(template.clone(), true),
-            template
-        );
-    }
-
-    #[test]
-    fn conversion_options_use_output_write_log_pill_not_config_default() {
-        let format = crate::tui::app::FormatState::new();
-        let mut output = crate::tui::app::OutputOptionsState::new();
-        let mut config = crate::config::TonepoetConfig::default();
-
-        config.conversion.write_log_file = false;
-        output.write_log.select_value(&true);
-        let options = try_pills_to_options(&format, &output, &config).expect("valid default options");
-        assert!(options.write_log_file);
-
-        config.conversion.write_log_file = true;
-        output.write_log.select_value(&false);
-        let options = try_pills_to_options(&format, &output, &config).expect("valid default options");
-        assert!(!options.write_log_file);
-    }
-}
 
 /// Build the unified pipeline settings from TUI format state.
 ///
@@ -615,6 +570,12 @@ fn commit_path_already_queued(
     active_queue_identities.contains(&queue_identity_path(path))
 }
 
+fn options_for_queue_request(options: &ConversionOptions) -> ConversionOptions {
+    let mut queued = options.clone();
+    queued.naming_template = Some(options.effective_naming_template("%NN% - %TITLE%"));
+    queued
+}
+
 /// Commit a batch and mark paths whose sibling CUE was already suppressed by
 /// browse expansion as sidecar-CUE metadata artifacts.
 pub fn commit_batch_with_cue_artifacts(
@@ -626,6 +587,7 @@ pub fn commit_batch_with_cue_artifacts(
     let existing = app.manager.get_items_clone();
     let mut active_queue_identities = active_queue_identity_set(&existing);
     let mut outcome = CommitOutcome::default();
+    let queued_options = options_for_queue_request(options);
 
     for path in paths {
         if commit_path_already_queued(&active_queue_identities, path) {
@@ -659,7 +621,7 @@ pub fn commit_batch_with_cue_artifacts(
 
         match app.manager.add_file_ready_for_processing_with_cue_sidecar_override(
             path.clone(),
-            options.clone(),
+            queued_options.clone(),
             archive_pw,
             cue_sidecar_override,
         ) {
@@ -994,6 +956,28 @@ mod lifecycle_forwarder_tests {
         assert_eq!(settings.dither_type, pipeline_enums::DitherType::Shibata);
     }
 
+    #[test]
+    fn pills_to_options_keeps_user_template_raw_until_request_boundary() {
+        let format = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        output.filename_template = "%ARTIST% - %ALBUM%/{%TITLE_EXTRA% }%TRACK% - %TITLE%".to_string();
+        output.disc_subfolders.select_value(&true);
+
+        let options = try_pills_to_options(&format, &output, &TonepoetConfig::default())
+            .expect("valid default TUI state");
+
+        assert_eq!(
+            options.naming_template.as_deref(),
+            Some("%ARTIST% - %ALBUM%/{%TITLE_EXTRA% }%TRACK% - %TITLE%")
+        );
+        assert!(options.create_disc_subfolders);
+        assert_eq!(
+            options.effective_naming_template("%NN% - %TITLE%"),
+            "%DISC_FOLDER%/%ARTIST% - %ALBUM%/{%TITLE_EXTRA% }%TRACK% - %TITLE%",
+            "disc-folder projection must prepend to the user's arbitrary filename template, not replace it with the default"
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -1064,6 +1048,27 @@ mod cue_sidecar_commit_metadata_tests {
             cue_sidecar_override_for_commit_path(&path, &later_no_artifact_batch),
             None,
             "a later batch with the same path vector must not inherit stale artifact metadata"
+        );
+    }
+
+
+    #[test]
+    fn queue_request_options_apply_effective_disc_subfolder_template_once() {
+        let mut options = ConversionOptions::default();
+        options.naming_template = Some("%ARTIST%/%TRACK% - %TITLE% {%TITLE_EXTRA%}".to_string());
+        options.create_disc_subfolders = true;
+
+        let queued = options_for_queue_request(&options);
+
+        assert_eq!(
+            queued.naming_template.as_deref(),
+            Some("%DISC_FOLDER%/%ARTIST%/%TRACK% - %TITLE% {%TITLE_EXTRA%}")
+        );
+        assert!(queued.create_disc_subfolders);
+        assert_eq!(
+            options_for_queue_request(&queued).naming_template.as_deref(),
+            Some("%DISC_FOLDER%/%ARTIST%/%TRACK% - %TITLE% {%TITLE_EXTRA%}"),
+            "queue/request normalization must be idempotent and must preserve the user's arbitrary template"
         );
     }
 

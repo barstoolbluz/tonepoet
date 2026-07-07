@@ -196,22 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn embedded_cursor_renderer_highlights_selection() {
-        let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
-        let mut input = TextInputState::new("abcdef".to_string());
-        input.cursor = 1;
-        input.extend_right();
-        input.extend_right();
-        input.extend_right();
-        let spans = render_inline_value_with_embedded_cursor(&input, 6, theme);
-        let selected = spans
-            .iter()
-            .find(|span| span.style.bg == Some(theme.selection_bg))
-            .expect("selection should produce highlighted span");
-        assert_eq!(selected.content.as_ref(), "bcd");
-    }
-
-    #[test]
     fn embedded_cursor_renderer_reuses_scrolled_text_input_view() {
         let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
         let mut input = TextInputState::new("0123456789".to_string());

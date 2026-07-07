@@ -4610,6 +4610,7 @@ fn execute_commit_with_source_options_transform(
         let pipeline_settings = options.pipeline_settings.clone().unwrap_or_else(|| {
             crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
         });
+        let canonical_naming_template = options.effective_naming_template("%NN% - %TITLE%");
 
         if let Ok(mut q) = app.manager.queue.try_write() {
             for item in q.all_items_mut() {
@@ -4641,6 +4642,10 @@ fn execute_commit_with_source_options_transform(
                     existing_req.pre_extracted_staging = item.pre_extracted_staging.clone();
                     existing_req.archive_metadata_overrides =
                         item.archive_metadata_overrides.clone();
+                    existing_req.naming.template = canonical_naming_template.clone();
+                    existing_req.naming.folder_template = options.folder_template.clone();
+                    existing_req.settings = pipeline_settings.clone();
+                    existing_req.merge = options.merge_to_single;
                     existing_req.companion = companion_policy.clone();
                 } else {
                     let output_root = options.output_dir.clone()
@@ -4662,10 +4667,7 @@ fn execute_commit_with_source_options_transform(
                         merge: options.merge_to_single,
                         output_root: output_root.clone(),
                         naming: NamingPolicy {
-                            template: options
-                                .naming_template
-                                .clone()
-                                .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
+                            template: canonical_naming_template.clone(),
                             folder_template: options.folder_template.clone(),
                             per_album_subdir: true,
                             collision_policy: NamingCollisionPolicy::Fail,
@@ -12723,6 +12725,33 @@ mod command_companion_policy_tests {
 
         assert!(policy_build < existing_assignment);
         assert!(policy_build < new_request_assignment);
+    }
+
+
+    #[test]
+    fn command_request_builder_uses_canonical_effective_naming_template() {
+        let source = include_str!("command.rs");
+        let command_path = source
+            .find("fn execute_commit_with_source_options_transform(")
+            .expect("command commit path should exist");
+        let command_body = &source[command_path..];
+
+        let canonical_build = command_body
+            .find(r#"let canonical_naming_template = options.effective_naming_template("%NN% - %TITLE%");"#)
+            .expect("commit path must build canonical naming template from ConversionOptions");
+        let existing_assignment = command_body
+            .find("existing_req.naming.template = canonical_naming_template.clone();")
+            .expect("prebuilt PipelineRequest branch must refresh canonical naming template");
+        let new_request_assignment = command_body
+            .find("template: canonical_naming_template.clone(),")
+            .expect("manual PipelineRequest initializer must use canonical naming template");
+
+        assert!(canonical_build < existing_assignment);
+        assert!(canonical_build < new_request_assignment);
+        assert!(
+            !command_body.contains(".naming_template\n                                .clone()"),
+            "request construction must not bypass ConversionOptions::effective_naming_template"
+        );
     }
 }
 

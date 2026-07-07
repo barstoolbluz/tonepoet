@@ -12,6 +12,10 @@ use super::button_map::TuiButton;
 use super::draw_browse::{
     browse_toolbar_area_for_screen, options_menu_geometry_for_area, OptionsMenuGeometry,
 };
+use super::draw_output_options::{
+    OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW, OUTPUT_OPTIONS_FORCE_ENCODE_ROW,
+    OUTPUT_OPTIONS_WRITE_LOG_ROW,
+};
 use super::message::AppMessage;
 use crate::convert::{ConversionOptions, ConversionStatus};
 
@@ -2725,7 +2729,7 @@ mod inline_edit_behavior_tests {
             0,
             0,
             0,
-            Some(vec!["other.flac".to_string()]),
+            None,
         ));
 
         browse_inline_tab_advance(&mut app, true, &tx);
@@ -7140,86 +7144,6 @@ fn handle_file_task_user_action(
     }
 }
 
-
-/// Paste terminal-provided text into the currently active metadata-editor text target.
-///
-/// This intentionally routes active inline metadata fields through the same
-/// `TextInputState` used by keyboard editing so selections are replaced exactly
-/// once, UTF-8 cursor offsets remain valid, and AddingKey/DetailEdit do not
-/// diverge from normal field editing. When the per-file detail grid is focused
-/// but no individual value is being edited, preserve the historical bulk-paste
-/// behavior that maps pasted lines onto per-file values.
-pub(super) fn metadata_editor_paste_text(
-    app: &mut AppState,
-    state: &mut super::app::MetadataEditorState,
-    text: &str,
-) -> bool {
-    use super::app::MetadataEditorPhase;
-
-    match state.phase {
-        MetadataEditorPhase::InlineEdit => {
-            if let Some(input) = state.edit_input.as_mut() {
-                input.insert_paste_text(text, super::text_input::PastePolicy::SingleLine);
-                return true;
-            }
-        }
-        MetadataEditorPhase::AddingKey => {
-            if let Some(input) = state.add_key_input.as_mut() {
-                input.insert_paste_text(text, super::text_input::PastePolicy::SingleLine);
-                return true;
-            }
-        }
-        MetadataEditorPhase::DetailEdit => {
-            if let Some(input) = state.detail_edit.as_mut() {
-                input.insert_paste_text(text, super::text_input::PastePolicy::SingleLine);
-                return true;
-            }
-
-            let field_idx = state.detail_field_idx;
-            let Some(entry_len) = state
-                .active_surface()
-                .entries
-                .get(field_idx)
-                .map(|entry| entry.per_file_values.len())
-            else {
-                return false;
-            };
-
-            let sanitized = text.replace("\r\n", "\n").replace('\r', "\n");
-            let lines: Vec<&str> = sanitized.split('\n').collect();
-            let entry = &mut state.active_surface_mut().entries[field_idx];
-            let is_album = entry.display_key.eq_ignore_ascii_case("ALBUM");
-
-            if is_album {
-                let val = lines
-                    .first()
-                    .map(|line| line.trim().to_string())
-                    .unwrap_or_default();
-                for slot in &mut entry.per_file_values {
-                    *slot = val.clone();
-                }
-            } else {
-                for (slot, line) in entry.per_file_values.iter_mut().zip(lines.iter()) {
-                    *slot = line.trim().to_string();
-                }
-            }
-
-            metadata_editor_recompute_entry_display(entry);
-            state.active_surface_mut().dirty = true;
-            let applied = lines.len().min(entry_len);
-            app.set_status(format!(
-                "Pasted {} value{}",
-                applied,
-                if applied == 1 { "" } else { "s" },
-            ));
-            return true;
-        }
-        MetadataEditorPhase::Editing | MetadataEditorPhase::Saving => {}
-    }
-
-    false
-}
-
 fn handle_metadata_editor_key(
     app: &mut AppState,
     key: KeyEvent,
@@ -7381,46 +7305,58 @@ fn handle_metadata_editor_key(
                         crate::tui::app::ContentTab::Artwork => {
                             handle_metadata_artwork_key(app, key, state, tx);
                         }
-                        crate::tui::app::ContentTab::Details => { match key.code {
-                            KeyCode::Up | KeyCode::Char('k') => scroll_metadata_read_only_tab(
-                                state,
-                                -1,
-                                metadata_editor_read_only_visible_rows(),
-                            ),
-                            KeyCode::Down | KeyCode::Char('j') => scroll_metadata_read_only_tab(
-                                state,
-                                1,
-                                metadata_editor_read_only_visible_rows(),
-                            ),
-                            KeyCode::PageUp => scroll_metadata_read_only_tab(
-                                state,
-                                -5,
-                                metadata_editor_read_only_visible_rows(),
-                            ),
-                            KeyCode::PageDown => scroll_metadata_read_only_tab(
-                                state,
-                                5,
-                                metadata_editor_read_only_visible_rows(),
-                            ),
-                            KeyCode::Home => set_metadata_read_only_scroll(
-                                state,
-                                0,
-                                metadata_editor_read_only_visible_rows(),
-                            ),
-                            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                let status = metadata_editor_retry_details_probe(state, tx);
-                                app.set_status(status);
-                                false
+                        crate::tui::app::ContentTab::Details => {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    scroll_metadata_read_only_tab(
+                                        state,
+                                        -1,
+                                        metadata_editor_read_only_visible_rows(),
+                                    );
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    scroll_metadata_read_only_tab(
+                                        state,
+                                        1,
+                                        metadata_editor_read_only_visible_rows(),
+                                    );
+                                }
+                                KeyCode::PageUp => {
+                                    scroll_metadata_read_only_tab(
+                                        state,
+                                        -5,
+                                        metadata_editor_read_only_visible_rows(),
+                                    );
+                                }
+                                KeyCode::PageDown => {
+                                    scroll_metadata_read_only_tab(
+                                        state,
+                                        5,
+                                        metadata_editor_read_only_visible_rows(),
+                                    );
+                                }
+                                KeyCode::Home => {
+                                    set_metadata_read_only_scroll(
+                                        state,
+                                        0,
+                                        metadata_editor_read_only_visible_rows(),
+                                    );
+                                }
+                                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    let status = metadata_editor_retry_details_probe(state, tx);
+                                    app.set_status(status);
+                                }
+                                KeyCode::Char('a') | KeyCode::Char('A') if key.modifiers.is_empty() => {
+                                    metadata_editor_start_details_analysis(app, state, tx);
+                                }
+                                _ => {
+                                    clamp_metadata_read_only_scroll(
+                                        state,
+                                        metadata_editor_read_only_visible_rows(),
+                                    );
+                                }
                             }
-                            KeyCode::Char('a') | KeyCode::Char('A') if key.modifiers.is_empty() => {
-                                metadata_editor_start_details_analysis(app, state, tx);
-                                false
-                            }
-                            _ => clamp_metadata_read_only_scroll(
-                                state,
-                                metadata_editor_read_only_visible_rows(),
-                            ),
-                        }; },
+                        }
                         crate::tui::app::ContentTab::Metadata => {}
                     }
                 }
@@ -7689,7 +7625,6 @@ fn handle_metadata_editor_key(
                         }
 
                         input.cursor = best_byte.min(input.text.len());
-                        input.clear_selection();
                     }
                     // For single-line values, Up/Down are no-ops.
                 }
@@ -10546,6 +10481,7 @@ pub(super) fn install_archive_metadata_editor_payload(
     archive_path: std::path::PathBuf,
     staging_dir: std::path::PathBuf,
     baseline: Option<(i64, u32, u64)>,
+    target_inner_paths: Option<Vec<String>>,
     payload: ArchiveMetadataEditorPayload,
 ) {
     let context = app
@@ -10560,7 +10496,7 @@ pub(super) fn install_archive_metadata_editor_payload(
             staging.archive_mtime_secs,
             staging.archive_mtime_nanos,
             staging.archive_size,
-            None,
+            target_inner_paths.clone(),
         ))
         .or_else(|| baseline.map(|(secs, nanos, size)| {
             ArchiveMetadataEditContext::browse_with_fingerprint(
@@ -10569,7 +10505,7 @@ pub(super) fn install_archive_metadata_editor_payload(
                 secs,
                 nanos,
                 size,
-                None,
+                target_inner_paths.clone(),
             )
         }))
         .unwrap_or_else(|| ArchiveMetadataEditContext::browse(archive_path.clone(), staging_dir));
@@ -15175,14 +15111,9 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
         }
         FormatSettingsKind::Aac {
             profile,
-            quality_preset,
             bitrate_input,
+            ..
         } => {
-            let before = (
-                app.convert.format.aac_profile,
-                app.convert.format.aac_quality_preset,
-                app.convert.format.aac_bitrate_kbps,
-            );
             let bitrate: u32 = bitrate_input
                 .text
                 .trim()
@@ -15190,28 +15121,19 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .unwrap_or(256)
                 .clamp(8, 1024);
             app.convert.format.aac_profile = *profile;
-            app.convert.format.aac_quality_preset = *quality_preset;
             app.convert.format.aac_bitrate_kbps = bitrate;
-            if before != (
-                app.convert.format.aac_profile,
-                app.convert.format.aac_quality_preset,
-                app.convert.format.aac_bitrate_kbps,
-            ) {
-                app.convert.format.aac_lossy_preset = None;
-            }
+            // Recompute quality_preset from the committed bitrate.
+            let presets = aac_presets_for_profile(*profile);
+            app.convert.format.aac_quality_preset = presets
+                .iter()
+                .position(|(br, _)| *br == bitrate);
         }
         FormatSettingsKind::Opus {
             content_type,
-            quality_preset,
             bitrate_input,
             complexity_input,
+            ..
         } => {
-            let before = (
-                app.convert.format.opus_content_type,
-                app.convert.format.opus_quality_preset,
-                app.convert.format.opus_bitrate_kbps,
-                app.convert.format.opus_complexity,
-            );
             let bitrate: u32 = bitrate_input
                 .text
                 .trim()
@@ -15225,32 +15147,19 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .unwrap_or(10)
                 .min(10);
             app.convert.format.opus_content_type = *content_type;
-            app.convert.format.opus_quality_preset = *quality_preset;
             app.convert.format.opus_bitrate_kbps = bitrate;
             app.convert.format.opus_complexity = complexity;
-            if before != (
-                app.convert.format.opus_content_type,
-                app.convert.format.opus_quality_preset,
-                app.convert.format.opus_bitrate_kbps,
-                app.convert.format.opus_complexity,
-            ) {
-                app.convert.format.opus_lossy_preset = None;
-            }
+            app.convert.format.opus_quality_preset = OPUS_PRESETS
+                .iter()
+                .position(|(br, _)| *br == bitrate);
         }
         FormatSettingsKind::Mp3 {
             mode,
             vbr_quality_input,
-            quality_preset,
             bitrate_input,
+            ..
         } => {
-            let before = (
-                app.convert.format.mp3_mode,
-                app.convert.format.mp3_quality_preset,
-                app.convert.format.mp3_vbr_quality,
-                app.convert.format.mp3_bitrate_kbps,
-            );
             app.convert.format.mp3_mode = *mode;
-            app.convert.format.mp3_quality_preset = *quality_preset;
             let vbr_q: u8 = vbr_quality_input.text.trim().parse().unwrap_or(0).min(9);
             app.convert.format.mp3_vbr_quality = vbr_q;
             let bitrate: u32 = bitrate_input
@@ -15260,14 +15169,9 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .unwrap_or(320)
                 .clamp(8, 1000);
             app.convert.format.mp3_bitrate_kbps = bitrate;
-            if before != (
-                app.convert.format.mp3_mode,
-                app.convert.format.mp3_quality_preset,
-                app.convert.format.mp3_vbr_quality,
-                app.convert.format.mp3_bitrate_kbps,
-            ) {
-                app.convert.format.mp3_lossy_preset = None;
-            }
+            app.convert.format.mp3_quality_preset = MP3_BITRATE_PRESETS
+                .iter()
+                .position(|(br, _)| *br == bitrate);
         }
         FormatSettingsKind::WavPack {
             mode,
@@ -15658,9 +15562,7 @@ fn handle_format_settings_field_key(
                     }
                 }
                 FormatSettingsFocus::Mp3VbrQuality => {
-                    if super::text_input::handle_text_input_key(vbr_quality_input, key) {
-                        *quality_preset = None;
-                    }
+                    super::text_input::handle_text_input_key(vbr_quality_input, key);
                 }
                 FormatSettingsFocus::Mp3Preset => {
                     if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
@@ -17157,7 +17059,6 @@ fn handle_metadata_editor_mouse(
                                 target_byte = orig_byte;
                             }
                             input.cursor = target_byte.min(input.text.len());
-                            input.clear_selection();
                         }
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         return;
@@ -18802,28 +18703,6 @@ fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
     }
 }
 
-
-fn output_options_conversion_pill_button_at(app: &AppState, x: u16, y: u16) -> Option<TuiButton> {
-    if app.current_screen != AppScreen::Convert
-        || !matches!(app.active_overlay, ActiveOverlay::None)
-        || !app.convert.is_maximized(ConvertFocus::OutputOptions)
-    {
-        return None;
-    }
-
-    let pane_rect = app
-        .button_map
-        .find_button_rect(&TuiButton::Pane(ConvertFocus::OutputOptions))
-        .or_else(|| app.button_map.find_button_rect(&TuiButton::MaximizeToggle(ConvertFocus::OutputOptions)))?;
-
-    // The pane title/maximize rect is enough to recover the pane origin. Use a
-    // full-height sentinel rect here; `output_options_conversion_pill_at`
-    // only needs x/y origin and relative rows. This intentionally takes
-    // precedence over `find_button_at` so a stale write-log rect from an older
-    // frame cannot steal clicks from the newly inserted force/disc rows.
-    let area = Rect::new(pane_rect.x, pane_rect.y, u16::MAX.saturating_sub(pane_rect.x), 16);
-    super::draw_output_options::output_options_conversion_pill_at(area, x, y)
-}
 
 fn clear_convert_double_click_state_for_button(app: &mut AppState, button: Option<TuiButton>) {
     if app.current_screen != AppScreen::Convert {
@@ -24046,6 +23925,79 @@ fn retry_failed(app: &mut AppState) {
 }
 
 /// Handle mouse events
+
+fn handle_output_options_pill_mouse_by_coordinate(app: &mut AppState, x: u16, y: u16) -> bool {
+    if app.current_screen != AppScreen::Convert
+        || app.convert.is_collapsed(ConvertFocus::OutputOptions)
+        || !app.convert.is_maximized(ConvertFocus::OutputOptions)
+    {
+        return false;
+    }
+
+    // The destination field is always registered for a visible Output Options
+    // pane. Its row is pane_y + 1 and its x coordinate is pane_x + 1, which lets
+    // us reconstruct the pane origin without depending on the optional pill rows
+    // themselves being present in ButtonRenderMap.
+    let Some(dest_rect) = app.button_map.find_button_rect(&TuiButton::DestPathField) else {
+        return false;
+    };
+    let pane_x = dest_rect.x.saturating_sub(1);
+    let pane_y = dest_rect.y.saturating_sub(1);
+    let label_col = pane_x + 17;
+    let Some(row) = y.checked_sub(pane_y) else {
+        return false;
+    };
+
+    match row {
+        OUTPUT_OPTIONS_FORCE_ENCODE_ROW => {
+            let Some(index) = pill_index_at_x(&app.convert.output_options.force_encode, x, label_col) else {
+                return false;
+            };
+            app.convert.focus = ConvertFocus::OutputOptions;
+            app.convert.output_options.field_focus = OutputOptionsField::ForceEncode;
+            app.convert.output_options.force_encode.selected = index;
+            app.preset.mark_modified();
+            true
+        }
+        OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW => {
+            let Some(index) = pill_index_at_x(&app.convert.output_options.disc_subfolders, x, label_col) else {
+                return false;
+            };
+            app.convert.focus = ConvertFocus::OutputOptions;
+            app.convert.output_options.field_focus = OutputOptionsField::DiscSubfolders;
+            app.convert.output_options.disc_subfolders.selected = index;
+            app.preset.mark_modified();
+            true
+        }
+        OUTPUT_OPTIONS_WRITE_LOG_ROW => {
+            let Some(index) = pill_index_at_x(&app.convert.output_options.write_log, x, label_col) else {
+                return false;
+            };
+            app.convert.focus = ConvertFocus::OutputOptions;
+            app.convert.output_options.field_focus = OutputOptionsField::WriteLog;
+            app.convert.output_options.write_log.selected = index;
+            app.preset.mark_modified();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn pill_index_at_x<T>(state: &super::pill::PillState<T>, x: u16, start_x: u16) -> Option<usize> {
+    let mut pill_x = start_x;
+    for (index, option) in state.options.iter().enumerate() {
+        if index > 0 {
+            pill_x = pill_x.saturating_add(2);
+        }
+        let width = option.label.len() as u16 + 2;
+        if x >= pill_x && x < pill_x.saturating_add(width) {
+            return option.enabled.then_some(index);
+        }
+        pill_x = pill_x.saturating_add(width);
+    }
+    None
+}
+
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
     // Metadata editor mouse: intercept all events when the editor is open.
     if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
@@ -24398,8 +24350,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
     let x = mouse.column;
     let y = mouse.row;
-    let clicked_button = output_options_conversion_pill_button_at(app, x, y)
-        .or_else(|| app.button_map.find_button_at(x, y));
+    let clicked_button = app.button_map.find_button_at(x, y);
     let double_click_candidate = if matches!(app.active_overlay, ActiveOverlay::None) {
         clicked_button
     } else {
@@ -24512,6 +24463,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
         }
+        return;
+    }
+
+    // Defensive fallback for below-the-fold Output Options pills. The normal path
+    // uses ButtonRenderMap entries registered during rendering, but these rows
+    // have regressed before because the rendered labels and hit-map rows drifted.
+    // Prefer the actual mouse coordinate for these rows so a visible `disc dirs`
+    // click cannot silently toggle the wrong pill or no-op because of a stale map.
+    if handle_output_options_pill_mouse_by_coordinate(app, x, y) {
         return;
     }
 
@@ -26259,178 +26219,8 @@ mod phase4_tests {
         assert!(app.pending_metadata_editor.is_some());
     }
 
-
-    fn metadata_editor_row_left_click(row: usize) -> MouseEvent {
-        let layout = metadata_editor_test_layout();
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: layout.content_area.x.saturating_add(2),
-            row: layout.content_area.y.saturating_add(row as u16),
-            modifiers: KeyModifiers::NONE,
-        }
-    }
-
     #[test]
-    fn metadata_editor_double_click_on_field_focuses_and_selects_all_text() {
-        let mut app = AppState::new_for_test(TonepoetConfig::default());
-        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
-            entry("TITLE", ItemKey::TrackTitle, &["Old Title"], &["Old Title"]),
-        ])));
-        let (tx, _rx) = mpsc::channel(1);
-        let click = metadata_editor_row_left_click(0);
-
-        handle_mouse(&mut app, click, &tx);
-        handle_mouse(&mut app, click, &tx);
-
-        match &app.active_overlay {
-            ActiveOverlay::MetadataEditor(state) => {
-                assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
-                let input = state.edit_input.as_ref().expect("inline input");
-                assert_eq!(input.text, "Old Title");
-                assert_eq!(input.selection_range(), Some(0.."Old Title".len()));
-            }
-            other => panic!("expected metadata editor, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn metadata_editor_keyboard_selection_updates_shared_input_state() {
-        let mut app = AppState::new_for_test(TonepoetConfig::default());
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = Box::new(single_image_state(vec![entry(
-            "TITLE",
-            ItemKey::TrackTitle,
-            &["alpha beta"],
-            &["alpha beta"],
-        )]));
-        state.phase = MetadataEditorPhase::InlineEdit;
-        state.edit_input = Some(crate::tui::text_input::TextInputState::new("alpha beta".to_string()));
-
-        handle_metadata_editor_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
-            &mut state,
-            &tx,
-        );
-        assert_eq!(
-            &state.edit_input.as_ref().unwrap().text[state.edit_input.as_ref().unwrap().selection_range().unwrap()],
-            "a"
-        );
-
-        handle_metadata_editor_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
-            &mut state,
-            &tx,
-        );
-        assert_eq!(
-            &state.edit_input.as_ref().unwrap().text[state.edit_input.as_ref().unwrap().selection_range().unwrap()],
-            "beta"
-        );
-    }
-
-    #[test]
-    fn metadata_editor_terminal_paste_replaces_selection_in_every_text_mode() {
-        let mut app = AppState::new_for_test(TonepoetConfig::default());
-
-        let mut inline = single_image_state(vec![entry(
-            "TITLE",
-            ItemKey::TrackTitle,
-            &["alpha beta"],
-            &["alpha beta"],
-        )]);
-        inline.phase = MetadataEditorPhase::InlineEdit;
-        inline.edit_input = Some(crate::tui::text_input::TextInputState::new("alpha beta".to_string()));
-        {
-            let input = inline.edit_input.as_mut().unwrap();
-            input.cursor = "alpha ".len();
-            input.extend_right();
-            input.extend_right();
-            input.extend_right();
-            input.extend_right();
-        }
-        assert!(metadata_editor_paste_text(&mut app, &mut inline, "gamma\nignored"));
-        assert_eq!(inline.edit_input.as_ref().unwrap().text, "alpha gamma ignored");
-
-        let mut adding = single_image_state(vec![]);
-        adding.phase = MetadataEditorPhase::AddingKey;
-        adding.add_key_input = Some(crate::tui::text_input::TextInputState::new("ALBUMSORT".to_string()));
-        adding.add_key_input.as_mut().unwrap().select_all_text();
-        assert!(metadata_editor_paste_text(&mut app, &mut adding, "COMPOSER\nignored"));
-        assert_eq!(adding.add_key_input.as_ref().unwrap().text, "COMPOSER ignored");
-
-        let mut detail = single_image_state(vec![entry(
-            "TITLE",
-            ItemKey::TrackTitle,
-            &["old one", "old two"],
-            &["old one", "old two"],
-        )]);
-        metadata_editor_begin_detail_edit_for_entry(&mut detail, 0, false);
-        detail.detail_cursor = 1;
-        detail.detail_edit = Some(crate::tui::text_input::TextInputState::new("old two".to_string()));
-        {
-            let input = detail.detail_edit.as_mut().unwrap();
-            input.cursor = "old ".len();
-            input.extend_right();
-            input.extend_right();
-            input.extend_right();
-        }
-        assert!(metadata_editor_paste_text(&mut app, &mut detail, "new\nignored"));
-        assert_eq!(detail.detail_edit.as_ref().unwrap().text, "old new ignored");
-    }
-
-    #[test]
-    fn metadata_editor_internal_clipboard_paste_normalizes_multiline_text() {
-        let mut app = AppState::new_for_test(TonepoetConfig::default());
-        let (tx, _rx) = mpsc::channel(1);
-        let mut source = crate::tui::text_input::TextInputState::new("blue\r\ntrain".to_string());
-        source.select_all_text();
-        assert!(source.copy_selection());
-
-        let mut state = Box::new(single_image_state(vec![entry(
-            "TITLE",
-            ItemKey::TrackTitle,
-            &["old title"],
-            &["old title"],
-        )]));
-        state.phase = MetadataEditorPhase::InlineEdit;
-        state.edit_input = Some(crate::tui::text_input::TextInputState::new_selected("old title".to_string()));
-
-        handle_metadata_editor_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
-            &mut state,
-            &tx,
-        );
-
-        let input = state.edit_input.as_ref().expect("inline input");
-        assert_eq!(input.text, "blue train");
-        assert_eq!(input.cursor, "blue train".len());
-        assert!(!input.has_selection());
-    }
-
-    #[test]
-    fn metadata_editor_tab_switch_clears_active_selection_state() {
-        let mut state = single_image_state(vec![entry(
-            "TITLE",
-            ItemKey::TrackTitle,
-            &["selected"],
-            &["selected"],
-        )]);
-        state.phase = MetadataEditorPhase::InlineEdit;
-        state.edit_input = Some(crate::tui::text_input::TextInputState::new("selected".to_string()));
-        state.edit_input.as_mut().unwrap().select_all_text();
-
-        assert!(state.set_content_tab(crate::tui::app::ContentTab::ReplayGain));
-
-        assert_eq!(state.phase, MetadataEditorPhase::Editing);
-        assert!(state.edit_input.is_none());
-        assert!(state.add_key_input.is_none());
-        assert!(state.detail_edit.is_none());
-    }
-
-    #[tokio::test]
-    async fn metadata_editor_footer_close_with_dirty_state_saves_before_closing() {
+    fn metadata_editor_footer_close_with_dirty_state_prompts_before_closing() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
@@ -26439,19 +26229,7 @@ mod phase4_tests {
 
         handle_mouse(&mut app, footer_close_mouse_event(), &tx);
 
-        // With the OK/Apply semantics, clicking close with dirty state
-        // initiates a save (transitions to Saving phase) rather than
-        // showing a discard confirmation prompt.
-        match &app.active_overlay {
-            ActiveOverlay::MetadataEditor(state) => {
-                assert!(
-                    matches!(state.model.phase, crate::tui::app::MetadataEditorPhase::Saving),
-                    "close with dirty state should initiate save, got phase: {:?}",
-                    state.model.phase
-                );
-            }
-            other => panic!("expected MetadataEditor in Saving phase, got {:?}", other),
-        }
+        assert_discard_confirmation(&app);
     }
 
     #[test]

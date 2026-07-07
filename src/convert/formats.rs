@@ -393,7 +393,7 @@ pub struct ConversionOptions {
     #[serde(default)]
     pub force_encode: bool,
 
-    /// Create `Disc NN` subfolders for detected multi-disc sets - defaults to false
+    /// Create `disc NN` subfolders for detected multi-disc sets - defaults to false
     #[serde(default)]
     pub create_disc_subfolders: bool,
 
@@ -491,6 +491,21 @@ impl Default for ConversionOptions {
 }
 
 impl ConversionOptions {
+    /// Effective file naming template for pipeline/request construction.
+    ///
+    /// `create_disc_subfolders` is a first-class conversion option, so queue and
+    /// processor code must not rely on the TUI having already mutated the raw
+    /// filename template. This method is the canonical handoff point from
+    /// `ConversionOptions` into `PipelineRequest::naming.template`.
+    #[must_use]
+    pub fn effective_naming_template(&self, default_template: &str) -> String {
+        let template = self
+            .naming_template
+            .clone()
+            .unwrap_or_else(|| default_template.to_string());
+        naming_template_with_disc_subfolder(template, self.create_disc_subfolders)
+    }
+
     /// Effective, normalized loose companion-file extensions for pipeline use.
     #[must_use]
     pub fn effective_companion_extensions(&self) -> Vec<String> {
@@ -508,6 +523,28 @@ impl ConversionOptions {
         }
         parse_companion_folders(&self.companion_folders.join(","))
     }
+}
+
+
+/// Token expanded by the planner into `disc NN` for detected multi-disc sets.
+pub const DISC_FOLDER_TEMPLATE_TOKEN: &str = "%DISC_FOLDER%";
+
+/// Return `template` with a leading disc-folder component when requested.
+///
+/// This helper is intentionally backend-owned rather than TUI-owned: the UI may
+/// surface `create_disc_subfolders`, but the conversion/processor handoff is
+/// responsible for preserving the option for every entrypoint. Existing explicit
+/// `%DISC_FOLDER%` tokens are respected to keep the operation idempotent.
+#[must_use]
+pub fn naming_template_with_disc_subfolder(
+    template: impl Into<String>,
+    create_disc_subfolders: bool,
+) -> String {
+    let template = template.into();
+    if !create_disc_subfolders || template.contains(DISC_FOLDER_TEMPLATE_TOKEN) {
+        return template;
+    }
+    format!("{DISC_FOLDER_TEMPLATE_TOKEN}/{template}")
 }
 
 /// Quality settings for different formats
