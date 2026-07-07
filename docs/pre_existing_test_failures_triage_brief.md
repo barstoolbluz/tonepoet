@@ -30,10 +30,10 @@ From `243d508` (naming template expansion). `%NONEXISTENT%` at end of template e
 ### 6. `title_extra_tests::preserves_country_only_parenthetical` (stages.rs)
 From `f0d8c7e` (%TITLE_EXTRA%). `extract_title_extra("Aftermath (US)")` should return `None` (country-only parentheticals must stay in the album title); it returns `Some(...)`. Note the sibling test `strips_last_parenthetical_only` passes `"Aftermath (US) (ABKCO Hybrid SACD ISO)"` and expects `(US)` preserved — so the country allowlist works in the two-parenthetical case but the single `(US)` parenthetical is still being extracted.
 
-### 7. `chunk_2_1_3_postprocessing_gate_and_phase_tests::failed_publish_preserves_staging_parent_for_diagnostics` (stages.rs:26380)
+### 7. `chunk_2_1_3_postprocessing_gate_and_phase_tests::failed_publish_preserves_staging_parent_for_diagnostics` (stages.rs:26494)
 Assertion: "failed publish keeps staging root for diagnostics/retry". After a forced publish failure the staging parent directory no longer exists (or is cleaned) where the test expects it preserved. Interacts with the scratch/tmpfs staging cleanup work.
 
-### 8. `chunk_2_1_3_postprocessing_gate_and_phase_tests::real_plan_output_failure_publishes_fragment_and_completes_batch` (stages.rs:25816)
+### 8. `chunk_2_1_3_postprocessing_gate_and_phase_tests::real_plan_output_failure_publishes_fragment_and_completes_batch` (stages.rs:25930)
 The test expects a path-escaping naming template (one that would escape the destination root) to fail during output planning; `plan_outputs` now succeeds and returns a sanitized in-root path (`.../Test Album/escaped-plan-output.flac`). Either the planner's escape handling changed from fail to sanitize (then the test should assert sanitization), or the sanitization silently swallows what should be a planning error.
 
 ### 9. `output_options_companion_projection_tests::output_options_field_cycle_includes_companion_fields_when_maximized` (src/tui/app.rs:3828)
@@ -57,7 +57,7 @@ out/
 └── Disc 02/01 - Hot ’Lanta.flac … 03 - Whipping Post.flac
 ```
 
-Why: a regular audio folder converts as a **folder album batch** — each file is dispatched as an independent single-track job (`prepare_independent_single_file_album_batch_for_dispatch`, one `PipelineRequest`/`PreparedSource` per file; the conversion.log shows seven distinct job ids each planning `.track-0001`). `%DISC_FOLDER%` is gated by `source_has_proven_multi_disc_layout(source)` (stages.rs:15408), which is evaluated **per job**, where the source contains exactly one track:
+Why: a regular audio folder converts as a **folder album batch** — each file is dispatched as an independent single-track job (`prepare_independent_single_file_album_batch_for_dispatch`, one `PipelineRequest`/`PreparedSource` per file; the conversion.log shows seven distinct job ids each planning `.track-0001`). `%DISC_FOLDER%` is gated by `source_has_proven_multi_disc_layout(source)` (stages.rs:15444), which is evaluated **per job**, where the source contains exactly one track:
 
 - a disc 2 track proves a multi-disc layout by itself (disc number 2 > 1) → `Disc 02` created;
 - a disc 1 track cannot (its only evidence is disc number 1, and the deliberate `album_metadata_disc_one_without_total_does_not_create_single_disc_folder` rule suppresses single-disc folders) → rendered into the album root.
@@ -68,11 +68,20 @@ One caveat for your triage: this fix relies on the tags carrying a disc total. A
 
 This failure is the same feature area as failures 1–3; triage them together.
 
+## Related: CLI folder scan queues CUE sidecars alongside their split tracks
+
+Observed while verifying the disc-folder fix (same album; each disc directory also contains two `.cue` files — one `{noncompliant}`, one `{Single Wave}` referencing an image that does not exist next to it). `tonepoet convert <album folder>` queues 11 items: 7 FLACs + 4 CUEs. The result:
+
+- FLAC-only copy of the same tree: `7/7 succeeded, 0 failed`.
+- Original tree with CUEs: `2/11 succeeded, 9 failed` — yet **all 7 output files publish correctly** (both per-disc conversion.logs report all tracks successful).
+
+Two distinct problems: (a) the CLI scan queues CUE sheets even when the split per-track audio they describe is being queued from the same directories — the Browse/TUI queue expansion has CUE-suppression logic for exactly this, the CLI path does not; (b) queue item status accounting misreports: only 2 of 11 items end Completed although every FLAC's audio converted and published (summary printed from `completed_items()`/`failed_items()` in `run_convert`, src/main.rs:920). At most 4 items (the CUEs) can have genuinely failed, so at least 5 successfully-published items are being counted as failed; the exact per-item split was not instrumented. Worth fixing (a) first, then re-checking whether (b) reproduces at all.
+
 ## Constraints
 
 - Fix whichever side (test or implementation) matches the intended product behavior; note the decision per failure.
 - Do not change the `pub(super)` visibility fix or the `use super::naming_template_tests::{template_request, template_source};` import — those are required for the test build to compile.
-- All other 2519 lib tests pass; do not regress them.
+- All other 2523 lib tests pass; do not regress them.
 
 ## Relevant files
 
