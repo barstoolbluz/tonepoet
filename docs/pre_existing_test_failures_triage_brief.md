@@ -1,0 +1,51 @@
+# Triage brief: 9 pre-existing test failures hidden by a broken test build
+
+Date: 2026-07-07
+
+## Background — how these went unnoticed
+
+The test build (`cargo test`) at commit `549040b` did not compile: `title_extra_tests` in `src/convert/pipeline/stages.rs` called `template_source()` / `template_request()` from the sibling `naming_template_tests` module without visibility or an import (16 compile errors). Because the lib test binary failed to build, **no lib tests ran** in the sessions that landed the recent feature commits, and `cargo test`'s fail-fast behavior also meant integration binaries were skipped.
+
+The visibility errors are now fixed (`pub(super)` on the two helpers plus an import in `title_extra_tests`), which surfaced 9 test failures that pre-date the udfread crash bundle. Each failure below was introduced with its feature commit and has never passed.
+
+These are all cases where the test's expectation and the implementation disagree. You wrote both sides (in different bundles); decide which side is correct and fix that side.
+
+## Failures
+
+### 1. `title_extra_tests::create_disc_subfolders_option_reaches_planned_final_paths` (stages.rs)
+From `92b2d4e` (disc subfolders). Expected `plan.entries[2].final_path` = `/out/Disc 01/Miles Davis/2 - Done Somebody Wrong.flac`; actual `1 - Done Somebody Wrong.flac`. The `%TRACK%` token in the planned final path renders `1` where the test expects `2` — track numbering within inferred disc groups appears to renumber (or not renumber) differently than the test assumes. The fixture is a 4-track, 2-disc source with explicit per-track disc numbers.
+
+### 2. `title_extra_tests::album_total_discs_without_track_disc_numbers_does_not_infer_disc_folders` (stages.rs)
+From `ac59b26`. Fixture: `total_discs = Some(2)` but every track has `disc_number = None` and sequential track numbers 1–3. Expected `%NN%` to render the track's own number (`02 - Middle`); actual `01 - Middle`. Same renumbering divergence as #1: the renderer appears to assign per-disc ordinals even when no disc inference should occur.
+
+### 3. `title_extra_tests::duplicate_track_numbers_alone_do_not_infer_disc_folders` (stages.rs)
+From `ac59b26`. Same symptom as #2 (`01 - In Memory of Elizabeth Reed` vs expected `02 - ...`) for a fixture with duplicate track numbers but no disc metadata.
+
+### 4. `title_extra_tests::conditional_template_preserves_literal_braces_when_block_resolves` (stages.rs)
+From `92b2d4e` (conditional template braces). Template: `%ARTIST% - %ALBUM% (%YEAR%) [%FORMAT%] {%TITLE_EXTRA%}` with the shared `template_source()` fixture. Expected `Miles Davis - At Fillmore East () [FLAC] {MFSL}`; actual `... (1971) ...`. Note the shared fixture *does* carry year 1971, so the expected string with an empty `()` looks like a fixture oversight in the test rather than an implementation bug — but confirm against the conditional-block semantics you intended (should a `(%YEAR%)` group with a resolving variable render the year, and should the empty-block-dropping rule have removed `()` if year were empty?).
+
+### 5. `naming_template_tests::render_track_template_expands_new_builtins_and_custom_extras` (stages.rs)
+From `243d508` (naming template expansion). `%NONEXISTENT%` at end of template expands to empty; expected output preserves the resulting trailing space (`"... - CAT 999 - "`), actual output is trimmed (`"... - CAT 999 -"`). Decide whether trailing-whitespace trimming of rendered path components is intended (it likely is, for filesystem hygiene) and fix the test, or fix the renderer.
+
+### 6. `title_extra_tests::preserves_country_only_parenthetical` (stages.rs)
+From `f0d8c7e` (%TITLE_EXTRA%). `extract_title_extra("Aftermath (US)")` should return `None` (country-only parentheticals must stay in the album title); it returns `Some(...)`. Note the sibling test `strips_last_parenthetical_only` passes `"Aftermath (US) (ABKCO Hybrid SACD ISO)"` and expects `(US)` preserved — so the country allowlist works in the two-parenthetical case but the single `(US)` parenthetical is still being extracted.
+
+### 7. `chunk_2_1_3_postprocessing_gate_and_phase_tests::failed_publish_preserves_staging_parent_for_diagnostics` (stages.rs:26380)
+Assertion: "failed publish keeps staging root for diagnostics/retry". After a forced publish failure the staging parent directory no longer exists (or is cleaned) where the test expects it preserved. Interacts with the scratch/tmpfs staging cleanup work.
+
+### 8. `chunk_2_1_3_postprocessing_gate_and_phase_tests::real_plan_output_failure_publishes_fragment_and_completes_batch` (stages.rs:25816)
+The test expects a path-escaping naming template (one that would escape the destination root) to fail during output planning; `plan_outputs` now succeeds and returns a sanitized in-root path (`.../Test Album/escaped-plan-output.flac`). Either the planner's escape handling changed from fail to sanitize (then the test should assert sanitization), or the sanitization silently swallows what should be a planning error.
+
+### 9. `output_options_companion_projection_tests::output_options_field_cycle_includes_companion_fields_when_maximized` (src/tui/app.rs:3828)
+From `e606eda` (companion copying), broken by later feature work: `CompanionFolders.next_for(true)` now returns `ForceEncode`, test expects `WriteLog`. `MAXIMIZED_FIELDS` (src/tui/app.rs:2448) now inserts `ForceEncode` and `DiscSubfolders` between `CompanionFolders` and `WriteLog`; the test predates both. Almost certainly a stale test: update the expected cycle to walk `CompanionFolders → ForceEncode → DiscSubfolders → WriteLog` (also check the `prev_for` assertions' symmetry).
+
+## Constraints
+
+- Fix whichever side (test or implementation) matches the intended product behavior; note the decision per failure.
+- Do not change the `pub(super)` visibility fix or the `use super::naming_template_tests::{template_request, template_source};` import — those are required for the test build to compile.
+- All other 2519 lib tests pass; do not regress them.
+
+## Relevant files
+
+- `src/convert/pipeline/stages.rs` — failures 1–8 (tests and the template/planning/publish implementations)
+- `src/tui/app.rs` — failure 9 (`OutputOptionsField` cycle + test)

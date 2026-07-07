@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use toml_edit::{value, Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
+use tokio::task;
 
 use super::app::*;
 use super::message::AppMessage;
@@ -20,6 +21,10 @@ pub const BULK_AUDIO_GUARD_THRESHOLD: usize = 50;
 /// Count exactly up to this many files for the confirmation copy; above this
 /// bound the prompt intentionally uses a capped wording to keep counting fast.
 pub const BULK_AUDIO_GUARD_EXACT_LIMIT: usize = 500;
+/// Hard cap for Browse folder expansion performed during Convert handoff. The
+/// cap applies inside the blocking worker so pathological trees cannot consume
+/// unbounded resources after the raw-mode reducer has handed the job off.
+pub const BROWSE_CONVERT_FOLDER_EXPANSION_MAX_VISITED: usize = 50_000;
 
 fn consume_bulk_guard_bypass(app: &mut AppState, operation: BulkOperationKind) -> bool {
     if app.bulk_guard_bypass == Some(operation) {
@@ -91,6 +96,423 @@ fn expand_audio_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
             )
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseConvertPostLoad {
+    /// Leave the expanded source on the Convert screen for manual review.
+    ReviewOnly,
+    /// Preserve context-menu Convert → Last used / preset behavior: after the
+    /// async expansion publishes the Convert source, commit it exactly as the
+    /// old synchronous Queue path did.
+    Commit { start: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowseConvertExpansionTarget {
+    /// Install the expanded paths as the Convert source for direct Browse load.
+    ConvertSource,
+    /// Add the expanded paths directly to the processing queue.
+    ConvertQueueItems,
+    /// Install the expanded paths as a Convert review source for `:queue` and
+    /// context-menu Convert actions. The preset is loaded only after expansion
+    /// succeeds, so failed/stale jobs do not mutate Convert pills. `post_load`
+    /// carries the continuation needed by context-menu actions that previously
+    /// committed immediately after synchronous Queue publication.
+    ConvertReview {
+        preset: Option<String>,
+        post_load: BrowseConvertPostLoad,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseConvertExpansionRequest {
+    pub target: BrowseConvertExpansionTarget,
+    pub selection_snapshot: Vec<PathBuf>,
+    pub browse_in_archive: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowseConvertExpansion {
+    pub paths: Vec<PathBuf>,
+    pub expanded_folder_count: usize,
+    pub empty_audio_folders: Vec<PathBuf>,
+    pub expansion_errors: Vec<String>,
+    pub visited: usize,
+    pub cancelled: bool,
+}
+
+fn normalized_path_snapshot(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Return true when a real filesystem directory should be expanded into audio
+/// files before conversion instead of installed as an opaque source. This is
+/// the shared Browse conversion/queue routing predicate for context-menu
+/// Convert, command-mode `:queue`, and direct Browse source loading. It is
+/// intentionally cheap: no recursive filesystem traversal may run here.
+#[must_use]
+pub(crate) fn is_regular_filesystem_audio_folder_convert_candidate(
+    app: &AppState,
+    path: &Path,
+) -> bool {
+    is_regular_filesystem_audio_folder_convert_candidate_raw(app.browse.is_in_archive(), path)
+}
+
+#[must_use]
+fn is_regular_filesystem_audio_folder_convert_candidate_raw(
+    browse_in_archive: bool,
+    path: &Path,
+) -> bool {
+    !browse_in_archive
+        && path.is_dir()
+        && !crate::disc::bluray_utils::is_bluray_backend_open_candidate(path)
+        && !crate::disc::dvda_utils::is_dvda_source(path)
+        && !crate::disc::dvdv_utils::is_dvdv_source(path)
+}
+
+/// Blocking implementation for background workers and narrow tests only. Do
+/// not call this from key handlers, reducers, context-menu dispatch, or command
+/// execution: use `start_browse_convert_folder_expansion` for Browse flows.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn regular_filesystem_audio_folder_paths_for_convert_blocking(
+    browse_in_archive: bool,
+    path: &Path,
+) -> Result<Option<(Vec<PathBuf>, usize)>, String> {
+    regular_filesystem_audio_folder_paths_for_convert_blocking_with_cancel(
+        browse_in_archive,
+        path,
+        None,
+    )
+}
+
+fn regular_filesystem_audio_folder_paths_for_convert_blocking_with_cancel(
+    browse_in_archive: bool,
+    path: &Path,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Option<(Vec<PathBuf>, usize)>, String> {
+    if !is_regular_filesystem_audio_folder_convert_candidate_raw(browse_in_archive, path) {
+        return Ok(None);
+    }
+
+    let mut visited = 0usize;
+    let mut paths = Vec::new();
+    let mut walk_errors = Vec::new();
+    for entry in walkdir::WalkDir::new(path).follow_links(false).into_iter() {
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return Err("folder expansion cancelled".to_string());
+        }
+        visited = visited.saturating_add(1);
+        if visited > BROWSE_CONVERT_FOLDER_EXPANSION_MAX_VISITED {
+            return Err(format!(
+                "folder expansion for {} exceeded {} entries; narrow the selection or queue files directly",
+                path.display(),
+                BROWSE_CONVERT_FOLDER_EXPANSION_MAX_VISITED
+            ));
+        }
+
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                walk_errors.push(err.to_string());
+                continue;
+            }
+        };
+        let candidate = entry.path();
+        if candidate.is_file()
+            && matches!(
+                super::browse::classify_file(candidate),
+                super::browse::EntryKind::AudioFile(_)
+            )
+        {
+            paths.push(candidate.to_path_buf());
+        }
+    }
+
+    if !walk_errors.is_empty() {
+        return Err(format!(
+            "folder expansion for {} could not fully scan the tree: {}",
+            path.display(),
+            walk_errors.join("; ")
+        ));
+    }
+
+    paths.sort();
+    paths.dedup();
+    Ok(Some((paths, visited)))
+}
+
+/// Backward-compatible test seam. Production Browse flows must not use this;
+/// the source-text tests below assert that queue/load paths use the async
+/// worker entry point instead.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn regular_filesystem_audio_folder_paths_for_convert(
+    app: &AppState,
+    path: &Path,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    regular_filesystem_audio_folder_paths_for_convert_blocking(app.browse.is_in_archive(), path)
+        .map(|value| value.map(|(paths, _visited)| paths))
+}
+
+#[must_use]
+pub(crate) fn browse_selection_contains_regular_audio_folder_for_convert(
+    app: &AppState,
+    paths: &[PathBuf],
+) -> bool {
+    paths
+        .iter()
+        .any(|path| is_regular_filesystem_audio_folder_convert_candidate(app, path))
+}
+
+/// Blocking expansion implementation for the Browse Convert worker. It expands
+/// only regular filesystem audio folders; real disc/archive/CUE/single-file
+/// sources remain opaque. The result is deterministic and explicit about empty
+/// folders versus scan failures.
+pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking(
+    browse_in_archive: bool,
+    paths: Vec<PathBuf>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> BrowseConvertExpansion {
+    let mut expanded = Vec::new();
+    let mut expanded_folder_count = 0usize;
+    let mut empty_audio_folders = Vec::new();
+    let mut expansion_errors = Vec::new();
+    let mut visited_total = 0usize;
+
+    for path in normalized_path_snapshot(paths) {
+        if cancel.is_cancelled() {
+            return BrowseConvertExpansion {
+                paths: Vec::new(),
+                expanded_folder_count: 0,
+                empty_audio_folders: Vec::new(),
+                expansion_errors: Vec::new(),
+                visited: visited_total,
+                cancelled: true,
+            };
+        }
+        match regular_filesystem_audio_folder_paths_for_convert_blocking_with_cancel(
+            browse_in_archive,
+            &path,
+            Some(&cancel),
+        ) {
+            Ok(Some((audio_paths, visited))) if audio_paths.is_empty() => {
+                visited_total = visited_total.saturating_add(visited);
+                empty_audio_folders.push(path);
+            }
+            Ok(Some((audio_paths, visited))) => {
+                visited_total = visited_total.saturating_add(visited);
+                expanded_folder_count = expanded_folder_count.saturating_add(1);
+                expanded.extend(audio_paths);
+            }
+            Ok(None) => expanded.push(path),
+            Err(err) if cancel.is_cancelled() => {
+                return BrowseConvertExpansion {
+                    paths: Vec::new(),
+                    expanded_folder_count: 0,
+                    empty_audio_folders: Vec::new(),
+                    expansion_errors: Vec::new(),
+                    visited: visited_total,
+                    cancelled: true,
+                };
+            }
+            Err(err) => expansion_errors.push(err),
+        }
+    }
+
+    expanded.sort();
+    expanded.dedup();
+
+    BrowseConvertExpansion {
+        paths: expanded,
+        expanded_folder_count,
+        empty_audio_folders,
+        expansion_errors,
+        visited: visited_total,
+        cancelled: false,
+    }
+}
+
+/// Start a Browse regular-folder expansion on the blocking worker pool. The
+/// caller has already determined that at least one selected path is a regular
+/// filesystem folder candidate. `probe_generation` is the active generation id:
+/// starting a newer Convert/probe/expansion request supersedes this job, and
+/// late completions are ignored by the event-loop handler.
+pub(crate) fn start_browse_convert_folder_expansion(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    target: BrowseConvertExpansionTarget,
+    paths: Vec<PathBuf>,
+) {
+    let selection_snapshot = normalized_path_snapshot(paths);
+    if selection_snapshot.is_empty() {
+        app.set_status("queue: no selection");
+        return;
+    }
+
+    let request = BrowseConvertExpansionRequest {
+        target,
+        selection_snapshot,
+        browse_in_archive: app.browse.is_in_archive(),
+    };
+    let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
+
+    let folder_count = request
+        .selection_snapshot
+        .iter()
+        .filter(|path| is_regular_filesystem_audio_folder_convert_candidate_raw(
+            request.browse_in_archive,
+            path,
+        ))
+        .count();
+    app.set_status(if folder_count > 1 {
+        "Expanding selected folders…".to_string()
+    } else {
+        "Expanding folder…".to_string()
+    });
+
+    let tx_for_worker = tx.clone();
+    let request_for_worker = request.clone();
+    tokio::spawn(async move {
+        let paths_for_worker = request_for_worker.selection_snapshot.clone();
+        let browse_in_archive = request_for_worker.browse_in_archive;
+        let cancel_for_worker = cancel.clone();
+        let worker_result = task::spawn_blocking(move || {
+            expand_regular_filesystem_audio_folders_for_convert_blocking(
+                browse_in_archive,
+                paths_for_worker,
+                cancel_for_worker,
+            )
+        })
+        .await
+        .unwrap_or_else(|err| BrowseConvertExpansion {
+            paths: Vec::new(),
+            expanded_folder_count: 0,
+            empty_audio_folders: Vec::new(),
+            expansion_errors: vec![format!("folder expansion worker failed: {err}")],
+            visited: 0,
+            cancelled: false,
+        });
+
+        let _ = tx_for_worker
+            .send(AppMessage::BrowseConvertExpansionComplete {
+                generation,
+                request: request_for_worker,
+                expansion: worker_result,
+            })
+            .await;
+    });
+}
+
+fn browse_convert_expansion_selection_still_current(
+    app: &AppState,
+    request: &BrowseConvertExpansionRequest,
+) -> bool {
+    if app.current_screen != AppScreen::Browse {
+        return false;
+    }
+
+    let current_paths = match &request.target {
+        BrowseConvertExpansionTarget::ConvertSource => app
+            .browse
+            .selected_entry()
+            .map(|entry| vec![entry.path.clone()])
+            .unwrap_or_default(),
+        BrowseConvertExpansionTarget::ConvertQueueItems
+        | BrowseConvertExpansionTarget::ConvertReview { .. } => {
+            // Compare against the raw Browse selection: expansion requests are
+            // created from raw paths (before directory expansion), so the
+            // freshness snapshot must be collected the same way.
+            if !app.browse.multi_selected.is_empty() {
+                app.browse.multi_selected.clone()
+            } else if let Some(entry) = app.browse.selected_entry() {
+                if matches!(entry.kind, super::browse::EntryKind::ParentDir) {
+                    Vec::new()
+                } else {
+                    vec![entry.path.clone()]
+                }
+            } else {
+                Vec::new()
+            }
+        }
+    };
+
+    normalized_path_snapshot(current_paths) == request.selection_snapshot
+}
+
+pub(crate) fn handle_browse_convert_expansion_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    request: BrowseConvertExpansionRequest,
+    expansion: BrowseConvertExpansion,
+) {
+    if !app.browse_convert_expansion_pending_for(generation, &request) {
+        log::debug!("discarded stale Browse Convert expansion generation {generation}");
+        return;
+    }
+    if generation != app.probe_generation {
+        log::debug!("discarded superseded Browse Convert expansion generation {generation}");
+        return;
+    }
+    if !browse_convert_expansion_selection_still_current(app, &request) {
+        let _ = app.complete_browse_convert_expansion(generation, &request);
+        log::debug!("discarded Browse Convert expansion after selection/screen changed");
+        return;
+    }
+    let _ = app.complete_browse_convert_expansion(generation, &request);
+
+    if expansion.cancelled {
+        app.set_status("folder expansion cancelled");
+        return;
+    }
+    if let Some(err) = expansion.expansion_errors.first() {
+        app.set_status(err.clone());
+        return;
+    }
+    if expansion.paths.is_empty() {
+        if let Some(folder) = expansion.empty_audio_folders.first() {
+            app.set_status(format!(
+                "No supported audio files found in {}",
+                folder.display()
+            ));
+        } else {
+            app.set_status("No supported sources selected");
+        }
+        return;
+    }
+
+    match request.target {
+        BrowseConvertExpansionTarget::ConvertSource => {
+            install_browse_convert_source_paths(
+                app,
+                tx,
+                expansion.paths,
+                expansion.expanded_folder_count,
+                true,
+            );
+        }
+        BrowseConvertExpansionTarget::ConvertQueueItems => {
+            queue_browse_convert_paths_for_processing(app, expansion.paths);
+            app.browse.clear_multi_selection();
+            app.current_screen = AppScreen::Queue;
+            app.browse.return_target = super::browse::BrowseReturnTarget::None;
+        }
+        BrowseConvertExpansionTarget::ConvertReview { preset, post_load } => {
+            if finish_browse_queue_review_after_expansion(
+                app,
+                tx,
+                preset,
+                expansion.paths,
+                expansion.expanded_folder_count,
+            ) {
+                apply_browse_convert_post_load_action(app, tx, post_load);
+            }
+        }
+    }
 }
 
 fn current_audio_paths(app: &AppState, include_convert: bool) -> Vec<PathBuf> {
@@ -4060,158 +4482,298 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
 ///
 /// Phase 6b limitation: multi-file selections are rejected with a message
 /// directing the user to deselect extras. Real batch support (summary +
-/// expand overlay + bulk commit) arrives in Phase 6c/6d.
-fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Option<String>) {
-    // Helper: load a named preset into the format/output-options pills.
-    // Returns Ok(()) on success, Err(status_message) on failure.
-    let load_preset_into_pills = |app: &mut AppState, name: &str| -> Result<(), String> {
-        let path = super::presets::preset_file_path(name);
-        match super::presets::load_preset_from_path(&path) {
-            Ok(p) => {
-                p.apply_to_pills(&mut app.convert.format, &mut app.convert.output_options);
-                app.preset.set_active_preset_path(name.to_string(), path);
-                app.preset.modified = false;
-                Ok(())
-            }
-            Err(e) => Err(format!("preset '{}' failed: {}", name, e)),
+fn load_queue_preset_into_pills(app: &mut AppState, name: &str) -> Result<(), String> {
+    let path = super::presets::preset_file_path(name);
+    match super::presets::load_preset_from_path(&path) {
+        Ok(preset) => {
+            preset.apply_to_pills(&mut app.convert.format, &mut app.convert.output_options);
+            app.preset.set_active_preset_path(name.to_string(), path);
+            app.preset.modified = false;
+            Ok(())
         }
+        Err(err) => Err(format!("preset '{}' failed: {}", name, err)),
+    }
+}
+
+fn queue_browse_convert_paths_for_processing(app: &mut AppState, paths: Vec<PathBuf>) {
+    let mut options = crate::convert::ConversionOptions::default();
+    options.append_lineage_to_comment = app.config.conversion.append_lineage_to_comment;
+    options.write_log_file = app.config.conversion.write_log_file;
+    options.generate_cue_files = app.config.conversion.generate_cue_files;
+    options.cue_generation_mode = app.config.conversion.cue_generation_mode.clone();
+    app.convert
+        .output_options
+        .apply_companion_copying_to_conversion_options(&mut options);
+
+    let mut count = 0usize;
+    let mut errors = 0usize;
+    for path in paths {
+        let archive_password = if crate::is_encrypted_archive_ext(&path) {
+            app.archive_passwords
+                .get(&path)
+                .cloned()
+                .or_else(|| {
+                    app.keychain.ensure_loaded();
+                    app.keychain.passwords.first().cloned()
+                })
+                .or_else(|| app.config.conversion.archive_password.clone())
+        } else {
+            None
+        };
+        match app
+            .manager
+            .add_file_ready_for_processing(path, options.clone(), archive_password)
+        {
+            Ok(_) => count = count.saturating_add(1),
+            Err(err) => {
+                errors = errors.saturating_add(1);
+                log::warn!("queue add failed during Browse Convert expansion: {err}");
+            }
+        }
+    }
+
+    if errors == 0 {
+        app.set_status(format!("Queued {} files", count));
+    } else {
+        app.set_status(format!("Queued {} files; {} failed", count, errors));
+    }
+    app.save_queue();
+}
+
+pub(crate) fn install_browse_convert_source_paths(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    paths: Vec<PathBuf>,
+    expanded_folder_count: usize,
+    from_folder_expansion: bool,
+) {
+    app.cancel_browse_convert_expansion();
+    let paths = normalized_path_snapshot(paths);
+    if paths.is_empty() {
+        app.set_status("No supported sources selected");
+        return;
+    }
+
+    let first = paths[0].clone();
+    let path_count = paths.len();
+    let archive_preview_single = path_count == 1 && is_nonprobeable_source_for_probe(&first);
+
+    app.probe_generation = app.probe_generation.saturating_add(1);
+    let generation = app.probe_generation;
+    let probe_notice = if archive_preview_single {
+        Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE.to_string())
+    } else {
+        source_probe_initial_notice(&first)
     };
 
+    clear_source_metadata_in_convert(&mut app.convert);
+    let mut mode = if path_count == 1 {
+        SourceMode::from_single_pending_probe(first.clone(), probe_notice.clone())
+    } else {
+        SourceMode::from_paths(paths)
+    };
+    match &mut mode {
+        SourceMode::Single { probe_notice: notice_slot, .. }
+        | SourceMode::MultiTrack { probe_notice: notice_slot, .. } => {
+            if notice_slot.is_none() {
+                *notice_slot = probe_notice.clone();
+            }
+        }
+        SourceMode::Batch {
+            probe_notice: batch_probe_notice,
+            cursor_probe_notice,
+            ..
+        } => {
+            *batch_probe_notice = probe_notice.clone();
+            *cursor_probe_notice = None;
+        }
+        SourceMode::Empty => {}
+    }
+
+    app.convert.set_source_mode(mode);
+    app.convert.source.cue_artifact_audio.clear();
+    app.convert.apply_source_defaults();
+    let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
+    app.recent.record_use_with_db(&first, &app.db);
+
+    if archive_preview_single {
+        let pending = create_pending_archive_preview(generation, first.clone());
+        let staging_dir = pending.staging_dir.clone();
+        let cancel = pending.cancel.clone();
+        app.convert.install_pending_archive_preview(pending);
+        let password = archive_preview_password_for_path(app, &first);
+        let tool_paths = app.manager.config.tool_paths.clone();
+        spawn_archive_preview(
+            generation,
+            first.clone(),
+            probe_baseline,
+            staging_dir,
+            cancel,
+            password,
+            tool_paths,
+            tx.clone(),
+        );
+    } else if probe_notice.is_some() {
+        spawn_convert_source_probe(generation, first.clone(), probe_baseline, tx.clone());
+    }
+
+    let batch_paths = app.convert.source.mode.all_paths();
+    let _ = app
+        .db
+        .save_batch_state(&batch_paths, None, None, None, None, None);
+
+    app.previous_screen = Some(AppScreen::Browse);
+    app.current_screen = AppScreen::Convert;
+
+    if archive_preview_single {
+        app.set_status(format!(
+            "Extracting archive: {} — review settings, then :commit or :Commit",
+            first.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    } else if probe_notice.is_some() {
+        app.set_status(format!(
+            "Probing: {} — review settings, then :commit or :Commit",
+            first.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    } else if from_folder_expansion && expanded_folder_count > 0 {
+        app.set_status(format!(
+            "expanded {} folder{} into {} files — review settings, then :commit or :Commit",
+            expanded_folder_count,
+            if expanded_folder_count == 1 { "" } else { "s" },
+            path_count
+        ));
+    } else if path_count == 1 {
+        app.set_status("review settings, then :commit or :Commit");
+    } else {
+        app.set_status(format!(
+            "batch of {} files — review settings, then :commit or :Commit",
+            path_count
+        ));
+    }
+}
+
+fn finish_browse_queue_review_after_expansion(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    preset: Option<String>,
+    paths: Vec<PathBuf>,
+    expanded_folder_count: usize,
+) -> bool {
+    let paths = normalized_path_snapshot(paths);
+    if paths.is_empty() {
+        app.set_status("queue: no supported sources in selection");
+        return false;
+    }
+
+    // Re-capture CUE policy metadata only after expansion succeeds and only
+    // from the still-current Browse selection. Stale expansion results never
+    // reach this function.
+    let selection = app.browse.collect_selection_for_queue();
+    let mut cue_artifact_audio = selection.cue_artifact_audio.clone();
+    cue_artifact_audio.retain(|path| paths.binary_search(path).is_ok());
+
+    if let Some(name) = &preset {
+        if let Err(msg) = load_queue_preset_into_pills(app, name) {
+            app.set_status(msg);
+            return false;
+        }
+    } else {
+        app.convert.format = super::app::FormatState::new();
+        // Reset to configured defaults, not to an empty state: AppState
+        // construction seeds dest_path from config, and the post-load Commit
+        // continuation (Convert -> Last used) is blocked without a destination.
+        app.convert.output_options = super::app::OutputOptionsState::new();
+        app.convert.output_options.dest_path = app.config.conversion.default_destination.clone();
+        app.preset.clear_active_preset();
+    }
+
+    install_browse_convert_source_paths(app, tx, paths, expanded_folder_count, expanded_folder_count > 0);
+    app.convert.source.cue_artifact_audio = cue_artifact_audio;
+    app.current_screen == AppScreen::Convert && !app.convert.source.mode.is_empty()
+}
+
+fn apply_browse_convert_post_load_action(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    post_load: BrowseConvertPostLoad,
+) {
+    match post_load {
+        BrowseConvertPostLoad::ReviewOnly => {}
+        BrowseConvertPostLoad::Commit { start } => {
+            if app.current_screen == AppScreen::Convert {
+                execute_commit_with_disc_selection_bridge(app, start, tx);
+            }
+        }
+    }
+}
+
+pub(crate) fn execute_queue_with_post_load_commit(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    preset: Option<String>,
+    start: bool,
+) {
+    execute_queue_with_post_load(
+        app,
+        tx,
+        preset,
+        BrowseConvertPostLoad::Commit { start },
+    );
+}
+
+/// expand overlay + bulk commit) arrives in Phase 6c/6d.
+fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Option<String>) {
+    execute_queue_with_post_load(app, tx, preset, BrowseConvertPostLoad::ReviewOnly);
+}
+
+fn execute_queue_with_post_load(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    preset: Option<String>,
+    post_load: BrowseConvertPostLoad,
+) {
     match app.current_screen {
         AppScreen::Browse => {
-            let expansion = app.browse.collect_selection_for_queue();
-            let mut paths = expansion.paths.clone();
-            paths.sort();
+            // Check the raw selection before collect_selection_for_queue():
+            // that collection expands directories with a synchronous recursive
+            // walk, which both blocks the reducer on large trees and erases
+            // the directory the async-expansion candidate check needs to see.
+            let raw_selection: Vec<PathBuf> = if !app.browse.multi_selected.is_empty() {
+                app.browse.multi_selected.clone()
+            } else if let Some(entry) = app.browse.selected_entry() {
+                if matches!(entry.kind, super::browse::EntryKind::ParentDir) {
+                    Vec::new()
+                } else {
+                    vec![entry.path.clone()]
+                }
+            } else {
+                Vec::new()
+            };
 
-            if paths.is_empty() {
+            if browse_selection_contains_regular_audio_folder_for_convert(app, &raw_selection) {
+                start_browse_convert_folder_expansion(
+                    app,
+                    tx,
+                    BrowseConvertExpansionTarget::ConvertReview { preset, post_load },
+                    raw_selection,
+                );
+                return;
+            }
+
+            let selection = app.browse.collect_selection_for_queue();
+            if selection.paths.is_empty() {
                 app.set_status("queue: no selection");
                 return;
             }
 
-            // Keep queue-expansion CUE policy metadata local until the Convert
-            // source mode is ready to publish. Probe and preset loading may
-            // fail below; on those failure paths, the existing Convert source
-            // state must remain untouched.
-            let cue_artifact_audio = expansion.cue_artifact_audio.clone();
-
-            let first = paths[0].clone();
-            let path_count = paths.len();
-
-            // Load preset (if any) before publishing the new source. If preset
-            // loading fails, leave the previous Convert state untouched.
-            if let Some(name) = &preset {
-                if let Err(msg) = load_preset_into_pills(app, name) {
-                    app.set_status(msg);
-                    return;
-                }
-            } else {
-                app.convert.format = super::app::FormatState::new();
-                app.convert.output_options = super::app::OutputOptionsState::new();
-                app.preset.clear_active_preset();
-            }
-
-            let archive_preview_single = path_count == 1 && is_nonprobeable_source_for_probe(&first);
-            app.probe_generation = app.probe_generation.saturating_add(1);
-            let generation = app.probe_generation;
-            let probe_notice = if archive_preview_single {
-                Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE.to_string())
-            } else {
-                source_probe_initial_notice(&first)
-            };
-            clear_source_metadata_in_convert(&mut app.convert);
-
-            // Publish a cheap source placeholder immediately. Single-source
-            // archives use the Phase 3 extract+discover+probe preview worker;
-            // ordinary SACD/DVD/Blu-ray/CUE/Lofty discovery remains deferred to
-            // the blocking probe worker, and batch setup only computes its
-            // cheap filesystem summary here.
-            let mut mode = if path_count == 1 {
-                SourceMode::from_single_pending_probe(first.clone(), probe_notice.clone())
-            } else {
-                SourceMode::from_paths(paths)
-            };
-            match &mut mode {
-                SourceMode::Single { probe_notice: notice_slot, .. }
-                | SourceMode::MultiTrack { probe_notice: notice_slot, .. } => {
-                    if notice_slot.is_none() {
-                        *notice_slot = probe_notice.clone();
-                    }
-                }
-                SourceMode::Batch {
-                    probe_notice: batch_probe_notice,
-                    cursor_probe_notice,
-                    ..
-                } => {
-                    *batch_probe_notice = probe_notice.clone();
-                    *cursor_probe_notice = None;
-                }
-                SourceMode::Empty => {}
-            }
-
-            // Publish the source mode and its queue-expansion metadata at the
-            // same success boundary. This keeps aborted Browse -> Convert flows
-            // from leaving CUE sidecar override metadata attached to an older
-            // Convert source mode.
-            app.convert.set_source_mode(mode);
-            app.convert.source.cue_artifact_audio = cue_artifact_audio;
-            app.convert.apply_source_defaults();
-            let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
-            app.recent.record_use_with_db(&first, &app.db);
-
-            if archive_preview_single {
-                let pending = create_pending_archive_preview(generation, first.clone());
-                let staging_dir = pending.staging_dir.clone();
-                let cancel = pending.cancel.clone();
-                app.convert.install_pending_archive_preview(pending);
-                let password = archive_preview_password_for_path(app, &first);
-                let tool_paths = app.manager.config.tool_paths.clone();
-                spawn_archive_preview(
-                    generation,
-                    first.clone(),
-                    probe_baseline,
-                    staging_dir,
-                    cancel,
-                    password,
-                    tool_paths,
-                    tx.clone(),
-                );
-            } else if probe_notice.is_some() {
-                spawn_convert_source_probe(generation, first.clone(), probe_baseline, tx.clone());
-            }
-
-            // Persist batch state for crash recovery.
-            let batch_paths = app.convert.source.mode.all_paths();
-            let _ = app
-                .db
-                .save_batch_state(&batch_paths, None, None, None, None, None);
-
-            // Remember where we came from, switch to Convert for review.
-            app.previous_screen = Some(AppScreen::Browse);
-            app.current_screen = AppScreen::Convert;
-
-            if archive_preview_single {
-                app.set_status(format!(
-                    "Extracting archive: {} — review settings, then :commit or :Commit",
-                    first.file_name().unwrap_or_default().to_string_lossy()
-                ));
-            } else if probe_notice.is_some() {
-                app.set_status(format!(
-                    "Probing: {} — review settings, then :commit or :Commit",
-                    first.file_name().unwrap_or_default().to_string_lossy()
-                ));
-            } else if path_count == 1 {
-                app.set_status("review settings, then :commit or :Commit");
-            } else {
-                app.set_status(format!(
-                    "batch of {} files — review settings, then :commit or :Commit",
-                    path_count
-                ));
+            if finish_browse_queue_review_after_expansion(app, tx, preset, selection.paths, 0) {
+                apply_browse_convert_post_load_action(app, tx, post_load);
             }
         }
         AppScreen::Library => {
             // Placeholder screen. Selection inheritance arrives in 6c.
             if let Some(name) = &preset {
-                match load_preset_into_pills(app, name) {
+                match load_queue_preset_into_pills(app, name) {
                     Ok(()) => app.set_status(format!("preset loaded: {}", name)),
                     Err(msg) => app.set_status(msg),
                 }
@@ -4223,7 +4785,7 @@ fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Opti
             // Already on Convert. A preset arg loads in place; without an
             // arg, remind the user to pick files in Browse first.
             if let Some(name) = &preset {
-                match load_preset_into_pills(app, name) {
+                match load_queue_preset_into_pills(app, name) {
                     Ok(()) => app.set_status(format!("preset loaded: {}", name)),
                     Err(msg) => app.set_status(msg),
                 }
@@ -4233,7 +4795,7 @@ fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Opti
         }
         AppScreen::Queue => {
             if let Some(name) = &preset {
-                match load_preset_into_pills(app, name) {
+                match load_queue_preset_into_pills(app, name) {
                     Ok(()) => app.set_status(format!("preset loaded: {}", name)),
                     Err(msg) => app.set_status(msg),
                 }
@@ -12620,56 +13182,177 @@ mod tags_mb_args_tests {
 
 #[cfg(test)]
 mod execute_queue_state_consistency_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{AppScreen, SourceMode};
+    use crate::tui::browse::{BrowseEntry, EntryKind};
+    use tokio::sync::mpsc;
+
     #[test]
-    fn execute_queue_does_not_publish_cue_metadata_before_successful_source_mode_update() {
+    fn execute_queue_uses_async_folder_expansion_before_source_publication() {
         let source = include_str!("command.rs");
         let execute_queue_start = source
-            .find("fn execute_queue(")
-            .expect("execute_queue should exist");
+            .find("fn execute_queue_with_post_load(")
+            .expect("shared queue implementation should exist");
         let library_arm_start = source[execute_queue_start..]
             .find("AppScreen::Library =>")
             .map(|offset| execute_queue_start + offset)
             .expect("Browse arm should be followed by Library arm");
         let browse_arm = &source[execute_queue_start..library_arm_start];
 
-        let local_capture = browse_arm
-            .find("let cue_artifact_audio = expansion.cue_artifact_audio.clone();")
-            .expect("queue expansion metadata should first be captured locally");
-        let preset_error_return = browse_arm
-            .find("if let Err(msg) = load_preset_into_pills(app, name)")
-            .expect("preset failure branch should still return before Convert source publication");
-        let source_mode_publish = browse_arm
-            .find("app.convert.set_source_mode(mode);")
-            .expect("source mode should be published explicitly");
-        let cue_metadata_publish = browse_arm
+        let candidate_check = browse_arm
+            .find("browse_selection_contains_regular_audio_folder_for_convert(app, &raw_selection)")
+            .expect("queue should cheaply detect regular folder candidates on the raw selection");
+        let async_start = browse_arm
+            .find("start_browse_convert_folder_expansion(")
+            .expect("regular folder expansion must start a background job");
+        let collect = browse_arm
+            .find("let selection = app.browse.collect_selection_for_queue();")
+            .expect("queue should collect the browse selection once");
+        let immediate_finish = browse_arm
+            .find("finish_browse_queue_review_after_expansion(app, tx, preset, selection.paths, 0)")
+            .expect("non-folder selections should still publish immediately");
+        let post_load = browse_arm
+            .find("apply_browse_convert_post_load_action(app, tx, post_load)")
+            .expect("non-folder selections should run the same post-load continuation");
+
+        // The raw-selection candidate check must run before
+        // collect_selection_for_queue(): that collection expands directories
+        // with a synchronous recursive walk on the reducer path.
+        assert!(candidate_check < async_start);
+        assert!(async_start < collect);
+        assert!(collect < immediate_finish);
+        assert!(immediate_finish < post_load);
+        assert!(
+            !browse_arm.contains("expand_regular_filesystem_audio_folders_for_convert_blocking"),
+            "execute_queue must not recursively expand folders on the reducer path"
+        );
+    }
+
+    #[test]
+    fn async_convert_review_completion_preserves_post_load_commit_continuation() {
+        let source = include_str!("command.rs");
+        let target_start = source
+            .find("ConvertReview {\n        preset: Option<String>,\n        post_load: BrowseConvertPostLoad,")
+            .expect("ConvertReview target should carry post-load continuation");
+        let handler_start = source
+            .find("pub(crate) fn handle_browse_convert_expansion_complete(")
+            .expect("expansion completion handler should exist");
+        let handler_body = &source[handler_start..];
+        let finish_call = handler_body
+            .find("finish_browse_queue_review_after_expansion(")
+            .expect("fresh ConvertReview completions should publish via queue review helper");
+        let continuation = handler_body
+            .find("apply_browse_convert_post_load_action(app, tx, post_load)")
+            .expect("fresh ConvertReview completions should resume post-load commit/start");
+
+        assert!(target_start < handler_start);
+        assert!(finish_call < continuation);
+    }
+
+    #[test]
+    fn browse_queue_completion_recaptures_cue_metadata_after_freshness_checks() {
+        let source = include_str!("command.rs");
+        let handler_start = source
+            .find("pub(crate) fn handle_browse_convert_expansion_complete(")
+            .expect("expansion completion handler should exist");
+        let handler_body = &source[handler_start..];
+        let generation_guard = handler_body
+            .find("if generation != app.probe_generation")
+            .expect("completion must generation-check stale jobs");
+        let selection_guard = handler_body
+            .find("browse_convert_expansion_selection_still_current")
+            .expect("completion must selection-check stale jobs");
+        let finish_call = handler_body
+            .find("finish_browse_queue_review_after_expansion(")
+            .expect("fresh ConvertReview completions should publish via queue review helper");
+
+        assert!(generation_guard < finish_call);
+        assert!(selection_guard < finish_call);
+
+        let finish_start = source
+            .find("fn finish_browse_queue_review_after_expansion(")
+            .expect("queue review finish helper should exist");
+        let finish_body = &source[finish_start..];
+        let recapture = finish_body
+            .find("let selection = app.browse.collect_selection_for_queue();")
+            .expect("CUE metadata should be recaptured from the still-current selection");
+        let retain = finish_body
+            .find("cue_artifact_audio.retain")
+            .expect("CUE metadata must be trimmed to expanded audio paths");
+        let publish = finish_body
             .find("app.convert.source.cue_artifact_audio = cue_artifact_audio;")
-            .expect("CUE artifact metadata should be published explicitly");
-        let probe_baseline_capture = browse_arm
-            .find("let probe_baseline = ConvertProbeBaseline::capture(&app.convert);")
-            .expect("probe baseline should be captured after the successful publication boundary");
+            .expect("CUE metadata should publish only after source publication succeeds");
 
-        assert!(
-            local_capture < source_mode_publish,
-            "metadata should be captured locally before source publication"
-        );
-        assert!(
-            preset_error_return < source_mode_publish,
-            "preset failure must return before source mode publication"
-        );
-        assert!(
-            source_mode_publish < cue_metadata_publish,
-            "CUE artifact metadata must be published at the same success boundary as the source mode"
-        );
-        assert!(
-            cue_metadata_publish < probe_baseline_capture,
-            "probe/default follow-up work must observe CUE metadata after publication"
+        assert!(recapture < retain);
+        assert!(retain < publish);
+    }
+
+    #[test]
+    fn stale_browse_convert_expansion_completion_does_not_publish_or_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album_a = temp.path().join("album-a");
+        let album_b = temp.path().join("album-b");
+        std::fs::create_dir_all(&album_a).expect("album-a dir");
+        std::fs::create_dir_all(&album_b).expect("album-b dir");
+        let track_a = album_a.join("01 - A.flac");
+        std::fs::write(&track_a, b"fixture").expect("track fixture");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut config = TonepoetConfig::default();
+        config.conversion.default_destination = Some(temp.path().join("out"));
+        let mut app = AppState::new_for_test(config);
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            BrowseEntry::new(
+                album_a.clone(),
+                "album-a".to_string(),
+                EntryKind::Directory,
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                album_b.clone(),
+                "album-b".to_string(),
+                EntryKind::Directory,
+                0,
+                None,
+            ),
+        ];
+        app.browse.selected_index = 0;
+
+        let request = BrowseConvertExpansionRequest {
+            target: BrowseConvertExpansionTarget::ConvertReview {
+                preset: None,
+                post_load: BrowseConvertPostLoad::Commit { start: false },
+            },
+            selection_snapshot: vec![album_a],
+            browse_in_archive: false,
+        };
+        let (generation, _cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        app.browse.selected_index = 1;
+        handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request,
+            BrowseConvertExpansion {
+                paths: vec![track_a],
+                expanded_folder_count: 1,
+                empty_audio_folders: Vec::new(),
+                expansion_errors: Vec::new(),
+                visited: 1,
+                cancelled: false,
+            },
         );
 
-        let before_source_mode_publish = &browse_arm[..source_mode_publish];
-        assert!(
-            !before_source_mode_publish.contains("app.convert.source.cue_artifact_audio ="),
-            "execute_queue must not assign Convert CUE metadata before source mode publication"
-        );
+        assert!(app.pending_browse_convert_expansion.is_none());
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        assert!(matches!(app.convert.source.mode, SourceMode::Empty));
+        let queued = app.manager.queue.try_read().expect("queue read").all_items().len();
+        assert_eq!(queued, 0);
     }
 }
 

@@ -1928,25 +1928,38 @@ fn build_initial_work(
         ));
     }
 
+    let Some(source_kind) = source_kind else {
+        pool.metrics().record_job_failed();
+        terminal.insert(
+            item_id.clone(),
+            ConversionStatus::Failed {
+                error: format!(
+                    "Unsupported conversion source: {}. Regular audio folders must be expanded into supported audio files before queue processing.",
+                    request.container.display()
+                ),
+                log_path: None,
+            },
+        );
+        return None;
+    };
+
     let materialize_kind = match source_kind {
-        Some(SourceKind::Archive) => WorkKind::ArchiveExtract,
-        Some(SourceKind::CueImage) => WorkKind::MaterializeItem,
-        Some(SourceKind::SacdIso) => WorkKind::MaterializeItem,
-        Some(SourceKind::DvdAudio) => WorkKind::MaterializeItem,
-        Some(SourceKind::DvdVideo) => WorkKind::MaterializeItem,
-        Some(SourceKind::BluRay) => WorkKind::MaterializeItem,
-        Some(SourceKind::SingleFile) => unreachable!("single files are submitted as immediate work units"),
-        None => WorkKind::MaterializeItem,
+        SourceKind::Archive => WorkKind::ArchiveExtract,
+        SourceKind::CueImage => WorkKind::MaterializeItem,
+        SourceKind::SacdIso => WorkKind::MaterializeItem,
+        SourceKind::DvdAudio => WorkKind::MaterializeItem,
+        SourceKind::DvdVideo => WorkKind::MaterializeItem,
+        SourceKind::BluRay => WorkKind::MaterializeItem,
+        SourceKind::SingleFile => unreachable!("single files are submitted as immediate work units"),
     };
     let unit_prefix = match source_kind {
-        Some(SourceKind::Archive) => "archive-extract",
-        Some(SourceKind::CueImage) => "cue-materialize",
-        Some(SourceKind::SacdIso) => "sacd-materialize",
-        Some(SourceKind::DvdAudio) => "dvda-materialize",
-        Some(SourceKind::DvdVideo) => "dvdv-materialize",
-        Some(SourceKind::BluRay) => "bluray-materialize",
-        Some(SourceKind::SingleFile) => unreachable!("single files are submitted as immediate work units"),
-        None => "materialize",
+        SourceKind::Archive => "archive-extract",
+        SourceKind::CueImage => "cue-materialize",
+        SourceKind::SacdIso => "sacd-materialize",
+        SourceKind::DvdAudio => "dvda-materialize",
+        SourceKind::DvdVideo => "dvdv-materialize",
+        SourceKind::BluRay => "bluray-materialize",
+        SourceKind::SingleFile => unreachable!("single files are submitted as immediate work units"),
     };
     let submit_tool_paths = tool_paths.clone();
     let submit_version_cache = version_cache.clone();
@@ -2765,6 +2778,33 @@ pub async fn process_item_with_scratch_policy(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn unsupported_source_does_not_fall_through_to_generic_materialization() {
+        let source = include_str!("processor.rs");
+        // Only scan runtime code: the assertions below would otherwise match
+        // their own literals inside this test module.
+        let runtime = source.split("\nmod tests {").next().unwrap_or(source);
+        let build_work_start = runtime
+            .find("fn build_work_unit_for_item")
+            .or_else(|| runtime.find("let source_kind = detect_source_kind(&request).ok();"))
+            .expect("processor work-unit source-kind branch should exist");
+        let tail = &runtime[build_work_start..];
+
+        assert!(
+            tail.contains("let Some(source_kind) = source_kind else"),
+            "unknown source kinds must fail explicitly before materialization"
+        );
+        assert!(
+            tail.contains("Regular audio folders must be expanded into supported audio files before queue processing"),
+            "unsupported-source error should explain the folder-expansion contract"
+        );
+        assert!(
+            !tail.contains("None => WorkKind::MaterializeItem"),
+            "unknown source kinds must not fall through to generic materialization"
+        );
+    }
+
     use super::*;
     use crate::convert::pipeline::DvdaDownmixPolicy;
 

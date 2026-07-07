@@ -95,15 +95,30 @@ impl Materializer for BlurayMaterializer {
 
 /// Route Blu-ray sources after SACD, DVD-Audio, and DVD-Video first-refusal.
 pub(crate) fn is_bluray_candidate(req: &PipelineRequest) -> Result<bool, SourceDetectError> {
-    if req.container.is_file() {
-        return Ok(crate::disc::bluray_utils::is_bluray_iso(&req.container)
-            || (req.source.explicit_bluray_requested() && has_extension(&req.container, "iso")));
+    Ok(is_bluray_candidate_path(
+        &req.container,
+        req.source.explicit_bluray_requested(),
+    ))
+}
+
+#[must_use]
+fn is_bluray_candidate_path(path: &Path, explicit_bluray_requested: bool) -> bool {
+    if path.is_file() {
+        return crate::disc::bluray_utils::is_bluray_iso(path)
+            || (explicit_bluray_requested
+                && has_extension(path, "iso")
+                && crate::disc::bluray_utils::is_bluray_backend_open_candidate(path));
     }
-    if req.container.is_dir() {
-        return Ok(crate::disc::bluray_utils::is_bluray_directory(&req.container)
-            || req.source.explicit_bluray_requested());
+
+    if path.is_dir() {
+        // An explicit Blu-ray request may disambiguate a structurally valid
+        // Blu-ray source, but it must never promote an arbitrary filesystem
+        // directory into the Blu-ray materializer. Regular album folders are
+        // expanded before queue processing and must return false here.
+        return crate::disc::bluray_utils::is_bluray_directory(path);
     }
-    Ok(false)
+
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -1315,7 +1330,7 @@ mod tests {
     };
     use super::{
         bluray_tool_versions, bluray_track_bit_depth, build_prepared_bluray_source,
-        chapter_end_pts_90k, select_bluray_program, select_bluray_program_with_audio_probe,
+        chapter_end_pts_90k, is_bluray_candidate_path, select_bluray_program, select_bluray_program_with_audio_probe,
         selected_chapter_ordinals, selected_stream_with_materialization_facts,
         selected_stream_with_materialization_facts_with_audio_probe, validate_chapter_pts,
         validate_explicit_stream_pair, BlurayPresentationRequest,
@@ -1430,6 +1445,35 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create fake Blu-ray source path");
         path
+    }
+
+    #[test]
+    fn explicit_bluray_flag_does_not_claim_regular_directory() {
+        let root = existing_source_path("regular_audio_dir_not_bluray_candidate");
+        std::fs::create_dir_all(&root).expect("create audio dir");
+        std::fs::write(root.join("01 - Track.flac"), b"not a blu-ray").expect("write audio fixture");
+
+        assert!(!is_bluray_candidate_path(&root, true));
+        assert!(!is_bluray_candidate_path(&root, false));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn valid_bluray_directory_remains_candidate() {
+        let root = existing_source_path("valid_bluray_dir_candidate");
+        let bdmv = root.join("BDMV");
+        std::fs::create_dir_all(bdmv.join("PLAYLIST")).expect("create playlist");
+        std::fs::create_dir_all(bdmv.join("STREAM")).expect("create stream");
+        std::fs::write(bdmv.join("index.bdmv"), b"index").expect("write index");
+        std::fs::write(bdmv.join("MovieObject.bdmv"), b"movie object").expect("write movie object");
+        std::fs::write(bdmv.join("PLAYLIST").join("00001.mpls"), b"playlist").expect("write playlist");
+        std::fs::write(bdmv.join("STREAM").join("00001.m2ts"), b"stream").expect("write stream");
+
+        assert!(is_bluray_candidate_path(&root, true));
+        assert!(is_bluray_candidate_path(&root, false));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     impl BlurayBackend for FakeBackend {

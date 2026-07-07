@@ -40,6 +40,26 @@ pub fn is_bluray_iso(path: &Path) -> bool {
     BlurayBackendLibbluray::open(path).is_ok()
 }
 
+/// Check whether a path may be passed to libbluray without first treating it
+/// as ordinary user data.
+///
+/// This predicate is deliberately structural and bounded. It must not call
+/// libbluray; callers use it as the final preflight before `bd_open`, including
+/// paths where libudfread would otherwise write directly to stderr and corrupt a
+/// raw terminal. ISO files require bounded Blu-ray markers; directories must
+/// contain the normalized BDMV navigation/media layout used by directory
+/// detection.
+#[must_use]
+pub(crate) fn is_bluray_backend_open_candidate(path: &Path) -> bool {
+    if path.is_file() {
+        bluray_iso_has_bounded_candidate_markers(path)
+    } else if path.is_dir() {
+        is_bluray_directory(path)
+    } else {
+        false
+    }
+}
+
 /// Check whether a directory contains a Blu-ray disc root.
 ///
 /// Accepts either the disc root (`.../DISC/BDMV`) or the `BDMV` directory
@@ -171,7 +191,7 @@ where
 
 pub fn bluray_source_path_for_backend(path: &Path) -> Result<PathBuf, String> {
     if path.is_file() {
-        if bluray_iso_has_bounded_candidate_markers(path) {
+        if is_bluray_backend_open_candidate(path) {
             return Ok(path.to_path_buf());
         }
         return Err(format!("Not a Blu-ray ISO: {}", path.display()));
@@ -181,7 +201,7 @@ pub fn bluray_source_path_for_backend(path: &Path) -> Result<PathBuf, String> {
         let root = bluray_directory_root(path).ok_or_else(|| {
             format!("Not a Blu-ray directory source: {}", path.display())
         })?;
-        if is_bluray_directory(&root) {
+        if is_bluray_backend_open_candidate(&root) {
             return Ok(root);
         }
         return Err(format!("Not a Blu-ray directory source: {}", path.display()));
@@ -1446,6 +1466,20 @@ TITLE = "Correct Track One"
         assert_eq!(contents.presentations[0].album_title.as_deref(), Some("Correct Playlist"));
         assert_eq!(contents.presentations[0].tracks[0].title.as_deref(), Some("Correct Track One"));
         assert_ne!(contents.presentations[0].album_title.as_deref(), Some("Wrong Playlist"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backend_open_candidate_rejects_regular_audio_directory() {
+        let root = unique_dir("regular-audio-dir");
+        fs::create_dir_all(&root).expect("create audio dir");
+        write_fixture_file(&root.join("01 - Track.flac"));
+        write_fixture_file(&root.join("02 - Track.flac"));
+
+        assert!(!is_bluray_backend_open_candidate(&root));
+        assert!(!is_bluray_source(&root));
+        assert!(bluray_source_path_for_backend(&root).is_err());
+
         let _ = fs::remove_dir_all(root);
     }
 

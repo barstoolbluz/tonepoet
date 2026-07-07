@@ -11723,7 +11723,7 @@ fn is_tar_compound(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
-    use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+    use std::sync::{atomic::AtomicBool, Arc};
     use std::time::Duration;
 
     fn canonical_equivalent_focus_path(real_path: &Path) -> PathBuf {
@@ -16462,34 +16462,6 @@ mod browse_perf_followup_v10_tests {
 #[cfg(test)]
 mod folder_content_classification_tests {
     use super::*;
-    use std::io::{Seek, SeekFrom, Write};
-
-    fn focused_state_for_existing_entry(path: PathBuf, name: &str, kind: EntryKind) -> BrowseState {
-        let metadata = std::fs::metadata(&path).expect("entry metadata");
-        let mut state = BrowseState::new();
-        state.entries = vec![BrowseEntry::new(
-            path,
-            name.to_string(),
-            kind,
-            metadata.len(),
-            metadata.modified().ok(),
-        )];
-        state.selected_index = 0;
-        state
-    }
-
-    fn make_valid_bluray_layout(root: &Path) {
-        let bdmv = root.join("BDMV");
-        std::fs::create_dir_all(&bdmv).expect("BDMV");
-        std::fs::write(bdmv.join("index.bdmv"), b"placeholder").expect("index.bdmv");
-        std::fs::write(bdmv.join("MovieObject.bdmv"), b"placeholder").expect("MovieObject.bdmv");
-        let playlist = bdmv.join("PLAYLIST");
-        std::fs::create_dir_all(&playlist).expect("PLAYLIST");
-        std::fs::write(playlist.join("00000.mpls"), b"placeholder").expect("mpls");
-        let stream = bdmv.join("STREAM");
-        std::fs::create_dir_all(&stream).expect("STREAM");
-        std::fs::write(stream.join("00001.m2ts"), b"placeholder").expect("m2ts");
-    }
 
     fn identity_for(path: &Path) -> ProbeCacheIdentity {
         ProbeCacheIdentity::from_metadata(&std::fs::metadata(path).expect("fixture metadata"))

@@ -6,9 +6,15 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::marker::PhantomData;
 use std::os::raw::c_int;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::time::Instant;
@@ -127,6 +133,90 @@ pub struct BlurayTitleSource {
     title_count: u32,
 }
 
+#[cfg(unix)]
+static LIBBLURAY_STDERR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn dup(fd: c_int) -> c_int;
+    fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+    fn close(fd: c_int) -> c_int;
+}
+
+/// Temporarily redirects process stderr while libbluray opens a source.
+///
+/// libbluray delegates UDF recognition to libudfread, and libudfread can write
+/// directly to fd 2 even when libbluray debugging is disabled. In a raw-mode
+/// TUI that output corrupts the screen. The guard is deliberately narrow,
+/// process-global, and serialized: only `bd_open` runs with stderr redirected,
+/// and the original fd is restored even if `bd_open` fails.
+#[cfg(unix)]
+struct StderrRedirectGuard<'a> {
+    _lock: MutexGuard<'a, ()>,
+    saved_fd: c_int,
+}
+
+#[cfg(unix)]
+impl StderrRedirectGuard<'static> {
+    fn new() -> Result<Self, String> {
+        let lock = LIBBLURAY_STDERR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let saved_fd = unsafe { dup(2) };
+        if saved_fd < 0 {
+            return Err(format!(
+                "dup(stderr) failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        let devnull = match OpenOptions::new().write(true).open("/dev/null") {
+            Ok(devnull) => devnull,
+            Err(err) => {
+                unsafe {
+                    let _ = close(saved_fd);
+                }
+                return Err(format!("open(/dev/null) failed: {err}"));
+            }
+        };
+
+        if unsafe { dup2(devnull.as_raw_fd(), 2) } < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                let _ = close(saved_fd);
+            }
+            return Err(format!("dup2(/dev/null, stderr) failed: {err}"));
+        }
+
+        Ok(Self {
+            _lock: lock,
+            saved_fd,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StderrRedirectGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = dup2(self.saved_fd, 2);
+            let _ = close(self.saved_fd);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct StderrRedirectGuard;
+
+#[cfg(not(unix))]
+impl StderrRedirectGuard {
+    fn new() -> Result<Self, String> {
+        Ok(Self)
+    }
+}
+
 impl BlurayDisc {
     pub fn open(path: &Path) -> Result<Self, String> {
         let (handle, title_count) = BlurayHandle::open_loaded(path)?;
@@ -180,10 +270,24 @@ impl BlurayDisc {
 
 impl BlurayHandle {
     fn open(path: &Path) -> Result<Self, String> {
-        // Suppress libbluray's debug output to stderr — it corrupts the TUI.
+        if !super::bluray_utils::is_bluray_backend_open_candidate(path) {
+            return Err(format!("Not a Blu-ray source: {}", path.display()));
+        }
+
+        // Suppress libbluray's own debug channel, but do not rely on this for
+        // raw-mode TUI safety: libudfread can write directly to fd 2 inside
+        // bd_open. The stderr guard below is the fail-closed defense.
         unsafe { ffi::bd_set_debug_mask(0) };
         let path_c = path_to_cstring(path)?;
-        let handle = unsafe { ffi::bd_open(path_c.as_ptr(), ptr::null()) };
+        let handle = {
+            let _stderr_guard = StderrRedirectGuard::new().map_err(|err| {
+                format!(
+                    "refusing to call libbluray without stderr suppression for '{}': {err}",
+                    path.display()
+                )
+            })?;
+            unsafe { ffi::bd_open(path_c.as_ptr(), ptr::null()) }
+        };
         let handle = NonNull::new(handle)
             .ok_or_else(|| format!("libbluray bd_open failed for {}", path.display()))?;
         Ok(Self {
@@ -1404,6 +1508,28 @@ fn event_name_from_libbluray(event: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bluray_backend_rejects_regular_audio_directory_before_libbluray_open() {
+        let root = std::env::temp_dir().join(format!(
+            "tonepoet-regular-audio-not-bluray-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create audio dir");
+        std::fs::write(root.join("01 - Track.flac"), b"audio").expect("write audio fixture");
+
+        let err = match BlurayDisc::open(&root) {
+            Ok(_) => panic!("regular audio directory must not reach bd_open"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("Not a Blu-ray source"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn libbluray_angle_adapter_uses_zero_based_arguments() {

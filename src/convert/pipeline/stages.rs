@@ -19064,7 +19064,12 @@ mod bluray_routing_tests {
     fn pipeline_bluray_explicit_iso_routes_before_archive_or_single_file_handling() {
         let temp = tempfile::tempdir().expect("temp dir");
         let iso = temp.path().join("explicit-bluray.iso");
-        std::fs::write(&iso, b"not an archive and not a valid BD image").expect("iso fixture");
+        // Explicit Blu-ray intent may only disambiguate a structurally
+        // plausible image: the file must carry bounded UDF volume markers and
+        // meet the minimum image size before libbluray routing is allowed.
+        let mut image = vec![0u8; 64 * 1024];
+        image[32 * 1024..32 * 1024 + 5].copy_from_slice(b"NSR02");
+        std::fs::write(&iso, &image).expect("iso fixture");
 
         let mut req = log_test_request();
         req.container = iso;
@@ -19074,6 +19079,24 @@ mod bluray_routing_tests {
         req.source.bluray_angle = Some(1);
 
         assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::BluRay);
+    }
+
+    #[test]
+    fn pipeline_bluray_explicit_iso_without_udf_markers_falls_back_to_archive() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let iso = temp.path().join("explicit-not-bluray.iso");
+        std::fs::write(&iso, b"not an archive and not a valid BD image").expect("iso fixture");
+
+        let mut req = log_test_request();
+        req.container = iso;
+        req.source.bluray_playlist = Some(12);
+        req.source.bluray_audio_pid = Some(0x1100);
+        req.source.bluray_audio_stream = Some(0);
+        req.source.bluray_angle = Some(1);
+
+        // Explicit Blu-ray fields must not promote arbitrary user data into
+        // the libbluray path; a markerless .iso stays on the archive route.
+        assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::Archive);
     }
 
     #[test]
@@ -19935,7 +19958,7 @@ mod conversion_log_tests {
 mod naming_template_tests {
     use super::*;
 
-    fn template_source() -> PreparedSource {
+    pub(super) fn template_source() -> PreparedSource {
         let mut album_extra = BTreeMap::new();
         album_extra.insert("catalog".to_string(), "CK-1234".to_string());
         PreparedSource {
@@ -19986,7 +20009,7 @@ mod naming_template_tests {
         }
     }
 
-    fn template_request(folder_template: Option<String>) -> PipelineRequest {
+    pub(super) fn template_request(folder_template: Option<String>) -> PipelineRequest {
         PipelineRequest {
             job_id: "job-test".to_string(),
             item_id: "item-test".to_string(),
@@ -20517,6 +20540,7 @@ mod naming_template_tests {
 
 #[cfg(test)]
 mod title_extra_tests {
+    use super::naming_template_tests::{template_request, template_source};
     use super::*;
 
     #[test]

@@ -948,6 +948,7 @@ pub(crate) fn install_archive_preview_convert_source(
     path: PathBuf,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
+    app.cancel_browse_convert_expansion();
     app.probe_generation = app.probe_generation.saturating_add(1);
     let generation = app.probe_generation;
 
@@ -1280,6 +1281,39 @@ impl PendingArchivePreview {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {}
         }
+    }
+}
+
+/// Lifecycle handle for Browse Convert folder expansion. It exists so a
+/// recursive filesystem walk can run on a blocking worker while the raw-mode
+/// reducer retains an explicit generation/cancellation owner.
+#[derive(Clone)]
+pub struct PendingBrowseConvertExpansion {
+    pub generation: u64,
+    pub request: crate::tui::command::BrowseConvertExpansionRequest,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+impl fmt::Debug for PendingBrowseConvertExpansion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingBrowseConvertExpansion")
+            .field("generation", &self.generation)
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingBrowseConvertExpansion {
+    pub fn matches(
+        &self,
+        generation: u64,
+        request: &crate::tui::command::BrowseConvertExpansionRequest,
+    ) -> bool {
+        self.generation == generation && &self.request == request
+    }
+
+    pub fn cancel(self) {
+        self.cancel.cancel();
     }
 }
 
@@ -7978,6 +8012,10 @@ pub struct AppState {
     /// Main TUI message sender, installed by the event loop. Helper paths that
     /// are not passed `tx` directly use this to launch async source probes.
     pub tui_tx: Option<tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    /// Browse Convert folder expansion currently running on a blocking worker.
+    /// New source/queue requests cancel and replace this handle; completion
+    /// reducers accept only the matching generation and request snapshot.
+    pub pending_browse_convert_expansion: Option<PendingBrowseConvertExpansion>,
     pub preset: PresetState,
 
     // Browse screen state
@@ -8800,6 +8838,7 @@ impl AppState {
             },
             probe_generation: 0,
             tui_tx: None,
+            pending_browse_convert_expansion: None,
             preset: PresetState::default(),
             browse,
             queue_focus: QueueFocus::FileList,
@@ -8898,6 +8937,68 @@ impl AppState {
         self.set_config_focus(next);
     }
 
+
+    pub fn begin_browse_convert_expansion(
+        &mut self,
+        request: crate::tui::command::BrowseConvertExpansionRequest,
+    ) -> (u64, tokio_util::sync::CancellationToken) {
+        self.cancel_browse_convert_expansion();
+        self.probe_generation = self.probe_generation.saturating_add(1);
+        let generation = self.probe_generation;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.pending_browse_convert_expansion = Some(PendingBrowseConvertExpansion {
+            generation,
+            request,
+            cancel: cancel.clone(),
+        });
+        (generation, cancel)
+    }
+
+    pub fn browse_convert_expansion_pending_for(
+        &self,
+        generation: u64,
+        request: &crate::tui::command::BrowseConvertExpansionRequest,
+    ) -> bool {
+        self.pending_browse_convert_expansion
+            .as_ref()
+            .map(|pending| pending.matches(generation, request))
+            .unwrap_or(false)
+    }
+
+    pub fn complete_browse_convert_expansion(
+        &mut self,
+        generation: u64,
+        request: &crate::tui::command::BrowseConvertExpansionRequest,
+    ) -> bool {
+        if self.browse_convert_expansion_pending_for(generation, request) {
+            self.pending_browse_convert_expansion = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cancel_browse_convert_expansion(&mut self) -> bool {
+        if let Some(pending) = self.pending_browse_convert_expansion.take() {
+            pending.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancel a pending Browse Convert folder expansion because the Browse
+    /// selection/navigation context that authorized it changed. This is more
+    /// aggressive than stale-result rejection: it asks the blocking walker to
+    /// stop early instead of letting a large scan continue until completion.
+    pub fn cancel_browse_convert_expansion_for_browse_change(&mut self, reason: &str) -> bool {
+        if self.cancel_browse_convert_expansion() {
+            self.set_status(format!("folder expansion cancelled: {reason}"));
+            true
+        } else {
+            false
+        }
+    }
 
     pub fn begin_archive_listing(
         &mut self,
@@ -9320,6 +9421,24 @@ impl AppState {
                 .unwrap_or_else(|| pending.archive_path.display().to_string());
             self.status_message = Some((
                 format!("Listing archive {}... {}s elapsed; Esc cancels", name, elapsed),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        if let Some(pending) = &self.pending_browse_convert_expansion {
+            let folder_count = pending
+                .request
+                .selection_snapshot
+                .iter()
+                .filter(|path| path.is_dir())
+                .count();
+            let label = if folder_count > 1 {
+                "selected folders"
+            } else {
+                "folder"
+            };
+            self.status_message = Some((
+                format!("Expanding {label}... Esc or navigation cancels"),
                 std::time::Instant::now(),
             ));
             return;
@@ -13106,5 +13225,82 @@ mod app_state_theme_ownership_tests {
 
         assert_eq!(app.config.ui.theme, crate::tui::theme::default_theme_slug());
         assert_eq!(app.theme.slug, crate::tui::theme::default_theme_slug());
+    }
+}
+
+#[cfg(test)]
+mod browse_convert_expansion_lifecycle_tests {
+    use super::*;
+
+    fn expansion_request(path: &str) -> crate::tui::command::BrowseConvertExpansionRequest {
+        crate::tui::command::BrowseConvertExpansionRequest {
+            target: crate::tui::command::BrowseConvertExpansionTarget::ConvertReview {
+                preset: None,
+                post_load: crate::tui::command::BrowseConvertPostLoad::ReviewOnly,
+            },
+            selection_snapshot: vec![PathBuf::from(path)],
+            browse_in_archive: false,
+        }
+    }
+
+    #[test]
+    fn starting_browse_convert_expansion_records_pending_generation_and_request() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let request = expansion_request("album");
+
+        let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        assert_eq!(generation, app.probe_generation);
+        assert!(!cancel.is_cancelled());
+        assert!(app.browse_convert_expansion_pending_for(generation, &request));
+    }
+
+    #[test]
+    fn newer_browse_convert_expansion_cancels_and_replaces_older_one() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let first = expansion_request("album-a");
+        let second = expansion_request("album-b");
+
+        let (first_generation, first_cancel) = app.begin_browse_convert_expansion(first.clone());
+        let (second_generation, second_cancel) = app.begin_browse_convert_expansion(second.clone());
+
+        assert!(second_generation > first_generation);
+        assert!(first_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
+        assert!(!app.browse_convert_expansion_pending_for(first_generation, &first));
+        assert!(app.browse_convert_expansion_pending_for(second_generation, &second));
+    }
+
+    #[test]
+    fn stale_completion_cannot_clear_current_browse_convert_expansion() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let first = expansion_request("album-a");
+        let second = expansion_request("album-b");
+
+        let (first_generation, _first_cancel) = app.begin_browse_convert_expansion(first.clone());
+        let (second_generation, _second_cancel) = app.begin_browse_convert_expansion(second.clone());
+
+        assert!(!app.complete_browse_convert_expansion(first_generation, &first));
+        assert!(app.browse_convert_expansion_pending_for(second_generation, &second));
+        assert!(app.complete_browse_convert_expansion(second_generation, &second));
+        assert!(!app.browse_convert_expansion_pending_for(second_generation, &second));
+    }
+
+    #[test]
+    fn browse_change_cancellation_cancels_pending_worker_token() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let request = expansion_request("album");
+        let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        assert!(app.browse_convert_expansion_pending_for(generation, &request));
+        assert!(app.cancel_browse_convert_expansion_for_browse_change("browse selection changed"));
+
+        assert!(cancel.is_cancelled());
+        assert!(!app.browse_convert_expansion_pending_for(generation, &request));
+        assert!(app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.contains("browse selection changed"))
+            .unwrap_or(false));
     }
 }

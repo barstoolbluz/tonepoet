@@ -944,23 +944,16 @@ pub fn execute_context_action(
         }
         ContextAction::ConvertLastUsed => {
             let start = resolve_convert_start(app, invert);
-            let cmd = super::command::Command::Queue { preset: None };
-            super::command::execute_command(app, cmd, tx);
-            if app.current_screen == AppScreen::Convert {
-                super::command::execute_commit_with_disc_selection_bridge(app, start, tx);
-            }
+            super::command::execute_queue_with_post_load_commit(app, tx, None, start);
         }
         ContextAction::ConvertWithPreset(name) => {
             let start = resolve_convert_start(app, invert);
-            let cmd = super::command::Command::Queue { preset: Some(name) };
-            super::command::execute_command(app, cmd, tx);
-            if app.current_screen == AppScreen::Convert {
-                super::command::execute_commit_with_disc_selection_bridge(app, start, tx);
-            }
+            super::command::execute_queue_with_post_load_commit(app, tx, Some(name), start);
         }
         ContextAction::Select => {
             if app.current_screen == AppScreen::Browse {
                 app.browse.toggle_selection();
+                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
             }
         }
         ContextAction::SelectAll => {
@@ -974,6 +967,7 @@ pub fn execute_context_action(
                     .map(|e| e.path.clone())
                     .collect();
                 app.browse.multi_selected = paths;
+                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
             }
         }
         ContextAction::SelectInverse => {
@@ -988,11 +982,13 @@ pub fn execute_context_action(
                     .map(|e| e.path.clone())
                     .collect();
                 app.browse.multi_selected = new_sel;
+                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
             }
         }
         ContextAction::Deselect => {
             if app.current_screen == AppScreen::Browse {
                 app.browse.clear_multi_selection();
+                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
             }
         }
         ContextAction::OpenEntry => {
@@ -1005,9 +1001,11 @@ pub fn execute_context_action(
                                 if !app.browse.go_up_in_archive() {
                                     super::keybindings::exit_browse_archive(app, tx);
                                 }
+                                app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
                                 app.browse.probe_current_with_db(tx, Some(&app.db));
                             } else if let Some(inner) = app.browse.archive_inner_path_for_path(&entry.path) {
                                 app.browse.enter_archive_dir(&inner);
+                                app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
                                 app.browse.probe_current_with_db(tx, Some(&app.db));
                             } else {
                                 app.set_status("archive: could not resolve directory entry");
@@ -1015,6 +1013,7 @@ pub fn execute_context_action(
                         }
                         EntryKind::Directory | EntryKind::ParentDir => {
                             app.browse.enter_selected();
+                            app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
                             app.browse.probe_current_with_db(tx, Some(&app.db));
                         }
                         _ => {
@@ -1693,6 +1692,143 @@ fn resolve_convert_start(app: &AppState, invert: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{AppScreen, SourceMode};
+    use crate::tui::message::AppMessage;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    fn app_with_selected_audio_directory(
+        album: &std::path::Path,
+        output_dir: Option<std::path::PathBuf>,
+    ) -> AppState {
+        let mut config = TonepoetConfig::default();
+        config.conversion.default_destination = output_dir;
+        // Make Last Used behave as enqueue-only in tests, so the assertion can
+        // inspect queue publication without starting worker processing.
+        config.ui.convert_default_action = "enqueue".to_string();
+
+        let mut app = AppState::new_for_test(config);
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = album
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            album.to_path_buf(),
+            "album".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app
+    }
+
+    async fn next_browse_convert_expansion(
+        rx: &mut mpsc::Receiver<AppMessage>,
+    ) -> (
+        u64,
+        crate::tui::command::BrowseConvertExpansionRequest,
+        crate::tui::command::BrowseConvertExpansion,
+    ) {
+        match timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("folder expansion message should arrive")
+            .expect("folder expansion channel should stay open")
+        {
+            AppMessage::BrowseConvertExpansionComplete {
+                generation,
+                request,
+                expansion,
+            } => (generation, request, expansion),
+            other => panic!("expected BrowseConvertExpansionComplete, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_menu_convert_custom_audio_directory_expands_to_convert_review_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let first = album.join("01 - One.flac");
+        let second = album.join("02 - Two.flac");
+        std::fs::write(&second, b"fixture").expect("second fixture");
+        std::fs::write(&first, b"fixture").expect("first fixture");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = app_with_selected_audio_directory(&album, None);
+
+        execute_context_action(&mut app, ContextAction::ConvertCustom, &tx, false);
+
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        assert!(app.pending_browse_convert_expansion.is_some());
+        let (generation, request, expansion) = next_browse_convert_expansion(&mut rx).await;
+        crate::tui::command::handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request,
+            expansion,
+        );
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.all_paths(), vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn context_menu_convert_last_used_audio_directory_commits_after_async_expansion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        let output = temp.path().join("out");
+        std::fs::create_dir_all(&album).expect("album dir");
+        std::fs::create_dir_all(&output).expect("output dir");
+        let first = album.join("01 - One.flac");
+        let second = album.join("02 - Two.flac");
+        std::fs::write(&second, b"fixture").expect("second fixture");
+        std::fs::write(&first, b"fixture").expect("first fixture");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = app_with_selected_audio_directory(&album, Some(output));
+
+        execute_context_action(&mut app, ContextAction::ConvertLastUsed, &tx, false);
+
+        let pending = app
+            .pending_browse_convert_expansion
+            .as_ref()
+            .expect("regular directory convert should start async expansion");
+        assert!(matches!(
+            &pending.request.target,
+            crate::tui::command::BrowseConvertExpansionTarget::ConvertReview {
+                post_load: crate::tui::command::BrowseConvertPostLoad::Commit { start: false },
+                ..
+            }
+        ));
+        assert_eq!(app.current_screen, AppScreen::Browse);
+
+        let (generation, request, expansion) = next_browse_convert_expansion(&mut rx).await;
+        crate::tui::command::handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request,
+            expansion,
+        );
+
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        assert!(matches!(app.convert.source.mode, SourceMode::Empty));
+        let queued_paths: Vec<_> = app
+            .manager
+            .queue
+            .try_read()
+            .expect("queue read")
+            .all_items()
+            .into_iter()
+            .map(|item| item.input_path.clone())
+            .collect();
+        assert_eq!(queued_paths, vec![first, second]);
+    }
+
 
     fn leaf(label: &str) -> ContextMenuEntry {
         ContextMenuEntry::Item(ContextMenuItem {

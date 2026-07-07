@@ -101,6 +101,14 @@ pub enum AppMessage {
     StatusMessage(String),
     /// Force a redraw
     Redraw,
+    /// Result of asynchronous Browse regular-folder expansion for Convert/Queue
+    /// handoff. The reducer accepts this only when the generation and captured
+    /// selection still match the active pending expansion.
+    BrowseConvertExpansionComplete {
+        generation: u64,
+        request: crate::tui::command::BrowseConvertExpansionRequest,
+        expansion: crate::tui::command::BrowseConvertExpansion,
+    },
     /// Result of an asynchronous Convert-source probe launched from command
     /// handlers or picker returns. `generation` is captured at dispatch time;
     /// the event-loop reducer drops stale completions when the source has

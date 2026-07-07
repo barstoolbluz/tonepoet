@@ -58,6 +58,9 @@ pub async fn run_app(
         if app.current_screen != AppScreen::Browse && app.cancel_archive_listing() {
             app.set_status("archive listing cancelled: Browse screen changed");
         }
+        if app.current_screen != AppScreen::Browse && app.cancel_browse_convert_expansion() {
+            app.set_status("folder expansion cancelled: Browse screen changed");
+        }
         if app.current_screen != AppScreen::Browse {
             if let Some(pending) = app.pending_browse_archive_metadata.take() {
                 pending.cancel_and_cleanup();
@@ -2554,6 +2557,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             app.set_status(msg);
         }
         AppMessage::Redraw => {} // Just triggers a redraw via the loop
+        AppMessage::BrowseConvertExpansionComplete {
+            generation,
+            request,
+            expansion,
+        } => {
+            super::command::handle_browse_convert_expansion_complete(
+                app,
+                tx,
+                generation,
+                request,
+                expansion,
+            );
+        }
         AppMessage::ProbeResult {
             generation,
             path,

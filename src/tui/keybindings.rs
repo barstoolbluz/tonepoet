@@ -199,7 +199,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 app.current_screen = AppScreen::from_config_name(&app.config.ui.default_screen);
                 if app.current_screen == AppScreen::Browse {
                     app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
                 return;
             }
@@ -212,7 +212,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 app.current_screen = AppScreen::from_config_name(&app.config.ui.default_screen);
                 if app.current_screen == AppScreen::Browse {
                     app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
                 return;
             }
@@ -231,7 +231,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                     app.current_screen = origin;
                     if origin == AppScreen::Browse {
                         app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                     }
                     app.set_status("cancelled");
                     return;
@@ -1354,6 +1354,7 @@ fn activate_browse_entry(
 
     if entry.is_navigable_dir() && app.browse.is_in_archive() {
         if activate_archive_browse_directory(app, idx, tx) {
+            app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
             app.browse.probe_current_with_db(tx, Some(&app.db));
             super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
@@ -1362,18 +1363,21 @@ fn activate_browse_entry(
 
     if entry.is_navigable_dir() {
         app.browse.enter_selected();
+        app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
         app.browse.probe_current_with_db(tx, Some(&app.db));
         super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         return;
     }
 
     if matches!(entry.kind, super::browse::EntryKind::Archive) && !app.browse.is_in_archive() {
+        app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
         start_browse_archive_listing(app, entry.path.clone(), tx, false);
         return;
     }
 
     if matches!(entry.kind, super::browse::EntryKind::AudioFile(_)) && app.browse.is_in_archive() {
         app.browse.toggle_selection_at_index(idx);
+        app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
         app.set_status(
             "archive entry selected; use Edit Tags or Rename for archive-aware changes",
         );
@@ -2409,6 +2413,72 @@ mod inline_edit_behavior_tests {
     }
 
     #[test]
+    fn regular_audio_directory_direct_convert_handoff_expands_to_batch_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("create album fixture");
+        let first = album.join("01 - One.flac");
+        let second = album.join("02 - Two.flac");
+        std::fs::write(&first, b"audio").expect("write first fixture");
+        std::fs::write(&second, b"audio").expect("write second fixture");
+
+        let app = AppState::new_for_test(TonepoetConfig::default());
+        let paths = super::super::command::regular_filesystem_audio_folder_paths_for_convert(&app, &album)
+            .expect("folder expansion should not fail")
+            .expect("regular audio directory should expand");
+
+        assert_eq!(paths, vec![first, second]);
+    }
+
+    #[test]
+    fn multi_selection_audio_directory_expands_deterministically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("create album fixture");
+        let first = album.join("01 - One.flac");
+        let second = album.join("02 - Two.flac");
+        let loose = temp.path().join("00 - Intro.wav");
+        std::fs::write(&second, b"audio").expect("write second fixture");
+        std::fs::write(&first, b"audio").expect("write first fixture");
+        std::fs::write(&loose, b"audio").expect("write loose fixture");
+
+        let app = AppState::new_for_test(TonepoetConfig::default());
+        let expansion = super::super::command::expand_regular_filesystem_audio_folders_for_convert_blocking(
+            app.browse.is_in_archive(),
+            vec![album.clone(), loose.clone(), album],
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        assert!(expansion.expansion_errors.is_empty());
+        assert!(expansion.empty_audio_folders.is_empty());
+        assert_eq!(expansion.paths, vec![loose, first, second]);
+    }
+
+    #[test]
+    fn bluray_directory_direct_convert_handoff_is_not_expanded_as_audio_folder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bdmv = temp.path().join("BDMV");
+        std::fs::create_dir_all(bdmv.join("PLAYLIST")).expect("create playlist");
+        std::fs::create_dir_all(bdmv.join("STREAM")).expect("create stream");
+        std::fs::write(bdmv.join("index.bdmv"), b"index").expect("write index");
+        std::fs::write(bdmv.join("MovieObject.bdmv"), b"movie object").expect("write movie object");
+        std::fs::write(bdmv.join("PLAYLIST").join("00001.mpls"), b"playlist")
+            .expect("write playlist");
+        std::fs::write(bdmv.join("STREAM").join("00001.m2ts"), b"stream")
+            .expect("write stream");
+        std::fs::write(temp.path().join("01 - Not Audio.flac"), b"audio")
+            .expect("write unrelated audio fixture");
+
+        let app = AppState::new_for_test(TonepoetConfig::default());
+
+        assert!(
+            super::super::command::regular_filesystem_audio_folder_paths_for_convert(&app, temp.path())
+                .expect("Blu-ray directory classification should not fail")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn browse_inline_tab_with_no_next_entry_commits_rename_without_resuming() {
         let (tx, _rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3390,8 +3460,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         if app.cancel_archive_listing() {
             app.set_status("archive listing cancelled: browse navigation changed");
         }
+        app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
         app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
     }
 }
 
@@ -3525,42 +3596,49 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
     match (key.code, key.modifiers) {
         (KeyCode::Enter, _) => {
             app.browse.close_filter_input(true);
+            app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         (KeyCode::Esc, _) => {
             app.browse.close_filter_input(false);
+            app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         // List navigation while filter input is open
         (KeyCode::Up, _) => {
             app.browse.move_up();
+            app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         (KeyCode::Down, _) => {
             app.browse.move_down();
+            app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         (KeyCode::PageUp, _) => {
             app.browse.page_up();
+            app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         (KeyCode::PageDown, _) => {
             app.browse.page_down();
+            app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
         }
         // Everything else: feed to the text input, then re-apply view
         _ => {
             if let Some(input) = &mut app.browse.filter_input {
                 if handle_text_input_key(input, &key) {
                     app.browse.update_filter_from_input();
+                    app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
                     app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
             }
         }
@@ -3710,6 +3788,25 @@ pub(super) fn start_browse_archive_listing(
 }
 
 fn install_convert_source_with_async_probe(app: &mut AppState, path: std::path::PathBuf) {
+    if super::command::browse_selection_contains_regular_audio_folder_for_convert(
+        app,
+        std::slice::from_ref(&path),
+    ) {
+        if let Some(tx) = app.tui_tx.clone() {
+            super::command::start_browse_convert_folder_expansion(
+                app,
+                &tx,
+                super::command::BrowseConvertExpansionTarget::ConvertSource,
+                vec![path],
+            );
+        } else {
+            app.set_status("Cannot expand folder: TUI worker channel is unavailable");
+        }
+        return;
+    }
+
+    app.cancel_browse_convert_expansion();
+
     if is_nonprobeable_source_for_probe(&path) {
         if let Some(tx) = app.tui_tx.clone() {
             install_archive_preview_convert_source(app, path, tx);
@@ -3787,6 +3884,22 @@ fn load_browse_selection(
             let mut paths_to_add = app.browse.multi_selected.clone();
             if paths_to_add.is_empty() {
                 paths_to_add.push(path);
+            }
+            if super::command::browse_selection_contains_regular_audio_folder_for_convert(
+                app,
+                &paths_to_add,
+            ) {
+                if let Some(tx) = app.tui_tx.clone() {
+                    super::command::start_browse_convert_folder_expansion(
+                        app,
+                        &tx,
+                        super::command::BrowseConvertExpansionTarget::ConvertQueueItems,
+                        paths_to_add,
+                    );
+                } else {
+                    app.set_status("Cannot expand folder: TUI worker channel is unavailable");
+                }
+                return;
             }
             let mut count = 0;
             let options = conversion_options_from_current_convert_output(app);
@@ -22810,7 +22923,7 @@ pub(super) fn commit_browse_rename(
                 app.browse.ensure_visible();
             }
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             app.set_status(format!("renamed: {} → {}", old_name, new_name));
             true
         }
@@ -22973,7 +23086,7 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Se
             let display = path.display().to_string();
             app.browse.navigate_to(path);
             app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             app.set_status(format!("cd: {}", display));
         }
         _ => {}
@@ -24601,7 +24714,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
                 app.current_screen = AppScreen::Browse;
                 app.browse.probe_current_with_db(tx, Some(&app.db));
-                                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             }
             TuiButton::SourceExpandButton => {
                 // Open the BatchList overlay if a batch is loaded.
@@ -24972,7 +25085,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.browse.toggle_selection_at_index(idx);
                 app.pending_browse_rename = None;
                 app.browse.drag_state.active = false;
-                app.browse.probe_current_with_db(tx, Some(&app.db));
+                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             }
             TuiButton::BrowseEntry(idx) => {
@@ -24995,6 +25109,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.last_browse_click = Some((clicked_path, now));
                     app.pending_browse_rename = None;
                     app.browse.drag_state.active = false;
+                    app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                     super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                     return;
@@ -25011,6 +25126,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.last_browse_click = Some((clicked_path, now));
                     app.pending_browse_rename = None;
                     app.browse.drag_state.active = false;
+                    app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                     super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                     return;
@@ -25057,6 +25173,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     if !matches!(app.browse.entries[idx].kind, super::browse::EntryKind::ParentDir) {
                         app.browse.multi_select_anchor = Some(clicked_path);
                     }
+                    app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                     super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
@@ -25073,24 +25190,28 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseToolbarBack => {
                 if app.browse.go_back() {
+                    app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                     super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
             }
             TuiButton::BrowseToolbarForward => {
                 if app.browse.go_forward() {
+                    app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                     super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
             }
             TuiButton::BrowseToolbarUp => {
                 if app.browse.go_parent() {
+                    app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
                     app.browse.probe_current_with_db(tx, Some(&app.db));
                     super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
                 }
             }
             TuiButton::BrowseToolbarRefresh => {
                 app.browse.refresh_with_search(Some(tx));
+                app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
                 app.browse.probe_current_with_db(tx, Some(&app.db));
                 app.set_status("browse refreshed");
             }
@@ -25102,13 +25223,17 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseToolbarShowHidden | TuiButton::BrowseOptionsShowHidden => {
                 app.browse.toggle_hidden_with_search(Some(tx));
+                app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
                 persist_browse_config(app);
             }
             TuiButton::BrowsePathGo => {
                 if let Some(input) = app.browse.path_input.as_ref() {
                     let path = input.text.clone();
                     match app.browse.navigate_to_str(&path) {
-                        Ok(()) => app.browse.path_input = None,
+                        Ok(()) => {
+                            app.browse.path_input = None;
+                            app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
+                        },
                         Err(err) => app.set_status(err),
                     }
                 } else {
@@ -26219,8 +26344,8 @@ mod phase4_tests {
         assert!(app.pending_metadata_editor.is_some());
     }
 
-    #[test]
-    fn metadata_editor_footer_close_with_dirty_state_prompts_before_closing() {
+    #[tokio::test]
+    async fn metadata_editor_footer_close_with_dirty_state_saves_before_closing() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
@@ -26229,7 +26354,19 @@ mod phase4_tests {
 
         handle_mouse(&mut app, footer_close_mouse_event(), &tx);
 
-        assert_discard_confirmation(&app);
+        // With the OK/Apply semantics, clicking close with dirty state
+        // initiates a save (transitions to Saving phase) rather than
+        // showing a discard confirmation prompt.
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert!(
+                    matches!(state.model.phase, crate::tui::app::MetadataEditorPhase::Saving),
+                    "close with dirty state should initiate save, got phase: {:?}",
+                    state.model.phase
+                );
+            }
+            other => panic!("expected MetadataEditor in Saving phase, got {:?}", other),
+        }
     }
 
     #[test]
