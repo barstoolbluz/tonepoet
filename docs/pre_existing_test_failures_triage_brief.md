@@ -39,6 +39,35 @@ The test expects a path-escaping naming template (one that would escape the dest
 ### 9. `output_options_companion_projection_tests::output_options_field_cycle_includes_companion_fields_when_maximized` (src/tui/app.rs:3828)
 From `e606eda` (companion copying), broken by later feature work: `CompanionFolders.next_for(true)` now returns `ForceEncode`, test expects `WriteLog`. `MAXIMIZED_FIELDS` (src/tui/app.rs:2448) now inserts `ForceEncode` and `DiscSubfolders` between `CompanionFolders` and `WriteLog`; the test predates both. Almost certainly a stale test: update the expected cycle to walk `CompanionFolders → ForceEncode → DiscSubfolders → WriteLog` (also check the `prev_for` assertions' symmetry).
 
+## Real-world failure: folder album batch loses disc 1's subfolder
+
+Empirical repro (2026-07-07, user's library). Source folder:
+
+```
+The Allman Brothers Band - At Fillmore East (1971) [FLAC] {MFSL}/
+├── disc 1/01 - Statesboro Blues.flac … 04 - You Don’t Love Me.flac
+└── disc 2/01 - Hot ’Lanta.flac … 03 - Whipping Post.flac
+```
+
+Converted with `create_disc_subfolders` (filename template `%DISC_FOLDER%/%TRACKNN% - %TITLE%.%EXT%`). Output:
+
+```
+out/
+├── 01 - Statesboro Blues.flac … 04 - You Don’t Love Me.flac   <- disc 1 tracks, NO subfolder
+└── Disc 02/01 - Hot ’Lanta.flac … 03 - Whipping Post.flac
+```
+
+Why: a regular audio folder converts as a **folder album batch** — each file is dispatched as an independent single-track job (`prepare_independent_single_file_album_batch_for_dispatch`, one `PipelineRequest`/`PreparedSource` per file; the conversion.log shows seven distinct job ids each planning `.track-0001`). `%DISC_FOLDER%` is gated by `source_has_proven_multi_disc_layout(source)` (stages.rs:15408), which is evaluated **per job**, where the source contains exactly one track:
+
+- a disc 2 track proves a multi-disc layout by itself (disc number 2 > 1) → `Disc 02` created;
+- a disc 1 track cannot (its only evidence is disc number 1, and the deliberate `album_metadata_disc_one_without_total_does_not_create_single_disc_folder` rule suppresses single-disc folders) → rendered into the album root.
+
+**This specific repro is already fixed** (verified against the real album): the root cause was `materializer_single.rs` discarding the disc total — `extract_file_tag_metadata` never read `tag.disk_total()` and `derive_album_metadata` hardcoded `total_discs: metadata.disc_number.map(|_| 1)`. It now stores `disctotal` in the tag extras (which the stages hint machinery already consumes) and derives `total_discs` from it, so a lone disc 1 track proves the multi-disc layout via its `DISCTOTAL=2` tag. Additionally, `source_disc_folder_token` now names the output disc folder after the source disc directory when the disc number is corroborated by a path ancestor (`disc 1` in the source yields `disc 01`, digits normalized to two, prefix casing/separator preserved); tag-only disc numbers keep the `Disc NN` default. Tests: `disc_folder_token_preserves_source_disc_directory_naming_style` and `single_track_batch_job_with_disc_total_creates_disc_one_folder` in `title_extra_tests`, plus `derive_album_metadata_*` unit tests in `materializer_single.rs`.
+
+One caveat for your triage: this fix relies on the tags carrying a disc total. A folder album batch whose files have `disc` numbers but **no** `DISCTOTAL` tag still splits per-track and disc 1 still can't prove multi-disc from a single-track source, even though the batch scope (sibling `disc N` directories under `source_grouping_root`) proves it. If you touch this area for failures 1–3, consider batch-scope disc-layout detection stamped into each request as the durable fix; the invariant is that within one album batch, either every track gets a disc folder or none does.
+
+This failure is the same feature area as failures 1–3; triage them together.
+
 ## Constraints
 
 - Fix whichever side (test or implementation) matches the intended product behavior; note the decision per failure.

@@ -172,6 +172,12 @@ fn read_track_metadata(path: &Path) -> TrackMetadata {
     if let Some(album) = tag.album() {
         extra.insert("album".to_string(), album.to_string());
     }
+    // Disc totals prove a multi-disc layout even when this materializer sees a
+    // single track (folder album batches dispatch one request per file). The
+    // template disc-folder machinery reads this through the "disctotal" hint.
+    if let Some(total) = tag.disk_total().filter(|value| *value > 0) {
+        extra.insert("disctotal".to_string(), total.to_string());
+    }
 
     TrackMetadata {
         title: tag.title().map(|value| value.to_string()),
@@ -212,8 +218,61 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
         genre: metadata.genre.clone(),
         date: metadata.date.clone(),
         total_tracks: tracks.len() as u32,
-        total_discs: metadata.disc_number.map(|_| 1),
+        total_discs: metadata
+            .extra
+            .get("disctotal")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .or_else(|| metadata.disc_number.map(|_| 1)),
         disc_number: metadata.disc_number,
         extra: metadata.extra.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn track_with_metadata(metadata: TrackMetadata) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: metadata.disc_number,
+                track_number: metadata.track_number.unwrap_or(1),
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(
+                "/library/album/disc 1/01 - Track.flac",
+            )),
+            metadata,
+            expected_samples: None,
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            source_audio: SourceAudioDescriptor::default(),
+        }
+    }
+
+    #[test]
+    fn derive_album_metadata_reads_disc_total_from_tag_extras() {
+        let mut metadata = TrackMetadata::default();
+        metadata.disc_number = Some(1);
+        metadata.track_number = Some(1);
+        metadata
+            .extra
+            .insert("disctotal".to_string(), "2".to_string());
+
+        let album = derive_album_metadata(&[track_with_metadata(metadata)]);
+        assert_eq!(album.total_discs, Some(2));
+        assert_eq!(album.disc_number, Some(1));
+    }
+
+    #[test]
+    fn derive_album_metadata_without_disc_total_defaults_to_single_disc() {
+        let mut metadata = TrackMetadata::default();
+        metadata.disc_number = Some(1);
+        metadata.track_number = Some(1);
+
+        let album = derive_album_metadata(&[track_with_metadata(metadata)]);
+        assert_eq!(album.total_discs, Some(1));
     }
 }

@@ -15403,7 +15403,42 @@ fn source_disc_folder_token(source: &PreparedSource, track: &PreparedTrack) -> O
         return None;
     }
     let disc = track_disc_number_hint(source, track).filter(|disc| *disc > 0)?;
+    if let Some(styled) = disc_folder_name_from_source_path_style(track, disc) {
+        return Some(styled);
+    }
     Some(format!("Disc {disc:02}"))
+}
+
+/// When the track's disc number is corroborated by a disc directory in the
+/// source tree, name the output disc folder after that directory (a source
+/// tree using `disc 1` yields `disc 01`, not `Disc 01`). Only the digit run is
+/// normalized to two digits; the user's prefix casing and separator style are
+/// preserved. Tag-only disc numbers keep the default `Disc NN` name.
+fn disc_folder_name_from_source_path_style(track: &PreparedTrack, disc: u32) -> Option<String> {
+    let path = template_source_file_path(&track.source_ref)?;
+    for ancestor in path.ancestors().skip(1) {
+        let Some(name) = ancestor.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(path_disc) = disc_number_from_template_component_name(name) else {
+            continue;
+        };
+        if path_disc != disc {
+            return None;
+        }
+        let digits_start = name.find(|ch: char| ch.is_ascii_digit())?;
+        let digits_len = name[digits_start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .count();
+        let styled = format!(
+            "{}{disc:02}{}",
+            &name[..digits_start],
+            &name[digits_start + digits_len..]
+        );
+        return Some(sanitize_component(styled.trim()));
+    }
+    None
 }
 
 fn source_has_proven_multi_disc_layout(source: &PreparedSource) -> bool {
@@ -21005,6 +21040,85 @@ mod title_extra_tests {
         assert_eq!(rels[3], PathBuf::from("Disc 01/04 - You Don't Love Me"));
         assert_eq!(rels[4], PathBuf::from("Disc 02/01 - Hot 'Lanta"));
         assert_eq!(rels[6], PathBuf::from("Disc 02/03 - Whipping Post"));
+    }
+
+    #[test]
+    fn disc_folder_token_preserves_source_disc_directory_naming_style() {
+        let mut source = template_source();
+        let base = source.tracks[0].clone();
+        let make_track = |source_ordinal: u32, disc: u32, source_rel: &str, title: &str| {
+            let mut track = base.clone();
+            track.id.source_ordinal = source_ordinal;
+            track.id.disc_number = Some(disc);
+            track.id.track_number = 1;
+            track.metadata.track_number = Some(1);
+            track.metadata.disc_number = Some(disc);
+            track.metadata.title = Some(title.to_string());
+            track.source_ref =
+                TrackSourceRef::StagedFile(PathBuf::from("/library/album").join(source_rel));
+            track
+        };
+        source.tracks = vec![
+            make_track(1, 1, "disc 1/01 - Statesboro Blues.flac", "Statesboro Blues"),
+            make_track(2, 2, "disc 2/01 - Hot 'Lanta.flac", "Hot 'Lanta"),
+        ];
+        source.album_metadata.total_tracks = source.tracks.len() as u32;
+        source.album_metadata.total_discs = Some(2);
+
+        let rels = source
+            .tracks
+            .iter()
+            .map(|track| {
+                render_track_template(
+                    "%DISC_FOLDER%/%NN% - %TITLE%",
+                    &source,
+                    track,
+                    &tonepoet_pipeline::AudioFormat::Flac,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        // The source tree spells its disc directories `disc N`; the output
+        // folders follow that style with only the digits normalized.
+        assert_eq!(rels[0], PathBuf::from("disc 01/01 - Statesboro Blues"));
+        assert_eq!(rels[1], PathBuf::from("disc 02/01 - Hot 'Lanta"));
+    }
+
+    #[test]
+    fn single_track_batch_job_with_disc_total_creates_disc_one_folder() {
+        // Folder album batches dispatch one single-track job per file. A disc 1
+        // track must still get its disc folder when the tags carry a disc
+        // total, otherwise disc 1 lands in the album root while disc 2 gets a
+        // subfolder (empirical regression: At Fillmore East, 2026-07-07).
+        let mut source = template_source();
+        let mut track = source.tracks[0].clone();
+        track.id.source_ordinal = 1;
+        track.id.disc_number = Some(1);
+        track.id.track_number = 1;
+        track.metadata.track_number = Some(1);
+        track.metadata.disc_number = Some(1);
+        track.metadata.title = Some("Statesboro Blues".to_string());
+        track
+            .metadata
+            .extra
+            .insert("disctotal".to_string(), "2".to_string());
+        track.source_ref = TrackSourceRef::StagedFile(PathBuf::from(
+            "/library/album/disc 1/01 - Statesboro Blues.flac",
+        ));
+        source.tracks = vec![track];
+        source.album_metadata.total_tracks = 1;
+        source.album_metadata.disc_number = Some(1);
+        source.album_metadata.total_discs = Some(2);
+
+        let rel = render_track_template(
+            "%DISC_FOLDER%/%NN% - %TITLE%",
+            &source,
+            &source.tracks[0],
+            &tonepoet_pipeline::AudioFormat::Flac,
+        )
+        .unwrap();
+        assert_eq!(rel, PathBuf::from("disc 01/01 - Statesboro Blues"));
     }
 
     #[test]

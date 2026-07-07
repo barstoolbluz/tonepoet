@@ -8697,7 +8697,12 @@ impl AppState {
         )
     }
 
-    pub fn new_for_test_with_isolated_db(config: TonepoetConfig) -> Self {
+    pub fn new_for_test_with_isolated_db(mut config: TonepoetConfig) -> Self {
+        // The temp SQLite database is isolated, but queue persistence would
+        // still fall back to the real user-level JSON file (first-run
+        // migration on an empty database) and write test items back into it.
+        // Tests must never read or mutate the developer's actual queue.
+        config.conversion.persist_queue = false;
         Self::new_with_startup_options(
             config,
             AppStartupOptions::without_archive_recovery().with_isolated_temp_database(),
