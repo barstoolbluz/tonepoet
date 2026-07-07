@@ -15225,11 +15225,7 @@ fn render_track_template<T: TemplateRenderTarget + ?Sized>(
         .as_deref()
         .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| artist.clone());
-    let disc = track
-        .id
-        .disc_number
-        .or(track.metadata.disc_number)
-        .unwrap_or(1);
+    let disc = resolved_track_disc_number(track).unwrap_or(1);
     let disc_folder = source_multi_disc_folder_token(source, disc)
         .map(|value| sanitize_component(&value))
         .unwrap_or_default();
@@ -15412,24 +15408,52 @@ fn source_is_multi_disc_for_template(source: &PreparedSource) -> bool {
     let mut disc_numbers = BTreeSet::new();
     let mut max_disc_total = 0_u32;
     for track in &source.tracks {
-        if let Some(disc) = track.id.disc_number.or(track.metadata.disc_number) {
-            if disc > 0 {
-                disc_numbers.insert(disc);
+        if let Some(disc) = resolved_track_disc_number(track) {
+            disc_numbers.insert(disc);
+        }
+        for key in ["disctotal", "disc_total", "totaldiscs", "total_discs"] {
+            if let Some(total) = track
+                .metadata
+                .extra
+                .get(key)
+                .and_then(|raw| parse_disc_total_hint(raw))
+                .filter(|total| *total > 0)
+            {
+                max_disc_total = max_disc_total.max(total);
             }
         }
-        for key in ["discnumber", "disc_number", "disc", "disctotal", "disc_total"] {
-            let Some(raw) = track.metadata.extra.get(key) else { continue; };
-            if let Some((disc, total)) = parse_disc_number_hint(raw) {
-                if let Some(disc) = disc.filter(|disc| *disc > 0) {
-                    disc_numbers.insert(disc);
-                }
-                if let Some(total) = total.filter(|total| *total > 0) {
-                    max_disc_total = max_disc_total.max(total);
-                }
+        for key in ["discnumber", "disc_number", "disc"] {
+            if let Some((_, Some(total))) = track
+                .metadata
+                .extra
+                .get(key)
+                .and_then(|raw| parse_disc_number_hint(raw))
+            {
+                max_disc_total = max_disc_total.max(total);
             }
         }
     }
     disc_numbers.len() > 1 || max_disc_total > 1
+}
+
+fn resolved_track_disc_number(track: &PreparedTrack) -> Option<u32> {
+    track
+        .id
+        .disc_number
+        .or(track.metadata.disc_number)
+        .or_else(|| {
+            ["discnumber", "disc_number", "disc"]
+                .iter()
+                .find_map(|key| {
+                    track
+                        .metadata
+                        .extra
+                        .get(*key)
+                        .and_then(|raw| parse_disc_number_hint(raw))
+                        .and_then(|(disc, _)| disc)
+                })
+        })
+        .filter(|disc| *disc > 0)
 }
 
 fn parse_disc_number_hint(value: &str) -> Option<(Option<u32>, Option<u32>)> {
@@ -15441,9 +15465,16 @@ fn parse_disc_number_hint(value: &str) -> Option<(Option<u32>, Option<u32>)> {
     let second = nums.next();
     match (first, second) {
         (None, None) => None,
-        (Some(total), None) => Some((None, Some(total))),
+        (Some(disc), None) => Some((Some(disc), None)),
         (disc, total) => Some((disc, total)),
     }
+}
+
+fn parse_disc_total_hint(value: &str) -> Option<u32> {
+    value
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .find_map(|part| part.parse::<u32>().ok())
 }
 
 fn render_template_with_tokens(
@@ -15474,12 +15505,21 @@ fn render_conditional_template_blocks(
         };
         let block = &after_open[..close];
         let variables = template_tokens_in(block);
-        if variables.iter().all(|token| {
+        if variables.is_empty() {
+            // Literal braces are not conditional syntax unless the block contains
+            // at least one template token. Preserve them exactly rather than
+            // silently deleting user-authored text.
+            output.push('{');
+            output.push_str(block);
+            output.push('}');
+        } else if variables.iter().all(|token| {
             !resolve_template_token(token, tokens, track_extra, album_extra)
                 .trim()
                 .is_empty()
         }) {
-            output.push_str(&render_template_segment(block, tokens, track_extra, album_extra));
+            // All variables resolved: emit the block contents and only remove
+            // the conditional delimiters. The outer render pass expands tokens.
+            output.push_str(block);
         }
         rest = &after_open[close + 1..];
     }
@@ -20319,6 +20359,65 @@ mod title_extra_tests {
         let s = result.to_string_lossy();
         assert_eq!(s, "01 - Right Off");
         assert!(!result.is_absolute(), "single-disc conditional prefix must not render an absolute path: {s}");
+    }
+
+
+    #[test]
+    fn conditional_title_extra_keeps_block_content_when_resolved() {
+        let mut source = template_source();
+        source.album_metadata.album = Some("At Fillmore East (MFSL)".to_string());
+        let result = render_folder_template(
+            "%ARTIST% - %ALBUM% {%TITLE_EXTRA%}",
+            &source,
+            &tonepoet_pipeline::AudioFormat::Flac,
+        );
+        let s = result.to_string_lossy();
+        assert!(s.contains("At Fillmore East MFSL"), "resolved block content should remain without braces: {s}");
+        assert!(!s.contains('{') && !s.contains('}'), "conditional delimiters should be removed: {s}");
+    }
+
+    #[test]
+    fn conditional_title_extra_drops_entire_block_when_unresolved() {
+        let mut source = template_source();
+        source.album_metadata.album = Some("At Fillmore East".to_string());
+        let result = render_folder_template(
+            "%ARTIST% - %ALBUM% {%TITLE_EXTRA%}",
+            &source,
+            &tonepoet_pipeline::AudioFormat::Flac,
+        );
+        let s = result.to_string_lossy();
+        assert_eq!(s, "Miles Davis - At Fillmore East");
+    }
+
+    #[test]
+    fn conditional_literal_braces_without_tokens_are_preserved() {
+        let source = template_source();
+        let result = render_folder_template(
+            "%ARTIST% - {literal} - %ALBUM%",
+            &source,
+            &tonepoet_pipeline::AudioFormat::Flac,
+        );
+        assert_eq!(result.to_string_lossy(), "Miles Davis - {literal} - A Tribute to Jack Johnson");
+    }
+
+    #[test]
+    fn disc_folder_uses_discnumber_extra_when_struct_field_is_missing() {
+        let mut source = template_source();
+        source.tracks.push(source.tracks[0].clone());
+        source.tracks[0].metadata.title = Some("Disc One Track".to_string());
+        source.tracks[0].metadata.extra.insert("discnumber".to_string(), "1/2".to_string());
+        source.tracks[1].metadata.title = Some("Disc Two Track".to_string());
+        source.tracks[1].id.track_number = 1;
+        source.tracks[1].metadata.extra.insert("discnumber".to_string(), "2/2".to_string());
+
+        let result = render_track_template(
+            "{%DISC_FOLDER%/}%NN% - %TITLE%",
+            &source,
+            &source.tracks[1],
+            &tonepoet_pipeline::AudioFormat::Flac,
+        )
+        .unwrap();
+        assert_eq!(result.to_string_lossy(), "Disc 02/01 - Disc Two Track");
     }
 
     fn template_source() -> PreparedSource {

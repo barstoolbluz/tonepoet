@@ -18803,6 +18803,28 @@ fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
 }
 
 
+fn output_options_conversion_pill_button_at(app: &AppState, x: u16, y: u16) -> Option<TuiButton> {
+    if app.current_screen != AppScreen::Convert
+        || !matches!(app.active_overlay, ActiveOverlay::None)
+        || !app.convert.is_maximized(ConvertFocus::OutputOptions)
+    {
+        return None;
+    }
+
+    let pane_rect = app
+        .button_map
+        .find_button_rect(&TuiButton::Pane(ConvertFocus::OutputOptions))
+        .or_else(|| app.button_map.find_button_rect(&TuiButton::MaximizeToggle(ConvertFocus::OutputOptions)))?;
+
+    // The pane title/maximize rect is enough to recover the pane origin. Use a
+    // full-height sentinel rect here; `output_options_conversion_pill_at`
+    // only needs x/y origin and relative rows. This intentionally takes
+    // precedence over `find_button_at` so a stale write-log rect from an older
+    // frame cannot steal clicks from the newly inserted force/disc rows.
+    let area = Rect::new(pane_rect.x, pane_rect.y, u16::MAX.saturating_sub(pane_rect.x), 16);
+    super::draw_output_options::output_options_conversion_pill_at(area, x, y)
+}
+
 fn clear_convert_double_click_state_for_button(app: &mut AppState, button: Option<TuiButton>) {
     if app.current_screen != AppScreen::Convert {
         return;
@@ -24376,7 +24398,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
     let x = mouse.column;
     let y = mouse.row;
-    let clicked_button = app.button_map.find_button_at(x, y);
+    let clicked_button = output_options_conversion_pill_button_at(app, x, y)
+        .or_else(|| app.button_map.find_button_at(x, y));
     let double_click_candidate = if matches!(app.active_overlay, ActiveOverlay::None) {
         clicked_button
     } else {
@@ -24872,6 +24895,26 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     && app.convert.output_options.merge.options[i].enabled
                 {
                     app.convert.output_options.merge.selected = i;
+                    app.preset.mark_modified();
+                }
+            }
+            TuiButton::ForceEncodePill(i) => {
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::ForceEncode;
+                if i < app.convert.output_options.force_encode.options.len()
+                    && app.convert.output_options.force_encode.options[i].enabled
+                {
+                    app.convert.output_options.force_encode.selected = i;
+                    app.preset.mark_modified();
+                }
+            }
+            TuiButton::DiscSubfoldersPill(i) => {
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::DiscSubfolders;
+                if i < app.convert.output_options.disc_subfolders.options.len()
+                    && app.convert.output_options.disc_subfolders.options[i].enabled
+                {
+                    app.convert.output_options.disc_subfolders.selected = i;
                     app.preset.mark_modified();
                 }
             }

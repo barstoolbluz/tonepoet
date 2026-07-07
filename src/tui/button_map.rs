@@ -34,6 +34,8 @@ pub enum TuiButton {
     ConversionPresetPill(usize),
     DsdGainPill(usize),
     MergePill(usize),
+    ForceEncodePill(usize),
+    DiscSubfoldersPill(usize),
     WriteLogPill(usize),
     ContainerPill(usize),
     /// ⚙ pill on the container row (below-the-fold) to open format-specific settings overlay.
@@ -414,6 +416,8 @@ impl TuiButton {
             | Self::ConversionPresetPill(_)
             | Self::DsdGainPill(_)
             | Self::MergePill(_)
+            | Self::ForceEncodePill(_)
+            | Self::DiscSubfoldersPill(_)
             | Self::WriteLogPill(_)
             | Self::ContainerPill(_)
             | Self::FormatSettingsButton

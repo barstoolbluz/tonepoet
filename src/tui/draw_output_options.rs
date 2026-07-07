@@ -9,10 +9,21 @@ use ratatui::{
 };
 
 use super::app::{FormatState, OutputOptionsField, OutputOptionsState};
+use super::button_map::{ButtonRenderMap, TuiButton};
 use super::inline_edit::{inline_cursor_col, render_inline_value};
 use super::pill::render_pill_spans;
 use super::probe::SourceInfo;
 use crate::convert::formats::AudioFormat;
+
+const OUTPUT_OPTIONS_DEST_ROW: usize = 1;
+const OUTPUT_OPTIONS_FOLDER_ROW: usize = 2;
+const OUTPUT_OPTIONS_FILENAME_ROW: usize = 3;
+const OUTPUT_OPTIONS_COMPANION_EXTENSIONS_ROW: usize = 8;
+const OUTPUT_OPTIONS_COMPANION_FOLDERS_ROW: usize = 9;
+pub(crate) const OUTPUT_OPTIONS_FORCE_ENCODE_ROW: usize = 12;
+pub(crate) const OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW: usize = 13;
+pub(crate) const OUTPUT_OPTIONS_WRITE_LOG_ROW: usize = 14;
+pub(crate) const OUTPUT_OPTIONS_PILL_START_COL: u16 = 16;
 
 /// Draw the output options pane with cyan border
 pub fn draw_output_options_pane(
@@ -259,6 +270,50 @@ pub fn draw_output_options_pane(
 
 
 
+/// Register mouse hit boxes for the output-options pane.
+///
+/// Keep this geometry in lock-step with `draw_output_options_pane`: rows are
+/// derived from the same constants used by rendering/cursor placement and the
+/// pill X offsets match `pill_row`'s border + label prefix layout. The helper is
+/// intentionally idempotent: redraws may call it repeatedly after the caller has
+/// cleared the frame's `ButtonRenderMap`.
+pub(crate) fn output_options_conversion_pill_at(area: Rect, x: u16, y: u16) -> Option<TuiButton> {
+    let rel_y = y.checked_sub(area.y)? as usize;
+    match rel_y {
+        OUTPUT_OPTIONS_FORCE_ENCODE_ROW => bool_pill_pair_at(area, x, "off", "on", TuiButton::ForceEncodePill),
+        OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW => bool_pill_pair_at(area, x, "off", "on", TuiButton::DiscSubfoldersPill),
+        OUTPUT_OPTIONS_WRITE_LOG_ROW => bool_pill_pair_at(area, x, "yes", "no", TuiButton::WriteLogPill),
+        _ => None,
+    }
+}
+
+fn bool_pill_pair_at(
+    area: Rect,
+    x: u16,
+    left: &'static str,
+    right: &'static str,
+    button: fn(usize) -> TuiButton,
+) -> Option<TuiButton> {
+    let start_x = area.x + OUTPUT_OPTIONS_PILL_START_COL;
+    let left_w = pill_label_width(left);
+    if x >= start_x && x < start_x + left_w {
+        return Some(button(0));
+    }
+    let right_x = start_x + left_w + 1;
+    let right_w = pill_label_width(right);
+    if x >= right_x && x < right_x + right_w {
+        return Some(button(1));
+    }
+    None
+}
+
+fn pill_label_width(label: &str) -> u16 {
+    // `render_pill_spans` renders labels with one leading and one trailing
+    // space. The three affected rows use ASCII labels, so byte length and cell
+    // width are identical here.
+    label.len() as u16 + 2
+}
+
 /// Section header styling for the Output Options pane.
 ///
 /// This intentionally mirrors the app-wide `theme.header` token used for
@@ -304,20 +359,20 @@ fn output_options_edit_cursor(
     let field = opts.editing?;
     let label_w = 15usize;
     match field {
-        OutputOptionsField::DestPath => Some((1, label_w, pane_width.saturating_sub(2 + label_w))),
+        OutputOptionsField::DestPath => Some((OUTPUT_OPTIONS_DEST_ROW, label_w, pane_width.saturating_sub(2 + label_w))),
         OutputOptionsField::FolderTemplate => {
             let pill_width = 6 + 1 + 8;
-            Some((2, label_w, pane_width.saturating_sub(15 + pill_width + 4)))
+            Some((OUTPUT_OPTIONS_FOLDER_ROW, label_w, pane_width.saturating_sub(15 + pill_width + 4)))
         }
         OutputOptionsField::FilenameTemplate => {
             let pill_width = 6 + 1 + 8;
-            Some((3, label_w, pane_width.saturating_sub(15 + pill_width + 4)))
+            Some((OUTPUT_OPTIONS_FILENAME_ROW, label_w, pane_width.saturating_sub(15 + pill_width + 4)))
         }
         OutputOptionsField::CompanionExtensions if maximized && area_height >= 11 => {
-            Some((8, label_w, pane_width.saturating_sub(2 + label_w)))
+            Some((OUTPUT_OPTIONS_COMPANION_EXTENSIONS_ROW, label_w, pane_width.saturating_sub(2 + label_w)))
         }
         OutputOptionsField::CompanionFolders if maximized && area_height >= 11 => {
-            Some((9, label_w, pane_width.saturating_sub(2 + label_w)))
+            Some((OUTPUT_OPTIONS_COMPANION_FOLDERS_ROW, label_w, pane_width.saturating_sub(2 + label_w)))
         }
         _ => None,
     }
@@ -546,6 +601,34 @@ mod output_options_companion_render_tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+
+
+    #[test]
+    fn conversion_pill_hit_boxes_match_rendered_rows() {
+        let mut map = ButtonRenderMap::new();
+        let opts = OutputOptionsState::new();
+        let area = Rect::new(0, 0, 60, 16);
+
+        record_output_options_buttons(&mut map, area, &opts, true);
+
+        assert!(matches!(
+            map.find_button_at(OUTPUT_OPTIONS_PILL_START_COL, OUTPUT_OPTIONS_FORCE_ENCODE_ROW as u16),
+            Some(TuiButton::ForceEncodePill(0))
+        ));
+        assert!(matches!(
+            map.find_button_at(OUTPUT_OPTIONS_PILL_START_COL + pill_label_width("off") + 1, OUTPUT_OPTIONS_FORCE_ENCODE_ROW as u16),
+            Some(TuiButton::ForceEncodePill(1))
+        ));
+        assert!(matches!(
+            map.find_button_at(OUTPUT_OPTIONS_PILL_START_COL, OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW as u16),
+            Some(TuiButton::DiscSubfoldersPill(0))
+        ));
+        assert!(matches!(
+            map.find_button_at(OUTPUT_OPTIONS_PILL_START_COL, OUTPUT_OPTIONS_WRITE_LOG_ROW as u16),
+            Some(TuiButton::WriteLogPill(0))
+        ));
+    }
 
     #[test]
     fn maximized_companion_header_uses_header_style_not_accent_style() {
