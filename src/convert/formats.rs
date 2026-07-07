@@ -331,13 +331,15 @@ pub fn default_companion_extensions() -> Vec<String> {
     .collect()
 }
 
-/// Parse a comma-separated list of exact companion file names to exclude from
+/// Parse a comma-separated list of companion file names to exclude from
 /// loose-file copying.
 ///
 /// Include is extension-based, so exclusion works at file-name granularity: an
 /// extension the user does not include is never copied in the first place.
-/// Tokens that look like paths are dropped defensively. Matching at the copy
-/// stage is case-insensitive; tokens are normalized to lowercase here.
+/// Tokens are exact names or simple wildcards (`*` matches any run of
+/// characters, `?` a single character), e.g. `EXIGO*` or `*_dr.txt`. Tokens
+/// that look like paths are dropped defensively. Matching at the copy stage is
+/// case-insensitive; tokens are normalized to lowercase here.
 pub fn parse_companion_exclude_files(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     for token in input.split(',') {
@@ -427,8 +429,9 @@ pub struct ConversionOptions {
     #[serde(default)]
     pub companion_folders: Vec<String>,
 
-    /// Exact companion file names (case-insensitive) that loose-file copying
-    /// must skip even when their extension is included. Empty excludes nothing.
+    /// Companion file names (case-insensitive; `*`/`?` wildcards allowed) that
+    /// loose-file copying must skip even when their extension is included.
+    /// Empty excludes nothing.
     #[serde(default)]
     pub companion_exclude_files: Vec<String>,
 

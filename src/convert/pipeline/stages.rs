@@ -13530,14 +13530,50 @@ fn normalized_companion_extension_set(values: &[String]) -> BTreeSet<String> {
         .collect()
 }
 
-/// Lowercased exact file names excluded from loose companion copying. Matching
-/// is case-insensitive by comparing lowercased names on every platform: an
-/// exclusion is a user veto, not a filesystem identity question.
+/// Lowercased file-name exclusion patterns for loose companion copying.
+/// Matching is case-insensitive by comparing lowercased names on every
+/// platform: an exclusion is a user veto, not a filesystem identity question.
 fn normalized_companion_exclude_file_set(values: &[String]) -> BTreeSet<String> {
     values
         .iter()
         .flat_map(|value| crate::convert::formats::parse_companion_exclude_files(value))
         .collect()
+}
+
+/// True when a lowercased file name matches any exclusion pattern. Patterns
+/// are exact names or simple wildcards: `*` matches any run of characters and
+/// `?` a single character (`exigo*` vetoes `EXIGO_ONLY_PLEASE_OMFG.txt`).
+fn companion_exclude_matches(patterns: &BTreeSet<String>, lowercased_name: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| companion_wildcard_matches(pattern, lowercased_name))
+}
+
+fn companion_wildcard_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let mut backtrack: Option<(usize, usize)> = None;
+
+    while ni < name.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == name[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            backtrack = Some((pi, ni));
+            pi += 1;
+        } else if let Some((star_pi, star_ni)) = backtrack {
+            pi = star_pi + 1;
+            ni = star_ni + 1;
+            backtrack = Some((star_pi, star_ni + 1));
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 fn normalized_companion_folder_set(values: &[String]) -> BTreeSet<String> {
@@ -13785,7 +13821,7 @@ fn copy_loose_companion_files(
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
-            if exclude_files.contains(&name.to_lowercase()) {
+            if companion_exclude_matches(exclude_files, &name.to_lowercase()) {
                 stats.skipped();
                 continue;
             }
@@ -14929,6 +14965,51 @@ mod companion_copy_hardening_tests {
         assert!(
             !dst.join("disc 01").join("foo_dr.txt").exists(),
             "excluded names are vetoed inside disc directories too"
+        );
+    }
+
+    #[test]
+    fn companion_exclude_patterns_support_simple_wildcards() {
+        let patterns = normalized_companion_exclude_file_set(&[
+            "EXIGO*".to_string(),
+            "*_dr.txt".to_string(),
+            "cover.?ng".to_string(),
+            "exact.log".to_string(),
+        ]);
+
+        assert!(companion_exclude_matches(&patterns, "exigo_only_please_omfg.txt"));
+        assert!(companion_exclude_matches(&patterns, "exigo"));
+        assert!(companion_exclude_matches(&patterns, "foo_dr.txt"));
+        assert!(companion_exclude_matches(&patterns, "cover.png"));
+        assert!(companion_exclude_matches(&patterns, "exact.log"));
+
+        assert!(!companion_exclude_matches(&patterns, "not_exigo.txt"));
+        assert!(!companion_exclude_matches(&patterns, "foo_dr.txt.bak"));
+        assert!(!companion_exclude_matches(&patterns, "cover.jpeg"));
+        assert!(!companion_exclude_matches(&patterns, "exact.log2"));
+        assert!(!companion_exclude_matches(&BTreeSet::new(), "anything.txt"));
+    }
+
+    #[test]
+    fn loose_companion_copy_applies_wildcard_exclusions() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&dst).expect("dst");
+        std::fs::write(src.join("EXIGO_ONLY_PLEASE_OMFG.txt"), b"clutter").expect("clutter");
+        std::fs::write(src.join("notes.txt"), b"notes").expect("notes");
+
+        let extensions = [".txt".to_string()].into_iter().collect::<BTreeSet<_>>();
+        let exclude = normalized_companion_exclude_file_set(&["EXIGO*".to_string()]);
+        let mut stats = CompanionCopyStats::default();
+
+        copy_loose_companion_files(&src, &dst, &extensions, &exclude, &BTreeSet::new(), &mut stats);
+
+        assert!(dst.join("notes.txt").is_file());
+        assert!(
+            !dst.join("EXIGO_ONLY_PLEASE_OMFG.txt").exists(),
+            "prefix wildcard vetoes matching names case-insensitively"
         );
     }
 
