@@ -99,7 +99,13 @@ tonepoet/
 tonepoet (main binary + lib)
 ├── tonepoet-backend     (no internal deps)
 ├── tonepoet-features    (depends on tonepoet-backend)
+├── tonepoet-pipeline    (pipeline settings, enums, planning)
 ├── tonepoet-wizard      (no internal deps)
+├── sacd-rs              (SACD ISO parsing)
+├── dvda-demuxer         (DVD-Audio demuxing)
+├── dvdvideo             (DVD-Video parsing)
+├── tui-file-picker      (file/directory picker widget)
+├── libbluray-sys        (FFI bindings for libbluray)
 ├── ffmpeg-next          (in-process audio probing via FFmpeg 7.1 bindings)
 └── lofty                (audio metadata/tag reading)
 ```
@@ -171,7 +177,7 @@ The `FormatState::apply_format_constraints()` method recalculates available opti
 - **TUI:** `ratatui` 0.26 + `crossterm` 0.27; Tokyo Night theme in `theme.rs`
 - **Audio probing:** `ffmpeg-next` 7.1 (in-process FFmpeg bindings, requires libclang for bindgen)
 - **Metadata reading:** `lofty` 0.21 with `TaggedFileExt` and `Accessor` traits
-- **External tool invocation:** `tokio::process::Command` (async) for ffmpeg/sox/7z/loudgain etc.
+- **External tool invocation:** `tokio::process::Command` (async) for ffmpeg/sox/7z/loudgain etc. All subprocesses use `Stdio::null()` for stdin (tool.rs) to prevent interactive prompts from blocking the TUI.
 - Module-level re-exports in `mod.rs` files — consumers import from `tonepoet::convert::` not submodules directly
 - TUI draw functions take immutable state refs; mouse buttons registered in a second pass via `ButtonRenderMap`
 
@@ -183,7 +189,7 @@ cargo test -p tonepoet-backend     # 16 tests: ffmpeg builders, integration, cha
 cargo test -p tonepoet-features    # 14 tests: log writer, CUE generator
 ```
 
-Tests are in `crates/*/tests/` directories. Examples in `crates/*/examples/` serve as integration smoke tests. The main `tonepoet` crate does not have its own test suite yet.
+Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The main crate has 2500+ tests across all binaries. Run `cargo test` for the full suite.
 
 ## External Tool Dependencies
 
@@ -222,9 +228,13 @@ The flake provides:
 
 ## Important Notes
 
-- **processor.rs is the largest file** (~4K LOC) — it orchestrates the entire conversion pipeline including 7z extraction, multi-format conversion, ReplayGain, metadata transfer, and file renaming
+- **stages.rs is the largest file** (~920KB / ~24K LOC) — it contains the full pipeline stage functions, publish logic, template rendering, and conversion log assembly. processor.rs (~4K LOC) orchestrates the shared scheduler and queue processing.
 - The wizard crate has its own `main.rs` for standalone use but tonepoet's `main.rs` embeds the wizard directly
 - The new TUI (`src/tui/`) is the primary interface; the wizard crate is kept as-is for legacy/preset access
 - Archive passwords are configurable via `--archive-password` flag or `config.toml` — no hardcoded defaults
 - The `items_mut()` method on `ConversionQueue` is private; use `add_item()` or `add_item_direct()` from outside the module
 - `probe_audio()` uses unsafe FFI to access `bits_per_raw_sample` from codec parameters (standard ffmpeg-next pattern)
+- The theme builder uses a `BuilderTab` + `BuilderOverlay` model (Edit/Preview/Derived tabs + floating gallery/menu overlays)
+- Pipeline staging can optionally use tmpfs via `scratch_directory` config, with a memory budget system (`memory_budget.rs`) that gates admission and falls back to disk
+- Template rendering supports conditional `{...}` blocks that are dropped when variables inside are empty
+- `trash` crate was removed — file deletion is permanent with safety guards (rejects root paths, dot components, empty paths)
