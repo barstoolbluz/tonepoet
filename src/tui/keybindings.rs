@@ -26387,7 +26387,7 @@ mod phase4_tests {
     }
 
     #[tokio::test]
-    async fn metadata_editor_footer_close_with_dirty_state_prompts_before_closing() {
+    async fn metadata_editor_footer_close_with_dirty_state_saves_before_closing() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
@@ -26396,7 +26396,19 @@ mod phase4_tests {
 
         handle_mouse(&mut app, footer_close_mouse_event(), &tx);
 
-        assert_discard_confirmation(&app);
+        // With the OK/Apply semantics, clicking close with dirty state
+        // initiates a save (transitions to Saving phase) rather than
+        // showing a discard confirmation prompt.
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert!(
+                    matches!(state.model.phase, crate::tui::app::MetadataEditorPhase::Saving),
+                    "close with dirty state should initiate save, got phase: {:?}",
+                    state.model.phase
+                );
+            }
+            other => panic!("expected MetadataEditor in Saving phase, got {:?}", other),
+        }
     }
 
     #[test]
