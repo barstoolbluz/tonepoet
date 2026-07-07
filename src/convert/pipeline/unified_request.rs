@@ -155,6 +155,7 @@ pub fn build_pipeline_request_from_settings(
             root: output_root.join(".tonepoet-logs"),
             write_for_blocked: true,
             write_json_log: item.options.write_log_file,
+            write_conversion_log: item.options.write_log_file,
         },
         stages: StagePolicy {
             metadata: if item.options.preserve_metadata {

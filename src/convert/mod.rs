@@ -1361,6 +1361,7 @@ mod bluray_queue_admission_tests {
                     .unwrap_or_else(|| PathBuf::from("logs")),
                 write_for_blocked: true,
                 write_json_log: false,
+                write_conversion_log: true,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,

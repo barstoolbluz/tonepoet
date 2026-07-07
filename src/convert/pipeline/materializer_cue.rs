@@ -2798,6 +2798,7 @@ FILE "album.flac" WAVE
                 root: container.parent().unwrap_or(Path::new(".")).to_path_buf(),
                 write_for_blocked: false,
                 write_json_log: false,
+                write_conversion_log: true,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,

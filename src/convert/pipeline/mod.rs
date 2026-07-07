@@ -124,6 +124,7 @@ mod tests {
                 root: PathBuf::from("/tmp/logs"),
                 write_for_blocked: true,
                 write_json_log: false,
+                write_conversion_log: true,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,

@@ -5243,6 +5243,7 @@ fn execute_commit_with_source_options_transform(
                             root: output_root.join(".tonepoet-logs"),
                             write_for_blocked: true,
                             write_json_log: false,
+                            write_conversion_log: options.write_log_file,
                         },
                         stages: StagePolicy {
                             metadata: if options.preserve_metadata {

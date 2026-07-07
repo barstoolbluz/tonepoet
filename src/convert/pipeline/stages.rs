@@ -4977,6 +4977,7 @@ FILE "album.flac" WAVE
                 root: root.join("logs"),
                 write_for_blocked: true,
                 write_json_log: false,
+                write_conversion_log: true,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,
@@ -5881,6 +5882,10 @@ fn stage_conversion_log_sidecars(
             "conversion.log sidecar suppressed for {} because the folder dispatcher found an album batch that cannot safely use ordered fragment assembly or legacy completion-order append",
             req.item_id
         );
+    } else if !req.log.write_conversion_log {
+        // The user turned the conversion log off. Hidden album-batch fragments
+        // above still flow — publish uses them to coordinate batch completion —
+        // but the visible standalone conversion.log is never built.
     } else {
         let log_staged = staging.root.join("conversion.log");
         let log_content = build_conversion_log_at_with_runner(
@@ -8028,6 +8033,7 @@ fn finalize_staged_conversion_log_for_publish(
     final_album_dir: &Path,
     expected_track_count: usize,
     fragment_mode: bool,
+    write_conversion_log: bool,
     target_identity: Option<&ConversionLogBatchIdentity>,
     published_entries: &mut Vec<PublishedEntry>,
 ) -> Result<bool, PublishError> {
@@ -8037,6 +8043,22 @@ fn finalize_staged_conversion_log_for_publish(
 
     let staged_log_path = work_album_dir.join("conversion.log");
     let final_log_path = final_album_dir.join("conversion.log");
+
+    if !write_conversion_log {
+        // The user disabled the conversion log: never assemble the visible
+        // file, but still report batch completion so post-publish cleanup can
+        // consume the hidden fragments once the album batch is complete.
+        remove_file_if_exists(&staged_log_path).map_err(PublishError::Io)?;
+        published_entries.retain(|entry| !conversion_log_entry_predicate(entry));
+        let complete = complete_conversion_log_fragments(
+            work_album_dir,
+            expected_track_count,
+            target_identity,
+        )?
+        .is_some();
+        return Ok(complete);
+    }
+
     match write_assembled_conversion_log_from_fragments(
         work_album_dir,
         &staged_log_path,
@@ -8059,6 +8081,7 @@ fn finalize_staged_conversion_log_for_publish(
 fn publish_incremental_assembled_conversion_log_from_fragments(
     album_dir: &Path,
     expected_track_count: usize,
+    write_conversion_log: bool,
     target_identity: Option<&ConversionLogBatchIdentity>,
     rollback: &mut IncrementalPublishRollback,
 ) -> Result<bool, PublishError> {
@@ -8069,6 +8092,13 @@ fn publish_incremental_assembled_conversion_log_from_fragments(
     )? else {
         return Ok(false);
     };
+
+    if !write_conversion_log {
+        // Batch complete but the user disabled the conversion log: report
+        // completion so post-publish cleanup consumes the hidden fragments,
+        // and write nothing visible.
+        return Ok(true);
+    }
 
     let log_path = album_dir.join("conversion.log");
     rollback.snapshot_destination(&log_path)?;
@@ -8346,6 +8376,30 @@ fn finalize_incomplete_conversion_log_batch_if_needed(
         }
 
         let fragments: Vec<ConversionLogFragment> = files.iter().map(|file| file.fragment.clone()).collect();
+
+        if !req.log.write_conversion_log {
+            // The user disabled the conversion log: consume the interrupted
+            // batch's fragments without writing a partial visible log.
+            let target_identity = fragments
+                .first()
+                .map(|fragment| fragment.batch_identity.clone());
+            remove_conversion_log_fragment_files_and_empty_dir(
+                &album_dir,
+                &files,
+                context,
+            );
+            cleanup_conversion_log_fragment_quarantine_after_finalization(
+                &album_dir,
+                target_identity.as_ref(),
+                context,
+            );
+            return Some(PublishedAlbum {
+                album_dir,
+                entries: Vec::new(),
+                manifest_path: None,
+            });
+        }
+
         let assembly_status = match terminal_failure_reason {
             Some(reason) => ConversionLogAssemblyStatus::TerminalFailurePartial {
                 expected_track_count: album_batch.expected_track_count,
@@ -8433,6 +8487,7 @@ fn publish_cancelled_conversion_log_fragment_and_finalize(
 fn cleanup_complete_conversion_log_fragments(
     album_dir: &Path,
     expected_track_count: usize,
+    require_assembled_log: bool,
     target_identity: Option<&ConversionLogBatchIdentity>,
 ) {
     let Some(target_identity) = target_identity else {
@@ -8494,14 +8549,18 @@ fn cleanup_complete_conversion_log_fragments(
 
     // Only remove fragments after the visible authoritative forensic log has
     // been assembled. Do not discard fragments merely because the hidden sidecar
-    // directory is complete.
-    let log_path = album_dir.join("conversion.log");
-    if !log_path.is_file() {
-        log::warn!(
-            "conversion log fragment cleanup skipped because assembled log is missing: {}",
-            log_path.display()
-        );
-        return;
+    // directory is complete. When the user disabled the conversion log there is
+    // deliberately no assembled file: the complete batch's fragments are
+    // consumed silently instead.
+    if require_assembled_log {
+        let log_path = album_dir.join("conversion.log");
+        if !log_path.is_file() {
+            log::warn!(
+                "conversion log fragment cleanup skipped because assembled log is missing: {}",
+                log_path.display()
+            );
+            return;
+        }
     }
 
     remove_conversion_log_fragment_files_and_empty_dir(
@@ -10509,6 +10568,7 @@ fn build_publish_plan_with_album_dir(
         source_audio_track_count,
         expected_album_track_count,
         suppress_incremental_conversion_log_append: req.suppress_incremental_conversion_log_append,
+        write_conversion_log: req.log.write_conversion_log,
     })
 }
 
@@ -10673,6 +10733,7 @@ pub fn publish_album_output(
         &plan.album_dir,
         plan.expected_album_track_count,
         plan_has_conversion_log_fragment(plan),
+        plan.write_conversion_log,
         fragment_batch_identity.as_ref(),
         &mut published_entries,
     )?;
@@ -10718,6 +10779,7 @@ pub fn publish_album_output(
         cleanup_complete_conversion_log_fragments(
             &plan.album_dir,
             plan.expected_album_track_count,
+            plan.write_conversion_log,
             fragment_batch_identity.as_ref(),
         );
     }
@@ -10908,6 +10970,7 @@ fn publish_incremental_album_output(
             assembled_conversion_log |= publish_incremental_assembled_conversion_log_from_fragments(
                 &plan.album_dir,
                 plan.expected_album_track_count,
+                plan.write_conversion_log,
                 fragment_batch_identity,
                 &mut rollback,
             )?;
@@ -10956,6 +11019,7 @@ fn publish_incremental_album_output(
         cleanup_complete_conversion_log_fragments(
             &plan.album_dir,
             plan.expected_album_track_count,
+            plan.write_conversion_log,
             fragment_batch_identity,
         );
     }
@@ -13431,6 +13495,14 @@ fn copy_companion_artifacts_best_effort(
             &source_file_skip_set,
             &mut stats,
         );
+        copy_nested_companion_files(
+            &source_dir,
+            &published.album_dir,
+            &extensions,
+            &folders,
+            &source_file_skip_set,
+            &mut stats,
+        );
     }
 
     if !folders.is_empty() {
@@ -13700,6 +13772,90 @@ fn copy_loose_companion_files(
         }
         let dest = dest_dir.join(entry.file_name());
         copy_regular_companion_file(&path, &dest, stats);
+    }
+}
+
+/// Copy companion loose files that live one level below the album root, in the
+/// subdirectories a multi-disc rip conventionally uses:
+///
+/// - disc directories (`disc 1`, `Disc 02`, `CD3`, ...) — destination is the
+///   same zero-padded folder name `%DISC_FOLDER%` renders for the audio, so
+///   companions land next to their disc's tracks;
+/// - `extra` / `extras` (case-insensitive) — destination keeps the source
+///   directory's own name.
+///
+/// Anything else — notably artwork-style directories (`artwork`, `art`,
+/// `scans`, ...) — is deliberately not scanned: whole-directory copying is the
+/// companion-folders feature's job. A subdirectory already matched by the
+/// companion folder set is skipped here too, because it is copied wholesale.
+fn copy_nested_companion_files(
+    source_dir: &Path,
+    dest_dir: &Path,
+    extensions: &BTreeSet<String>,
+    companion_folders: &BTreeSet<String>,
+    source_file_skip_set: &BTreeSet<PathBuf>,
+    stats: &mut CompanionCopyStats,
+) {
+    let entries = match fs::read_dir(source_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            stats.warning();
+            log::warn!(
+                "companion nested-file copy skipped: cannot read source directory {}: {err}",
+                source_dir.display()
+            );
+            return;
+        }
+    };
+
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                stats.warning();
+                log::warn!("companion nested-file copy skipped unreadable directory entry: {err}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                stats.warning();
+                log::warn!(
+                    "companion nested-file copy skipped {}: cannot inspect file type: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if companion_folders.contains(&companion_folder_match_key(&name)) {
+            continue;
+        }
+
+        let dest_component = if let Some(disc) = disc_number_from_template_component_name(&name) {
+            styled_disc_component_name(&name, disc)
+                .map(|styled| sanitize_component(styled.trim()))
+                .unwrap_or_else(|| format!("Disc {disc:02}"))
+        } else if name.eq_ignore_ascii_case("extra") || name.eq_ignore_ascii_case("extras") {
+            name.clone()
+        } else {
+            continue;
+        };
+
+        copy_loose_companion_files(
+            &path,
+            &dest_dir.join(dest_component),
+            extensions,
+            source_file_skip_set,
+            stats,
+        );
     }
 }
 
@@ -14246,6 +14402,7 @@ mod companion_copy_hardening_tests {
                 root: root.join("logs"),
                 write_for_blocked: true,
                 write_json_log: false,
+                write_conversion_log: true,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Disabled,
@@ -14530,6 +14687,63 @@ mod companion_copy_hardening_tests {
     }
 
     #[test]
+    fn companion_copy_reaches_files_nested_in_disc_and_extras_directories() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        std::fs::create_dir_all(source_dir.join("disc 1")).expect("disc 1");
+        std::fs::create_dir_all(source_dir.join("disc 2")).expect("disc 2");
+        std::fs::create_dir_all(source_dir.join("extras")).expect("extras");
+        std::fs::create_dir_all(source_dir.join("artwork")).expect("artwork");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = source_dir.join("disc 1").join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(source_dir.join("disc 1").join("rip.log"), b"log1").expect("log1");
+        std::fs::write(source_dir.join("disc 2").join("rip.log"), b"log2").expect("log2");
+        std::fs::write(source_dir.join("extras").join("bonus.log"), b"bonus").expect("bonus");
+        std::fs::write(source_dir.join("artwork").join("scan.log"), b"art").expect("art");
+
+        let mut req = test_request(temp.path(), audio.clone());
+        req.companion.extensions = vec![".log".to_string()];
+        req.album_batch = Some(AlbumBatchContext::new(
+            new_conversion_log_batch_id(),
+            1,
+            dst.clone(),
+            source_dir.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        copy_companion_artifacts_best_effort(&req, &prepared, &published);
+
+        assert_eq!(
+            std::fs::read(dst.join("disc 01").join("rip.log")).expect("disc 1 companion"),
+            b"log1"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("disc 02").join("rip.log")).expect("disc 2 companion"),
+            b"log2"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("extras").join("bonus.log")).expect("extras companion"),
+            b"bonus"
+        );
+        assert!(
+            !dst.join("artwork").exists(),
+            "artwork directories are covered by companion folder copying, not the nested scan"
+        );
+    }
+
+    #[test]
     fn image_input_with_sidecar_cue_copies_cue_companion_but_not_audio_image() {
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
@@ -14597,6 +14811,86 @@ mod companion_copy_hardening_tests {
         assert!(dst.join("notes.txt").is_file());
         assert!(!dst.join("01.flac").exists(), "source audio file must not be copied as a companion");
         assert!(!dst.join("nested").join("inside.jpg").exists(), "loose-file copy must not recurse");
+    }
+
+    #[test]
+    fn nested_companion_copy_scans_disc_and_extras_directories_only() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        for dir in ["disc 1", "disc 2", "Extras", "artwork", "Art", "random"] {
+            std::fs::create_dir_all(src.join(dir)).expect("source subdir");
+        }
+        std::fs::create_dir_all(&dst).expect("dst");
+        std::fs::write(src.join("disc 1").join("rip.log"), b"log1").expect("disc 1 log");
+        std::fs::write(src.join("disc 2").join("rip.log"), b"log2").expect("disc 2 log");
+        std::fs::write(src.join("disc 1").join("01.flac"), b"audio").expect("disc audio");
+        std::fs::write(src.join("Extras").join("bonus.txt"), b"bonus").expect("extras file");
+        std::fs::write(src.join("artwork").join("scan.log"), b"art").expect("artwork log");
+        std::fs::write(src.join("Art").join("front.txt"), b"art").expect("art file");
+        std::fs::write(src.join("random").join("notes.log"), b"notes").expect("random log");
+
+        let extensions = [".log".to_string(), ".txt".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut skip_set = BTreeSet::new();
+        skip_set.insert(normalize_path(&src.join("disc 1").join("01.flac")));
+        let mut stats = CompanionCopyStats::default();
+
+        copy_nested_companion_files(
+            &src,
+            &dst,
+            &extensions,
+            &BTreeSet::new(),
+            &skip_set,
+            &mut stats,
+        );
+
+        // Disc directories map to the same zero-padded style %DISC_FOLDER%
+        // renders; extras keep their own name.
+        assert!(dst.join("disc 01").join("rip.log").is_file());
+        assert!(dst.join("disc 02").join("rip.log").is_file());
+        assert!(dst.join("Extras").join("bonus.txt").is_file());
+        assert!(
+            !dst.join("artwork").exists() && !dst.join("Art").exists(),
+            "artwork-style directories are the folder-copy feature's job"
+        );
+        assert!(
+            !dst.join("random").exists(),
+            "unrelated directories are not scanned"
+        );
+        assert!(
+            !dst.join("disc 01").join("01.flac").exists(),
+            "source audio inside disc directories is never copied as a companion"
+        );
+    }
+
+    #[test]
+    fn nested_companion_copy_skips_directories_covered_by_folder_copy() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(src.join("extras")).expect("extras");
+        std::fs::create_dir_all(&dst).expect("dst");
+        std::fs::write(src.join("extras").join("bonus.txt"), b"bonus").expect("extras file");
+
+        let extensions = [".txt".to_string()].into_iter().collect::<BTreeSet<_>>();
+        let folders = normalized_companion_folder_set(&["extras".to_string()]);
+        let mut stats = CompanionCopyStats::default();
+
+        copy_nested_companion_files(
+            &src,
+            &dst,
+            &extensions,
+            &folders,
+            &BTreeSet::new(),
+            &mut stats,
+        );
+
+        assert!(
+            !dst.join("extras").exists(),
+            "a directory in the companion folder set is copied wholesale by folder copy, not rescanned"
+        );
     }
 
     #[test]
@@ -15426,19 +15720,26 @@ fn disc_folder_name_from_source_path_style(track: &PreparedTrack, disc: u32) -> 
         if path_disc != disc {
             return None;
         }
-        let digits_start = name.find(|ch: char| ch.is_ascii_digit())?;
-        let digits_len = name[digits_start..]
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .count();
-        let styled = format!(
-            "{}{disc:02}{}",
-            &name[..digits_start],
-            &name[digits_start + digits_len..]
-        );
+        let styled = styled_disc_component_name(name, disc)?;
         return Some(sanitize_component(styled.trim()));
     }
     None
+}
+
+/// Rewrite a disc directory name's digit run to the zero-padded disc number
+/// while preserving the user's prefix casing and separator style: `disc 1`
+/// becomes `disc 01`, `CD2` becomes `CD02`.
+fn styled_disc_component_name(name: &str, disc: u32) -> Option<String> {
+    let digits_start = name.find(|ch: char| ch.is_ascii_digit())?;
+    let digits_len = name[digits_start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    Some(format!(
+        "{}{disc:02}{}",
+        &name[..digits_start],
+        &name[digits_start + digits_len..]
+    ))
 }
 
 fn source_has_proven_multi_disc_layout(source: &PreparedSource) -> bool {
@@ -18955,6 +19256,7 @@ mod pipeline_test_helpers {
                 root: PathBuf::from("/out/.tonepoet-logs"),
                 write_for_blocked: true,
                 write_json_log: false,
+                write_conversion_log: true,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,
@@ -20087,6 +20389,7 @@ mod naming_template_tests {
                 root: PathBuf::from("/out/.tonepoet-logs"),
                 write_for_blocked: true,
                 write_json_log: false,
+                write_conversion_log: true,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Enabled,
@@ -21291,6 +21594,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 root: root.join("logs"),
                 write_for_blocked: true,
                 write_json_log: true,
+                write_conversion_log: true,
             },
             stages,
             failure_policy: policy,
@@ -22712,6 +23016,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            write_conversion_log: true,
         };
         let publish = fixture.album.req.publish.clone();
         let staging = fixture.album.staging;
@@ -22746,6 +23051,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            write_conversion_log: true,
         };
 
         let published = publish_album_output(retry_staging, &retry_plan, publish, None)
@@ -22791,6 +23097,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            write_conversion_log: true,
         };
         let publish = fixture.album.req.publish.clone();
         let staging = fixture.album.staging;
@@ -22849,6 +23156,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            write_conversion_log: true,
         }
     }
 
@@ -22882,6 +23190,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            write_conversion_log: true,
         }
     }
 
@@ -23555,6 +23864,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 source_audio_track_count,
                 expected_album_track_count: fragment.expected_track_count,
                 suppress_incremental_conversion_log_append: false,
+                write_conversion_log: true,
             },
         )
     }
@@ -24004,6 +24314,142 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             !staging.root.join("conversion.log").exists(),
             "fragment mode should avoid building the visible standalone log entirely"
         );
+    }
+
+    #[test]
+    fn write_conversion_log_disabled_stages_no_log_sidecars() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = log_test_source();
+        let mut req = log_test_request();
+        req.output_root = temp.path().join("out");
+        req.log.write_conversion_log = false;
+
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let staging = StagingDir::new(
+            temp.path().join("stage-log-disabled"),
+            "stage-log-disabled".to_string(),
+        );
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(Vec::new()),
+            sidecars: Vec::new(),
+        };
+
+        let staged = stage_conversion_log_sidecars(
+            artifacts,
+            &outcome,
+            &source,
+            &req,
+            &staging,
+            None,
+        )
+        .expect("disabled log staging succeeds");
+
+        assert!(
+            staged.sidecars.is_empty(),
+            "write log disabled must stage neither the visible conversion.log nor a fragment"
+        );
+        assert!(
+            !staging.root.join("conversion.log").exists(),
+            "write log disabled must not build the visible log file"
+        );
+    }
+
+    #[test]
+    fn write_conversion_log_disabled_suppresses_fragment_for_batch_jobs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("out").join("Album");
+        let source_root = temp.path().join("source-root");
+
+        let mut source = log_test_source();
+        source.kind = SourceKind::SingleFile;
+        source.container = source_root.join("01.wav");
+        source.tracks.truncate(1);
+
+        let mut req = log_test_request();
+        req.output_root = temp.path().join("out");
+        req.log.write_conversion_log = false;
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id("batch-log-disabled"),
+            2,
+            album_dir.clone(),
+            source_root,
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        req.container = source.container.clone();
+
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let staging = StagingDir::new(
+            temp.path().join("stage-batch-log-disabled"),
+            "stage-batch-log-disabled".to_string(),
+        );
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(Vec::new()),
+            sidecars: Vec::new(),
+        };
+
+        let staged = stage_conversion_log_sidecars(
+            artifacts,
+            &outcome,
+            &source,
+            &req,
+            &staging,
+            None,
+        )
+        .expect("disabled batch log staging succeeds");
+
+        // Fragments still flow: publish uses them to coordinate album-batch
+        // completion. Only the visible conversion.log is suppressed.
+        assert!(
+            staged.sidecars.iter().any(|sidecar| {
+                matches!(
+                    &sidecar.kind,
+                    SidecarKind::Other(kind) if kind == CONVERSION_LOG_FRAGMENT_SIDE_KIND
+                )
+            }),
+            "write log disabled must still stage the hidden album-batch fragment"
+        );
+        assert!(
+            staged
+                .sidecars
+                .iter()
+                .all(|sidecar| !matches!(sidecar.kind, SidecarKind::ConversionLog)),
+            "write log disabled must not stage a visible conversion.log"
+        );
+        assert!(
+            !staging.root.join("conversion.log").exists(),
+            "write log disabled must not build the visible log file"
+        );
+    }
+
+    #[test]
+    fn write_conversion_log_disabled_finalize_consumes_complete_fragments_without_log() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let work_album_dir = temp.path().join("work-album");
+        std::fs::create_dir_all(&work_album_dir).expect("work album dir");
+
+        let mut published_entries = Vec::new();
+        let assembled = finalize_staged_conversion_log_for_publish(
+            &work_album_dir,
+            &temp.path().join("final-album"),
+            1,
+            true,
+            false,
+            None,
+            &mut published_entries,
+        )
+        .expect("suppressed finalize succeeds");
+
+        // No fragments exist yet, so the batch is not complete and nothing is
+        // assembled; the important property is that no conversion.log appears.
+        assert!(!assembled);
+        assert!(!work_album_dir.join("conversion.log").exists());
+        assert!(published_entries.is_empty());
     }
 
     #[test]
@@ -25364,7 +25810,7 @@ Source-aware setting: yes
             .expect("complete current batch log");
         std::fs::write(album_dir.join("conversion.log"), final_log).expect("assembled log");
 
-        cleanup_complete_conversion_log_fragments(&album_dir, 2, Some(&identity));
+        cleanup_complete_conversion_log_fragments(&album_dir, 2, true, Some(&identity));
 
         assert!(!conversion_log_fragment_dir(&album_dir).exists(), "active fragments are cleaned");
         assert!(
@@ -26486,6 +26932,7 @@ Source-aware setting: yes
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            write_conversion_log: true,
         };
 
         let err = publish_album_output(staging, &plan, incremental_test_publish_policy(), None)
@@ -26870,6 +27317,7 @@ retry log
             source_audio_track_count: 2,
             expected_album_track_count: 2,
             suppress_incremental_conversion_log_append: false,
+            write_conversion_log: true,
         };
 
         let err = publish_album_output(staging, &plan, publish, None)
@@ -26910,6 +27358,7 @@ retry log
             source_audio_track_count: 2,
             expected_album_track_count: 2,
             suppress_incremental_conversion_log_append: false,
+            write_conversion_log: true,
         };
 
         let err = publish_album_output(staging, &plan, publish, None)

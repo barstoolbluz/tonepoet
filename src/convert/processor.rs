@@ -2968,6 +2968,7 @@ mod tests {
                 root: root.join("logs"),
                 write_for_blocked: true,
                 write_json_log: true,
+                write_conversion_log: true,
             },
             stages: StagePolicy {
                 metadata: StageRequirement::Disabled,

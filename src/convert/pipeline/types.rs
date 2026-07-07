@@ -738,6 +738,15 @@ pub struct LogPolicy {
     pub write_for_blocked: bool,
     #[serde(default)]
     pub write_json_log: bool,
+    /// Write the human-readable `conversion.log` album sidecar (and the hidden
+    /// per-track fragments that album batches assemble it from). The durable
+    /// JSON log under `log.root` is governed separately by `write_json_log`.
+    #[serde(default = "default_write_conversion_log")]
+    pub write_conversion_log: bool,
+}
+
+fn default_write_conversion_log() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1839,6 +1848,15 @@ pub struct PublishPlan {
     /// path writes in worker-completion order.
     #[serde(default)]
     pub suppress_incremental_conversion_log_append: bool,
+    /// False when the user disabled the conversion log. Fragments still flow
+    /// and coordinate album-batch completion, but publish must consume them
+    /// silently instead of assembling a visible conversion.log.
+    #[serde(default = "default_publish_write_conversion_log")]
+    pub write_conversion_log: bool,
+}
+
+fn default_publish_write_conversion_log() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
