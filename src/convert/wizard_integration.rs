@@ -254,6 +254,8 @@ pub fn extract_wizard_settings(
         cue_generation_mode: "IfMerging".to_string(), // Set from app config, not wizard
         container_extension: None,
         container_ffmpeg_flags: Vec::new(),
+        force_encode: false,
+        create_disc_subfolders: false,
     };
 
     (format, options)
@@ -611,6 +613,8 @@ pub fn preset_to_conversion_options(
         cue_generation_mode: "IfMerging".to_string(), // Presets don't include this (set from app config)
         container_extension: None,
         container_ffmpeg_flags: Vec::new(),
+        force_encode: false,
+        create_disc_subfolders: false,
     }
 }
 

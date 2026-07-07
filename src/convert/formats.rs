@@ -389,6 +389,14 @@ pub struct ConversionOptions {
     #[serde(default)]
     pub companion_folders: Vec<String>,
 
+    /// Force same-format re-encoding instead of passthrough - defaults to false
+    #[serde(default)]
+    pub force_encode: bool,
+
+    /// Create `Disc NN` subfolders for detected multi-disc sets - defaults to false
+    #[serde(default)]
+    pub create_disc_subfolders: bool,
+
     /// Force FLAC re-encoding instead of copying - defaults to false
     pub reencode_flac: bool,
 
@@ -464,6 +472,8 @@ impl Default for ConversionOptions {
             copy_subdirectories: true,
             companion_extensions: default_companion_extensions(),
             companion_folders: Vec::new(),
+            force_encode: false,
+            create_disc_subfolders: false,
             reencode_flac: false,       // Match wizard default (don't re-encode, copy is default)
             merge_to_single: false,
             preferred_backend: None,

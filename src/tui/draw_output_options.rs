@@ -51,6 +51,8 @@ pub fn draw_output_options_pane(
     let is_merge_focused = focused && opts.field_focus == OutputOptionsField::MergeMode;
     let is_extensions_focused = focused && opts.field_focus == OutputOptionsField::CompanionExtensions;
     let is_folders_focused = focused && opts.field_focus == OutputOptionsField::CompanionFolders;
+    let is_force_encode_focused = focused && opts.field_focus == OutputOptionsField::ForceEncode;
+    let is_disc_subfolders_focused = focused && opts.field_focus == OutputOptionsField::DiscSubfolders;
     let is_write_log_focused = focused && opts.field_focus == OutputOptionsField::WriteLog;
 
     let is_editing = |field| opts.editing == Some(field);
@@ -197,12 +199,30 @@ pub fn draw_output_options_pane(
         ));
     }
 
-    if maximized && area.height >= 14 {
+    if maximized && area.height >= 16 {
         lines.push(bordered_line(border_color, w, vec![], theme));
         lines.push(bordered_line(
             border_color,
             w,
-            vec![Span::styled("   Conversion log", output_options_section_header_style(theme))],
+            vec![Span::styled("   Conversion", output_options_section_header_style(theme))],
+            theme,
+        ));
+        lines.push(pill_row(
+            border_color,
+            w,
+            "force enc ",
+            "",
+            &render_pill_spans(&opts.force_encode, is_force_encode_focused, theme),
+            is_force_encode_focused,
+            theme,
+        ));
+        lines.push(pill_row(
+            border_color,
+            w,
+            "disc dirs ",
+            "",
+            &render_pill_spans(&opts.disc_subfolders, is_disc_subfolders_focused, theme),
+            is_disc_subfolders_focused,
             theme,
         ));
         lines.push(pill_row(

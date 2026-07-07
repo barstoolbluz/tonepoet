@@ -549,7 +549,7 @@ fn check_pending_browse_rename(app: &mut AppState) {
     };
 
     // Cancel if the user left the browse screen or has an overlay open already.
-    if app.current_screen != AppScreen::Browse || !matches!(app.active_overlay, ActiveOverlay::None)
+    if app.current_screen != AppScreen::Browse || !matches!(&app.active_overlay, ActiveOverlay::None)
     {
         app.pending_browse_rename = None;
         return;
@@ -1158,6 +1158,7 @@ fn handle_archive_preview_result(
     generation: u64,
     archive_path: std::path::PathBuf,
     result: Result<super::app::ArchivePreview, String>,
+    tx: &mpsc::Sender<AppMessage>,
     baseline: super::app::ConvertProbeBaseline,
 ) {
     let pending_matches = app
@@ -1225,6 +1226,33 @@ fn handle_archive_preview_result(
             ));
         }
         Err(err) => {
+            if super::app::looks_like_archive_password_error(&err) {
+                if let super::app::SourceMode::Single {
+                    path,
+                    probe_notice,
+                    ..
+                } = &mut app.convert.source.mode
+                {
+                    if *path == archive_path {
+                        *probe_notice = Some(
+                            "Archive is encrypted; enter password to preview".to_string(),
+                        );
+                    }
+                }
+                app.active_overlay = ActiveOverlay::TextEdit {
+                    input: TextInputState::empty(),
+                    target: TextEditTarget::ArchivePasswordForConvertPreview(
+                        archive_path.clone(),
+                    ),
+                    label: "archive password".to_string(),
+                };
+                app.set_status(format!(
+                    "Archive preview needs a password: {err}; enter password"
+                ));
+                let _ = tx;
+                return;
+            }
+
             let mut applied = false;
             if let super::app::SourceMode::Single { path, probe_notice, .. } = &mut app.convert.source.mode {
                 if *path == archive_path {
@@ -1286,6 +1314,7 @@ fn start_repackage_for_active_browse_staging(
         staging.archive_mtime_secs,
         staging.archive_mtime_nanos,
         staging.archive_size,
+        None,
     );
     start_browse_archive_repackage(app, context, tx);
     true
@@ -1346,7 +1375,7 @@ fn handle_archive_metadata_editor_prepared(
         return;
     }
 
-    if !matches!(app.active_overlay, ActiveOverlay::None) {
+    if !matches!(&app.active_overlay, ActiveOverlay::None) {
         let _pending = app.pending_browse_archive_metadata.take();
         if pending_owns_staging {
             super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
@@ -1407,6 +1436,26 @@ fn handle_archive_metadata_editor_prepared(
             if pending_owns_staging {
                 super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
                 super::keybindings::delete_pending_archive_session_best_effort(app, &archive_path);
+                if deferred_screen_switch.is_none()
+                    && !deferred_archive_exit
+                    && super::app::looks_like_archive_password_error(&err)
+                {
+                    app.active_overlay = ActiveOverlay::TextEdit {
+                        input: TextInputState::empty(),
+                        target: TextEditTarget::ArchivePasswordForMetadataEdit {
+                            archive_path: archive_path.clone(),
+                            target_inner_paths: pending_snapshot
+                                .as_ref()
+                                .and_then(|pending| pending.target_inner_paths.clone()),
+                        },
+                        label: "archive password".to_string(),
+                    };
+                    app.pending_browse_archive_metadata = None;
+                    app.set_status(format!(
+                        "archive metadata editor needs archive password: {err}; enter password"
+                    ));
+                    return;
+                }
                 if let Some(target) = app.deferred_browse_archive_screen_switch.take() {
                     app.current_screen = target;
                     app.deferred_browse_archive_exit = false;
@@ -2117,6 +2166,7 @@ fn handle_archive_entry_rename_result(
                         secs,
                         nanos,
                         size,
+                        None,
                     );
                     app.set_status(format!(
                         "renamed archive entry in {archive_label}: {old_name} -> {new_name}; saving archive changes"
@@ -2253,6 +2303,7 @@ fn handle_archive_entry_delete_result(
                         secs,
                         nanos,
                         size,
+                        None,
                     );
                     app.quit_after_browse_archive_repackage = quit_after_delete;
                     start_browse_archive_repackage(app, context, tx);
@@ -2482,9 +2533,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         AppMessage::FilesScanned { paths } => {
             let mut options = crate::convert::ConversionOptions::default();
             options.append_lineage_to_comment = app.config.conversion.append_lineage_to_comment;
-            options.write_log_file = app.config.conversion.write_log_file;
             options.generate_cue_files = app.config.conversion.generate_cue_files;
             options.cue_generation_mode = app.config.conversion.cue_generation_mode.clone();
+            app.convert
+                .output_options
+                .apply_companion_copying_to_conversion_options(&mut options);
 
             let mut count = 0;
             for path in paths {
@@ -2520,7 +2573,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             result,
             baseline,
         } => {
-            handle_archive_preview_result(app, generation, archive_path, result, baseline);
+            handle_archive_preview_result(app, generation, archive_path, result, tx, baseline);
         }
         AppMessage::ArchiveMetadataEditorProgress {
             archive_path,
@@ -3406,8 +3459,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         }
                         app.pending_archive_recovery_resume_conflicted = false;
                     }
-                    let lower = e.to_ascii_lowercase();
-                    if lower.contains("password") {
+                    if super::app::looks_like_archive_password_error(&e) {
                         app.active_overlay = ActiveOverlay::TextEdit {
                             input: TextInputState::empty(),
                             target: TextEditTarget::ArchivePassword(archive_path.clone()),
@@ -3781,7 +3833,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 if let Some(summary) =
                     state.apply_write_results(session_id, save_generation, results)
                 {
-                    let close_editor = summary.all_saved();
+                    let close_editor = summary.all_saved() && state.close_after_successful_save;
                     for path in &summary.saved_paths {
                         app.browse.remove_probe_cache_entry(path);
                         let _ = app.db.invalidate_probe(&path.display().to_string());
@@ -3827,6 +3879,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     } else {
                         app.set_status(summary.status_line());
                         state.phase = super::app::MetadataEditorPhase::Editing;
+                        state.close_after_successful_save = true;
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     }
                 } else {
@@ -4363,6 +4416,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
 /// multi-line paste replaces the template-derived targets line-by-line.
 /// In text input overlays, the pasted text is inserted at the cursor.
 fn handle_paste(app: &mut AppState, text: &str) {
+    if matches!(&app.active_overlay, ActiveOverlay::None) && paste_into_browse_inline_edit(app, text) {
+        return;
+    }
+
     match &app.active_overlay {
         ActiveOverlay::BulkRename(_) => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
@@ -4451,64 +4508,7 @@ fn handle_paste(app: &mut AppState, text: &str) {
         ActiveOverlay::MetadataEditor(_) => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             if let ActiveOverlay::MetadataEditor(mut state) = overlay {
-                use super::app::MetadataEditorPhase;
-                if state.phase == MetadataEditorPhase::DetailEdit {
-                    let field_idx = state.detail_field_idx;
-                    if field_idx < state.active_surface().entries.len() {
-                        let sanitized = text.replace("\r\n", "\n").replace('\r', "\n");
-                        let lines: Vec<&str> = sanitized.split('\n').collect();
-                        let n_files = state.active_surface().paths.len();
-
-                        // Cancel any active inline edit before taking the
-                        // mutable entry borrow (avoids double-borrow of state).
-                        state.detail_edit = None;
-
-                        let entry = &mut state.active_surface_mut().entries[field_idx];
-                        let is_album = entry.display_key.eq_ignore_ascii_case("ALBUM");
-
-                        if is_album {
-                            let val = lines
-                                .first()
-                                .map(|l| l.trim().to_string())
-                                .unwrap_or_default();
-                            for v in &mut entry.per_file_values {
-                                *v = val.clone();
-                            }
-                        } else {
-                            for (i, line) in lines.iter().enumerate() {
-                                if i >= n_files {
-                                    break;
-                                }
-                                entry.per_file_values[i] = line.trim().to_string();
-                            }
-                        }
-
-                        // Update merged display value + mixed state.
-                        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
-                        entry.is_mixed = !all_same && n_files > 1;
-                        entry.value = if entry.is_mixed {
-                            "<multiple values>".to_string()
-                        } else {
-                            entry.per_file_values.first().cloned().unwrap_or_default()
-                        };
-
-                        state.active_surface_mut().dirty = true;
-                        let applied = lines.len().min(n_files);
-                        app.set_status(format!(
-                            "Pasted {} value{}",
-                            applied,
-                            if applied == 1 { "" } else { "s" },
-                        ));
-                    }
-                } else if state.phase == MetadataEditorPhase::InlineEdit {
-                    // Single-field inline edit: insert first line at cursor.
-                    if let Some(ref mut input) = state.edit_input {
-                        let first_line = text.lines().next().unwrap_or("");
-                        for c in first_line.chars() {
-                            input.insert_char(c);
-                        }
-                    }
-                }
+                super::keybindings::metadata_editor_paste_text(app, &mut state, &text);
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
         }
@@ -4516,6 +4516,25 @@ fn handle_paste(app: &mut AppState, text: &str) {
             // Paste ignored outside text-entry contexts.
         }
     }
+}
+
+
+fn first_paste_line(text: &str) -> &str {
+    text.split(|ch| ch == '\r' || ch == '\n').next().unwrap_or("")
+}
+
+
+fn paste_into_browse_inline_edit(app: &mut AppState, text: &str) -> bool {
+    if app.current_screen != AppScreen::Browse {
+        return false;
+    }
+    let Some(state) = app.browse_inline_edit.as_mut() else {
+        return false;
+    };
+    state
+        .input
+        .insert_paste_text(first_paste_line(text), super::text_input::PastePolicy::SingleLine);
+    true
 }
 
 /// Handle the result of a `:cue-mb` MusicBrainz lookup. Caches the response,
@@ -5288,6 +5307,82 @@ fn handle_cue_fill_complete(
 
 
 #[cfg(test)]
+mod browse_inline_paste_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{BrowseInlineEditState, BrowseInlineEditTarget};
+
+    #[test]
+    fn bracketed_paste_inserts_first_line_into_browse_inline_rename() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename {
+                path: std::path::PathBuf::from("track.flac"),
+            },
+            input: TextInputState::new_selected("track.flac".to_string()),
+        });
+
+        handle_paste(&mut app, "renamed.flac\nignored.flac");
+
+        let input = &app.browse_inline_edit.as_ref().unwrap().input;
+        assert_eq!(input.text, "renamed.flac");
+        assert_eq!(input.cursor, "renamed.flac".len());
+    }
+
+    #[test]
+    fn internal_clipboard_paste_normalizes_multiline_in_browse_inline_rename() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        let mut source = TextInputState::new("album\r\ntrack.flac".to_string());
+        source.select_all_text();
+        assert!(source.copy_selection());
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename {
+                path: std::path::PathBuf::from("track.flac"),
+            },
+            input: TextInputState::new_selected("track.flac".to_string()),
+        });
+
+        let paste = KeyEvent {
+            code: KeyCode::Char('v'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        let input = &mut app.browse_inline_edit.as_mut().unwrap().input;
+        assert!(crate::tui::text_input::handle_text_input_key(input, &paste));
+
+        let input = &app.browse_inline_edit.as_ref().unwrap().input;
+        assert_eq!(input.text, "album track.flac");
+        assert_eq!(input.cursor, "album track.flac".len());
+        assert!(!input.has_selection());
+    }
+
+    #[test]
+    fn bracketed_paste_replaces_selection_in_browse_inline_metadata() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Metadata {
+                path: std::path::PathBuf::from("track.flac"),
+                field: crate::tui::probe::MetadataField::Title,
+            },
+            input: TextInputState::new_selected("Old Title".to_string()),
+        });
+
+        handle_paste(&mut app, "New Title");
+
+        let input = &app.browse_inline_edit.as_ref().unwrap().input;
+        assert_eq!(input.text, "New Title");
+        assert!(!input.has_selection());
+    }
+}
+
+#[cfg(test)]
 mod browse_archive_quit_lifecycle_tests {
     use super::*;
     use crate::config::TonepoetConfig;
@@ -5345,7 +5440,7 @@ mod browse_archive_quit_lifecycle_tests {
             !staging.exists(),
             "clean Browse archive metadata staging must be removed on quit"
         );
-        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(matches!(&app.active_overlay, ActiveOverlay::None));
     }
 
     #[test]
@@ -5466,6 +5561,7 @@ mod browse_archive_quit_lifecycle_tests {
                 active.archive_mtime_secs,
                 active.archive_mtime_nanos,
                 active.archive_size,
+                None,
             ),
         );
 
@@ -5537,6 +5633,7 @@ mod browse_archive_quit_lifecycle_tests {
             secs,
             nanos,
             size,
+            Some(vec!["old.flac".to_string()]),
         );
         let staging = pending.staging_dir.clone();
         fs::create_dir_all(&staging).expect("staging");
@@ -5788,6 +5885,7 @@ mod browse_archive_quit_lifecycle_tests {
             secs,
             nanos,
             size,
+            None,
         );
         assert!(context.editor_owns_staging);
 
@@ -6458,7 +6556,7 @@ mod copy_move_file_picker_flow_tests {
             "event-loop completion must snapshot the selected policy before closing the picker"
         );
         assert!(close_matching_file_picker(&mut app, session_id, &purpose));
-        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(matches!(&app.active_overlay, ActiveOverlay::None));
         assert_eq!(
             matching_file_picker_conflict_policy(&app, session_id, &purpose),
             None,

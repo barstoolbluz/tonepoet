@@ -104,15 +104,28 @@ pub fn draw_format_pane(
                 &format_state.sample_rate,
                 focused && format_state.field_focus == FormatField::SampleRate, theme),
             focused && format_state.field_focus == FormatField::SampleRate, theme));
-        lines.push(pill_row(
-            border_color,
-            w,
-            "bit depth  ",
-            "bit",
-            &render_pill_spans(
-                &format_state.bit_depth,
-                focused && format_state.field_focus == FormatField::BitDepth, theme),
-            focused && format_state.field_focus == FormatField::BitDepth, theme));
+        let bit_depth_focused = focused && format_state.field_focus == FormatField::BitDepth;
+        if let Some(preset_spans) = lossy_preset_spans(format_state, bit_depth_focused, theme) {
+            lines.push(pill_row(
+                border_color,
+                w,
+                "preset     ",
+                "",
+                &preset_spans,
+                bit_depth_focused,
+                theme,
+            ));
+        } else {
+            lines.push(pill_row(
+                border_color,
+                w,
+                "bit depth  ",
+                "bit",
+                &render_pill_spans(&format_state.bit_depth, bit_depth_focused, theme),
+                bit_depth_focused,
+                theme,
+            ));
+        }
         lines.push(pill_row(
             border_color,
             w,
@@ -397,6 +410,42 @@ fn dsd_gain_db_row(
     spans.push(Span::styled("│", theme.border(border_color)));
 
     Line::from(spans)
+}
+
+fn lossy_preset_spans(
+    format_state: &FormatState,
+    focused: bool,
+    theme: super::theme::Theme,
+) -> Option<Vec<Span<'static>>> {
+    let labels = format_state.lossy_preset_labels()?;
+    let selected_index = format_state
+        .lossy_preset_index()
+        .unwrap_or_else(|| labels.len().saturating_sub(1));
+    let count = labels.len();
+    Some(
+        labels
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, label)| {
+                let selected = i == selected_index;
+                let style = if selected && focused {
+                    Style::default()
+                        .fg(theme.pill_active_fg)
+                        .bg(theme.green)
+                        .add_modifier(Modifier::BOLD)
+                } else if selected {
+                    Style::default().fg(theme.green).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text_dim)
+                };
+                let mut spans = vec![Span::styled(format!(" {label} "), style)];
+                if i + 1 < count {
+                    spans.push(Span::styled(" ", Style::default()));
+                }
+                spans
+            })
+            .collect(),
+    )
 }
 
 fn dim_pill_spans<'a>(spans: &[Span<'a>],

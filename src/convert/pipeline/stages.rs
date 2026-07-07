@@ -2000,7 +2000,7 @@ pub fn plan_outputs(
     let album_dir = if req.naming.per_album_subdir {
         match &req.naming.folder_template {
             Some(tmpl) => {
-                let rendered = render_folder_template(tmpl, source, &req.settings.target_format);
+                let rendered = render_folder_template(tmpl, source, &req.settings);
                 output_root.join(rendered)
             }
             None => {
@@ -2031,7 +2031,7 @@ pub fn plan_outputs(
                 track.id.source_ordinal
             )));
         }
-        let rel = render_track_template(&req.naming.template, source, track, &req.settings.target_format)?;
+        let rel = render_track_template(&req.naming.template, source, track, &req.settings)?;
         reject_escaping_path(&rel).map_err(PlanError::InvalidTemplate)?;
 
         let mut final_path = normalize_path(&album_dir.join(rel));
@@ -15156,12 +15156,56 @@ fn validate_template(template: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn render_track_template(
+trait TemplateRenderTarget {
+    fn template_format(&self) -> &PlannerAudioFormat;
+    fn template_sample_rate_hz(&self, source: &PreparedSource, track: Option<&PreparedTrack>) -> Option<u32>;
+    fn template_bit_depth(&self, _source: &PreparedSource, track: Option<&PreparedTrack>) -> Option<u32>;
+}
+
+impl TemplateRenderTarget for PlannerAudioFormat {
+    fn template_format(&self) -> &PlannerAudioFormat {
+        self
+    }
+
+    fn template_sample_rate_hz(&self, source: &PreparedSource, track: Option<&PreparedTrack>) -> Option<u32> {
+        track
+            .and_then(|track| track.scalar_sample_rate())
+            .or_else(|| source.tracks.first().and_then(|track| track.scalar_sample_rate()))
+    }
+
+    fn template_bit_depth(&self, _source: &PreparedSource, track: Option<&PreparedTrack>) -> Option<u32> {
+        track.and_then(|track| track.bit_depth)
+    }
+}
+
+impl TemplateRenderTarget for tonepoet_pipeline::PipelineSettings {
+    fn template_format(&self) -> &PlannerAudioFormat {
+        &self.target_format
+    }
+
+    fn template_sample_rate_hz(&self, source: &PreparedSource, track: Option<&PreparedTrack>) -> Option<u32> {
+        if let Some(track) = track {
+            return resolved_target_rate_hz(track, self);
+        }
+        source
+            .tracks
+            .first()
+            .and_then(|track| resolved_target_rate_hz(track, self))
+    }
+
+    fn template_bit_depth(&self, _source: &PreparedSource, track: Option<&PreparedTrack>) -> Option<u32> {
+        track.and_then(|track| resolved_target_bit_depth(track, self.target_bit_depth))
+    }
+}
+
+fn render_track_template<T: TemplateRenderTarget + ?Sized>(
     template: &str,
     source: &PreparedSource,
     track: &PreparedTrack,
-    format: &PlannerAudioFormat,
+    target: &T,
 ) -> Result<PathBuf, PlanError> {
+    let raw_album = source.album_metadata.album.as_deref().unwrap_or("Album");
+    let (album, title_extra) = album_and_title_extra_for_template(template, raw_album, source);
     let title = track
         .metadata
         .title
@@ -15181,20 +15225,14 @@ fn render_track_template(
         .as_deref()
         .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| artist.clone());
-    let raw_album = source.album_metadata.album.as_deref().unwrap_or("Album");
-    let (album, title_extra) = if template.contains("%TITLE_EXTRA%") {
-        match extract_title_extra(raw_album) {
-            Some((clean, extra)) => (sanitize_component(&clean), sanitize_component(&extra)),
-            None => (sanitize_component(raw_album), String::new()),
-        }
-    } else {
-        (sanitize_component(raw_album), String::new())
-    };
     let disc = track
         .id
         .disc_number
         .or(track.metadata.disc_number)
         .unwrap_or(1);
+    let disc_folder = source_multi_disc_folder_token(source, disc)
+        .map(|value| sanitize_component(&value))
+        .unwrap_or_default();
     let n = track.metadata.track_number.unwrap_or(track.id.track_number);
     let year = source
         .album_metadata
@@ -15218,13 +15256,13 @@ fn render_track_template(
     let catalog = catalog_value(&source.album_metadata.extra)
         .map(sanitize_component)
         .unwrap_or_default();
-    let sample_rate = track
-        .scalar_sample_rate()
+    let sample_rate = target
+        .template_sample_rate_hz(source, Some(track))
         .map(format_sample_rate)
         .map(|value| sanitize_component(&value))
         .unwrap_or_default();
-    let bit_depth = track
-        .bit_depth
+    let bit_depth = target
+        .template_bit_depth(source, Some(track))
         .map(|depth| depth.to_string())
         .map(|value| sanitize_component(&value))
         .unwrap_or_default();
@@ -15235,30 +15273,34 @@ fn render_track_template(
         .map(sanitize_component)
         .unwrap_or_default();
 
-    let mut rendered = template.to_string();
+    let mut tokens = BTreeMap::new();
     let nn = format!("{n:02}");
-    rendered = rendered.replace("%NN%", &nn);
-    rendered = rendered.replace("%TRACKNN%", &nn);
+    tokens.insert("NN".to_string(), nn.clone());
+    tokens.insert("TRACKNN".to_string(), nn);
     let n_str = n.to_string();
-    rendered = rendered.replace("%N%", &n_str);
-    rendered = rendered.replace("%TRACKN%", &n_str);
-    rendered = rendered.replace("%TRACK%", &n_str);
-    rendered = rendered.replace("%TITLE%", &title);
-    rendered = rendered.replace("%ARTIST%", &artist);
-    rendered = rendered.replace("%ALBUM_ARTIST%", &album_artist);
-    rendered = rendered.replace("%ALBUM%", &album);
-    rendered = rendered.replace("%TITLE_EXTRA%", &title_extra);
-    rendered = rendered.replace("%DISC%", &disc.to_string());
-    rendered = rendered.replace("%FORMAT%", format.display_name());
-    rendered = rendered.replace("%YEAR%", &year);
-    rendered = rendered.replace("%GENRE%", &genre);
-    rendered = rendered.replace("%COMPOSER%", &composer);
-    rendered = rendered.replace("%CATALOG%", &catalog);
-    rendered = rendered.replace("%SAMPLERATE%", &sample_rate);
-    rendered = rendered.replace("%BITDEPTH%", &bit_depth);
-    rendered = rendered.replace("%ISRC%", &isrc);
-    rendered = resolve_extra_tokens(
-        &rendered,
+    tokens.insert("N".to_string(), n_str.clone());
+    tokens.insert("TRACKN".to_string(), n_str.clone());
+    tokens.insert("TRACK".to_string(), n_str);
+    tokens.insert("TITLE".to_string(), title);
+    tokens.insert("ARTIST".to_string(), artist);
+    tokens.insert("ALBUM_ARTIST".to_string(), album_artist);
+    tokens.insert("ALBUM".to_string(), album);
+    tokens.insert("TITLE_EXTRA".to_string(), title_extra);
+    tokens.insert("DISC".to_string(), disc.to_string());
+    tokens.insert("DISC_FOLDER".to_string(), disc_folder);
+    tokens.insert("FORMAT".to_string(), target.template_format().display_name().to_string());
+    tokens.insert("YEAR".to_string(), year);
+    tokens.insert("GENRE".to_string(), genre);
+    tokens.insert("COMPOSER".to_string(), composer);
+    tokens.insert("CATALOG".to_string(), catalog);
+    tokens.insert("SAMPLERATE".to_string(), sample_rate);
+    tokens.insert("BITDEPTH".to_string(), bit_depth);
+    tokens.insert("ISRC".to_string(), isrc);
+    tokens.insert("EXT".to_string(), String::new());
+
+    let rendered = render_template_with_tokens(
+        template,
+        &tokens,
         Some(&track.metadata.extra),
         &source.album_metadata.extra,
     );
@@ -15272,7 +15314,11 @@ fn render_track_template(
     Ok(rel)
 }
 
-fn render_folder_template(template: &str, source: &PreparedSource, format: &PlannerAudioFormat) -> PathBuf {
+fn render_folder_template<T: TemplateRenderTarget + ?Sized>(
+    template: &str,
+    source: &PreparedSource,
+    target: &T,
+) -> PathBuf {
     let artist = source
         .album_metadata
         .album_artist
@@ -15291,14 +15337,7 @@ fn render_folder_template(template: &str, source: &PreparedSource, format: &Plan
         .as_deref()
         .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
         .unwrap_or("Album");
-    let (album, title_extra) = if template.contains("%TITLE_EXTRA%") {
-        match extract_title_extra(raw_album) {
-            Some((clean, extra)) => (sanitize_component(&clean), sanitize_component(&extra)),
-            None => (sanitize_component(raw_album), String::new()),
-        }
-    } else {
-        (sanitize_component(raw_album), String::new())
-    };
+    let (album, title_extra) = album_and_title_extra_for_template(template, raw_album, source);
     let year = source
         .album_metadata
         .date
@@ -15314,45 +15353,148 @@ fn render_folder_template(template: &str, source: &PreparedSource, format: &Plan
     let catalog = catalog_value(&source.album_metadata.extra)
         .map(sanitize_component)
         .unwrap_or_default();
-    let sample_rate = source
-        .tracks
-        .first()
-        .and_then(|track| track.scalar_sample_rate())
+    let sample_rate = target
+        .template_sample_rate_hz(source, None)
         .map(format_sample_rate)
         .map(|value| sanitize_component(&value))
         .unwrap_or_default();
-    let bit_depth = source
-        .tracks
-        .first()
-        .and_then(|track| track.bit_depth)
+    let bit_depth = target
+        .template_bit_depth(source, source.tracks.first())
         .map(|depth| depth.to_string())
         .map(|value| sanitize_component(&value))
         .unwrap_or_default();
 
-    let mut rendered = template.to_string();
-    rendered = rendered.replace("%ARTIST%", &artist);
-    rendered = rendered.replace("%ALBUM_ARTIST%", &artist);
-    rendered = rendered.replace("%ALBUM%", &album);
-    rendered = rendered.replace("%TITLE_EXTRA%", &title_extra);
-    rendered = rendered.replace("%YEAR%", &year);
-    rendered = rendered.replace("%GENRE%", &genre);
-    rendered = rendered.replace("%CATALOG%", &catalog);
-    rendered = rendered.replace("%FORMAT%", format.display_name());
-    rendered = rendered.replace("%SAMPLERATE%", &sample_rate);
-    rendered = rendered.replace("%BITDEPTH%", &bit_depth);
-    rendered = resolve_extra_tokens(&rendered, None, &source.album_metadata.extra);
+    let mut tokens = BTreeMap::new();
+    tokens.insert("ARTIST".to_string(), artist.clone());
+    tokens.insert("ALBUM_ARTIST".to_string(), artist);
+    tokens.insert("ALBUM".to_string(), album);
+    tokens.insert("TITLE_EXTRA".to_string(), title_extra);
+    tokens.insert("YEAR".to_string(), year);
+    tokens.insert("GENRE".to_string(), genre);
+    tokens.insert("CATALOG".to_string(), catalog);
+    tokens.insert("FORMAT".to_string(), target.template_format().display_name().to_string());
+    tokens.insert("SAMPLERATE".to_string(), sample_rate);
+    tokens.insert("BITDEPTH".to_string(), bit_depth);
+    tokens.insert("EXT".to_string(), String::new());
 
+    let rendered = render_template_with_tokens(template, &tokens, None, &source.album_metadata.extra);
     path_from_template_components(&rendered)
 }
 
-fn resolve_extra_tokens(
-    rendered: &str,
+fn album_and_title_extra_for_template(
+    template: &str,
+    raw_album: &str,
+    source: &PreparedSource,
+) -> (String, String) {
+    if !template.contains("%TITLE_EXTRA%") {
+        return (sanitize_component(raw_album), String::new());
+    }
+    match extract_title_extra(raw_album) {
+        Some((clean, extra)) => {
+            let strip_resolution = template.contains("%BITDEPTH%") || template.contains("%SAMPLERATE%");
+            let normalized = normalize_title_extra_for_template(&extra, source, strip_resolution);
+            (sanitize_component(&clean), sanitize_optional_component(&normalized))
+        }
+        None => (sanitize_component(raw_album), String::new()),
+    }
+}
+
+
+fn source_multi_disc_folder_token(source: &PreparedSource, disc_number: u32) -> Option<String> {
+    if source_is_multi_disc_for_template(source) {
+        Some(format!("Disc {disc_number:02}"))
+    } else {
+        None
+    }
+}
+
+fn source_is_multi_disc_for_template(source: &PreparedSource) -> bool {
+    let mut disc_numbers = BTreeSet::new();
+    let mut max_disc_total = 0_u32;
+    for track in &source.tracks {
+        if let Some(disc) = track.id.disc_number.or(track.metadata.disc_number) {
+            if disc > 0 {
+                disc_numbers.insert(disc);
+            }
+        }
+        for key in ["discnumber", "disc_number", "disc", "disctotal", "disc_total"] {
+            let Some(raw) = track.metadata.extra.get(key) else { continue; };
+            if let Some((disc, total)) = parse_disc_number_hint(raw) {
+                if let Some(disc) = disc.filter(|disc| *disc > 0) {
+                    disc_numbers.insert(disc);
+                }
+                if let Some(total) = total.filter(|total| *total > 0) {
+                    max_disc_total = max_disc_total.max(total);
+                }
+            }
+        }
+    }
+    disc_numbers.len() > 1 || max_disc_total > 1
+}
+
+fn parse_disc_number_hint(value: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let mut nums = value
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok());
+    let first = nums.next();
+    let second = nums.next();
+    match (first, second) {
+        (None, None) => None,
+        (Some(total), None) => Some((None, Some(total))),
+        (disc, total) => Some((disc, total)),
+    }
+}
+
+fn render_template_with_tokens(
+    template: &str,
+    tokens: &BTreeMap<String, String>,
     track_extra: Option<&BTreeMap<String, String>>,
     album_extra: &BTreeMap<String, String>,
 ) -> String {
-    let mut output = String::with_capacity(rendered.len());
-    let mut rest = rendered;
+    let conditional = render_conditional_template_blocks(template, tokens, track_extra, album_extra);
+    render_template_segment(&conditional, tokens, track_extra, album_extra)
+}
 
+fn render_conditional_template_blocks(
+    template: &str,
+    tokens: &BTreeMap<String, String>,
+    track_extra: Option<&BTreeMap<String, String>>,
+    album_extra: &BTreeMap<String, String>,
+) -> String {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        output.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            output.push('{');
+            output.push_str(after_open);
+            return output;
+        };
+        let block = &after_open[..close];
+        let variables = template_tokens_in(block);
+        if variables.iter().all(|token| {
+            !resolve_template_token(token, tokens, track_extra, album_extra)
+                .trim()
+                .is_empty()
+        }) {
+            output.push_str(&render_template_segment(block, tokens, track_extra, album_extra));
+        }
+        rest = &after_open[close + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn render_template_segment(
+    segment: &str,
+    tokens: &BTreeMap<String, String>,
+    track_extra: Option<&BTreeMap<String, String>>,
+    album_extra: &BTreeMap<String, String>,
+) -> String {
+    let mut output = String::with_capacity(segment.len());
+    let mut rest = segment;
     while let Some(start) = rest.find('%') {
         output.push_str(&rest[..start]);
         rest = &rest[start + 1..];
@@ -15361,20 +15503,46 @@ fn resolve_extra_tokens(
             output.push_str(rest);
             return output;
         };
-
         let token = &rest[..end];
-        let key = token.to_ascii_lowercase();
-        let value = track_extra
-            .and_then(|extra| extra.get(&key))
-            .or_else(|| album_extra.get(&key))
-            .map(|value| sanitize_component(value))
-            .unwrap_or_default();
-        output.push_str(&value);
+        output.push_str(&resolve_template_token(token, tokens, track_extra, album_extra));
         rest = &rest[end + 1..];
     }
-
     output.push_str(rest);
     output
+}
+
+fn template_tokens_in(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut rest = segment;
+    while let Some(start) = rest.find('%') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('%') else {
+            break;
+        };
+        let token = rest[..end].to_string();
+        if !tokens.iter().any(|existing| existing == &token) {
+            tokens.push(token);
+        }
+        rest = &rest[end + 1..];
+    }
+    tokens
+}
+
+fn resolve_template_token(
+    token: &str,
+    tokens: &BTreeMap<String, String>,
+    track_extra: Option<&BTreeMap<String, String>>,
+    album_extra: &BTreeMap<String, String>,
+) -> String {
+    if let Some(value) = tokens.get(token) {
+        return value.clone();
+    }
+    let key = token.to_ascii_lowercase();
+    track_extra
+        .and_then(|extra| extra.get(&key))
+        .or_else(|| album_extra.get(&key))
+        .map(|value| sanitize_optional_component(value))
+        .unwrap_or_default()
 }
 
 fn path_from_template_components(rendered: &str) -> PathBuf {
@@ -15392,9 +15560,9 @@ fn path_from_template_components(rendered: &str) -> PathBuf {
 /// Extract metadata from a trailing parenthetical in an album name.
 ///
 /// Scans for the last `(content)` optionally followed by `[bracket]` at the
-/// end of the string. If the parenthetical content contains a recognized
-/// metadata identifier (catalog prefix, format keyword, or audiophile label),
-/// returns `Some((clean_album, extra_content))`. Otherwise returns `None`.
+/// end of the string. If the parenthetical content looks like release metadata
+/// (catalog, format, region, or resolution), returns `Some((clean_album,
+/// extra_content))`. Otherwise returns `None` so title subtitles are preserved.
 ///
 /// Only called when `%TITLE_EXTRA%` appears in the template.
 fn extract_title_extra(album: &str) -> Option<(String, String)> {
@@ -15423,13 +15591,7 @@ fn extract_title_extra(album: &str) -> Option<(String, String)> {
 
     let open = last_open?;
     let close = last_close?;
-    if close <= open {
-        return None;
-    }
-
-    // Don't strip parentheticals at the very start of the album name
-    // (e.g., "(Ain't That) Good News")
-    if open == 0 {
+    if close <= open || open == 0 {
         return None;
     }
 
@@ -15438,16 +15600,14 @@ fn extract_title_extra(album: &str) -> Option<(String, String)> {
         return None;
     }
 
-    // Check if the content contains a recognized metadata identifier
-    if !super::label_resolver::contains_metadata_identifier(content) {
+    if !super::label_resolver::contains_metadata_identifier(content)
+        && !looks_like_title_extra_metadata(content)
+    {
         return None;
     }
 
-    // Strip the parenthetical and any trailing bracket like [ISO], [FLAC]
     let before = album[..open].trim_end();
     let after = album[close + 1..].trim_start();
-
-    // Strip trailing [...] if present
     let clean = if after.starts_with('[') {
         if let Some(bracket_end) = after.find(']') {
             let remainder = after[bracket_end + 1..].trim();
@@ -15466,6 +15626,129 @@ fn extract_title_extra(album: &str) -> Option<(String, String)> {
     };
 
     Some((clean, content.trim().to_string()))
+}
+
+fn normalize_title_extra_for_template(
+    extra: &str,
+    source: &PreparedSource,
+    strip_resolution: bool,
+) -> String {
+    let mut normalized = extra.trim().to_string();
+    if title_extra_should_strip_iso_for_source(source) {
+        normalized = strip_iso_marker_from_title_extra(&normalized);
+    }
+    if strip_resolution {
+        normalized = strip_resolution_from_title_extra(&normalized);
+    }
+    normalized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| ch == '/' || ch == '-' || ch.is_whitespace())
+        .to_string()
+}
+
+fn title_extra_should_strip_iso_for_source(source: &PreparedSource) -> bool {
+    matches!(source.kind, SourceKind::SacdIso | SourceKind::DvdAudio | SourceKind::DvdVideo)
+        || source
+            .container
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+}
+
+fn strip_iso_marker_from_title_extra(extra: &str) -> String {
+    let mut kept = Vec::new();
+    for part in extra.split('/') {
+        let words = part
+            .split_whitespace()
+            .filter(|word| {
+                !word
+                    .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+                    .eq_ignore_ascii_case("iso")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !words.trim().is_empty() {
+            kept.push(words);
+        }
+    }
+    kept.join(" / ")
+}
+
+fn strip_resolution_from_title_extra(extra: &str) -> String {
+    let mut parts = Vec::new();
+    for part in extra.split('/') {
+        let trimmed = part.trim();
+        if !looks_like_resolution_fragment(trimmed) {
+            parts.push(trimmed);
+        }
+    }
+    let joined = parts.join(" / ");
+    joined
+        .split_whitespace()
+        .filter(|token| !looks_like_resolution_fragment(token.trim_matches(|ch| ch == '(' || ch == ')' || ch == ',')))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn looks_like_title_extra_metadata(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .filter(|word| !word.is_empty())
+        .collect();
+
+    let has_release_format = [
+        "blu-ray", "bluray", "dvd-a", "dvda", "dvd-v", "dvdv", "sacd", "shm", "shm-cd",
+        "iso", "lp", "cd",
+    ]
+    .iter()
+    .any(|needle| words.iter().any(|word| word == needle));
+    let has_resolution = content
+        .split(|ch: char| ch.is_whitespace() || ch == '/' || ch == ',' || ch == ';')
+        .any(looks_like_resolution_fragment);
+    let has_catalog = content.split_whitespace().any(looks_like_catalog_fragment);
+
+    // Policy: region-only parentheticals such as "(US)" or "(Japan)" are
+    // commonly part of an album/release title and are too ambiguous to strip
+    // by themselves. Regional tokens are preserved unless the same
+    // parenthetical also contains a non-regional release-metadata signal such
+    // as a format marker, ISO marker, catalog number, label identifier, or
+    // resolution. The label-identifier case is handled by the caller via
+    // label_resolver::contains_metadata_identifier().
+    has_release_format || has_resolution || has_catalog
+}
+
+fn looks_like_catalog_fragment(fragment: &str) -> bool {
+    let cleaned = fragment.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
+    if cleaned.len() < 4 {
+        return false;
+    }
+    let has_alpha = cleaned.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = cleaned.chars().any(|ch| ch.is_ascii_digit());
+    let has_separator = cleaned.contains('-');
+    has_alpha && has_digit && (has_separator || cleaned.chars().filter(|ch| ch.is_ascii_digit()).count() >= 3)
+}
+
+fn looks_like_resolution_fragment(fragment: &str) -> bool {
+    let cleaned = fragment
+        .trim()
+        .trim_matches(|ch: char| ch == '(' || ch == ')' || ch == '[' || ch == ']' || ch == ',')
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+    if cleaned.ends_with("khz") || cleaned.ends_with("kbps") || cleaned.ends_with("hz") {
+        return cleaned.chars().any(|ch| ch.is_ascii_digit());
+    }
+    let compact = cleaned.replace("/", "-");
+    let mut pieces = compact.split('-');
+    let first = pieces.next().unwrap_or_default();
+    let second = pieces.next().unwrap_or_default();
+    pieces.next().is_none()
+        && matches!(first, "16" | "20" | "24" | "32")
+        && second.parse::<u32>().is_ok_and(|rate| matches!(rate, 44 | 48 | 88 | 96 | 176 | 192 | 352 | 384 | 705 | 768))
 }
 
 fn catalog_value(extra: &BTreeMap<String, String>) -> Option<&str> {
@@ -15512,7 +15795,7 @@ fn format_sample_rate(hz: u32) -> String {
     format!("{khz}kHz")
 }
 
-fn sanitize_component(value: &str) -> String {
+fn sanitize_optional_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
         .map(|ch| match ch {
@@ -15521,7 +15804,11 @@ fn sanitize_component(value: &str) -> String {
             ch => ch,
         })
         .collect();
-    let trimmed = sanitized.trim().trim_matches('.').to_string();
+    sanitized.trim().trim_matches('.').to_string()
+}
+
+fn sanitize_component(value: &str) -> String {
+    let trimmed = sanitize_optional_component(value);
     if trimmed.is_empty() {
         "untitled".to_string()
     } else {
@@ -19911,6 +20198,20 @@ mod title_extra_tests {
     }
 
     #[test]
+    fn preserves_region_only_parenthetical() {
+        assert!(extract_title_extra("Aja (Japan)").is_none());
+        assert!(extract_title_extra("Abbey Road (UK)").is_none());
+        assert!(extract_title_extra("Kind of Blue (EU)").is_none());
+    }
+
+    #[test]
+    fn strips_region_when_combined_with_release_metadata() {
+        let (album, extra) = extract_title_extra("Aftermath (US CTI 6015 LP)").unwrap();
+        assert_eq!(album, "Aftermath");
+        assert_eq!(extra, "US CTI 6015 LP");
+    }
+
+    #[test]
     fn preserves_leading_parenthetical() {
         assert!(extract_title_extra("(Ain't That) Good News").is_none());
     }
@@ -19977,6 +20278,47 @@ mod title_extra_tests {
         assert!(s.contains("Dark Side of the Moon"), "album stripped: {s}");
         assert!(s.contains("MFSL SACD"), "extra populated: {s}");
         assert!(!s.contains("[ISO]"), "bracket stripped: {s}");
+    }
+
+    #[test]
+    fn title_extra_stripped_to_empty_stays_empty_not_untitled() {
+        let mut source = template_source();
+        source.album_metadata.album = Some("Aja (ISO)".to_string());
+        let result = render_folder_template(
+            "%ALBUM%{ (%TITLE_EXTRA%)}",
+            &source,
+            &tonepoet_pipeline::AudioFormat::Flac,
+        );
+        let s = result.to_string_lossy();
+        assert_eq!(s, "Aja");
+        assert!(!s.contains("untitled"), "empty optional extra must not be sanitized to untitled: {s}");
+    }
+
+    #[test]
+    fn resolution_only_title_extra_stripped_to_empty_stays_empty() {
+        let source = template_source();
+        let (_album, extra) = album_and_title_extra_for_template(
+            "%ALBUM%{ (%TITLE_EXTRA% %BITDEPTH%-%SAMPLERATE%)}",
+            "Aja (24-96)",
+            &source,
+        );
+        assert_eq!(extra, "");
+    }
+
+    #[test]
+    fn conditional_disc_folder_prefix_does_not_make_single_disc_path_absolute() {
+        let mut source = template_source();
+        source.tracks[0].metadata.title = Some("Right Off".to_string());
+        let result = render_track_template(
+            "{%DISC_FOLDER%/}%NN% - %TITLE%",
+            &source,
+            &source.tracks[0],
+            &tonepoet_pipeline::AudioFormat::Flac,
+        )
+        .unwrap();
+        let s = result.to_string_lossy();
+        assert_eq!(s, "01 - Right Off");
+        assert!(!result.is_absolute(), "single-disc conditional prefix must not render an absolute path: {s}");
     }
 
     fn template_source() -> PreparedSource {

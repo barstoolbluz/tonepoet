@@ -125,10 +125,22 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
     options.merge_to_single = matches!(*output_opts.merge.selected_value(), MergeMode::SingleImage);
     options.preserve_metadata = true;
     options.append_lineage_to_comment = config.conversion.append_lineage_to_comment;
-    options.write_log_file = config.conversion.write_log_file;
+    options.write_log_file = *output_opts.write_log.selected_value();
     options.generate_cue_files = config.conversion.generate_cue_files;
     options.cue_generation_mode = config.conversion.cue_generation_mode.clone();
+    options.force_encode = *output_opts.force_encode.selected_value();
+    options.create_disc_subfolders = *output_opts.disc_subfolders.selected_value();
+    if let Some(settings) = options.pipeline_settings.as_mut() {
+        settings.force_encode = *output_opts.force_encode.selected_value();
+    }
     options.pipeline_settings = format_state_to_pipeline_settings(&format).ok();
+    if let Some(settings) = options.pipeline_settings.as_mut() {
+        settings.force_encode = *output_opts.force_encode.selected_value();
+    }
+    options.naming_template = Some(naming_template_with_disc_subfolder(
+        output_opts.filename_template.clone(),
+        options.create_disc_subfolders,
+    ));
     options
 }
 
@@ -226,16 +238,25 @@ pub fn try_pills_to_options(
         dither_type,
         calculate_replaygain,
         replaygain_mode,
-        naming_template: Some(output_opts.filename_template.clone()),
+        naming_template: Some(naming_template_with_disc_subfolder(
+            output_opts.filename_template.clone(),
+            *output_opts.disc_subfolders.selected_value(),
+        )),
         folder_template: Some(output_opts.folder_template.clone()),
         output_dir: output_opts.dest_path.clone(),
         merge_to_single: matches!(merge, MergeMode::SingleImage),
         preserve_metadata: true,
         append_lineage_to_comment: config.conversion.append_lineage_to_comment,
-        write_log_file: config.conversion.write_log_file,
+        write_log_file: *output_opts.write_log.selected_value(),
         generate_cue_files: config.conversion.generate_cue_files,
         cue_generation_mode: config.conversion.cue_generation_mode.clone(),
-        pipeline_settings: Some(pipeline_settings),
+        force_encode: *output_opts.force_encode.selected_value(),
+        create_disc_subfolders: *output_opts.disc_subfolders.selected_value(),
+        pipeline_settings: Some({
+            let mut settings = pipeline_settings;
+            settings.force_encode = *output_opts.force_encode.selected_value();
+            settings
+        }),
         container_extension: if format.selected_container_index > 0 {
             Some(format.selected_extension().to_string())
         } else {
@@ -247,6 +268,53 @@ pub fn try_pills_to_options(
             .collect(),
         ..ConversionOptions::default()
     })
+}
+
+
+fn naming_template_with_disc_subfolder(template: String, enabled: bool) -> String {
+    if !enabled || template.contains("%DISC_FOLDER%") {
+        return template;
+    }
+    format!("{{%DISC_FOLDER%/}}{template}")
+}
+
+#[cfg(test)]
+mod naming_template_tests {
+    use super::{naming_template_with_disc_subfolder, try_pills_to_options};
+
+    #[test]
+    fn disc_subfolder_option_uses_conditional_prefix() {
+        assert_eq!(
+            naming_template_with_disc_subfolder("%NN% - %TITLE%".to_string(), true),
+            "{%DISC_FOLDER%/}%NN% - %TITLE%"
+        );
+    }
+
+    #[test]
+    fn disc_subfolder_option_does_not_duplicate_existing_token() {
+        let template = "{%DISC_FOLDER%/}%NN% - %TITLE%".to_string();
+        assert_eq!(
+            naming_template_with_disc_subfolder(template.clone(), true),
+            template
+        );
+    }
+
+    #[test]
+    fn conversion_options_use_output_write_log_pill_not_config_default() {
+        let format = crate::tui::app::FormatState::new();
+        let mut output = crate::tui::app::OutputOptionsState::new();
+        let mut config = crate::config::TonepoetConfig::default();
+
+        config.conversion.write_log_file = false;
+        output.write_log.select_value(&true);
+        let options = try_pills_to_options(&format, &output, &config).expect("valid default options");
+        assert!(options.write_log_file);
+
+        config.conversion.write_log_file = true;
+        output.write_log.select_value(&false);
+        let options = try_pills_to_options(&format, &output, &config).expect("valid default options");
+        assert!(!options.write_log_file);
+    }
 }
 
 /// Build the unified pipeline settings from TUI format state.

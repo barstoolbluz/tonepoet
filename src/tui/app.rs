@@ -1293,6 +1293,7 @@ pub struct PendingBrowseArchiveMetadataEdit {
     pub archive_mtime_secs: i64,
     pub archive_mtime_nanos: u32,
     pub archive_size: u64,
+    pub target_inner_paths: Option<Vec<String>>,
     pub cancel: tokio_util::sync::CancellationToken,
     pub owns_staging: bool,
 }
@@ -1305,6 +1306,7 @@ impl fmt::Debug for PendingBrowseArchiveMetadataEdit {
             .field("archive_mtime_secs", &self.archive_mtime_secs)
             .field("archive_mtime_nanos", &self.archive_mtime_nanos)
             .field("archive_size", &self.archive_size)
+            .field("target_inner_paths", &self.target_inner_paths)
             .field("owns_staging", &self.owns_staging)
             .finish_non_exhaustive()
     }
@@ -1316,6 +1318,7 @@ impl PendingBrowseArchiveMetadataEdit {
         archive_mtime_secs: i64,
         archive_mtime_nanos: u32,
         archive_size: u64,
+        target_inner_paths: Option<Vec<String>>,
     ) -> Self {
         Self {
             archive_path,
@@ -1326,12 +1329,17 @@ impl PendingBrowseArchiveMetadataEdit {
             archive_mtime_secs,
             archive_mtime_nanos,
             archive_size,
+            target_inner_paths,
             cancel: tokio_util::sync::CancellationToken::new(),
             owns_staging: true,
         }
     }
 
-    pub fn from_existing(archive_path: PathBuf, staging_dir: PathBuf) -> Self {
+    pub fn from_existing(
+        archive_path: PathBuf,
+        staging_dir: PathBuf,
+        target_inner_paths: Option<Vec<String>>,
+    ) -> Self {
         let (archive_mtime_secs, archive_mtime_nanos, archive_size) =
             archive_fingerprint(&archive_path).unwrap_or((0, 0, 0));
         Self {
@@ -1340,6 +1348,7 @@ impl PendingBrowseArchiveMetadataEdit {
             archive_mtime_secs,
             archive_mtime_nanos,
             archive_size,
+            target_inner_paths,
             cancel: tokio_util::sync::CancellationToken::new(),
             owns_staging: false,
         }
@@ -1372,6 +1381,7 @@ pub struct PendingBrowseArchiveRename {
     pub archive_mtime_secs: i64,
     pub archive_mtime_nanos: u32,
     pub archive_size: u64,
+    pub target_inner_paths: Option<Vec<String>>,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -1397,6 +1407,7 @@ impl PendingBrowseArchiveRename {
         archive_mtime_secs: i64,
         archive_mtime_nanos: u32,
         archive_size: u64,
+        target_inner_paths: Option<Vec<String>>,
     ) -> Self {
         Self {
             archive_path,
@@ -1409,6 +1420,7 @@ impl PendingBrowseArchiveRename {
             archive_mtime_secs,
             archive_mtime_nanos,
             archive_size,
+            target_inner_paths,
             cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1436,6 +1448,7 @@ pub struct PendingBrowseArchiveDelete {
     pub archive_mtime_secs: i64,
     pub archive_mtime_nanos: u32,
     pub archive_size: u64,
+    pub target_inner_paths: Option<Vec<String>>,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -1459,6 +1472,7 @@ impl PendingBrowseArchiveDelete {
         archive_mtime_secs: i64,
         archive_mtime_nanos: u32,
         archive_size: u64,
+        target_inner_paths: Option<Vec<String>>,
     ) -> Self {
         Self {
             archive_path,
@@ -1470,6 +1484,7 @@ impl PendingBrowseArchiveDelete {
             archive_mtime_secs,
             archive_mtime_nanos,
             archive_size,
+            target_inner_paths,
             cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1514,6 +1529,7 @@ pub struct ArchiveMetadataEditContext {
     pub archive_mtime_secs: Option<i64>,
     pub archive_mtime_nanos: Option<u32>,
     pub archive_size: Option<u64>,
+    pub target_inner_paths: Option<Vec<String>>,
     /// True only when the metadata editor created this staging tree for its
     /// own transient Browse archive edit. When the editor opens against an
     /// already-active ArchiveBrowseState staging session, Browse owns the
@@ -1533,6 +1549,7 @@ impl ArchiveMetadataEditContext {
             archive_mtime_secs,
             archive_mtime_nanos,
             archive_size,
+            target_inner_paths: None,
             editor_owns_staging: true,
         }
     }
@@ -1549,6 +1566,7 @@ impl ArchiveMetadataEditContext {
         archive_mtime_secs: i64,
         archive_mtime_nanos: u32,
         archive_size: u64,
+        target_inner_paths: Option<Vec<String>>,
     ) -> Self {
         Self {
             owner: ArchiveMetadataEditOwner::Browse,
@@ -1557,6 +1575,7 @@ impl ArchiveMetadataEditContext {
             archive_mtime_secs: Some(archive_mtime_secs),
             archive_mtime_nanos: Some(archive_mtime_nanos),
             archive_size: Some(archive_size),
+            target_inner_paths,
             editor_owns_staging: true,
         }
     }
@@ -1567,6 +1586,7 @@ impl ArchiveMetadataEditContext {
         archive_mtime_secs: i64,
         archive_mtime_nanos: u32,
         archive_size: u64,
+        target_inner_paths: Option<Vec<String>>,
     ) -> Self {
         Self {
             owner: ArchiveMetadataEditOwner::Browse,
@@ -1575,6 +1595,7 @@ impl ArchiveMetadataEditContext {
             archive_mtime_secs: Some(archive_mtime_secs),
             archive_mtime_nanos: Some(archive_mtime_nanos),
             archive_size: Some(archive_size),
+            target_inner_paths,
             editor_owns_staging: false,
         }
     }
@@ -1587,6 +1608,7 @@ impl ArchiveMetadataEditContext {
             archive_mtime_secs: None,
             archive_mtime_nanos: None,
             archive_size: None,
+            target_inner_paths: None,
             editor_owns_staging: true,
         }
     }
@@ -2375,6 +2397,8 @@ pub enum OutputOptionsField {
     MergeMode,
     CompanionExtensions,
     CompanionFolders,
+    ForceEncode,
+    DiscSubfolders,
     WriteLog,
 }
 
@@ -2385,13 +2409,15 @@ impl OutputOptionsField {
         Self::FilenameTemplate,
         Self::MergeMode,
     ];
-    const MAXIMIZED_FIELDS: [Self; 7] = [
+    const MAXIMIZED_FIELDS: [Self; 9] = [
         Self::DestPath,
         Self::FolderTemplate,
         Self::FilenameTemplate,
         Self::MergeMode,
         Self::CompanionExtensions,
         Self::CompanionFolders,
+        Self::ForceEncode,
+        Self::DiscSubfolders,
         Self::WriteLog,
     ];
 
@@ -2497,23 +2523,34 @@ pub struct FormatState {
     pub flac_md5: PillState<bool>,
     /// AAC profile (LC, HE, HEv2). Default: LC.
     pub aac_profile: tonepoet_pipeline::enums::AacProfile,
-    /// AAC quality preset index into the profile-specific preset table.
-    /// None = custom (user manually entered a bitrate).
+    /// AAC quality preset index into the profile-specific codec-settings table.
+    /// None = custom/manual settings within the codec-settings overlay.
     pub aac_quality_preset: Option<usize>,
+    /// Explicit above-the-fold lossy preset row state: Some(0..=2) = named
+    /// preset, None = explicit custom. This is intentionally separate from the
+    /// codec-settings table so selecting `custom` can be preserved even when
+    /// the numeric settings happen to match a named preset.
+    pub aac_lossy_preset: Option<usize>,
     /// AAC bitrate in kbps (8-1024). Default: 256.
     pub aac_bitrate_kbps: u32,
     /// Opus content type (Auto, Music, Speech). Default: Auto.
     pub opus_content_type: tonepoet_pipeline::enums::OpusContentType,
-    /// Opus quality preset index into OPUS_PRESETS. None = custom.
+    /// Opus quality preset index into OPUS_PRESETS. None = custom/manual
+    /// settings within the codec-settings overlay.
     pub opus_quality_preset: Option<usize>,
+    /// Explicit above-the-fold Opus lossy preset row state.
+    pub opus_lossy_preset: Option<usize>,
     /// Opus bitrate in kbps (6-510). Default: 192.
     pub opus_bitrate_kbps: u32,
     /// Opus encoder complexity (0-10). Default: 10.
     pub opus_complexity: u8,
     /// MP3 encoding mode (VBR, CBR, ABR). Default: VBR.
     pub mp3_mode: tonepoet_pipeline::enums::Mp3Mode,
-    /// MP3 bitrate preset index into MP3_BITRATE_PRESETS. None = custom.
+    /// MP3 bitrate preset index into MP3_BITRATE_PRESETS. None = custom/manual
+    /// settings within the codec-settings overlay.
     pub mp3_quality_preset: Option<usize>,
+    /// Explicit above-the-fold MP3 lossy preset row state.
+    pub mp3_lossy_preset: Option<usize>,
     /// MP3 VBR quality (0-9, 0=best). Default: 0.
     pub mp3_vbr_quality: u8,
     /// MP3 CBR/ABR bitrate in kbps (8-1000). Default: 320.
@@ -2726,15 +2763,18 @@ impl FormatState {
             ]),
             aac_profile: tonepoet_pipeline::enums::AacProfile::LcAac,
             aac_quality_preset: Some(1), // "high" = index 1 in LC presets
+            aac_lossy_preset: Some(0), // above-the-fold "256 VBR"
             aac_bitrate_kbps: 256,
             opus_content_type: tonepoet_pipeline::enums::OpusContentType::Auto,
             opus_quality_preset: Some(1), // "high" = index 1 (192 kbps)
+            opus_lossy_preset: None, // 192 kbps is intentionally an advanced/custom default
             opus_bitrate_kbps: 192,
             opus_complexity: 10,
             mp3_mode: tonepoet_pipeline::enums::Mp3Mode::Vbr,
             mp3_quality_preset: Some(0), // "insane" = index 0 (320 kbps)
+            mp3_lossy_preset: Some(0), // above-the-fold "V0"
             mp3_vbr_quality: 0,
-            mp3_bitrate_kbps: 320,
+            mp3_bitrate_kbps: 245,
             wavpack_mode: tonepoet_pipeline::enums::WavPackMode::Normal,
             wavpack_hybrid: false,
             wavpack_bitrate_kbps: 320,
@@ -2856,9 +2896,269 @@ impl FormatState {
         self.apply_format_constraints();
     }
 
+    pub fn is_lossy_codec_selected(&self) -> bool {
+        matches!(
+            *self.format.selected_value(),
+            AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus
+        )
+    }
+
+    pub fn lossy_preset_labels(&self) -> Option<Vec<String>> {
+        match *self.format.selected_value() {
+            AudioFormat::Mp3 => Some(vec![
+                "V0 (245kbps)".to_string(),
+                "V2 (190kbps)".to_string(),
+                "320 CBR".to_string(),
+                "custom".to_string(),
+            ]),
+            AudioFormat::Aac => Some(vec![
+                "256 VBR".to_string(),
+                "192 VBR".to_string(),
+                "128 VBR".to_string(),
+                "custom".to_string(),
+            ]),
+            AudioFormat::Opus => Some(vec![
+                "128".to_string(),
+                "96".to_string(),
+                "64".to_string(),
+                "custom".to_string(),
+            ]),
+            _ => None,
+        }
+    }
+
+    pub fn lossy_preset_index(&self) -> Option<usize> {
+        const CUSTOM: usize = 3;
+        match *self.format.selected_value() {
+            // The row reflects the user's explicit choice, not just a reverse
+            // lookup of numeric settings. If a user chooses `custom` and then
+            // happens to set values equal to V0/V2/etc., the row remains
+            // `custom` until they explicitly choose a named preset again.
+            AudioFormat::Mp3 => Some(match self.mp3_lossy_preset.filter(|idx| *idx < CUSTOM) {
+                Some(idx) if Some(idx) == self.infer_mp3_lossy_preset_index() => idx,
+                _ => CUSTOM,
+            }),
+            AudioFormat::Aac => Some(match self.aac_lossy_preset.filter(|idx| *idx < CUSTOM) {
+                Some(idx) if Some(idx) == self.infer_aac_lossy_preset_index() => idx,
+                _ => CUSTOM,
+            }),
+            AudioFormat::Opus => Some(match self.opus_lossy_preset.filter(|idx| *idx < CUSTOM) {
+                Some(idx) if Some(idx) == self.infer_opus_lossy_preset_index() => idx,
+                _ => CUSTOM,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn mp3_lossy_preset_key(&self) -> &'static str {
+        match self.mp3_lossy_preset {
+            Some(0) if self.infer_mp3_lossy_preset_index() == Some(0) => "v0",
+            Some(1) if self.infer_mp3_lossy_preset_index() == Some(1) => "v2",
+            Some(2) if self.infer_mp3_lossy_preset_index() == Some(2) => "320-cbr",
+            _ => "custom",
+        }
+    }
+
+    pub fn aac_lossy_preset_key(&self) -> &'static str {
+        match self.aac_lossy_preset {
+            Some(0) if self.infer_aac_lossy_preset_index() == Some(0) => "256-vbr",
+            Some(1) if self.infer_aac_lossy_preset_index() == Some(1) => "192-vbr",
+            Some(2) if self.infer_aac_lossy_preset_index() == Some(2) => "128-vbr",
+            _ => "custom",
+        }
+    }
+
+    pub fn opus_lossy_preset_key(&self) -> &'static str {
+        match self.opus_lossy_preset {
+            Some(0) if self.infer_opus_lossy_preset_index() == Some(0) => "128",
+            Some(1) if self.infer_opus_lossy_preset_index() == Some(1) => "96",
+            Some(2) if self.infer_opus_lossy_preset_index() == Some(2) => "64",
+            _ => "custom",
+        }
+    }
+
+    pub fn infer_mp3_lossy_preset_index(&self) -> Option<usize> {
+        use tonepoet_pipeline::enums::Mp3Mode;
+        if self.mp3_mode == Mp3Mode::Vbr
+            && self.mp3_vbr_quality == 0
+            && self.mp3_bitrate_kbps == 245
+        {
+            Some(0)
+        } else if self.mp3_mode == Mp3Mode::Vbr
+            && self.mp3_vbr_quality == 2
+            && self.mp3_bitrate_kbps == 190
+        {
+            Some(1)
+        } else if self.mp3_mode == Mp3Mode::Cbr && self.mp3_bitrate_kbps == 320 {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    pub fn infer_aac_lossy_preset_index(&self) -> Option<usize> {
+        use tonepoet_pipeline::enums::AacProfile;
+        match (self.aac_profile, self.aac_bitrate_kbps) {
+            (AacProfile::LcAac, 256) => Some(0),
+            (AacProfile::LcAac, 192) => Some(1),
+            (AacProfile::LcAac, 128) => Some(2),
+            _ => None,
+        }
+    }
+
+    pub fn infer_opus_lossy_preset_index(&self) -> Option<usize> {
+        match self.opus_bitrate_kbps {
+            128 => Some(0),
+            96 => Some(1),
+            64 => Some(2),
+            _ => None,
+        }
+    }
+
+    pub fn set_mp3_lossy_preset_from_key(&mut self, key: Option<&str>) {
+        self.mp3_lossy_preset = match key {
+            Some("v0") => Some(0),
+            Some("v2") => Some(1),
+            Some("320-cbr") | Some("320") => Some(2),
+            Some("custom") => None,
+            None => self.infer_mp3_lossy_preset_index(),
+            Some(_) => None,
+        };
+    }
+
+    pub fn set_aac_lossy_preset_from_key(&mut self, key: Option<&str>) {
+        self.aac_lossy_preset = match key {
+            Some("256-vbr") | Some("256") => Some(0),
+            Some("192-vbr") | Some("192") => Some(1),
+            Some("128-vbr") | Some("128") => Some(2),
+            Some("custom") => None,
+            None => self.infer_aac_lossy_preset_index(),
+            Some(_) => None,
+        };
+    }
+
+    pub fn set_opus_lossy_preset_from_key(&mut self, key: Option<&str>) {
+        self.opus_lossy_preset = match key {
+            Some("128") => Some(0),
+            Some("96") => Some(1),
+            Some("64") => Some(2),
+            Some("custom") => None,
+            None => self.infer_opus_lossy_preset_index(),
+            Some(_) => None,
+        };
+    }
+
+    pub fn select_lossy_preset_index(&mut self, index: usize) -> bool {
+        use tonepoet_pipeline::enums::{AacProfile, Mp3Mode};
+        match *self.format.selected_value() {
+            AudioFormat::Mp3 => match index.min(3) {
+                0 => {
+                    self.mp3_mode = Mp3Mode::Vbr;
+                    self.mp3_vbr_quality = 0;
+                    self.mp3_bitrate_kbps = 245;
+                    self.mp3_quality_preset = None;
+                    self.mp3_lossy_preset = Some(0);
+                    true
+                }
+                1 => {
+                    self.mp3_mode = Mp3Mode::Vbr;
+                    self.mp3_vbr_quality = 2;
+                    self.mp3_bitrate_kbps = 190;
+                    self.mp3_quality_preset = None;
+                    self.mp3_lossy_preset = Some(1);
+                    true
+                }
+                2 => {
+                    self.mp3_mode = Mp3Mode::Cbr;
+                    self.mp3_bitrate_kbps = 320;
+                    self.mp3_quality_preset = Some(0);
+                    self.mp3_lossy_preset = Some(2);
+                    true
+                }
+                _ => {
+                    self.mp3_lossy_preset = None;
+                    true
+                }
+            },
+            AudioFormat::Aac => match index.min(3) {
+                0 => {
+                    self.aac_profile = AacProfile::LcAac;
+                    self.aac_bitrate_kbps = 256;
+                    self.aac_quality_preset = Some(1);
+                    self.aac_lossy_preset = Some(0);
+                    true
+                }
+                1 => {
+                    self.aac_profile = AacProfile::LcAac;
+                    self.aac_bitrate_kbps = 192;
+                    self.aac_quality_preset = Some(2);
+                    self.aac_lossy_preset = Some(1);
+                    true
+                }
+                2 => {
+                    self.aac_profile = AacProfile::LcAac;
+                    self.aac_bitrate_kbps = 128;
+                    self.aac_quality_preset = Some(3);
+                    self.aac_lossy_preset = Some(2);
+                    true
+                }
+                _ => {
+                    self.aac_lossy_preset = None;
+                    true
+                }
+            },
+            AudioFormat::Opus => match index.min(3) {
+                0 => {
+                    self.opus_bitrate_kbps = 128;
+                    self.opus_quality_preset = Some(2);
+                    self.opus_lossy_preset = Some(0);
+                    true
+                }
+                1 => {
+                    self.opus_bitrate_kbps = 96;
+                    self.opus_quality_preset = Some(3);
+                    self.opus_lossy_preset = Some(1);
+                    true
+                }
+                2 => {
+                    self.opus_bitrate_kbps = 64;
+                    self.opus_quality_preset = Some(4);
+                    self.opus_lossy_preset = Some(2);
+                    true
+                }
+                _ => {
+                    self.opus_lossy_preset = None;
+                    true
+                }
+            },
+            _ => false,
+        }
+    }
+
+    pub fn select_lossy_preset_next(&mut self) -> bool {
+        let Some(labels) = self.lossy_preset_labels() else {
+            return false;
+        };
+        let current = self.lossy_preset_index().unwrap_or(labels.len() - 1);
+        self.select_lossy_preset_index((current + 1) % labels.len())
+    }
+
+    pub fn select_lossy_preset_prev(&mut self) -> bool {
+        let Some(labels) = self.lossy_preset_labels() else {
+            return false;
+        };
+        let current = self.lossy_preset_index().unwrap_or(labels.len() - 1);
+        self.select_lossy_preset_index((current + labels.len() - 1) % labels.len())
+    }
+
     /// Select the next enabled pill in the focused row and run row-specific side effects.
     /// Key and mouse handlers should use this instead of calling `focused_pill_mut()` directly.
     pub fn select_focused_next(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
+        if self.field_focus == FormatField::BitDepth && self.is_lossy_codec_selected() {
+            self.select_lossy_preset_next();
+            self.apply_format_constraints();
+            return;
+        }
         let before_depth = *self.bit_depth.selected_value();
         let before_format = *self.format.selected_value();
         let focused = self.field_focus;
@@ -2868,6 +3168,11 @@ impl FormatState {
 
     /// Select the previous enabled pill in the focused row and run row-specific side effects.
     pub fn select_focused_prev(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
+        if self.field_focus == FormatField::BitDepth && self.is_lossy_codec_selected() {
+            self.select_lossy_preset_prev();
+            self.apply_format_constraints();
+            return;
+        }
         let before_depth = *self.bit_depth.selected_value();
         let before_format = *self.format.selected_value();
         let focused = self.field_focus;
@@ -2883,6 +3188,9 @@ impl FormatState {
         match row {
             FormatField::Format => select_enabled_index(&mut self.format, index),
             FormatField::SampleRate | FormatField::DsdRate => select_enabled_index(&mut self.sample_rate, index),
+            FormatField::BitDepth if self.is_lossy_codec_selected() => {
+                self.select_lossy_preset_index(index);
+            }
             FormatField::BitDepth => select_enabled_index(&mut self.bit_depth, index),
             FormatField::Resampler => select_enabled_index(&mut self.resampler, index),
             FormatField::Dither => select_enabled_index(&mut self.dither, index),
@@ -3453,6 +3761,8 @@ pub struct OutputOptionsState {
     pub merge: PillState<MergeMode>,
     pub companion_extensions: String,
     pub companion_folders: String,
+    pub force_encode: PillState<bool>,
+    pub disc_subfolders: PillState<bool>,
     pub write_log: PillState<bool>,
     pub field_focus: OutputOptionsField,
     pub editing: Option<OutputOptionsField>,
@@ -3466,6 +3776,10 @@ impl OutputOptionsState {
             (MergeMode::MultiFile, "multi-file"),
             (MergeMode::SingleImage, "single image"),
         ]);
+        let mut force_encode = PillState::new(vec![(false, "off"), (true, "on")]);
+        force_encode.select_value(&false);
+        let mut disc_subfolders = PillState::new(vec![(false, "off"), (true, "on")]);
+        disc_subfolders.select_value(&false);
         let mut write_log = PillState::new(vec![(true, "yes"), (false, "no")]);
         write_log.select_value(&false);
 
@@ -3476,6 +3790,8 @@ impl OutputOptionsState {
             merge,
             companion_extensions: String::new(),
             companion_folders: String::new(),
+            force_encode,
+            disc_subfolders,
             write_log,
             field_focus: OutputOptionsField::DestPath,
             editing: None,
@@ -3520,6 +3836,20 @@ impl OutputOptionsState {
         options.copy_subdirectories = !folders.is_empty();
         options.companion_extensions = extensions;
         options.companion_folders = folders;
+        options.force_encode = *self.force_encode.selected_value();
+        options.create_disc_subfolders = *self.disc_subfolders.selected_value();
+        if *self.disc_subfolders.selected_value() {
+            let current = options
+                .naming_template
+                .clone()
+                .unwrap_or_else(|| self.filename_template.clone());
+            if !current.contains("%DISC_FOLDER%") {
+                options.naming_template = Some(format!("{{%DISC_FOLDER%/}}{current}"));
+            }
+        }
+        if let Some(settings) = options.pipeline_settings.as_mut() {
+            settings.force_encode = *self.force_encode.selected_value();
+        }
         options.write_log_file = *self.write_log.selected_value();
     }
 }
@@ -3541,6 +3871,7 @@ mod output_options_companion_projection_tests {
         assert!(options.copy_subdirectories);
         assert_eq!(options.companion_extensions, vec![".jpg", ".pdf"]);
         assert_eq!(options.companion_folders, vec!["Scans", "Artwork"]);
+        assert!(!options.force_encode);
         assert_eq!(options.effective_companion_extensions(), vec![".jpg", ".pdf"]);
         assert_eq!(options.effective_companion_folders(), vec!["Scans", "Artwork"]);
         assert!(!options.write_log_file);
@@ -3584,10 +3915,12 @@ mod output_options_companion_projection_tests {
 
         assert_eq!(MergeMode.next_for(true), CompanionExtensions);
         assert_eq!(CompanionExtensions.next_for(true), CompanionFolders);
-        assert_eq!(CompanionFolders.next_for(true), WriteLog);
+        assert_eq!(CompanionFolders.next_for(true), ForceEncode);
+        assert_eq!(ForceEncode.next_for(true), DiscSubfolders);
+        assert_eq!(DiscSubfolders.next_for(true), WriteLog);
         assert_eq!(WriteLog.next_for(true), DestPath);
         assert_eq!(DestPath.prev_for(true), WriteLog);
-        assert_eq!(WriteLog.prev_for(true), CompanionFolders);
+        assert_eq!(WriteLog.prev_for(true), DiscSubfolders);
         assert_eq!(CompanionExtensions.clamp_for(true), CompanionExtensions);
     }
 }
@@ -5757,6 +6090,11 @@ pub struct MetadataEditorState {
     /// staged edits.
     pub archive_staging_dirty: bool,
 
+    /// True when a successful explicit save should close the overlay. The
+    /// Apply command deliberately sets this false so users can save from any
+    /// tab without losing editor context.
+    pub close_after_successful_save: bool,
+
     /// Authoritative metadata editor model.
     ///
     /// All active editable rows, selected presentation state, source facts,
@@ -5780,6 +6118,7 @@ impl MetadataEditorState {
         Self {
             archive_edit_context: None,
             archive_staging_dirty: false,
+            close_after_successful_save: true,
             model,
         }
     }
@@ -7290,6 +7629,31 @@ pub enum TextEditTarget {
     /// The TextEdit input is the password. On commit, it's stored as a
     /// session override and added to the keychain.
     ArchivePassword(std::path::PathBuf),
+    /// Retry browse archive metadata extraction after collecting a password.
+    ArchivePasswordForMetadataEdit {
+        archive_path: std::path::PathBuf,
+        target_inner_paths: Option<Vec<String>>,
+    },
+    /// Retry convert-preview probing after collecting a password.
+    ArchivePasswordForConvertPreview(std::path::PathBuf),
+}
+
+/// Return true when an archive tool error is likely asking for a password.
+/// The exact wording differs between archive backends, so keep this intentionally
+/// conservative but broader than the listing path's old `password`-only check.
+pub(crate) fn looks_like_archive_password_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "password",
+        "passphrase",
+        "encrypted",
+        "encryption",
+        "wrong password",
+        "requires password",
+        "unsupported encryption",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 
@@ -9639,9 +10003,13 @@ pub fn apply_format_settings_kind(
             quality_preset,
             bitrate_input,
         } => {
+            let before = (format.aac_profile, format.aac_quality_preset, format.aac_bitrate_kbps);
             format.aac_profile = profile;
             format.aac_quality_preset = quality_preset;
             format.aac_bitrate_kbps = parse_required_u32("AAC bitrate", &bitrate_input.text, 8, 1024)?;
+            if before != (format.aac_profile, format.aac_quality_preset, format.aac_bitrate_kbps) {
+                format.aac_lossy_preset = None;
+            }
         }
         FormatSettingsKind::Opus {
             content_type,
@@ -9649,10 +10017,24 @@ pub fn apply_format_settings_kind(
             bitrate_input,
             complexity_input,
         } => {
+            let before = (
+                format.opus_content_type,
+                format.opus_quality_preset,
+                format.opus_bitrate_kbps,
+                format.opus_complexity,
+            );
             format.opus_content_type = content_type;
             format.opus_quality_preset = quality_preset;
             format.opus_bitrate_kbps = parse_required_u32("Opus bitrate", &bitrate_input.text, 6, 510)?;
             format.opus_complexity = parse_required_u8("Opus complexity", &complexity_input.text, 0, 10)?;
+            if before != (
+                format.opus_content_type,
+                format.opus_quality_preset,
+                format.opus_bitrate_kbps,
+                format.opus_complexity,
+            ) {
+                format.opus_lossy_preset = None;
+            }
         }
         FormatSettingsKind::Mp3 {
             mode,
@@ -9660,10 +10042,24 @@ pub fn apply_format_settings_kind(
             quality_preset,
             bitrate_input,
         } => {
+            let before = (
+                format.mp3_mode,
+                format.mp3_quality_preset,
+                format.mp3_vbr_quality,
+                format.mp3_bitrate_kbps,
+            );
             format.mp3_mode = mode;
             format.mp3_quality_preset = quality_preset;
             format.mp3_vbr_quality = parse_required_u8("MP3 VBR quality", &vbr_quality_input.text, 0, 9)?;
             format.mp3_bitrate_kbps = parse_required_u32("MP3 bitrate", &bitrate_input.text, 8, 1000)?;
+            if before != (
+                format.mp3_mode,
+                format.mp3_quality_preset,
+                format.mp3_vbr_quality,
+                format.mp3_bitrate_kbps,
+            ) {
+                format.mp3_lossy_preset = None;
+            }
         }
         FormatSettingsKind::WavPack {
             mode,
@@ -12498,6 +12894,120 @@ mod metadata_presentation_tab_tests {
         assert!(matches!(details.details_probe_state, MetadataDetailsProbeState::Unloaded));
     }
 
+}
+
+#[cfg(test)]
+mod lossy_custom_preset_state_tests {
+    use super::*;
+    use tonepoet_pipeline::enums::{AacProfile, Mp3Mode, OpusContentType};
+
+    #[test]
+    fn selecting_named_lossy_presets_applies_expected_codec_settings() {
+        let mut format = FormatState::new();
+
+        format.format.select_value(&AudioFormat::Mp3);
+        assert!(format.select_lossy_preset_index(1));
+        assert_eq!(format.lossy_preset_index(), Some(1));
+        assert_eq!(format.mp3_mode, Mp3Mode::Vbr);
+        assert_eq!(format.mp3_vbr_quality, 2);
+        assert_eq!(format.mp3_bitrate_kbps, 190);
+
+        format.format.select_value(&AudioFormat::Aac);
+        assert!(format.select_lossy_preset_index(2));
+        assert_eq!(format.lossy_preset_index(), Some(2));
+        assert_eq!(format.aac_profile, AacProfile::LcAac);
+        assert_eq!(format.aac_bitrate_kbps, 128);
+
+        format.format.select_value(&AudioFormat::Opus);
+        assert!(format.select_lossy_preset_index(0));
+        assert_eq!(format.lossy_preset_index(), Some(0));
+        assert_eq!(format.opus_bitrate_kbps, 128);
+    }
+
+    #[test]
+    fn custom_lossy_preset_is_selectable_and_preserves_current_settings() {
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Mp3);
+        assert!(format.select_lossy_preset_index(0));
+        let before = (format.mp3_mode, format.mp3_vbr_quality, format.mp3_bitrate_kbps);
+
+        assert!(format.select_lossy_preset_index(3));
+
+        assert_eq!(format.lossy_preset_index(), Some(3));
+        assert_eq!((format.mp3_mode, format.mp3_vbr_quality, format.mp3_bitrate_kbps), before);
+    }
+
+    #[test]
+    fn explicit_custom_display_is_preserved_even_when_settings_match_named_preset() {
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Aac);
+        assert!(format.select_lossy_preset_index(0));
+        assert_eq!(format.lossy_preset_index(), Some(0));
+
+        assert!(format.select_lossy_preset_index(3));
+
+        assert_eq!(format.aac_bitrate_kbps, 256);
+        assert_eq!(format.infer_aac_lossy_preset_index(), Some(0));
+        assert_eq!(format.lossy_preset_index(), Some(3));
+    }
+
+    #[test]
+    fn stale_named_lossy_preset_state_displays_custom_when_values_no_longer_match() {
+        let mut format = FormatState::new();
+
+        format.format.select_value(&AudioFormat::Mp3);
+        assert!(format.select_lossy_preset_index(0));
+        format.mp3_bitrate_kbps = 320;
+        assert_eq!(format.lossy_preset_index(), Some(3));
+
+        format.format.select_value(&AudioFormat::Opus);
+        assert!(format.select_lossy_preset_index(0));
+        format.opus_bitrate_kbps = 192;
+
+        assert_eq!(format.lossy_preset_index(), Some(3));
+    }
+
+    #[test]
+    fn manual_codec_settings_edit_switches_named_lossy_preset_to_custom() {
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Opus);
+        assert!(format.select_lossy_preset_index(0));
+        assert_eq!(format.lossy_preset_index(), Some(0));
+
+        apply_format_settings_kind(&mut format, FormatSettingsKind::Opus {
+            content_type: OpusContentType::Speech,
+            quality_preset: Some(2),
+            bitrate_input: crate::tui::text_input::TextInputState::new("128".to_string()),
+            complexity_input: crate::tui::text_input::TextInputState::new("10".to_string()),
+        }).expect("valid opus settings");
+
+        assert_eq!(format.lossy_preset_index(), Some(3));
+        assert_eq!(format.opus_bitrate_kbps, 128);
+    }
+
+    #[test]
+    fn lossy_preset_state_is_kept_per_codec_without_cross_codec_leakage() {
+        let mut format = FormatState::new();
+
+        format.format.select_value(&AudioFormat::Mp3);
+        assert!(format.select_lossy_preset_index(3));
+        assert_eq!(format.lossy_preset_index(), Some(3));
+
+        format.format.select_value(&AudioFormat::Aac);
+        assert!(format.select_lossy_preset_index(1));
+        assert_eq!(format.lossy_preset_index(), Some(1));
+
+        format.format.select_value(&AudioFormat::Opus);
+        assert!(format.select_lossy_preset_index(2));
+        assert_eq!(format.lossy_preset_index(), Some(2));
+
+        format.format.select_value(&AudioFormat::Mp3);
+        assert_eq!(format.lossy_preset_index(), Some(3));
+        format.format.select_value(&AudioFormat::Aac);
+        assert_eq!(format.lossy_preset_index(), Some(1));
+        format.format.select_value(&AudioFormat::Opus);
+        assert_eq!(format.lossy_preset_index(), Some(2));
+    }
 }
 
 #[cfg(test)]

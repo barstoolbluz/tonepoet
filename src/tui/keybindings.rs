@@ -775,6 +775,41 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             app.convert.output_options.merge.select_next();
             app.preset.mark_modified();
         }
+
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::ForceEncode =>
+        {
+            app.convert.output_options.force_encode.select_prev();
+            app.preset.mark_modified();
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::ForceEncode =>
+        {
+            app.convert.output_options.force_encode.select_next();
+            app.preset.mark_modified();
+        }
+
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::DiscSubfolders =>
+        {
+            app.convert.output_options.disc_subfolders.select_prev();
+            app.preset.mark_modified();
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::DiscSubfolders =>
+        {
+            app.convert.output_options.disc_subfolders.select_next();
+            app.preset.mark_modified();
+        }
+
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
                 && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
@@ -1513,6 +1548,14 @@ fn open_output_options_text_edit(app: &mut AppState) {
             app.convert.output_options.merge.select_next();
             app.preset.mark_modified();
         }
+        OutputOptionsField::ForceEncode => {
+            app.convert.output_options.force_encode.select_next();
+            app.preset.mark_modified();
+        }
+        OutputOptionsField::DiscSubfolders => {
+            app.convert.output_options.disc_subfolders.select_next();
+            app.preset.mark_modified();
+        }
         OutputOptionsField::WriteLog => {
             app.convert.output_options.write_log.select_next();
             app.preset.mark_modified();
@@ -1535,7 +1578,10 @@ fn output_options_field_value(app: &AppState, field: OutputOptionsField) -> Stri
         OutputOptionsField::FilenameTemplate => app.convert.output_options.filename_template.clone(),
         OutputOptionsField::CompanionExtensions => app.convert.output_options.companion_extensions.clone(),
         OutputOptionsField::CompanionFolders => app.convert.output_options.companion_folders.clone(),
-        OutputOptionsField::MergeMode | OutputOptionsField::WriteLog => String::new(),
+        OutputOptionsField::MergeMode
+        | OutputOptionsField::ForceEncode
+        | OutputOptionsField::DiscSubfolders
+        | OutputOptionsField::WriteLog => String::new(),
     }
 }
 
@@ -1593,7 +1639,10 @@ fn commit_output_options_inline_edit(app: &mut AppState) {
             app.convert.output_options.companion_folders = trimmed.to_string();
             app.preset.mark_modified();
         }
-        OutputOptionsField::MergeMode | OutputOptionsField::WriteLog => {}
+        OutputOptionsField::MergeMode
+        | OutputOptionsField::ForceEncode
+        | OutputOptionsField::DiscSubfolders
+        | OutputOptionsField::WriteLog => {}
     }
 }
 
@@ -2676,6 +2725,7 @@ mod inline_edit_behavior_tests {
             0,
             0,
             0,
+            Some(vec!["other.flac".to_string()]),
         ));
 
         browse_inline_tab_advance(&mut app, true, &tx);
@@ -5836,6 +5886,99 @@ pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
     }
 }
 
+fn metadata_editor_apply(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    state.close_after_successful_save = false;
+    metadata_editor_save(app, state, tx);
+    if state.phase != super::app::MetadataEditorPhase::Saving {
+        state.close_after_successful_save = true;
+    }
+}
+
+fn metadata_editor_ok(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    state.close_after_successful_save = true;
+    if state.any_presentation_dirty() {
+        metadata_editor_save(app, state, tx);
+        if state.phase != super::app::MetadataEditorPhase::Saving && !state.any_presentation_dirty() {
+            request_metadata_editor_close(app, state, tx);
+        }
+    } else {
+        request_metadata_editor_close(app, state, tx);
+    }
+}
+
+fn metadata_editor_switch_content_tab(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    forward: bool,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let was_details = state.content_tab == crate::tui::app::ContentTab::Details;
+    let changed = if forward {
+        state.next_content_tab()
+    } else {
+        state.previous_content_tab()
+    };
+    if changed {
+        if state.content_tab == crate::tui::app::ContentTab::Details {
+            ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+        } else if was_details {
+            metadata_editor_cancel_details_probe(state);
+        }
+        if state.content_tab == crate::tui::app::ContentTab::Metadata {
+            ensure_cursor_visible(state);
+        }
+        if let Some(status) = metadata_editor_apply_content_tab_progress(state) {
+            app.set_status(status);
+        } else {
+            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            app.set_status(metadata_editor_status_for_content_tab(&**state));
+        }
+    }
+}
+
+fn metadata_editor_cycle_field_in_current_tab(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    total_rows: usize,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match state.content_tab {
+        crate::tui::app::ContentTab::Metadata => {
+            if total_rows > 0 {
+                state.cursor = (state.cursor + 1) % total_rows;
+                ensure_cursor_visible(state);
+            }
+        }
+        crate::tui::app::ContentTab::ReplayGain => {
+            handle_metadata_replaygain_key(
+                app,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                state,
+                tx,
+            );
+        }
+        crate::tui::app::ContentTab::Artwork => {
+            handle_metadata_artwork_key(
+                app,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                state,
+                tx,
+            );
+        }
+        crate::tui::app::ContentTab::Details => {
+            scroll_metadata_read_only_tab(state, 1, metadata_editor_read_only_visible_rows());
+        }
+    }
+}
+
 fn request_metadata_editor_close(
     app: &mut AppState,
     state: &mut Box<super::app::MetadataEditorState>,
@@ -6997,6 +7140,86 @@ fn handle_file_task_user_action(
     }
 }
 
+
+/// Paste terminal-provided text into the currently active metadata-editor text target.
+///
+/// This intentionally routes active inline metadata fields through the same
+/// `TextInputState` used by keyboard editing so selections are replaced exactly
+/// once, UTF-8 cursor offsets remain valid, and AddingKey/DetailEdit do not
+/// diverge from normal field editing. When the per-file detail grid is focused
+/// but no individual value is being edited, preserve the historical bulk-paste
+/// behavior that maps pasted lines onto per-file values.
+pub(super) fn metadata_editor_paste_text(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+    text: &str,
+) -> bool {
+    use super::app::MetadataEditorPhase;
+
+    match state.phase {
+        MetadataEditorPhase::InlineEdit => {
+            if let Some(input) = state.edit_input.as_mut() {
+                input.insert_paste_text(text, super::text_input::PastePolicy::SingleLine);
+                return true;
+            }
+        }
+        MetadataEditorPhase::AddingKey => {
+            if let Some(input) = state.add_key_input.as_mut() {
+                input.insert_paste_text(text, super::text_input::PastePolicy::SingleLine);
+                return true;
+            }
+        }
+        MetadataEditorPhase::DetailEdit => {
+            if let Some(input) = state.detail_edit.as_mut() {
+                input.insert_paste_text(text, super::text_input::PastePolicy::SingleLine);
+                return true;
+            }
+
+            let field_idx = state.detail_field_idx;
+            let Some(entry_len) = state
+                .active_surface()
+                .entries
+                .get(field_idx)
+                .map(|entry| entry.per_file_values.len())
+            else {
+                return false;
+            };
+
+            let sanitized = text.replace("\r\n", "\n").replace('\r', "\n");
+            let lines: Vec<&str> = sanitized.split('\n').collect();
+            let entry = &mut state.active_surface_mut().entries[field_idx];
+            let is_album = entry.display_key.eq_ignore_ascii_case("ALBUM");
+
+            if is_album {
+                let val = lines
+                    .first()
+                    .map(|line| line.trim().to_string())
+                    .unwrap_or_default();
+                for slot in &mut entry.per_file_values {
+                    *slot = val.clone();
+                }
+            } else {
+                for (slot, line) in entry.per_file_values.iter_mut().zip(lines.iter()) {
+                    *slot = line.trim().to_string();
+                }
+            }
+
+            metadata_editor_recompute_entry_display(entry);
+            state.active_surface_mut().dirty = true;
+            let applied = lines.len().min(entry_len);
+            app.set_status(format!(
+                "Pasted {} value{}",
+                applied,
+                if applied == 1 { "" } else { "s" },
+            ));
+            return true;
+        }
+        MetadataEditorPhase::Editing | MetadataEditorPhase::Saving => {}
+    }
+
+    false
+}
+
 fn handle_metadata_editor_key(
     app: &mut AppState,
     key: KeyEvent,
@@ -7052,7 +7275,11 @@ fn handle_metadata_editor_key(
                         let changed = state.select_presentation_selector_cursor();
                         if changed {
                             if state.content_tab == crate::tui::app::ContentTab::Details {
-                                ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+                                ensure_metadata_content_tab_loaded(
+                                    state,
+                                    crate::tui::app::ContentTab::Details,
+                                    tx,
+                                );
                             }
                             if let Some(label) = state.active_presentation_label() {
                                 app.set_status(format!("metadata editor: {}", label));
@@ -7066,7 +7293,11 @@ fn handle_metadata_editor_key(
                             let changed = state.select_presentation_selector_cursor();
                             if changed {
                                 if state.content_tab == crate::tui::app::ContentTab::Details {
-                                    ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+                                    ensure_metadata_content_tab_loaded(
+                                        state,
+                                        crate::tui::app::ContentTab::Details,
+                                        tx,
+                                    );
                                 }
                                 if let Some(label) = state.active_presentation_label() {
                                     app.set_status(format!("metadata editor: {}", label));
@@ -7079,8 +7310,21 @@ fn handle_metadata_editor_key(
                 return;
             }
 
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                match key.code {
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        metadata_editor_apply(app, state, tx);
+                        return;
+                    }
+                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                        metadata_editor_ok(app, state, tx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
             match key.code {
-                // Command mode: park editor state, open command input.
                 KeyCode::Char(':') => {
                     let parked = state.clone();
                     app.pending_metadata_editor = Some(parked);
@@ -7093,48 +7337,23 @@ fn handle_metadata_editor_key(
                 KeyCode::Esc => {
                     request_metadata_editor_close(app, state, tx);
                 }
-                KeyCode::Tab => {
-                    let was_details = state.content_tab == crate::tui::app::ContentTab::Details;
-                    let changed = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        state.previous_content_tab()
-                    } else {
-                        state.next_content_tab()
-                    };
-                    if changed {
-                        if state.content_tab == crate::tui::app::ContentTab::Details {
-                            ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
-                        } else if was_details {
-                            metadata_editor_cancel_details_probe(state);
-                        }
-                        if state.content_tab == crate::tui::app::ContentTab::Metadata {
-                            ensure_cursor_visible(state);
-                        }
-                        if let Some(status) = metadata_editor_apply_content_tab_progress(state) {
-                            app.set_status(status);
-                        } else {
-                            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
-                            app.set_status(metadata_editor_status_for_content_tab(&**state));
-                        }
-                    }
+                KeyCode::Tab
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    metadata_editor_switch_content_tab(app, state, false, tx);
+                }
+                KeyCode::BackTab if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    metadata_editor_switch_content_tab(app, state, false, tx);
+                }
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    metadata_editor_switch_content_tab(app, state, true, tx);
                 }
                 KeyCode::BackTab => {
-                    let was_details = state.content_tab == crate::tui::app::ContentTab::Details;
-                    if state.previous_content_tab() {
-                        if state.content_tab == crate::tui::app::ContentTab::Details {
-                            ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
-                        } else if was_details {
-                            metadata_editor_cancel_details_probe(state);
-                        }
-                        if state.content_tab == crate::tui::app::ContentTab::Metadata {
-                            ensure_cursor_visible(state);
-                        }
-                        if let Some(status) = metadata_editor_apply_content_tab_progress(state) {
-                            app.set_status(status);
-                        } else {
-                            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
-                            app.set_status(metadata_editor_status_for_content_tab(&**state));
-                        }
-                    }
+                    metadata_editor_switch_content_tab(app, state, true, tx);
+                }
+                KeyCode::Tab => {
+                    metadata_editor_cycle_field_in_current_tab(app, state, total_rows, tx);
                 }
                 KeyCode::Char(' ') if key.modifiers.is_empty() && state.shows_presentation_control() => {
                     state.open_presentation_selector();
@@ -7143,7 +7362,11 @@ fn handle_metadata_editor_key(
                     let idx = (c as u8 - b'1') as usize;
                     if state.switch_presentation_tab(idx) {
                         if state.content_tab == crate::tui::app::ContentTab::Details {
-                            ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+                            ensure_metadata_content_tab_loaded(
+                                state,
+                                crate::tui::app::ContentTab::Details,
+                                tx,
+                            );
                         }
                         if let Some(label) = state.active_presentation_label() {
                             app.set_status(format!("metadata editor: {}", label));
@@ -7158,33 +7381,46 @@ fn handle_metadata_editor_key(
                         crate::tui::app::ContentTab::Artwork => {
                             handle_metadata_artwork_key(app, key, state, tx);
                         }
-                        crate::tui::app::ContentTab::Details => match key.code {
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                scroll_metadata_read_only_tab(state, -1, metadata_editor_read_only_visible_rows());
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                scroll_metadata_read_only_tab(state, 1, metadata_editor_read_only_visible_rows());
-                            }
-                            KeyCode::PageUp => {
-                                scroll_metadata_read_only_tab(state, -5, metadata_editor_read_only_visible_rows());
-                            }
-                            KeyCode::PageDown => {
-                                scroll_metadata_read_only_tab(state, 5, metadata_editor_read_only_visible_rows());
-                            }
-                            KeyCode::Home => {
-                                set_metadata_read_only_scroll(state, 0, metadata_editor_read_only_visible_rows());
-                            }
+                        crate::tui::app::ContentTab::Details => { match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => scroll_metadata_read_only_tab(
+                                state,
+                                -1,
+                                metadata_editor_read_only_visible_rows(),
+                            ),
+                            KeyCode::Down | KeyCode::Char('j') => scroll_metadata_read_only_tab(
+                                state,
+                                1,
+                                metadata_editor_read_only_visible_rows(),
+                            ),
+                            KeyCode::PageUp => scroll_metadata_read_only_tab(
+                                state,
+                                -5,
+                                metadata_editor_read_only_visible_rows(),
+                            ),
+                            KeyCode::PageDown => scroll_metadata_read_only_tab(
+                                state,
+                                5,
+                                metadata_editor_read_only_visible_rows(),
+                            ),
+                            KeyCode::Home => set_metadata_read_only_scroll(
+                                state,
+                                0,
+                                metadata_editor_read_only_visible_rows(),
+                            ),
                             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 let status = metadata_editor_retry_details_probe(state, tx);
                                 app.set_status(status);
+                                false
                             }
                             KeyCode::Char('a') | KeyCode::Char('A') if key.modifiers.is_empty() => {
                                 metadata_editor_start_details_analysis(app, state, tx);
+                                false
                             }
-                            _ => {
-                                clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
-                            }
-                        },
+                            _ => clamp_metadata_read_only_scroll(
+                                state,
+                                metadata_editor_read_only_visible_rows(),
+                            ),
+                        }; },
                         crate::tui::app::ContentTab::Metadata => {}
                     }
                 }
@@ -7198,17 +7434,27 @@ fn handle_metadata_editor_key(
                     }
                     ensure_cursor_visible(state);
                 }
+                KeyCode::PageUp => {
+                    state.cursor = state.cursor.saturating_sub(10);
+                    ensure_cursor_visible(state);
+                }
+                KeyCode::PageDown => {
+                    state.cursor = (state.cursor + 10).min(total_rows.saturating_sub(1));
+                    ensure_cursor_visible(state);
+                }
+                KeyCode::Home => {
+                    state.cursor = 0;
+                    ensure_cursor_visible(state);
+                }
+                KeyCode::End => {
+                    state.cursor = total_rows.saturating_sub(1);
+                    ensure_cursor_visible(state);
+                }
                 KeyCode::Enter => {
                     if state.cursor < state.active_surface().entries.len() {
                         let entry = &state.active_surface().entries[state.cursor];
                         if !entry.is_binary && !state.active_surface().deleted.contains(&state.cursor) {
-                            // Use the entry's own dimension: per-track entries
-                            // (e.g. TITLE on a single-image rip with embedded
-                            // CUESHEET) have per_file_values.len() != paths.len().
                             if entry.is_mixed && entry.per_file_values.len() > 1 {
-                                // Per-track detail view is allowed even in
-                                // read-only mode (the per-track editing inside
-                                // is gated separately in handle_detail_edit).
                                 metadata_editor_begin_detail_edit_for_entry(state, state.cursor, false);
                             } else if state.read_only {
                                 app.set_status("read-only editor (SACD ISO)");
@@ -7217,7 +7463,10 @@ fn handle_metadata_editor_key(
                                 if writable == 0 && blocked > 0 {
                                     let reason = metadata_editor_entry_edit_block_reason(state, state.cursor)
                                         .unwrap_or_else(|| "no writable file slots".to_string());
-                                    app.set_status(format!("metadata editor: cannot edit blocked field — {}", reason));
+                                    app.set_status(format!(
+                                        "metadata editor: cannot edit blocked field — {}",
+                                        reason
+                                    ));
                                 } else if blocked > 0 {
                                     app.set_status(format!(
                                         "metadata editor: editing per-file values; {} writable file{} can change, {} blocked slot{} remain visible and locked",
@@ -7228,7 +7477,7 @@ fn handle_metadata_editor_key(
                                     ));
                                     metadata_editor_begin_detail_edit_for_entry(state, state.cursor, true);
                                 } else {
-                                    state.edit_input = Some(super::text_input::TextInputState::new(
+                                    state.edit_input = Some(super::text_input::TextInputState::new_selected(
                                         entry.value.clone(),
                                     ));
                                     state.phase = MetadataEditorPhase::InlineEdit;
@@ -7251,16 +7500,11 @@ fn handle_metadata_editor_key(
                                     if blocked == 1 { "" } else { "s" }
                                 ));
                             }
-                            // "Add field" row — start adding a new key.
                             state.add_key_input = Some(super::text_input::TextInputState::empty());
                             state.phase = MetadataEditorPhase::AddingKey;
                         }
                     }
                 }
-                // Delete-key convenience: same action as :d. The
-                // bare-char `a`/`d`/`D`/`u`/`w` bindings have been
-                // removed (no-bare-char-keys rule); user invokes them
-                // via colon commands or footer-pill clicks.
                 KeyCode::Delete => {
                     if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
@@ -7445,6 +7689,7 @@ fn handle_metadata_editor_key(
                         }
 
                         input.cursor = best_byte.min(input.text.len());
+                        input.clear_selection();
                     }
                     // For single-line values, Up/Down are no-ops.
                 }
@@ -7579,7 +7824,7 @@ fn handle_metadata_editor_key(
                     } else if field_idx < state.active_surface().entries.len() && state.detail_cursor < n_files {
                         let val =
                             state.active_surface().entries[field_idx].per_file_values[state.detail_cursor].clone();
-                        state.detail_edit = Some(super::text_input::TextInputState::new(val));
+                        state.detail_edit = Some(super::text_input::TextInputState::new_selected(val));
                     }
                 }
                 _ => {}
@@ -9280,6 +9525,7 @@ pub(super) fn exit_browse_archive(app: &mut AppState, tx: &mpsc::Sender<AppMessa
                 staging.archive_mtime_secs,
                 staging.archive_mtime_nanos,
                 staging.archive_size,
+                None,
             );
             // Keep the archive view's staging session live until the repackage
             // succeeds. Conflict and failure paths need a usable in-app owner
@@ -9338,6 +9584,8 @@ fn open_browse_archive_metadata_editor_for_entries(
         return;
     }
 
+    let target_inner_paths_for_retry = target_inner_paths.clone();
+
     let Some(tx) = app.tui_tx.clone() else {
         app.set_status("metadata: cannot edit archive before TUI message channel is ready");
         return;
@@ -9353,6 +9601,7 @@ fn open_browse_archive_metadata_editor_for_entries(
         let pending = PendingBrowseArchiveMetadataEdit::from_existing(
             archive_path.clone(),
             staging.staging_dir.clone(),
+            target_inner_paths_for_retry.clone(),
         );
         let staging_dir = staging.staging_dir.clone();
         let cancel = pending.cancel.clone();
@@ -9438,6 +9687,7 @@ fn open_browse_archive_metadata_editor_for_entries(
         archive_mtime_secs,
         archive_mtime_nanos,
         archive_size,
+        target_inner_paths_for_retry.clone(),
     );
     let staging_dir = pending.staging_dir.clone();
     if let Err(err) = persist_empty_archive_staging_registration(
@@ -10197,6 +10447,7 @@ pub(super) fn start_browse_archive_entry_delete(
         archive_mtime_secs,
         archive_mtime_nanos,
         archive_size,
+        Some(inner_paths.clone()),
     );
     let staging_dir = pending.staging_dir.clone();
     if let Err(err) = persist_empty_archive_staging_registration(
@@ -10309,6 +10560,7 @@ pub(super) fn install_archive_metadata_editor_payload(
             staging.archive_mtime_secs,
             staging.archive_mtime_nanos,
             staging.archive_size,
+            None,
         ))
         .or_else(|| baseline.map(|(secs, nanos, size)| {
             ArchiveMetadataEditContext::browse_with_fingerprint(
@@ -10317,6 +10569,7 @@ pub(super) fn install_archive_metadata_editor_payload(
                 secs,
                 nanos,
                 size,
+                None,
             )
         }))
         .unwrap_or_else(|| ArchiveMetadataEditContext::browse(archive_path.clone(), staging_dir));
@@ -14922,9 +15175,14 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
         }
         FormatSettingsKind::Aac {
             profile,
+            quality_preset,
             bitrate_input,
-            ..
         } => {
+            let before = (
+                app.convert.format.aac_profile,
+                app.convert.format.aac_quality_preset,
+                app.convert.format.aac_bitrate_kbps,
+            );
             let bitrate: u32 = bitrate_input
                 .text
                 .trim()
@@ -14932,19 +15190,28 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .unwrap_or(256)
                 .clamp(8, 1024);
             app.convert.format.aac_profile = *profile;
+            app.convert.format.aac_quality_preset = *quality_preset;
             app.convert.format.aac_bitrate_kbps = bitrate;
-            // Recompute quality_preset from the committed bitrate.
-            let presets = aac_presets_for_profile(*profile);
-            app.convert.format.aac_quality_preset = presets
-                .iter()
-                .position(|(br, _)| *br == bitrate);
+            if before != (
+                app.convert.format.aac_profile,
+                app.convert.format.aac_quality_preset,
+                app.convert.format.aac_bitrate_kbps,
+            ) {
+                app.convert.format.aac_lossy_preset = None;
+            }
         }
         FormatSettingsKind::Opus {
             content_type,
+            quality_preset,
             bitrate_input,
             complexity_input,
-            ..
         } => {
+            let before = (
+                app.convert.format.opus_content_type,
+                app.convert.format.opus_quality_preset,
+                app.convert.format.opus_bitrate_kbps,
+                app.convert.format.opus_complexity,
+            );
             let bitrate: u32 = bitrate_input
                 .text
                 .trim()
@@ -14958,19 +15225,32 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .unwrap_or(10)
                 .min(10);
             app.convert.format.opus_content_type = *content_type;
+            app.convert.format.opus_quality_preset = *quality_preset;
             app.convert.format.opus_bitrate_kbps = bitrate;
             app.convert.format.opus_complexity = complexity;
-            app.convert.format.opus_quality_preset = OPUS_PRESETS
-                .iter()
-                .position(|(br, _)| *br == bitrate);
+            if before != (
+                app.convert.format.opus_content_type,
+                app.convert.format.opus_quality_preset,
+                app.convert.format.opus_bitrate_kbps,
+                app.convert.format.opus_complexity,
+            ) {
+                app.convert.format.opus_lossy_preset = None;
+            }
         }
         FormatSettingsKind::Mp3 {
             mode,
             vbr_quality_input,
+            quality_preset,
             bitrate_input,
-            ..
         } => {
+            let before = (
+                app.convert.format.mp3_mode,
+                app.convert.format.mp3_quality_preset,
+                app.convert.format.mp3_vbr_quality,
+                app.convert.format.mp3_bitrate_kbps,
+            );
             app.convert.format.mp3_mode = *mode;
+            app.convert.format.mp3_quality_preset = *quality_preset;
             let vbr_q: u8 = vbr_quality_input.text.trim().parse().unwrap_or(0).min(9);
             app.convert.format.mp3_vbr_quality = vbr_q;
             let bitrate: u32 = bitrate_input
@@ -14980,9 +15260,14 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .unwrap_or(320)
                 .clamp(8, 1000);
             app.convert.format.mp3_bitrate_kbps = bitrate;
-            app.convert.format.mp3_quality_preset = MP3_BITRATE_PRESETS
-                .iter()
-                .position(|(br, _)| *br == bitrate);
+            if before != (
+                app.convert.format.mp3_mode,
+                app.convert.format.mp3_quality_preset,
+                app.convert.format.mp3_vbr_quality,
+                app.convert.format.mp3_bitrate_kbps,
+            ) {
+                app.convert.format.mp3_lossy_preset = None;
+            }
         }
         FormatSettingsKind::WavPack {
             mode,
@@ -15373,7 +15658,9 @@ fn handle_format_settings_field_key(
                     }
                 }
                 FormatSettingsFocus::Mp3VbrQuality => {
-                    super::text_input::handle_text_input_key(vbr_quality_input, key);
+                    if super::text_input::handle_text_input_key(vbr_quality_input, key) {
+                        *quality_preset = None;
+                    }
                 }
                 FormatSettingsFocus::Mp3Preset => {
                     if matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
@@ -16715,7 +17002,7 @@ fn handle_metadata_editor_mouse(
                                     let val =
                                         state.active_surface().entries[field_idx].per_file_values[file_idx].clone();
                                     state.detail_edit =
-                                        Some(super::text_input::TextInputState::new(val));
+                                        Some(super::text_input::TextInputState::new_selected(val));
                                     state.detail_cursor = file_idx;
                                     state.last_click = None;
                                 }
@@ -16870,6 +17157,7 @@ fn handle_metadata_editor_mouse(
                                 target_byte = orig_byte;
                             }
                             input.cursor = target_byte.min(input.text.len());
+                            input.clear_selection();
                         }
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         return;
@@ -16935,7 +17223,7 @@ fn handle_metadata_editor_mouse(
                                 metadata_editor_begin_detail_edit_for_entry(&mut state, row, true);
                             } else {
                                 state.edit_input =
-                                    Some(super::text_input::TextInputState::new(entry.value.clone()));
+                                    Some(super::text_input::TextInputState::new_selected(entry.value.clone()));
                                 state.phase = MetadataEditorPhase::InlineEdit;
                             }
                         }
@@ -16994,6 +17282,10 @@ fn handle_metadata_editor_mouse(
                             }
                             crate::tui::app::ContentTab::Metadata => {}
                         }
+                        if state.any_presentation_dirty() {
+                            pills.push(("Alt+A Apply", "apply"));
+                        }
+                        pills.push(("Alt+O OK", "ok"));
                         pills.push(("Esc close", "esc"));
                         if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
                             match action {
@@ -17047,6 +17339,18 @@ fn handle_metadata_editor_mouse(
                                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                     return;
                                 }
+                                "apply" => {
+                                    metadata_editor_apply(app, &mut state, tx);
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                    return;
+                                }
+                                "ok" => {
+                                    metadata_editor_ok(app, &mut state, tx);
+                                    if !matches!(app.active_overlay, ActiveOverlay::None) {
+                                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                    }
+                                    return;
+                                }
                                 "esc" => {
                                     request_metadata_editor_close(app, &mut state, tx);
                                     return;
@@ -17082,9 +17386,12 @@ fn handle_metadata_editor_mouse(
                         (":d delete", ":d"),
                         (":u undo", ":u"),
                         (":a add", ":a"),
-                        (":w save", ":w"),
-                        ("Esc close", "esc"),
                     ]);
+                    if state.any_presentation_dirty() {
+                        pills.push(("Alt+A Apply", "apply"));
+                    }
+                    pills.push(("Alt+O OK", "ok"));
+                    pills.push(("Esc close", "esc"));
                     if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
@@ -17093,6 +17400,18 @@ fn handle_metadata_editor_mouse(
                             return;
                         }
                         match action {
+                            "apply" => {
+                                metadata_editor_apply(app, &mut state, tx);
+                                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                return;
+                            }
+                            "ok" => {
+                                metadata_editor_ok(app, &mut state, tx);
+                                if !matches!(app.active_overlay, ActiveOverlay::None) {
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                }
+                                return;
+                            }
                             "esc" => {
                                 request_metadata_editor_close(app, &mut state, tx);
                                 return;
@@ -18784,6 +19103,13 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
 }
 
 /// Apply a text edit to the target field, setting modified flag as needed
+
+fn store_archive_password_for_path(app: &mut AppState, archive_path: &std::path::Path, password: &str) {
+    app.archive_passwords
+        .insert(archive_path.to_path_buf(), password.to_string());
+    let _ = super::keychain::add_password(password);
+    app.keychain.reload();
+}
 fn apply_text_edit(
     app: &mut AppState,
     target: TextEditTarget,
@@ -18955,18 +19281,30 @@ fn apply_text_edit(
         }
         TextEditTarget::ArchivePassword(archive_path) => {
             if !trimmed.is_empty() {
-                // Store as session override for this archive.
-                app.archive_passwords
-                    .insert(archive_path.clone(), trimmed.to_string());
-                // Also add to keychain for future use.
-                let _ = super::keychain::add_password(trimmed);
-                app.keychain.reload();
+                store_archive_password_for_path(app, &archive_path, trimmed);
                 let name = archive_path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 app.set_status(&format!("Password set for {} (saved to keychain)", name));
                 start_browse_archive_listing(app, archive_path, tx, true);
+            }
+        }
+        TextEditTarget::ArchivePasswordForMetadataEdit {
+            archive_path,
+            target_inner_paths,
+        } => {
+            if !trimmed.is_empty() {
+                store_archive_password_for_path(app, &archive_path, trimmed);
+                app.set_status("Password set; retrying archive metadata editor");
+                open_browse_archive_metadata_editor_for_entries(app, archive_path, target_inner_paths);
+            }
+        }
+        TextEditTarget::ArchivePasswordForConvertPreview(archive_path) => {
+            if !trimmed.is_empty() {
+                store_archive_password_for_path(app, &archive_path, trimmed);
+                app.set_status("Password set; retrying archive preview");
+                super::app::install_archive_preview_convert_source(app, archive_path, tx.clone());
             }
         }
     }
@@ -22387,6 +22725,7 @@ fn start_browse_archive_entry_rename(
         archive_mtime_secs,
         archive_mtime_nanos,
         archive_size,
+        Some(vec![old_inner_path.clone()]),
     );
     let staging_dir = pending.staging_dir.clone();
     if let Err(err) = persist_empty_archive_staging_registration(
@@ -25770,6 +26109,7 @@ mod phase4_tests {
                     0,
                     0,
                     7,
+                    None,
                 ),
                 error: "boom".to_string(),
             },
@@ -25876,8 +26216,178 @@ mod phase4_tests {
         assert!(app.pending_metadata_editor.is_some());
     }
 
+
+    fn metadata_editor_row_left_click(row: usize) -> MouseEvent {
+        let layout = metadata_editor_test_layout();
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: layout.content_area.x.saturating_add(2),
+            row: layout.content_area.y.saturating_add(row as u16),
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     #[test]
-    fn metadata_editor_footer_close_with_dirty_state_prompts_before_closing() {
+    fn metadata_editor_double_click_on_field_focuses_and_selects_all_text() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
+            entry("TITLE", ItemKey::TrackTitle, &["Old Title"], &["Old Title"]),
+        ])));
+        let (tx, _rx) = mpsc::channel(1);
+        let click = metadata_editor_row_left_click(0);
+
+        handle_mouse(&mut app, click, &tx);
+        handle_mouse(&mut app, click, &tx);
+
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
+                let input = state.edit_input.as_ref().expect("inline input");
+                assert_eq!(input.text, "Old Title");
+                assert_eq!(input.selection_range(), Some(0.."Old Title".len()));
+            }
+            other => panic!("expected metadata editor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn metadata_editor_keyboard_selection_updates_shared_input_state() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = Box::new(single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["alpha beta"],
+            &["alpha beta"],
+        )]));
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.edit_input = Some(crate::tui::text_input::TextInputState::new("alpha beta".to_string()));
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+            &mut state,
+            &tx,
+        );
+        assert_eq!(
+            &state.edit_input.as_ref().unwrap().text[state.edit_input.as_ref().unwrap().selection_range().unwrap()],
+            "a"
+        );
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            &mut state,
+            &tx,
+        );
+        assert_eq!(
+            &state.edit_input.as_ref().unwrap().text[state.edit_input.as_ref().unwrap().selection_range().unwrap()],
+            "beta"
+        );
+    }
+
+    #[test]
+    fn metadata_editor_terminal_paste_replaces_selection_in_every_text_mode() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        let mut inline = single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["alpha beta"],
+            &["alpha beta"],
+        )]);
+        inline.phase = MetadataEditorPhase::InlineEdit;
+        inline.edit_input = Some(crate::tui::text_input::TextInputState::new("alpha beta".to_string()));
+        {
+            let input = inline.edit_input.as_mut().unwrap();
+            input.cursor = "alpha ".len();
+            input.extend_right();
+            input.extend_right();
+            input.extend_right();
+            input.extend_right();
+        }
+        assert!(metadata_editor_paste_text(&mut app, &mut inline, "gamma\nignored"));
+        assert_eq!(inline.edit_input.as_ref().unwrap().text, "alpha gamma ignored");
+
+        let mut adding = single_image_state(vec![]);
+        adding.phase = MetadataEditorPhase::AddingKey;
+        adding.add_key_input = Some(crate::tui::text_input::TextInputState::new("ALBUMSORT".to_string()));
+        adding.add_key_input.as_mut().unwrap().select_all_text();
+        assert!(metadata_editor_paste_text(&mut app, &mut adding, "COMPOSER\nignored"));
+        assert_eq!(adding.add_key_input.as_ref().unwrap().text, "COMPOSER ignored");
+
+        let mut detail = single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["old one", "old two"],
+            &["old one", "old two"],
+        )]);
+        metadata_editor_begin_detail_edit_for_entry(&mut detail, 0, false);
+        detail.detail_cursor = 1;
+        detail.detail_edit = Some(crate::tui::text_input::TextInputState::new("old two".to_string()));
+        {
+            let input = detail.detail_edit.as_mut().unwrap();
+            input.cursor = "old ".len();
+            input.extend_right();
+            input.extend_right();
+            input.extend_right();
+        }
+        assert!(metadata_editor_paste_text(&mut app, &mut detail, "new\nignored"));
+        assert_eq!(detail.detail_edit.as_ref().unwrap().text, "old new ignored");
+    }
+
+    #[test]
+    fn metadata_editor_internal_clipboard_paste_normalizes_multiline_text() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(1);
+        let mut source = crate::tui::text_input::TextInputState::new("blue\r\ntrain".to_string());
+        source.select_all_text();
+        assert!(source.copy_selection());
+
+        let mut state = Box::new(single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["old title"],
+            &["old title"],
+        )]));
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.edit_input = Some(crate::tui::text_input::TextInputState::new_selected("old title".to_string()));
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            &mut state,
+            &tx,
+        );
+
+        let input = state.edit_input.as_ref().expect("inline input");
+        assert_eq!(input.text, "blue train");
+        assert_eq!(input.cursor, "blue train".len());
+        assert!(!input.has_selection());
+    }
+
+    #[test]
+    fn metadata_editor_tab_switch_clears_active_selection_state() {
+        let mut state = single_image_state(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["selected"],
+            &["selected"],
+        )]);
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.edit_input = Some(crate::tui::text_input::TextInputState::new("selected".to_string()));
+        state.edit_input.as_mut().unwrap().select_all_text();
+
+        assert!(state.set_content_tab(crate::tui::app::ContentTab::ReplayGain));
+
+        assert_eq!(state.phase, MetadataEditorPhase::Editing);
+        assert!(state.edit_input.is_none());
+        assert!(state.add_key_input.is_none());
+        assert!(state.detail_edit.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_editor_footer_close_with_dirty_state_prompts_before_closing() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
@@ -29366,6 +29876,7 @@ mod staged_archive_metadata_path_tests {
             0,
             0,
             7,
+            None,
         );
         assert!(!context.editor_owns_staging);
 

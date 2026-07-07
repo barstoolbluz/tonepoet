@@ -1,8 +1,14 @@
 //! Shared text input state with UTF-8 safe cursor movement and horizontal scrolling
 
-use std::path::{Path, PathBuf};
-
 use crossterm::event::{KeyCode, KeyEvent};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+static TEXT_INPUT_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn shared_text_input_clipboard() -> &'static Mutex<String> {
+    TEXT_INPUT_CLIPBOARD.get_or_init(|| Mutex::new(String::new()))
+}
 
 /// State for a single-line text input field.
 ///
@@ -34,6 +40,45 @@ pub enum CompletionMode {
     Path,
     /// Complete Tonepoet filename/folder-template variables such as `%ARTIST%`.
     TemplateVariable,
+}
+
+/// Paste handling policy for text-entry call sites. `TextInputState` is used
+/// primarily for single-line fields; those must never receive embedded CR/LF
+/// bytes from either Ctrl+V or bracketed-paste paths. Multiline owners should
+/// opt in explicitly and usually own a multiline buffer rather than this state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastePolicy {
+    SingleLine,
+    Multiline,
+}
+
+/// Normalize pasted text according to a field policy. Single-line paste
+/// collapses every CR/LF run, including CRLF, to at most one ASCII space. This
+/// preserves useful separation without allowing hidden newlines into filenames,
+/// tags, commands, or numeric fields. Unicode scalar boundaries are preserved
+/// because the operation is character-based and linear in the pasted length.
+pub fn normalize_paste_text(text: &str, policy: PastePolicy) -> String {
+    match policy {
+        PastePolicy::Multiline => text.to_string(),
+        PastePolicy::SingleLine => {
+            let mut out = String::with_capacity(text.len());
+            let mut pending_break = false;
+            for ch in text.chars() {
+                if ch == '\r' || ch == '\n' {
+                    pending_break = true;
+                    continue;
+                }
+                if pending_break {
+                    if !out.is_empty() && !out.ends_with(' ') && !ch.is_whitespace() {
+                        out.push(' ');
+                    }
+                    pending_break = false;
+                }
+                out.push(ch);
+            }
+            out
+        }
+    }
 }
 
 const TEMPLATE_VARIABLES: &[&str] = &[
@@ -133,8 +178,13 @@ impl TextInputState {
     }
 
     pub fn copy_selection(&mut self) -> bool {
-        let Some(range) = self.selection_range() else { return false; };
+        let Some(range) = self.selection_range() else {
+            return false;
+        };
         self.clipboard = self.text[range].to_string();
+        if let Ok(mut shared) = shared_text_input_clipboard().lock() {
+            *shared = self.clipboard.clone();
+        }
         true
     }
 
@@ -147,11 +197,22 @@ impl TextInputState {
     }
 
     pub fn paste_clipboard(&mut self) -> bool {
+        self.paste_clipboard_with_policy(PastePolicy::SingleLine)
+    }
+
+    pub fn paste_clipboard_with_policy(&mut self, policy: PastePolicy) -> bool {
+        if self.clipboard.is_empty() {
+            if let Ok(shared) = shared_text_input_clipboard().lock() {
+                if !shared.is_empty() {
+                    self.clipboard = shared.clone();
+                }
+            }
+        }
         if self.clipboard.is_empty() {
             return false;
         }
         let clipboard = self.clipboard.clone();
-        self.insert_string(&clipboard);
+        self.insert_paste_text(&clipboard, policy);
         true
     }
 
@@ -162,13 +223,21 @@ impl TextInputState {
         self.cursor += c.len_utf8();
     }
 
-    /// Insert a string at the cursor and advance the cursor past it.
+    /// Insert a string at the cursor and advance the cursor past it. This is
+    /// deliberately raw for programmatic completions/replacements. User paste
+    /// paths should call `insert_paste_text` so field policy is explicit.
     pub fn insert_string(&mut self, s: &str) {
         self.delete_selection();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
 
+    /// Insert pasted text according to the field policy, replacing any active
+    /// selection and leaving the cursor at the end of the normalized insertion.
+    pub fn insert_paste_text(&mut self, text: &str, policy: PastePolicy) {
+        let normalized = normalize_paste_text(text, policy);
+        self.insert_string(&normalized);
+    }
 
     /// Replace a UTF-8-boundary byte range and move the cursor to the end of
     /// the replacement. Invalid ranges are ignored rather than panicking so
@@ -1158,6 +1227,181 @@ mod tests {
             ),
         );
         assert_eq!(s.cursor, 0);
+    }
+
+
+    #[test]
+    fn select_all_selects_full_text_and_replacement_clears_selection() {
+        let mut s = TextInputState::new("Kind of Blue".to_string());
+        s.select_all_text();
+        assert_eq!(s.selection_range(), Some(0.."Kind of Blue".len()));
+        s.insert_char('X');
+        assert_eq!(s.text, "X");
+        assert_eq!(s.cursor, 1);
+        assert!(!s.has_selection());
+    }
+
+    #[test]
+    fn shift_selection_extends_by_utf8_safe_character_boundaries() {
+        let mut s = TextInputState::new("aé日z".to_string());
+        s.cursor_end();
+        s.extend_left();
+        assert_eq!(s.selection_range(), Some("aé日".len().."aé日z".len()));
+        s.extend_left();
+        assert_eq!(s.selection_range(), Some("aé".len().."aé日z".len()));
+        assert_eq!(&s.text[s.selection_range().unwrap()], "日z");
+    }
+
+    #[test]
+    fn ctrl_shift_selection_extends_by_words() {
+        let mut s = TextInputState::new("alpha beta gamma".to_string());
+        s.cursor_end();
+        handle_text_input_key(
+            &mut s,
+            &key(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+        assert_eq!(&s.text[s.selection_range().unwrap()], "gamma");
+        handle_text_input_key(
+            &mut s,
+            &key(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+        assert_eq!(&s.text[s.selection_range().unwrap()], "beta gamma");
+    }
+
+    #[test]
+    fn typed_text_replaces_active_selection() {
+        let mut s = TextInputState::new("Miles Davis".to_string());
+        s.cursor = "Miles ".len();
+        s.extend_right();
+        s.extend_right();
+        s.extend_right();
+        s.extend_right();
+        s.extend_right();
+        assert_eq!(&s.text[s.selection_range().unwrap()], "Davis");
+        handle_text_input_key(&mut s, &key(KeyCode::Char('Q'), KeyModifiers::NONE));
+        assert_eq!(s.text, "Miles Q");
+        assert_eq!(s.cursor, "Miles Q".len());
+        assert!(!s.has_selection());
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_selection_once() {
+        let mut backspace = TextInputState::new("abcdef".to_string());
+        backspace.cursor = 2;
+        backspace.extend_right();
+        backspace.extend_right();
+        assert_eq!(&backspace.text[backspace.selection_range().unwrap()], "cd");
+        backspace.backspace();
+        assert_eq!(backspace.text, "abef");
+        assert_eq!(backspace.cursor, 2);
+
+        let mut delete = TextInputState::new("abcdef".to_string());
+        delete.cursor = 2;
+        delete.extend_right();
+        delete.extend_right();
+        delete.delete();
+        assert_eq!(delete.text, "abef");
+        assert_eq!(delete.cursor, 2);
+    }
+
+    #[test]
+    fn copy_cut_and_paste_use_selection_and_shared_clipboard() {
+        let mut source = TextInputState::new("alpha beta".to_string());
+        source.cursor = "alpha ".len();
+        source.extend_right();
+        source.extend_right();
+        source.extend_right();
+        source.extend_right();
+        assert!(source.copy_selection());
+        assert_eq!(source.text, "alpha beta");
+
+        let mut destination = TextInputState::new("one two".to_string());
+        destination.cursor = "one ".len();
+        destination.extend_right();
+        destination.extend_right();
+        destination.extend_right();
+        assert!(destination.paste_clipboard());
+        assert_eq!(destination.text, "one beta");
+        assert_eq!(destination.cursor, "one beta".len());
+
+        assert!(source.cut_selection());
+        assert_eq!(source.text, "alpha ");
+        assert_eq!(source.clipboard, "beta");
+    }
+
+    #[test]
+    fn unicode_selection_replacement_never_slices_inside_codepoints() {
+        let mut s = TextInputState::new("café 日本語".to_string());
+        s.cursor = "café ".len();
+        s.extend_right();
+        s.extend_right();
+        s.extend_right();
+        assert_eq!(&s.text[s.selection_range().unwrap()], "日本語");
+        s.insert_string("東京");
+        assert_eq!(s.text, "café 東京");
+        assert_eq!(s.cursor, "café 東京".len());
+        assert!(s.text.is_char_boundary(s.cursor));
+    }
+
+    #[test]
+    fn single_line_paste_collapses_lf_and_crlf_runs() {
+        assert_eq!(
+            normalize_paste_text("alpha\nbeta\r\ngamma\rdelta", PastePolicy::SingleLine),
+            "alpha beta gamma delta"
+        );
+        assert_eq!(normalize_paste_text("\nalpha", PastePolicy::SingleLine), "alpha");
+        assert_eq!(normalize_paste_text("alpha\n beta", PastePolicy::SingleLine), "alpha beta");
+    }
+
+    #[test]
+    fn multiline_paste_policy_preserves_newlines() {
+        assert_eq!(
+            normalize_paste_text("alpha\nbeta\r\ngamma", PastePolicy::Multiline),
+            "alpha\nbeta\r\ngamma"
+        );
+    }
+
+    #[test]
+    fn paste_clipboard_normalizes_multiline_into_single_line() {
+        let mut source = TextInputState::new("alpha\nbeta\r\ngamma".to_string());
+        source.select_all_text();
+        assert!(source.copy_selection());
+
+        let mut destination = TextInputState::new("x".to_string());
+        destination.cursor_end();
+        assert!(destination.paste_clipboard());
+
+        assert_eq!(destination.text, "xalpha beta gamma");
+        assert_eq!(destination.cursor, "xalpha beta gamma".len());
+        assert!(!destination.has_selection());
+    }
+
+    #[test]
+    fn paste_over_selection_normalizes_then_replaces_selection() {
+        let mut source = TextInputState::new("one\ntwo".to_string());
+        source.select_all_text();
+        assert!(source.copy_selection());
+
+        let mut destination = TextInputState::new("abcXYZdef".to_string());
+        destination.cursor = 3;
+        destination.extend_right();
+        destination.extend_right();
+        destination.extend_right();
+        assert!(destination.paste_clipboard());
+
+        assert_eq!(destination.text, "abcone twodef");
+        assert_eq!(destination.cursor, "abcone two".len());
+        assert!(!destination.has_selection());
+    }
+
+    #[test]
+    fn unicode_plus_newline_paste_stays_utf8_safe() {
+        let mut s = TextInputState::new("prefix ".to_string());
+        s.cursor_end();
+        s.insert_paste_text("日本\n語 café", PastePolicy::SingleLine);
+        assert_eq!(s.text, "prefix 日本 語 café");
+        assert_eq!(s.cursor, s.text.len());
+        assert!(s.text.is_char_boundary(s.cursor));
     }
 
     #[test]

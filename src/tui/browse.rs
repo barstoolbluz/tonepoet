@@ -2935,7 +2935,6 @@ impl BrowseState {
         self.current_dir = path;
         self.selected_index = 0;
         self.reset_nav_state();
-        self.reset_sort_to_default();
         self.sync_tree_to_current_dir();
         self.refresh();
     }
@@ -3250,7 +3249,6 @@ impl BrowseState {
         self.clear_dir_stats_work_queue();
         self.clear_folder_classification_work_queue();
         self.clear_type_ahead();
-        self.reset_sort_to_default();
         self.refresh_archive_view();
         self.selected_index = 0;
         self.scroll_offset = 0;
@@ -3328,7 +3326,6 @@ impl BrowseState {
         self.clear_dir_stats_work_queue();
         self.clear_folder_classification_work_queue();
         self.clear_type_ahead();
-        self.reset_sort_to_default();
         self.refresh_archive_view_with_search(tx);
 
         if let Some(inner) = previous_selected_inner {
@@ -3362,7 +3359,6 @@ impl BrowseState {
         self.multi_selected.clear();
         self.selected_index = 0;
         self.scroll_offset = 0;
-        self.reset_sort_to_default();
         self.refresh();
     }
 
@@ -3378,7 +3374,6 @@ impl BrowseState {
         self.scroll_offset = 0;
         self.clear_dir_stats_work_queue();
         self.clear_folder_classification_work_queue();
-        self.reset_sort_to_default();
         self.refresh_archive_view();
     }
 
@@ -3401,7 +3396,6 @@ impl BrowseState {
             self.scroll_offset = 0;
             self.clear_dir_stats_work_queue();
             self.clear_folder_classification_work_queue();
-            self.reset_sort_to_default();
             self.refresh_archive_view();
             return true;
         }
@@ -4017,7 +4011,6 @@ impl BrowseState {
                 self.current_dir = path;
                 self.selected_index = 0;
                 self.reset_nav_state();
-                self.reset_sort_to_default();
                 self.sync_tree_to_current_dir();
                 self.refresh();
                 return true;
@@ -4040,7 +4033,6 @@ impl BrowseState {
             self.push_nav_history(parent.clone());
             self.current_dir = parent;
             self.reset_nav_state();
-            self.reset_sort_to_default();
             self.sync_tree_to_current_dir();
             self.refresh();
             return true;
@@ -4056,7 +4048,6 @@ impl BrowseState {
             self.current_dir = path;
             self.selected_index = 0;
             self.reset_nav_state();
-            self.reset_sort_to_default();
             self.sync_tree_to_current_dir();
             self.refresh();
         }
@@ -4128,7 +4119,6 @@ impl BrowseState {
             self.current_dir = final_path;
             self.selected_index = 0;
             self.reset_nav_state();
-            self.reset_sort_to_default();
             self.sync_tree_to_current_dir();
             self.refresh();
             Ok(())
