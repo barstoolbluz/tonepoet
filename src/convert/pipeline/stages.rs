@@ -14990,6 +14990,64 @@ mod companion_copy_hardening_tests {
         assert!(!companion_exclude_matches(&BTreeSet::new(), "anything.txt"));
     }
 
+    /// Trivially-correct exponential reference matcher for the differential
+    /// test below. Correctness by construction; never used in production.
+    fn reference_wildcard_matches(pattern: &[char], name: &[char]) -> bool {
+        match (pattern.first(), name.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                reference_wildcard_matches(&pattern[1..], name)
+                    || (!name.is_empty() && reference_wildcard_matches(pattern, &name[1..]))
+            }
+            (Some('?'), Some(_)) => reference_wildcard_matches(&pattern[1..], &name[1..]),
+            (Some(p), Some(n)) if p == n => {
+                reference_wildcard_matches(&pattern[1..], &name[1..])
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn companion_wildcard_matcher_agrees_with_reference_exhaustively() {
+        // Every pattern up to length 4 over {a, b, *, ?} against every name up
+        // to length 4 over {a, b}: 1 + 4 + 16 + 64 + 256 patterns x
+        // 1 + 2 + 4 + 8 + 16 names = 341 x 31 = 10,571 cases. Exhaustive over
+        // this alphabet, so single-star backtracking bugs, multi-star
+        // interactions, and end-of-input handling cannot hide.
+        let pattern_alphabet = ['a', 'b', '*', '?'];
+        let name_alphabet = ['a', 'b'];
+
+        fn enumerate(alphabet: &[char], max_len: usize) -> Vec<Vec<char>> {
+            let mut out: Vec<Vec<char>> = vec![Vec::new()];
+            let mut frontier: Vec<Vec<char>> = vec![Vec::new()];
+            for _ in 0..max_len {
+                let mut next = Vec::new();
+                for word in &frontier {
+                    for ch in alphabet {
+                        let mut grown = word.clone();
+                        grown.push(*ch);
+                        next.push(grown);
+                    }
+                }
+                out.extend(next.iter().cloned());
+                frontier = next;
+            }
+            out
+        }
+
+        for pattern in enumerate(&pattern_alphabet, 4) {
+            for name in enumerate(&name_alphabet, 4) {
+                let pattern_str: String = pattern.iter().collect();
+                let name_str: String = name.iter().collect();
+                assert_eq!(
+                    companion_wildcard_matches(&pattern_str, &name_str),
+                    reference_wildcard_matches(&pattern, &name),
+                    "matcher disagrees with reference for pattern {pattern_str:?} vs name {name_str:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn loose_companion_copy_applies_wildcard_exclusions() {
         let temp = tempfile::tempdir().expect("temp dir");

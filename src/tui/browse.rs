@@ -15884,7 +15884,10 @@ mod browse_perf_followup_v10_tests {
     #[test]
     fn recursive_dir_stats_queue_is_bounded_and_current_selection_first() {
         let mut state = BrowseState::new();
-        let active = std::env::temp_dir();
+        // An isolated directory: using a shared location like env::temp_dir()
+        // makes the captured identity race with unrelated tests mutating it.
+        let active_dir = tempfile::tempdir().expect("isolated active dir");
+        let active = active_dir.path().to_path_buf();
         let active_identity = std::fs::metadata(&active)
             .ok()
             .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))

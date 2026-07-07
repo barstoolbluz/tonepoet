@@ -704,6 +704,7 @@ merge = "multi-file"
         let mut output = OutputOptionsState::new();
         output.companion_extensions = ".jpg, .pdf".to_string();
         output.companion_folders = "Scans, Artwork".to_string();
+        output.companion_exclude_files = "EXIGO*, foo_dr.txt".to_string();
         output.force_encode.select_value(&true);
         output.write_log.select_value(&true);
 
@@ -712,11 +713,13 @@ merge = "multi-file"
         let mut restored_output = OutputOptionsState::new();
         restored_output.companion_extensions.clear();
         restored_output.companion_folders.clear();
+        restored_output.companion_exclude_files.clear();
 
         preset.apply_to_pills(&mut restored_format, &mut restored_output);
 
         assert_eq!(restored_output.companion_extensions, ".jpg, .pdf");
         assert_eq!(restored_output.companion_folders, "Scans, Artwork");
+        assert_eq!(restored_output.companion_exclude_files, "EXIGO*, foo_dr.txt");
         assert!(*restored_output.force_encode.selected_value());
         assert!(*restored_output.write_log.selected_value());
     }
