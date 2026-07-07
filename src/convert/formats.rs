@@ -526,7 +526,7 @@ impl ConversionOptions {
 }
 
 
-/// Token expanded by the planner into `disc NN` for detected multi-disc sets.
+/// Token expanded by the planner into `Disc NN` for detected multi-disc sets.
 pub const DISC_FOLDER_TEMPLATE_TOKEN: &str = "%DISC_FOLDER%";
 
 /// Return `template` with a leading disc-folder component when requested.

@@ -15227,11 +15227,11 @@ fn render_track_template<T: TemplateRenderTarget + ?Sized>(
         .as_deref()
         .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
         .unwrap_or_else(|| artist.clone());
-    let disc = track_disc_number_hint(track).filter(|disc| *disc > 0).unwrap_or(1);
+    let disc = template_disc_number(source, track);
     let disc_folder = source_disc_folder_token(source, track)
         .map(|value| sanitize_component(&value))
         .unwrap_or_default();
-    let n = template_track_number(track);
+    let n = template_track_number(source, track);
     let year = source
         .album_metadata
         .date
@@ -15399,42 +15399,120 @@ fn album_and_title_extra_for_template(
 
 
 fn source_disc_folder_token(source: &PreparedSource, track: &PreparedTrack) -> Option<String> {
-    if !source_is_multi_disc_for_template(source) {
+    if !source_has_proven_multi_disc_layout(source) {
         return None;
     }
-    let disc_number = track_disc_number_hint(track)
-        .filter(|disc| *disc > 0)
-        .or_else(|| infer_disc_number_from_duplicate_track_numbers(source, track))
-        .unwrap_or(1);
-    Some(format!("disc {disc_number:02}"))
+    let disc = track_disc_number_hint(source, track).filter(|disc| *disc > 0)?;
+    Some(format!("Disc {disc:02}"))
 }
 
-fn source_is_multi_disc_for_template(source: &PreparedSource) -> bool {
+fn source_has_proven_multi_disc_layout(source: &PreparedSource) -> bool {
+    if source.album_metadata.total_discs.unwrap_or(0) > 1 {
+        return true;
+    }
+    if source_disc_total_extra_hint(source).unwrap_or(0) > 1 {
+        return true;
+    }
+    if source_disc_number_hint(source).unwrap_or(0) > 1 {
+        return true;
+    }
+
     let mut disc_numbers = BTreeSet::new();
     let mut max_disc_total = 0_u32;
     for track in &source.tracks {
-        if let Some(disc) = track_disc_number_hint(track).filter(|disc| *disc > 0) {
+        if let Some(disc) = track_disc_number_hint(source, track).filter(|disc| *disc > 0) {
             disc_numbers.insert(disc);
         }
         max_disc_total = max_disc_total.max(track_disc_total_hint(track).unwrap_or(0));
     }
-    disc_numbers.len() > 1 || max_disc_total > 1 || source_has_duplicate_track_numbers(source)
+    disc_numbers.len() > 1 || max_disc_total > 1
 }
 
-fn template_track_number(track: &PreparedTrack) -> u32 {
-    track.metadata.track_number.unwrap_or(track.id.track_number)
+fn template_disc_number(source: &PreparedSource, track: &PreparedTrack) -> u32 {
+    track_disc_number_hint(source, track)
+        .filter(|disc| *disc > 0)
+        .unwrap_or(1)
 }
 
-fn track_disc_number_hint(track: &PreparedTrack) -> Option<u32> {
-    track
+fn template_track_number(source: &PreparedSource, track: &PreparedTrack) -> u32 {
+    let metadata_number = track.metadata.track_number.filter(|value| *value > 0);
+    let path_number = track_number_from_source_ref_path(track).filter(|value| *value > 0);
+
+    // Archive materialization can preserve source filenames even when tags are
+    // absent, stale, or normalized to a flat sequence. When one-file-per-track
+    // paths prove a multi-disc layout or duplicate filename prefixes, prefer
+    // those filename prefixes for `%NN%`/`%TRACK%`. Disc folder assignment
+    // remains driven by explicit disc metadata or source path disc directories.
+    if source_has_multiple_path_disc_numbers(source) || source_has_duplicate_source_path_track_numbers(source) {
+        path_number
+            .or(metadata_number)
+            .unwrap_or(track.id.track_number)
+    } else {
+        metadata_number
+            .or(path_number)
+            .unwrap_or(track.id.track_number)
+    }
+}
+
+fn track_disc_number_hint(source: &PreparedSource, track: &PreparedTrack) -> Option<u32> {
+    let explicit = track
         .id
         .disc_number
         .or(track.metadata.disc_number)
-        .or_else(|| track_disc_number_extra_hint(track))
+        .or_else(|| track_disc_number_extra_hint(track));
+    let path = track_disc_number_from_source_ref_path(track);
+    let source_scope = source_disc_number_hint(source);
+
+    // If multiple disc directories are present in the materialized source tree,
+    // they are stronger evidence than tags that may have been missing, flattened,
+    // or duplicated during archive extraction. Source-scope album metadata is a
+    // final fallback for carrier/image materializers that know the disc at
+    // album/source scope but do not repeat it into every logical track.
+    if source_has_multiple_path_disc_numbers(source) {
+        path.or(explicit).or(source_scope)
+    } else {
+        explicit.or(path).or(source_scope)
+    }
 }
 
 fn track_disc_total_hint(track: &PreparedTrack) -> Option<u32> {
     track_disc_total_extra_hint(track)
+}
+
+fn source_disc_number_hint(source: &PreparedSource) -> Option<u32> {
+    source
+        .album_metadata
+        .disc_number
+        .filter(|disc| *disc > 0)
+        .or_else(|| source_disc_number_extra_hint(source))
+}
+
+fn source_disc_number_extra_hint(source: &PreparedSource) -> Option<u32> {
+    for key in ["discnumber", "disc_number", "disc"] {
+        let Some(raw) = extra_value_case_insensitive(&source.album_metadata.extra, key) else {
+            continue;
+        };
+        if let Some((disc, _)) = parse_disc_number_hint_for_key(key, raw) {
+            if disc.is_some() {
+                return disc;
+            }
+        }
+    }
+    None
+}
+
+fn source_disc_total_extra_hint(source: &PreparedSource) -> Option<u32> {
+    for key in ["disctotal", "disc_total", "discnumber", "disc_number", "disc"] {
+        let Some(raw) = extra_value_case_insensitive(&source.album_metadata.extra, key) else {
+            continue;
+        };
+        if let Some((_, total)) = parse_disc_number_hint_for_key(key, raw) {
+            if total.is_some() {
+                return total;
+            }
+        }
+    }
+    None
 }
 
 fn track_disc_number_extra_hint(track: &PreparedTrack) -> Option<u32> {
@@ -15459,6 +15537,143 @@ fn track_disc_total_extra_hint(track: &PreparedTrack) -> Option<u32> {
         if let Some((_, total)) = parse_disc_number_hint_for_key(key, raw) {
             if total.is_some() {
                 return total;
+            }
+        }
+    }
+    None
+}
+
+fn source_has_multiple_path_disc_numbers(source: &PreparedSource) -> bool {
+    let mut disc_numbers = BTreeSet::new();
+    for track in &source.tracks {
+        if let Some(disc) = track_disc_number_from_source_ref_path(track).filter(|disc| *disc > 0) {
+            disc_numbers.insert(disc);
+            if disc_numbers.len() > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn source_has_duplicate_source_path_track_numbers(source: &PreparedSource) -> bool {
+    let mut seen = BTreeSet::new();
+    for track in &source.tracks {
+        let Some(n) = track_number_from_source_ref_path(track).filter(|value| *value > 0) else {
+            continue;
+        };
+        if !seen.insert(n) {
+            return true;
+        }
+    }
+    false
+}
+
+fn track_number_from_source_ref_path(track: &PreparedTrack) -> Option<u32> {
+    // Only one-file-per-track staged sources are allowed to contribute a
+    // filename-prefix track number to template rendering. Carrier/container
+    // source refs (CUE images, SACD ISOs, DVD-A/DVD-Video/Blu-ray roots) can
+    // back many logical tracks with one shared path; using that shared path's
+    // prefix would collapse `%NN%`/`%TRACK%` for every logical track in the
+    // carrier.
+    let path = track_specific_template_source_file_path(&track.source_ref)?;
+    strict_track_number_from_path_stem(path)
+}
+
+fn track_disc_number_from_source_ref_path(track: &PreparedTrack) -> Option<u32> {
+    let path = template_source_file_path(&track.source_ref)?;
+    disc_number_from_path_ancestors(path)
+}
+
+fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
+    match source_ref {
+        TrackSourceRef::StagedFile(path) => Some(path.as_path()),
+        TrackSourceRef::CueSegmentCarrier { .. }
+        | TrackSourceRef::ImageSegment { .. }
+        | TrackSourceRef::SacdTrack { .. }
+        | TrackSourceRef::DvdaTrack { .. }
+        | TrackSourceRef::DvdVideoTrack { .. }
+        | TrackSourceRef::BluRayTrack { .. } => None,
+    }
+}
+
+fn template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
+    match source_ref {
+        TrackSourceRef::StagedFile(path) => Some(path.as_path()),
+        TrackSourceRef::CueSegmentCarrier { source_image, .. } => Some(source_image.as_path()),
+        TrackSourceRef::ImageSegment { image, .. } => Some(image.as_path()),
+        TrackSourceRef::SacdTrack { iso, .. } => Some(iso.as_path()),
+        TrackSourceRef::DvdaTrack { volume_source, .. } => match volume_source {
+            DvdaVolumeSourceRef::Directory { root }
+            | DvdaVolumeSourceRef::Iso { path: root, .. }
+            | DvdaVolumeSourceRef::StagedAudioTs { root, .. } => Some(root.as_path()),
+        },
+        TrackSourceRef::DvdVideoTrack { source, .. }
+        | TrackSourceRef::BluRayTrack { source, .. } => Some(source.as_path()),
+    }
+}
+
+fn strict_track_number_from_path_stem(path: &Path) -> Option<u32> {
+    let stem = path.file_stem()?.to_str()?.trim();
+    let mut digits = String::new();
+    for ch in stem.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() || digits.len() > 3 {
+        return None;
+    }
+    let rest = &stem[digits.len()..];
+    if !has_strict_track_prefix_separator_for_template(rest) {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn has_strict_track_prefix_separator_for_template(rest: &str) -> bool {
+    if rest.is_empty() {
+        return true;
+    }
+    let trimmed = rest.trim_start();
+    matches!(trimmed.chars().next(), Some('-' | '_' | '.' | ')' | ']'))
+}
+
+fn disc_number_from_path_ancestors(path: &Path) -> Option<u32> {
+    for ancestor in path.ancestors().skip(1) {
+        let Some(name) = ancestor.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Some(number) = disc_number_from_template_component_name(name) {
+            return Some(number);
+        }
+    }
+    None
+}
+
+fn disc_number_from_template_component_name(name: &str) -> Option<u32> {
+    let lower = name.trim().to_ascii_lowercase();
+    for prefix in ["disc", "disk", "cd"] {
+        let Some(rest) = lower.strip_prefix(prefix) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let rest = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('_'))
+            .or_else(|| rest.strip_prefix('.'))
+            .or_else(|| rest.strip_prefix(' '))
+            .unwrap_or(rest)
+            .trim_start();
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        if let Ok(number) = digits.parse::<u32>() {
+            if number > 0 {
+                return Some(number);
             }
         }
     }
@@ -15490,49 +15705,6 @@ fn parse_disc_number_hint_for_key(key: &str, value: &str) -> Option<(Option<u32>
         (Some(disc), None) => Some((Some(disc), None)),
         (disc, total) => Some((disc, total)),
     }
-}
-
-fn source_has_duplicate_track_numbers(source: &PreparedSource) -> bool {
-    let mut seen = BTreeSet::new();
-    for track in &source.tracks {
-        let n = template_track_number(track);
-        if n == 0 {
-            continue;
-        }
-        if !seen.insert(n) {
-            return true;
-        }
-    }
-    false
-}
-
-fn infer_disc_number_from_duplicate_track_numbers(
-    source: &PreparedSource,
-    target: &PreparedTrack,
-) -> Option<u32> {
-    if !source_has_duplicate_track_numbers(source) {
-        return None;
-    }
-    let target_number = template_track_number(target);
-    if target_number == 0 {
-        return None;
-    }
-
-    let mut occurrence = 0_u32;
-    let mut total_occurrences = 0_u32;
-    for track in &source.tracks {
-        if template_track_number(track) == target_number {
-            total_occurrences += 1;
-            if track.id.source_ordinal == target.id.source_ordinal
-                && track.id.track_number == target.id.track_number
-                && track.id.disc_number == target.id.disc_number
-            {
-                occurrence = total_occurrences;
-            }
-        }
-    }
-
-    (occurrence > 0 && total_occurrences > 1).then_some(occurrence)
 }
 
 fn render_template_with_tokens(
@@ -20520,7 +20692,7 @@ mod title_extra_tests {
     }
 
     #[test]
-    fn disc_folder_token_infers_discs_from_duplicate_track_numbers() {
+    fn duplicate_track_numbers_alone_do_not_infer_disc_folders() {
         let mut source = template_source();
         let base = source.tracks[0].clone();
         let make_track = |source_ordinal: u32, track_number: u32, title: &str| {
@@ -20534,12 +20706,12 @@ mod title_extra_tests {
             track
         };
         source.tracks = vec![
-            make_track(1, 1, "Statesboro Blues"),
-            make_track(2, 1, "Hot 'Lanta"),
-            make_track(3, 2, "Done Somebody Wrong"),
-            make_track(4, 2, "In Memory of Elizabeth Reed"),
-            make_track(5, 3, "Stormy Monday"),
-            make_track(6, 3, "Whipping Post"),
+            make_track(1, 1, "Hot 'Lanta"),
+            make_track(2, 1, "Statesboro Blues"),
+            make_track(3, 2, "In Memory of Elizabeth Reed"),
+            make_track(4, 2, "Done Somebody Wrong"),
+            make_track(5, 3, "Whipping Post"),
+            make_track(6, 3, "Stormy Monday"),
             make_track(7, 4, "You Don't Love Me"),
         ];
         source.album_metadata.total_tracks = source.tracks.len() as u32;
@@ -20558,17 +20730,17 @@ mod title_extra_tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(rels[0], PathBuf::from("disc 01/01 - Statesboro Blues"));
-        assert_eq!(rels[1], PathBuf::from("disc 02/01 - Hot 'Lanta"));
-        assert_eq!(rels[2], PathBuf::from("disc 01/02 - Done Somebody Wrong"));
-        assert_eq!(rels[3], PathBuf::from("disc 02/02 - In Memory of Elizabeth Reed"));
-        assert_eq!(rels[6], PathBuf::from("disc 01/04 - You Don't Love Me"));
+        assert_eq!(rels[0], PathBuf::from("01 - Hot 'Lanta"));
+        assert_eq!(rels[1], PathBuf::from("01 - Statesboro Blues"));
+        assert_eq!(rels[2], PathBuf::from("02 - In Memory of Elizabeth Reed"));
+        assert_eq!(rels[3], PathBuf::from("02 - Done Somebody Wrong"));
+        assert_eq!(rels[6], PathBuf::from("04 - You Don't Love Me"));
     }
 
-
     #[test]
-    fn create_disc_subfolders_option_reaches_planned_final_paths() {
+    fn album_total_discs_without_track_disc_numbers_does_not_infer_disc_folders() {
         let mut source = template_source();
+        source.album_metadata.total_discs = Some(2);
         let base = source.tracks[0].clone();
         let make_track = |source_ordinal: u32, track_number: u32, title: &str| {
             let mut track = base.clone();
@@ -20581,13 +20753,145 @@ mod title_extra_tests {
             track
         };
         source.tracks = vec![
-            make_track(1, 1, "Statesboro Blues"),
-            make_track(2, 1, "Hot 'Lanta"),
-            make_track(3, 2, "Done Somebody Wrong"),
-            make_track(4, 2, "In Memory of Elizabeth Reed"),
-            make_track(5, 3, "Stormy Monday"),
-            make_track(6, 3, "Whipping Post"),
-            make_track(7, 4, "You Don't Love Me"),
+            make_track(1, 1, "Opening"),
+            make_track(2, 2, "Middle"),
+            make_track(3, 3, "Finale"),
+        ];
+        source.album_metadata.total_tracks = source.tracks.len() as u32;
+
+        let rels = source
+            .tracks
+            .iter()
+            .map(|track| {
+                render_track_template(
+                    "%DISC_FOLDER%/%NN% - %TITLE%",
+                    &source,
+                    track,
+                    &tonepoet_pipeline::AudioFormat::Flac,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rels[0], PathBuf::from("01 - Opening"));
+        assert_eq!(rels[1], PathBuf::from("02 - Middle"));
+        assert_eq!(rels[2], PathBuf::from("03 - Finale"));
+    }
+
+
+
+    #[test]
+    fn album_metadata_disc_number_supplies_disc_folder_for_source_scoped_carrier_disc() {
+        let mut source = template_source();
+        source.kind = SourceKind::CueImage;
+        source.container = PathBuf::from("/cue/At Fillmore East Disc 2.cue");
+        source.album_metadata.disc_number = Some(2);
+        source.album_metadata.total_discs = Some(2);
+        let base = source.tracks[0].clone();
+        let shared_image = PathBuf::from("/cue/At Fillmore East.flac");
+        let make_track = |source_ordinal: u32, track_number: u32, title: &str| {
+            let mut track = base.clone();
+            track.id.source_ordinal = source_ordinal;
+            track.id.track_number = track_number;
+            track.id.disc_number = None;
+            track.metadata.track_number = Some(track_number);
+            track.metadata.disc_number = None;
+            track.metadata.title = Some(title.to_string());
+            track.source_ref = TrackSourceRef::CueSegmentCarrier {
+                path: PathBuf::from(format!("/stage/cue-disc2-track-{source_ordinal:02}.wav")),
+                source_image: shared_image.clone(),
+                start_sample: (source_ordinal as u64 - 1) * 44_100,
+                samples: 44_100,
+                carrier: CueSegmentCarrier::PcmS32LeWav,
+            };
+            track
+        };
+        source.tracks = vec![
+            make_track(1, 1, "Hot 'Lanta"),
+            make_track(2, 2, "In Memory of Elizabeth Reed"),
+            make_track(3, 3, "Whipping Post"),
+        ];
+        source.album_metadata.total_tracks = source.tracks.len() as u32;
+
+        let rels = source
+            .tracks
+            .iter()
+            .map(|track| {
+                render_track_template(
+                    "%DISC_FOLDER%/%NN% - %TITLE%",
+                    &source,
+                    track,
+                    &tonepoet_pipeline::AudioFormat::Flac,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rels[0], PathBuf::from("Disc 02/01 - Hot 'Lanta"));
+        assert_eq!(rels[1], PathBuf::from("Disc 02/02 - In Memory of Elizabeth Reed"));
+        assert_eq!(rels[2], PathBuf::from("Disc 02/03 - Whipping Post"));
+    }
+
+    #[test]
+    fn album_metadata_disc_one_without_total_does_not_create_single_disc_folder() {
+        let mut source = template_source();
+        source.album_metadata.disc_number = Some(1);
+        source.album_metadata.total_discs = None;
+
+        let rel = render_track_template(
+            "%DISC_FOLDER%/%NN% - %TITLE%",
+            &source,
+            &source.tracks[0],
+            &tonepoet_pipeline::AudioFormat::Flac,
+        )
+        .unwrap();
+
+        assert_eq!(rel, PathBuf::from("01 - Right Off"));
+    }
+
+    #[test]
+    fn explicit_track_disc_number_overrides_album_metadata_disc_number() {
+        let mut source = template_source();
+        source.album_metadata.disc_number = Some(2);
+        source.album_metadata.total_discs = Some(2);
+        source.tracks[0].id.disc_number = Some(1);
+        source.tracks[0].metadata.disc_number = Some(1);
+        source.tracks[0].metadata.track_number = Some(4);
+        source.tracks[0].metadata.title = Some("You Don't Love Me".to_string());
+
+        let rel = render_track_template(
+            "%DISC_FOLDER%/%NN% - %TITLE%",
+            &source,
+            &source.tracks[0],
+            &tonepoet_pipeline::AudioFormat::Flac,
+        )
+        .unwrap();
+
+        assert_eq!(rel, PathBuf::from("Disc 01/04 - You Don't Love Me"));
+    }
+
+    #[test]
+    fn create_disc_subfolders_option_reaches_planned_final_paths() {
+        let mut source = template_source();
+        let base = source.tracks[0].clone();
+        let make_track = |source_ordinal: u32, disc_number: u32, track_number: u32, title: &str| {
+            let mut track = base.clone();
+            track.id.source_ordinal = source_ordinal;
+            track.id.disc_number = Some(disc_number);
+            track.id.track_number = track_number;
+            track.metadata.track_number = Some(track_number);
+            track.metadata.disc_number = Some(disc_number);
+            track.metadata.title = Some(title.to_string());
+            track
+        };
+        source.tracks = vec![
+            make_track(1, 1, 1, "Statesboro Blues"),
+            make_track(2, 2, 1, "Hot 'Lanta"),
+            make_track(3, 1, 2, "Done Somebody Wrong"),
+            make_track(4, 2, 2, "In Memory of Elizabeth Reed"),
+            make_track(5, 1, 3, "Stormy Monday"),
+            make_track(6, 2, 3, "Whipping Post"),
+            make_track(7, 1, 4, "You Don't Love Me"),
         ];
         source.album_metadata.total_tracks = source.tracks.len() as u32;
 
@@ -20606,23 +20910,130 @@ mod title_extra_tests {
         let plan = plan_outputs(&source, &req).expect("disc-subfolder planning");
         assert_eq!(
             plan.entries[0].final_path,
-            PathBuf::from("/out/disc 01/Miles Davis/1 - Statesboro Blues.flac")
+            PathBuf::from("/out/Disc 01/Miles Davis/1 - Statesboro Blues.flac")
         );
         assert_eq!(
             plan.entries[1].final_path,
-            PathBuf::from("/out/disc 02/Miles Davis/1 - Hot 'Lanta.flac")
+            PathBuf::from("/out/Disc 02/Miles Davis/1 - Hot 'Lanta.flac")
         );
         assert_eq!(
             plan.entries[2].final_path,
-            PathBuf::from("/out/disc 01/Miles Davis/2 - Done Somebody Wrong.flac")
+            PathBuf::from("/out/Disc 01/Miles Davis/2 - Done Somebody Wrong.flac")
         );
         assert_eq!(
             plan.entries[3].final_path,
-            PathBuf::from("/out/disc 02/Miles Davis/2 - In Memory of Elizabeth Reed.flac")
+            PathBuf::from("/out/Disc 02/Miles Davis/2 - In Memory of Elizabeth Reed.flac")
         );
         assert_eq!(
             plan.entries[6].final_path,
-            PathBuf::from("/out/disc 01/Miles Davis/4 - You Don't Love Me.flac")
+            PathBuf::from("/out/Disc 01/Miles Davis/4 - You Don't Love Me.flac")
+        );
+    }
+
+    #[test]
+    fn disc_folder_token_uses_archive_disc_directories_when_tags_are_missing_or_flattened() {
+        let mut source = template_source();
+        source.kind = SourceKind::Archive;
+        source.container = PathBuf::from("/archive/At Fillmore East.7z");
+        let base = source.tracks[0].clone();
+        let make_track = |source_ordinal: u32,
+                          id_track_number: u32,
+                          source_rel: &str,
+                          title: &str| {
+            let mut track = base.clone();
+            track.id.source_ordinal = source_ordinal;
+            track.id.disc_number = None;
+            // Simulate an archive materializer that assigned flat discovery
+            // ordinals while the source filenames still carry per-disc numbers.
+            track.id.track_number = id_track_number;
+            track.metadata.track_number = Some(id_track_number);
+            track.metadata.disc_number = Some(1);
+            track.metadata.title = Some(title.to_string());
+            track.source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/unpack").join(source_rel));
+            track
+        };
+        source.tracks = vec![
+            make_track(1, 1, "Disc 01/01 - Statesboro Blues.flac", "Statesboro Blues"),
+            make_track(2, 2, "Disc 01/02 - Done Somebody Wrong.flac", "Done Somebody Wrong"),
+            make_track(3, 3, "Disc 01/03 - Stormy Monday.flac", "Stormy Monday"),
+            make_track(4, 4, "Disc 01/04 - You Don't Love Me.flac", "You Don't Love Me"),
+            make_track(5, 5, "Disc 02/01 - Hot 'Lanta.flac", "Hot 'Lanta"),
+            make_track(6, 6, "Disc 02/02 - In Memory of Elizabeth Reed.flac", "In Memory of Elizabeth Reed"),
+            make_track(7, 7, "Disc 02/03 - Whipping Post.flac", "Whipping Post"),
+        ];
+        source.album_metadata.total_tracks = source.tracks.len() as u32;
+
+        let rels = source
+            .tracks
+            .iter()
+            .map(|track| {
+                render_track_template(
+                    "%DISC_FOLDER%/%NN% - %TITLE%",
+                    &source,
+                    track,
+                    &tonepoet_pipeline::AudioFormat::Flac,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rels[0], PathBuf::from("Disc 01/01 - Statesboro Blues"));
+        assert_eq!(rels[3], PathBuf::from("Disc 01/04 - You Don't Love Me"));
+        assert_eq!(rels[4], PathBuf::from("Disc 02/01 - Hot 'Lanta"));
+        assert_eq!(rels[6], PathBuf::from("Disc 02/03 - Whipping Post"));
+    }
+
+    #[test]
+    fn carrier_source_filename_prefix_does_not_override_logical_track_numbers() {
+        let mut source = template_source();
+        source.kind = SourceKind::CueImage;
+        source.container = PathBuf::from("/cue/01 - Album.cue");
+        let base = source.tracks[0].clone();
+        let shared_image = PathBuf::from("/cue/01 - Album.flac");
+        let make_track = |source_ordinal: u32, track_number: u32, title: &str| {
+            let mut track = base.clone();
+            track.id.source_ordinal = source_ordinal;
+            track.id.track_number = track_number;
+            track.id.disc_number = None;
+            track.metadata.track_number = Some(track_number);
+            track.metadata.disc_number = None;
+            track.metadata.title = Some(title.to_string());
+            track.source_ref = TrackSourceRef::CueSegmentCarrier {
+                path: PathBuf::from(format!("/stage/cue-track-{source_ordinal:02}.wav")),
+                source_image: shared_image.clone(),
+                start_sample: (source_ordinal as u64 - 1) * 44_100,
+                samples: 44_100,
+                carrier: CueSegmentCarrier::PcmS32LeWav,
+            };
+            track
+        };
+        source.tracks = vec![
+            make_track(1, 1, "Opening"),
+            make_track(2, 2, "Middle"),
+            make_track(3, 3, "Finale"),
+        ];
+        source.album_metadata.total_tracks = source.tracks.len() as u32;
+
+        let rels = source
+            .tracks
+            .iter()
+            .map(|track| {
+                render_track_template(
+                    "%NN% - %TITLE%",
+                    &source,
+                    track,
+                    &tonepoet_pipeline::AudioFormat::Flac,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rels[0], PathBuf::from("01 - Opening"));
+        assert_eq!(rels[1], PathBuf::from("02 - Middle"));
+        assert_eq!(rels[2], PathBuf::from("03 - Finale"));
+        assert!(
+            !source_has_duplicate_source_path_track_numbers(&source),
+            "a shared CUE image filename must not be treated as per-track path numbering evidence"
         );
     }
 
@@ -20637,44 +21048,6 @@ mod title_extra_tests {
         )
         .expect("empty disc folder component is omitted");
         assert_eq!(rel, PathBuf::from("01 - Right Off"));
-    }
-
-    fn template_source() -> PreparedSource {
-        PreparedSource {
-            container: PathBuf::from("/tmp/test.iso"),
-            kind: SourceKind::SacdIso,
-            tracks: vec![PreparedTrack {
-                id: TrackId {
-                    source_ordinal: 1,
-                    track_number: 1,
-                    disc_number: None,
-                },
-                source_ref: TrackSourceRef::StagedFile(PathBuf::from("/tmp/track.dsf")),
-                metadata: TrackMetadata {
-                    artist: Some("Miles Davis".to_string()),
-                    ..Default::default()
-                },
-                expected_samples: None,
-                sample_rate: Some(2_822_400),
-                source_audio: SourceAudioDescriptor::from_scalar(
-                    Some(2_822_400),
-                    None,
-                    Some(SourceAudioCoding::Dsd),
-                ),
-                bit_depth: None,
-            }],
-            album_metadata: AlbumMetadata {
-                album: Some("A Tribute to Jack Johnson".to_string()),
-                album_artist: Some("Miles Davis".to_string()),
-                ..Default::default()
-            },
-            provenance: ExtractionProvenance {
-                source_kind: SourceKind::SacdIso,
-                source_sha256: None,
-                tool_versions: BTreeMap::new(),
-                extracted_at: chrono::Utc::now(),
-            },
-        }
     }
 }
 

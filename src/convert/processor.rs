@@ -25,8 +25,11 @@ use tonepoet_pipeline::PipelineSettings;
 
 use crate::config::DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT;
 
+use crate::convert::formats::naming_template_with_disc_subfolder;
+
 use crate::convert::pipeline::{
-    boxed_work, build_pipeline_request, build_pipeline_request_from_settings, detect_source_kind,
+    boxed_work, build_pipeline_request as raw_build_pipeline_request, detect_source_kind,
+    build_pipeline_request_from_settings as raw_build_pipeline_request_from_settings,
     prepare_independent_single_file_album_batch_for_dispatch,
     encode_realized_track_for_scheduler_with_tool_limits_and_version_cache,
     encode_track_for_scheduler_with_tool_limits_and_version_cache,
@@ -215,6 +218,42 @@ fn companion_policy_from_item(item: &ConversionItem) -> CompanionCopyPolicy {
 
 fn apply_companion_policy_from_item(request: &mut PipelineRequest, item: &ConversionItem) {
     request.companion = companion_policy_from_item(item);
+}
+
+/// Enforce conversion-option invariants at the production request boundary.
+///
+/// The request builders live behind the pipeline module and may be reached by
+/// TUI, direct processor, and settings-driven call sites. The processor must not
+/// assume those builders have already projected every legacy `ConversionOptions`
+/// field into `PipelineRequest`. In particular, `create_disc_subfolders` affects
+/// the final publish path through `PipelineRequest::naming.template`, so apply it
+/// idempotently to the concrete template returned by the raw builder before the
+/// request can enter batching, scratch staging, or scheduler dispatch.
+fn apply_conversion_options_request_contract(
+    request: &mut PipelineRequest,
+    item: &ConversionItem,
+) {
+    if item.options.create_disc_subfolders {
+        request.naming.template = naming_template_with_disc_subfolder(
+            std::mem::take(&mut request.naming.template),
+            true,
+        );
+    }
+}
+
+fn build_pipeline_request(item: &ConversionItem) -> ConversionResult<PipelineRequest> {
+    let mut request = raw_build_pipeline_request(item)?;
+    apply_conversion_options_request_contract(&mut request, item);
+    Ok(request)
+}
+
+fn build_pipeline_request_from_settings(
+    item: &ConversionItem,
+    settings: PipelineSettings,
+) -> ConversionResult<PipelineRequest> {
+    let mut request = raw_build_pipeline_request_from_settings(item, settings)?;
+    apply_conversion_options_request_contract(&mut request, item);
+    Ok(request)
 }
 
 fn apply_scratch_staging_from_run(
@@ -446,6 +485,7 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
                                 }
                             },
                         };
+                        apply_conversion_options_request_contract(&mut request, item);
                         request.album_batch = None;
                         request.album_batch_track = None;
                         request.expected_album_track_count = None;
@@ -2914,6 +2954,71 @@ mod tests {
         item.input_path = request.container.clone();
         item.pipeline_request = Some(request);
         item
+    }
+
+    #[test]
+    fn production_request_boundary_applies_disc_subfolder_template_to_raw_builder_output() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut request = pipeline_request_for_processor_limit_test(temp.path());
+        request.naming.template = "%ARTIST%/%TRACK% - %TITLE%".to_string();
+
+        let mut item =
+            conversion_item_with_pipeline_request("disc-boundary-item", request.clone());
+        item.options.create_disc_subfolders = true;
+
+        apply_conversion_options_request_contract(&mut request, &item);
+
+        assert_eq!(
+            request.naming.template,
+            "%DISC_FOLDER%/%ARTIST%/%TRACK% - %TITLE%",
+            "processor request construction must project create_disc_subfolders into the concrete PipelineRequest naming template returned by the raw builder"
+        );
+
+        apply_conversion_options_request_contract(&mut request, &item);
+
+        assert_eq!(
+            request.naming.template,
+            "%DISC_FOLDER%/%ARTIST%/%TRACK% - %TITLE%",
+            "the production request-boundary projection must be idempotent"
+        );
+    }
+
+    #[test]
+    fn production_request_boundary_preserves_explicit_disc_folder_token() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut request = pipeline_request_for_processor_limit_test(temp.path());
+        request.naming.template = "%ALBUM%/%DISC_FOLDER%/%TRACK% - %TITLE%".to_string();
+
+        let mut item =
+            conversion_item_with_pipeline_request("explicit-disc-token-item", request.clone());
+        item.options.create_disc_subfolders = true;
+
+        apply_conversion_options_request_contract(&mut request, &item);
+
+        assert_eq!(
+            request.naming.template,
+            "%ALBUM%/%DISC_FOLDER%/%TRACK% - %TITLE%",
+            "explicit user/request templates containing the disc-folder token must not be double-prefixed"
+        );
+    }
+
+    #[test]
+    fn production_request_boundary_does_not_remove_manual_disc_folder_template_when_toggle_off() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut request = pipeline_request_for_processor_limit_test(temp.path());
+        request.naming.template = "%DISC_FOLDER%/%TRACK% - %TITLE%".to_string();
+
+        let mut item =
+            conversion_item_with_pipeline_request("manual-disc-token-item", request.clone());
+        item.options.create_disc_subfolders = false;
+
+        apply_conversion_options_request_contract(&mut request, &item);
+
+        assert_eq!(
+            request.naming.template,
+            "%DISC_FOLDER%/%TRACK% - %TITLE%",
+            "the contract must not strip a manually authored disc-folder token when the UI toggle is off"
+        );
     }
 
     #[tokio::test]
