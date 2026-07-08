@@ -1863,3 +1863,4 @@ mod all_audio_expansion_tests {
         assert_eq!(names(&out), vec!["a.flac", "b.flac"]);
     }
 }
+

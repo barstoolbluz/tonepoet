@@ -11076,15 +11076,11 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     }
 
-    let mut paths: Vec<std::path::PathBuf> = crate::convert::queue_expansion::expand_paths_to_audio(&sel)
-        .into_iter()
-        .filter(|p| {
-            matches!(
-                crate::convert::classify::classify_file(p),
-                crate::convert::classify::EntryKind::AudioFile(_)
-            )
-        })
-        .collect();
+    // Metadata semantics, via the shared helper: every audio file including
+    // single-image CUE carriers that queue expansion suppresses. This call
+    // site has been silently reverted to queue semantics twice by bundle
+    // applications; the behavioral test below pins it.
+    let mut paths: Vec<std::path::PathBuf> = super::command::expand_audio_paths_for_metadata(&sel);
 
     if paths.is_empty() {
         app.set_status("No audio files selected");
@@ -30010,5 +30006,80 @@ mod staged_archive_metadata_path_tests {
             .expect_err("symlink descendant must reject folder metadata edit");
 
         assert!(err.contains("symlink"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod single_image_metadata_editor_regression_tests {
+    use super::*;
+    use crate::tui::app::{ActiveOverlay, AppState};
+    use crate::config::TonepoetConfig;
+
+    fn fixture_tool_available(tool: &str) -> bool {
+        std::process::Command::new(tool)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Regression pin: Edit Metadata on a single-image CUE directory must
+    /// open the editor on the image file, never report "No audio files
+    /// selected". This call path has been silently reverted to queue-
+    /// suppression semantics twice by wholesale bundle file application
+    /// (13b100d-era heuristics via stale snapshots); a behavioral test is
+    /// the only durable protection.
+    #[test]
+    fn open_metadata_editor_targets_single_image_cue_directory() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let image = album.join("album.flac");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                   "sine=frequency=440:sample_rate=44100:duration=1", "-c:a", "flac"])
+            .arg(&image)
+            .status()
+            .expect("ffmpeg fixture");
+        assert!(status.success());
+        std::fs::write(
+            album.join("album.cue"),
+            "TITLE \"Album\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:30:00\n",
+        )
+        .expect("cue fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::convert::classify::EntryKind::Directory]
+            .into_iter()
+            .map(|kind| {
+                super::super::browse::BrowseEntry::new(
+                    album.clone(),
+                    "album".to_string(),
+                    kind,
+                    0,
+                    None,
+                )
+            })
+            .collect();
+        app.browse.selected_index = 0;
+
+        open_metadata_editor(&mut app);
+
+        assert_ne!(
+            app.status_message.as_ref().map(|(text, _)| text.as_str()),
+            Some("No audio files selected"),
+            "single-image directories must resolve their image for metadata editing"
+        );
+        assert!(
+            matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)),
+            "metadata editor should open on the image file"
+        );
     }
 }

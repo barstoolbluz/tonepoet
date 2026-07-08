@@ -87,6 +87,10 @@ fn current_bulk_guard_paths(app: &AppState) -> Vec<PathBuf> {
         _ => Vec::new(),
     }
 }
+pub(crate) fn expand_audio_paths_for_metadata(paths: &[PathBuf]) -> Vec<PathBuf> {
+    expand_audio_paths(paths)
+}
+
 fn expand_audio_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     // Metadata/analysis semantics: every audio file, including single-image
     // CUE carriers that queue expansion would suppress in favor of the CUE.
