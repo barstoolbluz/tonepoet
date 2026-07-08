@@ -13407,6 +13407,7 @@ mod browse_convert_expansion_lifecycle_tests {
             },
             selection_snapshot: vec![PathBuf::from(path)],
             browse_in_archive: false,
+            dropped_stale_selection_count: 0,
         }
     }
 

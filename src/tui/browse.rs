@@ -2715,6 +2715,13 @@ pub struct PendingBrowseInlineRenameAfterScan {
     pub target_path: PathBuf,
 }
 
+/// Result of directory-scoping raw multi-select marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopedMultiSelection {
+    pub paths: Vec<PathBuf>,
+    pub dropped_stale_count: usize,
+}
+
 impl BrowseState {
     pub fn new() -> Self {
         Self::new_with_config(&crate::config::BrowsingConfig::default())
@@ -2907,6 +2914,11 @@ impl BrowseState {
 
     fn navigate_without_history(&mut self, path: PathBuf) {
         if !path.is_dir() {
+            return;
+        }
+        if same_path(&self.current_dir, &path) {
+            self.current_dir = path;
+            self.refresh();
             return;
         }
         self.invalidate_path_validation();
@@ -3220,8 +3232,7 @@ impl BrowseState {
             password,
             staging: None,
         });
-        self.multi_selected.clear();
-        self.multi_select_anchor = None;
+        self.clear_multi_selection();
         self.selected_index = 0;
         self.scroll_offset = 0;
         self.clear_dir_stats_work_queue();
@@ -3299,8 +3310,7 @@ impl BrowseState {
             password,
             staging: previous_staging,
         });
-        self.multi_selected.clear();
-        self.multi_select_anchor = None;
+        self.clear_multi_selection();
         self.clear_dir_stats_work_queue();
         self.clear_folder_classification_work_queue();
         self.clear_type_ahead();
@@ -3334,7 +3344,7 @@ impl BrowseState {
         self.invalidate_path_validation();
         self.close_search_for_navigation();
         self.archive = None;
-        self.multi_selected.clear();
+        self.clear_multi_selection();
         self.selected_index = 0;
         self.scroll_offset = 0;
         self.refresh();
@@ -3347,7 +3357,7 @@ impl BrowseState {
         if let Some(ref mut arc) = self.archive {
             arc.inner_path = dir_path.to_string();
         }
-        self.multi_selected.clear();
+        self.clear_multi_selection();
         self.selected_index = 0;
         self.scroll_offset = 0;
         self.clear_dir_stats_work_queue();
@@ -3369,7 +3379,7 @@ impl BrowseState {
                 Some(pos) => arc.inner_path[..pos].to_string(),
                 None => String::new(),
             };
-            self.multi_selected.clear();
+            self.clear_multi_selection();
             self.selected_index = 0;
             self.scroll_offset = 0;
             self.clear_dir_stats_work_queue();
@@ -3984,6 +3994,10 @@ impl BrowseState {
         if let Some(entry) = self.entries.get(self.selected_index) {
             if entry.is_dir() {
                 let path = entry.path.clone();
+                if same_path(&self.current_dir, &path) {
+                    self.refresh();
+                    return true;
+                }
                 self.invalidate_path_validation();
                 self.push_nav_history(path.clone());
                 self.current_dir = path;
@@ -4007,6 +4021,10 @@ impl BrowseState {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string());
             let parent = parent.to_path_buf();
+            if same_path(&self.current_dir, &parent) {
+                self.refresh();
+                return true;
+            }
             self.invalidate_path_validation();
             self.push_nav_history(parent.clone());
             self.current_dir = parent;
@@ -4021,6 +4039,11 @@ impl BrowseState {
     /// Navigate directly to a given path
     pub fn navigate_to(&mut self, path: PathBuf) {
         if path.is_dir() {
+            if same_path(&self.current_dir, &path) {
+                self.current_dir = path;
+                self.refresh();
+                return;
+            }
             self.invalidate_path_validation();
             self.push_nav_history(path.clone());
             self.current_dir = path;
@@ -4091,6 +4114,11 @@ impl BrowseState {
             let final_path = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
             if !final_path.is_dir() {
                 return Err(format!("not a directory: {}", final_path.display()));
+            }
+            if same_path(&self.current_dir, &final_path) {
+                self.current_dir = final_path;
+                self.refresh();
+                return Ok(());
             }
             self.invalidate_path_validation();
             self.push_nav_history(final_path.clone());
@@ -4323,16 +4351,29 @@ impl BrowseState {
         }
     }
 
+    fn discard_multi_select_anchor_if_unselected(&mut self) {
+        if self
+            .multi_select_anchor
+            .as_ref()
+            .is_some_and(|anchor| !self.multi_selected.iter().any(|selected| selected == anchor))
+        {
+            self.multi_select_anchor = None;
+        }
+    }
+
     /// Toggle multi-select on the entry at `index` without changing the cursor.
     /// ParentDir is deliberately ignored because it is a navigation pseudo-row.
     pub fn toggle_selection_at_index(&mut self, index: usize) -> Option<PathBuf> {
         let path = self.selectable_entry_path_at(index)?;
         if let Some(pos) = self.multi_selected.iter().position(|p| p == &path) {
             self.multi_selected.remove(pos);
+            if self.multi_select_anchor.as_ref().is_some_and(|anchor| anchor == &path) {
+                self.multi_select_anchor = None;
+            }
         } else {
             self.multi_selected.push(path.clone());
+            self.multi_select_anchor = Some(path.clone());
         }
-        self.multi_select_anchor = Some(path.clone());
         Some(path)
     }
 
@@ -4343,6 +4384,86 @@ impl BrowseState {
 
     pub fn is_multi_selected(&self, path: &Path) -> bool {
         self.multi_selected.iter().any(|p| p.as_path() == path)
+    }
+
+    fn path_is_in_current_mark_scope(&self, path: &Path) -> bool {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+
+        if let Some(arc) = self.archive.as_ref() {
+            let expected_parent = if arc.inner_path.is_empty() {
+                arc.listing.archive_path.clone()
+            } else {
+                arc.listing.archive_path.join(&arc.inner_path)
+            };
+            parent == expected_parent.as_path()
+        } else {
+            parent == self.current_dir.as_path()
+        }
+    }
+
+    /// Return only marks that belong to the directory context currently shown
+    /// by Browse. This is the consumer-side safety invariant for multi-select:
+    /// a mark is only ever visible-and-actionable in the directory that
+    /// contains it. The filter is deterministic and filesystem-free; it
+    /// preserves mark order and reports how many stale cross-directory paths
+    /// were removed from the actionable view.
+    pub(crate) fn scoped_multi_selected_in_current_directory(&self) -> ScopedMultiSelection {
+        let paths: Vec<PathBuf> = self
+            .multi_selected
+            .iter()
+            .filter(|path| self.path_is_in_current_mark_scope(path))
+            .cloned()
+            .collect();
+        let dropped_stale_count = self.multi_selected.len().saturating_sub(paths.len());
+        ScopedMultiSelection {
+            paths,
+            dropped_stale_count,
+        }
+    }
+
+    /// Backward-compatible convenience for callers that only need the scoped
+    /// path list. New file-operation consumers should prefer
+    /// `scoped_multi_selected_in_current_directory()` so they can surface stale
+    /// drops to the user.
+    pub(crate) fn multi_selected_in_current_directory(&self) -> Vec<PathBuf> {
+        self.scoped_multi_selected_in_current_directory().paths
+    }
+
+    /// Remove stale cross-directory marks from raw Browse state and return the
+    /// number removed. This is the mutating form of the mark-scope invariant:
+    /// once any consumer detects stale marks, the raw selection state is
+    /// repaired immediately so Esc, select-all/invert, anchor handling, and
+    /// later cursor fallback all observe the same scoped selection.
+    pub(crate) fn prune_stale_multi_selection_for_current_directory(&mut self) -> usize {
+        let scoped = self.scoped_multi_selected_in_current_directory();
+        if scoped.dropped_stale_count == 0 {
+            return 0;
+        }
+        self.multi_selected = scoped.paths;
+        self.discard_multi_select_anchor_if_unselected();
+        self.selection_mode = SelectionMode::Normal;
+        self.drag_state.active = false;
+        scoped.dropped_stale_count
+    }
+
+    /// Raw, unexpanded Browse action selection for async freshness snapshots
+    /// and command/file-op consumers. Pure snapshot callers preserve the
+    /// historical rule that raw mark mode suppresses cursor fallback, while
+    /// mutating file-operation consumers first call
+    /// `prune_stale_multi_selection_for_current_directory()` so stale-only raw
+    /// marks are repaired before fallback is decided.
+    pub(crate) fn action_selection_in_current_directory(&self) -> Vec<PathBuf> {
+        if !self.multi_selected.is_empty() {
+            return self.multi_selected_in_current_directory();
+        }
+        if let Some(entry) = self.selected_entry() {
+            if !matches!(entry.kind, EntryKind::ParentDir) {
+                return vec![entry.path.clone()];
+            }
+        }
+        Vec::new()
     }
 
     pub fn is_range_mode(&self) -> bool {
@@ -4369,6 +4490,7 @@ impl BrowseState {
     }
 
     pub fn begin_range_selection_at(&mut self, anchor_index: usize) {
+        self.prune_stale_multi_selection_for_current_directory();
         if !self.is_range_mode() {
             self.selection_mode = SelectionMode::Range {
                 anchor_index: anchor_index.min(self.entries.len().saturating_sub(1)),
@@ -4419,6 +4541,7 @@ impl BrowseState {
                 ..
             } => {
                 self.multi_selected = pre_range_selection;
+                self.discard_multi_select_anchor_if_unselected();
                 true
             }
             SelectionMode::Normal => {
@@ -4443,6 +4566,7 @@ impl BrowseState {
     }
 
     pub fn toggle_all_visible_selection(&mut self) {
+        self.prune_stale_multi_selection_for_current_directory();
         let visible_paths: Vec<PathBuf> = self
             .entries
             .iter()
@@ -4463,10 +4587,12 @@ impl BrowseState {
                 self.push_unique_selection(path);
             }
         }
+        self.discard_multi_select_anchor_if_unselected();
         self.selection_mode = SelectionMode::Normal;
     }
 
     pub fn invert_visible_selection(&mut self) {
+        self.prune_stale_multi_selection_for_current_directory();
         let visible_paths: Vec<PathBuf> = self
             .entries
             .iter()
@@ -4480,19 +4606,21 @@ impl BrowseState {
                 self.multi_selected.push(path);
             }
         }
+        self.discard_multi_select_anchor_if_unselected();
         self.selection_mode = SelectionMode::Normal;
     }
 
     pub fn clear_multi_selection(&mut self) {
         self.multi_selected.clear();
+        self.multi_select_anchor = None;
         self.selection_mode = SelectionMode::Normal;
         self.drag_state.active = false;
     }
 
-    fn multi_selected_disc_source_dir_roots(&self) -> Vec<PathBuf> {
+    fn multi_selected_disc_source_dir_roots_for(&self, selected_paths: &[PathBuf]) -> Vec<PathBuf> {
         let mut roots = Vec::new();
         let mut root_keys = HashSet::new();
-        for selected_path in &self.multi_selected {
+        for selected_path in selected_paths {
             let selected_entry = self
                 .entries
                 .iter()
@@ -4528,12 +4656,16 @@ impl BrowseState {
     /// so Library and future screens can reuse the same logic.
     pub fn collect_selection_for_queue(&self) -> QueueExpansionResult {
         if !self.multi_selected.is_empty() {
-            let preserved_disc_roots = self.multi_selected_disc_source_dir_roots();
+            let selected_paths = self.multi_selected_in_current_directory();
+            if selected_paths.is_empty() {
+                return QueueExpansionResult::default();
+            }
+            let preserved_disc_roots = self.multi_selected_disc_source_dir_roots_for(&selected_paths);
             if preserved_disc_roots.is_empty() {
-                return expand_paths_to_audio_with_metadata(&self.multi_selected);
+                return expand_paths_to_audio_with_metadata(&selected_paths);
             }
             return expand_paths_to_audio_with_preserved_disc_roots(
-                &self.multi_selected,
+                &selected_paths,
                 &preserved_disc_roots,
             );
         }
@@ -5745,13 +5877,16 @@ impl BrowseState {
         });
     }
 
-    /// Reset filter state AND clear the multi-select anchor, used by navigation
-    /// methods. The anchor is for range-select (Alt+click) and is a
-    /// per-directory context.
+    /// Reset all per-directory Browse state after a real directory-context
+    /// change. Multi-select marks, their anchor, and any in-progress range or
+    /// drag selection are directory-scoped: a mark is only ever
+    /// visible-and-actionable in the directory that contains it. Callers that
+    /// re-enter the same directory should not call this; same-directory
+    /// navigation is a no-op for marks.
     fn reset_nav_state(&mut self) {
         self.close_search_for_navigation();
         self.reset_filter_state();
-        self.multi_select_anchor = None;
+        self.clear_multi_selection();
         self.clear_type_ahead();
         self.clear_pending_inline_rename_after_scan();
         self.probe_debounce = None;
@@ -15592,6 +15727,7 @@ mod disc_directory_navigation_tests {
             );
 
             let mut state = BrowseState::new();
+            state.current_dir = temp.path().to_path_buf();
             state.entries = vec![disc_entry, normal_entry];
             state.multi_selected = vec![disc_dir.clone(), normal_dir.clone(), nested_audio.clone()];
 
@@ -16269,6 +16405,9 @@ mod selection_behavior_tests {
 
     fn selection_state() -> BrowseState {
         let mut state = BrowseState::new();
+        // The fixture entries live under /tmp; marks are directory-scoped, so
+        // the fixture must stand in the directory that contains them.
+        state.current_dir = PathBuf::from("/tmp");
         state.entries = vec![
             test_entry("..", EntryKind::ParentDir),
             test_entry("a.flac", EntryKind::OtherFile),
@@ -16356,8 +16495,119 @@ mod selection_behavior_tests {
         assert!(state.multi_selected.is_empty());
 
         state.toggle_selection_at_index(1);
+        assert_eq!(state.multi_select_anchor, Some(state.entries[1].path.clone()));
+        state.toggle_selection_at_index(1);
+        assert!(state.multi_selected.is_empty());
+        assert!(state.multi_select_anchor.is_none());
+
+        state.toggle_selection_at_index(1);
         state.invert_visible_selection();
         assert_eq!(selected_names(&state), vec!["b.flac", "c.flac"]);
+        assert!(state.multi_select_anchor.is_none());
         assert!(!state.multi_selected.iter().any(|path| path.ends_with("..")));
+    }
+
+    #[test]
+    fn root_directory_mark_scope_keeps_only_root_children() {
+        let mut state = BrowseState::new();
+        let root_child = PathBuf::from("/album");
+        let nested_child = PathBuf::from("/tmp/album");
+        state.current_dir = PathBuf::from("/");
+        state.multi_selected = vec![root_child.clone(), nested_child];
+
+        assert_eq!(state.multi_selected_in_current_directory(), vec![root_child]);
+    }
+
+    #[test]
+    fn navigation_reset_clears_marks_anchor_and_range_state() {
+        let mut state = selection_state();
+        state.toggle_selection_at_index(1);
+        state.begin_range_selection_at(1);
+        state.selected_index = 3;
+        state.update_range_preview();
+        state.drag_state.active = true;
+
+        state.reset_nav_state();
+
+        assert!(state.multi_selected.is_empty());
+        assert!(state.multi_select_anchor.is_none());
+        assert_eq!(state.selection_mode, SelectionMode::Normal);
+        assert!(!state.drag_state.active);
+    }
+
+    #[test]
+    fn same_directory_navigation_preserves_marks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current = temp.path().join("current");
+        std::fs::create_dir_all(&current).expect("current dir");
+        let marked = current.join("album");
+        std::fs::create_dir_all(&marked).expect("marked dir");
+
+        let mut state = BrowseState::new();
+        state.current_dir = current.clone();
+        state.multi_selected = vec![marked.clone()];
+        state.multi_select_anchor = Some(marked.clone());
+
+        state.navigate_to(current.clone());
+
+        assert_eq!(state.current_dir, current);
+        assert_eq!(state.multi_selected, vec![marked.clone()]);
+        assert_eq!(state.multi_select_anchor, Some(marked));
+    }
+
+    #[test]
+    fn directory_round_trip_clears_marks_each_time() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir_a = temp.path().join("a");
+        let dir_b = temp.path().join("b");
+        std::fs::create_dir_all(&dir_a).expect("dir a");
+        std::fs::create_dir_all(&dir_b).expect("dir b");
+        let a_album = dir_a.join("album-a");
+        let b_album = dir_b.join("album-b");
+        std::fs::create_dir_all(&a_album).expect("album a");
+        std::fs::create_dir_all(&b_album).expect("album b");
+
+        let mut state = BrowseState::new();
+        state.current_dir = dir_a.clone();
+        state.multi_selected = vec![a_album];
+        state.multi_select_anchor = state.multi_selected.first().cloned();
+
+        state.navigate_to(dir_b.clone());
+        assert_eq!(state.current_dir, dir_b);
+        assert!(state.multi_selected.is_empty());
+        assert!(state.multi_select_anchor.is_none());
+
+        state.multi_selected = vec![b_album];
+        state.multi_select_anchor = state.multi_selected.first().cloned();
+        state.navigate_to(dir_a.clone());
+        assert_eq!(state.current_dir, dir_a);
+        assert!(state.multi_selected.is_empty());
+        assert!(state.multi_select_anchor.is_none());
+    }
+
+    #[test]
+    fn queue_collection_drops_cross_directory_marks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir_a = temp.path().join("a");
+        let dir_b = temp.path().join("b");
+        std::fs::create_dir_all(&dir_a).expect("dir a");
+        std::fs::create_dir_all(&dir_b).expect("dir b");
+        let a_one = dir_a.join("a-one.flac");
+        let a_two = dir_a.join("a-two.flac");
+        let b_one = dir_b.join("b-one.flac");
+        let b_two = dir_b.join("b-two.flac");
+        for path in [&a_one, &a_two, &b_one, &b_two] {
+            std::fs::write(path, b"fixture").expect("audio fixture");
+        }
+
+        let mut state = BrowseState::new();
+        state.current_dir = dir_b;
+        state.multi_selected = vec![a_one, b_one.clone(), a_two, b_two.clone()];
+
+        let mut collected = state.collect_selection_for_queue().paths;
+        collected.sort();
+        let mut expected = vec![b_one, b_two];
+        expected.sort();
+        assert_eq!(collected, expected);
     }
 }

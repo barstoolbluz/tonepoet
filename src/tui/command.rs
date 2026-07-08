@@ -129,6 +129,11 @@ pub struct BrowseConvertExpansionRequest {
     pub target: BrowseConvertExpansionTarget,
     pub selection_snapshot: Vec<PathBuf>,
     pub browse_in_archive: bool,
+    /// Number of stale Browse multi-select marks pruned when this request was
+    /// created. Folder expansion publishes status asynchronously, so the count
+    /// travels with the request to preserve stale-mark observability after the
+    /// final queue/convert status is written.
+    pub dropped_stale_selection_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -350,10 +355,14 @@ pub(crate) fn start_browse_convert_folder_expansion(
     tx: &mpsc::Sender<AppMessage>,
     target: BrowseConvertExpansionTarget,
     paths: Vec<PathBuf>,
+    dropped_stale_selection_count: usize,
 ) {
     let selection_snapshot = normalized_path_snapshot(paths);
     if selection_snapshot.is_empty() {
-        app.set_status("queue: no selection");
+        app.set_status(status_with_stale_selection_notice(
+            dropped_stale_selection_count,
+            "queue: no selection",
+        ));
         return;
     }
 
@@ -361,6 +370,7 @@ pub(crate) fn start_browse_convert_folder_expansion(
         target,
         selection_snapshot,
         browse_in_archive: app.browse.is_in_archive(),
+        dropped_stale_selection_count,
     };
     let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
 
@@ -372,11 +382,15 @@ pub(crate) fn start_browse_convert_folder_expansion(
             path,
         ))
         .count();
-    app.set_status(if folder_count > 1 {
+    let status = if folder_count > 1 {
         "Expanding selected folders…".to_string()
     } else {
         "Expanding folder…".to_string()
-    });
+    };
+    app.set_status(status_with_stale_selection_notice(
+        dropped_stale_selection_count,
+        status,
+    ));
 
     let tx_for_worker = tx.clone();
     let request_for_worker = request.clone();
@@ -423,17 +437,7 @@ fn browse_convert_expansion_selection_still_current(
             // Compare against the raw Browse selection: expansion requests are
             // created from raw paths (before directory expansion), so the
             // freshness snapshot must be collected the same way.
-            if !app.browse.multi_selected.is_empty() {
-                app.browse.multi_selected.clone()
-            } else if let Some(entry) = app.browse.selected_entry() {
-                if matches!(entry.kind, crate::convert::classify::EntryKind::ParentDir) {
-                    Vec::new()
-                } else {
-                    vec![entry.path.clone()]
-                }
-            } else {
-                Vec::new()
-            }
+            app.browse.action_selection_in_current_directory()
         }
     };
 
@@ -463,22 +467,29 @@ pub(crate) fn handle_browse_convert_expansion_complete(
     let _ = app.complete_browse_convert_expansion(generation, &request);
 
     if expansion.cancelled {
-        app.set_status("folder expansion cancelled");
+        app.set_status(status_with_stale_selection_notice(
+            request.dropped_stale_selection_count,
+            "folder expansion cancelled",
+        ));
         return;
     }
     if let Some(err) = expansion.expansion_errors.first() {
-        app.set_status(err.clone());
+        app.set_status(status_with_stale_selection_notice(
+            request.dropped_stale_selection_count,
+            err.clone(),
+        ));
         return;
     }
     if expansion.queue.paths.is_empty() {
-        if let Some(folder) = expansion.empty_audio_folders.first() {
-            app.set_status(format!(
-                "No supported audio files found in {}",
-                folder.display()
-            ));
+        let status = if let Some(folder) = expansion.empty_audio_folders.first() {
+            format!("No supported audio files found in {}", folder.display())
         } else {
-            app.set_status("No supported sources selected");
-        }
+            "No supported sources selected".to_string()
+        };
+        app.set_status(status_with_stale_selection_notice(
+            request.dropped_stale_selection_count,
+            status,
+        ));
         return;
     }
 
@@ -491,12 +502,20 @@ pub(crate) fn handle_browse_convert_expansion_complete(
                 expansion.expanded_folder_count,
                 true,
             );
+            prefix_current_status_with_stale_selection_notice(
+                app,
+                request.dropped_stale_selection_count,
+            );
         }
         BrowseConvertExpansionTarget::ConvertQueueItems => {
             queue_browse_convert_paths_for_processing(app, expansion.queue);
             app.browse.clear_multi_selection();
             app.current_screen = AppScreen::Queue;
             app.browse.return_target = super::browse::BrowseReturnTarget::None;
+            prefix_current_status_with_stale_selection_notice(
+                app,
+                request.dropped_stale_selection_count,
+            );
         }
         BrowseConvertExpansionTarget::ConvertReview { preset, post_load } => {
             if finish_browse_queue_review_after_expansion(
@@ -508,6 +527,10 @@ pub(crate) fn handle_browse_convert_expansion_complete(
             ) {
                 apply_browse_convert_post_load_action(app, tx, post_load);
             }
+            prefix_current_status_with_stale_selection_notice(
+                app,
+                request.dropped_stale_selection_count,
+            );
         }
     }
 }
@@ -3511,8 +3534,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             if app.current_screen != AppScreen::Browse {
                 app.set_status(":rename-all only works on the browse screen");
             } else {
-                let paths = collect_selection_for_file_ops(app);
-                let audio_paths: Vec<PathBuf> = paths
+                let selection = collect_selection_for_file_ops_scoped(app);
+                let dropped_stale_count = selection.dropped_stale_count;
+                let audio_paths: Vec<PathBuf> = selection
+                    .paths
                     .into_iter()
                     .filter(|p| {
                         app.browse.entries.iter().any(|e| {
@@ -3521,6 +3546,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     })
                     .collect();
                 super::keybindings::open_bulk_rename(app, audio_paths);
+                surface_stale_selection_notice(app, dropped_stale_count);
             }
         }
         Command::WriteRgTrack | Command::WriteRgAlbum => {
@@ -4795,21 +4821,15 @@ fn execute_queue_with_post_load(
 ) {
     match app.current_screen {
         AppScreen::Browse => {
+            let dropped_stale_count = app
+                .browse
+                .prune_stale_multi_selection_for_current_directory();
+
             // Check the raw selection before collect_selection_for_queue():
             // that collection expands directories with a synchronous recursive
             // walk, which both blocks the reducer on large trees and erases
             // the directory the async-expansion candidate check needs to see.
-            let raw_selection: Vec<PathBuf> = if !app.browse.multi_selected.is_empty() {
-                app.browse.multi_selected.clone()
-            } else if let Some(entry) = app.browse.selected_entry() {
-                if matches!(entry.kind, crate::convert::classify::EntryKind::ParentDir) {
-                    Vec::new()
-                } else {
-                    vec![entry.path.clone()]
-                }
-            } else {
-                Vec::new()
-            };
+            let raw_selection: Vec<PathBuf> = app.browse.action_selection_in_current_directory();
 
             if browse_selection_contains_regular_audio_folder_for_convert(app, &raw_selection) {
                 start_browse_convert_folder_expansion(
@@ -4817,19 +4837,24 @@ fn execute_queue_with_post_load(
                     tx,
                     BrowseConvertExpansionTarget::ConvertReview { preset, post_load },
                     raw_selection,
+                    dropped_stale_count,
                 );
                 return;
             }
 
             let selection = app.browse.collect_selection_for_queue();
             if selection.paths.is_empty() {
-                app.set_status("queue: no selection");
+                app.set_status(status_with_stale_selection_notice(
+                    dropped_stale_count,
+                    "queue: no selection",
+                ));
                 return;
             }
 
             if finish_browse_queue_review_after_expansion(app, tx, preset, selection, 0) {
                 apply_browse_convert_post_load_action(app, tx, post_load);
             }
+            prefix_current_status_with_stale_selection_notice(app, dropped_stale_count);
         }
         AppScreen::Library => {
             // Placeholder screen. Selection inheritance arrives in 6c.
@@ -5458,7 +5483,8 @@ fn execute_delete(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
             super::keybindings::start_browse_archive_entry_delete(app, tx);
         }
         DeleteCommandDispatch::FilesystemPermanentDelete => {
-            let paths = collect_selection_for_file_ops(app);
+            let selection = collect_selection_for_file_ops_scoped(app);
+            let paths = selection.paths;
             if paths.is_empty() {
                 app.set_status("no files selected");
                 return;
@@ -5472,6 +5498,7 @@ fn execute_delete(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
                 ),
                 action: ConfirmAction::DeleteSelection(paths),
             };
+            surface_stale_selection_notice(app, selection.dropped_stale_count);
         }
     }
 }
@@ -5524,14 +5551,16 @@ fn execute_file_op(
     // Collect sources: multi-selected or cursor entry. Unlike
     // collect_selection_for_queue, we DON'T expand directories — copy/move
     // operates on the entry itself, not its contents.
-    let sources = collect_selection_for_file_ops(app);
+    let selection = collect_selection_for_file_ops_scoped(app);
+    let sources = selection.paths;
+    let dropped_stale_count = selection.dropped_stale_count;
     if sources.is_empty() {
         app.set_status("no files selected for copy/move");
         return;
     }
 
     if dest.trim().is_empty() {
-        open_file_picker_for_copy_move(app, sources, force, is_move);
+        open_file_picker_for_copy_move(app, sources, force, is_move, dropped_stale_count);
         return;
     }
 
@@ -5546,6 +5575,7 @@ fn execute_file_op(
     // completions and picker completions.
     let dest_expanded = expand_path(dest.trim());
     super::keybindings::apply_file_op_with_tx(app, target, &dest_expanded, tx);
+    surface_stale_selection_notice(app, dropped_stale_count);
 }
 
 /// Open the reusable file picker as a Browse-screen destination chooser for
@@ -5557,6 +5587,7 @@ pub(super) fn open_file_picker_for_copy_move(
     sources: Vec<PathBuf>,
     force: bool,
     is_move: bool,
+    dropped_stale_count: usize,
 ) {
     if app.current_screen != AppScreen::Browse {
         let cmd = if is_move { ":mv" } else { ":cp" };
@@ -5594,7 +5625,11 @@ pub(super) fn open_file_picker_for_copy_move(
         FilePickerPurpose::CopyTo { sources, force }
     };
     app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(purpose, picker));
-    app.set_status(format!("{}: choose a destination folder", title));
+    let status = format!("{}: choose a destination folder", title);
+    app.set_status(status_with_stale_selection_notice(
+        dropped_stale_count,
+        status,
+    ));
 }
 
 fn directory_destination_picker_policy() -> tui_file_picker::FileOperationPolicy {
@@ -5704,23 +5739,96 @@ fn preset_picker_policy() -> tui_file_picker::FileOperationPolicy {
     }
 }
 
-/// Collect selected entries for file ops (copy/move). Unlike
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ScopedFileSelection {
+    pub paths: Vec<PathBuf>,
+    pub dropped_stale_count: usize,
+}
+
+fn stale_selection_notice(dropped_stale_count: usize) -> Option<String> {
+    if dropped_stale_count == 0 {
+        None
+    } else {
+        Some(format!(
+            "Ignored {} stale selection mark{} outside the current directory",
+            dropped_stale_count,
+            if dropped_stale_count == 1 { "" } else { "s" }
+        ))
+    }
+}
+
+pub(super) fn status_with_stale_selection_notice(
+    dropped_stale_count: usize,
+    status: impl Into<String>,
+) -> String {
+    let status = status.into();
+    match stale_selection_notice(dropped_stale_count) {
+        Some(notice) => format!("{notice}; {status}"),
+        None => status,
+    }
+}
+
+pub(super) fn surface_stale_selection_notice(app: &mut AppState, dropped_stale_count: usize) {
+    if let Some(notice) = stale_selection_notice(dropped_stale_count) {
+        app.set_status(notice);
+    }
+}
+
+pub(super) fn prefix_current_status_with_stale_selection_notice(
+    app: &mut AppState,
+    dropped_stale_count: usize,
+) {
+    let Some(notice) = stale_selection_notice(dropped_stale_count) else {
+        return;
+    };
+    let current = app
+        .status_message
+        .as_ref()
+        .map(|(message, _)| message.clone())
+        .unwrap_or_default();
+    if current.starts_with(&notice) {
+        return;
+    }
+    if current.is_empty() {
+        app.set_status(notice);
+    } else {
+        app.set_status(format!("{notice}; {current}"));
+    }
+}
+
+/// Collect selected entries for file ops (copy/move/delete/rename). Unlike
 /// `collect_selection_for_queue`, directories are NOT expanded — the
-/// op targets the directory itself.
+/// op targets the directory itself. Multi-select marks are defensively scoped
+/// to the current Browse directory before any destructive consumer sees them;
+/// a stale cross-directory mark is never actionable even if navigation forgot
+/// to clear it. This immutable helper remains useful for pure planning paths;
+/// mutating/destructive consumers should use
+/// `collect_selection_for_file_ops_scoped()` so stale raw state is repaired and
+/// the user can be told when an upstream invariant failed.
 pub(super) fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
     if let Some(paths) = app.bulk_guard_frozen_paths.as_ref() {
         return paths.clone();
     }
-    use crate::convert::classify::EntryKind;
-    if !app.browse.multi_selected.is_empty() {
-        return app.browse.multi_selected.clone();
+    app.browse.action_selection_in_current_directory()
+}
+
+/// Mutating file-op selection boundary. It preserves the bulk-guard frozen
+/// snapshot contract, otherwise prunes stale raw Browse marks before deriving
+/// the actionable path list. The returned count lets destructive consumers
+/// surface observability instead of silently hiding an invariant failure.
+pub(super) fn collect_selection_for_file_ops_scoped(app: &mut AppState) -> ScopedFileSelection {
+    if let Some(paths) = app.bulk_guard_frozen_paths.as_ref() {
+        return ScopedFileSelection {
+            paths: paths.clone(),
+            dropped_stale_count: 0,
+        };
     }
-    if let Some(entry) = app.browse.selected_entry() {
-        if !matches!(entry.kind, EntryKind::ParentDir) {
-            return vec![entry.path.clone()];
-        }
+    let dropped_stale_count = app.browse.prune_stale_multi_selection_for_current_directory();
+    let paths = app.browse.action_selection_in_current_directory();
+    ScopedFileSelection {
+        paths,
+        dropped_stale_count,
     }
-    Vec::new()
 }
 
 /// Phase C-2 seed values for `search_releases_by_query` extracted
@@ -13502,6 +13610,71 @@ mod execute_queue_state_consistency_tests {
         ));
     }
 
+    // Entering the Convert screen kicks off an async source probe
+    // (tokio::spawn), so this test needs a runtime.
+    #[tokio::test]
+    async fn async_browse_queue_review_completion_preserves_stale_notice_after_final_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let track = album.join("01 - One.flac");
+        std::fs::write(&track, b"fixture").expect("track fixture");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        let request = BrowseConvertExpansionRequest {
+            target: BrowseConvertExpansionTarget::ConvertReview {
+                preset: None,
+                post_load: BrowseConvertPostLoad::ReviewOnly,
+            },
+            selection_snapshot: vec![album],
+            browse_in_archive: false,
+            dropped_stale_selection_count: 2,
+        };
+        let (generation, _cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request,
+            BrowseConvertExpansion {
+                queue: QueueExpansionResult {
+                    paths: vec![track],
+                    cue_artifact_audio: std::collections::HashSet::new(),
+                },
+                expanded_folder_count: 1,
+                empty_audio_folders: Vec::new(),
+                expansion_errors: Vec::new(),
+                visited: 1,
+                cancelled: false,
+            },
+        );
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or_default();
+        // The stale notice must survive as a prefix of whichever completion
+        // status the review flow writes (probe wording varies by fixture
+        // decodability, so pin the shared suffix instead of one branch).
+        assert!(status.starts_with("Ignored 2 stale selection marks outside the current directory; "));
+        assert!(status.contains("review settings, then :commit or :Commit"));
+    }
+
     #[test]
     fn stale_browse_convert_expansion_completion_does_not_publish_or_commit() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -13543,6 +13716,7 @@ mod execute_queue_state_consistency_tests {
             },
             selection_snapshot: vec![album_a],
             browse_in_archive: false,
+            dropped_stale_selection_count: 0,
         };
         let (generation, _cancel) = app.begin_browse_convert_expansion(request.clone());
 
@@ -13832,5 +14006,261 @@ mod bulk_guard_behavior_tests {
         app.bulk_guard_frozen_paths = Some(vec![frozen_album.clone()]);
 
         assert_eq!(collect_selection_for_file_ops(&app), vec![frozen_album]);
+    }
+
+    #[derive(Clone, Copy)]
+    enum IncidentEntryKind {
+        Directory,
+        AudioFile,
+    }
+
+    fn incident_entry(path: &PathBuf, kind: IncidentEntryKind) -> crate::tui::browse::BrowseEntry {
+        let name = path
+            .file_name()
+            .expect("fixture path has a filename")
+            .to_string_lossy()
+            .to_string();
+        let entry_kind = match kind {
+            IncidentEntryKind::Directory => crate::convert::classify::EntryKind::Directory,
+            IncidentEntryKind::AudioFile => crate::convert::classify::EntryKind::AudioFile(
+                crate::convert::formats::AudioFormat::Flac,
+            ),
+        };
+        crate::tui::browse::BrowseEntry::new(path.clone(), name, entry_kind, 0, None)
+    }
+
+    fn install_browse_listing(
+        app: &mut AppState,
+        dir: PathBuf,
+        paths: &[PathBuf],
+        kind: IncidentEntryKind,
+    ) {
+        app.browse.current_dir = dir;
+        app.browse.entries = paths
+            .iter()
+            .map(|path| incident_entry(path, kind))
+            .collect();
+        app.browse.selected_index = 0;
+        app.browse.visible_height = app.browse.entries.len().max(1);
+    }
+
+    fn mark_all_visible(app: &mut AppState) {
+        for index in 0..app.browse.entries.len() {
+            app.browse
+                .toggle_selection_at_index(index)
+                .expect("fixture entry should be selectable");
+        }
+    }
+
+    fn incident_shape_app(
+        kind: IncidentEntryKind,
+    ) -> (tempfile::TempDir, AppState, Vec<PathBuf>, Vec<PathBuf>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir_a = temp.path().join("source-library");
+        let dir_b = temp.path().join("converted-output");
+        std::fs::create_dir_all(&dir_a).expect("source dir");
+        std::fs::create_dir_all(&dir_b).expect("current dir");
+
+        let (paths_a, paths_b) = match kind {
+            IncidentEntryKind::Directory => (
+                vec![dir_a.join("ccr-source-1"), dir_a.join("ccr-source-2")],
+                vec![dir_b.join("ccr-converted-1"), dir_b.join("ccr-converted-2")],
+            ),
+            IncidentEntryKind::AudioFile => (
+                vec![dir_a.join("01 - source.flac"), dir_a.join("02 - source.flac")],
+                vec![dir_b.join("01 - converted.flac"), dir_b.join("02 - converted.flac")],
+            ),
+        };
+        for path in paths_a.iter().chain(paths_b.iter()) {
+            match kind {
+                IncidentEntryKind::Directory => {
+                    std::fs::create_dir_all(path).expect("album dir");
+                }
+                IncidentEntryKind::AudioFile => {
+                    std::fs::write(path, b"fixture").expect("audio fixture");
+                }
+            }
+        }
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        install_browse_listing(&mut app, dir_a.clone(), &paths_a, kind);
+        mark_all_visible(&mut app);
+        assert_eq!(app.browse.multi_selected, paths_a);
+
+        app.browse.navigate_to(dir_b.clone());
+        assert!(
+            app.browse.multi_selected.is_empty(),
+            "directory navigation must clear source-directory marks before the user marks destination entries"
+        );
+        install_browse_listing(&mut app, dir_b, &paths_b, kind);
+        mark_all_visible(&mut app);
+        assert_eq!(app.browse.multi_selected, paths_b);
+
+        (temp, app, paths_a, paths_b)
+    }
+
+    fn raw_stale_and_current_app() -> (tempfile::TempDir, AppState, Vec<PathBuf>, Vec<PathBuf>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir_a = temp.path().join("source-library");
+        let dir_b = temp.path().join("converted-output");
+        std::fs::create_dir_all(&dir_a).expect("source dir");
+        std::fs::create_dir_all(&dir_b).expect("current dir");
+
+        let stale = vec![dir_a.join("ccr-source-1"), dir_a.join("ccr-source-2")];
+        let current = vec![dir_b.join("ccr-converted-1"), dir_b.join("ccr-converted-2")];
+        for path in stale.iter().chain(current.iter()) {
+            std::fs::create_dir_all(path).expect("album dir");
+        }
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        install_browse_listing(&mut app, dir_b, &current, IncidentEntryKind::Directory);
+        app.browse.multi_selected = vec![
+            stale[0].clone(),
+            stale[1].clone(),
+            current[0].clone(),
+            current[1].clone(),
+        ];
+        app.browse.multi_select_anchor = Some(stale[0].clone());
+        (temp, app, stale, current)
+    }
+
+    #[test]
+    fn context_move_to_incident_shape_captures_only_current_directory_sources() {
+        let (_temp, mut app, source_paths, current_paths) =
+            incident_shape_app(IncidentEntryKind::Directory);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        super::super::context_menu::execute_context_action(
+            &mut app,
+            super::super::context_menu::ContextAction::MoveTo,
+            &tx,
+            false,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::FilePicker(state) => match &state.purpose {
+                FilePickerPurpose::MoveTo { sources, force } => {
+                    assert_eq!(sources, &current_paths);
+                    assert!(!force);
+                }
+                other => panic!("expected MoveTo file picker purpose, got {other:?}"),
+            },
+            other => panic!("expected destination file picker, got {other:?}"),
+        }
+        assert!(source_paths.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn delete_incident_shape_confirms_only_current_directory_sources() {
+        let (_temp, mut app, source_paths, current_paths) =
+            incident_shape_app(IncidentEntryKind::Directory);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        execute_command(&mut app, Command::Delete, &tx);
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation {
+                action: ConfirmAction::DeleteSelection(paths),
+                ..
+            } => assert_eq!(paths, &current_paths),
+            other => panic!("expected delete confirmation, got {other:?}"),
+        }
+        assert!(source_paths.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn bulk_rename_incident_shape_opens_with_only_current_directory_audio_sources() {
+        let (_temp, mut app, source_paths, current_paths) =
+            incident_shape_app(IncidentEntryKind::AudioFile);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        execute_command(&mut app, Command::BulkRename, &tx);
+
+        match &app.active_overlay {
+            ActiveOverlay::BulkRename(state) => assert_eq!(&state.sources, &current_paths),
+            other => panic!("expected bulk rename overlay, got {other:?}"),
+        }
+        assert!(source_paths.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn scoped_file_op_selection_prunes_raw_stale_marks_and_reports_count() {
+        let (_temp, mut app, stale, current) = raw_stale_and_current_app();
+
+        let selection = collect_selection_for_file_ops_scoped(&mut app);
+
+        assert_eq!(selection.paths, current);
+        assert_eq!(selection.dropped_stale_count, stale.len());
+        assert_eq!(app.browse.multi_selected, selection.paths);
+        assert!(app.browse.multi_select_anchor.is_none());
+        surface_stale_selection_notice(&mut app, selection.dropped_stale_count);
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or_default();
+        assert!(status.contains("Ignored 2 stale selection marks outside the current directory"));
+    }
+
+    #[test]
+    fn stale_only_marks_are_pruned_before_cursor_fallback_is_decided() {
+        let (_temp, mut app, stale, _current) = raw_stale_and_current_app();
+        let cursor_path = app.browse.entries[0].path.clone();
+        app.browse.multi_selected = stale;
+        app.browse.multi_select_anchor = app.browse.multi_selected.first().cloned();
+        app.browse.selected_index = 0;
+
+        let selection = collect_selection_for_file_ops_scoped(&mut app);
+
+        assert_eq!(selection.paths, vec![cursor_path]);
+        assert_eq!(selection.dropped_stale_count, 2);
+        assert!(app.browse.multi_selected.is_empty());
+        assert!(app.browse.multi_select_anchor.is_none());
+    }
+
+    // Entering the Convert screen kicks off an async source probe
+    // (tokio::spawn), so this test needs a runtime.
+    #[tokio::test]
+    async fn queue_command_preserves_stale_notice_after_final_queue_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir_a = temp.path().join("source-library");
+        let dir_b = temp.path().join("converted-output");
+        std::fs::create_dir_all(&dir_a).expect("source dir");
+        std::fs::create_dir_all(&dir_b).expect("current dir");
+
+        let stale = vec![dir_a.join("01 - source.flac"), dir_a.join("02 - source.flac")];
+        let current = vec![dir_b.join("01 - converted.flac"), dir_b.join("02 - converted.flac")];
+        for path in stale.iter().chain(current.iter()) {
+            std::fs::write(path, b"fixture").expect("audio fixture");
+        }
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        install_browse_listing(&mut app, dir_b, &current, IncidentEntryKind::AudioFile);
+        app.browse.multi_selected = vec![
+            stale[0].clone(),
+            stale[1].clone(),
+            current[0].clone(),
+            current[1].clone(),
+        ];
+        app.browse.multi_select_anchor = Some(stale[0].clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        execute_command(&mut app, Command::Queue { preset: None }, &tx);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.all_paths(), current);
+        assert_eq!(app.browse.multi_selected, current);
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or_default();
+        // Same invariant as the async review test: notice prefix + a real
+        // completion status, without pinning the probe-dependent wording.
+        assert!(status.starts_with("Ignored 2 stale selection marks outside the current directory; "));
+        assert!(status.contains("review settings, then :commit or :Commit"));
     }
 }

@@ -3827,6 +3827,7 @@ fn install_convert_source_with_async_probe(app: &mut AppState, path: std::path::
                 &tx,
                 super::command::BrowseConvertExpansionTarget::ConvertSource,
                 vec![path],
+                0,
             );
         } else {
             app.set_status("Cannot expand folder: TUI worker channel is unavailable");
@@ -3909,9 +3910,14 @@ fn load_browse_selection(
             app.browse.return_target = BrowseReturnTarget::None;
         }
         BrowseReturnTarget::ConvertQueue => {
-            // Add all multi-selected files (or just this one) to the queue
-            let mut paths_to_add = app.browse.multi_selected.clone();
-            if paths_to_add.is_empty() {
+            // Add all multi-selected files (or just this one) to the queue.
+            // Repair stale raw marks at this selection boundary so queue-return
+            // flows preserve the same directory-scoped invariant as :queue.
+            let dropped_stale_count = app
+                .browse
+                .prune_stale_multi_selection_for_current_directory();
+            let mut paths_to_add = app.browse.multi_selected_in_current_directory();
+            if paths_to_add.is_empty() && app.browse.multi_selected.is_empty() {
                 paths_to_add.push(path);
             }
             if super::command::browse_selection_contains_regular_audio_folder_for_convert(
@@ -3924,6 +3930,7 @@ fn load_browse_selection(
                         &tx,
                         super::command::BrowseConvertExpansionTarget::ConvertQueueItems,
                         paths_to_add,
+                        dropped_stale_count,
                     );
                 } else {
                     app.set_status("Cannot expand folder: TUI worker channel is unavailable");
@@ -3956,7 +3963,10 @@ fn load_browse_selection(
                 }
             }
             app.browse.clear_multi_selection();
-            app.set_status(format!("Queued {} files", count));
+            app.set_status(super::command::status_with_stale_selection_notice(
+                dropped_stale_count,
+                format!("Queued {} files", count),
+            ));
             app.current_screen = AppScreen::Queue;
             app.browse.return_target = BrowseReturnTarget::None;
         }
@@ -10358,14 +10368,7 @@ fn collect_all_staged_archive_audio_files(
 }
 
 fn collect_selected_archive_delete_inner_paths(app: &AppState) -> Vec<String> {
-    let candidate_paths: Vec<std::path::PathBuf> = if app.browse.multi_selected.is_empty() {
-        app.browse
-            .selected_entry()
-            .map(|entry| vec![entry.path.clone()])
-            .unwrap_or_default()
-    } else {
-        app.browse.multi_selected.clone()
-    };
+    let candidate_paths: Vec<std::path::PathBuf> = app.browse.action_selection_in_current_directory();
 
     let mut inner_paths: Vec<String> = candidate_paths
         .iter()

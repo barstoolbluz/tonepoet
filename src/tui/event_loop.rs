@@ -6396,7 +6396,7 @@ mod copy_move_file_picker_flow_tests {
         let size = fs::metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
         app.browse.entries = vec![BrowseEntry::new(path, name, kind, size, None)];
         app.browse.selected_index = 0;
-        app.browse.multi_selected.clear();
+        app.browse.clear_multi_selection();
         app.active_overlay = ActiveOverlay::None;
         app
     }

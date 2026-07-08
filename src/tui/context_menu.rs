@@ -1329,8 +1329,10 @@ pub fn execute_context_action(
                 return;
             }
             // Reuse the same path as the R keybinding.
-            let paths = super::command::collect_selection_for_file_ops(app);
-            let audio_paths: Vec<std::path::PathBuf> = paths
+            let selection = super::command::collect_selection_for_file_ops_scoped(app);
+            let dropped_stale_count = selection.dropped_stale_count;
+            let audio_paths: Vec<std::path::PathBuf> = selection
+                .paths
                 .into_iter()
                 .filter(|p| {
                     app.browse
@@ -1340,22 +1342,39 @@ pub fn execute_context_action(
                 })
                 .collect();
             super::keybindings::open_bulk_rename(app, audio_paths);
+            super::command::surface_stale_selection_notice(app, dropped_stale_count);
         }
         ContextAction::CopyTo => {
             if app.browse.is_in_archive() {
                 archive_synthetic_file_op_status(app, "copy/move");
                 return;
             }
-            let sources = super::command::collect_selection_for_file_ops(app);
-            super::command::open_file_picker_for_copy_move(app, sources, false, false);
+            let selection = super::command::collect_selection_for_file_ops_scoped(app);
+            let sources = selection.paths;
+            let dropped_stale_count = selection.dropped_stale_count;
+            super::command::open_file_picker_for_copy_move(
+                app,
+                sources,
+                false,
+                false,
+                dropped_stale_count,
+            );
         }
         ContextAction::MoveTo => {
             if app.browse.is_in_archive() {
                 archive_synthetic_file_op_status(app, "copy/move");
                 return;
             }
-            let sources = super::command::collect_selection_for_file_ops(app);
-            super::command::open_file_picker_for_copy_move(app, sources, false, true);
+            let selection = super::command::collect_selection_for_file_ops_scoped(app);
+            let sources = selection.paths;
+            let dropped_stale_count = selection.dropped_stale_count;
+            super::command::open_file_picker_for_copy_move(
+                app,
+                sources,
+                false,
+                true,
+                dropped_stale_count,
+            );
         }
         ContextAction::Refresh => {
             if app.current_screen == AppScreen::Browse {
