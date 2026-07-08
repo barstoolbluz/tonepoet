@@ -696,6 +696,7 @@ pub struct ConvertProbeMetadataSnapshot {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub album_artist_for_conversion: Option<String>,
     pub genre: Option<String>,
     pub year: Option<String>,
 }
@@ -706,6 +707,7 @@ impl ConvertProbeMetadataSnapshot {
             title: metadata.title.clone(),
             artist: metadata.artist.clone(),
             album: metadata.album.clone(),
+            album_artist_for_conversion: metadata.album_artist_for_conversion.clone(),
             genre: metadata.genre.clone(),
             year: metadata.year.clone(),
         }
@@ -3600,12 +3602,20 @@ pub enum ConvertMetadataField {
     Title,
     Artist,
     Album,
+    AlbumArtist,
     Genre,
     Year,
 }
 
 impl ConvertMetadataField {
-    const FIELDS: [Self; 5] = [Self::Title, Self::Artist, Self::Album, Self::Genre, Self::Year];
+    const FIELDS: [Self; 6] = [
+        Self::Title,
+        Self::Artist,
+        Self::Album,
+        Self::AlbumArtist,
+        Self::Genre,
+        Self::Year,
+    ];
 
     pub fn next(self) -> Self {
         let idx = Self::FIELDS
@@ -3628,6 +3638,7 @@ impl ConvertMetadataField {
             crate::tui::button_map::MetadataFieldKind::Title => Self::Title,
             crate::tui::button_map::MetadataFieldKind::Artist => Self::Artist,
             crate::tui::button_map::MetadataFieldKind::Album => Self::Album,
+            crate::tui::button_map::MetadataFieldKind::AlbumArtist => Self::AlbumArtist,
             crate::tui::button_map::MetadataFieldKind::Genre => Self::Genre,
             crate::tui::button_map::MetadataFieldKind::Year => Self::Year,
         }
@@ -3640,6 +3651,10 @@ pub struct MetadataState {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// Request-scope ALBUMARTIST override for this conversion. Unlike the
+    /// source-derived preview fields above, this is user intent: when set it
+    /// drives output tags and album identity/folder rendering for the batch.
+    pub album_artist_for_conversion: Option<String>,
     pub genre: Option<String>,
     pub year: Option<String>,
     pub field_focus: ConvertMetadataField,
@@ -3657,6 +3672,7 @@ impl Default for MetadataState {
             title: None,
             artist: None,
             album: None,
+            album_artist_for_conversion: None,
             genre: None,
             year: None,
             field_focus: ConvertMetadataField::Title,

@@ -9,6 +9,7 @@ pub enum MetadataFieldKind {
     Title,
     Artist,
     Album,
+    AlbumArtist,
     Genre,
     Year,
 }

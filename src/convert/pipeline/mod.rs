@@ -137,6 +137,8 @@ mod tests {
             album_batch_track: None,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             suppress_incremental_conversion_log_append: false,
             expected_album_track_count: None,
             container_extension: None,

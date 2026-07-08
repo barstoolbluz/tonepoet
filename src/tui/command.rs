@@ -1631,6 +1631,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &name,
                     &app.convert.format,
                     &app.convert.output_options,
+                    &app.convert.metadata,
                 );
                 match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
                     Ok(_) => {
@@ -1682,6 +1683,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &name,
                     &app.convert.format,
                     &app.convert.output_options,
+                    &app.convert.metadata,
                 );
                 if super::presets::save_preset_to_path_with_db(&preset, &path, &app.db).is_ok() {
                     app.preset.set_active_preset_path(name, path);
@@ -1846,6 +1848,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         preset.apply_to_pills(
                             &mut app.convert.format,
                             &mut app.convert.output_options,
+                            &mut app.convert.metadata,
                         );
                         app.preset
                             .set_active_preset_path(name.clone(), super::presets::preset_file_path(&name));
@@ -1864,6 +1867,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &name,
                     &app.convert.format,
                     &app.convert.output_options,
+                    &app.convert.metadata,
                 );
                 let path = super::presets::preset_file_path(&name);
                 match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
@@ -4521,7 +4525,11 @@ fn load_queue_preset_into_pills(app: &mut AppState, name: &str) -> Result<(), St
     let path = super::presets::preset_file_path(name);
     match super::presets::load_preset_from_path(&path) {
         Ok(preset) => {
-            preset.apply_to_pills(&mut app.convert.format, &mut app.convert.output_options);
+            preset.apply_to_pills(
+                &mut app.convert.format,
+                &mut app.convert.output_options,
+                &mut app.convert.metadata,
+            );
             app.preset.set_active_preset_path(name.to_string(), path);
             app.preset.modified = false;
             Ok(())
@@ -5110,6 +5118,14 @@ fn execute_commit_with_source_options_transform(
     app.convert
         .output_options
         .apply_companion_copying_to_conversion_options(&mut options);
+    options.album_artist_override = app
+        .convert
+        .metadata
+        .album_artist_for_conversion
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
     let format_name = options.output_format.name();
 
     // Enqueue the whole batch via the shared helper. CUE sidecar override
@@ -5312,6 +5328,8 @@ fn execute_commit_with_source_options_transform(
                         failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
                         pre_extracted_staging: item.pre_extracted_staging.clone(),
                         archive_metadata_overrides: item.archive_metadata_overrides.clone(),
+                        metadata_overrides: Default::default(),
+                        batch_resolved_identity: None,
                         container_extension: options.container_extension.clone(),
                         container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
                         album_batch: None,

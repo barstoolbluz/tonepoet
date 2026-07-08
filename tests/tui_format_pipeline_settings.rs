@@ -139,14 +139,16 @@ fn preset_uses_stable_dsf_and_dff_format_keys_not_display_labels() {
         format_state.apply_format_constraints();
 
         let output = OutputOptionsState::new();
-        let preset = TuiPreset::from_pill_state("stable-format-key", &format_state, &output);
+        let metadata = tonepoet::tui::app::MetadataState::default();
+        let preset = TuiPreset::from_pill_state("stable-format-key", &format_state, &output, &metadata);
         assert_eq!(preset.format, format.extension());
 
         let encoded = toml::to_string(&preset).unwrap();
         let decoded: TuiPreset = toml::from_str(&encoded).unwrap();
         let mut restored_format = FormatState::new();
         let mut restored_output = OutputOptionsState::new();
-        decoded.apply_to_pills(&mut restored_format, &mut restored_output);
+        let mut restored_metadata = tonepoet::tui::app::MetadataState::default();
+        decoded.apply_to_pills(&mut restored_format, &mut restored_output, &mut restored_metadata);
         assert_eq!(*restored_format.format.selected_value(), format);
         assert!(restored_format.is_dsd_selected());
     }
@@ -166,13 +168,15 @@ fn preset_v3_round_trips_new_format_fields() {
     let mut output = OutputOptionsState::new();
     output.merge.select_value(&MergeMode::SingleImage);
 
-    let preset = TuiPreset::from_pill_state("roundtrip", &format, &output);
+    let metadata = tonepoet::tui::app::MetadataState::default();
+    let preset = TuiPreset::from_pill_state("roundtrip", &format, &output, &metadata);
     let encoded = toml::to_string(&preset).unwrap();
     let decoded: TuiPreset = toml::from_str(&encoded).unwrap();
 
     let mut new_format = FormatState::new();
     let mut new_output = OutputOptionsState::new();
-    decoded.apply_to_pills(&mut new_format, &mut new_output);
+    let mut new_metadata = tonepoet::tui::app::MetadataState::default();
+    decoded.apply_to_pills(&mut new_format, &mut new_output, &mut new_metadata);
 
     assert_eq!(*new_format.format.selected_value(), AudioFormat::Dsf);
     assert_eq!(*new_format.sample_rate.selected_value(), 11_289_600);

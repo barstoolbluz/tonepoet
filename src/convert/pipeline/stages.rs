@@ -68,6 +68,9 @@ const CONVERSION_LOG_FRAGMENT_DIR: &str = ".tonepoet-log-fragments";
 const CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR: &str = ".tonepoet-log-fragments.quarantine";
 const CONVERSION_LOG_FRAGMENT_SIDE_KIND: &str = "tonepoet-conversion-log-fragment";
 const CONVERSION_LOG_BATCH_ID_PREFIX: &str = "tonepoet-log-batch-v1";
+const COMPANION_BATCH_TRANSIENT_DIR: &str = ".tonepoet-companion-copy";
+const COMPANION_BATCH_LEGACY_COMPLETION_MARKER_FILE: &str = "album-batch.done";
+const COMPANION_BATCH_TRANSIENT_FINALIZER_PREFIX: &str = ".album-batch.finalizing.";
 
 
 #[cfg(test)]
@@ -186,6 +189,10 @@ pub(crate) fn set_publish_fault_hook_for_test(hook: Box<PublishFaultHook>) -> Pu
 }
 static CONVERSION_LOG_BATCH_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static COMPANION_COPY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+std::thread_local! {
+    static ALBUM_BATCH_COMPANION_SCAN_ATTEMPTS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
 
 // ===========================================================================
 // Materializer trait
@@ -272,6 +279,14 @@ pub fn validate_request(req: &PipelineRequest) -> Result<(), RequestValidationEr
         if password.expose().is_empty() {
             return Err(RequestValidationError::InvalidSecretState(
                 "archive password is present but empty".to_string(),
+            ));
+        }
+    }
+
+    if let MetadataTextOverride::Set(value) = &req.metadata_overrides.album_artist {
+        if value.trim().is_empty() {
+            return Err(RequestValidationError::InvalidStagePolicy(
+                "album-artist override must be non-empty when set".to_string(),
             ));
         }
     }
@@ -486,15 +501,41 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
         ));
     }
 
-    let expected_track_count = requests.len();
+    let mut expected_track_count = 0_usize;
+    for req in &requests {
+        let kind = detect_source_kind(req).map_err(|err| {
+            RequestValidationError::InvalidStagePolicy(format!(
+                "album batch fragment dispatch could not classify {} as a supported source: {err}",
+                req.container.display()
+            ))
+        })?;
+        expected_track_count = expected_track_count
+            .checked_add(dispatcher_album_batch_expected_track_count(req, kind)?)
+            .ok_or_else(|| {
+                RequestValidationError::InvalidStagePolicy(
+                    "album batch expected track count overflowed usize".to_string(),
+                )
+            })?;
+    }
+    if expected_track_count == 0 {
+        return Err(RequestValidationError::InvalidStagePolicy(
+            "album batch dispatch requires at least one expected source track".to_string(),
+        ));
+    }
     let normalized_grouping_root = normalize_path(&source_grouping_root);
-    let album_batch = AlbumBatchContext::from_dispatcher_source_count(
+    let resolved_identity = requests
+        .iter()
+        .find_map(|req| req.batch_resolved_identity.clone());
+    let mut album_batch = AlbumBatchContext::from_dispatcher_source_count(
         conversion_log_batch_id,
         expected_track_count,
         album_output_dir,
         source_grouping_root,
     )
     .map_err(RequestValidationError::InvalidStagePolicy)?;
+    if let Some(identity) = resolved_identity {
+        album_batch = album_batch.with_resolved_identity(identity);
+    }
 
     for req in requests.iter_mut() {
         let Some(dispatcher_track_context) = req.album_batch_track.clone() else {
@@ -511,16 +552,16 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
         }
 
         match detect_source_kind(req) {
-            Ok(SourceKind::SingleFile) => {}
+            Ok(SourceKind::SingleFile | SourceKind::CueImage) => {}
             Ok(kind) => {
                 return Err(RequestValidationError::InvalidStagePolicy(format!(
-                    "album batch fragment dispatch accepts only independent single-file jobs, got {kind:?} for {}",
+                    "album batch fragment dispatch accepts only independent single-file or CUE-image jobs, got {kind:?} for {}",
                     req.container.display()
                 )));
             }
             Err(err) => {
                 return Err(RequestValidationError::InvalidStagePolicy(format!(
-                    "album batch fragment dispatch could not classify {} as a single-file audio source: {err}",
+                    "album batch fragment dispatch could not classify {} as a supported album-batch source: {err}",
                     req.container.display()
                 )));
             }
@@ -559,6 +600,82 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
         album_batch,
         requests,
     })
+}
+
+fn dispatcher_album_batch_expected_track_count(
+    req: &PipelineRequest,
+    kind: SourceKind,
+) -> Result<usize, RequestValidationError> {
+    match kind {
+        SourceKind::SingleFile => Ok(1),
+        SourceKind::CueImage => {
+            let cue = crate::convert::cue_parser::parse_cue_file(&req.container).map_err(|err| {
+                RequestValidationError::InvalidStagePolicy(format!(
+                    "album batch CUE source {} could not be parsed for expected track count: {err}",
+                    req.container.display()
+                ))
+            })?;
+            let count = selected_album_batch_cue_track_count(
+                cue.tracks.len(),
+                &req.source.track_selection,
+                &req.container,
+            )?;
+            Ok(count)
+        }
+        other => Err(RequestValidationError::InvalidStagePolicy(format!(
+            "album batch fragment dispatch does not support source kind {other:?} for {}",
+            req.container.display()
+        ))),
+    }
+}
+
+
+fn selected_album_batch_cue_track_count(
+    track_count: usize,
+    selection: &TrackSelection,
+    path: &Path,
+) -> Result<usize, RequestValidationError> {
+    if track_count == 0 {
+        return Err(RequestValidationError::InvalidStagePolicy(format!(
+            "album batch CUE source {} contains no audio tracks",
+            path.display()
+        )));
+    }
+    match selection {
+        TrackSelection::All => Ok(track_count),
+        TrackSelection::Range { start, end } => {
+            if *start == 0 || *end == 0 || start > end {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "album batch CUE source {} has invalid track-selection range {start}-{end}",
+                    path.display()
+                )));
+            }
+            let max_ordinal = u32::try_from(track_count).unwrap_or(u32::MAX);
+            if *start > max_ordinal {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "album batch CUE source {} track-selection range start {start} exceeds track count {max_ordinal}",
+                    path.display()
+                )));
+            }
+            Ok(((*end).min(max_ordinal) - *start + 1) as usize)
+        }
+        TrackSelection::Set(indices) => {
+            if indices.is_empty() {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "album batch CUE source {} has empty track-selection set",
+                    path.display()
+                )));
+            }
+            let max_ordinal = u32::try_from(track_count).unwrap_or(u32::MAX);
+            if let Some(invalid) = indices.iter().find(|idx| **idx == 0 || **idx > max_ordinal) {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "album batch CUE source {} track-selection entry {invalid} is outside valid range 1-{max_ordinal}",
+                    path.display()
+                )));
+            }
+            Ok(indices.len())
+        }
+    }
 }
 
 /// Dispatch a supported source kind to its materializer.
@@ -3346,6 +3463,23 @@ fn cue_extra_tag_key(scope: &str, key: &str) -> String {
     }
 }
 
+const PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY: &str = "tonepoet_preserved_source_album_tag";
+const PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY: &str =
+    "tonepoet_preserved_source_album_artist_tag";
+const LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY: &str = "album_tag_override";
+const LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY: &str = "album_artist_tag_override";
+
+fn is_internal_metadata_extra_key(key: &str) -> bool {
+    key == PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY
+        || key == PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY
+        || key == LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY
+        || key == LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY
+        || key == CUE_ARTWORK_PATH_EXTRA_KEY
+        || key == CUE_ARTWORK_MIME_EXTRA_KEY
+        || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
+        || key == CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY
+}
+
 fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> Vec<(String, String)> {
     let mut tags: Vec<(String, String)> = Vec::new();
     if let Some(ref v) = meta.title {
@@ -3354,12 +3488,33 @@ fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> V
     if let Some(ref v) = meta.artist {
         push_tag_value(&mut tags, "ARTIST", v);
     }
-    if let Some(v) = meta.album_artist.as_ref().or(album.album_artist.as_ref()) {
+
+    // Written album-artist metadata has an intentionally separate contract from
+    // batch-resolved organizational identity:
+    //   1. track-level album artist is authoritative. In normal operation this
+    //      is source metadata; when the user sets a request override, the
+    //      override is applied to every track before writing;
+    //   2. otherwise, an internal preserved-source value wins when the batch
+    //      identity mutated AlbumMetadata for folder/log planning;
+    //   3. otherwise, use the source album metadata as materialized.
+    // Legacy `album_artist_tag_override` is deliberately not consulted here; it
+    // is an internal sentinel key only and must never outrank real metadata.
+    if let Some(v) = meta
+        .album_artist
+        .as_ref()
+        .or_else(|| album.extra.get(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY))
+        .or(album.album_artist.as_ref())
+    {
         push_tag_value(&mut tags, "ALBUMARTIST", v);
     }
+
+    // ALBUM follows the same organization-vs-tags split. A resolved batch album
+    // may drive folder rendering, but the writer keeps the source album tag
+    // unless an explicit metadata-edit path supplied a per-track album value.
     let album_tag = album
         .extra
-        .get("album_tag_override")
+        .get(PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY)
+        .or_else(|| album.extra.get(LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY))
         .or_else(|| meta.extra.get("album"))
         .or(album.album.as_ref());
     if let Some(v) = album_tag {
@@ -3417,18 +3572,16 @@ fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> V
         push_tag_value(&mut tags, "CATALOG", v);
     }
     for (key, value) in &album.extra {
-        if key == "album_tag_override"
-            || key == CUE_ARTWORK_PATH_EXTRA_KEY
-            || key == CUE_ARTWORK_MIME_EXTRA_KEY
-            || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
-            || key == CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY
-        {
+        if is_internal_metadata_extra_key(key) {
             continue;
         }
         let tag_key = cue_extra_tag_key("ALBUM", key);
         push_tag_value(&mut tags, &tag_key, value);
     }
     for (key, value) in &meta.extra {
+        if is_internal_metadata_extra_key(key) {
+            continue;
+        }
         let tag_key = cue_extra_tag_key("TRACK", key);
         push_tag_value(&mut tags, &tag_key, value);
     }
@@ -4004,10 +4157,23 @@ mod metadata_writer_command_tests {
     fn sample_metadata() -> (TrackMetadata, AlbumMetadata) {
         let mut album_extra = BTreeMap::new();
         album_extra.insert("catalog".to_string(), "ABC-123".to_string());
-        album_extra.insert("album_tag_override".to_string(), "Cue Album Override".to_string());
+        album_extra.insert(
+            LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY.to_string(),
+            "Cue Album Override".to_string(),
+        );
+        album_extra.insert(
+            LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY.to_string(),
+            "Cue Album Artist Override".to_string(),
+        );
         album_extra.insert("label".to_string(), "Example Label".to_string());
-        album_extra.insert(CUE_ARTWORK_PATH_EXTRA_KEY.to_string(), "staging/cue-artwork/cover.jpg".to_string());
-        album_extra.insert(CUE_ARTWORK_MIME_EXTRA_KEY.to_string(), "image/jpeg".to_string());
+        album_extra.insert(
+            CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+            "staging/cue-artwork/cover.jpg".to_string(),
+        );
+        album_extra.insert(
+            CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+            "image/jpeg".to_string(),
+        );
 
         let mut track_extra = BTreeMap::new();
         track_extra.insert("index_00".to_string(), "00:00:32".to_string());
@@ -4039,6 +4205,26 @@ mod metadata_writer_command_tests {
         )
     }
 
+    fn assert_no_internal_metadata_tags(tags: &[(String, String)]) {
+        for forbidden in [
+            "TONEPOET_ALBUM_ALBUM_TAG_OVERRIDE",
+            "TONEPOET_ALBUM_ALBUM_ARTIST_TAG_OVERRIDE",
+            "TONEPOET_ALBUM_TONEPOET_PRESERVED_SOURCE_ALBUM_TAG",
+            "TONEPOET_ALBUM_TONEPOET_PRESERVED_SOURCE_ALBUM_ARTIST_TAG",
+            "TONEPOET_TRACK_ALBUM_TAG_OVERRIDE",
+            "TONEPOET_TRACK_ALBUM_ARTIST_TAG_OVERRIDE",
+            "TONEPOET_TRACK_TONEPOET_PRESERVED_SOURCE_ALBUM_TAG",
+            "TONEPOET_TRACK_TONEPOET_PRESERVED_SOURCE_ALBUM_ARTIST_TAG",
+            "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_PATH",
+            "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_MIME",
+        ] {
+            assert!(
+                !tags.iter().any(|(key, _)| key == forbidden),
+                "internal metadata key {forbidden} leaked into {tags:?}"
+            );
+        }
+    }
+
     #[test]
     fn authoritative_tags_cover_cue_album_track_and_number_fields() {
         let (track, album) = sample_metadata();
@@ -4056,15 +4242,138 @@ mod metadata_writer_command_tests {
         assert!(tags.contains(&("CATALOG".to_string(), "ABC-123".to_string())));
         assert!(tags.contains(&("PERFORMER".to_string(), "Cue Performer".to_string())));
         assert!(tags.contains(&("PRE_EMPHASIS".to_string(), "1".to_string())));
-        assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_ALBUM_TAG_OVERRIDE"));
-        assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_PATH"));
-        assert!(!tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_MIME"));
+        assert_no_internal_metadata_tags(&tags);
+    }
+
+    #[test]
+    fn preserved_source_album_artist_is_written_without_emitting_internal_keys() {
+        let (mut track, mut album) = sample_metadata();
+        track.album_artist = None;
+        track.extra.insert(
+            LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY.to_string(),
+            "Track Internal Sentinel".to_string(),
+        );
+        track.extra.insert(
+            PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
+            "Track Preserved Sentinel".to_string(),
+        );
+        album.album_artist = Some("Resolved Organizational Artist".to_string());
+        album.extra.insert(
+            PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
+            "Original Album Artist".to_string(),
+        );
+
+        let tags = authoritative_metadata_tags(&track, &album);
+
+        assert!(tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Original Album Artist".to_string(),
+        )));
+        assert!(!tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Resolved Organizational Artist".to_string(),
+        )));
+        assert_no_internal_metadata_tags(&tags);
+    }
+
+    #[test]
+    fn legacy_album_artist_internal_key_does_not_override_real_metadata() {
+        let (mut track, mut album) = sample_metadata();
+        track.album_artist = None;
+        album.album_artist = Some("Real Source Album Artist".to_string());
+        album.extra.insert(
+            LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY.to_string(),
+            "Legacy Internal Sentinel".to_string(),
+        );
+
+        let tags = authoritative_metadata_tags(&track, &album);
+
+        assert!(tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Real Source Album Artist".to_string(),
+        )));
+        assert!(!tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Legacy Internal Sentinel".to_string(),
+        )));
+        assert_no_internal_metadata_tags(&tags);
+    }
+
+    #[test]
+    fn batch_resolved_identity_does_not_rewrite_written_album_or_album_artist() {
+        let (mut track, mut album) = sample_metadata();
+        track.album_artist = None;
+        track.extra.remove("album");
+        album.album = Some("Resolved Organizational Album".to_string());
+        album.album_artist = Some("Resolved Organizational Artist".to_string());
+        album.extra.insert(
+            PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY.to_string(),
+            "Source Album (Disc 1)".to_string(),
+        );
+        album.extra.insert(
+            PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
+            "Source Album Artist".to_string(),
+        );
+
+        let tags = authoritative_metadata_tags(&track, &album);
+        let ffmpeg_tags = ffmpeg_authoritative_metadata_tags(&tags);
+
+        assert!(tags.contains(&(
+            "ALBUM".to_string(),
+            "Source Album (Disc 1)".to_string(),
+        )));
+        assert!(tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Source Album Artist".to_string(),
+        )));
+        assert!(!tags.contains(&(
+            "ALBUM".to_string(),
+            "Resolved Organizational Album".to_string(),
+        )));
+        assert!(!tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Resolved Organizational Artist".to_string(),
+        )));
+        assert!(ffmpeg_tags.contains(&(
+            "album_artist".to_string(),
+            "Source Album Artist".to_string(),
+        )));
+        assert_no_internal_metadata_tags(&tags);
+    }
+
+    #[test]
+    fn explicit_album_artist_override_rewrites_native_and_ffmpeg_metadata() {
+        let (mut track, mut album) = sample_metadata();
+        track.album_artist = Some("Explicit Conversion Override".to_string());
+        album.album_artist = Some("Resolved Organizational Artist".to_string());
+        album.extra.insert(
+            PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
+            "Source Album Artist".to_string(),
+        );
+
+        let tags = authoritative_metadata_tags(&track, &album);
+        let ffmpeg_tags = ffmpeg_authoritative_metadata_tags(&tags);
+
+        assert!(tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Explicit Conversion Override".to_string(),
+        )));
+        assert!(!tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Source Album Artist".to_string(),
+        )));
+        assert!(ffmpeg_tags.contains(&(
+            "album_artist".to_string(),
+            "Explicit Conversion Override".to_string(),
+        )));
+        assert_no_internal_metadata_tags(&tags);
     }
 
     #[test]
     fn authoritative_tags_prefer_track_album_extra_when_no_album_override_exists() {
         let (mut track, mut album) = sample_metadata();
-        album.extra.remove("album_tag_override");
+        album.extra.remove(LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY);
+        album.extra.remove(PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY);
         album.album = Some("Common Album".to_string());
         track
             .extra
@@ -4988,6 +5297,8 @@ FILE "album.flac" WAVE
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -5855,28 +6166,29 @@ fn stage_conversion_log_sidecars(
     let log_generated_at = chrono::Utc::now();
 
     if should_stage_conversion_log_fragment(outcome, source, req, &artifacts) {
-        // Fragment-backed independent single-file jobs must not build or stage
-        // a visible one-track conversion.log. The hidden fragment is the only
-        // conversion-log sidecar for this job; publish-time fragment counting
+        // Fragment-backed independent source jobs must not build or stage a
+        // visible per-source conversion.log. The hidden fragments are the only
+        // conversion-log sidecars for this job; publish-time fragment counting
         // under the album lock decides whether the unified album log is ready.
-        let (fragment_staged, fragment_name) = stage_conversion_log_fragment(
+        for (fragment_staged, fragment_name) in stage_conversion_log_fragments(
             outcome,
             source,
             req,
             &artifacts,
             &album_dir,
-            Some(settings_fingerprint_text),
+            Some(settings_fingerprint_text.clone()),
             log_generated_at,
             staging,
             runner,
-        )?;
-        artifacts.sidecars.push(SidecarArtifact {
-            kind: SidecarKind::Other(CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string()),
-            staged_path: fragment_staged,
-            final_path: album_dir
-                .join(CONVERSION_LOG_FRAGMENT_DIR)
-                .join(fragment_name),
-        });
+        )? {
+            artifacts.sidecars.push(SidecarArtifact {
+                kind: SidecarKind::Other(CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string()),
+                staged_path: fragment_staged,
+                final_path: album_dir
+                    .join(CONVERSION_LOG_FRAGMENT_DIR)
+                    .join(fragment_name),
+            });
+        }
     } else if req.suppress_incremental_conversion_log_append {
         log::warn!(
             "conversion.log sidecar suppressed for {} because the folder dispatcher found an album batch that cannot safely use ordered fragment assembly or legacy completion-order append",
@@ -5992,7 +6304,10 @@ fn publish_terminal_conversion_log_fragment_if_needed(
     };
 
     match publish_album_output(staging, &publish_plan, req.publish.clone(), None) {
-        Ok(album) => Some(album),
+        Ok(album) => {
+            copy_album_batch_companion_artifacts_once_ready_best_effort(req, &album);
+            Some(album)
+        }
         Err(err) => {
             log::warn!(
                 "terminal conversion log fragment publish skipped for {}: {err}",
@@ -6136,7 +6451,10 @@ fn publish_pre_materialization_conversion_log_fragment_with_selection(
     };
 
     match publish_album_output(staging, &publish_plan, req.publish.clone(), None) {
-        Ok(album) => PreMaterializationLogFragmentAttempt::Published(album),
+        Ok(album) => {
+            copy_album_batch_companion_artifacts_once_ready_best_effort(req, &album);
+            PreMaterializationLogFragmentAttempt::Published(album)
+        }
         Err(err) => {
             log::warn!(
                 "pre-materialization conversion log fragment publish skipped for {}: {err}",
@@ -6182,7 +6500,10 @@ fn publish_pre_materialization_conversion_log_fragment_if_needed(
     };
 
     match publish_album_output(staging, &publish_plan, req.publish.clone(), None) {
-        Ok(album) => Some(album),
+        Ok(album) => {
+            copy_album_batch_companion_artifacts_once_ready_best_effort(req, &album);
+            Some(album)
+        }
         Err(err) => {
             log::warn!(
                 "pre-materialization conversion log fragment publish skipped for {}: {err}",
@@ -6220,7 +6541,9 @@ fn publish_pre_materialization_terminal_batch_failure_or_finalize(
         "conversion log fragment could not be published for terminal batch failure in {}: {reason}; attempting partial batch finalization",
         req.item_id
     );
-    finalize_terminal_batch_failure_conversion_log_batch_if_needed(req, reason)
+    let published = finalize_terminal_batch_failure_conversion_log_batch_if_needed(req, reason)?;
+    copy_album_batch_companion_artifacts_once_ready_best_effort(req, &published);
+    Some(published)
 }
 
 fn pre_materialization_conversion_log_fragment_candidate(
@@ -6809,6 +7132,19 @@ fn conversion_log_fragment_sort_key(req: &PipelineRequest, fallback_track_id: &T
     }
 }
 
+fn conversion_log_materialized_fragment_sort_key(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    fallback_track_id: &TrackId,
+) -> ConversionLogTrackSortKey {
+    if source.kind == SourceKind::SingleFile && source.tracks.len() == 1 {
+        if let Some(track) = req.album_batch_track.as_ref() {
+            return ConversionLogTrackSortKey::from(&track.track_id());
+        }
+    }
+    ConversionLogTrackSortKey::from(fallback_track_id)
+}
+
 fn conversion_log_expected_track_count(req: &PipelineRequest) -> io::Result<usize> {
     let album_batch = conversion_log_album_batch(req)?;
     if album_batch.expected_track_count == 0 {
@@ -6881,24 +7217,30 @@ fn should_stage_conversion_log_fragment(
     req: &PipelineRequest,
     _artifacts: &ArtifactSet,
 ) -> bool {
-    if source.kind != SourceKind::SingleFile || source.tracks.len() != 1 {
+    if !album_batch_fragment_source_kind(source.kind) || source.tracks.is_empty() {
         return false;
     }
     if req.album_batch.is_none() || req.album_batch_track.is_none() {
         // No dispatcher-supplied album batch/track contract means this is not
         // the fragment-backed folder path. Fall back to the legacy per-job log
-        // path instead of silently treating a single track as a complete album
-        // or emitting an unordered pre-materialization failure fragment.
+        // path instead of silently treating a source as a complete album or
+        // emitting unordered pre-materialization failure fragments.
         return false;
     }
 
-    // The unit of work is the source track, not a successfully encoded audio
-    // artifact. A failed single-track job normally has zero TrackArtifacts but
-    // still has exactly one TrackRecord carrying TrackOutcome::Err/Blocked.
-    // Stage that record so the final album log can include the failure.
-    collect_outcome_tracks(outcome).len() == 1
+    // The unit of work is the materialized source track. Single-file jobs emit
+    // one fragment. CUE-image jobs emit one fragment per decomposed CUE track so
+    // the batch completion threshold remains the album's source-track count,
+    // not the number of per-disc CUE files.
+    let track_count = collect_outcome_tracks(outcome).len();
+    track_count > 0 && track_count <= source.tracks.len()
 }
 
+fn album_batch_fragment_source_kind(kind: SourceKind) -> bool {
+    matches!(kind, SourceKind::SingleFile | SourceKind::CueImage)
+}
+
+#[cfg(test)]
 fn stage_conversion_log_fragment(
     outcome: &AlbumOutcome,
     source: &PreparedSource,
@@ -6910,75 +7252,130 @@ fn stage_conversion_log_fragment(
     staging: &StagingDir,
     runner: Option<&dyn ToolRunner>,
 ) -> io::Result<(PathBuf, String)> {
-    let track_record = conversion_log_fragment_track_record(outcome).ok_or_else(|| {
-        io::Error::new(
+    let fragments = stage_conversion_log_fragments(
+        outcome,
+        source,
+        req,
+        artifacts,
+        album_dir,
+        settings_fingerprint,
+        generated_at,
+        staging,
+        runner,
+    )?;
+    if fragments.len() != 1 {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "conversion log fragment requires exactly one track record",
-        )
-    })?;
-    let track_id = track_record.track_id.clone();
-    let sort_key = conversion_log_fragment_sort_key(req, &track_id)?;
+            format!(
+                "single conversion log fragment helper expected exactly one track fragment, got {}",
+                fragments.len()
+            ),
+        ));
+    }
+    Ok(fragments.into_iter().next().expect("one fragment"))
+}
+
+fn stage_conversion_log_fragments(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+    album_dir: &Path,
+    settings_fingerprint: Option<String>,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    staging: &StagingDir,
+    runner: Option<&dyn ToolRunner>,
+) -> io::Result<Vec<(PathBuf, String)>> {
+    let track_records = conversion_log_fragment_track_records(outcome);
+    if track_records.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "conversion log fragment publishing requires at least one track record",
+        ));
+    }
+
     let batch_identity = conversion_log_batch_identity(
         req,
         album_dir,
         settings_fingerprint.as_deref(),
     )?;
-    let fragment_name = conversion_log_fragment_file_name(sort_key, &batch_identity);
     let source_tracks_by_ordinal = build_source_track_index(source);
     let artifacts_by_track_id = build_track_artifact_index(artifacts);
     let metadata_stage_result = metadata_stage_outcome(outcome);
-    let mut track_section = String::new();
-    append_track_log(
-        &mut track_section,
-        track_record,
-        source_tracks_by_ordinal
-            .get(&track_id.source_ordinal)
-            .copied(),
-        artifacts_by_track_id.get(&track_id).copied(),
+    let common = build_conversion_log_common_fragment_with_runner(
+        outcome,
+        source,
         req,
-        metadata_stage_result,
+        artifacts,
+        runner,
     );
-
-    let fragment = ConversionLogFragment {
-        version: CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION,
-        expected_track_count: conversion_log_expected_track_count(req)?,
-        sort_key,
-        generated_at,
-        settings_fingerprint,
-        batch_identity,
-        common: build_conversion_log_common_fragment_with_runner(
-            outcome,
-            source,
-            req,
-            artifacts,
-            runner,
-        ),
-        track: ConversionLogTrackFragment {
-            section: track_section,
-        },
-        summary: ConversionLogTrackSummary::from_track_record(track_record),
-        stages: outcome_stage_records(outcome).to_vec(),
-    };
+    let stages = outcome_stage_records(outcome).to_vec();
+    let expected_track_count = conversion_log_expected_track_count(req)?;
     fs::create_dir_all(&staging.root)?;
-    let fragment_staged = staging.root.join(".conversion-log-fragment.json");
-    let bytes = serde_json::to_vec_pretty(&fragment).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("could not serialize conversion log fragment: {err}"),
-        )
-    })?;
-    fs::write(&fragment_staged, bytes)?;
-    Ok((fragment_staged, fragment_name))
+
+    let mut staged = Vec::with_capacity(track_records.len());
+    let mut seen_sort_keys = BTreeSet::new();
+    for track_record in track_records {
+        let track_id = track_record.track_id.clone();
+        let sort_key = conversion_log_materialized_fragment_sort_key(req, source, &track_id);
+        if !seen_sort_keys.insert(sort_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conversion log fragment source {} produced duplicate batch sort key d{} t{} s{}",
+                    req.container.display(),
+                    sort_key.disc_number,
+                    sort_key.track_number,
+                    sort_key.source_ordinal
+                ),
+            ));
+        }
+        let fragment_name = conversion_log_fragment_file_name(sort_key, &batch_identity);
+        let mut track_section = String::new();
+        append_track_log(
+            &mut track_section,
+            track_record,
+            source_tracks_by_ordinal
+                .get(&track_id.source_ordinal)
+                .copied(),
+            artifacts_by_track_id.get(&track_id).copied(),
+            req,
+            metadata_stage_result,
+        );
+
+        let fragment = ConversionLogFragment {
+            version: CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION,
+            expected_track_count,
+            sort_key,
+            generated_at,
+            settings_fingerprint: settings_fingerprint.clone(),
+            batch_identity: batch_identity.clone(),
+            common: common.clone(),
+            track: ConversionLogTrackFragment {
+                section: track_section,
+            },
+            summary: ConversionLogTrackSummary::from_track_record(track_record),
+            stages: stages.clone(),
+        };
+        let fragment_staged = staging
+            .root
+            .join(format!(".conversion-log-fragment-{fragment_name}"));
+        let bytes = serde_json::to_vec_pretty(&fragment).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("could not serialize conversion log fragment: {err}"),
+            )
+        })?;
+        fs::write(&fragment_staged, bytes)?;
+        staged.push((fragment_staged, fragment_name));
+    }
+    Ok(staged)
 }
 
-fn conversion_log_fragment_track_record(outcome: &AlbumOutcome) -> Option<&TrackRecord> {
-    let tracks = collect_outcome_tracks(outcome);
-    if tracks.len() == 1 {
-        tracks.into_iter().next()
-    } else {
-        None
-    }
+fn conversion_log_fragment_track_records(outcome: &AlbumOutcome) -> Vec<&TrackRecord> {
+    collect_outcome_tracks(outcome)
 }
+
 
 impl ConversionLogTrackSummary {
     fn from_track_record(record: &TrackRecord) -> Self {
@@ -11567,6 +11964,118 @@ fn enrich_source_with_label_info(source: &mut PreparedSource, container: &Path, 
     );
 }
 
+fn request_batch_resolved_identity(req: &PipelineRequest) -> Option<&BatchResolvedAlbumIdentity> {
+    req.batch_resolved_identity
+        .as_ref()
+        .or_else(|| req.album_batch.as_ref().and_then(|batch| batch.resolved_identity()))
+}
+
+fn remove_preserved_source_album_artist_tag(album: &mut AlbumMetadata) {
+    album
+        .extra
+        .remove(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY);
+    album
+        .extra
+        .remove(LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY);
+}
+
+fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &PipelineRequest) {
+    if let Some(identity) = request_batch_resolved_identity(req) {
+        preserve_source_tags_for_organizational_identity(&mut source.album_metadata);
+        if let Some(album) = identity.album.as_ref() {
+            source.album_metadata.album = Some(album.clone());
+        }
+        if let Some(album_artist) = identity.album_artist.as_ref() {
+            source.album_metadata.album_artist = Some(album_artist.clone());
+        }
+        if let Some(date) = identity.date.as_ref() {
+            source.album_metadata.date = Some(date.clone());
+        }
+        if let Some(total_discs) = identity.total_discs {
+            source.album_metadata.total_discs = Some(total_discs);
+        }
+        for track in &mut source.tracks {
+            let disc = identity
+                .disc_number_for_path(&source.container)
+                .or_else(|| identity.disc_number_for_path(track_source_identity_path(track)));
+            if let Some(disc) = disc {
+                if track.id.disc_number.is_none() {
+                    track.id.disc_number = Some(disc);
+                }
+                if track.metadata.disc_number.is_none() {
+                    track.metadata.disc_number = Some(disc);
+                }
+            }
+        }
+    }
+
+    match &req.metadata_overrides.album_artist {
+        MetadataTextOverride::Keep => {}
+        MetadataTextOverride::Clear => {
+            source.album_metadata.album_artist = None;
+            remove_preserved_source_album_artist_tag(&mut source.album_metadata);
+            for track in &mut source.tracks {
+                track.metadata.album_artist = None;
+            }
+        }
+        MetadataTextOverride::Set(value) => {
+            let value = value.trim();
+            if !value.is_empty() {
+                source.album_metadata.album_artist = Some(value.to_string());
+                remove_preserved_source_album_artist_tag(&mut source.album_metadata);
+                for track in &mut source.tracks {
+                    track.metadata.album_artist = Some(value.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn preserve_source_tags_for_organizational_identity(album: &mut AlbumMetadata) {
+    if !album.extra.contains_key(PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY) {
+        if let Some(original) = album
+            .extra
+            .get("album")
+            .cloned()
+            .or_else(|| album.album.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            album
+                .extra
+                .insert(PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY.to_string(), original);
+        }
+    }
+    if !album
+        .extra
+        .contains_key(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY)
+    {
+        if let Some(original) = album
+            .album_artist
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            album.extra.insert(
+                PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
+                original,
+            );
+        }
+    }
+}
+
+fn track_source_identity_path(track: &PreparedTrack) -> &Path {
+    match &track.source_ref {
+        TrackSourceRef::StagedFile(path) => path.as_path(),
+        TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.as_path(),
+        TrackSourceRef::ImageSegment { image, .. } => image.as_path(),
+        TrackSourceRef::SacdTrack { iso, .. } => iso.as_path(),
+        TrackSourceRef::DvdaTrack { volume_source, .. } => volume_source.root_or_image().as_path(),
+        TrackSourceRef::DvdVideoTrack { source, .. } => source.as_path(),
+        TrackSourceRef::BluRayTrack { source, .. } => source.as_path(),
+    }
+}
+
 
 // ===========================================================================
 // Scheduler split points
@@ -11807,6 +12316,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
     }
 
     enrich_source_with_label_info(&mut prepared, &req.container, &req);
+    apply_batch_identity_and_request_metadata(&mut prepared, &req);
 
     emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
     let album_plan = match plan_outputs(&prepared, &req) {
@@ -12648,7 +13158,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             current_outcome = push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
-            copy_companion_artifacts_best_effort(&req, &source_value, &album);
+            copy_companion_artifacts_after_publish_best_effort(&req, &source_value, &album);
             published = Some(album);
         }
         Err(err) => {
@@ -12962,6 +13472,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     // Tag-sourced values take priority; the resolver only fills gaps.
     if let Some(ref mut src) = source {
         enrich_source_with_label_info(src, &req.container, &req);
+        apply_batch_identity_and_request_metadata(src, &req);
     }
 
     emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
@@ -13380,7 +13891,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
             if let Some(source_ref) = source.as_ref() {
-                copy_companion_artifacts_best_effort(&req, source_ref, &album);
+                copy_companion_artifacts_after_publish_best_effort(&req, source_ref, &album);
             }
             published = Some(album);
         }
@@ -13443,6 +13954,346 @@ impl CompanionCopyStats {
     fn warning(&mut self) {
         self.warnings += 1;
     }
+
+    fn is_fully_successful(&self) -> bool {
+        self.warnings == 0
+    }
+}
+
+/// Coordinate companion copying at the publish/finalization boundary.
+///
+/// Historical call path: successful materialization publishes audio/sidecars,
+/// then calls this hook before the pipeline reports the item complete. Ordinary
+/// non-batch conversions still copy immediately from that item's source
+/// directory. Resolved album batches do not scan from that per-item hook; they
+/// wait until publish emits the album-batch completion signal, then scan the
+/// source grouping root once into the planner-resolved album directory.
+fn copy_companion_artifacts_after_publish_best_effort(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    published: &PublishedAlbum,
+) {
+    if should_coordinate_album_batch_companion_copy(req) {
+        copy_album_batch_companion_artifacts_once_ready_best_effort(req, published);
+    } else {
+        copy_companion_artifacts_best_effort(req, source, published);
+    }
+}
+
+fn should_coordinate_album_batch_companion_copy(req: &PipelineRequest) -> bool {
+    req.album_batch
+        .as_ref()
+        .and_then(|batch| batch.resolved_identity())
+        .is_some()
+}
+
+fn copy_album_batch_companion_artifacts_once_ready_best_effort(
+    req: &PipelineRequest,
+    published: &PublishedAlbum,
+) {
+    if !should_coordinate_album_batch_companion_copy(req) {
+        return;
+    }
+    if !album_batch_companion_finalization_signal(req, published) {
+        return;
+    }
+    if req.companion.is_empty() {
+        return;
+    }
+
+    let Some(batch) = req.album_batch.as_ref() else {
+        return;
+    };
+    let source_dir = batch.source_grouping_root.clone();
+    let context = format!("album batch {}", batch.conversion_log_batch_id.trim());
+    let finalization_key = companion_batch_finalization_key(req, published, batch);
+
+    if let Err(err) = with_album_publish_lock_for_companion_copy(&published.album_dir, || {
+        sweep_companion_batch_stale_temp_state_best_effort(&published.album_dir, context.as_str());
+
+        if companion_batch_finalized_in_this_run(finalization_key.as_str()) {
+            log::info!(
+                "companion copy skipped for {}: batch already finalized in this conversion run",
+                context
+            );
+            clean_companion_batch_transient_state_after_success_best_effort(&published.album_dir, context.as_str());
+            return;
+        }
+
+        record_album_batch_companion_scan_attempt();
+        let source_file_skip_set = companion_batch_source_file_skip_set(&source_dir);
+        let stats = copy_companion_artifacts_from_source_dir_best_effort(
+            req,
+            &source_dir,
+            &published.album_dir,
+            &source_file_skip_set,
+            context.as_str(),
+        );
+
+        if stats.is_fully_successful() {
+            remember_companion_batch_finalized_in_this_run(finalization_key);
+            clean_companion_batch_transient_state_after_success_best_effort(&published.album_dir, context.as_str());
+        } else {
+            log::warn!(
+                "companion copy not marked finalized for {}: scan/copy completed with {} warning(s); a later finalizer call will rescan",
+                context,
+                stats.warnings
+            );
+        }
+    }) {
+        log::warn!(
+            "companion copy skipped for {}: could not acquire album publish lock for {}: {err}",
+            context,
+            published.album_dir.display()
+        );
+    }
+}
+
+fn with_album_publish_lock_for_companion_copy(
+    album_dir: &Path,
+    operation: impl FnOnce(),
+) -> Result<(), PublishError> {
+    let _publish_lock = acquire_publish_lock(album_dir)?;
+    operation();
+    Ok(())
+}
+
+fn companion_batch_finalization_key(
+    req: &PipelineRequest,
+    published: &PublishedAlbum,
+    batch: &AlbumBatchContext,
+) -> String {
+    let extensions = normalized_companion_extension_set(&req.companion.extensions)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    let folders = normalized_companion_folder_set(&req.companion.folders)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    let excludes = normalized_companion_exclude_file_set(&req.companion.exclude_files)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+
+    let mut key = String::new();
+    key.push_str("tonepoet-companion-batch-finalized-v3\n");
+    push_finalization_key_line(
+        &mut key,
+        "conversion_log_batch_id",
+        batch.conversion_log_batch_id.trim(),
+    );
+    push_finalization_key_line(&mut key, "source_grouping_root", &stable_finalization_path_value(&batch.source_grouping_root));
+    push_finalization_key_line(&mut key, "album_dir", &stable_finalization_path_value(&published.album_dir));
+    push_finalization_key_line(&mut key, "expected_track_count", &batch.expected_track_count.to_string());
+    push_finalization_key_line(&mut key, "extensions", &extensions);
+    push_finalization_key_line(&mut key, "folders", &folders);
+    push_finalization_key_line(&mut key, "exclude_files", &excludes);
+    if let Some(identity) = batch.resolved_identity() {
+        push_finalization_key_line(&mut key, "resolved_album", identity.album.as_deref().unwrap_or(""));
+        push_finalization_key_line(&mut key, "resolved_album_artist", identity.album_artist.as_deref().unwrap_or(""));
+        push_finalization_key_line(&mut key, "resolved_date", identity.date.as_deref().unwrap_or(""));
+        push_finalization_key_line(
+            &mut key,
+            "resolved_total_discs",
+            &identity.total_discs.map(|value| value.to_string()).unwrap_or_default(),
+        );
+        for (path, disc) in &identity.source_disc_numbers {
+            push_finalization_key_line(&mut key, "resolved_source_disc", &format!("{path}={disc}"));
+        }
+    }
+    key
+}
+
+fn push_finalization_key_line(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push('=');
+    for ch in value.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\n');
+}
+
+fn stable_finalization_path_value(path: &Path) -> String {
+    normalize_path(path).to_string_lossy().replace('\\', "/")
+}
+
+fn companion_batch_finalized_keys() -> &'static Mutex<BTreeSet<String>> {
+    static KEYS: std::sync::OnceLock<Mutex<BTreeSet<String>>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn companion_batch_finalized_in_this_run(key: &str) -> bool {
+    companion_batch_finalized_keys()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(key)
+}
+
+fn remember_companion_batch_finalized_in_this_run(key: String) {
+    companion_batch_finalized_keys()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key);
+}
+
+#[cfg(test)]
+fn reset_companion_batch_finalized_in_this_run_for_tests() {
+    companion_batch_finalized_keys()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+fn companion_batch_transient_dir(album_dir: &Path) -> PathBuf {
+    album_dir.join(COMPANION_BATCH_TRANSIENT_DIR)
+}
+
+fn sweep_companion_batch_stale_temp_state_best_effort(album_dir: &Path, context: &str) {
+    sweep_companion_batch_transient_state_best_effort(album_dir, context, false);
+}
+
+fn clean_companion_batch_transient_state_after_success_best_effort(album_dir: &Path, context: &str) {
+    sweep_companion_batch_transient_state_best_effort(album_dir, context, true);
+}
+
+fn sweep_companion_batch_transient_state_best_effort(
+    album_dir: &Path,
+    context: &str,
+    remove_legacy_completion_marker: bool,
+) {
+    let dir = companion_batch_transient_dir(album_dir);
+    if !dir.is_dir() {
+        return;
+    }
+
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            log::warn!(
+                "companion batch transient cleanup skipped for {} at {}: cannot read directory: {err}",
+                context,
+                dir.display()
+            );
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                log::warn!(
+                    "companion batch transient cleanup skipped unreadable entry for {} under {}: {err}",
+                    context,
+                    dir.display()
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            log::warn!(
+                "companion batch transient cleanup skipped {} for {}: cannot inspect file type",
+                path.display(),
+                context
+            );
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(|name| name.to_string()) else {
+            continue;
+        };
+        if !is_owned_companion_batch_transient_file_name(name.as_str(), remove_legacy_completion_marker) {
+            continue;
+        }
+        if let Err(err) = fs::remove_file(&path) {
+            log::warn!(
+                "companion batch transient cleanup could not remove {} for {}: {err}",
+                path.display(),
+                context
+            );
+        }
+    }
+
+    match fs::remove_dir(&dir) {
+        Ok(()) => sync_parent_dir_best_effort(&dir),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+        Err(err) => log::warn!(
+            "companion batch transient cleanup could not remove empty directory {} for {}: {err}",
+            dir.display(),
+            context
+        ),
+    }
+}
+
+fn is_owned_companion_batch_transient_file_name(
+    name: &str,
+    remove_legacy_completion_marker: bool,
+) -> bool {
+    (remove_legacy_completion_marker && name == COMPANION_BATCH_LEGACY_COMPLETION_MARKER_FILE)
+        || (name.starts_with(".album-batch.done.tonepoet-copy.") && name.ends_with(".tmp"))
+        || (name.starts_with(COMPANION_BATCH_TRANSIENT_FINALIZER_PREFIX) && name.ends_with(".tmp"))
+}
+
+#[cfg(test)]
+fn record_album_batch_companion_scan_attempt() {
+    ALBUM_BATCH_COMPANION_SCAN_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_album_batch_companion_scan_attempts() {
+    ALBUM_BATCH_COMPANION_SCAN_ATTEMPTS.with(|attempts| attempts.set(0));
+    reset_companion_batch_finalized_in_this_run_for_tests();
+}
+
+#[cfg(test)]
+fn album_batch_companion_scan_attempts() -> u64 {
+    ALBUM_BATCH_COMPANION_SCAN_ATTEMPTS.with(|attempts| attempts.get())
+}
+
+#[cfg(not(test))]
+fn record_album_batch_companion_scan_attempt() {}
+
+fn album_batch_companion_finalization_signal(req: &PipelineRequest, published: &PublishedAlbum) -> bool {
+    if req.album_batch.is_none() {
+        return true;
+    }
+
+    // With visible conversion logs enabled, publish only includes the final
+    // conversion.log entry when hidden fragments have reached the dispatcher
+    // expected-track count and have assembled successfully. Earlier successful
+    // tracks publish only their audio payload plus hidden fragments, so they do
+    // not trigger a companion scan.
+    if published.entries.iter().any(|entry| {
+        matches!(entry.role, PublishRole::Sidecar(SidecarKind::ConversionLog))
+            && entry
+                .final_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("conversion.log"))
+    }) {
+        return true;
+    }
+
+    // With conversion logs disabled, fragments still coordinate batch
+    // completion but publish deliberately suppresses the visible conversion.log
+    // sidecar. Completion is therefore represented by the fragment directory
+    // being consumed/removed by the same publish finalization path.
+    if !req.log.write_conversion_log && !conversion_log_fragment_dir(&published.album_dir).exists() {
+        return true;
+    }
+
+    false
 }
 
 fn copy_companion_artifacts_best_effort(
@@ -13461,76 +14312,135 @@ fn copy_companion_artifacts_best_effort(
         );
         return;
     };
+    let source_file_skip_set = companion_source_file_skip_set(req, source);
+    copy_companion_artifacts_from_source_dir_best_effort(
+        req,
+        &source_dir,
+        &published.album_dir,
+        &source_file_skip_set,
+        req.item_id.as_str(),
+    );
+}
+
+fn copy_companion_artifacts_from_source_dir_best_effort(
+    req: &PipelineRequest,
+    source_dir: &Path,
+    album_dir: &Path,
+    source_file_skip_set: &BTreeSet<PathBuf>,
+    context: &str,
+) -> CompanionCopyStats {
+    let mut stats = CompanionCopyStats::default();
+
+    if req.companion.is_empty() {
+        return stats;
+    }
 
     if !source_dir.is_dir() {
+        stats.warning();
         log::warn!(
             "companion copy skipped for {}: source directory is not readable: {}",
-            req.item_id,
+            context,
             source_dir.display()
         );
-        return;
+        return stats;
     }
 
-    if !published.album_dir.is_dir() {
+    if !album_dir.is_dir() {
+        stats.warning();
         log::warn!(
             "companion copy skipped for {}: published album directory is not readable: {}",
-            req.item_id,
-            published.album_dir.display()
+            context,
+            album_dir.display()
         );
-        return;
+        return stats;
     }
 
-    if normalize_path(&source_dir) == normalize_path(&published.album_dir) {
+    if normalize_path(source_dir) == normalize_path(album_dir) {
         log::info!(
             "companion copy skipped for {}: source and destination directories are identical ({})",
-            req.item_id,
+            context,
             source_dir.display()
         );
-        return;
+        return stats;
     }
 
     let extensions = normalized_companion_extension_set(&req.companion.extensions);
     let folders = normalized_companion_folder_set(&req.companion.folders);
     if extensions.is_empty() && folders.is_empty() {
-        return;
+        return stats;
     }
 
     let exclude_files = normalized_companion_exclude_file_set(&req.companion.exclude_files);
-    let source_file_skip_set = companion_source_file_skip_set(req, source);
-    let mut stats = CompanionCopyStats::default();
 
     if !extensions.is_empty() {
         copy_loose_companion_files(
-            &source_dir,
-            &published.album_dir,
+            source_dir,
+            album_dir,
             &extensions,
             &exclude_files,
-            &source_file_skip_set,
+            source_file_skip_set,
             &mut stats,
         );
         copy_nested_companion_files(
-            &source_dir,
-            &published.album_dir,
+            source_dir,
+            album_dir,
             &extensions,
             &exclude_files,
             &folders,
-            &source_file_skip_set,
+            source_file_skip_set,
             &mut stats,
         );
     }
 
     if !folders.is_empty() {
-        copy_companion_folders(&source_dir, &published.album_dir, &folders, &mut stats);
+        copy_companion_folders(source_dir, album_dir, &folders, &mut stats);
     }
 
     if stats.copied > 0 || stats.skipped > 0 || stats.warnings > 0 {
         log::info!(
             "companion copy for {} complete: copied={}, skipped={}, warnings={}",
-            req.item_id,
+            context,
             stats.copied,
             stats.skipped,
             stats.warnings
         );
+    }
+
+    stats
+}
+
+fn companion_batch_source_file_skip_set(source_dir: &Path) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    insert_batch_audio_source_skip_paths(&mut paths, source_dir, 0);
+    paths
+}
+
+fn insert_batch_audio_source_skip_paths(paths: &mut BTreeSet<PathBuf>, dir: &Path, depth: usize) {
+    if depth > 1 {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry_result in entries {
+        let Ok(entry) = entry_result else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_file() {
+            if crate::convert::classify::is_audio_file_path(&path) {
+                paths.insert(normalize_path(&path));
+            }
+        } else if file_type.is_dir() && depth == 0 {
+            insert_batch_audio_source_skip_paths(paths, &path, depth + 1);
+        }
     }
 }
 
@@ -14058,10 +14968,10 @@ enum CompanionFileCopyOutcome {
     /// failed. Companion copying is best-effort, so the conversion must not
     /// fail merely because permissions or mtimes could not be preserved.
     CopiedWithMetadataWarning,
-    /// The destination already existed with the same size and mtime, either
-    /// before copying began or because a concurrent writer won the race.
+    /// The destination already existed with the same size, mtime, and content,
+    /// either before copying began or because a concurrent writer won the race.
     SkippedExistingSameMetadata,
-    /// The destination already existed with different metadata. No-clobber
+    /// The destination already existed with different metadata or content. No-clobber
     /// semantics require us to leave it untouched and record a warning.
     SkippedExistingDifferentMetadata,
 }
@@ -14087,14 +14997,14 @@ fn copy_regular_companion_file(src: &Path, dst: &Path, stats: &mut CompanionCopy
         }
     };
 
-    match existing_companion_destination_outcome(&src_meta, dst) {
+    match existing_companion_destination_outcome(src, &src_meta, dst) {
         Ok(Some(CompanionFileCopyOutcome::SkippedExistingSameMetadata)) => {
             stats.skipped();
             return;
         }
         Ok(Some(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata)) => {
             stats.warning();
-            log_companion_destination_conflict(src, dst, "destination already exists with different metadata");
+            log_companion_destination_conflict(src, dst, "destination already exists with different metadata or content");
             return;
         }
         Ok(None) => {}
@@ -14120,7 +15030,7 @@ fn copy_regular_companion_file(src: &Path, dst: &Path, stats: &mut CompanionCopy
             log_companion_destination_conflict(
                 src,
                 dst,
-                "destination appeared during copy with different metadata",
+                "destination appeared during copy with different metadata or content",
             );
         }
         Err(err) => {
@@ -14139,11 +15049,12 @@ fn log_companion_destination_conflict(src: &Path, dst: &Path, reason: &str) {
 }
 
 fn existing_companion_destination_outcome(
+    src: &Path,
     src_meta: &fs::Metadata,
     dst: &Path,
 ) -> io::Result<Option<CompanionFileCopyOutcome>> {
     match fs::symlink_metadata(dst) {
-        Ok(dst_meta) if same_size_and_mtime(src_meta, &dst_meta) => {
+        Ok(dst_meta) if same_size_mtime_and_content(src, src_meta, dst, &dst_meta)? => {
             Ok(Some(CompanionFileCopyOutcome::SkippedExistingSameMetadata))
         }
         Ok(_) => Ok(Some(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata)),
@@ -14152,13 +15063,43 @@ fn existing_companion_destination_outcome(
     }
 }
 
-fn same_size_and_mtime(src_meta: &fs::Metadata, dst_meta: &fs::Metadata) -> bool {
+fn same_size_mtime_and_content(
+    src: &Path,
+    src_meta: &fs::Metadata,
+    dst: &Path,
+    dst_meta: &fs::Metadata,
+) -> io::Result<bool> {
     if !dst_meta.is_file() || src_meta.len() != dst_meta.len() {
-        return false;
+        return Ok(false);
     }
     match (src_meta.modified(), dst_meta.modified()) {
-        (Ok(src), Ok(dst)) => system_time_abs_diff(src, dst) <= Duration::from_secs(1),
-        _ => false,
+        (Ok(src_mtime), Ok(dst_mtime))
+            if system_time_abs_diff(src_mtime, dst_mtime) <= Duration::from_secs(1) => {}
+        _ => return Ok(false),
+    }
+    regular_file_contents_equal(src, dst)
+}
+
+fn regular_file_contents_equal(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::io::Read;
+
+    let mut left = fs::File::open(a)?;
+    let mut right = fs::File::open(b)?;
+    let mut left_buf = [0_u8; 8192];
+    let mut right_buf = [0_u8; 8192];
+
+    loop {
+        let left_n = left.read(&mut left_buf)?;
+        let right_n = right.read(&mut right_buf)?;
+        if left_n != right_n {
+            return Ok(false);
+        }
+        if left_n == 0 {
+            return Ok(true);
+        }
+        if left_buf[..left_n] != right_buf[..right_n] {
+            return Ok(false);
+        }
     }
 }
 
@@ -14182,7 +15123,7 @@ fn copy_regular_companion_file_noclobber(
     })?;
     fs::create_dir_all(parent)?;
 
-    if let Some(outcome) = existing_companion_destination_outcome(src_meta, dst)? {
+    if let Some(outcome) = existing_companion_destination_outcome(src, src_meta, dst)? {
         return Ok(outcome);
     }
 
@@ -14233,7 +15174,7 @@ fn finalize_companion_temp_file(
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                existing_companion_destination_outcome(src_meta, dst).map(|outcome| {
+                existing_companion_destination_outcome(src, src_meta, dst).map(|outcome| {
                     outcome.unwrap_or(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata)
                 })
             }
@@ -14264,7 +15205,7 @@ fn install_companion_temp_by_copy_no_clobber(
     let mut output = match fs::OpenOptions::new().write(true).create_new(true).open(dst) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            return existing_companion_destination_outcome(src_meta, dst).map(|outcome| {
+            return existing_companion_destination_outcome(src, src_meta, dst).map(|outcome| {
                 outcome.unwrap_or(CompanionFileCopyOutcome::SkippedExistingDifferentMetadata)
             });
         }
@@ -14482,6 +15423,8 @@ mod companion_copy_hardening_tests {
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -14809,6 +15752,775 @@ mod companion_copy_hardening_tests {
         assert!(
             !dst.join("artwork").exists(),
             "artwork directories are covered by companion folder copying, not the nested scan"
+        );
+    }
+
+    #[test]
+    fn companion_copy_isolates_per_disc_cue_m3u_and_log_files_across_reruns() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        let disc2 = source_dir.join("disc 02");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&disc2).expect("disc 2");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = disc1.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(disc1.join("disc1.cue"), b"cue1").expect("cue1");
+        std::fs::write(disc1.join("disc1.m3u"), b"m3u1").expect("m3u1");
+        std::fs::write(disc1.join("disc1.log"), b"log1").expect("log1");
+        std::fs::write(disc2.join("disc2.cue"), b"cue2").expect("cue2");
+        std::fs::write(disc2.join("disc2.m3u"), b"m3u2").expect("m3u2");
+        std::fs::write(disc2.join("disc2.log"), b"log2").expect("log2");
+
+        let mut req = test_request(temp.path(), audio.clone());
+        req.companion.extensions = vec!["cue".to_string(), "m3u".to_string(), "log".to_string()];
+        req.album_batch = Some(AlbumBatchContext::new(
+            new_conversion_log_batch_id(),
+            2,
+            dst.clone(),
+            source_dir.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        copy_companion_artifacts_best_effort(&req, &prepared, &published);
+        copy_companion_artifacts_best_effort(&req, &prepared, &published);
+
+        for name in ["disc1.cue", "disc1.m3u", "disc1.log"] {
+            assert!(dst.join("disc 01").join(name).exists(), "disc 1 companion {name} copied to disc 01");
+            assert!(!dst.join("disc 02").join(name).exists(), "disc 1 companion {name} must not contaminate disc 02");
+        }
+        for name in ["disc2.cue", "disc2.m3u", "disc2.log"] {
+            assert!(dst.join("disc 02").join(name).exists(), "disc 2 companion {name} copied to disc 02");
+            assert!(!dst.join("disc 01").join(name).exists(), "disc 2 companion {name} must not contaminate disc 01");
+        }
+        assert_eq!(std::fs::read(dst.join("disc 01").join("disc1.log")).expect("disc1 log"), b"log1");
+        assert_eq!(std::fs::read(dst.join("disc 02").join("disc2.log")).expect("disc2 log"), b"log2");
+    }
+
+
+    fn resolved_companion_test_identity(total_discs: u32) -> BatchResolvedAlbumIdentity {
+        BatchResolvedAlbumIdentity {
+            album: Some("Resolved Album".to_string()),
+            album_artist: Some("Resolved Artist".to_string()),
+            date: Some("1972".to_string()),
+            total_discs: Some(total_discs),
+            source_disc_numbers: BTreeMap::new(),
+        }
+    }
+
+    fn resolved_companion_batch_request(
+        output_root: &Path,
+        source_file: PathBuf,
+        album_dir: PathBuf,
+        source_grouping_root: PathBuf,
+        expected_tracks: usize,
+    ) -> PipelineRequest {
+        let mut req = test_request(output_root, source_file);
+        req.companion.extensions = vec!["cue".to_string(), "m3u".to_string(), "log".to_string(), "flac".to_string()];
+        req.album_batch = Some(
+            AlbumBatchContext::new(
+                new_conversion_log_batch_id(),
+                expected_tracks,
+                album_dir,
+                source_grouping_root,
+            )
+            .with_resolved_identity(resolved_companion_test_identity(2)),
+        );
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        req
+    }
+
+    fn completed_album_batch_published_album(album_dir: PathBuf) -> PublishedAlbum {
+        PublishedAlbum {
+            album_dir: album_dir.clone(),
+            entries: vec![PublishedEntry {
+                final_path: album_dir.join("conversion.log"),
+                role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                bytes: 1,
+            }],
+            manifest_path: None,
+        }
+    }
+
+    fn sorted_relative_regular_files(root: &Path) -> Vec<PathBuf> {
+        fn visit(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    visit(root, &path, out);
+                } else if file_type.is_file() {
+                    if let Ok(relative) = path.strip_prefix(root) {
+                        out.push(relative.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        visit(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn resolved_album_batch_companion_copy_defers_until_batch_finalization() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        let disc2 = source_dir.join("disc 02");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&disc2).expect("disc 2");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = disc1.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(disc1.join("disc1.log"), b"log1").expect("log1");
+        std::fs::write(disc2.join("disc2.log"), b"log2").expect("log2");
+
+        let req = resolved_companion_batch_request(
+            temp.path(),
+            audio.clone(),
+            dst.clone(),
+            source_dir,
+            2,
+        );
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+
+        assert!(
+            !dst.join("disc 01").join("disc1.log").exists(),
+            "resolved album batches must not scan companions once per track before finalization"
+        );
+        assert!(
+            !dst.join("disc 02").join("disc2.log").exists(),
+            "resolved album batches must wait for the batch completion signal"
+        );
+    }
+
+    #[test]
+    fn resolved_album_batch_companion_copy_runs_once_after_complete_and_skips_audio_sources() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        let disc2 = source_dir.join("disc 02");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&disc2).expect("disc 2");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio1 = disc1.join("01.flac");
+        let audio2 = disc2.join("01.flac");
+        std::fs::write(&audio1, b"audio1").expect("audio1");
+        std::fs::write(&audio2, b"audio2").expect("audio2");
+        std::fs::write(disc1.join("disc1.cue"), b"cue1").expect("cue1");
+        std::fs::write(disc1.join("disc1.m3u"), b"m3u1").expect("m3u1");
+        std::fs::write(disc1.join("disc1.log"), b"log1").expect("log1");
+        std::fs::write(disc2.join("disc2.cue"), b"cue2").expect("cue2");
+        std::fs::write(disc2.join("disc2.m3u"), b"m3u2").expect("m3u2");
+        std::fs::write(disc2.join("disc2.log"), b"log2").expect("log2");
+
+        let req = resolved_companion_batch_request(
+            temp.path(),
+            audio1.clone(),
+            dst.clone(),
+            source_dir.clone(),
+            2,
+        );
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio1.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio1))],
+        );
+        let published = completed_album_batch_published_album(dst.clone());
+        let transient_dir = companion_batch_transient_dir(&dst);
+        std::fs::create_dir_all(&transient_dir).expect("transient dir");
+        std::fs::write(
+            transient_dir.join(COMPANION_BATCH_LEGACY_COMPLETION_MARKER_FILE),
+            b"legacy marker from interrupted older build",
+        )
+        .expect("legacy marker");
+        std::fs::write(
+            transient_dir.join(".album-batch.done.tonepoet-copy.1.1.tmp"),
+            b"stale temp marker",
+        )
+        .expect("stale temp");
+
+        reset_album_batch_companion_scan_attempts();
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        let first_layout = sorted_relative_regular_files(&dst);
+        assert!(
+            !dst.join(COMPANION_BATCH_TRANSIENT_DIR).exists(),
+            "successful batch companion finalization must clean owned transient marker state"
+        );
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            1,
+            "first completed finalizer call should perform exactly one batch companion scan"
+        );
+
+        reset_companion_batch_finalized_in_this_run_for_tests();
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        let rerun_layout = sorted_relative_regular_files(&dst);
+        assert_eq!(
+            first_layout, rerun_layout,
+            "a later process run without a durable marker must remain idempotent through existing-destination validation"
+        );
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            2,
+            "a simulated later process run should rescan once because no durable success marker remains"
+        );
+
+        std::fs::remove_dir_all(&source_dir).expect("source removed after in-run finalization");
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        let second_layout = sorted_relative_regular_files(&dst);
+
+        assert_eq!(rerun_layout, second_layout, "rerunning companion finalization in the same process must be idempotent");
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            2,
+            "process-local batch finalization state must make repeated finalization exit before rescanning the source tree"
+        );
+        for name in ["disc1.cue", "disc1.m3u", "disc1.log"] {
+            assert!(dst.join("disc 01").join(name).exists(), "disc 1 companion {name} copied to disc 01");
+            assert!(!dst.join("disc 02").join(name).exists(), "disc 1 companion {name} must not contaminate disc 02");
+        }
+        for name in ["disc2.cue", "disc2.m3u", "disc2.log"] {
+            assert!(dst.join("disc 02").join(name).exists(), "disc 2 companion {name} copied to disc 02");
+            assert!(!dst.join("disc 01").join(name).exists(), "disc 2 companion {name} must not contaminate disc 01");
+        }
+        assert!(
+            !dst.join("disc 01").join("01.flac").exists(),
+            "batch companion copying must skip source audio even when that extension is configured"
+        );
+        assert!(
+            !dst.join("disc 02").join("01.flac").exists(),
+            "batch companion copying must skip sibling source audio, not only the representative track"
+        );
+    }
+
+    #[test]
+    fn resolved_album_batch_companion_copy_does_not_mark_failed_scan_and_recovers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = source_dir.join("disc 01").join("01.flac");
+
+        let req = resolved_companion_batch_request(
+            temp.path(),
+            audio.clone(),
+            dst.clone(),
+            source_dir.clone(),
+            1,
+        );
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio.clone()))],
+        );
+        let published = completed_album_batch_published_album(dst.clone());
+
+        reset_album_batch_companion_scan_attempts();
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        assert!(
+            !companion_batch_finalized_in_this_run(companion_batch_finalization_key(&req, &published, req.album_batch.as_ref().expect("album batch")).as_str()),
+            "failed or interrupted batch companion scans must not record successful in-run finalization"
+        );
+        assert!(
+            !dst.join(COMPANION_BATCH_TRANSIENT_DIR).exists(),
+            "failed scans must not leave a durable companion completion marker directory"
+        );
+        assert_eq!(album_batch_companion_scan_attempts(), 1);
+
+        std::fs::create_dir_all(source_dir.join("disc 01")).expect("source disc");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(source_dir.join("disc 01").join("rip.log"), b"log").expect("log");
+
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        assert_eq!(
+            std::fs::read(dst.join("disc 01").join("rip.log")).expect("copied log"),
+            b"log"
+        );
+        assert!(
+            companion_batch_finalized_in_this_run(companion_batch_finalization_key(&req, &published, req.album_batch.as_ref().expect("album batch")).as_str()),
+            "a successful retry after an unmarked failed scan must record in-run finalization"
+        );
+        assert!(
+            !dst.join(COMPANION_BATCH_TRANSIENT_DIR).exists(),
+            "successful retry must still leave no durable companion marker debris"
+        );
+        assert_eq!(album_batch_companion_scan_attempts(), 2);
+    }
+
+    #[test]
+    fn resolved_album_batch_companion_conflict_does_not_overwrite_or_mark_success() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        let dst_disc1 = dst.join("disc 01");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&dst_disc1).expect("dst disc 1");
+        let audio = disc1.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(disc1.join("rip.log"), b"source log").expect("source log");
+        std::fs::write(dst_disc1.join("rip.log"), b"conflicting destination").expect("destination conflict");
+
+        let req = resolved_companion_batch_request(
+            temp.path(),
+            audio.clone(),
+            dst.clone(),
+            source_dir.clone(),
+            1,
+        );
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = completed_album_batch_published_album(dst.clone());
+        let key = companion_batch_finalization_key(&req, &published, req.album_batch.as_ref().expect("album batch"));
+
+        reset_album_batch_companion_scan_attempts();
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+
+        assert_eq!(
+            std::fs::read(dst_disc1.join("rip.log")).expect("destination retained"),
+            b"conflicting destination",
+            "conflicting existing companion files must never be overwritten"
+        );
+        assert!(
+            !companion_batch_finalized_in_this_run(key.as_str()),
+            "warning-bearing conflict scans must not record successful finalization"
+        );
+        assert_eq!(album_batch_companion_scan_attempts(), 1);
+
+        std::fs::remove_dir_all(&source_dir).expect("source removed before retry");
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            2,
+            "unmarked conflict finalization must rescan on retry rather than skipping"
+        );
+    }
+
+    #[test]
+    fn companion_batch_transient_cleanup_removes_only_owned_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        let transient_dir = companion_batch_transient_dir(&dst);
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&transient_dir).expect("transient dir");
+        let audio = disc1.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(disc1.join("rip.log"), b"log").expect("log");
+        std::fs::write(
+            transient_dir.join(COMPANION_BATCH_LEGACY_COMPLETION_MARKER_FILE),
+            b"legacy marker",
+        )
+        .expect("legacy marker");
+        std::fs::write(
+            transient_dir.join(".album-batch.done.tonepoet-copy.1.2.tmp"),
+            b"owned temp",
+        )
+        .expect("owned temp");
+        std::fs::write(transient_dir.join("user-not-owned.txt"), b"keep").expect("non-owned file");
+
+        let req = resolved_companion_batch_request(
+            temp.path(),
+            audio.clone(),
+            dst.clone(),
+            source_dir,
+            1,
+        );
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = completed_album_batch_published_album(dst.clone());
+
+        reset_album_batch_companion_scan_attempts();
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+
+        assert!(!transient_dir.join(COMPANION_BATCH_LEGACY_COMPLETION_MARKER_FILE).exists());
+        assert!(!transient_dir.join(".album-batch.done.tonepoet-copy.1.2.tmp").exists());
+        assert_eq!(std::fs::read(transient_dir.join("user-not-owned.txt")).expect("kept file"), b"keep");
+        assert_eq!(std::fs::read(dst.join("disc 01").join("rip.log")).expect("copied companion"), b"log");
+    }
+
+    #[test]
+    fn resolved_album_batch_companion_in_run_key_is_validated_against_copy_contract() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = disc1.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(disc1.join("rip.log"), b"log").expect("log");
+        std::fs::write(disc1.join("playlist.m3u"), b"m3u").expect("m3u");
+
+        let mut req = resolved_companion_batch_request(
+            temp.path(),
+            audio.clone(),
+            dst.clone(),
+            source_dir.clone(),
+            1,
+        );
+        req.companion.extensions = vec!["log".to_string()];
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = completed_album_batch_published_album(dst.clone());
+
+        reset_album_batch_companion_scan_attempts();
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        assert_eq!(album_batch_companion_scan_attempts(), 1);
+        assert!(dst.join("disc 01").join("rip.log").is_file());
+        assert!(
+            !dst.join("disc 01").join("playlist.m3u").exists(),
+            "first in-run finalization key is valid only for the companion extensions used to create it"
+        );
+
+        let mut req_with_m3u = req.clone();
+        req_with_m3u.companion.extensions = vec!["log".to_string(), "m3u".to_string()];
+        copy_companion_artifacts_after_publish_best_effort(&req_with_m3u, &prepared, &published);
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            2,
+            "changed companion settings must invalidate the in-run finalization key and force one more scan"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("disc 01").join("playlist.m3u")).expect("copied m3u"),
+            b"m3u"
+        );
+
+        std::fs::remove_dir_all(&source_dir).expect("source removed after updated in-run finalization");
+        copy_companion_artifacts_after_publish_best_effort(&req_with_m3u, &prepared, &published);
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            2,
+            "updated in-run finalization key must skip before source scanning"
+        );
+    }
+
+
+    #[test]
+    fn companion_batch_in_run_finalization_key_is_scoped_to_dispatch_attempt() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = disc1.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(disc1.join("rip.log"), b"log").expect("log");
+
+        let req = resolved_companion_batch_request(
+            temp.path(),
+            audio.clone(),
+            dst.clone(),
+            source_dir.clone(),
+            1,
+        );
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = completed_album_batch_published_album(dst.clone());
+
+        reset_album_batch_companion_scan_attempts();
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        assert_eq!(album_batch_companion_scan_attempts(), 1);
+        assert_eq!(
+            std::fs::read(dst.join("disc 01").join("rip.log")).expect("copied log"),
+            b"log"
+        );
+
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            1,
+            "a repeated finalizer signal for the same album dispatch attempt must skip before rescanning"
+        );
+
+        std::fs::write(disc1.join("new-rip.log"), b"new log").expect("new log");
+        let mut fresh_attempt_req = req.clone();
+        let old_attempt_id = fresh_attempt_req
+            .album_batch
+            .as_ref()
+            .expect("album batch")
+            .conversion_log_batch_id
+            .clone();
+        fresh_attempt_req
+            .album_batch
+            .as_mut()
+            .expect("album batch")
+            .conversion_log_batch_id = new_conversion_log_batch_id();
+        assert_ne!(
+            old_attempt_id,
+            fresh_attempt_req
+                .album_batch
+                .as_ref()
+                .expect("album batch")
+                .conversion_log_batch_id,
+            "test must model a fresh album dispatch attempt in the same process"
+        );
+
+        copy_companion_artifacts_after_publish_best_effort(&fresh_attempt_req, &prepared, &published);
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            2,
+            "a new album dispatch attempt in the same process must rescan, not inherit the previous attempt's in-run finalized state"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("disc 01").join("new-rip.log")).expect("copied new log"),
+            b"new log"
+        );
+
+        copy_companion_artifacts_after_publish_best_effort(&fresh_attempt_req, &prepared, &published);
+        assert_eq!(
+            album_batch_companion_scan_attempts(),
+            2,
+            "the fresh attempt's own repeated finalizer signal should then skip before rescanning"
+        );
+    }
+
+
+    #[test]
+    fn resolved_per_disc_cue_image_batch_companion_copy_is_batch_finalized() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        let disc2 = source_dir.join("disc 02");
+        let staging_dir = temp.path().join("staging").join("cue-segments");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&disc2).expect("disc 2");
+        std::fs::create_dir_all(&staging_dir).expect("staging");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let cue1 = disc1.join("disc1.cue");
+        let cue2 = disc2.join("disc2.cue");
+        let image1 = disc1.join("disc1.flac");
+        let image2 = disc2.join("disc2.flac");
+        let staged = staging_dir.join("01.wav");
+        std::fs::write(&cue1, b"cue1").expect("cue1");
+        std::fs::write(&cue2, b"cue2").expect("cue2");
+        std::fs::write(&image1, b"image1").expect("image1");
+        std::fs::write(&image2, b"image2").expect("image2");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        let req = resolved_companion_batch_request(
+            temp.path(),
+            cue1.clone(),
+            dst.clone(),
+            source_dir,
+            4,
+        );
+        let prepared = test_prepared_source(
+            SourceKind::CueImage,
+            cue1,
+            vec![cue_segment_track(staged, image1)],
+        );
+        let published = completed_album_batch_published_album(dst.clone());
+
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+
+        assert_eq!(std::fs::read(dst.join("disc 01").join("disc1.cue")).expect("disc1 cue"), b"cue1");
+        assert_eq!(std::fs::read(dst.join("disc 02").join("disc2.cue")).expect("disc2 cue"), b"cue2");
+        assert!(
+            !dst.join("disc 01").join("disc1.flac").exists(),
+            "batch CUE companion finalization must not copy disc 1 audio image"
+        );
+        assert!(
+            !dst.join("disc 02").join("disc2.flac").exists(),
+            "batch CUE companion finalization must skip sibling disc audio images too"
+        );
+    }
+
+    #[test]
+    fn resolved_album_batch_companion_copy_runs_after_terminal_failure_finalization_signal() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        let disc2 = source_dir.join("disc 02");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&disc2).expect("disc 2");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = disc1.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(disc2.join("disc2.log"), b"log2").expect("log2");
+
+        let req = resolved_companion_batch_request(
+            temp.path(),
+            audio.clone(),
+            dst.clone(),
+            source_dir,
+            2,
+        );
+        let published = completed_album_batch_published_album(dst.clone());
+
+        copy_album_batch_companion_artifacts_once_ready_best_effort(&req, &published);
+
+        assert_eq!(
+            std::fs::read(dst.join("disc 02").join("disc2.log")).expect("disc 2 companion"),
+            b"log2",
+            "batch-level companion finalization must run after a complete batch signal even if one track failed"
+        );
+    }
+
+    #[test]
+    fn non_batch_companion_copy_keeps_immediate_per_item_behavior() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = source_dir.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(source_dir.join("rip.log"), b"log").expect("log");
+
+        let mut req = test_request(temp.path(), audio.clone());
+        req.companion.extensions = vec!["log".to_string()];
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+
+        assert_eq!(std::fs::read(dst.join("rip.log")).expect("copied log"), b"log");
+    }
+
+    #[test]
+    fn resolved_album_batch_companion_copy_uses_silent_log_completion_signal() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        let disc1 = source_dir.join("disc 01");
+        let disc2 = source_dir.join("disc 02");
+        std::fs::create_dir_all(&disc1).expect("disc 1");
+        std::fs::create_dir_all(&disc2).expect("disc 2");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = disc1.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(disc1.join("disc1.log"), b"log1").expect("log1");
+        std::fs::write(disc2.join("disc2.log"), b"log2").expect("log2");
+
+        let mut req = resolved_companion_batch_request(
+            temp.path(),
+            audio.clone(),
+            dst.clone(),
+            source_dir,
+            2,
+        );
+        req.log.write_conversion_log = false;
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        let fragment_dir = conversion_log_fragment_dir(&dst);
+        std::fs::create_dir_all(&fragment_dir).expect("fragment dir represents incomplete hidden batch state");
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        assert!(
+            !dst.join("disc 01").join("disc1.log").exists(),
+            "with conversion logs disabled, hidden fragments still gate companion finalization"
+        );
+
+        std::fs::remove_dir(&fragment_dir).expect("fragment dir consumed by publish finalization");
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+        assert_eq!(std::fs::read(dst.join("disc 01").join("disc1.log")).expect("disc 1 companion"), b"log1");
+        assert_eq!(std::fs::read(dst.join("disc 02").join("disc2.log")).expect("disc 2 companion"), b"log2");
+    }
+
+    #[test]
+    fn unresolved_album_batch_keeps_legacy_immediate_companion_copy() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let dst = temp.path().join("published");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = source_dir.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(source_dir.join("rip.log"), b"log").expect("log");
+
+        let mut req = test_request(temp.path(), audio.clone());
+        req.companion.extensions = vec!["log".to_string()];
+        req.album_batch = Some(AlbumBatchContext::new(
+            new_conversion_log_batch_id(),
+            1,
+            dst.clone(),
+            source_dir.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, &published);
+
+        assert_eq!(
+            std::fs::read(dst.join("rip.log")).expect("copied log"),
+            b"log",
+            "batches without resolved identity preserve the historical immediate copy path"
         );
     }
 
@@ -19541,6 +21253,8 @@ mod pipeline_test_helpers {
             failure_policy: FailurePolicy::AllowPartialAlbum,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -20674,6 +22388,8 @@ mod naming_template_tests {
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -21874,6 +23590,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             failure_policy: policy,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
@@ -24702,6 +26420,78 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[test]
+    fn cue_album_batch_stages_one_hidden_fragment_per_decomposed_track() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("out").join("Cue Album");
+        let source_root = temp.path().join("source-root");
+
+        let mut source = log_test_source();
+        source.kind = SourceKind::CueImage;
+        source.container = source_root.join("disc 01").join("album.cue");
+        source.provenance.source_kind = SourceKind::CueImage;
+        source.tracks.truncate(2);
+
+        let mut second = failed_record();
+        second.outcome = TrackOutcome::Ok;
+        second.output_file = Some(PathBuf::from("/encoded/02.flac"));
+        second.bytes_out = Some(1536);
+        second.duration = Some(Duration::from_secs(70));
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record(), second],
+            stages: stage_records(),
+        };
+
+        let mut req = log_test_request();
+        req.output_root = temp.path().join("out");
+        req.container = source.container.clone();
+        req.album_batch = Some(AlbumBatchContext::new(
+            generated_test_batch_id("cue-batch-fragments"),
+            4,
+            album_dir.clone(),
+            source_root,
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+
+        let staging = StagingDir::new(
+            temp.path().join("stage-cue-batch-fragments"),
+            "stage-cue-batch-fragments".to_string(),
+        );
+        let staged = stage_conversion_log_sidecars(
+            log_test_artifacts(),
+            &outcome,
+            &source,
+            &req,
+            &staging,
+            None,
+        )
+        .expect("cue fragment staging succeeds");
+
+        let fragments = staged
+            .sidecars
+            .iter()
+            .filter(|sidecar| {
+                matches!(
+                    &sidecar.kind,
+                    SidecarKind::Other(kind) if kind == CONVERSION_LOG_FRAGMENT_SIDE_KIND
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fragments.len(), 2, "one fragment per materialized CUE track");
+
+        let mut sort_keys = Vec::new();
+        for sidecar in fragments {
+            let bytes = std::fs::read(&sidecar.staged_path).expect("fragment json");
+            let fragment: ConversionLogFragment = serde_json::from_slice(&bytes).expect("fragment parses");
+            assert_eq!(fragment.expected_track_count, 4);
+            sort_keys.push(fragment.sort_key);
+            assert!(sidecar.final_path.starts_with(album_dir.join(CONVERSION_LOG_FRAGMENT_DIR)));
+        }
+        sort_keys.sort();
+        assert_eq!(sort_keys[0].track_number, 1);
+        assert_eq!(sort_keys[1].track_number, 2);
+    }
+
+    #[test]
     fn write_conversion_log_disabled_finalize_consumes_complete_fragments_without_log() {
         let temp = tempfile::tempdir().expect("temp dir");
         let work_album_dir = temp.path().join("work-album");
@@ -24911,7 +26701,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         };
         let staging = StagingDir::new(temp.path().join("stage-tags"), "stage-tags".to_string());
 
-        let (_staged, _name) = stage_conversion_log_fragment(
+        let (staged, _name) = stage_conversion_log_fragment(
             &outcome,
             &source,
             &req,
@@ -24923,8 +26713,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             None,
         )
         .expect("fragment uses dispatcher batch count, not tag totals");
-        let fragment = read_conversion_log_fragment_file(&staging.root.join(".conversion-log-fragment.json"))
-            .expect("fragment json");
+        let fragment = read_conversion_log_fragment_file(&staged).expect("fragment json");
 
         assert_eq!(fragment.expected_track_count, 4);
         assert_eq!(conversion_log_expected_track_count(&req).expect("dispatcher count"), 4);
@@ -26255,7 +28044,35 @@ Source-aware setting: yes
     }
 
     #[test]
-    fn folder_dispatch_entry_point_rejects_mixed_non_single_file_jobs() {
+    fn folder_dispatch_entry_point_rejects_unsupported_source_kinds() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut single = real_fragment_unbatched_request_with_track(temp.path(), "dispatch-ok-track", 1, None, 1);
+        single.container = real_fragment_source_root(temp.path()).join("01.flac");
+        std::fs::write(&single.container, b"audio").expect("single audio");
+
+        let mut archive = real_fragment_unbatched_request_with_track(temp.path(), "dispatch-archive-source", 2, None, 2);
+        archive.container = real_fragment_source_root(temp.path()).join("album.7z");
+        std::fs::write(&archive.container, b"not really an archive").expect("archive source");
+
+        let err = prepare_independent_single_file_album_batch_for_dispatch(
+            vec![single, archive],
+            real_fragment_album_dir(temp.path()),
+            real_fragment_source_root(temp.path()),
+        )
+        .expect_err("folder fragment dispatch must reject archive/multi-track container sources");
+
+        assert!(
+            err.to_string().contains("does not support source kind"),
+            "error documents which source kind was rejected: {err}"
+        );
+    }
+
+    /// Multi-disc sets frequently arrive as per-disc CUE images. Batch
+    /// dispatch now admits CUE sources and counts their selected tracks
+    /// toward the album's expected total, so the assembled conversion.log
+    /// and batch completion cover the whole set.
+    #[test]
+    fn folder_dispatch_entry_point_admits_cue_sources_with_parsed_track_counts() {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut single = real_fragment_unbatched_request_with_track(temp.path(), "dispatch-ok-track", 1, None, 1);
         single.container = real_fragment_source_root(temp.path()).join("01.flac");
@@ -26263,19 +28080,23 @@ Source-aware setting: yes
 
         let mut cue = real_fragment_unbatched_request_with_track(temp.path(), "dispatch-cue-source", 2, None, 2);
         cue.container = real_fragment_source_root(temp.path()).join("album.cue");
-        std::fs::write(&cue.container, b"FILE 'album.wav' WAVE").expect("cue source");
+        std::fs::write(
+            &cue.container,
+            "FILE \"album.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("cue source");
 
-        let err = prepare_independent_single_file_album_batch_for_dispatch(
+        let dispatch = prepare_independent_single_file_album_batch_for_dispatch(
             vec![single, cue],
             real_fragment_album_dir(temp.path()),
             real_fragment_source_root(temp.path()),
         )
-        .expect_err("folder fragment dispatch must not include CUE/multi-track sources");
+        .expect("mixed single-file + CUE batches are dispatchable");
 
-        assert!(
-            err.to_string().contains("independent single-file jobs")
-                || err.to_string().contains("single-file audio source"),
-            "error documents that fragment batch wiring is restricted to independent single-file jobs: {err}"
+        assert_eq!(
+            dispatch.album_batch.expected_track_count,
+            3,
+            "one loose track plus a two-track CUE image totals three album tracks"
         );
     }
 
@@ -26929,11 +28750,17 @@ Source-aware setting: yes
 
     #[tokio::test]
     async fn real_multitrack_source_stays_on_canonical_single_log_path() {
+        // CUE sources dispatched in an album batch now participate in
+        // fragment assembly (see
+        // cue_album_batch_stages_one_hidden_fragment_per_decomposed_track).
+        // The surviving contract pinned here: a STANDALONE one-job
+        // multi-track conversion, with no dispatcher batch attached, keeps
+        // the canonical single conversion.log and never enters fragment mode.
         let temp = tempfile::tempdir().expect("temp dir");
         let mut req = log_test_request();
         req.output_root = temp.path().join("out");
-        req.album_batch = Some(real_fragment_batch(temp.path(), "ignored-for-cue", 2));
-        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        req.album_batch = None;
+        req.album_batch_track = None;
         let album_dir = real_fragment_album_dir(temp.path());
         let mut source = log_test_source();
         source.kind = SourceKind::CueImage;
@@ -26966,15 +28793,29 @@ Source-aware setting: yes
             tracks: vec![ok_record(), failed_record()],
             stages: stage_records(),
         };
-        let (staging, plan) = real_fragment_plan_through_features(
-            temp.path(),
-            "real-cue-existing-log-path",
-            &req,
-            &source,
-            &outcome,
+        // Standalone conversions publish through build_publish_plan with the
+        // planner-chosen album dir; the fragment-or-fallback builder is the
+        // batch dispatcher's path and now requires a fragment sidecar.
+        let staging = StagingDir::new(
+            temp.path().join("real-cue-existing-log-path"),
+            "real-cue-existing-log-path".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let runner = crate::convert::pipeline::tool::StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let (staged, _features) = run_features(
             artifacts,
+            &outcome,
+            &source,
+            &req,
+            &staging,
+            &runner,
+            &cancel,
         )
-        .await;
+        .await
+        .expect("real feature path stages conversion-log sidecars");
+        let plan = build_publish_plan(&staged, &req, &album_dir)
+            .expect("standalone publish plan builds against the planner album dir");
         drop(staging);
 
         assert!(

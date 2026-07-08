@@ -852,7 +852,7 @@ fn reduce_file_picker_complete(
             };
             match super::presets::load_preset_from_path(&path) {
                 Ok(preset) => {
-                    preset.apply_to_pills(&mut app.convert.format, &mut app.convert.output_options);
+                    preset.apply_to_pills(&mut app.convert.format, &mut app.convert.output_options, &mut app.convert.metadata);
                     app.preset.set_active_preset_path(name.clone(), path.clone());
                     app.preset.modified = false;
                     app.set_status(format!("Loaded preset: {}", path.display()));
@@ -877,6 +877,7 @@ fn reduce_file_picker_complete(
                 &name,
                 &app.convert.format,
                 &app.convert.output_options,
+                &app.convert.metadata,
             );
             match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
                 Ok(()) => {

@@ -443,6 +443,12 @@ pub struct ConversionOptions {
     #[serde(default)]
     pub create_disc_subfolders: bool,
 
+    /// Request-scope album-artist override. When set, output files write this
+    /// ALBUMARTIST and batch identity/folder rendering use it. Empty/None keeps
+    /// source tags and conservative batch heuristics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_artist_override: Option<String>,
+
     /// Force FLAC re-encoding instead of copying - defaults to false
     pub reencode_flac: bool,
 
@@ -521,6 +527,7 @@ impl Default for ConversionOptions {
             companion_exclude_files: Vec::new(),
             force_encode: false,
             create_disc_subfolders: false,
+            album_artist_override: None,
             reencode_flac: false,       // Match wizard default (don't re-encode, copy is default)
             merge_to_single: false,
             preferred_backend: None,

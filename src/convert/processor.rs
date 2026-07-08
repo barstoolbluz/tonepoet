@@ -10,7 +10,7 @@ use super::{
     ConversionStatus,
 };
 use log::info;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -38,16 +38,17 @@ use crate::convert::pipeline::{
     realize_track_for_scheduler_with_tool_limits_and_version_cache,
     run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry,
     scheduled_worker_failure_output,
-    AlbumBatchTrackContext, AlbumCompletionTracker,
-    AlbumOutcome, AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, PipelineReport, PipelineRequest, PoolLimits,
+    AlbumBatchTrackContext, AlbumCompletionTracker, BatchResolvedAlbumIdentity,
+    AlbumOutcome, AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, MetadataTextOverride, PipelineReport, PipelineRequest, PoolLimits,
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
     ScratchStagingConfig, SharedWorkerPool, SourceKind, StageOutcome, ToolBinary, ToolConcurrencyLimits,
-    TrackOutcome, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
+    TrackMetadata, TrackOutcome, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
 };
 use crate::convert::pipeline::stages::{
     disk_staging_parent_for, pipeline_report_requests_scratch_disk_retry,
 };
+use crate::convert::pipeline::materializer_single::read_track_metadata as read_single_file_track_metadata;
 #[cfg(test)]
 use crate::convert::pipeline::stages::{
     set_post_materialization_stage_fault_hook_for_test, set_publish_fault_hook_for_test,
@@ -60,7 +61,7 @@ use crate::convert::pipeline::{
     PublishPolicy, RedactedPipelineRequest, scheduled_album_for_test,
     SourceAudioDescriptor,
     SourceAudioCoding, SourceOptions, StagePolicy, StageRequirement, StagingDir,
-    TrackArtifact, TrackId, TrackMetadata, TrackRecord, TrackSelection,
+    TrackArtifact, TrackId, TrackRecord, TrackSelection,
 };
 
 /// Scratch-staging policy for direct single-item API calls.
@@ -202,10 +203,12 @@ struct IndependentSingleFileBatchKey {
     naming_key: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct IndependentSingleFileBatchCandidate {
     item_index: usize,
     request: PipelineRequest,
+    source_kind: SourceKind,
+    create_disc_subfolders: bool,
 }
 
 
@@ -239,6 +242,15 @@ fn apply_conversion_options_request_contract(
             std::mem::take(&mut request.naming.template),
             true,
         );
+    }
+    if let Some(value) = item
+        .options
+        .album_artist_override
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        request.metadata_overrides.album_artist = MetadataTextOverride::Set(value.to_string());
     }
 }
 
@@ -281,6 +293,8 @@ fn scratch_staging_config_for_run(
 fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [ConversionItem]) {
     let mut groups: BTreeMap<IndependentSingleFileBatchKey, Vec<IndependentSingleFileBatchCandidate>> =
         BTreeMap::new();
+    let mut identity_groups: BTreeMap<IndependentSingleFileBatchKey, Vec<IndependentSingleFileBatchCandidate>> =
+        BTreeMap::new();
 
     for (item_index, item) in items.iter().enumerate() {
         let request = match build_pipeline_request(item) {
@@ -301,9 +315,11 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
             continue;
         }
 
-        if !matches!(detect_source_kind(&request), Ok(SourceKind::SingleFile)) {
-            continue;
-        }
+        let source_kind = match detect_source_kind(&request) {
+            Ok(kind @ (SourceKind::SingleFile | SourceKind::CueImage)) => kind,
+            Ok(_) => continue,
+            Err(_) => continue,
+        };
 
         let source_grouping_root = source_grouping_root_for_dispatch_request(&request);
         let album_output_dir = provisional_album_output_dir_for_dispatch_request(&request, &source_grouping_root);
@@ -324,13 +340,47 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
                 request.naming.per_album_subdir
             ),
         };
-        groups.entry(key).or_default().push(IndependentSingleFileBatchCandidate {
+        let candidate = IndependentSingleFileBatchCandidate {
             item_index,
             request,
-        });
+            source_kind,
+            create_disc_subfolders: item.options.create_disc_subfolders,
+        };
+        if candidate.create_disc_subfolders {
+            identity_groups.entry(key.clone()).or_default().push(candidate.clone());
+        }
+        if matches!(candidate.source_kind, SourceKind::SingleFile)
+            || (candidate.create_disc_subfolders && matches!(candidate.source_kind, SourceKind::CueImage))
+        {
+            groups.entry(key).or_default().push(candidate);
+        }
     }
 
-    for (_key, group) in groups {
+    let resolved_identity_by_key: BTreeMap<IndependentSingleFileBatchKey, BatchResolvedAlbumIdentity> = identity_groups
+        .iter()
+        .filter_map(|(key, group)| resolve_batch_album_identity(group).map(|identity| (key.clone(), identity)))
+        .collect();
+
+    for (key, group) in identity_groups.iter() {
+        if group.len() <= 1 {
+            continue;
+        }
+        let Some(identity) = resolved_identity_by_key.get(key).cloned() else {
+            continue;
+        };
+        for candidate in group {
+            if matches!(candidate.source_kind, SourceKind::SingleFile) {
+                continue;
+            }
+            if let Some(item) = items.get_mut(candidate.item_index) {
+                let mut request = candidate.request.clone();
+                request.batch_resolved_identity = Some(identity.clone());
+                item.pipeline_request = Some(request);
+            }
+        }
+    }
+
+    for (key, group) in groups {
         if group.len() <= 1 {
             continue;
         }
@@ -356,11 +406,13 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
         let mut ambiguous_track_identity = None;
         for candidate in group.iter() {
             let metadata_track_context = track_context_from_dispatch_metadata(&candidate.request.container);
+            let source_probe = batch_identity_probe_for_request(&candidate.request, candidate.source_kind);
             let disc_number = candidate
                 .request
                 .album_batch_track
                 .as_ref()
                 .and_then(|track| track.disc_number)
+                .or_else(|| source_probe.disc_number)
                 .or_else(|| metadata_track_context.and_then(|context| context.0))
                 .or_else(|| disc_number_from_dispatch_path(&candidate.request.container));
             let track_number = candidate
@@ -368,6 +420,7 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
                 .album_batch_track
                 .as_ref()
                 .map(|track| track.track_number)
+                .or(source_probe.track_number)
                 .or_else(|| metadata_track_context.map(|context| context.1))
                 .or_else(|| strict_track_number_from_dispatch_path(&candidate.request.container));
             let Some(track_number) = track_number.filter(|value| *value > 0) else {
@@ -433,6 +486,9 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
         let mut item_indices = Vec::with_capacity(prepared.len());
 
         for (ordinal_index, (disc_number_for_sort, track_number, _path_key, item_index, mut request)) in prepared.into_iter().enumerate() {
+            if let Some(identity) = resolved_identity_by_key.get(&key) {
+                request.batch_resolved_identity = Some(identity.clone());
+            }
             if request.album_batch_track.is_none() {
                 let source_ordinal = u32::try_from(ordinal_index + 1).unwrap_or(u32::MAX);
                 let disc_number = if disc_number_for_sort == 0 {
@@ -497,6 +553,437 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct BatchIdentityProbe {
+    path_key: String,
+    album: Option<String>,
+    album_artist: Option<String>,
+    artist: Option<String>,
+    date: Option<String>,
+    disc_number: Option<u32>,
+    total_discs: Option<u32>,
+    track_number: Option<u32>,
+}
+
+fn resolve_batch_album_identity(
+    group: &[IndependentSingleFileBatchCandidate],
+) -> Option<BatchResolvedAlbumIdentity> {
+    if group.len() <= 1 || group.iter().any(|candidate| !candidate.create_disc_subfolders) {
+        return None;
+    }
+
+    let probes: Vec<BatchIdentityProbe> = group
+        .iter()
+        .map(|candidate| batch_identity_probe_for_request(&candidate.request, candidate.source_kind))
+        .collect();
+
+    let override_album_artist = group.iter().find_map(|candidate| match &candidate.request.metadata_overrides.album_artist {
+        MetadataTextOverride::Set(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => None,
+    });
+
+    resolve_batch_album_identity_from_probes(probes, override_album_artist)
+}
+
+fn resolve_batch_album_identity_from_probes(
+    mut probes: Vec<BatchIdentityProbe>,
+    override_album_artist: Option<String>,
+) -> Option<BatchResolvedAlbumIdentity> {
+    if probes.len() <= 1 {
+        return None;
+    }
+
+    for probe in &mut probes {
+        // Enforce the lookup key normalization here rather than trusting every
+        // probe constructor: disc_number_for_path() normalizes its argument,
+        // so stored keys must match or path-derived disc numbers vanish.
+        probe.path_key = probe.path_key.replace('\\', "/").to_ascii_lowercase();
+        if probe.disc_number.is_none() {
+            probe.disc_number = disc_number_from_dispatch_path(Path::new(&probe.path_key));
+        }
+    }
+
+    let disc_numbers: BTreeSet<u32> = probes
+        .iter()
+        .filter_map(|probe| probe.disc_number)
+        .filter(|disc| *disc > 0)
+        .collect();
+    let max_total_discs = probes
+        .iter()
+        .filter_map(|probe| probe.total_discs)
+        .max()
+        .or_else(|| disc_numbers.iter().next_back().copied());
+    let has_disc_evidence = disc_numbers.len() > 1 || max_total_discs.is_some_and(|total| total > 1);
+    if !has_disc_evidence {
+        return None;
+    }
+
+    let mut normalized_album_values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for album in probes.iter().filter_map(|probe| probe.album.as_deref()) {
+        let normalized = normalize_album_identity_key(album);
+        if !normalized.is_empty() {
+            normalized_album_values
+                .entry(normalized)
+                .or_default()
+                .push(album.trim().to_string());
+        }
+    }
+    if normalized_album_values.len() > 1 {
+        return None;
+    }
+
+    let resolved_album = normalized_album_values
+        .values()
+        .next()
+        .and_then(|values| canonical_album_from_batch_variants(values, &disc_numbers, max_total_discs));
+
+    let date_values: BTreeSet<String> = probes
+        .iter()
+        .filter_map(|probe| probe.date.as_deref())
+        .map(normalize_date_for_batch_identity)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if date_values.len() > 1 {
+        return None;
+    }
+    let resolved_date = date_values.iter().next().cloned();
+
+    let resolved_album_artist = override_album_artist.or_else(|| {
+        majority_text_value(probes.iter().filter_map(|probe| {
+            probe
+                .album_artist
+                .as_deref()
+                .or(probe.artist.as_deref())
+        }))
+    });
+
+    let source_disc_numbers: BTreeMap<String, u32> = probes
+        .iter()
+        .filter_map(|probe| {
+            probe
+                .disc_number
+                .filter(|disc| *disc > 0)
+                .map(|disc| (probe.path_key.clone(), disc))
+        })
+        .collect();
+
+    let identity = BatchResolvedAlbumIdentity {
+        album: resolved_album,
+        album_artist: resolved_album_artist,
+        date: resolved_date,
+        total_discs: max_total_discs.filter(|total| *total > 1),
+        source_disc_numbers,
+    };
+
+    if identity.is_empty() {
+        None
+    } else {
+        Some(identity)
+    }
+}
+
+fn batch_identity_probe_for_request(req: &PipelineRequest, source_kind: SourceKind) -> BatchIdentityProbe {
+    let mut probe = match source_kind {
+        SourceKind::SingleFile => single_file_batch_identity_probe(&req.container).unwrap_or_default(),
+        SourceKind::CueImage => cue_batch_identity_probe(&req.container).unwrap_or_default(),
+        _ => BatchIdentityProbe::default(),
+    };
+    probe.path_key = normalized_path_key(&req.container);
+    if let Some((disc, track)) = track_context_from_dispatch_metadata(&req.container) {
+        probe.disc_number = probe.disc_number.or(disc);
+        probe.track_number = probe.track_number.or(Some(track));
+    }
+    probe.disc_number = probe
+        .disc_number
+        .or_else(|| disc_number_from_dispatch_path(&req.container));
+    probe.track_number = probe
+        .track_number
+        .or_else(|| strict_track_number_from_dispatch_path(&req.container));
+    probe
+}
+
+fn single_file_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
+    // Use the same Lofty-backed metadata reader as the single-file materializer
+    // instead of maintaining a parallel FLAC-only tag parser in the dispatcher.
+    // The dispatcher only uses these fields as conservative organizational
+    // evidence; written metadata still comes from the materialized source and
+    // explicit request overrides.
+    let metadata = read_single_file_track_metadata(path);
+    batch_identity_probe_from_track_metadata(&metadata)
+}
+
+fn batch_identity_probe_from_track_metadata(metadata: &TrackMetadata) -> Option<BatchIdentityProbe> {
+    let album = metadata.extra.get("album").cloned();
+    let total_discs = metadata
+        .extra
+        .get("disctotal")
+        .and_then(|value| parse_metadata_ordinal(value));
+
+    let probe = BatchIdentityProbe {
+        path_key: String::new(),
+        album,
+        album_artist: metadata.album_artist.clone(),
+        artist: metadata.artist.clone(),
+        date: metadata.date.clone(),
+        disc_number: metadata.disc_number,
+        total_discs,
+        track_number: metadata.track_number,
+    };
+
+    if probe.album.is_none()
+        && probe.album_artist.is_none()
+        && probe.artist.is_none()
+        && probe.date.is_none()
+        && probe.disc_number.is_none()
+        && probe.total_discs.is_none()
+        && probe.track_number.is_none()
+    {
+        None
+    } else {
+        Some(probe)
+    }
+}
+
+fn cue_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
+    let cue = crate::convert::cue_parser::parse_cue_file(path).ok()?;
+    Some(BatchIdentityProbe {
+        album: cue.title,
+        album_artist: cue.performer,
+        artist: None,
+        date: cue.date,
+        disc_number: disc_number_from_dispatch_path(path),
+        total_discs: None,
+        track_number: cue.tracks.first().map(|track| track.number),
+        path_key: String::new(),
+    })
+}
+
+fn majority_text_value<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut counts: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let mut total = 0usize;
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        total += 1;
+        let key = normalize_text_identity_key(trimmed);
+        let entry = counts.entry(key).or_insert_with(|| (0, trimmed.to_string()));
+        entry.0 += 1;
+    }
+    counts
+        .into_values()
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+        .and_then(|(count, value)| if count * 2 > total { Some(value) } else { None })
+}
+
+fn canonical_album_from_batch_variants(
+    values: &[String],
+    disc_numbers: &BTreeSet<u32>,
+    max_total_discs: Option<u32>,
+) -> Option<String> {
+    let mut unique: BTreeSet<String> = values
+        .iter()
+        .map(|value| strip_album_disc_designator(value).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if unique.is_empty() {
+        return None;
+    }
+    if unique.len() == 1 {
+        return unique.pop_first();
+    }
+    let values = unique.into_iter().collect::<Vec<_>>();
+    merge_trailing_numeric_catalog_variants(&values, disc_numbers, max_total_discs)
+}
+
+fn merge_trailing_numeric_catalog_variants(
+    values: &[String],
+    disc_numbers: &BTreeSet<u32>,
+    max_total_discs: Option<u32>,
+) -> Option<String> {
+    if !catalog_variant_disc_evidence_is_strict(values.len(), disc_numbers, max_total_discs) {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for value in values {
+        let (prefix, digits, closing) = trailing_catalog_number_parts(value)?;
+        parts.push((prefix, digits, closing));
+    }
+    let (prefix, first_digits, closing) = parts.first()?.clone();
+    if parts.iter().any(|(p, _, c)| p != &prefix || *c != closing) {
+        return None;
+    }
+    let numbers: Vec<u32> = parts
+        .iter()
+        .filter_map(|(_, digits, _)| digits.parse::<u32>().ok())
+        .collect();
+    if numbers.len() != parts.len() {
+        return None;
+    }
+    let min = *numbers.iter().min()?;
+    let max = *numbers.iter().max()?;
+    if max.saturating_sub(min) + 1 != numbers.len() as u32 {
+        return None;
+    }
+    let start = first_digits;
+    let end = max.to_string();
+    let common = start
+        .chars()
+        .zip(end.chars())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let rendered = if min == max {
+        format!("{prefix}{start}")
+    } else {
+        let end_suffix = end.get(common..).unwrap_or(&end);
+        format!("{prefix}{start}-{end_suffix}")
+    };
+    Some(if closing { format!("{rendered})") } else { rendered })
+}
+
+fn catalog_variant_disc_evidence_is_strict(
+    variant_count: usize,
+    disc_numbers: &BTreeSet<u32>,
+    max_total_discs: Option<u32>,
+) -> bool {
+    if variant_count < 2 || disc_numbers.len() != variant_count {
+        return false;
+    }
+    match max_total_discs.and_then(|total| usize::try_from(total).ok()) {
+        Some(total) => total == variant_count,
+        None => true,
+    }
+}
+
+fn normalize_album_identity_key(value: &str) -> String {
+    normalize_text_identity_key(&strip_album_catalog_variance(&strip_album_disc_designator(value)))
+}
+
+fn strip_album_disc_designator(value: &str) -> String {
+    let mut out = value.trim().to_string();
+    loop {
+        let Some(stripped) = strip_trailing_parenthesized_disc_designator(&out)
+            .or_else(|| strip_trailing_dash_disc_designator(&out))
+        else {
+            break;
+        };
+        if stripped == out {
+            break;
+        }
+        out = stripped;
+    }
+    out.trim().to_string()
+}
+
+fn strip_trailing_parenthesized_disc_designator(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let close = trimmed.chars().last()?;
+    if close != ')' && close != ']' {
+        return None;
+    }
+    let open = if close == ')' { '(' } else { '[' };
+    let open_idx = trimmed.rfind(open)?;
+    let inner = &trimmed[open_idx + 1..trimmed.len() - 1];
+    if is_disc_designator_text(inner) {
+        Some(trimmed[..open_idx].trim_end().to_string())
+    } else {
+        None
+    }
+}
+
+fn strip_trailing_dash_disc_designator(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    for sep in [" - ", " — ", " – "] {
+        if let Some(idx) = trimmed.rfind(sep) {
+            let tail = &trimmed[idx + sep.len()..];
+            if is_disc_designator_text(tail) {
+                return Some(trimmed[..idx].trim_end().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_disc_designator_text(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    for prefix in ["disc", "disk", "cd"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            return rest.trim().chars().next().is_some_and(|ch| ch.is_ascii_digit());
+        }
+    }
+    false
+}
+
+fn strip_album_catalog_variance(value: &str) -> String {
+    let Some((prefix, _digits, closing)) = trailing_catalog_number_parts(value) else {
+        return value.trim().to_string();
+    };
+    let mut out = prefix.trim_end().to_string();
+    if closing {
+        out.push(')');
+    }
+    out
+}
+
+fn trailing_catalog_number_parts(value: &str) -> Option<(String, String, bool)> {
+    let trimmed = value.trim();
+    let closing = trimmed.ends_with(')');
+    let core = if closing {
+        &trimmed[..trimmed.len().saturating_sub(1)]
+    } else {
+        trimmed
+    };
+    let digit_start = core
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(0);
+    if digit_start == core.len() || core[digit_start..].len() < 2 {
+        return None;
+    }
+    let prefix = &core[..digit_start];
+    if !catalog_prefix_has_catalog_evidence(prefix, closing) {
+        return None;
+    }
+    Some((prefix.to_string(), core[digit_start..].to_string(), closing))
+}
+
+fn catalog_prefix_has_catalog_evidence(prefix: &str, closing_parenthetical: bool) -> bool {
+    let has_parenthetical_catalog_context = closing_parenthetical && prefix.rfind('(').is_some();
+    let has_catalog_token = prefix
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .any(catalog_token_has_letter_and_digit);
+    has_parenthetical_catalog_context && has_catalog_token
+}
+
+fn catalog_token_has_letter_and_digit(token: &str) -> bool {
+    let token = token.trim_matches(|ch: char| ch == '-' || ch == '_');
+    token.len() >= 3
+        && token.chars().any(|ch| ch.is_ascii_alphabetic())
+        && token.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn normalize_text_identity_key(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| ch.to_lowercase())
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_date_for_batch_identity(value: &str) -> String {
+    value
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
 }
 
 fn conversion_settings_fingerprint_key(settings: &PipelineSettings) -> String {
@@ -2982,6 +3469,8 @@ mod tests {
             album_batch_track: None,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             suppress_incremental_conversion_log_append: false,
             expected_album_track_count: None,
             container_extension: None,
@@ -4197,6 +4686,325 @@ mod tests {
         );
         assert!(!prepared_a.suppress_incremental_conversion_log_append);
         assert!(!prepared_b.suppress_incremental_conversion_log_append);
+    }
+
+    fn batch_probe(
+        path: impl Into<String>,
+        album: Option<&str>,
+        album_artist: Option<&str>,
+        artist: Option<&str>,
+        date: Option<&str>,
+        disc_number: Option<u32>,
+        total_discs: Option<u32>,
+        track_number: Option<u32>,
+    ) -> BatchIdentityProbe {
+        BatchIdentityProbe {
+            path_key: path.into(),
+            album: album.map(str::to_string),
+            album_artist: album_artist.map(str::to_string),
+            artist: artist.map(str::to_string),
+            date: date.map(str::to_string),
+            disc_number,
+            total_discs,
+            track_number,
+        }
+    }
+
+    #[test]
+    fn batch_identity_merges_eat_a_peach_catalog_variants_under_one_album() {
+        let probes = vec![
+            batch_probe(
+                "/library/abb/eat/disc 01/01.flac",
+                Some("Eat a Peach (Japan / Polydor P58P 25005)"),
+                Some("The Allman Brothers Band"),
+                None,
+                Some("1972"),
+                Some(1),
+                Some(2),
+                Some(1),
+            ),
+            batch_probe(
+                "/library/abb/eat/disc 02/01.flac",
+                Some("Eat a Peach (Japan / Polydor P58P 25006)"),
+                Some("The Allman Brothers Band"),
+                None,
+                Some("1972"),
+                Some(2),
+                Some(2),
+                Some(1),
+            ),
+        ];
+
+        let identity = resolve_batch_album_identity_from_probes(probes, None)
+            .expect("catalog-variant two-disc set resolves");
+        assert_eq!(identity.album.as_deref(), Some("Eat a Peach (Japan / Polydor P58P 25005-6)"));
+        assert_eq!(identity.album_artist.as_deref(), Some("The Allman Brothers Band"));
+        assert_eq!(identity.date.as_deref(), Some("1972"));
+        assert_eq!(identity.total_discs, Some(2));
+        assert_eq!(identity.disc_number_for_path(std::path::Path::new("/library/abb/eat/disc 01/01.flac")), Some(1));
+        assert_eq!(identity.disc_number_for_path(std::path::Path::new("/library/abb/eat/disc 02/01.flac")), Some(2));
+    }
+
+    #[test]
+    fn batch_identity_refuses_broad_trailing_number_title_merge() {
+        let probes = vec![
+            batch_probe(
+                "/library/classical/set/disc 01/01.flac",
+                Some("Symphony 1"),
+                Some("Example Orchestra"),
+                None,
+                Some("1980"),
+                Some(1),
+                Some(2),
+                Some(1),
+            ),
+            batch_probe(
+                "/library/classical/set/disc 02/01.flac",
+                Some("Symphony 2"),
+                Some("Example Orchestra"),
+                None,
+                Some("1980"),
+                Some(2),
+                Some(2),
+                Some(1),
+            ),
+        ];
+
+        assert!(
+            resolve_batch_album_identity_from_probes(probes, None).is_none(),
+            "shared source-root and disc evidence alone must not merge ordinary trailing title numbers"
+        );
+    }
+
+    #[test]
+    fn batch_identity_models_real_dreams_four_disc_majority_with_one_album_artist_outlier() {
+        let mut probes = Vec::new();
+        let disc_counts = [(1_u32, 17_u32), (2, 13), (3, 13), (4, 12)];
+        for (disc, count) in disc_counts {
+            for track in 1..=count {
+                let outlier = disc == 1 && track == 1;
+                probes.push(batch_probe(
+                    format!("/library/abb/dreams/disc {disc:02}/{track:02}.flac"),
+                    Some(&format!("Dreams (Disc {disc})")),
+                    Some(if outlier { "Duane Allman" } else { "The Allman Brothers Band" }),
+                    None,
+                    Some("1989"),
+                    Some(disc),
+                    Some(4),
+                    Some(track),
+                ));
+            }
+        }
+        assert_eq!(probes.len(), 55, "test fixture should model the real 55-track box");
+
+        let identity = resolve_batch_album_identity_from_probes(probes, None)
+            .expect("four-disc majority evidence resolves");
+        assert_eq!(identity.album.as_deref(), Some("Dreams"));
+        assert_eq!(identity.album_artist.as_deref(), Some("The Allman Brothers Band"));
+        assert_eq!(identity.date.as_deref(), Some("1989"));
+        assert_eq!(identity.total_discs, Some(4));
+        assert_eq!(identity.disc_number_for_path(std::path::Path::new("/library/abb/dreams/disc 01/01.flac")), Some(1));
+        assert_eq!(identity.disc_number_for_path(std::path::Path::new("/library/abb/dreams/disc 04/12.flac")), Some(4));
+    }
+
+    #[test]
+    fn batch_identity_uses_sibling_disc_folders_when_disc_tags_are_absent() {
+        let probes = vec![
+            batch_probe(
+                "/library/untagged/Album/disc 01/01.flac",
+                Some("Album"),
+                Some("Artist"),
+                None,
+                Some("1971"),
+                None,
+                None,
+                Some(1),
+            ),
+            batch_probe(
+                "/library/untagged/Album/disc 02/01.flac",
+                Some("Album"),
+                Some("Artist"),
+                None,
+                Some("1971"),
+                None,
+                None,
+                Some(1),
+            ),
+        ];
+
+        let identity = resolve_batch_album_identity_from_probes(probes, None)
+            .expect("sibling disc directories prove multi-disc identity without disc tags");
+        assert_eq!(identity.album.as_deref(), Some("Album"));
+        assert_eq!(identity.total_discs, Some(2));
+        assert_eq!(identity.disc_number_for_path(std::path::Path::new("/library/untagged/Album/disc 01/01.flac")), Some(1));
+        assert_eq!(identity.disc_number_for_path(std::path::Path::new("/library/untagged/Album/disc 02/01.flac")), Some(2));
+    }
+
+    #[test]
+    fn batch_identity_resolution_is_deterministic_across_reruns_and_input_order() {
+        let forward = vec![
+            batch_probe(
+                "/library/abb/eat/disc 01/01.flac",
+                Some("Eat a Peach (Japan / Polydor P58P 25005)"),
+                Some("The Allman Brothers Band"),
+                None,
+                Some("1972"),
+                Some(1),
+                Some(2),
+                Some(1),
+            ),
+            batch_probe(
+                "/library/abb/eat/disc 02/01.flac",
+                Some("Eat a Peach (Japan / Polydor P58P 25006)"),
+                Some("The Allman Brothers Band"),
+                None,
+                Some("1972"),
+                Some(2),
+                Some(2),
+                Some(1),
+            ),
+        ];
+        let mut reverse = forward.clone();
+        reverse.reverse();
+
+        let first = resolve_batch_album_identity_from_probes(forward, None).expect("first run");
+        let second = resolve_batch_album_identity_from_probes(reverse, None).expect("second run");
+        assert_eq!(first, second, "same tree must resolve to same identity independent of enumeration order");
+    }
+
+    #[test]
+    fn batch_identity_probe_uses_materializer_metadata_shape_for_single_files() {
+        let mut metadata = TrackMetadata::default();
+        metadata.artist = Some("The Allman Brothers Band".to_string());
+        metadata.album_artist = Some("The Allman Brothers Band".to_string());
+        metadata.date = Some("1972".to_string());
+        metadata.disc_number = Some(1);
+        metadata.track_number = Some(1);
+        metadata.extra.insert("album".to_string(), "Eat a Peach".to_string());
+        metadata.extra.insert("disctotal".to_string(), "2".to_string());
+
+        let probe = batch_identity_probe_from_track_metadata(&metadata)
+            .expect("canonical materializer metadata should supply batch identity evidence");
+        assert_eq!(probe.album.as_deref(), Some("Eat a Peach"));
+        assert_eq!(probe.album_artist.as_deref(), Some("The Allman Brothers Band"));
+        assert_eq!(probe.total_discs, Some(2));
+        assert_eq!(probe.disc_number, Some(1));
+        assert_eq!(probe.track_number, Some(1));
+    }
+
+    #[test]
+    fn cue_image_disc_batches_receive_set_level_log_identity_and_track_count() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("The Allman Brothers Band - Dreams");
+        let disc1 = album_root.join("disc 01");
+        let disc2 = album_root.join("disc 02");
+        std::fs::create_dir_all(&disc1).expect("disc1 dir");
+        std::fs::create_dir_all(&disc2).expect("disc2 dir");
+        let cue_1 = disc1.join("dreams-disc1.cue");
+        let cue_2 = disc2.join("dreams-disc2.cue");
+        std::fs::write(
+            &cue_1,
+            r#"REM DATE 1989
+PERFORMER "The Allman Brothers Band"
+TITLE "Dreams (Disc 1)"
+FILE "disc1.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track 1"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Track 2"
+    INDEX 01 03:00:00
+"#,
+        )
+        .expect("cue 1");
+        std::fs::write(
+            &cue_2,
+            r#"REM DATE 1989
+PERFORMER "The Allman Brothers Band"
+TITLE "Dreams (Disc 2)"
+FILE "disc2.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track 1"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Track 2"
+    INDEX 01 03:00:00
+  TRACK 03 AUDIO
+    TITLE "Track 3"
+    INDEX 01 06:00:00
+"#,
+        )
+        .expect("cue 2");
+
+        let mut items = vec![
+            conversion_item_with_pipeline_request(
+                "dreams-cue-1",
+                processor_dispatch_request_for_path(temp.path(), "dreams-cue-1", "job-cue-1", cue_1.clone()),
+            ),
+            conversion_item_with_pipeline_request(
+                "dreams-cue-2",
+                processor_dispatch_request_for_path(temp.path(), "dreams-cue-2", "job-cue-2", cue_2.clone()),
+            ),
+        ];
+        for item in &mut items {
+            item.options.create_disc_subfolders = true;
+        }
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let first = items[0].pipeline_request.as_ref().expect("first cue prepared");
+        let second = items[1].pipeline_request.as_ref().expect("second cue prepared");
+        let batch = first.album_batch.as_ref().expect("first cue enters album batch");
+        assert_eq!(Some(batch), second.album_batch.as_ref());
+        assert_eq!(batch.expected_track_count, 5, "expected count is selected CUE tracks, not number of CUE files");
+        let identity = batch.resolved_identity().expect("cue batch resolved identity");
+        assert_eq!(identity.album.as_deref(), Some("Dreams"));
+        assert_eq!(identity.album_artist.as_deref(), Some("The Allman Brothers Band"));
+        assert_eq!(identity.disc_number_for_path(&cue_1), Some(1));
+        assert_eq!(identity.disc_number_for_path(&cue_2), Some(2));
+    }
+
+    #[test]
+    fn disc_subfolders_off_does_not_apply_batch_identity_resolution() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("The Allman Brothers Band - Eat a Peach");
+        let disc1 = album_root.join("disc 01");
+        let disc2 = album_root.join("disc 02");
+        std::fs::create_dir_all(&disc1).expect("disc1 dir");
+        std::fs::create_dir_all(&disc2).expect("disc2 dir");
+        let track_01 = disc1.join("01 - First.flac");
+        let track_02 = disc2.join("01 - Second.flac");
+        std::fs::write(&track_01, b"not real audio; dispatch test only").expect("track 1");
+        std::fs::write(&track_02, b"not real audio; dispatch test only").expect("track 2");
+
+        let mut items = vec![
+            conversion_item_with_pipeline_request(
+                "eat-1",
+                processor_dispatch_request_for_path(temp.path(), "eat-1", "job-eat-1", track_01),
+            ),
+            conversion_item_with_pipeline_request(
+                "eat-2",
+                processor_dispatch_request_for_path(temp.path(), "eat-2", "job-eat-2", track_02),
+            ),
+        ];
+        for item in &mut items {
+            item.options.create_disc_subfolders = false;
+        }
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        for item in &items {
+            let request = item.pipeline_request.as_ref().expect("prepared request");
+            assert!(
+                request
+                    .album_batch
+                    .as_ref()
+                    .and_then(|batch| batch.resolved_identity())
+                    .is_none(),
+                "disc-subfolder switch off must preserve pre-existing per-tag identity behavior"
+            );
+            assert!(request.batch_resolved_identity.is_none());
+        }
     }
 
     #[test]

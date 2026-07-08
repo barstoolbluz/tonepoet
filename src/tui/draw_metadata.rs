@@ -42,15 +42,18 @@ pub fn draw_metadata_pane(
     let mut lines = vec![top_line];
     match source_mode {
         SourceMode::Batch { paths, cursor, .. } => {
+            lines.push(render_album_artist_override_row(border_color, w, metadata, focused, theme));
             lines.extend(render_batch_file_list(
                 border_color,
                 w,
                 paths,
                 *cursor,
                 metadata.file_scroll,
-                list_visible_rows,
+                list_visible_rows.saturating_sub(1),
                 focused,
-                metadata, theme));
+                metadata,
+                theme,
+            ));
         }
         SourceMode::MultiTrack {
             archive_preview: Some(preview),
@@ -68,13 +71,14 @@ pub fn draw_metadata_pane(
             ));
         }
         SourceMode::MultiTrack { tracks, cursor, .. } => {
+            lines.push(render_album_artist_override_row(border_color, w, metadata, focused, theme));
             lines.extend(render_track_file_list(
                 border_color,
                 w,
                 tracks,
                 *cursor,
                 metadata.file_scroll,
-                list_visible_rows,
+                list_visible_rows.saturating_sub(1),
                 focused,
                 metadata,
                 theme,
@@ -111,6 +115,22 @@ fn metadata_edit_cursor(
     source_mode: &SourceMode,
     pane_width: usize,
 ) -> Option<(usize, usize, usize)> {
+    let field = metadata.editing?;
+    let list_mode = matches!(
+        source_mode,
+        SourceMode::Batch { .. }
+            | SourceMode::MultiTrack {
+                archive_preview: None,
+                ..
+            }
+    );
+    if list_mode {
+        if field != ConvertMetadataField::AlbumArtist {
+            return None;
+        }
+        let label_w = "   album artist ".len();
+        return Some((1, label_w, pane_width.saturating_sub(2 + label_w)));
+    }
     if !matches!(
         source_mode,
         SourceMode::Empty
@@ -122,7 +142,6 @@ fn metadata_edit_cursor(
     ) {
         return None;
     }
-    let field = metadata.editing?;
     let content_w = pane_width.saturating_sub(2);
     let half_w = content_w / 2;
     match field {
@@ -137,6 +156,10 @@ fn metadata_edit_cursor(
         ConvertMetadataField::Album => {
             let label_w = half_w + "album  ".len();
             Some((2, label_w, content_w.saturating_sub(label_w).max(1)))
+        }
+        ConvertMetadataField::AlbumArtist => {
+            let label_w = "   album artist ".len();
+            Some((4, label_w, pane_width.saturating_sub(2 + label_w)))
         }
         ConvertMetadataField::Genre => {
             let label_w = "   genre   ".len();
@@ -193,6 +216,34 @@ fn metadata_title_line<'a>(
     ));
     spans.extend(right_spans);
     Line::from(spans)
+}
+
+fn render_album_artist_override_row<'a>(
+    border_color: ratatui::style::Color,
+    w: usize,
+    metadata: &'a MetadataState,
+    pane_focused: bool,
+    theme: super::theme::Theme,
+) -> Line<'a> {
+    let label = "   album artist ";
+    let value_w = w.saturating_sub(2 + label.len());
+    let focused = pane_focused && metadata.field_focus == ConvertMetadataField::AlbumArtist;
+    bordered_line(
+        border_color,
+        w,
+        vec![
+            Span::styled(label, if focused { theme.bright() } else { theme.muted() }),
+            render_inline_value(
+                metadata.album_artist_for_conversion.as_deref().unwrap_or(""),
+                metadata.editing == Some(ConvertMetadataField::AlbumArtist),
+                &metadata.edit_input,
+                focused,
+                value_w,
+                theme,
+            ),
+        ],
+        theme,
+    )
 }
 
 fn render_single_metadata<'a>(
@@ -308,7 +359,29 @@ fn render_single_metadata<'a>(
         theme,
     );
 
-    vec![title_row, row2, row3]
+    let album_artist_label = "   album artist ";
+    let album_artist_value_w = w.saturating_sub(2 + album_artist_label.len());
+    let row4 = bordered_line(
+        border_color,
+        w,
+        vec![
+            Span::styled(
+                album_artist_label,
+                if is_focused(ConvertMetadataField::AlbumArtist) { theme.bright() } else { theme.muted() },
+            ),
+            render_inline_value(
+                value(&metadata.album_artist_for_conversion),
+                is_editing(ConvertMetadataField::AlbumArtist),
+                &metadata.edit_input,
+                is_focused(ConvertMetadataField::AlbumArtist),
+                album_artist_value_w,
+                theme,
+            ),
+        ],
+        theme,
+    );
+
+    vec![title_row, row2, row3, row4]
 }
 
 fn render_archive_preview_metadata<'a>(

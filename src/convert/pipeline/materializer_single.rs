@@ -156,7 +156,7 @@ fn json_u32(value: &serde_json::Value) -> Option<u32> {
         .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
 }
 
-fn read_track_metadata(path: &Path) -> TrackMetadata {
+pub(crate) fn read_track_metadata(path: &Path) -> TrackMetadata {
     use lofty::prelude::*;
 
     let tagged = match lofty::read_from_path(path) {

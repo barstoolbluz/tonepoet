@@ -2147,6 +2147,8 @@ mod tests {
             failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             album_batch: None,
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,

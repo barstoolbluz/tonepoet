@@ -219,10 +219,39 @@ fn register_metadata_buttons(app: &mut AppState, area: Rect) {
 
     match &app.convert.source.mode {
         SourceMode::Batch { paths, cursor, .. } => {
+            app.button_map.record_button(
+                TuiButton::MetadataField(MetadataFieldKind::AlbumArtist),
+                Rect::new(list_area.x + 1, list_area.y + 1, list_area.width.saturating_sub(2), 1),
+            );
+            let shifted_area = Rect::new(
+                list_area.x,
+                list_area.y.saturating_add(1),
+                list_area.width,
+                list_area.height.saturating_sub(1),
+            );
             register_metadata_file_rows(
                 &mut app.button_map,
-                list_area,
+                shifted_area,
                 paths.len(),
+                *cursor,
+                app.convert.metadata.file_scroll,
+            );
+        }
+        SourceMode::MultiTrack { tracks, cursor, archive_preview: None, .. } => {
+            app.button_map.record_button(
+                TuiButton::MetadataField(MetadataFieldKind::AlbumArtist),
+                Rect::new(list_area.x + 1, list_area.y + 1, list_area.width.saturating_sub(2), 1),
+            );
+            let shifted_area = Rect::new(
+                list_area.x,
+                list_area.y.saturating_add(1),
+                list_area.width,
+                list_area.height.saturating_sub(1),
+            );
+            register_metadata_file_rows(
+                &mut app.button_map,
+                shifted_area,
+                tracks.len(),
                 *cursor,
                 app.convert.metadata.file_scroll,
             );
@@ -447,6 +476,10 @@ fn register_metadata_fields(buttons: &mut ButtonRenderMap, area: Rect) {
     buttons.record_button(
         TuiButton::MetadataField(MetadataFieldKind::Year),
         Rect::new(inner_x + half_w, area.y + 3, inner_w - half_w, 1),
+    );
+    buttons.record_button(
+        TuiButton::MetadataField(MetadataFieldKind::AlbumArtist),
+        Rect::new(inner_x, area.y + 4, inner_w, 1),
     );
 }
 

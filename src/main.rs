@@ -85,6 +85,11 @@ enum Commands {
         #[arg(long)]
         write_log: bool,
 
+        /// Create per-disc subfolders (disc 01/, disc 02/, ...) for
+        /// multi-disc sets, with batch-scope album identity resolution
+        #[arg(long)]
+        disc_subfolders: bool,
+
         /// Generate CUE files
         #[arg(long)]
         generate_cue: bool,
@@ -287,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
             backend,
             append_lineage,
             write_log,
+            disc_subfolders,
             generate_cue,
             track,
             track_range,
@@ -322,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
                 track_range,
                 area,
                 no_cue,
+                disc_subfolders,
                 partial,
                 overwrite_output,
                 naming,
@@ -603,6 +610,7 @@ async fn run_convert(
     track_range: Option<String>,
     area: Option<String>,
     no_cue: bool,
+    disc_subfolders: bool,
     partial: bool,
     overwrite_output: bool,
     naming: Option<String>,
@@ -708,6 +716,7 @@ async fn run_convert(
     options.append_lineage_to_comment =
         append_lineage || config.conversion.append_lineage_to_comment;
     options.write_log_file = write_log || config.conversion.write_log_file;
+    options.create_disc_subfolders = disc_subfolders;
     options.generate_cue_files = generate_cue || config.conversion.generate_cue_files;
     if let Some(template) = &naming {
         options.naming_template = Some(template.clone());
@@ -1157,6 +1166,8 @@ fn build_pipeline_request_template(
         },
         pre_extracted_staging: None,
         archive_metadata_overrides: Vec::new(),
+        metadata_overrides: Default::default(),
+        batch_resolved_identity: None,
         expected_album_track_count: None,
         suppress_incremental_conversion_log_append: false,
     })

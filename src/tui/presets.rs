@@ -19,6 +19,13 @@ fn default_companion_extensions() -> String {
     crate::convert::formats::default_companion_extensions().join(", ")
 }
 
+fn normalize_optional_text_override(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// A TUI-native preset that stores pill values directly
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiPreset {
@@ -40,6 +47,10 @@ pub struct TuiPreset {
     pub modulator_order: Option<u8>, // 4-8
     #[serde(default)]
     pub dsd_filter_preset: Option<String>, // "auto", "sinc"
+
+    // Metadata pane
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_artist_for_conversion: Option<String>,
 
     // Output options pane
     #[serde(default)]
@@ -67,6 +78,7 @@ impl TuiPreset {
         name: &str,
         format: &FormatState,
         output_opts: &OutputOptionsState,
+        metadata: &MetadataState,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -85,6 +97,9 @@ impl TuiPreset {
             noise_shaper: Some(format.noise_shaper.selected_label().to_lowercase()),
             modulator_order: Some(format.modulator_order.selected_value().value()),
             dsd_filter_preset: Some(format.conversion_preset.selected_label().to_lowercase()),
+            album_artist_for_conversion: normalize_optional_text_override(
+                metadata.album_artist_for_conversion.as_deref(),
+            ),
             dest_path: output_opts
                 .dest_path
                 .as_ref()
@@ -109,6 +124,7 @@ impl TuiPreset {
         &self,
         format_state: &mut FormatState,
         output_opts: &mut OutputOptionsState,
+        metadata: &mut MetadataState,
     ) {
         // Format
         if let Some(fmt) = parse_format(&self.format) {
@@ -167,6 +183,10 @@ impl TuiPreset {
         if let Some(mm) = parse_merge(&self.merge) {
             output_opts.merge.select_value(&mm);
         }
+
+        metadata.album_artist_for_conversion = normalize_optional_text_override(
+            self.album_artist_for_conversion.as_deref(),
+        );
 
         // Re-apply constraints after all pills are set
         format_state.apply_format_constraints();
@@ -242,6 +262,7 @@ impl TuiPreset {
             noise_shaper: Some("clans".to_string()),
             modulator_order: Some(8),
             dsd_filter_preset: Some("auto".to_string()),
+            album_artist_for_conversion: None,
             dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
@@ -702,25 +723,89 @@ merge = "multi-file"
     fn companion_fields_round_trip_through_preset_capture_and_apply() {
         let format = FormatState::new();
         let mut output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
         output.companion_extensions = ".jpg, .pdf".to_string();
         output.companion_folders = "Scans, Artwork".to_string();
         output.companion_exclude_files = "EXIGO*, foo_dr.txt".to_string();
         output.force_encode.select_value(&true);
         output.write_log.select_value(&true);
 
-        let preset = TuiPreset::from_pill_state("companions", &format, &output);
+        let preset = TuiPreset::from_pill_state("companions", &format, &output, &metadata);
         let mut restored_format = FormatState::new();
         let mut restored_output = OutputOptionsState::new();
         restored_output.companion_extensions.clear();
         restored_output.companion_folders.clear();
         restored_output.companion_exclude_files.clear();
 
-        preset.apply_to_pills(&mut restored_format, &mut restored_output);
+        let mut restored_metadata = MetadataState::default();
+        preset.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
 
         assert_eq!(restored_output.companion_extensions, ".jpg, .pdf");
         assert_eq!(restored_output.companion_folders, "Scans, Artwork");
         assert_eq!(restored_output.companion_exclude_files, "EXIGO*, foo_dr.txt");
         assert!(*restored_output.force_encode.selected_value());
         assert!(*restored_output.write_log.selected_value());
+    }
+
+    #[test]
+    fn album_artist_override_round_trips_through_preset_capture_and_apply() {
+        let format = FormatState::new();
+        let output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        metadata.album_artist_for_conversion = Some("  The Allman Brothers Band  ".to_string());
+
+        let preset = TuiPreset::from_pill_state("album-artist", &format, &output, &metadata);
+        assert_eq!(
+            preset.album_artist_for_conversion.as_deref(),
+            Some("The Allman Brothers Band")
+        );
+
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        restored_metadata.album_artist_for_conversion = Some("Stale Override".to_string());
+
+        preset.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+
+        assert_eq!(
+            restored_metadata.album_artist_for_conversion.as_deref(),
+            Some("The Allman Brothers Band")
+        );
+    }
+
+    #[test]
+    fn legacy_preset_without_album_artist_override_clears_stale_metadata_override() {
+        let preset: TuiPreset = toml::from_str(
+            r#"
+name = "legacy"
+version = 3
+format = "flac"
+sample_rate = 44100
+bit_depth = "24"
+dither = "tpdf"
+replaygain = "off"
+folder_template = "%ARTIST%/%ALBUM%"
+filename_template = "%TRACKNN% - %TITLE%.%EXT%"
+merge = "multi-file"
+"#,
+        )
+        .expect("preset without metadata override should deserialize");
+
+        let mut format = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        metadata.album_artist_for_conversion = Some("Stale Override".to_string());
+
+        preset.apply_to_pills(&mut format, &mut output, &mut metadata);
+
+        assert!(metadata.album_artist_for_conversion.is_none());
     }
 }

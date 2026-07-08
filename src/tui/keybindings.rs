@@ -1396,10 +1396,8 @@ fn convert_metadata_inline_fields_visible(app: &AppState) -> bool {
         &app.convert.source.mode,
         SourceMode::Empty
             | SourceMode::Single { .. }
-            | SourceMode::MultiTrack {
-                archive_preview: Some(_),
-                ..
-            }
+            | SourceMode::Batch { .. }
+            | SourceMode::MultiTrack { .. }
     )
 }
 
@@ -1408,6 +1406,12 @@ fn convert_metadata_field_value(app: &AppState, field: ConvertMetadataField) -> 
         ConvertMetadataField::Title => app.convert.metadata.title.clone().unwrap_or_default(),
         ConvertMetadataField::Artist => app.convert.metadata.artist.clone().unwrap_or_default(),
         ConvertMetadataField::Album => app.convert.metadata.album.clone().unwrap_or_default(),
+        ConvertMetadataField::AlbumArtist => app
+            .convert
+            .metadata
+            .album_artist_for_conversion
+            .clone()
+            .unwrap_or_default(),
         ConvertMetadataField::Genre => app.convert.metadata.genre.clone().unwrap_or_default(),
         ConvertMetadataField::Year => app.convert.metadata.year.clone().unwrap_or_default(),
     }
@@ -1425,6 +1429,7 @@ fn set_convert_metadata_field_value(app: &mut AppState, field: ConvertMetadataFi
         ConvertMetadataField::Title => app.convert.metadata.title = value_opt,
         ConvertMetadataField::Artist => app.convert.metadata.artist = value_opt,
         ConvertMetadataField::Album => app.convert.metadata.album = value_opt,
+        ConvertMetadataField::AlbumArtist => app.convert.metadata.album_artist_for_conversion = value_opt,
         ConvertMetadataField::Genre => app.convert.metadata.genre = value_opt,
         ConvertMetadataField::Year => app.convert.metadata.year = value_opt,
     }
@@ -1438,6 +1443,18 @@ fn begin_convert_metadata_inline_edit(
     if !convert_metadata_inline_fields_visible(app) {
         return;
     }
+    let field = if matches!(
+        &app.convert.source.mode,
+        SourceMode::Batch { .. }
+            | SourceMode::MultiTrack {
+                archive_preview: None,
+                ..
+            }
+    ) {
+        ConvertMetadataField::AlbumArtist
+    } else {
+        field
+    };
     let initial = convert_metadata_field_value(app, field);
     app.convert.focus = ConvertFocus::Metadata;
     app.convert.metadata.field_focus = field;
@@ -1453,8 +1470,12 @@ fn commit_convert_metadata_inline_edit(app: &mut AppState) {
     let Some(field) = app.convert.metadata.editing.take() else {
         return;
     };
+    let before = convert_metadata_field_value(app, field);
     let value = app.convert.metadata.edit_input.text.clone();
     set_convert_metadata_field_value(app, field, &value);
+    if field == ConvertMetadataField::AlbumArtist && before.trim() != value.trim() {
+        app.preset.mark_modified();
+    }
     sync_convert_metadata_to_current_archive_preview(app);
 }
 
@@ -2918,6 +2939,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                     &name,
                     &app.convert.format,
                     &app.convert.output_options,
+                    &app.convert.metadata,
                 );
                 match super::presets::save_preset_with_db(&preset, &app.db) {
                     Ok(_) => {
@@ -2972,6 +2994,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                         preset.apply_to_pills(
                             &mut app.convert.format,
                             &mut app.convert.output_options,
+                            &mut app.convert.metadata,
                         );
                         app.preset
                             .set_active_preset_path(name.clone(), super::presets::preset_file_path(&name));
@@ -11053,7 +11076,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     }
 
-    let mut paths: Vec<std::path::PathBuf> = crate::convert::queue_expansion::expand_paths_to_all_audio(&sel)
+    let mut paths: Vec<std::path::PathBuf> = crate::convert::queue_expansion::expand_paths_to_audio(&sel)
         .into_iter()
         .filter(|p| {
             matches!(
@@ -23824,6 +23847,7 @@ fn execute_confirm_action(
                 name,
                 &app.convert.format,
                 &app.convert.output_options,
+                &app.convert.metadata,
             );
             match super::presets::save_preset_to_path_with_db(&preset, path, &app.db) {
                 Ok(()) => {

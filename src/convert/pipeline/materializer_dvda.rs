@@ -5956,6 +5956,8 @@ mod tests {
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
+            batch_resolved_identity: None,
+            metadata_overrides: Default::default(),
         }
     }
 

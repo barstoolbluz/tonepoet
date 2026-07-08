@@ -17,8 +17,9 @@ use tonepoet_pipeline::{
 use crate::convert::formats::{AacProfile, Mp3BitrateMode, QualitySettings, WavPackMode};
 use crate::convert::pipeline::{
     CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy, NamingCollisionPolicy,
-    NamingPolicy, OverwritePolicy, PipelineRequest, PublishPolicy, SecretString, SourceOptions,
-    StagePolicy, StageRequirement, TrackSelection,
+    MetadataTextOverride, NamingPolicy, OverwritePolicy, PipelineRequest, PublishPolicy,
+    RequestMetadataOverrides, SecretString, SourceOptions, StagePolicy, StageRequirement,
+    TrackSelection,
 };
 use crate::convert::{ConversionError, ConversionItem, ConversionResult};
 
@@ -34,6 +35,7 @@ pub fn build_pipeline_request(item: &ConversionItem) -> ConversionResult<Pipelin
         if let Some(cue_sidecar_override) = item.cue_sidecar_override {
             request.source.cue_sidecar = cue_sidecar_override;
         }
+        merge_request_metadata_overrides_for_item(&mut request, item);
         return Ok(request);
     }
 
@@ -181,11 +183,36 @@ pub fn build_pipeline_request_from_settings(
         },
         pre_extracted_staging: item.pre_extracted_staging.clone(),
         archive_metadata_overrides: Vec::new(),
+        metadata_overrides: request_metadata_overrides_for_item(item),
+        batch_resolved_identity: None,
         album_batch: None,
         album_batch_track: None,
         expected_album_track_count: None,
         suppress_incremental_conversion_log_append: false,
     })
+}
+
+fn request_metadata_overrides_for_item(item: &ConversionItem) -> RequestMetadataOverrides {
+    RequestMetadataOverrides {
+        album_artist: item
+            .options
+            .album_artist_override
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| MetadataTextOverride::Set(value.to_string()))
+            .unwrap_or_default(),
+    }
+}
+
+fn merge_request_metadata_overrides_for_item(
+    request: &mut PipelineRequest,
+    item: &ConversionItem,
+) {
+    let overrides = request_metadata_overrides_for_item(item);
+    if !overrides.album_artist.is_keep() {
+        request.metadata_overrides.album_artist = overrides.album_artist;
+    }
 }
 
 /// Explicit compatibility-only projection from legacy `ConversionOptions`.

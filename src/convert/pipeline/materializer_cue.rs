@@ -2813,6 +2813,8 @@ FILE "album.flac" WAVE
             companion: Default::default(),
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
+            metadata_overrides: Default::default(),
+            batch_resolved_identity: None,
             expected_album_track_count: None,
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),

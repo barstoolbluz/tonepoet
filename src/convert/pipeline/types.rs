@@ -73,6 +73,49 @@ impl AlbumBatchSourceContext {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchResolvedAlbumIdentity {
+    /// Batch-resolved album title used for folder planning and album-level log
+    /// identity. This is intentionally organizational metadata unless an
+    /// explicit request metadata override also asks the writer to change tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    /// Batch-resolved album artist used for folder planning. The metadata writer
+    /// only writes this value when `PipelineRequest::metadata_overrides` carries
+    /// an explicit album-artist override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_artist: Option<String>,
+    /// Conservative shared date/year evidence for folder planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// Proven or inferred disc count for the source grouping root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_discs: Option<u32>,
+    /// Per-source container path -> resolved one-based disc number. Keys are
+    /// deterministic lossy path strings so the contract survives serde and does
+    /// not depend on platform-specific Path hashing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_disc_numbers: BTreeMap<String, u32>,
+}
+
+impl BatchResolvedAlbumIdentity {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.album.is_none()
+            && self.album_artist.is_none()
+            && self.date.is_none()
+            && self.total_discs.is_none()
+            && self.source_disc_numbers.is_empty()
+    }
+
+    #[must_use]
+    pub fn disc_number_for_path(&self, path: &std::path::Path) -> Option<u32> {
+        self.source_disc_numbers
+            .get(&path.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+            .copied()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlbumBatchContext {
     /// Explicit shared conversion-log batch id assigned once by the folder/album
@@ -118,6 +161,13 @@ pub struct AlbumBatchContext {
     /// `source_grouping_root`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) source_context: Option<AlbumBatchSourceContext>,
+    /// Conservative batch-scope album identity resolved by the dispatcher from
+    /// sibling disc folders, disc tags, normalized album strings, and majority
+    /// album-artist/date evidence. It is used for output organization and
+    /// album-log identity, not for tag rewriting unless an explicit metadata
+    /// override is also present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved_identity: Option<BatchResolvedAlbumIdentity>,
 }
 
 impl AlbumBatchContext {
@@ -142,6 +192,7 @@ impl AlbumBatchContext {
             source_context: Some(AlbumBatchSourceContext::folder_album_batch(
                 source_grouping_root.clone(),
             )),
+            resolved_identity: None,
             source_grouping_root,
         }
     }
@@ -175,6 +226,17 @@ impl AlbumBatchContext {
     pub(crate) fn with_source_context(mut self, source_context: AlbumBatchSourceContext) -> Self {
         self.source_context = Some(source_context);
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_resolved_identity(mut self, identity: BatchResolvedAlbumIdentity) -> Self {
+        self.resolved_identity = if identity.is_empty() { None } else { Some(identity) };
+        self
+    }
+
+    #[must_use]
+    pub fn resolved_identity(&self) -> Option<&BatchResolvedAlbumIdentity> {
+        self.resolved_identity.as_ref()
     }
 
     #[must_use]
@@ -354,6 +416,22 @@ impl ArchiveTrackMetadataOverride {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestMetadataOverrides {
+    /// Request-scope album-artist override selected by the user for this
+    /// conversion. `Keep` means the writer preserves source tags while
+    /// batch-scope identity may still organize outputs conservatively.
+    #[serde(default, skip_serializing_if = "MetadataTextOverride::is_keep")]
+    pub album_artist: MetadataTextOverride,
+}
+
+impl RequestMetadataOverrides {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.album_artist.is_keep()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineRequest {
     pub job_id: String,
@@ -388,6 +466,18 @@ pub struct PipelineRequest {
     /// output metadata without mutating staged source audio opportunistically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archive_metadata_overrides: Vec<ArchiveTrackMetadataOverride>,
+    /// Request-scope metadata override contract used by non-archive and
+    /// archive materializers alike. Kept separate from
+    /// `archive_metadata_overrides`, which edits individual staged archive
+    /// tracks by ordinal/path.
+    #[serde(default, skip_serializing_if = "RequestMetadataOverrides::is_empty")]
+    pub metadata_overrides: RequestMetadataOverrides,
+    /// Batch-scope album identity attached directly to this request when the
+    /// source kind does not use `AlbumBatchContext` fragments, for example
+    /// per-disc CUE images. Independent single-file album batches usually carry
+    /// the same identity inside `album_batch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_resolved_identity: Option<BatchResolvedAlbumIdentity>,
     /// Album/folder batch contract for independent single-file jobs. Production
     /// callers must obtain this through
     /// `prepare_independent_single_file_album_batch_for_dispatch(...)`; direct
@@ -448,6 +538,12 @@ impl PipelineRequest {
     #[must_use]
     pub fn with_album_batch_track(mut self, album_batch_track: AlbumBatchTrackContext) -> Self {
         self.album_batch_track = Some(album_batch_track);
+        self
+    }
+
+    #[must_use]
+    pub fn with_batch_resolved_identity(mut self, identity: BatchResolvedAlbumIdentity) -> Self {
+        self.batch_resolved_identity = if identity.is_empty() { None } else { Some(identity) };
         self
     }
 }
@@ -790,6 +886,8 @@ pub struct RedactedPipelineRequest {
     pub log: LogPolicy,
     pub stages: StagePolicy,
     pub failure_policy: FailurePolicy,
+    pub metadata_overrides: RequestMetadataOverrides,
+    pub batch_resolved_identity: Option<BatchResolvedAlbumIdentity>,
     pub album_batch: Option<AlbumBatchContext>,
     pub album_batch_track: Option<AlbumBatchTrackContext>,
     pub suppress_incremental_conversion_log_append: bool,
@@ -869,6 +967,8 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
             log: req.log.clone(),
             stages: req.stages.clone(),
             failure_policy: req.failure_policy,
+            metadata_overrides: req.metadata_overrides.clone(),
+            batch_resolved_identity: req.batch_resolved_identity.clone(),
             album_batch: req.album_batch.clone(),
             album_batch_track: req.album_batch_track.clone(),
             suppress_incremental_conversion_log_append: req.suppress_incremental_conversion_log_append,
