@@ -535,7 +535,10 @@ pub fn commit_batch(
     commit_batch_with_cue_artifacts(app, paths, &std::collections::HashSet::new(), options)
 }
 
-fn cue_sidecar_override_for_commit_path(
+/// Map queue-expansion CUE-artifact metadata onto the sidecar policy for one
+/// queued path. Shared by the TUI commit path and the CLI folder scan so both
+/// front ends apply identical CUE semantics.
+pub fn cue_sidecar_override_for_commit_path(
     path: &std::path::Path,
     cue_artifact_audio: &std::collections::HashSet<std::path::PathBuf>,
 ) -> Option<crate::convert::pipeline::CueSidecarPolicy> {

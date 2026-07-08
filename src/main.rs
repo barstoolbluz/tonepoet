@@ -763,49 +763,30 @@ async fn run_convert(
     // Build queue
     let queue = Arc::new(RwLock::new(ConversionQueue::new()));
 
-    // Add files to queue
+    // Add files to queue through the same expansion heuristics the TUI uses:
+    // directories expand to their queueable contents with CUE suppression
+    // (split-track folders never queue their describing CUE; unsplit images
+    // queue the CUE and suppress the image), deterministic ordering, and
+    // deduplication across overlapping arguments. Explicitly named files keep
+    // explicit semantics — naming a CUE on the command line queues it.
+    // Note: expansion does not follow symlinks inside directories (matching
+    // Browse); symlinked layouts need explicit file arguments.
     {
         let mut q = queue.write().await;
-        for path in &paths {
-            if !path.exists() {
-                eprintln!("Warning: path does not exist: {}", path.display());
-                continue;
-            }
-
-            if path.is_dir() {
-                for entry in walkdir::WalkDir::new(path)
-                    .follow_links(true)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                {
-                    let p = entry.path();
-                    if p.is_file() {
-                        if let Ok(format) = FormatDetector::detect(p) {
-                            add_item_to_queue(
-                                &mut q,
-                                p.to_path_buf(),
-                                format,
-                                &options,
-                                &archive_password,
-                                config,
-                            );
-                        }
-                    }
-                }
-            } else if path.is_file() {
-                if let Ok(format) = FormatDetector::detect(path) {
-                    add_item_to_queue(
-                        &mut q,
-                        path.clone(),
-                        format,
-                        &options,
-                        &archive_password,
-                        config,
-                    );
-                } else {
-                    eprintln!("Warning: unsupported file format: {}", path.display());
-                }
-            }
+        let planned = plan_cli_convert_queue(&paths);
+        for warning in &planned.warnings {
+            eprintln!("Warning: {warning}");
+        }
+        for (path, format, cue_sidecar_override) in planned.items {
+            add_item_to_queue(
+                &mut q,
+                path,
+                format,
+                cue_sidecar_override,
+                &options,
+                &archive_password,
+                config,
+            );
         }
 
         // Attach pipeline request template to each item if pipeline flags were set.
@@ -925,15 +906,75 @@ async fn run_convert(
     result.map_err(|e| anyhow::anyhow!("{}", e))
 }
 
+/// Everything the CLI convert scan decided to queue, plus user-facing
+/// warnings. Separated from queue mutation so the decision logic is testable.
+struct PlannedCliQueue {
+    items: Vec<(
+        PathBuf,
+        FileFormat,
+        Option<tonepoet::convert::pipeline::CueSidecarPolicy>,
+    )>,
+    warnings: Vec<String>,
+}
+
+/// Expand CLI convert arguments through the same queue-expansion heuristics
+/// the TUI uses: directories expand to their queueable contents with CUE
+/// suppression (split-track folders never queue their describing CUE; unsplit
+/// images queue the CUE and suppress the image), deterministic ordering, and
+/// deduplication across overlapping arguments. Explicitly named files keep
+/// explicit semantics — naming a CUE on the command line queues it. Expansion
+/// does not follow symlinks inside directories (matching Browse); symlinked
+/// layouts need explicit file arguments.
+fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
+    let mut warnings = Vec::new();
+    let mut expansion_inputs = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            warnings.push(format!("path does not exist: {}", path.display()));
+            continue;
+        }
+        expansion_inputs.push(path.clone());
+    }
+
+    let expansion = tonepoet::tui::browse::expand_paths_to_audio_with_metadata(&expansion_inputs);
+
+    // Explicit file arguments the expansion filtered out (unsupported formats)
+    // still deserve the historical warning.
+    for path in &expansion_inputs {
+        if path.is_file()
+            && !expansion.paths.iter().any(|queued| queued == path)
+            && FormatDetector::detect(path).is_err()
+        {
+            warnings.push(format!("unsupported file format: {}", path.display()));
+        }
+    }
+
+    let mut items = Vec::new();
+    for path in &expansion.paths {
+        if let Ok(format) = FormatDetector::detect(path) {
+            let cue_sidecar_override =
+                tonepoet::tui::convert_actions::cue_sidecar_override_for_commit_path(
+                    path,
+                    &expansion.cue_artifact_audio,
+                );
+            items.push((path.clone(), format, cue_sidecar_override));
+        }
+    }
+
+    PlannedCliQueue { items, warnings }
+}
+
 fn add_item_to_queue(
     queue: &mut ConversionQueue,
     path: PathBuf,
     format: FileFormat,
+    cue_sidecar_override: Option<tonepoet::convert::pipeline::CueSidecarPolicy>,
     options: &ConversionOptions,
     archive_password: &Option<String>,
     config: &TonepoetConfig,
 ) {
     let mut item = ConversionItem::new(path.clone(), format, options.clone());
+    item.cue_sidecar_override = cue_sidecar_override;
     if tonepoet::is_encrypted_archive_ext(&path) {
         // Password priority: CLI flag → config → keychain MRU → None.
         item.archive_password = archive_password
@@ -2883,5 +2924,140 @@ mod terminal_restore_session_tests {
 
         guard.disarm();
         assert!(!terminal_session_is_active());
+    }
+}
+
+#[cfg(test)]
+mod cli_convert_queue_planning_tests {
+    use super::*;
+
+    fn touch(path: &std::path::Path) {
+        std::fs::write(path, b"fixture").expect("fixture file");
+    }
+
+    fn planned_names(planned: &PlannedCliQueue) -> Vec<String> {
+        planned
+            .items
+            .iter()
+            .map(|(path, _, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The Dreams box-set shape: split per-track FLACs plus an uppercase .CUE
+    /// describing an image that is not present. The CUE must be suppressed —
+    /// it previously queued and failed every folder conversion containing one.
+    #[test]
+    fn folder_scan_suppresses_cue_beside_split_tracks_case_insensitively() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let disc = temp.path().join("disc 03");
+        std::fs::create_dir_all(&disc).expect("disc dir");
+        touch(&disc.join("01 - One.flac"));
+        touch(&disc.join("02 - Two.flac"));
+        std::fs::write(
+            disc.join("Dreams CD3.CUE"),
+            "FILE \"Dreams CD3.WAV\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("cue fixture");
+
+        let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
+
+        let names = planned_names(&planned);
+        assert_eq!(names, vec!["01 - One.flac", "02 - Two.flac"]);
+        assert!(
+            !names.iter().any(|name| name.ends_with(".CUE")),
+            "a CUE describing a missing image must never be queued from a folder scan"
+        );
+    }
+
+    /// An unsplit image with its CUE: the CUE is the queueable source and the
+    /// image is suppressed, with no double conversion.
+    #[test]
+    fn folder_scan_queues_split_source_cue_and_suppresses_its_image() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        touch(&temp.path().join("album.flac"));
+        std::fs::write(
+            temp.path().join("album.cue"),
+            "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("cue fixture");
+
+        let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
+
+        assert_eq!(planned_names(&planned), vec!["album.cue"]);
+    }
+
+    /// Explicitly naming a CUE on the command line keeps explicit semantics
+    /// even when the expansion would classify it as a metadata artifact.
+    #[test]
+    fn explicit_cue_file_argument_is_still_queued() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("01 - One.flac");
+        touch(&audio);
+        let cue = temp.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            "FILE \"01 - One.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("cue fixture");
+
+        let planned = plan_cli_convert_queue(&[cue.clone()]);
+        assert_eq!(planned_names(&planned), vec!["album.cue"]);
+    }
+
+    /// Overlapping arguments (a directory and a file inside it) queue once.
+    #[test]
+    fn overlapping_arguments_deduplicate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("01 - One.flac");
+        touch(&audio);
+
+        let planned = plan_cli_convert_queue(&[temp.path().to_path_buf(), audio.clone()]);
+        assert_eq!(planned_names(&planned), vec!["01 - One.flac"]);
+    }
+
+    /// Suppressed sibling audio from an unresolvable CUE carries the
+    /// EmbeddedOnly sidecar override so downstream conversion skips sidecar
+    /// CUE discovery, exactly like the TUI commit path.
+    #[test]
+    fn cue_artifact_audio_gets_embedded_only_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        touch(&temp.path().join("01 - One.flac"));
+        std::fs::write(
+            temp.path().join("broken.cue"),
+            "FILE \"missing-image.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("cue fixture");
+
+        let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
+        assert_eq!(planned.items.len(), 1);
+        let (path, _, override_policy) = &planned.items[0];
+        assert!(path.ends_with("01 - One.flac"));
+        assert_eq!(
+            *override_policy,
+            Some(tonepoet::convert::pipeline::CueSidecarPolicy::EmbeddedOnly),
+            "sibling audio of an unresolvable CUE must skip sidecar CUE detection"
+        );
+    }
+
+    /// Unsupported explicit file arguments warn; missing paths warn; neither
+    /// aborts the rest of the queue.
+    #[test]
+    fn warnings_for_missing_and_unsupported_arguments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("01 - One.flac");
+        touch(&audio);
+        let unsupported = temp.path().join("notes.xyz");
+        touch(&unsupported);
+
+        let planned = plan_cli_convert_queue(&[
+            audio.clone(),
+            unsupported.clone(),
+            temp.path().join("does-not-exist.flac"),
+        ]);
+
+        assert_eq!(planned_names(&planned), vec!["01 - One.flac"]);
+        assert_eq!(planned.warnings.len(), 2);
+        assert!(planned.warnings.iter().any(|w| w.contains("does not exist")));
+        assert!(planned.warnings.iter().any(|w| w.contains("unsupported file format")));
     }
 }
