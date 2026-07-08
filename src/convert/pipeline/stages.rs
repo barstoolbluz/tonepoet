@@ -7125,6 +7125,10 @@ fn conversion_log_album_batch_track(req: &PipelineRequest) -> io::Result<&AlbumB
     })
 }
 
+// Only the canonical-fragment test helper still builds sort keys this way;
+// production paths use ConversionLogTrackSortKey::from and
+// conversion_log_materialized_fragment_sort_key.
+#[cfg(test)]
 fn conversion_log_fragment_sort_key(req: &PipelineRequest, fallback_track_id: &TrackId) -> io::Result<ConversionLogTrackSortKey> {
     match req.album_batch_track.as_ref() {
         Some(track) => Ok(ConversionLogTrackSortKey::from(&track.track_id())),
@@ -25891,20 +25895,6 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
     fn real_fragment_source_root(temp: &Path) -> PathBuf {
         temp.join("source-root")
-    }
-
-    fn real_fragment_batch(
-        temp: &Path,
-        batch_id: &str,
-        expected_track_count: usize,
-    ) -> AlbumBatchContext {
-        AlbumBatchContext::from_dispatcher_source_count(
-            batch_id,
-            expected_track_count,
-            real_fragment_album_dir(temp),
-            real_fragment_source_root(temp),
-        )
-        .expect("dispatcher-authored album batch context")
     }
 
     fn real_fragment_unbatched_request(
