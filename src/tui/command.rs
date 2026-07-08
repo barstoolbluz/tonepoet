@@ -13289,9 +13289,9 @@ mod execute_queue_state_consistency_tests {
         let finish_start = source
             .find("fn finish_browse_queue_review_after_expansion(")
             .expect("queue review finish helper should exist");
-        // Bound the scan to this function: the next top-level fn is
-        // execute_queue_with_post_load, whose synchronous non-folder path
-        // legitimately collects the Browse selection.
+        // Bound the scan to this function (up to the next top-level `fn `):
+        // later functions — notably execute_queue_with_post_load's synchronous
+        // non-folder path — legitimately collect the Browse selection.
         let finish_tail = &source[finish_start..];
         let finish_end = finish_tail[1..]
             .find("\nfn ")

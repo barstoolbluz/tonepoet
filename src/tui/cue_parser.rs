@@ -177,8 +177,3 @@ pub fn can_ffmpeg_read(path: &Path) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}
