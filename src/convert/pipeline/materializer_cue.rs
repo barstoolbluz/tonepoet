@@ -352,7 +352,120 @@ fn read_sidecar_cue(
         }
     }
 
+    // Queued sidecar CUE sources: the metadata editor writes corrections to
+    // the referenced image (flat tags plus a regenerated embedded CUESHEET);
+    // the sidecar text on disk goes stale. The sidecar stays authoritative for
+    // structure and image resolution, but when the image carries an embedded
+    // sheet that structurally matches, that sheet is authoritative for
+    // metadata — it is what the metadata overlay shows the user.
+    if has_extension(&req.container, "cue") {
+        if let Some(upgraded) = try_upgrade_sidecar_to_embedded_image_cue(&cue_input) {
+            return Ok(upgraded);
+        }
+    }
+
     Ok(cue_input)
+}
+
+/// Effective metadata sheet for a sidecar CUE at dispatch time: the same
+/// freshness precedence the materializer applies. The dispatcher's batch
+/// identity probes must see the corrected embedded metadata when conversion
+/// will, or a corrected multi-disc set resolves its album folder name from
+/// stale sidecar text while its tracks carry the corrections.
+pub(crate) fn dispatch_metadata_sheet_for_sidecar_cue(cue_path: &Path) -> Option<CueSheet> {
+    let raw_cue = read_cue_text(cue_path).ok()?;
+    let sheet = parse_cue(&raw_cue);
+    let sidecar = CueInput {
+        sheet,
+        raw_cue,
+        origin: CueOrigin::Sidecar,
+        cue_parent: cue_path.parent().map(Path::to_path_buf),
+        fallback_image: None,
+    };
+    match try_upgrade_sidecar_to_embedded_image_cue(&sidecar) {
+        Some(upgraded) => Some(upgraded.sheet),
+        None => Some(sidecar.sheet),
+    }
+}
+
+/// Best-effort freshness upgrade for a sidecar-resolved single-image CUE: use
+/// the referenced image's embedded CUESHEET when it exists, is a valid
+/// single-image sheet, and has the same track count as the sidecar. Any
+/// failure or structural disagreement keeps the sidecar (logged) — conversion
+/// must never fail because an embedded sheet is absent or malformed.
+fn try_upgrade_sidecar_to_embedded_image_cue(sidecar: &CueInput) -> Option<CueInput> {
+    let track_images = match resolve_track_image_paths(sidecar) {
+        Ok(images) => images,
+        Err(_) => return None,
+    };
+    let mut unique = track_images.clone();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != 1 {
+        // Track-per-file or multi-image layouts keep sidecar authority; the
+        // editor's embedded round-trip only exists for single-image rips.
+        return None;
+    }
+    let image = &unique[0];
+
+    let raw_cue = match read_embedded_cuesheet(image) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return None,
+        Err(err) => {
+            log::warn!(
+                "sidecar CUE kept: embedded CUESHEET on {} was unreadable: {err}",
+                image.display()
+            );
+            return None;
+        }
+    };
+    let sheet = parse_cue(&raw_cue);
+    if let Err(err) = validate_embedded_single_image_layout(&sheet) {
+        log::warn!(
+            "sidecar CUE kept: embedded CUESHEET on {} failed validation: {err}",
+            image.display()
+        );
+        return None;
+    }
+    if sheet.tracks.len() != sidecar.sheet.tracks.len() {
+        log::warn!(
+            "sidecar CUE kept: embedded CUESHEET on {} has {} tracks but the sidecar has {}",
+            image.display(),
+            sheet.tracks.len(),
+            sidecar.sheet.tracks.len()
+        );
+        return None;
+    }
+    // Structure authority means split points, not just track count: segment
+    // boundaries are INDEX 01 driven, so the embedded sheet is only a safe
+    // wholesale substitute when every INDEX 01 matches the sidecar's. The
+    // editor's regenerated sheets round-trip boundaries exactly; third-party
+    // embedded sheets that disagree keep the sidecar.
+    let boundaries_match = sheet
+        .tracks
+        .iter()
+        .zip(sidecar.sheet.tracks.iter())
+        .all(|(embedded, side)| embedded.index01_frames == side.index01_frames);
+    if !boundaries_match {
+        log::warn!(
+            "sidecar CUE kept: embedded CUESHEET on {} has matching track count but different INDEX 01 boundaries",
+            image.display()
+        );
+        return None;
+    }
+
+    log::info!(
+        "using embedded CUESHEET metadata from {} (sidecar structure verified, {} tracks)",
+        image.display(),
+        sheet.tracks.len()
+    );
+    Some(CueInput {
+        sheet,
+        raw_cue,
+        origin: CueOrigin::Embedded,
+        cue_parent: None,
+        fallback_image: Some(image.clone()),
+    })
 }
 
 fn resolve_embedded_cue(req: &PipelineRequest) -> Result<CueInput, MaterializeError> {
@@ -2755,7 +2868,7 @@ FILE "album.flac" WAVE
         .to_string()
     }
 
-    fn test_request(container: &Path) -> PipelineRequest {
+    pub(super) fn test_request(container: &Path) -> PipelineRequest {
         PipelineRequest {
             job_id: "test-job".to_string(),
             item_id: "test-item".to_string(),
@@ -4086,7 +4199,7 @@ FILE "track2.flac" WAVE
     }
 
 
-    fn fixture_tool_available(tool: &str) -> bool {
+    pub(super) fn fixture_tool_available(tool: &str) -> bool {
         std::process::Command::new(tool)
             .arg("-version")
             .stdout(std::process::Stdio::null())
@@ -4096,7 +4209,7 @@ FILE "track2.flac" WAVE
             .unwrap_or(false)
     }
 
-    fn run_fixture_command(command: &mut std::process::Command) {
+    pub(super) fn run_fixture_command(command: &mut std::process::Command) {
         let output = command.output().expect("spawn fixture command");
         assert!(
             output.status.success(),
@@ -4400,5 +4513,163 @@ FILE "lofty-image.flac" WAVE
         staging.disarm();
 
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod sidecar_embedded_upgrade_tests {
+    use super::*;
+    use super::materializer_cue_tests::{fixture_tool_available, run_fixture_command, test_request};
+
+    fn write_image_with_embedded(dir: &Path, image_name: &str, embedded_cue: Option<&str>) -> PathBuf {
+        let image = dir.join(image_name);
+        run_fixture_command(
+            std::process::Command::new("ffmpeg")
+                .arg("-y")
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg("sine=frequency=440:sample_rate=44100:duration=1")
+                .arg("-c:a")
+                .arg("flac")
+                .arg(&image),
+        );
+        if let Some(cue) = embedded_cue {
+            let cue_path = dir.join("embedded-fixture.cue");
+            std::fs::write(&cue_path, cue).expect("embedded cue text");
+            run_fixture_command(
+                std::process::Command::new("metaflac")
+                    .arg(format!("--set-tag-from-file=CUESHEET={}", cue_path.display()))
+                    .arg(&image),
+            );
+            std::fs::remove_file(&cue_path).expect("remove staging cue");
+        }
+        image
+    }
+
+    fn sidecar_cue_text(image_name: &str) -> String {
+        format!(
+            "PERFORMER \"Stale Artist\"\nTITLE \"Stale Album\"\nFILE \"{image_name}\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Stale One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Stale Two\"\n    INDEX 01 00:30:00\n"
+        )
+    }
+
+    /// The metadata editor writes corrections to the image's embedded
+    /// CUESHEET; a structurally matching embedded sheet must drive conversion
+    /// metadata instead of the stale sidecar text.
+    #[test]
+    fn sidecar_resolution_prefers_matching_embedded_sheet_metadata() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
+            eprintln!("skipping: ffmpeg or metaflac unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let embedded = "PERFORMER \"Corrected Artist\"\nTITLE \"Corrected Album\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Corrected One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Corrected Two\"\n    INDEX 01 00:30:00\n";
+        write_image_with_embedded(temp.path(), "image.flac", Some(embedded));
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&cue_path, sidecar_cue_text("image.flac")).expect("sidecar cue");
+
+        let req = test_request(&cue_path);
+        let input = read_sidecar_cue(&req, cue_path.clone()).expect("sidecar resolution");
+
+        assert_eq!(input.origin, CueOrigin::Embedded);
+        assert_eq!(input.sheet.title.as_deref(), Some("Corrected Album"));
+        assert_eq!(input.sheet.tracks[0].title.as_deref(), Some("Corrected One"));
+    }
+
+    /// Structural disagreement (different track count) keeps the sidecar —
+    /// the upgrade is metadata freshness, never a structure override.
+    #[test]
+    fn sidecar_resolution_keeps_sidecar_when_embedded_track_count_differs() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
+            eprintln!("skipping: ffmpeg or metaflac unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let embedded = "TITLE \"Corrected Album\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Only One\"\n    INDEX 01 00:00:00\n";
+        write_image_with_embedded(temp.path(), "image.flac", Some(embedded));
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&cue_path, sidecar_cue_text("image.flac")).expect("sidecar cue");
+
+        let req = test_request(&cue_path);
+        let input = read_sidecar_cue(&req, cue_path.clone()).expect("sidecar resolution");
+
+        assert_eq!(input.origin, CueOrigin::Sidecar);
+        assert_eq!(input.sheet.title.as_deref(), Some("Stale Album"));
+    }
+
+    /// Same track count but different INDEX 01 boundaries: the sidecar keeps
+    /// structure authority — a wholesale embedded swap would move split
+    /// points.
+    #[test]
+    fn sidecar_resolution_keeps_sidecar_when_embedded_boundaries_differ() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
+            eprintln!("skipping: ffmpeg or metaflac unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let embedded = "TITLE \"Corrected Album\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Corrected One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Corrected Two\"\n    INDEX 01 00:45:00\n";
+        write_image_with_embedded(temp.path(), "image.flac", Some(embedded));
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&cue_path, sidecar_cue_text("image.flac")).expect("sidecar cue");
+
+        let req = test_request(&cue_path);
+        let input = read_sidecar_cue(&req, cue_path.clone()).expect("sidecar resolution");
+
+        assert_eq!(input.origin, CueOrigin::Sidecar);
+        assert_eq!(input.sheet.title.as_deref(), Some("Stale Album"));
+    }
+
+    /// Dispatch-time identity probing and materialization must share one
+    /// metadata precedence: the dispatch sheet for a corrected single-image
+    /// album carries the embedded (corrected) metadata, so batch identity
+    /// cannot name album folders from stale sidecar text.
+    #[test]
+    fn dispatch_metadata_sheet_matches_materialization_precedence() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
+            eprintln!("skipping: ffmpeg or metaflac unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let embedded = "PERFORMER \"Corrected Artist\"\nTITLE \"Corrected Album\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Corrected One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Corrected Two\"\n    INDEX 01 00:30:00\n";
+        write_image_with_embedded(temp.path(), "image.flac", Some(embedded));
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&cue_path, sidecar_cue_text("image.flac")).expect("sidecar cue");
+
+        let sheet = dispatch_metadata_sheet_for_sidecar_cue(&cue_path)
+            .expect("dispatch sheet resolves");
+        assert_eq!(sheet.title.as_deref(), Some("Corrected Album"));
+        assert_eq!(sheet.performer.as_deref(), Some("Corrected Artist"));
+
+        // And without an embedded sheet, dispatch sees the sidecar unchanged.
+        let plain = temp.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("plain dir");
+        write_image_with_embedded(&plain, "image.flac", None);
+        let plain_cue = plain.join("album.cue");
+        std::fs::write(&plain_cue, sidecar_cue_text("image.flac")).expect("plain cue");
+        let sheet = dispatch_metadata_sheet_for_sidecar_cue(&plain_cue)
+            .expect("dispatch sheet resolves");
+        assert_eq!(sheet.title.as_deref(), Some("Stale Album"));
+    }
+
+    /// No embedded sheet: byte-identical to today's behavior.
+    #[test]
+    fn sidecar_resolution_unchanged_without_embedded_sheet() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
+            eprintln!("skipping: ffmpeg or metaflac unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_image_with_embedded(temp.path(), "image.flac", None);
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(&cue_path, sidecar_cue_text("image.flac")).expect("sidecar cue");
+
+        let req = test_request(&cue_path);
+        let input = read_sidecar_cue(&req, cue_path.clone()).expect("sidecar resolution");
+
+        assert_eq!(input.origin, CueOrigin::Sidecar);
+        assert_eq!(input.sheet.tracks[0].title.as_deref(), Some("Stale One"));
     }
 }

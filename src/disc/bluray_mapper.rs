@@ -1872,13 +1872,28 @@ exit 42
         permissions.set_mode(0o755);
         std::fs::set_permissions(&ffprobe, permissions).unwrap();
 
-        let facts = ffprobe_bluray_playlist_audio_streams(
-            &ffprobe,
-            &dir,
-            777,
-            &BlurayProbeControl::bounded_default(),
-        )
-        .unwrap();
+        // Executing a just-written script races with concurrent test threads
+        // forking: a child forked between our write and exec can briefly hold
+        // the script's fd open, so exec fails with ETXTBSY (observed once
+        // under full-suite load, hypothesis unconfirmed). Retry spawn-level
+        // errors only; assertion substance below is untouched.
+        let mut attempt = 0;
+        let facts = loop {
+            match ffprobe_bluray_playlist_audio_streams(
+                &ffprobe,
+                &dir,
+                777,
+                &BlurayProbeControl::bounded_default(),
+            ) {
+                Ok(facts) => break facts,
+                Err(err) if attempt < 3 => {
+                    attempt += 1;
+                    eprintln!("retrying fixture ffprobe spawn (attempt {attempt}): {err}");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => panic!("fixture ffprobe failed after retries: {err}"),
+            }
+        };
 
         let args = std::fs::read_to_string(args_file).unwrap();
         assert!(args.contains("-playlist\n777\n"));

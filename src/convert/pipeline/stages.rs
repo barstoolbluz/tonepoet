@@ -14250,6 +14250,17 @@ fn record_album_batch_companion_scan_attempt() {
     ALBUM_BATCH_COMPANION_SCAN_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
 }
 
+/// Tests that exercise the in-run companion finalization memo mutate
+/// process-global state (companion_batch_finalized_keys); they must serialize
+/// on this lock or parallel test threads reset each other mid-flight.
+#[cfg(test)]
+fn companion_batch_global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 fn reset_album_batch_companion_scan_attempts() {
     ALBUM_BATCH_COMPANION_SCAN_ATTEMPTS.with(|attempts| attempts.set(0));
@@ -15883,6 +15894,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn resolved_album_batch_companion_copy_defers_until_batch_finalization() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -15928,6 +15940,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn resolved_album_batch_companion_copy_runs_once_after_complete_and_skips_audio_sources() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16029,6 +16042,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn resolved_album_batch_companion_copy_does_not_mark_failed_scan_and_recovers() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16083,6 +16097,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn resolved_album_batch_companion_conflict_does_not_overwrite_or_mark_success() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16135,6 +16150,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn companion_batch_transient_cleanup_removes_only_owned_files() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16182,6 +16198,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn resolved_album_batch_companion_in_run_key_is_validated_against_copy_contract() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16242,6 +16259,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn companion_batch_in_run_finalization_key_is_scoped_to_dispatch_attempt() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16326,6 +16344,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn resolved_per_disc_cue_image_batch_companion_copy_is_batch_finalized() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16377,6 +16396,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn resolved_album_batch_companion_copy_runs_after_terminal_failure_finalization_signal() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16409,6 +16429,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn non_batch_companion_copy_keeps_immediate_per_item_behavior() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16438,6 +16459,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn resolved_album_batch_companion_copy_uses_silent_log_completion_signal() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");
@@ -16486,6 +16508,7 @@ mod companion_copy_hardening_tests {
 
     #[test]
     fn unresolved_album_batch_keeps_legacy_immediate_companion_copy() {
+        let _global_state = companion_batch_global_state_test_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let source_dir = temp.path().join("source");
         let dst = temp.path().join("published");

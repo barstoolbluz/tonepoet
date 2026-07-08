@@ -747,7 +747,11 @@ fn batch_identity_probe_from_track_metadata(metadata: &TrackMetadata) -> Option<
 }
 
 fn cue_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
-    let cue = crate::convert::cue_parser::parse_cue_file(path).ok()?;
+    // Same freshness precedence as the CUE materializer: the metadata editor
+    // writes corrections to the referenced image's embedded CUESHEET, and the
+    // identity that names the album folder must match what conversion emits.
+    let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_sidecar_cue(path)
+        .or_else(|| crate::convert::cue_parser::parse_cue_file(path).ok())?;
     Some(BatchIdentityProbe {
         album: cue.title,
         album_artist: cue.performer,
