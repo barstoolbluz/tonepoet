@@ -353,11 +353,12 @@ fn read_sidecar_cue(
     }
 
     // Queued sidecar CUE sources: the metadata editor writes corrections to
-    // the referenced image (flat tags plus a regenerated embedded CUESHEET);
-    // the sidecar text on disk goes stale. The sidecar stays authoritative for
-    // structure and image resolution, but when the image carries an embedded
-    // sheet that structurally matches, that sheet is authoritative for
-    // metadata — it is what the metadata overlay shows the user.
+    // the referenced image (flat tags plus a regenerated embedded CUESHEET)
+    // and, when sidecar write-back is eligible, to the associated `.cue` file.
+    // The sidecar remains authoritative for structure and image resolution.
+    // When the referenced image carries an embedded sheet that structurally
+    // matches, prefer that sheet for metadata so conversion observes saved
+    // editor corrections even if sidecar write-back was skipped or failed.
     if has_extension(&req.container, "cue") {
         if let Some(upgraded) = try_upgrade_sidecar_to_embedded_image_cue(&cue_input) {
             return Ok(upgraded);
@@ -4556,9 +4557,10 @@ mod sidecar_embedded_upgrade_tests {
         )
     }
 
-    /// The metadata editor writes corrections to the image's embedded
-    /// CUESHEET; a structurally matching embedded sheet must drive conversion
-    /// metadata instead of the stale sidecar text.
+    /// If sidecar write-back was skipped or failed, the metadata editor's
+    /// corrections can still live only in the image's embedded CUESHEET; a
+    /// structurally matching embedded sheet must then drive conversion metadata
+    /// instead of stale sidecar text.
     #[test]
     fn sidecar_resolution_prefers_matching_embedded_sheet_metadata() {
         if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {

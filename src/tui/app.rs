@@ -5036,6 +5036,12 @@ pub enum MetadataEditorWriteOutcome {
     Saved,
     Failed { reason: String },
     Skipped { reason: String },
+    SidecarCueSaved {
+        cue_path: std::path::PathBuf,
+        unchanged: bool,
+        rewritten_as_utf8: bool,
+    },
+    SidecarCueFailed { cue_path: std::path::PathBuf, reason: String },
 }
 
 /// Path-keyed result from the async metadata-editor save worker.
@@ -5058,11 +5064,43 @@ impl MetadataEditorWriteResult {
         Self { path, outcome: MetadataEditorWriteOutcome::Skipped { reason: reason.into() } }
     }
 
+    pub fn sidecar_cue_saved(
+        audio_path: std::path::PathBuf,
+        cue_path: std::path::PathBuf,
+        unchanged: bool,
+        rewritten_as_utf8: bool,
+    ) -> Self {
+        Self {
+            path: audio_path,
+            outcome: MetadataEditorWriteOutcome::SidecarCueSaved {
+                cue_path,
+                unchanged,
+                rewritten_as_utf8,
+            },
+        }
+    }
+
+    pub fn sidecar_cue_failed(
+        audio_path: std::path::PathBuf,
+        cue_path: std::path::PathBuf,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: audio_path,
+            outcome: MetadataEditorWriteOutcome::SidecarCueFailed {
+                cue_path,
+                reason: reason.into(),
+            },
+        }
+    }
+
     pub fn into_legacy_result(self) -> (std::path::PathBuf, Result<(), String>) {
         match self.outcome {
-            MetadataEditorWriteOutcome::Saved => (self.path, Ok(())),
+            MetadataEditorWriteOutcome::Saved
+            | MetadataEditorWriteOutcome::SidecarCueSaved { .. } => (self.path, Ok(())),
             MetadataEditorWriteOutcome::Failed { reason }
-            | MetadataEditorWriteOutcome::Skipped { reason } => (self.path, Err(reason)),
+            | MetadataEditorWriteOutcome::Skipped { reason }
+            | MetadataEditorWriteOutcome::SidecarCueFailed { reason, .. } => (self.path, Err(reason)),
         }
     }
 }
@@ -5074,6 +5112,10 @@ pub struct MetadataEditorWriteSummary {
     pub failed: usize,
     pub skipped: usize,
     pub ignored: usize,
+    pub sidecar_cue_saved: usize,
+    pub sidecar_cue_unchanged: usize,
+    pub sidecar_cue_failed: usize,
+    pub sidecar_cue_utf8_fallback: usize,
     /// True when save-result reduction leaves pending model changes behind.
     ///
     /// A save can return only successful path-keyed write results while the
@@ -5086,16 +5128,57 @@ pub struct MetadataEditorWriteSummary {
 }
 
 impl MetadataEditorWriteSummary {
+    fn sidecar_cue_saved_status(&self) -> String {
+        let suffix = if self.sidecar_cue_saved == 1 { "" } else { "s" };
+        if self.sidecar_cue_utf8_fallback == 0 {
+            format!("{} CUE sidecar{} updated", self.sidecar_cue_saved, suffix)
+        } else if self.sidecar_cue_utf8_fallback == self.sidecar_cue_saved {
+            format!(
+                "{} CUE sidecar{} updated as UTF-8",
+                self.sidecar_cue_saved,
+                suffix
+            )
+        } else {
+            format!(
+                "{} CUE sidecar{} updated ({} rewritten as UTF-8)",
+                self.sidecar_cue_saved,
+                suffix,
+                self.sidecar_cue_utf8_fallback
+            )
+        }
+    }
+
     pub fn all_saved(&self) -> bool {
-        self.failed == 0 && self.skipped == 0 && self.ignored == 0 && !self.remaining_dirty
+        self.failed == 0
+            && self.skipped == 0
+            && self.ignored == 0
+            && self.sidecar_cue_failed == 0
+            && !self.remaining_dirty
     }
 
     pub fn status_line(&self) -> String {
         if self.all_saved() {
+            let mut suffixes = Vec::new();
+            if self.sidecar_cue_saved > 0 {
+                suffixes.push(self.sidecar_cue_saved_status());
+            }
+            if self.sidecar_cue_unchanged > 0 {
+                suffixes.push(format!(
+                    "{} CUE sidecar{} already current",
+                    self.sidecar_cue_unchanged,
+                    if self.sidecar_cue_unchanged == 1 { "" } else { "s" }
+                ));
+            }
+            let suffix = if suffixes.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", suffixes.join(", "))
+            };
             return format!(
-                "Metadata saved ({} file{})",
+                "Metadata saved ({} file{}{})",
                 self.saved,
                 if self.saved == 1 { "" } else { "s" },
+                suffix,
             );
         }
 
@@ -5108,6 +5191,15 @@ impl MetadataEditorWriteSummary {
         }
         if self.ignored > 0 {
             parts.push(format!("{} stale/unknown ignored", self.ignored));
+        }
+        if self.sidecar_cue_saved > 0 {
+            parts.push(self.sidecar_cue_saved_status());
+        }
+        if self.sidecar_cue_unchanged > 0 {
+            parts.push(format!("{} CUE sidecar already current", self.sidecar_cue_unchanged));
+        }
+        if self.sidecar_cue_failed > 0 {
+            parts.push(format!("{} CUE sidecar stale", self.sidecar_cue_failed));
         }
         if self.remaining_dirty {
             parts.push("unsaved changes remain".to_string());
@@ -6934,46 +7026,87 @@ fn apply_write_results_to_tab(
     let mut summary = MetadataEditorWriteSummary::default();
     let mut saved_slots = std::collections::BTreeSet::new();
 
-    for result in results {
-        let Some(&idx) = path_to_index.get(&result.path) else {
-            summary.ignored = summary.ignored.saturating_add(1);
-            if summary.first_problem.is_none() {
-                summary.first_problem = Some(format!(
-                    "ignored stale save result for '{}'",
-                    result.path.display()
-                ));
+    for MetadataEditorWriteResult { path, outcome } in results {
+        match outcome {
+            MetadataEditorWriteOutcome::SidecarCueSaved {
+                cue_path: _,
+                unchanged,
+                rewritten_as_utf8,
+            } => {
+                if unchanged {
+                    summary.sidecar_cue_unchanged = summary.sidecar_cue_unchanged.saturating_add(1);
+                } else {
+                    summary.sidecar_cue_saved = summary.sidecar_cue_saved.saturating_add(1);
+                    if rewritten_as_utf8 {
+                        summary.sidecar_cue_utf8_fallback = summary
+                            .sidecar_cue_utf8_fallback
+                            .saturating_add(1);
+                    }
+                }
             }
-            continue;
-        };
-
-        match result.outcome {
+            MetadataEditorWriteOutcome::SidecarCueFailed { cue_path, reason } => {
+                summary.sidecar_cue_failed = summary.sidecar_cue_failed.saturating_add(1);
+                if summary.first_problem.is_none() {
+                    summary.first_problem = Some(format!("{}: {}", cue_path.display(), reason));
+                }
+                if let Some(&idx) = path_to_index.get(&path) {
+                    attach_write_issue(tab, idx, MetadataIssue::Write {
+                        path: cue_path,
+                        reason,
+                    });
+                }
+            }
             MetadataEditorWriteOutcome::Saved => {
+                let Some(&idx) = path_to_index.get(&path) else {
+                    summary.ignored = summary.ignored.saturating_add(1);
+                    if summary.first_problem.is_none() {
+                        summary.first_problem = Some(format!(
+                            "ignored stale save result for '{}'",
+                            path.display()
+                        ));
+                    }
+                    continue;
+                };
                 summary.saved = summary.saved.saturating_add(1);
-                summary.saved_paths.push(result.path.clone());
+                summary.saved_paths.push(path.clone());
                 saved_slots.insert(idx);
                 if let Some(file) = tab.technical_details.files.get_mut(idx) {
                     file.issues.retain(|issue| !matches!(issue, MetadataIssue::Write { .. }));
                 }
             }
             MetadataEditorWriteOutcome::Failed { reason } => {
+                let Some(&idx) = path_to_index.get(&path) else {
+                    summary.ignored = summary.ignored.saturating_add(1);
+                    if summary.first_problem.is_none() {
+                        summary.first_problem = Some(format!(
+                            "ignored stale save result for '{}'",
+                            path.display()
+                        ));
+                    }
+                    continue;
+                };
                 summary.failed = summary.failed.saturating_add(1);
                 if summary.first_problem.is_none() {
                     summary.first_problem = Some(reason.clone());
                 }
-                attach_write_issue(tab, idx, MetadataIssue::Write {
-                    path: result.path,
-                    reason,
-                });
+                attach_write_issue(tab, idx, MetadataIssue::Write { path, reason });
             }
             MetadataEditorWriteOutcome::Skipped { reason } => {
+                let Some(&idx) = path_to_index.get(&path) else {
+                    summary.ignored = summary.ignored.saturating_add(1);
+                    if summary.first_problem.is_none() {
+                        summary.first_problem = Some(format!(
+                            "ignored stale save result for '{}'",
+                            path.display()
+                        ));
+                    }
+                    continue;
+                };
                 summary.skipped = summary.skipped.saturating_add(1);
                 if summary.first_problem.is_none() {
                     summary.first_problem = Some(reason.clone());
                 }
-                attach_write_issue(tab, idx, MetadataIssue::SaveBlocked {
-                    path: result.path,
-                    reason,
-                });
+                attach_write_issue(tab, idx, MetadataIssue::SaveBlocked { path, reason });
             }
         }
     }

@@ -35,6 +35,84 @@ pub struct SingleImageInfo {
 /// reference, multiple TRACKs with INDEX 01 timestamps, and the
 /// referenced audio file exists. Returns `None` for track-per-file
 /// layouts or directories without CUE sheets.
+
+/// Locate the sidecar CUE that actually references `audio_path` as a
+/// single-image album.
+///
+/// Unlike `find_sidecar_cue`, this is deliberately not lexicographic. It parses
+/// every `.cue` in the audio file's directory, keeps only multi-track CUEs whose
+/// audio tracks all share one FILE reference, resolves that reference with the
+/// same extension-mismatch semantics used elsewhere in the TUI, and returns the
+/// CUE only when exactly one candidate resolves to the edited audio file. This
+/// prevents metadata save write-back from touching an unrelated or ambiguous CUE
+/// in a multi-CUE directory.
+pub fn find_sidecar_cue_for_audio_image(audio_path: &Path) -> Option<PathBuf> {
+    let parent = audio_path.parent()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    let mut cues: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("cue"))
+                .unwrap_or(false)
+        })
+        .collect();
+    cues.sort();
+
+    let matches: Vec<PathBuf> = cues
+        .into_iter()
+        .filter(|cue_path| {
+            let Ok(sheet) = parse_cue_file(cue_path) else {
+                return false;
+            };
+            if sheet.tracks.len() < 2
+                || !sheet.tracks.iter().all(|track| track.index01_frames.is_some())
+            {
+                return false;
+            }
+            let Some(first_file) = sheet.tracks.first().and_then(|track| track.file.as_deref()) else {
+                return false;
+            };
+            if !sheet
+                .tracks
+                .iter()
+                .all(|track| track.file.as_deref() == Some(first_file))
+            {
+                return false;
+            }
+            let Some(resolved) = crate::tui::accuraterip::resolve_cue_file_reference(parent, first_file) else {
+                return false;
+            };
+            paths_refer_to_same_file(&resolved, audio_path)
+        })
+        .collect();
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => absolutize_lossy(a) == absolutize_lossy(b),
+    }
+}
+
+fn absolutize_lossy(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
 pub fn detect_single_image(dir: &Path) -> Option<SingleImageInfo> {
     let cue_path = crate::tui::gnudb::find_cue_in_dir(dir)?;
     let sheet = parse_cue_file(&cue_path).ok()?;

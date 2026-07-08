@@ -5901,10 +5901,18 @@ pub(super) fn metadata_editor_save(
         }
         return;
     }
-    if let Err(reason) = regenerate_cuesheet_for_save(state) {
-        app.set_status(reason);
-        return;
-    }
+    let regenerated_cuesheet = match regenerate_cuesheet_for_save(state) {
+        Ok(regenerated) => regenerated,
+        Err(reason) => {
+            app.set_status(reason);
+            return;
+        }
+    };
+    let cue_sidecar_writeback = if regenerated_cuesheet {
+        cue_sidecar_writeback_plan_for_state(state)
+    } else {
+        None
+    };
     state.phase = super::app::MetadataEditorPhase::Saving;
     let (session_id, save_generation) = state.begin_write();
     let paths = state.active_surface().paths.clone();
@@ -5943,12 +5951,20 @@ pub(super) fn metadata_editor_save(
     let tx = tx.clone();
     tokio::spawn(async move {
         let results = tokio::task::spawn_blocking(move || {
-            crate::tui::probe::apply_audio_tag_changes_with_save_blocks(
+            let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks(
                 &paths,
                 &entries_snap,
                 &deleted,
                 &save_block_reasons,
-            )
+            );
+            if let Some(plan) = cue_sidecar_writeback {
+                if let Some(sidecar_result) =
+                    cue_sidecar_writeback_result_after_successful_image_save(plan, &results)
+                {
+                    results.push(sidecar_result);
+                }
+            }
+            results
         })
         .await
         .unwrap_or_else(|e| {
@@ -5969,6 +5985,74 @@ pub(super) fn metadata_editor_save(
             })
             .await;
     });
+}
+
+
+#[derive(Debug, Clone)]
+struct CueSidecarWritebackPlan {
+    audio_path: std::path::PathBuf,
+    cue_path: std::path::PathBuf,
+    replacement_cuesheet: String,
+}
+
+fn cue_sidecar_writeback_plan_for_state(
+    state: &super::app::MetadataEditorState,
+) -> Option<CueSidecarWritebackPlan> {
+    let surface = state.active_surface();
+    if surface.paths.len() != 1 {
+        return None;
+    }
+    let audio_path = surface.paths.first()?.clone();
+    let cue_path = super::cue_parser::find_sidecar_cue_for_audio_image(&audio_path)?;
+    let replacement_cuesheet = surface
+        .entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))?
+        .per_file_values
+        .first()?
+        .clone();
+    if replacement_cuesheet.trim().is_empty() {
+        return None;
+    }
+    Some(CueSidecarWritebackPlan {
+        audio_path,
+        cue_path,
+        replacement_cuesheet,
+    })
+}
+
+fn cue_sidecar_writeback_result_after_successful_image_save(
+    plan: CueSidecarWritebackPlan,
+    audio_results: &[crate::tui::app::MetadataEditorWriteResult],
+) -> Option<crate::tui::app::MetadataEditorWriteResult> {
+    let image_saved = audio_results.iter().any(|result| {
+        result.path.as_path() == plan.audio_path.as_path()
+            && matches!(&result.outcome, crate::tui::app::MetadataEditorWriteOutcome::Saved)
+    });
+    if !image_saved {
+        return None;
+    }
+
+    let result = match super::cue_parser::rewrite_cue_sidecar_metadata_from_cuesheet(
+        &plan.cue_path,
+        &plan.replacement_cuesheet,
+    ) {
+        Ok(outcome) => crate::tui::app::MetadataEditorWriteResult::sidecar_cue_saved(
+            plan.audio_path,
+            plan.cue_path,
+            matches!(&outcome, super::cue_parser::CueSidecarWritebackOutcome::Unchanged),
+            matches!(
+                &outcome,
+                super::cue_parser::CueSidecarWritebackOutcome::RewrittenUtf8Fallback { .. }
+            ),
+        ),
+        Err(reason) => crate::tui::app::MetadataEditorWriteResult::sidecar_cue_failed(
+            plan.audio_path,
+            plan.cue_path,
+            reason,
+        ),
+    };
+    Some(result)
 }
 
 fn plural(count: usize, singular: &str, plural: &str) -> String {
@@ -8146,17 +8230,46 @@ pub fn regenerate_cuesheet_for_save(
     Ok(true)
 }
 
+fn metadata_editor_sidecar_for_audio(audio_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(associated) = super::cue_parser::find_sidecar_cue_for_audio_image(audio_path) {
+        return Some(associated);
+    }
+
+    // Compatibility fallback for tests and edge cases where the audio image is
+    // not yet probe-resolvable: a single CUE beside the file is unambiguous,
+    // but two or more sidecars must not fall back to lexicographic selection.
+    let parent = audio_path.parent()?;
+    let cue_count = std::fs::read_dir(parent)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("cue"))
+                .unwrap_or(false)
+        })
+        .count();
+    if cue_count == 1 {
+        super::cue_parser::find_sidecar_cue(audio_path)
+    } else {
+        None
+    }
+}
+
+
 /// When the editor opens on a single audio file with no embedded
 /// CUESHEET tag but a sidecar `.cue` file alongside, parse the sidecar
 /// and inject a synthetic CUESHEET entry into `entries`. The synthetic
 /// entry has `per_file_originals[0]=""` (signalling "not yet on the
 /// file"), so the save loop will write a fresh embedded CUESHEET tag
-/// to the file at first save while leaving the sidecar `.cue` on disk
-/// untouched.
+/// to the file at first save. Save-time CUE sidecar write-back uses the
+/// same regenerated CUESHEET text, keeping both copies in sync.
 ///
 /// Skips silently when:
 /// - `entries` already contains a CUESHEET entry (embedded wins)
-/// - no sidecar `.cue` exists in the audio file's parent directory
+/// - no unambiguous sidecar `.cue` exists in the audio file's parent directory
 /// - the sidecar can't be read or parses to fewer than 2 tracks
 /// - the sidecar is track-by-track structured (different FILE per
 ///   TRACK) — those CUE timestamps reset per file and don't make
@@ -8171,20 +8284,20 @@ pub fn inject_sidecar_cuesheet_if_present(
     if already_has_cue {
         return;
     }
-    let Some(sidecar) = super::cue_parser::find_sidecar_cue(audio_path) else {
+    let Some(sidecar) = metadata_editor_sidecar_for_audio(audio_path) else {
         return;
     };
-    // Read raw bytes + lossy-decode UTF-8: many real-world `.cue` files
-    // are Shift_JIS / Windows-1252 (Japanese rips, foreign-character
-    // titles). String::from_utf8_lossy replaces invalid bytes with
-    // U+FFFD so we still surface track structure even when encoding
-    // is wrong; CUE keywords (TITLE/PERFORMER/INDEX/etc.) are pure
-    // ASCII so they parse correctly regardless. Mirrors the strategy
-    // in cue_parser::parse_cue_file.
+    // Decode with the same bounded, non-lossy CUE encoding detector used by
+    // conversion. This keeps non-UTF-8 sidecars (CP932/Shift-JIS, GBK, Big5,
+    // EUC-JP, Windows-1252, UTF-16 BOM) from entering the editor with U+FFFD
+    // substitutions; the save-time sidecar writer relies on that same decoded
+    // text as its metadata source of truth.
     let Ok(raw) = std::fs::read(&sidecar) else {
         return;
     };
-    let text = String::from_utf8_lossy(&raw).into_owned();
+    let Ok(text) = super::cue_parser::decode_cue_bytes_for_path(&raw, &sidecar) else {
+        return;
+    };
     let parsed = super::cue_parser::parse_cue(&text);
     if parsed.tracks.len() < 2 {
         return;
@@ -8489,8 +8602,8 @@ pub(super) fn reload_from_sidecar_cue(
         return Err(":tags-cue-sidecar requires a single-image rip (one file)".to_string());
     }
     let audio = &state.active_surface().paths[0];
-    let sidecar = super::cue_parser::find_sidecar_cue(audio)
-        .ok_or_else(|| ":tags-cue-sidecar: no .cue file found alongside audio".to_string())?;
+    let sidecar = metadata_editor_sidecar_for_audio(audio)
+        .ok_or_else(|| ":tags-cue-sidecar: no unambiguous .cue file found alongside audio".to_string())?;
     let raw = std::fs::read(&sidecar).map_err(|e| {
         format!(
             ":tags-cue-sidecar: failed to read {}: {}",
@@ -8498,7 +8611,13 @@ pub(super) fn reload_from_sidecar_cue(
             e
         )
     })?;
-    let text = String::from_utf8_lossy(&raw).into_owned();
+    let text = super::cue_parser::decode_cue_bytes_for_path(&raw, &sidecar).map_err(|e| {
+        format!(
+            ":tags-cue-sidecar: failed to decode {}: {}",
+            sidecar.display(),
+            e
+        )
+    })?;
     let parsed = super::cue_parser::parse_cue(&text);
     if parsed.tracks.len() < 2 {
         return Err(format!(
@@ -27306,6 +27425,208 @@ mod phase4_tests {
         p
     }
 
+    #[test]
+    fn cue_sidecar_writeback_plan_selects_associated_cue_in_multi_cue_directory() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let audio = td.path().join("album.flac");
+        let other_audio = td.path().join("other.flac");
+        std::fs::write(&audio, b"").expect("create edited audio image");
+        std::fs::write(&other_audio, b"").expect("create unrelated audio image");
+        let unrelated_cue = "TITLE \"Other\"\nFILE \"other.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"Other 1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Other 2\"\n    INDEX 01 01:00:00\n";
+        let associated_cue = "TITLE \"Album\"\nFILE \"album.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"Track 1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Track 2\"\n    INDEX 01 01:00:00\n";
+        write_sidecar(td.path(), "000-unrelated.cue", unrelated_cue);
+        let expected = write_sidecar(td.path(), "zzz-associated.cue", associated_cue);
+
+        let state = MetadataEditorState::for_files(
+            vec![audio],
+            vec![entry(
+                "CUESHEET",
+                ItemKey::Unknown("CUESHEET".into()),
+                &[associated_cue],
+                &[associated_cue],
+            )],
+            vec!["01".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("associated sidecar should be selected");
+        assert_eq!(plan.cue_path.as_path(), expected.as_path());
+    }
+
+
+    #[test]
+    fn cue_sidecar_writeback_summary_reports_utf8_fallback() {
+        let summary = crate::tui::app::MetadataEditorWriteSummary {
+            saved: 1,
+            sidecar_cue_saved: 1,
+            sidecar_cue_utf8_fallback: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            summary.status_line(),
+            "Metadata saved (1 file; 1 CUE sidecar updated as UTF-8)"
+        );
+    }
+
+    #[test]
+    fn cue_sidecar_writeback_save_path_regression_updates_sidecar_and_reduces_summary() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let audio = td.path().join("album.flac");
+        std::fs::write(&audio, b"").expect("create edited audio image");
+        let cue_path = write_sidecar(td.path(), "album.cue", CUE_TEMPLATE);
+
+        let mut state = MetadataEditorState::for_files(
+            vec![audio.clone()],
+            vec![
+                entry(
+                    "CUESHEET",
+                    ItemKey::Unknown("CUESHEET".into()),
+                    &[CUE_TEMPLATE],
+                    &[CUE_TEMPLATE],
+                ),
+                entry("ALBUM", ItemKey::AlbumTitle, &["New Album"], &["Old Album"]),
+                entry(
+                    "TITLE",
+                    ItemKey::TrackTitle,
+                    &["Track 1", "Edited Track 2", "Track 3"],
+                    &["Track 1", "Track 2", "Track 3"],
+                ),
+            ],
+            vec!["album.flac".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().dirty = true;
+
+        let regenerated = regenerate_cuesheet_for_save(&mut state)
+            .expect("dirty per-track values should regenerate CUESHEET");
+        assert!(regenerated);
+        let regenerated_cue = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET entry")
+            .per_file_values[0]
+            .clone();
+        assert!(regenerated_cue.contains("TITLE \"New Album\""));
+        assert!(regenerated_cue.contains("TITLE \"Edited Track 2\""));
+
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("successful regen should create a sidecar write-back plan");
+        assert_eq!(plan.audio_path.as_path(), audio.as_path());
+        assert_eq!(plan.cue_path.as_path(), cue_path.as_path());
+        assert_eq!(plan.replacement_cuesheet, regenerated_cue);
+
+        let (session_id, generation) = state.begin_write();
+        let image_result = crate::tui::app::MetadataEditorWriteResult::saved(audio.clone());
+        let sidecar_result = cue_sidecar_writeback_result_after_successful_image_save(
+            plan,
+            &[image_result.clone()],
+        )
+        .expect("image save success should be followed by sidecar write-back");
+        assert!(matches!(
+            &sidecar_result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved { unchanged: false, .. }
+        ));
+
+        let summary = state
+            .apply_write_results(session_id, generation, vec![image_result, sidecar_result])
+            .expect("matching save completion should reduce editor state");
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.sidecar_cue_saved, 1);
+        assert_eq!(summary.sidecar_cue_failed, 0);
+        assert!(summary.all_saved(), "unexpected save summary: {:?}", summary);
+        assert_eq!(
+            summary.status_line(),
+            "Metadata saved (1 file; 1 CUE sidecar updated)"
+        );
+        assert!(!state.active_surface().dirty);
+
+        let sidecar_text = std::fs::read_to_string(&cue_path).expect("read updated sidecar");
+        assert!(sidecar_text.contains("TITLE \"New Album\""));
+        assert!(sidecar_text.contains("TITLE \"Edited Track 2\""));
+        assert!(sidecar_text.contains("FILE \"album.flac\" FLAC"));
+        let cue_entry = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET entry after reduction");
+        assert_eq!(cue_entry.per_file_values, cue_entry.per_file_originals);
+    }
+
+    #[test]
+    fn cue_sidecar_writeback_save_path_regression_reports_read_only_sidecar_as_stale() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let audio = td.path().join("album.flac");
+        std::fs::write(&audio, b"").expect("create edited audio image");
+        let cue_path = write_sidecar(td.path(), "album.cue", CUE_TEMPLATE);
+        let original_sidecar = std::fs::read(&cue_path).expect("read original sidecar");
+
+        let mut state = MetadataEditorState::for_files(
+            vec![audio.clone()],
+            vec![
+                entry(
+                    "CUESHEET",
+                    ItemKey::Unknown("CUESHEET".into()),
+                    &[CUE_TEMPLATE],
+                    &[CUE_TEMPLATE],
+                ),
+                entry(
+                    "TITLE",
+                    ItemKey::TrackTitle,
+                    &["Track 1", "Edited Track 2", "Track 3"],
+                    &["Track 1", "Track 2", "Track 3"],
+                ),
+            ],
+            vec!["album.flac".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().dirty = true;
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("regen succeeds"));
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("successful regen should create a sidecar write-back plan");
+
+        let mut permissions = std::fs::metadata(&cue_path).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&cue_path, permissions).expect("mark sidecar read-only");
+
+        let (session_id, generation) = state.begin_write();
+        let image_result = crate::tui::app::MetadataEditorWriteResult::saved(audio.clone());
+        let sidecar_result = cue_sidecar_writeback_result_after_successful_image_save(
+            plan,
+            &[image_result.clone()],
+        )
+        .expect("image save success should still produce a sidecar status result");
+        assert!(matches!(
+            &sidecar_result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::SidecarCueFailed { reason, .. }
+                if reason.contains("read-only")
+        ));
+
+        let summary = state
+            .apply_write_results(session_id, generation, vec![image_result, sidecar_result])
+            .expect("matching save completion should reduce editor state");
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.sidecar_cue_failed, 1);
+        assert!(!summary.all_saved());
+        let status = summary.status_line();
+        assert!(status.contains("1 saved"), "unexpected status: {status}");
+        assert!(status.contains("1 CUE sidecar stale"), "unexpected status: {status}");
+        assert!(status.contains("read-only"), "unexpected status: {status}");
+        assert_eq!(
+            std::fs::read(&cue_path).expect("read unchanged read-only sidecar"),
+            original_sidecar,
+            "read-only sidecar must be left byte-identical"
+        );
+        assert!(!state.active_surface().dirty, "image save success should reduce editor dirt even when sidecar stays stale");
+
+        let mut permissions = std::fs::metadata(&cue_path).expect("metadata").permissions();
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&cue_path, permissions);
+    }
+
     /// Multi-track single-image CUE used as the well-formed input.
     const SIDECAR_3_TRACK_SINGLE_IMAGE: &str = "TITLE \"Album\"\n\
          FILE \"image.flac\" FLAC\n\
@@ -27624,7 +27945,10 @@ mod phase4_tests {
         let mut state = state_for_sidecar_test(td.path(), vec![]);
         let result = reload_from_sidecar_cue(&mut state);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no .cue"));
+        assert!(
+            result.unwrap_err().contains("no unambiguous .cue"),
+            "locator reports the unambiguous-association contract"
+        );
     }
 
     #[test]

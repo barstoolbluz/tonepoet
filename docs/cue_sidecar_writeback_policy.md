@@ -1,0 +1,15 @@
+# CUE sidecar write-back policy
+
+Date: 2026-07-08
+
+Metadata-editor saves for single-image CUE albums now update the associated sidecar `.cue` after the audio image has saved successfully. The associated sidecar is selected by parsing every `.cue` next to the edited image and resolving its single shared `FILE` reference back to that image; lexicographic first-match selection is not used for write-back.
+
+The write-back is intentionally byte-span targeted for ASCII-compatible source encodings that do not carry an inline syntax BOM: UTF-8 without BOM, CP932/Shift-JIS, EUC-JP, GBK, Big5, and Windows-1252. The decoded text is used only to identify editable CUE metadata commands and scopes. The writer then edits the original byte buffer by replacing only the value span for explicit metadata fields carried by the regenerated embedded CUESHEET: album `TITLE`, `PERFORMER`, `SONGWRITER`, `REM DATE`/`REM YEAR`, `REM GENRE`, and track `TITLE`, `PERFORMER`, `SONGWRITER`. `CATALOG`, `ISRC`, `FILE`, `TRACK`, `INDEX`, `PREGAP`, `FLAGS`, unknown `REM` lines, comments, line endings, indentation, and unrecognized lines remain byte-identical. Missing editable metadata lines may be inserted into the relevant album or track scope when the regenerated CUESHEET has explicit values for them.
+
+UTF-8 BOM sidecars use the line-preserved text rewrite path and are re-encoded with exactly one BOM at byte 0. This avoids moving the BOM onto the first logical CUE command when album metadata must be inserted before an initial `FILE` or `TRACK` line.
+
+CUE quoted strings do not have a portable escape mechanism for embedded double quotes. The writer therefore does not rewrite quotes as apostrophes or backslash escapes. Replacement CUESHEET metadata with embedded or malformed double quotes in `TITLE`, `PERFORMER`, `SONGWRITER`, or quoted `REM DATE`/`REM YEAR`/`REM GENRE` is rejected with a clear stale-sidecar status, leaving the original sidecar unchanged. Metadata containing line breaks is also rejected for sidecar write-back because it cannot be represented as a single CUE metadata line. The audio-image tag save still succeeds in these cases.
+
+Encoding policy: decode with the existing bounded CUE detector. Preserve the source encoding on write when the corrected text is representable. For ASCII-compatible legacy encodings, the preserved-encoding path encodes only new metadata values and leaves all untouched raw lines as original bytes. UTF-8 BOM and UTF-16 BOM sidecars use the conservative whole-text re-encode path so byte-order marks stay at the beginning of the file. If a legacy encoding cannot represent the corrected metadata, write UTF-8 without BOM rather than replacing characters lossy; this fallback is explicit and reported as such. Saves are deterministic: an immediate second save is a no-op.
+
+Safety policy: never truncate in place. The writer creates a same-directory temporary file with `create_new`, writes and syncs it, then renames it over the original. Read-only sidecars are detected before writing and reported as a sidecar-stale status while leaving the audio-image tag save successful.
