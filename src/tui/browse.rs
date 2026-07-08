@@ -4391,7 +4391,7 @@ impl BrowseState {
             return false;
         };
 
-        if let Some(arc) = self.archive.as_ref() {
+        let in_directory_context = if let Some(arc) = self.archive.as_ref() {
             let expected_parent = if arc.inner_path.is_empty() {
                 arc.listing.archive_path.clone()
             } else {
@@ -4400,7 +4400,17 @@ impl BrowseState {
             parent == expected_parent.as_path()
         } else {
             parent == self.current_dir.as_path()
+        };
+        if in_directory_context {
+            return true;
         }
+
+        // Recursive search replaces `entries` with hits from nested
+        // subdirectories; a mark the user made on a listed entry is visible
+        // and deliberate, so it stays actionable even though its parent is
+        // not the current directory. Stale cross-directory marks are never
+        // in `entries`, so this keeps the incident fix intact.
+        self.entries.iter().any(|entry| entry.path.as_path() == path)
     }
 
     /// Return only marks that belong to the directory context currently shown
@@ -16516,6 +16526,42 @@ mod selection_behavior_tests {
         state.multi_selected = vec![root_child.clone(), nested_child];
 
         assert_eq!(state.multi_selected_in_current_directory(), vec![root_child]);
+    }
+
+    #[test]
+    fn marks_on_visible_recursive_search_hits_stay_actionable() {
+        // Recursive search lists entries from nested subdirectories; marking
+        // one is a visible, deliberate act and must stay actionable even
+        // though the hit's parent is not the current directory.
+        let mut state = selection_state();
+        let nested_hit = PathBuf::from("/tmp/nested/deep.flac");
+        state.entries.push(BrowseEntry::new(
+            nested_hit.clone(),
+            "deep.flac".to_string(),
+            EntryKind::OtherFile,
+            0,
+            None,
+        ));
+        let truly_stale = PathBuf::from("/somewhere-else/old.flac");
+        state.multi_selected = vec![nested_hit.clone(), truly_stale];
+
+        let scoped = state.scoped_multi_selected_in_current_directory();
+        assert_eq!(scoped.paths, vec![nested_hit]);
+        assert_eq!(scoped.dropped_stale_count, 1);
+    }
+
+    #[test]
+    fn same_directory_marks_stay_actionable_when_not_currently_listed() {
+        // A filter or search may hide a marked same-directory entry from the
+        // visible list; the mark still belongs to this directory and must
+        // stay actionable (pre-existing behavior, preserved).
+        let mut state = selection_state();
+        let hidden_same_dir = PathBuf::from("/tmp/filtered-out.flac");
+        state.multi_selected = vec![hidden_same_dir.clone()];
+
+        let scoped = state.scoped_multi_selected_in_current_directory();
+        assert_eq!(scoped.paths, vec![hidden_same_dir]);
+        assert_eq!(scoped.dropped_stale_count, 0);
     }
 
     #[test]
