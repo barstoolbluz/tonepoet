@@ -11053,7 +11053,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     }
 
-    let mut paths: Vec<std::path::PathBuf> = crate::convert::queue_expansion::expand_paths_to_audio(&sel)
+    let mut paths: Vec<std::path::PathBuf> = crate::convert::queue_expansion::expand_paths_to_all_audio(&sel)
         .into_iter()
         .filter(|p| {
             matches!(

@@ -99,12 +99,76 @@ pub fn count_audio_files_bounded(paths: &[PathBuf], limit: usize) -> usize {
     count
 }
 
-/// Expands files/directories to queueable audio paths using the historical
-/// `Vec<PathBuf>` API. Keep this wrapper for non-queue call sites (metadata
-/// editor, AccurateRip, context menu actions, and other tree-local utilities)
-/// that only need paths and should not own conversion policy metadata.
+/// Expands files/directories to queueable paths using the historical
+/// `Vec<PathBuf>` API, applying conversion-queue CUE semantics: a
+/// split-source CUE is the queueable path and its referenced audio (for a
+/// single-image album, the image file itself) is suppressed. Only queue
+/// construction should use this.
 pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
     expand_paths_to_audio_with_metadata(paths).into_paths()
+}
+
+/// Expands files/directories to every audio file they contain, with no CUE
+/// suppression. This is the collector for metadata and analysis surfaces
+/// (metadata editor, tag lookups, verification, comparison): tags and audio
+/// data live in the audio files, so a single-image album must yield its
+/// image file here even though queue expansion would suppress it in favor of
+/// the CUE. Deterministic: per-level sorted walk order (files before
+/// subdirectories), deduplicated by canonical path, symlinks skipped
+/// (matching the queue walk policy).
+pub fn expand_paths_to_all_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        collect_all_audio(path, &mut out, &mut seen);
+    }
+    out
+}
+
+fn collect_all_audio(path: &Path, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) {
+    if path.is_dir() {
+        let Ok(read) = fs::read_dir(path) else {
+            return;
+        };
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for entry in read.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let child = entry.path();
+            if file_type.is_dir() {
+                dirs.push(child);
+            } else {
+                files.push(child);
+            }
+        }
+        dirs.sort();
+        files.sort();
+        for file in files {
+            push_audio_file(file, out, seen);
+        }
+        for dir in dirs {
+            collect_all_audio(&dir, out, seen);
+        }
+    } else {
+        push_audio_file(path.to_path_buf(), out, seen);
+    }
+}
+
+fn push_audio_file(path: PathBuf, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) {
+    if !matches!(
+        crate::convert::classify::classify_file(&path),
+        crate::convert::classify::EntryKind::AudioFile(_)
+    ) {
+        return;
+    }
+    if seen.insert(queue_path_key(&path)) {
+        out.push(path);
+    }
 }
 
 /// Expands files/directories for conversion queue construction and carries
@@ -1720,5 +1784,82 @@ mod limited_queue_expansion_tests {
         assert_eq!(expanded.paths.len(), 1);
         assert!(path_list_contains(&expanded.paths, &real));
         assert!(path_list_contains(&expanded.paths, &link));
+    }
+}
+
+#[cfg(test)]
+mod all_audio_expansion_tests {
+    use super::*;
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"fixture").expect("fixture");
+    }
+
+    fn names(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The regression: a single-image CUE album must yield its image file for
+    /// metadata/analysis surfaces even though queue expansion suppresses it
+    /// in favor of the CUE (Edit Metadata and :tags-mb reported "no audio
+    /// files" on such albums).
+    #[test]
+    fn single_image_album_yields_image_for_metadata_and_cue_for_queue() {
+        let td = tempfile::tempdir().expect("tempdir");
+        touch(&td.path().join("album.flac"));
+        std::fs::write(
+            td.path().join("album.cue"),
+            "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("cue");
+
+        let metadata_view = expand_paths_to_all_audio(&[td.path().to_path_buf()]);
+        assert_eq!(names(&metadata_view), vec!["album.flac"]);
+
+        let queue_view = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert_eq!(names(&queue_view), vec!["album.cue"]);
+    }
+
+    /// One-to-one per-track CUEs: both views agree on the audio files.
+    #[test]
+    fn per_track_cue_pairs_yield_audio_in_both_views() {
+        let td = tempfile::tempdir().expect("tempdir");
+        for n in ["01 - One", "02 - Two"] {
+            touch(&td.path().join(format!("{n}.flac")));
+            std::fs::write(
+                td.path().join(format!("{n}.cue")),
+                format!("FILE \"{n}.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n"),
+            )
+            .expect("cue");
+        }
+
+        let metadata_view = expand_paths_to_all_audio(&[td.path().to_path_buf()]);
+        assert_eq!(names(&metadata_view), vec!["01 - One.flac", "02 - Two.flac"]);
+
+        let queue_view = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        assert_eq!(names(&queue_view), vec!["01 - One.flac", "02 - Two.flac"]);
+    }
+
+    /// The all-audio walk stays deterministic, deduplicated, and never
+    /// returns non-audio files.
+    #[test]
+    fn all_audio_walk_is_sorted_deduplicated_and_audio_only() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join("sub")).expect("sub");
+        touch(&td.path().join("sub").join("b.flac"));
+        touch(&td.path().join("a.flac"));
+        touch(&td.path().join("notes.txt"));
+        touch(&td.path().join("cover.jpg"));
+
+        let file_arg = td.path().join("a.flac");
+        let out = expand_paths_to_all_audio(&[
+            td.path().to_path_buf(),
+            file_arg.clone(),
+            file_arg,
+        ]);
+        assert_eq!(names(&out), vec!["a.flac", "b.flac"]);
     }
 }

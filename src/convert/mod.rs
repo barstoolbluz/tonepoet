@@ -34,7 +34,8 @@ pub use formats::{
 pub use classify::{classify_file, EntryKind};
 pub use cue_parser::{parse_cue, parse_cue_file, CueSheet, CueTrack};
 pub use queue_expansion::{
-    count_audio_files_bounded, cue_sidecar_override_for_commit_path, expand_paths_to_audio,
+    count_audio_files_bounded, cue_sidecar_override_for_commit_path, expand_paths_to_all_audio,
+    expand_paths_to_audio,
     expand_paths_to_audio_with_metadata, expand_paths_to_audio_with_metadata_limited,
     QueueExpansionLimitedError, QueueExpansionResult,
 };

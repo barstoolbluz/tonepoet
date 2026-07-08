@@ -1540,7 +1540,7 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
     // Collect audio file paths, group by disc, query GNUDB.
     let paths = super::command::collect_selection_for_file_ops(app);
     let mut audio_paths: Vec<std::path::PathBuf> =
-        crate::convert::queue_expansion::expand_paths_to_audio(&paths)
+        crate::convert::queue_expansion::expand_paths_to_all_audio(&paths)
             .into_iter()
             .filter(|p| {
                 matches!(

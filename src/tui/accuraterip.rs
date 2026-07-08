@@ -1484,7 +1484,7 @@ pub async fn batch_verify(
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) -> Box<ArBatchResult> {
     // Discover all audio files recursively.
-    let mut all_audio = super::browse::expand_paths_to_audio(&[scan_dir.to_path_buf()]);
+    let mut all_audio = crate::convert::queue_expansion::expand_paths_to_all_audio(&[scan_dir.to_path_buf()]);
     super::probe::sort_paths_by_track(&mut all_audio);
 
     if all_audio.is_empty() {

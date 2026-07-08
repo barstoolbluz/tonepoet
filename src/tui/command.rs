@@ -88,15 +88,9 @@ fn current_bulk_guard_paths(app: &AppState) -> Vec<PathBuf> {
     }
 }
 fn expand_audio_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
-    crate::convert::queue_expansion::expand_paths_to_audio(paths)
-        .into_iter()
-        .filter(|p| {
-            matches!(
-                crate::convert::classify::classify_file(p),
-                crate::convert::classify::EntryKind::AudioFile(_)
-            )
-        })
-        .collect()
+    // Metadata/analysis semantics: every audio file, including single-image
+    // CUE carriers that queue expansion would suppress in favor of the CUE.
+    crate::convert::queue_expansion::expand_paths_to_all_audio(paths)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2375,7 +2369,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
                 AppScreen::Browse => {
                     let sel = collect_selection_for_file_ops(app);
-                    crate::convert::queue_expansion::expand_paths_to_audio(&sel)
+                    crate::convert::queue_expansion::expand_paths_to_all_audio(&sel)
                         .into_iter()
                         .filter(|p| {
                             matches!(
@@ -2476,7 +2470,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
                 AppScreen::Browse => {
                     let sel = collect_selection_for_file_ops(app);
-                    crate::convert::queue_expansion::expand_paths_to_audio(&sel)
+                    crate::convert::queue_expansion::expand_paths_to_all_audio(&sel)
                         .into_iter()
                         .filter(|p| {
                             matches!(
@@ -3088,6 +3082,48 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
 
+            // Single-image CUE albums: one audio file carries every track.
+            // Mirror the GNUDB path — compute the TOC from the CUE's own
+            // track boundaries and repeat the image path per track so
+            // per-track results map onto editor rows backed by the image.
+            if paths.len() == 1 {
+                if let Some(info) = super::cue_parser::detect_single_image(&dir) {
+                    // Canonicalize both sides: the CUE resolver and the audio
+                    // walk can produce differently-normalized spellings of the
+                    // same file.
+                    let same_image = info.audio_path == paths[0]
+                        || match (info.audio_path.canonicalize(), paths[0].canonicalize()) {
+                            (Ok(a), Ok(b)) => a == b,
+                            _ => false,
+                        };
+                    if same_image && !info.track_boundaries.is_empty() {
+                        let samples_per_frame = (info.sample_rate / 75).max(1) as u64;
+                        let mut sectors = Vec::with_capacity(info.track_boundaries.len() + 1);
+                        let mut frame: u64 = 150;
+                        for &(_, count) in &info.track_boundaries {
+                            sectors.push(frame as u32);
+                            frame += count / samples_per_frame;
+                        }
+                        sectors.push(frame as u32);
+                        let toc_string = match super::musicbrainz::build_mb_toc(&sectors) {
+                            Some(s) => s,
+                            None => {
+                                app.set_status(":tags-mb: TOC too short".to_string());
+                                return;
+                            }
+                        };
+                        let image_paths: Vec<std::path::PathBuf> = (0..info.track_boundaries.len())
+                            .map(|_| info.audio_path.clone())
+                            .collect();
+                        spawn_tags_mb_toc_lookup(
+                            app, tx, sectors, toc_string, image_paths,
+                            /* editor_park */ false, /* fallback_seed */ None,
+                        );
+                        return;
+                    }
+                }
+            }
+
             let sectors: Vec<u32> = match super::accuraterip::find_toc_offsets(&dir) {
                 Some(s) => s,
                 None => match super::accuraterip::collect_sample_counts(&paths) {
@@ -3124,7 +3160,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
                 AppScreen::Browse => {
                     let sel = collect_selection_for_file_ops(app);
-                    crate::convert::queue_expansion::expand_paths_to_audio(&sel)
+                    crate::convert::queue_expansion::expand_paths_to_all_audio(&sel)
                         .into_iter()
                         .filter(|p| {
                             matches!(
@@ -3294,7 +3330,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(":mark only works on the browse screen");
             } else {
                 let sel = collect_selection_for_file_ops(app);
-                let mut paths: Vec<std::path::PathBuf> = crate::convert::queue_expansion::expand_paths_to_audio(&sel)
+                let mut paths: Vec<std::path::PathBuf> = crate::convert::queue_expansion::expand_paths_to_all_audio(&sel)
                     .into_iter()
                     .filter(|p| {
                         matches!(
@@ -3329,7 +3365,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             } else {
                 let sel = collect_selection_for_file_ops(app);
                 let mut targets: Vec<std::path::PathBuf> =
-                    crate::convert::queue_expansion::expand_paths_to_audio(&sel)
+                    crate::convert::queue_expansion::expand_paths_to_all_audio(&sel)
                         .into_iter()
                         .filter(|p| {
                             matches!(
@@ -3570,7 +3606,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
                 AppScreen::Browse => {
                     let sel = collect_selection_for_file_ops(app);
-                    crate::convert::queue_expansion::expand_paths_to_audio(&sel)
+                    crate::convert::queue_expansion::expand_paths_to_all_audio(&sel)
                         .into_iter()
                         .filter(|p| {
                             matches!(
