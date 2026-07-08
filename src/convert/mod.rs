@@ -7,12 +7,16 @@
 //! - 7z archive extraction and processing
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+pub mod classify;
+pub mod cue_parser;
 pub mod formats;
+pub mod queue_expansion;
+pub mod sacd;
 pub mod labels;
 pub mod metadata;
 pub mod pipeline;
@@ -26,6 +30,13 @@ pub mod wizard_integration;
 pub use formats::{
     AacProfile, AudioFormat, ConversionOptions, FileFormat, FormatDetector, Mp3BitrateMode,
     QualitySettings, WavPackMode,
+};
+pub use classify::{classify_file, EntryKind};
+pub use cue_parser::{parse_cue, parse_cue_file, CueSheet, CueTrack};
+pub use queue_expansion::{
+    count_audio_files_bounded, cue_sidecar_override_for_commit_path, expand_paths_to_audio,
+    expand_paths_to_audio_with_metadata, expand_paths_to_audio_with_metadata_limited,
+    QueueExpansionLimitedError, QueueExpansionResult,
 };
 pub use labels::{detect_pressing_info, LabelInfo};
 pub use metadata::{extract_metadata_from_flac, extract_year_from_flac_files, FlacMetadata};
@@ -121,254 +132,6 @@ impl Default for ConversionConfig {
     }
 }
 
-#[derive(Default)]
-struct DirectoryQueuePlan {
-    cue_sheets: Vec<PathBuf>,
-    audio_files: Vec<PathBuf>,
-    other_queueable: Vec<PathBuf>,
-}
-
-impl DirectoryQueuePlan {
-    fn add_detected(&mut self, path: PathBuf, format: FileFormat) {
-        match format {
-            FileFormat::CueSheet => push_unique_path(&mut self.cue_sheets, path),
-            FileFormat::Audio(_) => push_unique_path(&mut self.audio_files, path),
-            FileFormat::Archive => push_unique_path(&mut self.other_queueable, path),
-        }
-    }
-
-    fn into_queue_paths(self) -> Vec<PathBuf> {
-        let referenced_audio = cue_referenced_audio_paths(&self.cue_sheets);
-        let mut result = Vec::new();
-
-        for cue in self.cue_sheets {
-            push_unique_path(&mut result, cue);
-        }
-        for audio in self.audio_files {
-            if !path_list_contains(&referenced_audio, &audio) {
-                push_unique_path(&mut result, audio);
-            }
-        }
-        for path in self.other_queueable {
-            push_unique_path(&mut result, path);
-        }
-
-        result
-    }
-}
-
-fn cue_referenced_audio_paths(cue_paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut referenced = Vec::new();
-    for cue_path in cue_paths {
-        match materializable_cue_referenced_audio_paths(cue_path) {
-            Ok(paths) => {
-                for path in paths {
-                    push_unique_path(&mut referenced, path);
-                }
-            }
-            Err(err) => {
-                log::warn!(
-                    "CUE {} is not materializer-compatible; not suppressing any referenced audio files: {}",
-                    cue_path.display(),
-                    err
-                );
-            }
-        }
-    }
-    referenced
-}
-
-fn materializable_cue_referenced_audio_paths(cue_path: &Path) -> Result<Vec<PathBuf>, String> {
-    let sheet = crate::tui::cue_parser::parse_cue_file(cue_path)
-        .map_err(|err| format!("failed to parse CUE: {err}"))?;
-    let parent = cue_path
-        .parent()
-        .ok_or_else(|| "CUE path has no parent directory".to_string())?;
-
-    if sheet.tracks.is_empty() {
-        return Err("CUE sheet has no tracks".to_string());
-    }
-
-    let mut referenced = Vec::new();
-    let mut resolved_tracks = Vec::with_capacity(sheet.tracks.len());
-    for track in &sheet.tracks {
-        let index01 = track
-            .index01_frames
-            .ok_or_else(|| format!("track {} has no INDEX 01", track.number))?;
-        let file_ref = track
-            .file
-            .as_deref()
-            .ok_or_else(|| format!("track {} has no FILE reference", track.number))?;
-
-        let resolved = match resolve_cue_file_reference(parent, file_ref) {
-            CueReferenceResolution::Resolved(path) => path,
-            CueReferenceResolution::Missing => {
-                return Err(format!(
-                    "track {} FILE reference {:?} was not found",
-                    track.number, file_ref
-                ));
-            }
-            CueReferenceResolution::Ambiguous(candidates) => {
-                return Err(format!(
-                    "track {} FILE reference {:?} was ambiguous: {}",
-                    track.number,
-                    file_ref,
-                    format_candidate_paths_for_log(&candidates)
-                ));
-            }
-        };
-
-        if !matches!(FormatDetector::detect(&resolved), Ok(FileFormat::Audio(_))) {
-            return Err(format!(
-                "track {} FILE reference {:?} did not resolve to a supported audio file: {}",
-                track.number,
-                file_ref,
-                resolved.display()
-            ));
-        }
-
-        push_unique_path(&mut referenced, resolved.clone());
-        resolved_tracks.push((track.number, resolved, index01));
-    }
-
-    validate_queue_cue_index_order(&resolved_tracks)?;
-    Ok(referenced)
-}
-
-fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Result<(), String> {
-    let mut previous_by_file: BTreeMap<String, (u32, u32)> = BTreeMap::new();
-    for (track_number, path, index01) in resolved_tracks {
-        let key = deterministic_path_sort_key(path);
-        if let Some((previous_track, previous_index)) = previous_by_file.get(&key) {
-            if index01 <= previous_index {
-                return Err(format!(
-                    "non-increasing INDEX 01 for track {} in {}; previous track {} was at frame {}",
-                    track_number,
-                    path.display(),
-                    previous_track,
-                    previous_index
-                ));
-            }
-        }
-        previous_by_file.insert(key, (*track_number, *index01));
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-enum CueReferenceResolution {
-    Resolved(PathBuf),
-    Missing,
-    Ambiguous(Vec<PathBuf>),
-}
-
-fn resolve_cue_file_reference(parent: &Path, file_ref: &str) -> CueReferenceResolution {
-    let normalized_ref = file_ref.replace('\\', &std::path::MAIN_SEPARATOR.to_string());
-    let raw_path = PathBuf::from(&normalized_ref);
-
-    if raw_path.is_absolute() && raw_path.is_file() {
-        return CueReferenceResolution::Resolved(raw_path);
-    }
-
-    let direct = parent.join(&raw_path);
-    if direct.is_file() {
-        return CueReferenceResolution::Resolved(direct);
-    }
-
-    let wanted_name = raw_path.file_name().and_then(|value| value.to_str());
-    let wanted_stem = raw_path.file_stem().and_then(|value| value.to_str());
-    let fallback_search_dir = cue_reference_fallback_search_dir(parent, &raw_path);
-
-    if let Some(wanted) = wanted_name {
-        let name_matches = collect_audio_reference_candidates(&fallback_search_dir, |path| {
-            path.file_name()
-                .and_then(|value| value.to_str())
-                .map(|value| value.eq_ignore_ascii_case(wanted))
-                .unwrap_or(false)
-        });
-        match unique_queue_reference_candidate(name_matches) {
-            CueReferenceResolution::Missing => {}
-            other => return other,
-        }
-    }
-
-    if let Some(wanted) = wanted_stem {
-        let stem_matches = collect_audio_reference_candidates(&fallback_search_dir, |path| {
-            path.file_stem()
-                .and_then(|value| value.to_str())
-                .map(|value| value.eq_ignore_ascii_case(wanted))
-                .unwrap_or(false)
-        });
-        return unique_queue_reference_candidate(stem_matches);
-    }
-
-    CueReferenceResolution::Missing
-}
-
-
-fn cue_reference_fallback_search_dir(parent: &Path, raw_path: &Path) -> PathBuf {
-    raw_path
-        .parent()
-        .filter(|component| !component.as_os_str().is_empty())
-        .map(|component| parent.join(component))
-        .unwrap_or_else(|| parent.to_path_buf())
-}
-
-fn collect_audio_reference_candidates(
-    parent: &Path,
-    matches_reference: impl Fn(&Path) -> bool,
-) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return Vec::new();
-    };
-
-    let mut candidates: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && matches!(FormatDetector::detect(path), Ok(FileFormat::Audio(_)))
-                && matches_reference(path)
-        })
-        .collect();
-    candidates.sort_by_key(|path| deterministic_path_sort_key(path));
-    candidates.dedup_by(|left, right| same_path_for_queue(left, right));
-    candidates
-}
-
-fn unique_queue_reference_candidate(candidates: Vec<PathBuf>) -> CueReferenceResolution {
-    match candidates.len() {
-        0 => CueReferenceResolution::Missing,
-        1 => CueReferenceResolution::Resolved(candidates.into_iter().next().unwrap()),
-        _ => CueReferenceResolution::Ambiguous(candidates),
-    }
-}
-
-fn deterministic_path_sort_key(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase()
-}
-
-fn format_candidate_paths_for_log(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if !path_list_contains(paths, &candidate) {
-        paths.push(candidate);
-    }
-}
-
-fn path_list_contains(paths: &[PathBuf], candidate: &Path) -> bool {
-    paths
-        .iter()
-        .any(|existing| same_path_for_queue(existing, candidate))
-}
 
 pub(crate) fn queue_identity_path(path: &Path) -> PathBuf {
     let identity = if path.is_dir() {
@@ -503,29 +266,21 @@ impl ConversionManager {
 
     /// Scan a directory for queueable conversion inputs.
     ///
-    /// Build a complete directory plan before returning paths: CUE sheets are
-    /// album control files, so any audio file referenced by any CUE in the scan
-    /// tree is suppressed from the standalone file list. This keeps directory
-    /// conversion idempotent for parent-CUE/child-audio layouts, per-track CUEs,
-    /// single-image CUEs, and relative references such as `../disc.flac`.
+    /// Keep directory admission as a thin compatibility adapter over the
+    /// canonical conversion-domain queue expansion planner. This avoids a
+    /// second CUE/queue implementation inside `convert::mod` and keeps CLI,
+    /// TUI, and manager directory scans on one set of semantics.
     fn scan_directory(&self, dir: &Path) -> ConversionResult<Vec<PathBuf>> {
-        let mut plan = DirectoryQueuePlan::default();
-
-        for entry in walkdir::WalkDir::new(dir)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if let Ok(format) = FormatDetector::detect(path) {
-                plan.add_detected(path.to_path_buf(), format);
-            }
+        if !dir.is_dir() {
+            return Err(ConversionError::ValidationError(format!(
+                "not a directory: {}",
+                dir.display()
+            )));
         }
 
-        Ok(plan.into_queue_paths())
+        Ok(crate::convert::queue_expansion::expand_paths_to_audio(&[
+            dir.to_path_buf(),
+        ]))
     }
 
     /// Start processing the conversion queue
@@ -1932,145 +1687,46 @@ mod per_track_epoch_tests {
     }
 
     #[test]
-    fn scan_directory_suppresses_cue_referenced_child_audio() {
+    fn scan_directory_delegates_to_canonical_queue_expansion() {
         let td = tempfile::tempdir().expect("tempdir");
-        let subdir = td.path().join("disc");
-        std::fs::create_dir(&subdir).unwrap();
-        let image = subdir.join("image.flac");
-        let loose = td.path().join("loose.flac");
         let cue = td.path().join("album.cue");
+        let image = td.path().join("album.flac");
+        let loose = td.path().join("loose.flac");
         std::fs::write(&image, b"not real flac").unwrap();
         std::fs::write(&loose, b"not real flac").unwrap();
         std::fs::write(
             &cue,
-            r#"FILE "disc/image.flac" WAVE
-  TRACK 01 AUDIO
-    INDEX 01 00:00:00
-"#,
-        )
-        .unwrap();
-
-        let manager = ConversionManager::new(ConversionConfig::default());
-        let files = manager.scan_directory(td.path()).expect("scan directory");
-        assert!(path_list_contains(&files, &cue));
-        assert!(path_list_contains(&files, &loose));
-        assert!(!path_list_contains(&files, &image));
-    }
-
-    #[test]
-    fn scan_directory_suppresses_relative_parent_audio_referenced_by_cue() {
-        let td = tempfile::tempdir().expect("tempdir");
-        let cue_dir = td.path().join("cue_dir");
-        let audio_dir = td.path().join("audio");
-        std::fs::create_dir(&cue_dir).unwrap();
-        std::fs::create_dir(&audio_dir).unwrap();
-        let image = audio_dir.join("image.flac");
-        let cue = cue_dir.join("album.cue");
-        std::fs::write(&image, b"not real flac").unwrap();
-        std::fs::write(
-            &cue,
-            r#"FILE "../audio/image.flac" WAVE
-  TRACK 01 AUDIO
-    INDEX 01 00:00:00
-"#,
-        )
-        .unwrap();
-
-        let manager = ConversionManager::new(ConversionConfig::default());
-        let files = manager.scan_directory(td.path()).expect("scan directory");
-        assert!(path_list_contains(&files, &cue));
-        assert!(!path_list_contains(&files, &image));
-    }
-
-    #[test]
-    fn scan_directory_keeps_all_ambiguous_stem_matches() {
-        let td = tempfile::tempdir().expect("tempdir");
-        let cue = td.path().join("album.cue");
-        let flac = td.path().join("album.flac");
-        let wav = td.path().join("album.wav");
-        std::fs::write(&flac, b"not real flac").unwrap();
-        std::fs::write(&wav, b"not real wav").unwrap();
-        std::fs::write(
-            &cue,
-            r#"FILE "album.ape" WAVE
-  TRACK 01 AUDIO
-    INDEX 01 00:00:00
-"#,
-        )
-        .unwrap();
-
-        let manager = ConversionManager::new(ConversionConfig::default());
-        let files = manager.scan_directory(td.path()).expect("scan directory");
-        assert!(path_list_contains(&files, &cue));
-        assert!(path_list_contains(&files, &flac));
-        assert!(path_list_contains(&files, &wav));
-    }
-
-    #[test]
-    fn scan_directory_suppresses_subdirectory_extension_mismatch_reference() {
-        let td = tempfile::tempdir().expect("tempdir");
-        let disc = td.path().join("disc");
-        std::fs::create_dir(&disc).unwrap();
-        let cue = td.path().join("album.cue");
-        let image = disc.join("image.flac");
-        std::fs::write(&image, b"not real flac").unwrap();
-        std::fs::write(
-            &cue,
-            r#"FILE "disc/image.wav" WAVE
-  TRACK 01 AUDIO
-    INDEX 01 00:00:00
-"#,
-        )
-        .unwrap();
-
-        let manager = ConversionManager::new(ConversionConfig::default());
-        let files = manager.scan_directory(td.path()).expect("scan directory");
-        assert!(path_list_contains(&files, &cue));
-        assert!(!path_list_contains(&files, &image));
-    }
-
-    #[test]
-    fn scan_directory_does_not_suppress_audio_for_cue_missing_index01() {
-        let td = tempfile::tempdir().expect("tempdir");
-        let cue = td.path().join("album.cue");
-        let image = td.path().join("album.flac");
-        std::fs::write(&image, b"not real flac").unwrap();
-        std::fs::write(
-            &cue,
             r#"FILE "album.flac" WAVE
   TRACK 01 AUDIO
-    TITLE "No INDEX 01"
-"#,
-        )
-        .unwrap();
-
-        let manager = ConversionManager::new(ConversionConfig::default());
-        let files = manager.scan_directory(td.path()).expect("scan directory");
-        assert!(path_list_contains(&files, &cue));
-        assert!(path_list_contains(&files, &image));
-    }
-
-    #[test]
-    fn scan_directory_does_not_suppress_audio_for_non_increasing_cue_indexes() {
-        let td = tempfile::tempdir().expect("tempdir");
-        let cue = td.path().join("album.cue");
-        let image = td.path().join("album.flac");
-        std::fs::write(&image, b"not real flac").unwrap();
-        std::fs::write(
-            &cue,
-            r#"FILE "album.flac" WAVE
-  TRACK 01 AUDIO
-    INDEX 01 00:10:00
+    INDEX 01 00:00:00
   TRACK 02 AUDIO
-    INDEX 01 00:05:00
+    INDEX 01 03:12:00
 "#,
         )
         .unwrap();
 
         let manager = ConversionManager::new(ConversionConfig::default());
         let files = manager.scan_directory(td.path()).expect("scan directory");
-        assert!(path_list_contains(&files, &cue));
-        assert!(path_list_contains(&files, &image));
+        let expected = crate::convert::queue_expansion::expand_paths_to_audio(&[
+            td.path().to_path_buf(),
+        ]);
+
+        assert_eq!(files, expected);
+        assert_eq!(files, vec![cue, loose]);
+    }
+
+    #[test]
+    fn scan_directory_rejects_non_directory_without_queue_walk() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let not_dir = td.path().join("track.flac");
+        std::fs::write(&not_dir, b"not real flac").unwrap();
+
+        let manager = ConversionManager::new(ConversionConfig::default());
+        let err = manager
+            .scan_directory(&not_dir)
+            .expect_err("non-directory should be rejected explicitly");
+
+        assert!(matches!(err, ConversionError::ValidationError(_)));
     }
 
 }

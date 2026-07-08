@@ -9,7 +9,8 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
 use super::app::{ActiveOverlay, AppScreen, AppState, TextEditTarget};
-use super::browse::{BrowseDeferredWorkFlags, EntryKind};
+use super::browse::BrowseDeferredWorkFlags;
+use crate::convert::classify::EntryKind;
 use super::draw::draw_ui;
 use super::keybindings::{handle_key, handle_mouse};
 use super::message::AppMessage;
@@ -6371,7 +6372,8 @@ mod copy_move_file_picker_flow_tests {
     use super::*;
     use crate::config::TonepoetConfig;
     use crate::tui::app::{FilePickerPurpose, MetadataFilePickerState};
-    use crate::tui::browse::{BrowseEntry, EntryKind};
+    use crate::convert::classify::EntryKind;
+    use crate::tui::browse::BrowseEntry;
     use crate::tui::command::Command;
     use crate::tui::context_menu::{execute_context_action, ContextAction};
     use std::fs;

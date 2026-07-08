@@ -936,7 +936,8 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
         expansion_inputs.push(path.clone());
     }
 
-    let expansion = tonepoet::tui::browse::expand_paths_to_audio_with_metadata(&expansion_inputs);
+    let expansion =
+        tonepoet::convert::queue_expansion::expand_paths_to_audio_with_metadata(&expansion_inputs);
 
     // Explicit file arguments the expansion filtered out (unsupported formats)
     // still deserve the historical warning.
@@ -953,7 +954,7 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
     for path in &expansion.paths {
         if let Ok(format) = FormatDetector::detect(path) {
             let cue_sidecar_override =
-                tonepoet::tui::convert_actions::cue_sidecar_override_for_commit_path(
+                tonepoet::convert::queue_expansion::cue_sidecar_override_for_commit_path(
                     path,
                     &expansion.cue_artifact_audio,
                 );

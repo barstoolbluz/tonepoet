@@ -1326,13 +1326,13 @@ fn activate_archive_browse_directory(
         return false;
     };
     match entry.kind.clone() {
-        super::browse::EntryKind::ParentDir => {
+        crate::convert::classify::EntryKind::ParentDir => {
             if !app.browse.go_up_in_archive() {
                 exit_browse_archive(app, tx);
             }
             true
         }
-        super::browse::EntryKind::Directory => {
+        crate::convert::classify::EntryKind::Directory => {
             let Some(inner) = app.browse.archive_inner_path_for_entry(&entry) else {
                 app.set_status("archive: could not resolve directory entry");
                 return false;
@@ -1370,13 +1370,13 @@ fn activate_browse_entry(
         return;
     }
 
-    if matches!(entry.kind, super::browse::EntryKind::Archive) && !app.browse.is_in_archive() {
+    if matches!(entry.kind, crate::convert::classify::EntryKind::Archive) && !app.browse.is_in_archive() {
         app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
         start_browse_archive_listing(app, entry.path.clone(), tx, false);
         return;
     }
 
-    if matches!(entry.kind, super::browse::EntryKind::AudioFile(_)) && app.browse.is_in_archive() {
+    if matches!(entry.kind, crate::convert::classify::EntryKind::AudioFile(_)) && app.browse.is_in_archive() {
         app.browse.toggle_selection_at_index(idx);
         app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
         app.set_status(
@@ -1699,9 +1699,9 @@ pub(super) fn begin_browse_inline_rename(app: &mut AppState, path: std::path::Pa
     });
 }
 
-fn browse_entry_supports_inline_rename(app: &AppState, kind: &super::browse::EntryKind) -> bool {
-    !matches!(kind, super::browse::EntryKind::ParentDir)
-        && !(app.browse.is_in_archive() && matches!(kind, super::browse::EntryKind::Directory))
+fn browse_entry_supports_inline_rename(app: &AppState, kind: &crate::convert::classify::EntryKind) -> bool {
+    !matches!(kind, crate::convert::classify::EntryKind::ParentDir)
+        && !(app.browse.is_in_archive() && matches!(kind, crate::convert::classify::EntryKind::Directory))
 }
 
 fn current_browse_metadata_value(app: &AppState, field: crate::tui::probe::MetadataField) -> String {
@@ -1924,7 +1924,7 @@ mod inline_edit_behavior_tests {
     }
 
     fn browse_app_with_disc_directory(
-        kind: crate::tui::browse::EntryKind,
+        kind: crate::convert::classify::EntryKind,
     ) -> (AppState, tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().to_path_buf();
@@ -1950,9 +1950,9 @@ mod inline_edit_behavior_tests {
     fn browse_enter_key_descends_into_disc_directory_kinds() {
         let (tx, _rx) = channel();
         for kind in [
-            crate::tui::browse::EntryKind::DvdAudioDir,
-            crate::tui::browse::EntryKind::DvdVideoDir,
-            crate::tui::browse::EntryKind::BlurayDir,
+            crate::convert::classify::EntryKind::DvdAudioDir,
+            crate::convert::classify::EntryKind::DvdVideoDir,
+            crate::convert::classify::EntryKind::BlurayDir,
         ] {
             let (mut app, _temp, disc_dir) = browse_app_with_disc_directory(kind);
 
@@ -1967,9 +1967,9 @@ mod inline_edit_behavior_tests {
     fn browse_right_key_descends_into_disc_directory_kinds() {
         let (tx, _rx) = channel();
         for kind in [
-            crate::tui::browse::EntryKind::DvdAudioDir,
-            crate::tui::browse::EntryKind::DvdVideoDir,
-            crate::tui::browse::EntryKind::BlurayDir,
+            crate::convert::classify::EntryKind::DvdAudioDir,
+            crate::convert::classify::EntryKind::DvdVideoDir,
+            crate::convert::classify::EntryKind::BlurayDir,
         ] {
             let (mut app, _temp, disc_dir) = browse_app_with_disc_directory(kind);
 
@@ -1984,9 +1984,9 @@ mod inline_edit_behavior_tests {
     async fn browse_double_click_descends_into_disc_directory_kinds() {
         let (tx, _rx) = channel();
         for kind in [
-            crate::tui::browse::EntryKind::DvdAudioDir,
-            crate::tui::browse::EntryKind::DvdVideoDir,
-            crate::tui::browse::EntryKind::BlurayDir,
+            crate::convert::classify::EntryKind::DvdAudioDir,
+            crate::convert::classify::EntryKind::DvdVideoDir,
+            crate::convert::classify::EntryKind::BlurayDir,
         ] {
             let (mut app, _temp, disc_dir) = browse_app_with_disc_directory(kind);
             app.button_map
@@ -2140,7 +2140,7 @@ mod inline_edit_behavior_tests {
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
             temp.path().to_path_buf(),
             "album".to_string(),
-            crate::tui::browse::EntryKind::Directory,
+            crate::convert::classify::EntryKind::Directory,
             0,
             None,
         )];
@@ -2457,7 +2457,7 @@ mod inline_edit_behavior_tests {
 
         assert!(expansion.expansion_errors.is_empty());
         assert!(expansion.empty_audio_folders.is_empty());
-        assert_eq!(expansion.paths, vec![loose, first, second]);
+        assert_eq!(expansion.queue.paths, vec![loose, first, second]);
     }
 
     #[test]
@@ -2636,7 +2636,7 @@ mod inline_edit_behavior_tests {
         crate::tui::browse::BrowseEntry::new(
             path,
             name,
-            crate::tui::browse::EntryKind::OtherFile,
+            crate::convert::classify::EntryKind::OtherFile,
             1,
             None,
         )
@@ -3080,7 +3080,7 @@ fn adjust_archive_listing_timeout(app: &mut AppState, delta: i64) {
 // ── Browse screen keybindings ────────────────────────────────────────
 
 fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
-    use super::browse::EntryKind;
+    use crate::convert::classify::EntryKind;
 
     // Track whether selection may have changed; if so, probe the new selection.
     let mut selection_may_have_changed = false;
@@ -10008,8 +10008,8 @@ fn staged_archive_file_for_metadata(
         return Err(format!("archive entry is not a staged file: {}", inner_path));
     }
     if !matches!(
-        super::browse::classify_file(&path),
-        super::browse::EntryKind::AudioFile(_)
+        crate::convert::classify::classify_file(&path),
+        crate::convert::classify::EntryKind::AudioFile(_)
     ) {
         return Err(format!(
             "archive entry is not a supported audio file: {}",
@@ -10058,8 +10058,8 @@ fn collect_staged_archive_audio_inner_paths(
     })?;
     if metadata.file_type().is_file() {
         if matches!(
-            super::browse::classify_file(&root),
-            super::browse::EntryKind::AudioFile(_)
+            crate::convert::classify::classify_file(&root),
+            crate::convert::classify::EntryKind::AudioFile(_)
         ) {
             return Ok(vec![inner_path.to_string()]);
         }
@@ -10098,8 +10098,8 @@ fn collect_staged_archive_audio_inner_paths(
             }
             if metadata.file_type().is_file()
                 && matches!(
-                    super::browse::classify_file(&path),
-                    super::browse::EntryKind::AudioFile(_)
+                    crate::convert::classify::classify_file(&path),
+                    crate::convert::classify::EntryKind::AudioFile(_)
                 )
             {
                 let relative = path.strip_prefix(staging_dir).map_err(|_| {
@@ -10126,8 +10126,8 @@ fn collect_listing_archive_audio_inner_paths(app: &AppState, inner_path: &str) -
     };
     if !entry.is_dir {
         return matches!(
-            super::browse::classify_file(std::path::Path::new(entry.file_name())),
-            super::browse::EntryKind::AudioFile(_)
+            crate::convert::classify::classify_file(std::path::Path::new(entry.file_name())),
+            crate::convert::classify::EntryKind::AudioFile(_)
         )
         .then(|| inner_path.to_string())
         .into_iter()
@@ -10146,8 +10146,8 @@ fn collect_listing_archive_audio_inner_paths(app: &AppState, inner_path: &str) -
         .filter(|candidate| !candidate.is_dir && candidate.path.starts_with(&prefix))
         .filter(|candidate| {
             matches!(
-                super::browse::classify_file(std::path::Path::new(candidate.file_name())),
-                super::browse::EntryKind::AudioFile(_)
+                crate::convert::classify::classify_file(std::path::Path::new(candidate.file_name())),
+                crate::convert::classify::EntryKind::AudioFile(_)
             )
         })
         .map(|candidate| candidate.path.clone())
@@ -10203,8 +10203,8 @@ fn collect_all_staged_archive_audio_files(
                 ));
             }
             if matches!(
-                super::browse::classify_file(&path),
-                super::browse::EntryKind::AudioFile(_)
+                crate::convert::classify::classify_file(&path),
+                crate::convert::classify::EntryKind::AudioFile(_)
             ) {
                 paths.push(path);
             }
@@ -10989,7 +10989,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
 
     if sel.len() == 1
         && !app.browse.is_in_archive()
-        && matches!(super::browse::classify_file(&sel[0]), super::browse::EntryKind::Archive)
+        && matches!(crate::convert::classify::classify_file(&sel[0]), crate::convert::classify::EntryKind::Archive)
     {
         open_browse_archive_metadata_editor(app, sel[0].clone());
         return;
@@ -11053,12 +11053,12 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     }
 
-    let mut paths: Vec<std::path::PathBuf> = super::browse::expand_paths_to_audio(&sel)
+    let mut paths: Vec<std::path::PathBuf> = crate::convert::queue_expansion::expand_paths_to_audio(&sel)
         .into_iter()
         .filter(|p| {
             matches!(
-                super::browse::classify_file(p),
-                super::browse::EntryKind::AudioFile(_)
+                crate::convert::classify::classify_file(p),
+                crate::convert::classify::EntryKind::AudioFile(_)
             )
         })
         .collect();
@@ -25174,13 +25174,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         .unwrap_or(false);
 
                     if same_path_as_last
-                        && !matches!(app.browse.entries[idx].kind, super::browse::EntryKind::ParentDir)
+                        && !matches!(app.browse.entries[idx].kind, crate::convert::classify::EntryKind::ParentDir)
                     {
                         begin_browse_inline_rename(app, clicked_path.clone());
                     }
 
                     app.last_browse_click = Some((clicked_path.clone(), now));
-                    if !matches!(app.browse.entries[idx].kind, super::browse::EntryKind::ParentDir) {
+                    if !matches!(app.browse.entries[idx].kind, crate::convert::classify::EntryKind::ParentDir) {
                         app.browse.multi_select_anchor = Some(clicked_path);
                     }
                     app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");

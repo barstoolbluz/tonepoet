@@ -12,6 +12,7 @@ use tonepoet_pipeline::PipelineSettings;
 use crate::convert::{
     queue_identity_path, ConversionItem, ConversionStatus, LifecycleEvent, ProgressUpdate,
 };
+use crate::convert::queue_expansion::cue_sidecar_override_for_commit_path;
 
 use super::app::*;
 use super::message::AppMessage;
@@ -535,18 +536,6 @@ pub fn commit_batch(
     commit_batch_with_cue_artifacts(app, paths, &std::collections::HashSet::new(), options)
 }
 
-/// Map queue-expansion CUE-artifact metadata onto the sidecar policy for one
-/// queued path. Shared by the TUI commit path and the CLI folder scan so both
-/// front ends apply identical CUE semantics.
-pub fn cue_sidecar_override_for_commit_path(
-    path: &std::path::Path,
-    cue_artifact_audio: &std::collections::HashSet<std::path::PathBuf>,
-) -> Option<crate::convert::pipeline::CueSidecarPolicy> {
-    cue_artifact_audio
-        .contains(path)
-        .then_some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly)
-}
-
 fn is_active_commit_item(item: &ConversionItem) -> bool {
     !matches!(
         item.status,
@@ -580,7 +569,7 @@ fn options_for_queue_request(options: &ConversionOptions) -> ConversionOptions {
 }
 
 /// Commit a batch and mark paths whose sibling CUE was already suppressed by
-/// browse expansion as sidecar-CUE metadata artifacts.
+/// queue expansion as sidecar-CUE metadata artifacts.
 pub fn commit_batch_with_cue_artifacts(
     app: &mut AppState,
     paths: &[std::path::PathBuf],

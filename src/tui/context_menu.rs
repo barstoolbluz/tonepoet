@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use super::app::*;
-use super::browse::{BrowseEntry, EntryKind};
+use super::browse::BrowseEntry;
+use crate::convert::classify::EntryKind;
 use super::message::AppMessage;
 use crate::convert::ConversionStatus;
 
@@ -958,7 +959,7 @@ pub fn execute_context_action(
         }
         ContextAction::SelectAll => {
             if app.current_screen == AppScreen::Browse {
-                use super::browse::EntryKind;
+                use crate::convert::classify::EntryKind;
                 let paths: Vec<std::path::PathBuf> = app
                     .browse
                     .entries
@@ -972,7 +973,7 @@ pub fn execute_context_action(
         }
         ContextAction::SelectInverse => {
             if app.current_screen == AppScreen::Browse {
-                use super::browse::EntryKind;
+                use crate::convert::classify::EntryKind;
                 let new_sel: Vec<std::path::PathBuf> = app
                     .browse
                     .entries
@@ -1539,12 +1540,12 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
     // Collect audio file paths, group by disc, query GNUDB.
     let paths = super::command::collect_selection_for_file_ops(app);
     let mut audio_paths: Vec<std::path::PathBuf> =
-        super::browse::expand_paths_to_audio(&paths)
+        crate::convert::queue_expansion::expand_paths_to_audio(&paths)
             .into_iter()
             .filter(|p| {
                 matches!(
-                    super::browse::classify_file(p),
-                    super::browse::EntryKind::AudioFile(_)
+                    crate::convert::classify::classify_file(p),
+                    crate::convert::classify::EntryKind::AudioFile(_)
                 )
             })
             .collect();
