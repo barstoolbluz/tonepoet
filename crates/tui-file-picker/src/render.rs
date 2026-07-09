@@ -1090,6 +1090,13 @@ fn fit_text_right(text: &str, width: usize) -> String {
         tail.push(ch);
         used += ch_width;
     }
+    // Reverse iteration takes a combining mark before its base glyph; if the
+    // base then failed to fit, the kept suffix would start with an orphaned
+    // zero-width mark that visually attaches to the ellipsis. Drop such marks
+    // (they sit at the END of the reversed buffer = start of the suffix).
+    while tail.last().is_some_and(|ch| char_display_width(*ch) == 0) {
+        tail.pop();
+    }
     let mut out = String::from('\u{2026}');
     out.extend(tail.into_iter().rev());
     pad_to_width(out, used + 1, width)
@@ -1294,6 +1301,21 @@ mod tests {
         assert_eq!(fit_text_start("日本盤", 4), "日\u{2026} ");
         assert_eq!(fit_text_right("日本盤", 4), "\u{2026}盤 ");
         assert_eq!(fit_text_left("日本盤", 5), "日本 ");
+    }
+
+    #[test]
+    fn fit_text_right_drops_combining_marks_orphaned_by_the_cut() {
+        // Reversed accumulation takes U+0301 (zero-width) before its base;
+        // when the wide base does not fit, the mark must not survive to
+        // attach itself to the ellipsis.
+        let text = "a\u{65E5}\u{0301}cd"; // a + 日́ + cd
+        let out = fit_text_right(text, 4);
+        assert_eq!(out, "\u{2026}cd ");
+        assert_eq!(text_display_width(&out), 4);
+        // A mark whose base IS kept survives the cut ("wxéd" is 4 columns,
+        // width 3 keeps "éd" plus the ellipsis).
+        let kept = fit_text_right("wxe\u{0301}d", 3);
+        assert_eq!(kept, "\u{2026}e\u{0301}d");
     }
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
