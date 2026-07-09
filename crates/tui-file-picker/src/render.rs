@@ -1005,39 +1005,94 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     )
 }
 
-fn fit_text_left(text: &str, width: usize) -> String {
-    let mut out: String = text.chars().take(width).collect();
-    let used = out.chars().count();
+// The fit_text_* helpers measure DISPLAY COLUMNS (unicode-width), not chars:
+// a CJK glyph occupies two terminal cells, combining marks occupy none. Every
+// helper returns a string that renders to exactly `width` columns (padding
+// with spaces where a wide glyph cannot straddle the boundary), so callers can
+// rely on cell-exact layout.
+
+fn char_display_width(ch: char) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    ch.width().unwrap_or(0)
+}
+
+fn text_display_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    text.width()
+}
+
+fn pad_to_width(mut out: String, used: usize, width: usize) -> String {
     if used < width {
         out.push_str(&" ".repeat(width - used));
     }
     out
 }
 
+fn fit_text_left(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = char_display_width(ch);
+        if used + ch_width > width {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    pad_to_width(out, used, width)
+}
+
 /// Fit `text` into `width` keeping its beginning; overflow is marked with a
 /// trailing ellipsis. Use for name-like text where the prefix discriminates.
 fn fit_text_start(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
+    if text_display_width(text) <= width {
         return fit_text_left(text, width);
     }
-    if width <= 1 {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
         return "\u{2026}".to_string();
     }
-    let prefix: String = text.chars().take(width - 1).collect();
-    format!("{prefix}\u{2026}")
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = char_display_width(ch);
+        if used + ch_width > width - 1 {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push('\u{2026}');
+    pad_to_width(out, used + 1, width)
 }
 
+/// Fit `text` into `width` keeping its end; overflow is marked with a leading
+/// ellipsis. Use for path-like text where the tail discriminates.
 fn fit_text_right(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
+    if text_display_width(text) <= width {
         return fit_text_left(text, width);
     }
-    if width <= 1 {
-        return "…".to_string();
+    if width == 0 {
+        return String::new();
     }
-    let suffix: String = text.chars().rev().take(width - 1).collect::<String>().chars().rev().collect();
-    format!("…{suffix}")
+    if width == 1 {
+        return "\u{2026}".to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for ch in text.chars().rev() {
+        let ch_width = char_display_width(ch);
+        if used + ch_width > width - 1 {
+            break;
+        }
+        tail.push(ch);
+        used += ch_width;
+    }
+    let mut out = String::from('\u{2026}');
+    out.extend(tail.into_iter().rev());
+    pad_to_width(out, used + 1, width)
 }
 
 fn button_width(label: &str) -> u16 {
@@ -1200,6 +1255,45 @@ mod tests {
         );
         assert_eq!(fit_text_start("short", 10), "short     ");
         assert_eq!(fit_text_start("overflow", 1), "\u{2026}");
+        assert_eq!(fit_text_start("overflow", 0), "");
+    }
+
+    #[test]
+    fn fit_text_helpers_render_to_exactly_the_requested_display_width() {
+        // Every helper must produce cell-exact output: CJK glyphs are two
+        // columns wide, combining marks are zero. A char-counting
+        // implementation overflows the pane on wide glyphs.
+        let samples = [
+            "(1960) Nat Adderley - Work Song",
+            "日本盤 デラックス・エディション",              // fullwidth
+            "1996. 山下達郎 - Cozy {WPCV-10021}",           // mixed
+            "Sinéad O'Connor - Universal Mother",        // combining é
+            "アート・ブレイキー",
+        ];
+        for text in samples {
+            for width in [0usize, 1, 2, 3, 7, 10, 16, 25, 40, 80] {
+                for (name, out) in [
+                    ("fit_text_left", fit_text_left(text, width)),
+                    ("fit_text_start", fit_text_start(text, width)),
+                    ("fit_text_right", fit_text_right(text, width)),
+                ] {
+                    assert_eq!(
+                        text_display_width(&out),
+                        width,
+                        "{name}({text:?}, {width}) -> {out:?} is not cell-exact"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fit_text_start_and_right_truncate_wide_glyphs_without_splitting_cells() {
+        // "日本盤" is 6 columns. At width 4 the start-fit keeps one glyph (2)
+        // + ellipsis (1) + pad (1); a straddling second glyph must not leak.
+        assert_eq!(fit_text_start("日本盤", 4), "日\u{2026} ");
+        assert_eq!(fit_text_right("日本盤", 4), "\u{2026}盤 ");
+        assert_eq!(fit_text_left("日本盤", 5), "日本 ");
     }
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
