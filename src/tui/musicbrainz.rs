@@ -1857,6 +1857,9 @@ fn release_already_tagged_on_file(audio_path: &std::path::Path, release: &MbRele
     if release.release_id.is_empty() {
         return false;
     }
+    if super::probe::recover_flac_metadata_before_read(audio_path).is_err() {
+        return false;
+    }
     let Ok(tagged) = lofty::read_from_path(audio_path) else {
         return false;
     };

@@ -70,7 +70,7 @@ pub(crate) fn dispatch_artwork_write(
 
     #[cfg(not(test))]
     {
-        let (session_id, generation) = state.begin_artwork_write(
+        let (session_id, generation, cancel) = state.begin_cancellable_artwork_write(
             crate::tui::app::MetadataArtworkWriteMode::Write,
             paths.len(),
         );
@@ -79,7 +79,7 @@ pub(crate) fn dispatch_artwork_write(
         tokio::spawn(async move {
             let result_paths = paths.clone();
             let result = tokio::task::spawn_blocking(move || {
-                super::probe::write_artwork_to_files(&paths, &image_path, picture_type)
+                super::probe::write_artwork_to_files_with_cancel(&paths, &image_path, picture_type, Some(&cancel))
             })
             .await
             .unwrap_or_else(|err| Err(format!("artwork write task failed: {err}")));

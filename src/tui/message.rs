@@ -411,7 +411,7 @@ pub enum AppMessage {
         generation: u64,
         mode: crate::tui::app::MetadataArtworkWriteMode,
         paths: Vec<std::path::PathBuf>,
-        result: Result<Vec<crate::tui::probe::SourceMetadata>, String>,
+        result: Result<crate::tui::probe::ArtworkWriteBatchResult, String>,
     },
     /// Progress for an async archive listing (`7zz l -slt`).
     ArchiveListingProgress {

@@ -5924,7 +5924,7 @@ pub(super) fn metadata_editor_save(
         None
     };
     state.phase = super::app::MetadataEditorPhase::Saving;
-    let (session_id, save_generation) = state.begin_write();
+    let (session_id, save_generation, cancel) = state.begin_cancellable_write();
     let paths = state.active_surface().paths.clone();
     let deleted = state.active_surface().deleted.clone();
     let save_block_reasons: Vec<Option<String>> = state.active_surface()
@@ -5960,12 +5960,34 @@ pub(super) fn metadata_editor_save(
 
     let tx = tx.clone();
     tokio::spawn(async move {
+        let progress_tx = tx.clone();
         let results = tokio::task::spawn_blocking(move || {
-            let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks(
+            let progress: crate::tui::probe::MetadataWriteProgressCallback = std::sync::Arc::new(
+                move |done, total, path, result| {
+                    let file_name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let outcome = match &result.outcome {
+                        crate::tui::app::MetadataEditorWriteOutcome::Saved => "saved",
+                        crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. } => "saved with warning",
+                        crate::tui::app::MetadataEditorWriteOutcome::Failed { .. } => "failed",
+                        crate::tui::app::MetadataEditorWriteOutcome::Skipped { .. } => "skipped",
+                        crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved { .. } => "sidecar saved",
+                        crate::tui::app::MetadataEditorWriteOutcome::SidecarCueFailed { .. } => "sidecar failed",
+                    };
+                    let _ = progress_tx.blocking_send(AppMessage::StatusMessage(format!(
+                        "metadata save {done}/{total}: {file_name} {outcome}"
+                    )));
+                },
+            );
+            let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_and_progress(
                 &paths,
                 &entries_snap,
                 &deleted,
                 &save_block_reasons,
+                Some(progress),
+                Some(cancel.clone()),
             );
             if let Some(plan) = cue_sidecar_writeback {
                 if let Some(sidecar_result) =
@@ -6037,7 +6059,11 @@ fn cue_sidecar_writeback_result_after_successful_image_save(
 ) -> Option<crate::tui::app::MetadataEditorWriteResult> {
     let image_saved = audio_results.iter().any(|result| {
         result.path.as_path() == plan.audio_path.as_path()
-            && matches!(&result.outcome, crate::tui::app::MetadataEditorWriteOutcome::Saved)
+            && matches!(
+                &result.outcome,
+                crate::tui::app::MetadataEditorWriteOutcome::Saved
+                    | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+            )
     });
     if !image_saved {
         return None;
@@ -6225,11 +6251,26 @@ fn request_metadata_editor_close(
     _tx: &mpsc::Sender<AppMessage>,
 ) {
     if state.phase == super::app::MetadataEditorPhase::Saving {
+        let requested = state.cancel_metadata_write();
         app.active_overlay = ActiveOverlay::MetadataEditor(state.clone());
-        app.set_status("metadata editor: save in progress — wait for completion before closing".to_string());
+        if requested {
+            app.set_status("metadata editor: cancellation requested; current file will stop at the next safe point".to_string());
+        } else {
+            app.set_status("metadata editor: save in progress — waiting for completion".to_string());
+        }
         return;
     }
-    if state.replaygain_scan.is_some() || state.artwork_write.is_some() {
+    if state.artwork_write.is_some() {
+        let requested = state.cancel_artwork_write();
+        app.active_overlay = ActiveOverlay::MetadataEditor(state.clone());
+        if requested {
+            app.set_status("metadata editor: artwork write cancellation requested; current file will stop at the next safe point".to_string());
+        } else {
+            app.set_status("metadata editor: artwork write in progress — waiting for completion".to_string());
+        }
+        return;
+    }
+    if state.replaygain_scan.is_some() {
         app.active_overlay = ActiveOverlay::MetadataEditor(state.clone());
         app.set_status(
             "metadata editor: metadata file write in progress — wait for completion before closing"
@@ -7236,7 +7277,7 @@ fn metadata_editor_dispatch_artwork_remove(
         app.set_status("metadata editor: no files available for artwork removal");
         return;
     }
-    let (session_id, generation) = state.begin_artwork_write(
+    let (session_id, generation, cancel) = state.begin_cancellable_artwork_write(
         crate::tui::app::MetadataArtworkWriteMode::Remove,
         paths.len(),
     );
@@ -7244,7 +7285,7 @@ fn metadata_editor_dispatch_artwork_remove(
     tokio::spawn(async move {
         let result_paths = paths.clone();
         let result = tokio::task::spawn_blocking(move || {
-            super::probe::remove_artwork_from_files(&paths, picture_type)
+            super::probe::remove_artwork_from_files_with_cancel(&paths, picture_type, Some(&cancel))
         })
         .await
         .unwrap_or_else(|err| Err(format!("artwork removal task failed: {err}")));
@@ -19353,19 +19394,21 @@ fn apply_text_edit(
                 return;
             }
 
-            // Step 1 (main thread, fast): create backup + journal entry.
-            let backup = crate::db::Database::backup_path_for(&write_path);
-            if let Err(e) = crate::db::Database::create_backup_for(&write_path, &backup) {
-                app.set_status(format!("backup failed: {}", e));
-                return;
-            }
-            if let Err(e) = app
-                .db
-                .begin_metadata_write(&write_path.display().to_string(), &backup.display().to_string())
-            {
-                let _ = std::fs::remove_file(&backup);
-                app.set_status(format!("journal error: {}", e));
-                return;
+            // Cheap durable intent only: do not copy the file on the TUI
+            // thread. Native FLAC writes are deliberately NOT recorded in the
+            // DB metadata journal: their sole recovery artifact is the FLAC
+            // sidecar `.tonepoet-meta-journal`, created and cleared by the
+            // blocking writer itself. The DB journal remains the legacy
+            // file-scope backup journal for non-FLAC fallback writers.
+            if !crate::tui::probe::uses_native_flac_metadata_journal(&write_path) {
+                let backup = crate::db::Database::backup_path_for(&write_path);
+                if let Err(e) = app
+                    .db
+                    .begin_metadata_write(&write_path.display().to_string(), &backup.display().to_string())
+                {
+                    app.set_status(format!("journal error: {}", e));
+                    return;
+                }
             }
 
             app.set_status(format!(
@@ -19373,7 +19416,10 @@ fn apply_text_edit(
                 write_path.file_name().unwrap_or_default().to_string_lossy()
             ));
 
-            // Step 2 (background): lofty write (potentially slow for large files).
+            // The write machinery now owns crash-safety and format-specific
+            // rollback. Keep every byte of heavy I/O off the TUI thread; on
+            // padded FLAC this touches only the metadata region and a small
+            // journal.
             let path = write_path.clone();
             let write_field = field;
             let write_value = trimmed.to_string();
@@ -27522,7 +27568,10 @@ mod phase4_tests {
         assert_eq!(plan.replacement_cuesheet, regenerated_cue);
 
         let (session_id, generation) = state.begin_write();
-        let image_result = crate::tui::app::MetadataEditorWriteResult::saved(audio.clone());
+        let image_result = crate::tui::app::MetadataEditorWriteResult::saved_with_warnings(
+            audio.clone(),
+            vec!["durability warning after FLAC overflow rewrite commit: parent-directory fsync failed after committed audio mutation".to_string()],
+        );
         let sidecar_result = cue_sidecar_writeback_result_after_successful_image_save(
             plan,
             &[image_result.clone()],
@@ -27539,10 +27588,11 @@ mod phase4_tests {
         assert_eq!(summary.saved, 1);
         assert_eq!(summary.sidecar_cue_saved, 1);
         assert_eq!(summary.sidecar_cue_failed, 0);
+        assert_eq!(summary.durability_warnings, 1);
         assert!(summary.all_saved(), "unexpected save summary: {:?}", summary);
         assert_eq!(
             summary.status_line(),
-            "Metadata saved (1 file; 1 CUE sidecar updated)"
+            "Metadata saved (1 file; 1 CUE sidecar updated, 1 durability warning) — durability warning after FLAC overflow rewrite commit: parent-directory fsync failed after committed audio mutation"
         );
         assert!(!state.active_surface().dirty);
 

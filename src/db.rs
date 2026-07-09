@@ -1902,7 +1902,12 @@ impl Database {
 
     // ── Metadata journal ─────────────────────────────────────────
 
-    /// Record an in-flight metadata write. Called BEFORE the actual write.
+    /// Record an in-flight legacy metadata write. Called BEFORE the actual
+    /// write. This DB table models the full-file `.tonepoet-bak` rollback
+    /// path used by non-FLAC fallback writers. Native FLAC metadata writes do
+    /// not enter this table because their recovery artifact is the adjacent
+    /// `.tonepoet-meta-journal` that stores the original FLAC metadata region
+    /// plus the intended replacement metadata-region identity.
     pub fn begin_metadata_write(&self, file_path: &str, backup_path: &str) -> Result<(), String> {
         self.conn
             .execute(
@@ -2235,7 +2240,8 @@ impl Database {
         }
     }
 
-    /// Recover from any stale journal entries (crash recovery).
+    /// Recover from any stale legacy DB journal entries. Native FLAC recovery
+    /// is handled separately by the FLAC metadata-region journal scanner.
     /// Returns descriptions of recovered files.
     pub fn recover_stale_metadata_writes(&self) -> Vec<String> {
         let entries = match self.stale_metadata_writes() {
@@ -2999,14 +3005,14 @@ mod tests {
     #[test]
     fn metadata_journal_round_trip() {
         let db = Database::open_memory().unwrap();
-        db.begin_metadata_write("/music/song.flac", "/music/song.flac.tonepoet-bak")
+        db.begin_metadata_write("/music/song.mp3", "/music/song.mp3.tonepoet-bak")
             .unwrap();
 
         let stale = db.stale_metadata_writes().unwrap();
         assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].0, "/music/song.flac");
+        assert_eq!(stale[0].0, "/music/song.mp3");
 
-        db.complete_metadata_write("/music/song.flac").unwrap();
+        db.complete_metadata_write("/music/song.mp3").unwrap();
         let stale = db.stale_metadata_writes().unwrap();
         assert!(stale.is_empty());
     }
@@ -3156,21 +3162,21 @@ mod tests {
             ..Default::default()
         };
 
-        db.store_probe("/music/song.flac", 1000, 5000000, &row)
+        db.store_probe("/music/song.mp3", 1000, 5000000, &row)
             .unwrap();
 
         // Hit: same mtime + size.
-        let cached = db.get_cached_probe("/music/song.flac", 1000, 5000000);
+        let cached = db.get_cached_probe("/music/song.mp3", 1000, 5000000);
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().title, Some("Test Song".into()));
 
         // Miss: different mtime.
-        let cached = db.get_cached_probe("/music/song.flac", 2000, 5000000);
+        let cached = db.get_cached_probe("/music/song.mp3", 2000, 5000000);
         assert!(cached.is_none());
 
         // Invalidate.
-        db.invalidate_probe("/music/song.flac").unwrap();
-        let cached = db.get_cached_probe("/music/song.flac", 1000, 5000000);
+        db.invalidate_probe("/music/song.mp3").unwrap();
+        let cached = db.get_cached_probe("/music/song.mp3", 1000, 5000000);
         assert!(cached.is_none());
     }
 
@@ -3217,7 +3223,7 @@ mod tests {
         use crate::tui::preemphasis::PreemphasisConfidence;
 
         let db = Database::open_memory().unwrap();
-        let path = "/music/song.flac";
+        let path = "/music/song.mp3";
         let complete = MetadataAnalysisFacts {
             hdcd_detected: Some(true),
             hdcd_detail: Some("HDCD detected".into()),

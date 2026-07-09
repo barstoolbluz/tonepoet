@@ -359,6 +359,7 @@ fn source_path_is_dsd(path: &Path) -> bool {
 /// Returns None if the file has no embedded cue or lofty can't read it.
 fn read_embedded_cuesheet_for_preview(path: &Path) -> Option<crate::tui::cue_parser::CueSheet> {
     use lofty::prelude::*;
+    crate::tui::probe::recover_flac_metadata_before_read(path).ok()?;
     let tagged = lofty::read_from_path(path).ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
     let cue_text = tag.items()
@@ -5038,6 +5039,10 @@ pub struct MetadataDetailsProbeFileResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEditorWriteOutcome {
     Saved,
+    /// The file mutation committed and should be treated as saved for all
+    /// semantic follow-up work (including CUE sidecar writeback), but one or
+    /// more post-commit durability operations could not be fully confirmed.
+    SavedWithWarnings { warnings: Vec<String> },
     Failed { reason: String },
     Skipped { reason: String },
     SidecarCueSaved {
@@ -5058,6 +5063,14 @@ pub struct MetadataEditorWriteResult {
 impl MetadataEditorWriteResult {
     pub fn saved(path: std::path::PathBuf) -> Self {
         Self { path, outcome: MetadataEditorWriteOutcome::Saved }
+    }
+
+    pub fn saved_with_warnings(path: std::path::PathBuf, warnings: Vec<String>) -> Self {
+        if warnings.is_empty() {
+            Self::saved(path)
+        } else {
+            Self { path, outcome: MetadataEditorWriteOutcome::SavedWithWarnings { warnings } }
+        }
     }
 
     pub fn failed(path: std::path::PathBuf, reason: impl Into<String>) -> Self {
@@ -5101,6 +5114,7 @@ impl MetadataEditorWriteResult {
     pub fn into_legacy_result(self) -> (std::path::PathBuf, Result<(), String>) {
         match self.outcome {
             MetadataEditorWriteOutcome::Saved
+            | MetadataEditorWriteOutcome::SavedWithWarnings { .. }
             | MetadataEditorWriteOutcome::SidecarCueSaved { .. } => (self.path, Ok(())),
             MetadataEditorWriteOutcome::Failed { reason }
             | MetadataEditorWriteOutcome::Skipped { reason }
@@ -5120,6 +5134,8 @@ pub struct MetadataEditorWriteSummary {
     pub sidecar_cue_unchanged: usize,
     pub sidecar_cue_failed: usize,
     pub sidecar_cue_utf8_fallback: usize,
+    pub durability_warnings: usize,
+    pub first_durability_warning: Option<String>,
     /// True when save-result reduction leaves pending model changes behind.
     ///
     /// A save can return only successful path-keyed write results while the
@@ -5173,17 +5189,30 @@ impl MetadataEditorWriteSummary {
                     if self.sidecar_cue_unchanged == 1 { "" } else { "s" }
                 ));
             }
+            if self.durability_warnings > 0 {
+                suffixes.push(format!(
+                    "{} durability warning{}",
+                    self.durability_warnings,
+                    if self.durability_warnings == 1 { "" } else { "s" }
+                ));
+            }
             let suffix = if suffixes.is_empty() {
                 String::new()
             } else {
                 format!("; {}", suffixes.join(", "))
             };
-            return format!(
+            let line = format!(
                 "Metadata saved ({} file{}{})",
                 self.saved,
                 if self.saved == 1 { "" } else { "s" },
                 suffix,
             );
+            if let Some(warning) = &self.first_durability_warning {
+                if !warning.trim().is_empty() {
+                    return format!("{line} — {warning}");
+                }
+            }
+            return line;
         }
 
         let mut parts = vec![format!("{} saved", self.saved)];
@@ -5205,12 +5234,22 @@ impl MetadataEditorWriteSummary {
         if self.sidecar_cue_failed > 0 {
             parts.push(format!("{} CUE sidecar stale", self.sidecar_cue_failed));
         }
+        if self.durability_warnings > 0 {
+            parts.push(format!(
+                "{} durability warning{}",
+                self.durability_warnings,
+                if self.durability_warnings == 1 { "" } else { "s" }
+            ));
+        }
         if self.remaining_dirty {
             parts.push("unsaved changes remain".to_string());
         }
-        match &self.first_problem {
-            Some(problem) if !problem.trim().is_empty() => {
+        match (&self.first_problem, &self.first_durability_warning) {
+            (Some(problem), _) if !problem.trim().is_empty() => {
                 format!("Metadata: {} — {}", parts.join(", "), problem)
+            }
+            (_, Some(warning)) if !warning.trim().is_empty() => {
+                format!("Metadata: {} — {}", parts.join(", "), warning)
             }
             _ => format!("Metadata: {}", parts.join(", ")),
         }
@@ -6128,6 +6167,12 @@ pub struct MetadataEditorState {
     /// tab without losing editor context.
     pub close_after_successful_save: bool,
 
+    /// Cooperative cancellation flag for the active tag-grid save, if any.
+    pub metadata_write_cancel: Option<crate::tui::probe::MetadataWriteCancelFlag>,
+
+    /// Cooperative cancellation flag for the active artwork write/remove, if any.
+    pub artwork_write_cancel: Option<crate::tui::probe::MetadataWriteCancelFlag>,
+
     /// Authoritative metadata editor model.
     ///
     /// All active editable rows, selected presentation state, source facts,
@@ -6152,6 +6197,8 @@ impl MetadataEditorState {
             archive_edit_context: None,
             archive_staging_dirty: false,
             close_after_successful_save: true,
+            metadata_write_cancel: None,
+            artwork_write_cancel: None,
             model,
         }
     }
@@ -6304,6 +6351,26 @@ impl MetadataEditorState {
         (session_id, generation)
     }
 
+    pub fn begin_cancellable_artwork_write(
+        &mut self,
+        mode: MetadataArtworkWriteMode,
+        file_count: usize,
+    ) -> (u64, u64, crate::tui::probe::MetadataWriteCancelFlag) {
+        let (session_id, generation) = self.begin_artwork_write(mode, file_count);
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        self.artwork_write_cancel = Some(cancel.clone());
+        (session_id, generation, cancel)
+    }
+
+    pub fn cancel_artwork_write(&self) -> bool {
+        if let Some(cancel) = &self.artwork_write_cancel {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn complete_artwork_write(&mut self, session_id: u64, generation: u64) -> bool {
         if self
             .artwork_write
@@ -6312,6 +6379,7 @@ impl MetadataEditorState {
             .unwrap_or(false)
         {
             self.artwork_write = None;
+            self.artwork_write_cancel = None;
             true
         } else {
             false
@@ -6963,6 +7031,26 @@ impl MetadataEditorState {
         self.model.active_surface_mut().technical_details.begin_write()
     }
 
+    pub fn begin_cancellable_write(&mut self) -> (u64, u64, crate::tui::probe::MetadataWriteCancelFlag) {
+        let (session_id, generation) = self.begin_write();
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        self.metadata_write_cancel = Some(cancel.clone());
+        (session_id, generation, cancel)
+    }
+
+    pub fn cancel_metadata_write(&self) -> bool {
+        if let Some(cancel) = &self.metadata_write_cancel {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_metadata_write_cancel(&mut self) {
+        self.metadata_write_cancel = None;
+    }
+
     /// Reduce save results into the matching editor surface.
     ///
     /// Invariant: async write completions must match the active editor session
@@ -6975,22 +7063,26 @@ impl MetadataEditorState {
         save_generation: u64,
         results: Vec<MetadataEditorWriteResult>,
     ) -> Option<MetadataEditorWriteSummary> {
-        if self.presentation_tabs.is_empty() {
+        let summary = if self.presentation_tabs.is_empty() {
             if self.model.file_surface.technical_details.session_id != session_id {
                 return None;
             }
-            return apply_write_results_to_tab(
+            apply_write_results_to_tab(
                 &mut self.model.file_surface,
                 save_generation,
                 results,
-            );
+            )
+        } else {
+            let idx = self
+                .presentation_tabs
+                .iter()
+                .position(|tab| tab.technical_details.session_id == session_id)?;
+            apply_write_results_to_tab(&mut self.presentation_tabs[idx], save_generation, results)
+        };
+        if summary.is_some() {
+            self.clear_metadata_write_cancel();
         }
-
-        let idx = self
-            .presentation_tabs
-            .iter()
-            .position(|tab| tab.technical_details.session_id == session_id)?;
-        apply_write_results_to_tab(&mut self.presentation_tabs[idx], save_generation, results)
+        summary
     }
 }
 
@@ -7058,6 +7150,33 @@ fn apply_write_results_to_tab(
                         path: cue_path,
                         reason,
                     });
+                }
+            }
+            MetadataEditorWriteOutcome::SavedWithWarnings { warnings } => {
+                let Some(&idx) = path_to_index.get(&path) else {
+                    summary.ignored = summary.ignored.saturating_add(1);
+                    if summary.first_problem.is_none() {
+                        summary.first_problem = Some(format!(
+                            "ignored stale save result for '{}'",
+                            path.display()
+                        ));
+                    }
+                    continue;
+                };
+                summary.saved = summary.saved.saturating_add(1);
+                summary.saved_paths.push(path.clone());
+                saved_slots.insert(idx);
+                if let Some(file) = tab.technical_details.files.get_mut(idx) {
+                    file.issues.retain(|issue| !matches!(issue, MetadataIssue::Write { .. }));
+                }
+                summary.durability_warnings = summary
+                    .durability_warnings
+                    .saturating_add(warnings.len());
+                if summary.first_durability_warning.is_none() {
+                    summary.first_durability_warning = warnings
+                        .iter()
+                        .find(|warning| !warning.trim().is_empty())
+                        .cloned();
                 }
             }
             MetadataEditorWriteOutcome::Saved => {

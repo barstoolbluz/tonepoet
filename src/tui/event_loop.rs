@@ -33,6 +33,15 @@ pub async fn run_app(
     // spawn async scans. Must happen before the event loop starts.
     app.browse.set_tx(tx.clone());
     app.tui_tx = Some(tx.clone());
+    // Recover both explicit metadata-write models at startup. Native FLAC
+    // writes use sidecar metadata-region journals; legacy non-FLAC writes use
+    // DB entries that point at full-file `.tonepoet-bak` backups.
+    for message in super::probe::recover_stale_flac_metadata_journals_in_dir(&app.browse.current_dir) {
+        app.set_status(message);
+    }
+    for message in app.db.recover_stale_metadata_writes() {
+        app.set_status(message);
+    }
     let mut deferred_browse_visible_messages: VecDeque<AppMessage> = VecDeque::new();
 
     loop {
@@ -3294,13 +3303,18 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             value,
             result,
         } => {
-            // Step 3 (main thread): cleanup journal + backup, invalidate caches.
+            // Step 3 (main thread): invalidate caches. Native FLAC writes
+            // are recovered by their sidecar metadata journal; non-FLAC
+            // fallback writes may also have a legacy DB/full-file backup.
             let path_str = path.display().to_string();
+            let uses_native_flac_journal = crate::tui::probe::uses_native_flac_metadata_journal(&path);
             let backup = crate::db::Database::backup_path_for(&path);
             match result {
                 Ok(()) => {
-                    let _ = app.db.complete_metadata_write(&path_str);
-                    let _ = std::fs::remove_file(&backup);
+                    if !uses_native_flac_journal {
+                        let _ = app.db.complete_metadata_write(&path_str);
+                        let _ = std::fs::remove_file(&backup);
+                    }
                     app.browse.remove_probe_cache_entry(&path);
                     app.browse.probe_pending.remove(&path);
                     app.browse.invalidate_search_tag_cache_for_metadata_path(&path);
@@ -3350,11 +3364,15 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                 }
                 Err(e) => {
-                    // Rollback: restore from backup.
+                    // Non-FLAC fallback may still leave a file-scope backup.
+                    // Native FLAC writes restore from their metadata journal
+                    // internally and are not represented in the DB journal.
                     if backup.exists() {
                         let _ = std::fs::rename(&backup, &path);
                     }
-                    let _ = app.db.complete_metadata_write(&path_str);
+                    if !uses_native_flac_journal {
+                        let _ = app.db.complete_metadata_write(&path_str);
+                    }
                     app.set_status(format!("write failed (rolled back): {}", e));
                 }
             }
@@ -3787,9 +3805,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     reduced = true;
                 } else {
                     match result {
-                        Ok(metadata) => {
+                        Ok(batch_result) => {
+                            let durability_warning_count = batch_result.durability_warnings.len();
+                            let first_durability_warning = batch_result.durability_warnings.first().cloned();
                             if let Some(surface) = state.surface_mut_for_session(session_id) {
-                                metadata_editor_apply_artwork_metadata(surface, &paths, &metadata);
+                                metadata_editor_apply_artwork_metadata(surface, &paths, &batch_result.metadata);
                                 state.mark_archive_staging_dirty();
                                 let archive_persist_result = if let Some(context) = state.archive_edit_context.clone().filter(|context| context.owner == super::app::ArchiveMetadataEditOwner::Browse) {
                                     super::keybindings::record_staged_archive_metadata_write(
@@ -3810,6 +3830,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                     app.set_status(format!(
                                         "metadata editor: {} wrote staged files, but archive recovery tracking failed: {err}",
                                         mode.label()
+                                    ));
+                                } else if durability_warning_count > 0 {
+                                    app.set_status(format!(
+                                        "metadata editor: {} updated {} file{} with {} durability warning{}{}",
+                                        mode.label(),
+                                        paths.len(),
+                                        if paths.len() == 1 { "" } else { "s" },
+                                        durability_warning_count,
+                                        if durability_warning_count == 1 { "" } else { "s" },
+                                        first_durability_warning
+                                            .as_ref()
+                                            .map(|warning| format!(": {warning}"))
+                                            .unwrap_or_default()
                                     ));
                                 } else {
                                     app.set_status(format!(
