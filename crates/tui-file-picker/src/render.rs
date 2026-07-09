@@ -459,7 +459,10 @@ impl FilePickerState {
                 " "
             };
             let indent = "  ".repeat(node.depth);
-            let label = fit_text_right(&format!("{indent}{marker} {}", node.name), inner.width as usize);
+            // Keep the START of the name: the tree is prefix-sorted, so the
+            // leading text (year, artist) is what makes it navigable. Paths in
+            // the address/target displays keep the tail instead (fit_text_right).
+            let label = fit_text_start(&format!("{indent}{marker} {}", node.name), inner.width as usize);
             let style = if idx == self.tree_cursor && self.focus == FilePickerFocus::Tree {
                 self.theme.selected
             } else if same_display_path(&node.path, &self.current_dir) {
@@ -1011,6 +1014,20 @@ fn fit_text_left(text: &str, width: usize) -> String {
     out
 }
 
+/// Fit `text` into `width` keeping its beginning; overflow is marked with a
+/// trailing ellipsis. Use for name-like text where the prefix discriminates.
+fn fit_text_start(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return fit_text_left(text, width);
+    }
+    if width <= 1 {
+        return "\u{2026}".to_string();
+    }
+    let prefix: String = text.chars().take(width - 1).collect();
+    format!("{prefix}\u{2026}")
+}
+
 fn fit_text_right(text: &str, width: usize) -> String {
     let count = text.chars().count();
     if count <= width {
@@ -1172,6 +1189,18 @@ fn same_display_path(a: &std::path::Path, b: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crate::{ConflictPolicyPreset, FilePickerConfig, FilePickerFilter};
+
+    #[test]
+    fn fit_text_start_keeps_name_prefix_and_marks_overflow_at_the_end() {
+        // The folder tree is prefix-sorted; truncation must preserve the
+        // discriminating leading text, unlike fit_text_right (path tails).
+        assert_eq!(
+            fit_text_start("(1960) Nat Adderley - Work Song [Riverside]", 20),
+            "(1960) Nat Adderley\u{2026}"
+        );
+        assert_eq!(fit_text_start("short", 10), "short     ");
+        assert_eq!(fit_text_start("overflow", 1), "\u{2026}");
+    }
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier, Style};
@@ -1434,8 +1463,11 @@ mod tests {
             .draw(|frame| picker.render(frame, Rect::new(0, 0, 96, 24)))
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let delete = find_text(buffer, " Delete ", 100, 30).expect("delete button text");
-        let cancel = find_text(buffer, " Cancel ", 100, 30).expect("cancel button text");
+        // The popup's message line ("Delete \"front 2.jpg\"?") also contains
+        // " Delete " and renders above the buttons; the buttons are the LAST
+        // occurrence on screen.
+        let delete = find_text_last(buffer, " Delete ", 100, 30).expect("delete button text");
+        let cancel = find_text_last(buffer, " Cancel ", 100, 30).expect("cancel button text");
 
         assert_eq!(buffer.get(delete.0, delete.1).bg, Color::Blue);
         assert_eq!(buffer.get(cancel.0, cancel.1).bg, Color::Green);
@@ -1512,6 +1544,26 @@ mod tests {
             && inner.y >= outer.y
             && inner.x.saturating_add(inner.width) <= outer.x.saturating_add(outer.width)
             && inner.y.saturating_add(inner.height) <= outer.y.saturating_add(outer.height)
+    }
+
+    fn find_text_last(buffer: &Buffer, text: &str, width: u16, height: u16) -> Option<(u16, u16)> {
+        let symbols = text.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+        let text_width = u16::try_from(symbols.len()).ok()?;
+        if text_width == 0 || text_width > width {
+            return None;
+        }
+        for y in (0..height).rev() {
+            for x in 0..=width.saturating_sub(text_width) {
+                if symbols
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, symbol)| buffer.get(x.saturating_add(offset as u16), y).symbol() == symbol.as_str())
+                {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
     }
 
     fn find_text(buffer: &Buffer, text: &str, width: u16, height: u16) -> Option<(u16, u16)> {

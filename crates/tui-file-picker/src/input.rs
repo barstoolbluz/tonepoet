@@ -128,6 +128,25 @@ impl FilePickerState {
                 self.activate_tree_cursor();
                 FilePickerAction::None
             }
+            KeyCode::PageUp => {
+                let rows = self.tree_visible_rows();
+                self.move_tree_cursor(-(rows as isize), rows);
+                FilePickerAction::None
+            }
+            KeyCode::PageDown => {
+                let rows = self.tree_visible_rows();
+                self.move_tree_cursor(rows as isize, rows);
+                FilePickerAction::None
+            }
+            KeyCode::Home => {
+                self.set_tree_cursor(0, self.tree_visible_rows());
+                FilePickerAction::None
+            }
+            KeyCode::End => {
+                let last = self.tree_nodes.len().saturating_sub(1);
+                self.set_tree_cursor(last, self.tree_visible_rows());
+                FilePickerAction::None
+            }
             KeyCode::Backspace => {
                 self.go_parent();
                 FilePickerAction::None
@@ -674,6 +693,34 @@ mod tests {
             picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
             FilePickerAction::Selected(temp.path().to_path_buf())
         );
+    }
+
+    #[test]
+    fn tree_pane_pages_and_jumps_with_page_and_home_end_keys() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 0..40 {
+            fs::create_dir(temp.path().join(format!("dir-{index:02}"))).expect("dir");
+        }
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.set_focus(FilePickerFocus::Tree);
+        picker.set_tree_visible_rows(10);
+        let node_count = picker.tree_nodes.len();
+        assert!(node_count > 10, "fixture must overflow one page");
+
+        picker.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(picker.tree_cursor, node_count - 1, "End jumps to the last node");
+
+        picker.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(picker.tree_cursor, 0, "Home jumps to the first node");
+
+        picker.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(picker.tree_cursor, 10, "PageDown advances one visible page");
+
+        picker.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(picker.tree_cursor, 0, "PageUp retreats one visible page");
     }
 
     #[test]
