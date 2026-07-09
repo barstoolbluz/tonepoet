@@ -555,7 +555,7 @@ fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDe
 
     let mut matching = Vec::new();
     for cue_path in candidates {
-        if sidecar_cue_is_usable_for_image(&cue_path, image)? {
+        if sidecar_cue_subdivides_image(&cue_path, image)? {
             matching.push(cue_path);
         }
     }
@@ -570,18 +570,20 @@ fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDe
     }
 }
 
-fn sidecar_cue_is_usable_for_image(
+/// Number of the CUE's tracks whose resolved FILE reference is `image`
+/// (0 when the CUE cannot be decoded, parsed, or fully resolved).
+fn sidecar_cue_track_count_for_image(
     cue_path: &Path,
     image: &Path,
-) -> Result<bool, SourceDetectError> {
+) -> Result<usize, SourceDetectError> {
     let raw = std::fs::read(cue_path)?;
     let content = match decode_cue_bytes_for_path(&raw, cue_path) {
         Ok(content) => content,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(0),
     };
     let sheet = parse_cue(&content);
     if validate_sidecar_layout_detect(&sheet).is_err() {
-        return Ok(false);
+        return Ok(0);
     }
 
     let cue_input = CueInput {
@@ -593,12 +595,37 @@ fn sidecar_cue_is_usable_for_image(
     };
 
     let Ok(track_images) = resolve_track_image_paths(&cue_input) else {
-        return Ok(false);
+        return Ok(0);
     };
 
     Ok(track_images
         .iter()
-        .any(|resolved| same_existing_path(resolved, image)))
+        .filter(|resolved| same_existing_path(resolved, image))
+        .count())
+}
+
+/// Explicit-pairing check for SAME-STEM sidecars: the CUE merely has to
+/// reference the image. A same-stem name is a deliberate association made by
+/// whoever produced the rip, so subdivision evidence is not required.
+fn sidecar_cue_is_usable_for_image(
+    cue_path: &Path,
+    image: &Path,
+) -> Result<bool, SourceDetectError> {
+    Ok(sidecar_cue_track_count_for_image(cue_path, image)? >= 1)
+}
+
+/// Inference check for DIRECTORY-SCAN association: a foreign-stem CUE
+/// qualifies `image` as a decomposable CUE image only when it SUBDIVIDES it
+/// (maps two or more tracks to it). A CUE that maps exactly one track to the
+/// file is an album-level split-track listing (one FILE per track); the file
+/// is a split track and must stay on the legacy single-file path — otherwise
+/// every track of such an album decomposes into the whole album, duplicating
+/// the conversion once per queued track.
+fn sidecar_cue_subdivides_image(
+    cue_path: &Path,
+    image: &Path,
+) -> Result<bool, SourceDetectError> {
+    Ok(sidecar_cue_track_count_for_image(cue_path, image)? >= 2)
 }
 
 fn embedded_cuesheet_is_present(path: &Path) -> bool {
@@ -628,7 +655,7 @@ fn find_valid_sidecar_cue_for_image(image: &Path) -> Result<Option<PathBuf>, Mat
 
     let mut matching = Vec::new();
     for cue_path in candidates {
-        match sidecar_cue_matches_image(&cue_path, image) {
+        match sidecar_cue_subdivides_image_materialize(&cue_path, image) {
             Ok(true) => matching.push(cue_path),
             Ok(false) => {}
             Err(_) => {
@@ -664,7 +691,10 @@ fn validate_sidecar_cue_matches_image(
     }
 }
 
-fn sidecar_cue_matches_image(cue_path: &Path, image: &Path) -> Result<bool, MaterializeError> {
+fn sidecar_cue_track_count_for_image_materialize(
+    cue_path: &Path,
+    image: &Path,
+) -> Result<usize, MaterializeError> {
     let raw_cue = read_cue_text(cue_path)?;
     let sheet = parse_cue(&raw_cue);
     validate_sidecar_layout(&sheet)?;
@@ -678,7 +708,25 @@ fn sidecar_cue_matches_image(cue_path: &Path, image: &Path) -> Result<bool, Mate
     let track_images = resolve_track_image_paths(&cue_input)?;
     Ok(track_images
         .iter()
-        .any(|resolved| same_existing_path(resolved, image)))
+        .filter(|resolved| same_existing_path(resolved, image))
+        .count())
+}
+
+/// Explicit same-stem pairing: reference alone suffices (see the detect-time
+/// twin `sidecar_cue_is_usable_for_image` for the rationale).
+fn sidecar_cue_matches_image(cue_path: &Path, image: &Path) -> Result<bool, MaterializeError> {
+    Ok(sidecar_cue_track_count_for_image_materialize(cue_path, image)? >= 1)
+}
+
+/// Directory-scan inference: requires subdivision (two or more tracks mapped
+/// to the image) — one-track-per-file album CUEs list split tracks and must
+/// not turn them into whole-album CUE images (see the detect-time twin
+/// `sidecar_cue_subdivides_image`).
+fn sidecar_cue_subdivides_image_materialize(
+    cue_path: &Path,
+    image: &Path,
+) -> Result<bool, MaterializeError> {
+    Ok(sidecar_cue_track_count_for_image_materialize(cue_path, image)? >= 2)
 }
 
 fn source_detect_to_materialize(err: SourceDetectError) -> MaterializeError {
@@ -3822,7 +3870,11 @@ FILE "03 - Wonderin.wav" WAVE
     }
 
     #[test]
-    fn sidecar_discovery_matches_audio_inside_multiple_file_cue() {
+    fn sidecar_discovery_ignores_one_track_per_file_album_cue_for_listed_tracks() {
+        // A one-track-per-FILE album CUE lists split tracks; discovering it
+        // for a listed track would decompose the whole album once per queued
+        // track (the Kansas incident). Scan-based discovery requires the CUE
+        // to SUBDIVIDE the queried file (map two or more tracks to it).
         let temp = tempfile::tempdir().expect("temp dir");
         let cue_path = temp.path().join("album.cue");
         let track1 = temp.path().join("track1.flac");
@@ -3840,9 +3892,42 @@ FILE "track2.flac" WAVE
         let _ = std::fs::write(&track1, b"fake-audio-data");
         let _ = std::fs::write(&track2, b"fake-audio-data");
 
-        let discovered = find_valid_sidecar_cue_for_image(&track2)
+        let discovered =
+            find_valid_sidecar_cue_for_image(&track2).expect("sidecar search succeeds");
+        assert_eq!(
+            discovered, None,
+            "a split track listed once in an album CUE must not adopt that CUE"
+        );
+    }
+
+    #[test]
+    fn sidecar_discovery_matches_side_image_subdivided_by_multi_file_cue() {
+        // The legitimate multi-FILE case: per-side images where the CUE maps
+        // several tracks to each file. Scan-based discovery still applies.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_path = temp.path().join("album.cue");
+        let side_a = temp.path().join("side-a.flac");
+        let side_b = temp.path().join("side-b.flac");
+        let _ = std::fs::write(
+            &cue_path,
+            br#"FILE "side-a.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+FILE "side-b.flac" WAVE
+  TRACK 03 AUDIO
+    INDEX 01 00:00:00
+  TRACK 04 AUDIO
+    INDEX 01 04:00:00
+"#,
+        );
+        let _ = std::fs::write(&side_a, b"fake-audio-data");
+        let _ = std::fs::write(&side_b, b"fake-audio-data");
+
+        let discovered = find_valid_sidecar_cue_for_image(&side_a)
             .expect("sidecar search succeeds")
-            .expect("multi-file CUE matches referenced audio");
+            .expect("a CUE subdividing the queried image is discovered");
         assert_eq!(discovered, cue_path);
     }
 
@@ -4334,6 +4419,88 @@ FILE "track2.flac" WAVE
             destination.metadata().expect("staged metadata").len() > 0,
             "published staged segment should be non-empty"
         );
+    }
+
+    fn split_track_album_cue_fixture(dir: &Path, ref_ext: &str) -> Vec<std::path::PathBuf> {
+        // Kansas-shape layout: individual track files plus ONE album-level
+        // noncompliant CUE that lists every track as its own FILE entry.
+        let titles = ["01-Alpha", "02-Beta", "03-Gamma"];
+        let mut cue = String::new();
+        let mut files = Vec::new();
+        for (idx, title) in titles.iter().enumerate() {
+            let audio = dir.join(format!("{title}.flac"));
+            std::fs::write(&audio, b"not-a-real-flac").expect("track fixture");
+            cue.push_str(&format!(
+                "FILE \"{title}.{ref_ext}\" WAVE\n  TRACK {:02} AUDIO\n  TITLE \"{title}\"\n  INDEX 01 00:00:00\n",
+                idx + 1
+            ));
+            files.push(audio);
+        }
+        std::fs::write(dir.join("album.cue"), cue.as_bytes()).expect("album cue");
+        files
+    }
+
+    #[test]
+    fn split_track_listed_in_album_cue_is_not_a_cue_image_candidate() {
+        // Regression: a noncompliant multi-FILE album CUE (one track per FILE)
+        // references every split track; each queued track must stay on the
+        // legacy single-file path, NOT decompose the whole album per item.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let files = split_track_album_cue_fixture(temp.path(), "flac");
+
+        for audio in &files {
+            let mut req = test_request(audio);
+            req.source.cue_sidecar = CueSidecarPolicy::PreferEmbedded;
+            let candidate = is_cue_image_candidate(&req).expect("candidacy check");
+            assert!(
+                !candidate,
+                "{} is a split track listed in an album CUE and must not route as a CUE image",
+                audio.display()
+            );
+        }
+    }
+
+    #[test]
+    fn split_track_listed_in_wav_referencing_album_cue_is_not_a_cue_image_candidate() {
+        // Same layout but the CUE references .wav names while files are .flac
+        // (the common EAC noncompliant-cue artifact); stem resolution must not
+        // turn split tracks into whole-album CUE images either.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let files = split_track_album_cue_fixture(temp.path(), "wav");
+
+        for audio in &files {
+            let mut req = test_request(audio);
+            req.source.cue_sidecar = CueSidecarPolicy::PreferEmbedded;
+            let candidate = is_cue_image_candidate(&req).expect("candidacy check");
+            assert!(
+                !candidate,
+                "{} is a split track listed in a wav-referencing album CUE and must not route as a CUE image",
+                audio.display()
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_single_image_cue_remains_a_cue_image_candidate() {
+        // Control: one image subdivided into multiple tracks stays on the CUE
+        // pipeline under the same policy.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album-image.flac");
+        std::fs::write(&image, b"not-a-real-flac").expect("image fixture");
+        std::fs::write(
+            temp.path().join("album-image.cue"),
+            br#"FILE "album-image.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#,
+        )
+        .expect("image cue");
+
+        let mut req = test_request(&image);
+        req.source.cue_sidecar = CueSidecarPolicy::PreferEmbedded;
+        assert!(is_cue_image_candidate(&req).expect("candidacy check"));
     }
 
     #[test]
