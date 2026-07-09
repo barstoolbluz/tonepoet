@@ -10976,11 +10976,20 @@ fn build_publish_plan_with_album_dir(
 /// Publish a whole album atomically by filling a temp directory beside the
 /// final album directory, then renaming it into place.
 pub fn publish_album_output(
-    staging: StagingDir,
+    mut staging: StagingDir,
     plan: &PublishPlan,
     policy: PublishPolicy,
     manifest: Option<&super::manifest::ConversionManifest>,
 ) -> Result<PublishedAlbum, PublishError> {
+    // A failed publish preserves disk staging for diagnostics/retry: every
+    // error return below drops `staging`, and an armed drop would delete the
+    // staged tree. Success does not rely on the armed drop either — it removes
+    // staging explicitly via cleanup_successful_staging. Scratch (tmpfs)
+    // staging stays armed: leftovers there hold memory the scratch budget no
+    // longer accounts for once the reservation is released.
+    if !staging.is_scratch_staging() {
+        staging.disarm();
+    }
     if plan.entries.is_empty() {
         return Err(PublishError::StagingMissing);
     }
@@ -18275,9 +18284,14 @@ fn strip_resolution_from_title_extra(extra: &str) -> String {
 
 fn looks_like_title_extra_metadata(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
+    // Region words ("US", "UK", "Japan", ...) are deliberately NOT evidence:
+    // a country-only parenthetical is album identity ("Aftermath (US)" and
+    // "Aftermath (UK)" are different albums) and must stay in the title.
+    // Region-bearing pressing designators still extract because they carry
+    // format/resolution/catalog evidence of their own ("Japan / SHM SACD ISO").
     let has_format_or_region = [
         "blu-ray", "bluray", "dvd-a", "dvda", "dvd-v", "dvdv", "sacd", "shm", "shm-cd",
-        "iso", "japan", "us", "usa", "uk", "eu", "lp", "cd", "mfsl", "mofi",
+        "iso", "lp", "cd", "mfsl", "mofi",
         "mobile", "fidelity", "first-press", "pressing",
     ]
     .iter()
@@ -22714,9 +22728,12 @@ mod naming_template_tests {
             &tonepoet_pipeline::AudioFormat::Flac,
         )
         .unwrap();
+        // %NONEXISTENT% expands to empty and the renderer trims trailing
+        // whitespace per path component (deliberate filesystem hygiene,
+        // same policy as sanitize_component).
         assert_eq!(
             path,
-            PathBuf::from("01 - Right Off - 1971 - Jazz - CK-1234 - 44.1kHz - 24 - CAT 999 - ")
+            PathBuf::from("01 - Right Off - 1971 - Jazz - CK-1234 - 44.1kHz - 24 - CAT 999 -")
         );
     }
 
@@ -23034,9 +23051,12 @@ mod title_extra_tests {
             &source,
             &tonepoet_pipeline::AudioFormat::Flac,
         );
+        // The shared fixture carries date "March 1971", so the (%YEAR%)
+        // group resolves; this test's subject is the literal {braces}
+        // surviving around a resolving %TITLE_EXTRA% block.
         assert_eq!(
             rendered,
-            PathBuf::from("Miles Davis - At Fillmore East () [FLAC] {MFSL}")
+            PathBuf::from("Miles Davis - At Fillmore East (1971) [FLAC] {MFSL}")
         );
     }
 
@@ -23082,6 +23102,13 @@ mod title_extra_tests {
             track.metadata.track_number = Some(track_number);
             track.metadata.disc_number = None;
             track.metadata.title = Some(title.to_string());
+            // Distinct staged paths whose duplicate NN prefixes mirror the
+            // duplicate track numbers under test; "a"/"b" dirs deliberately
+            // carry no disc-directory evidence.
+            let side = if source_ordinal % 2 == 1 { "a" } else { "b" };
+            track.source_ref = TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "/stage/{side}/{track_number:02} - {title}.flac"
+            )));
             track
         };
         source.tracks = vec![
@@ -23129,6 +23156,11 @@ mod title_extra_tests {
             track.metadata.track_number = Some(track_number);
             track.metadata.disc_number = None;
             track.metadata.title = Some(title.to_string());
+            // One staged file per track; a shared path would fabricate
+            // duplicate filename-prefix evidence this test does not intend.
+            track.source_ref = TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "/stage/{track_number:02} - {title}.flac"
+            )));
             track
         };
         source.tracks = vec![
@@ -23261,6 +23293,13 @@ mod title_extra_tests {
             track.metadata.track_number = Some(track_number);
             track.metadata.disc_number = Some(disc_number);
             track.metadata.title = Some(title.to_string());
+            // One staged file per track (the fixture must not reuse one path
+            // for every track, or the duplicate-filename-prefix preference
+            // kicks in on degenerate evidence). Neutral "s{n}" dirs keep disc
+            // folder styling driven by the disc tags under test.
+            track.source_ref = TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "/stage/s{disc_number}/{track_number:02} - {title}.flac"
+            )));
             track
         };
         source.tracks = vec![
@@ -28478,10 +28517,24 @@ Source-aware setting: yes
         );
 
         let mut failed_req = real_fragment_request(temp.path(), batch_id, 2, "plan-failed-track");
-        failed_req.naming.template = "../escaped-plan-output".to_string();
         let failed_source = real_fragment_source(temp.path(), Some(1), 2, 2, 2);
+
+        // Adjudicated: a path-escaping template no longer fails planning —
+        // per-component sanitization neutralizes it inside the output root
+        // (robustness posture; reject_escaping_path remains the backstop).
+        failed_req.naming.template = "../escaped-plan-output".to_string();
+        let sanitized = plan_outputs(&failed_source, &failed_req)
+            .expect("escaping template sanitizes in-root instead of failing");
+        assert!(
+            sanitized.entries.iter().all(|entry| entry.final_path.starts_with(&sanitized.album_dir)),
+            "sanitized escape must stay inside the album dir: {sanitized:?}"
+        );
+
+        // The PlanFailed fragment flow under test needs a template that
+        // genuinely fails planning: a structurally malformed token.
+        failed_req.naming.template = "%TITLE".to_string();
         let plan_error = plan_outputs(&failed_source, &failed_req)
-            .expect_err("the path-escaping template should fail during output planning")
+            .expect_err("an unclosed % token must fail output planning")
             .to_string();
         let failed_outcome = AlbumOutcome::Blocked {
             successful: Vec::new(),

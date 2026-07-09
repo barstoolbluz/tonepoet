@@ -3854,10 +3854,14 @@ mod output_options_companion_projection_tests {
 
         assert_eq!(MergeMode.next_for(true), CompanionExtensions);
         assert_eq!(CompanionExtensions.next_for(true), CompanionFolders);
-        assert_eq!(CompanionFolders.next_for(true), WriteLog);
+        assert_eq!(CompanionFolders.next_for(true), ExcludeFiles);
+        assert_eq!(ExcludeFiles.next_for(true), ForceEncode);
+        assert_eq!(ForceEncode.next_for(true), DiscSubfolders);
+        assert_eq!(DiscSubfolders.next_for(true), WriteLog);
         assert_eq!(WriteLog.next_for(true), DestPath);
         assert_eq!(DestPath.prev_for(true), WriteLog);
-        assert_eq!(WriteLog.prev_for(true), CompanionFolders);
+        assert_eq!(WriteLog.prev_for(true), DiscSubfolders);
+        assert_eq!(DiscSubfolders.prev_for(true), ForceEncode);
         assert_eq!(CompanionExtensions.clamp_for(true), CompanionExtensions);
     }
 }
