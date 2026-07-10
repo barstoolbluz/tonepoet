@@ -31,6 +31,16 @@ const WINDOW_CAP: usize = 2000;
 
 fn scan_file(path: &Path, violations: &mut Vec<String>) {
     let source = std::fs::read_to_string(path).expect("read source file");
+    for line in violating_lines(&source) {
+        violations.push(format!("{}:{}", path.display(), line));
+    }
+}
+
+/// Line numbers of stdin-inheriting launches in `source`. Extracted from the
+/// file scan so the detector itself is pinned by tests below — a refactor
+/// that stops detecting would otherwise leave the sentinel vacuously green.
+fn violating_lines(source: &str) -> Vec<usize> {
+    let mut lines = Vec::new();
     for launcher in [".spawn()", ".status()"] {
         let mut search_from = 0;
         while let Some(rel) = source[search_from..].find(launcher) {
@@ -58,10 +68,10 @@ fn scan_file(path: &Path, violations: &mut Vec<String>) {
             if window.contains(".output()") {
                 continue;
             }
-            let line = source[..launch].matches('\n').count() + 1;
-            violations.push(format!("{}:{}", path.display(), line));
+            lines.push(source[..launch].matches('\n').count() + 1);
         }
     }
+    lines
 }
 
 fn scan_dir(dir: &Path, violations: &mut Vec<String>) {
@@ -107,4 +117,55 @@ fn spawn_and_status_subprocesses_configure_stdin() {
         "subprocess launches inheriting stdin (add .stdin(Stdio::null()) or annotate `DELIBERATE stdin inheritance`):\n{}",
         violations.join("\n")
     );
+}
+
+// Detector self-tests: pin every behavior the convention relies on, so a
+// refactor of the window logic cannot silently stop detecting.
+
+#[test]
+fn detector_flags_single_statement_chain() {
+    let src = "fn f() {\n    let s = Command::new(\"x\").arg(\"y\").status();\n}\n";
+    assert_eq!(violating_lines(src), vec![2]);
+}
+
+#[test]
+fn detector_flags_builder_pattern_spawn() {
+    let src = "fn f() {\n    let mut cmd = Command::new(\"x\");\n    cmd.arg(\"y\");\n    let child = cmd.spawn();\n}\n";
+    assert_eq!(violating_lines(src), vec![4]);
+}
+
+#[test]
+fn detector_passes_stdin_configured_launches() {
+    let chain = "let s = Command::new(\"x\").stdin(Stdio::null()).status();";
+    let builder = "let mut c = Command::new(\"x\");\nc.stdin(Stdio::piped());\nlet ch = c.spawn();";
+    assert!(violating_lines(chain).is_empty());
+    assert!(violating_lines(builder).is_empty());
+}
+
+#[test]
+fn detector_honors_exemption_marker_above_the_launch() {
+    let src = "// DELIBERATE stdin inheritance: editor needs the TTY\nlet s = Command::new(\"x\").status();";
+    assert!(violating_lines(src).is_empty());
+}
+
+#[test]
+fn detector_skips_output_consumed_command_before_unrelated_status() {
+    // The .status() belongs to an HTTP response, not the Command (which
+    // .output() consumed safely). Must not flag.
+    let src = "let o = Command::new(\"x\").output()?;\nlet code = resp.status();";
+    assert!(violating_lines(src).is_empty());
+}
+
+#[test]
+fn detector_ignores_status_with_no_command_in_range() {
+    let src = "let code = resp.status();\nlet h = tokio::spawn(async {});";
+    assert!(violating_lines(src).is_empty());
+}
+
+#[test]
+fn detector_flags_each_violation_with_its_own_line() {
+    let src = "let a = Command::new(\"x\").status();\nlet ok = Command::new(\"y\").stdin(Stdio::null()).status();\nlet mut c = Command::new(\"z\");\nlet b = c.spawn();\n";
+    let mut lines = violating_lines(src);
+    lines.sort_unstable();
+    assert_eq!(lines, vec![1, 4]);
 }
