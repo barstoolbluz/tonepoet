@@ -119,10 +119,10 @@ enum Commands {
         #[arg(long, name = "overwrite")]
         overwrite_output: bool,
 
-        /// Output naming template (e.g. "%NN% - %TITLE%")
+        /// Output naming template (e.g. "%NN% - %TITLE%"; disc tokens include %DISC_FOLDER%, %DISCNUMBER%, %NNDISCNUMBER%, %NNNDISCNUMBER%, %DISCTOTAL%)
         #[arg(long)]
         naming: Option<String>,
-        /// Output album/folder naming template (e.g. "%ARTIST%/%ALBUM% (%YEAR%)")
+        /// Output album/folder naming template (e.g. "%ARTIST%/%ALBUM% (%YEAR%)"; disc-number tokens are available for proven multi-disc items)
         #[arg(long = "folder-naming")]
         folder_naming: Option<String>,
 

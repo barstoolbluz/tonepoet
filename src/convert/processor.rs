@@ -3644,6 +3644,7 @@ mod tests {
         let disk_album_dir = output_root.join("disk-attempt-complete");
         let plan = AlbumPlan {
             album_dir: disk_album_dir.clone(),
+            album_dirs: Vec::new(),
             entries: vec![PlannedTrackOutput {
                 track_id: track_id.clone(),
                 final_path: disk_album_dir.join("01.flac"),
@@ -3953,6 +3954,7 @@ mod tests {
             };
             let plan = AlbumPlan {
                 album_dir: album_dir.clone(),
+                album_dirs: Vec::new(),
                 entries: plan_entries,
             };
             let album = scheduled_album_for_test(
@@ -4224,6 +4226,7 @@ mod tests {
         };
         let plan = AlbumPlan {
             album_dir: album_dir.clone(),
+            album_dirs: Vec::new(),
             entries: vec![PlannedTrackOutput {
                 track_id: track_id.clone(),
                 final_path: final_path.clone(),

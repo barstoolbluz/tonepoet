@@ -1751,7 +1751,16 @@ pub struct PreparedSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlbumPlan {
+    /// Primary album directory for legacy single-root consumers. For ordinary
+    /// plans this is the only publish root. For disc-scoped folder templates
+    /// that intentionally render multiple sibling album directories, this is
+    /// the first deterministic root and `album_dirs` carries the complete set.
     pub album_dir: PathBuf,
+    /// Complete set of album directories that a single planned item publishes
+    /// into. Empty means the historical single-root interpretation of
+    /// `album_dir`; non-empty is sorted and normalized by the planner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub album_dirs: Vec<PathBuf>,
     pub entries: Vec<PlannedTrackOutput>,
 }
 

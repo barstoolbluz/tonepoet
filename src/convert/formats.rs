@@ -378,10 +378,19 @@ pub struct ConversionOptions {
     /// ReplayGain mode (Track, Album, or Both)
     pub replaygain_mode: Option<ReplayGainMode>,
 
-    /// Output filename template
+    /// Output filename template.
+    ///
+    /// Built-in disc tokens include `%DISC_FOLDER%` (standardized `disc NN`),
+    /// `%DISCNUMBER%`, `%NNDISCNUMBER%`, `%NNNDISCNUMBER%`, and `%DISCTOTAL%`.
+    /// The disc-number family renders empty unless the source is a proven
+    /// multi-disc layout, so conditional template blocks drop for single-disc
+    /// albums carrying incidental `DISCNUMBER=1` tags. When those blocks
+    /// resolve for proven multi-disc sources, disc-routing blocks unwrap to
+    /// their contents rather than emitting literal braces.
     pub naming_template: Option<String>,
 
-    /// Output album/folder template
+    /// Output album/folder template. The same disc-number tokens are accepted
+    /// here for independent per-track album-batch items.
     pub folder_template: Option<String>,
 
     /// Whether to overwrite existing files
@@ -590,22 +599,59 @@ impl ConversionOptions {
 }
 
 
-/// Token expanded by the planner into `Disc NN` for detected multi-disc sets.
+/// Token expanded by the planner into standardized `disc NN` for detected multi-disc sets.
 pub const DISC_FOLDER_TEMPLATE_TOKEN: &str = "%DISC_FOLDER%";
+
+const DISC_NUMBER_ROUTE_TEMPLATE_TOKENS: [&str; 3] = [
+    "%DISCNUMBER%",
+    "%NNDISCNUMBER%",
+    "%NNNDISCNUMBER%",
+];
+
+/// True when the filename template already authors a disc-scoped path segment.
+///
+/// `create_disc_subfolders` is a projection convenience, not a command to wrap
+/// user-authored disc routing. A template such as
+/// `disc %NNDISCNUMBER%/%TRACKNN% - %TITLE%` must therefore be left alone.
+/// `%DISCTOTAL%` is album-level data, not a per-disc route: it does not
+/// suppress the convenience prefix unless a real disc-scoped token is also in
+/// a non-leaf component. A bare disc number in the leaf filename likewise still
+/// receives the convenience prefix when the switch is on.
+fn template_has_explicit_disc_route(template: &str) -> bool {
+    if template.contains(DISC_FOLDER_TEMPLATE_TOKEN) {
+        return true;
+    }
+
+    let mut components = template.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        if DISC_NUMBER_ROUTE_TEMPLATE_TOKENS
+            .iter()
+            .any(|token| component.contains(token))
+        {
+            return true;
+        }
+    }
+
+    false
+}
 
 /// Return `template` with a leading disc-folder component when requested.
 ///
 /// This helper is intentionally backend-owned rather than TUI-owned: the UI may
 /// surface `create_disc_subfolders`, but the conversion/processor handoff is
 /// responsible for preserving the option for every entrypoint. Existing explicit
-/// `%DISC_FOLDER%` tokens are respected to keep the operation idempotent.
+/// `%DISC_FOLDER%` tokens and user-authored disc-number path components are
+/// respected to keep the operation idempotent.
 #[must_use]
 pub fn naming_template_with_disc_subfolder(
     template: impl Into<String>,
     create_disc_subfolders: bool,
 ) -> String {
     let template = template.into();
-    if !create_disc_subfolders || template.contains(DISC_FOLDER_TEMPLATE_TOKEN) {
+    if !create_disc_subfolders || template_has_explicit_disc_route(&template) {
         return template;
     }
     format!("{DISC_FOLDER_TEMPLATE_TOKEN}/{template}")
@@ -878,8 +924,9 @@ fn default_cue_generation_mode() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_companion_extensions, parse_companion_exclude_files, parse_companion_extensions,
-        parse_companion_folders, AudioFormat, FileFormat, FormatDetector,
+        default_companion_extensions, naming_template_with_disc_subfolder,
+        parse_companion_exclude_files, parse_companion_extensions, parse_companion_folders,
+        AudioFormat, FileFormat, FormatDetector,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -919,6 +966,44 @@ mod tests {
         fs::write(bdmv.join("PLAYLIST").join("00000.mpls"), b"playlist")
             .expect("write playlist");
         fs::write(bdmv.join("STREAM").join("00000.m2ts"), b"stream").expect("write stream");
+    }
+
+    #[test]
+    fn disc_subfolder_projection_respects_explicit_disc_number_route() {
+        assert_eq!(
+            naming_template_with_disc_subfolder(
+                "disc %NNDISCNUMBER%/%TRACKNN% - %TITLE%",
+                true,
+            ),
+            "disc %NNDISCNUMBER%/%TRACKNN% - %TITLE%"
+        );
+        assert_eq!(
+            naming_template_with_disc_subfolder(
+                "{disc %NNDISCNUMBER%/}%TRACKNN% - %TITLE%",
+                true,
+            ),
+            "{disc %NNDISCNUMBER%/}%TRACKNN% - %TITLE%"
+        );
+    }
+
+    #[test]
+    fn disc_subfolder_projection_still_prefixes_leaf_disc_number_filename() {
+        assert_eq!(
+            naming_template_with_disc_subfolder("%DISCNUMBER% - %TRACKNN% - %TITLE%", true),
+            "%DISC_FOLDER%/%DISCNUMBER% - %TRACKNN% - %TITLE%"
+        );
+    }
+
+    #[test]
+    fn disc_total_alone_does_not_suppress_disc_subfolder_projection() {
+        assert_eq!(
+            naming_template_with_disc_subfolder("%DISCTOTAL% discs/%TRACKNN% - %TITLE%", true),
+            "%DISC_FOLDER%/%DISCTOTAL% discs/%TRACKNN% - %TITLE%"
+        );
+        assert_eq!(
+            naming_template_with_disc_subfolder("%DISCTOTAL% discs/disc %NNDISCNUMBER%/%TRACKNN% - %TITLE%", true),
+            "%DISCTOTAL% discs/disc %NNDISCNUMBER%/%TRACKNN% - %TITLE%"
+        );
     }
 
     #[test]
