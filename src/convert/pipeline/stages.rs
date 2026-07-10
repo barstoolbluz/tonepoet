@@ -16624,6 +16624,17 @@ fn copy_album_batch_companion_artifacts_once_ready_best_effort(
     }
 
     let source_dir = batch.source_grouping_root.clone();
+    if companion_container_requires_dedicated_dir(&req.container)
+        && !companion_dir_is_dedicated_to_container(&source_dir, &req.container)
+    {
+        log::info!(
+            "companion copy skipped for {context}: source container {} sits in a shared directory ({}) that is not dedicated to it; companions come from inside the container only",
+            req.container.display(),
+            source_dir.display()
+        );
+        cleanup_conversion_log_batch_coordination_after_success_best_effort(req, context.as_str());
+        return;
+    }
     let finalization_key = companion_batch_finalization_key(req, published, batch);
     let finalization_lock_dir = companion_batch_finalization_lock_dir(req)
         .unwrap_or_else(|| published.album_dir.clone());
@@ -17975,9 +17986,7 @@ enum CompanionSourceRefRole {
 /// direct pipeline-item cases explicit instead of applying `parent()` to every
 /// source ref indiscriminately.
 fn companion_source_dir(req: &PipelineRequest, source: &PreparedSource) -> Option<PathBuf> {
-    if let Some(batch_root) = companion_batch_source_root(req) {
-        return Some(batch_root);
-    }
+    let batch_root = companion_batch_source_root(req);
 
     let request_root = companion_root_for_existing_path(&req.container);
     let prepared_container_root = companion_root_for_existing_path(&source.container);
@@ -17985,14 +17994,81 @@ fn companion_source_dir(req: &PipelineRequest, source: &PreparedSource) -> Optio
 
     match source.kind {
         SourceKind::SingleFile | SourceKind::CueImage => {
-            request_root.or(prepared_container_root).or(track_root)
+            batch_root.or(request_root).or(prepared_container_root).or(track_root)
         }
+        // Self-contained container sources: their companions live INSIDE the
+        // container (extracted staging). The directory that merely holds the
+        // container file — a downloads dump with thousands of unrelated
+        // archives and logs — must never be swept into the album. A parent
+        // directory qualifies only when it is dedicated to this container
+        // (e.g. one archive per album folder with its cover art beside it).
         SourceKind::Archive
         | SourceKind::SacdIso
         | SourceKind::DvdAudio
         | SourceKind::DvdVideo
-        | SourceKind::BluRay => track_root.or(prepared_container_root).or(request_root),
+        | SourceKind::BluRay => track_root.or_else(|| {
+            [prepared_container_root, request_root, batch_root]
+                .into_iter()
+                .flatten()
+                .find(|root| companion_dir_is_dedicated_to_container(root, &req.container))
+        }),
     }
+}
+
+/// True when `dir` looks like a dedicated per-album home for `container`:
+/// it holds no OTHER container-like file (archive/disc-image) and no loose
+/// audio files. Artwork, cue sheets, logs, and subdirectories are fine —
+/// that is exactly the layout the companion sweep exists for. A bulk
+/// downloads directory fails this immediately on its other archives.
+fn companion_dir_is_dedicated_to_container(dir: &Path, container: &Path) -> bool {
+    const CONTAINER_EXTENSIONS: &[&str] = &[
+        "7z", "zip", "rar", "tar", "iso", "cab", "dmg", "gz", "bz2", "xz", "zst", "lz", "lzma",
+        "tgz", "tbz2", "txz",
+    ];
+    const AUDIO_EXTENSIONS: &[&str] = &[
+        "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4", "aac", "opus",
+        "ogg", "ape", "w64", "rf64", "dsf", "dff", "shn", "dts", "ac3",
+    ];
+    let container_identity = normalize_path(container);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if normalize_path(&path) == container_identity {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if CONTAINER_EXTENSIONS.contains(&ext.as_str()) || AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Container-file sources whose companion sweep must respect the
+/// dedicated-directory rule (see `companion_dir_is_dedicated_to_container`).
+fn companion_container_requires_dedicated_dir(container: &Path) -> bool {
+    if container.is_dir() {
+        return false;
+    }
+    let name = container
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    const SELF_CONTAINED: &[&str] = &[
+        ".7z", ".zip", ".rar", ".tar", ".iso", ".cab", ".dmg", ".tgz", ".tbz2", ".txz",
+        ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz", ".tar.lzma",
+    ];
+    SELF_CONTAINED.iter().any(|suffix| name.ends_with(suffix))
 }
 
 fn companion_batch_source_root(req: &PipelineRequest) -> Option<PathBuf> {
@@ -19828,6 +19904,86 @@ mod companion_copy_hardening_tests {
         );
         assert!(!dst.join("disc 01").exists(), "pending retry must not invent fallback disc folders");
         assert!(!dst.join("disc 02").exists(), "pending retry must not invent fallback disc folders");
+    }
+
+    fn shared_downloads_dir_fixture(temp: &Path) -> (PathBuf, PathBuf) {
+        let downloads = temp.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("downloads dir");
+        let container = downloads.join("Dio - The Last In Line (UK).7z");
+        std::fs::write(&container, b"archive bytes").expect("container");
+        std::fs::write(downloads.join("Other Album.7z"), b"other archive").expect("sibling archive");
+        std::fs::write(downloads.join("conversion-log-20260224-172850.txt"), b"hexload log").expect("stray log");
+        (downloads, container)
+    }
+
+    #[test]
+    fn shared_download_dir_is_not_dedicated_to_an_archive_container() {
+        // Regression for the Dio incident: 426 stray hexload logs swept from
+        // a 12k-file downloads directory into the album because the archive's
+        // parent directory was used as the companion source root.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (downloads, container) = shared_downloads_dir_fixture(temp.path());
+        assert!(!companion_dir_is_dedicated_to_container(&downloads, &container));
+
+        let dedicated = temp.path().join("Album");
+        std::fs::create_dir_all(&dedicated).expect("album dir");
+        let solo = dedicated.join("album.7z");
+        std::fs::write(&solo, b"archive").expect("solo archive");
+        std::fs::write(dedicated.join("cover.jpg"), b"art").expect("cover");
+        std::fs::write(dedicated.join("rip.log"), b"log").expect("log");
+        std::fs::create_dir_all(dedicated.join("Artwork")).expect("artwork dir");
+        assert!(companion_dir_is_dedicated_to_container(&dedicated, &solo));
+
+        std::fs::write(dedicated.join("loose.flac"), b"audio").expect("loose audio");
+        assert!(
+            !companion_dir_is_dedicated_to_container(&dedicated, &solo),
+            "loose audio beside the container disqualifies the directory"
+        );
+    }
+
+    #[test]
+    fn archive_in_shared_dir_gets_no_parent_companion_source() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (downloads, container) = shared_downloads_dir_fixture(temp.path());
+
+        let mut req = test_request(temp.path(), container.clone());
+        req.album_batch = Some(AlbumBatchContext::new(
+            super::chunk_2_1_3_postprocessing_gate_and_phase_tests::generated_test_batch_id("shared-dir-archive"),
+            1,
+            temp.path().join("out").join("Album"),
+            downloads.clone(),
+        ));
+        let mut source = test_prepared_source(
+            SourceKind::Archive,
+            container.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(container.clone()))],
+        );
+        // Post-publish, extracted staging is gone: no track root survives.
+        source.tracks.clear();
+
+        assert_eq!(
+            companion_source_dir(&req, &source),
+            None,
+            "an archive in a shared downloads dir must not sweep its parent"
+        );
+
+        let dedicated = temp.path().join("Album Home");
+        std::fs::create_dir_all(&dedicated).expect("dedicated");
+        let solo = dedicated.join("album.7z");
+        std::fs::write(&solo, b"archive").expect("solo");
+        let mut solo_req = test_request(temp.path(), solo.clone());
+        solo_req.album_batch = None;
+        let mut solo_source = test_prepared_source(
+            SourceKind::Archive,
+            solo.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(solo.clone()))],
+        );
+        solo_source.tracks.clear();
+        assert_eq!(
+            companion_source_dir(&solo_req, &solo_source),
+            Some(dedicated.clone()),
+            "a dedicated per-album archive home still sweeps beside the container"
+        );
     }
 
     #[test]
