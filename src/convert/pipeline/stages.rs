@@ -16682,6 +16682,18 @@ fn copy_companion_artifacts_after_publish_best_effort(
         copy_album_batch_companion_artifacts_once_ready_best_effort(req, artifacts, published);
     } else {
         copy_companion_artifacts_best_effort(req, source, artifacts, published);
+        // Album batches WITHOUT a resolved identity take this legacy per-item
+        // path, but they still own a log-coordination workspace under
+        // .tonepoet-batch/. The coordinated finalizer never runs for them, so
+        // once the batch is durably complete nothing else would clean that
+        // workspace — the last-finishing item does it here. (Idempotent and
+        // best-effort: concurrent finishers may both observe completion.)
+        if req.album_batch.is_some() && conversion_log_batch_is_durably_complete(req) {
+            cleanup_conversion_log_batch_coordination_after_success_best_effort(
+                req,
+                req.item_id.as_str(),
+            );
+        }
     }
 }
 
@@ -20143,6 +20155,112 @@ mod companion_copy_hardening_tests {
         assert_eq!(
             std::fs::read(album_dir.join("lineage.txt")).expect("lineage copied"),
             b"ripped from UK first press"
+        );
+    }
+
+    #[test]
+    fn uncoordinated_batch_cleans_its_coordination_workspace_once_complete() {
+        // Task #12: album batches WITHOUT a resolved identity (disc-subfolders
+        // off) take the legacy per-item companion path; the coordinated
+        // finalizer never runs, so the .tonepoet-batch workspace survived
+        // successful conversions forever. The per-item path now cleans it
+        // once the batch is durably complete.
+        let _global_state = companion_batch_global_state_test_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let out = temp.path().join("out");
+        let dst = out.join("Album");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        std::fs::create_dir_all(&dst).expect("dst");
+        let audio = source_dir.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+
+        let mut req = test_request(temp.path(), audio.clone());
+        req.output_root = out.clone();
+        req.companion.extensions = vec!["log".to_string()];
+        // AlbumBatchContext WITHOUT resolved identity => uncoordinated path.
+        req.album_batch = Some(AlbumBatchContext::new(
+            super::chunk_2_1_3_postprocessing_gate_and_phase_tests::generated_test_batch_id(
+                "uncoordinated-cleanup",
+            ),
+            1,
+            dst.clone(),
+            source_dir.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+        assert!(
+            !should_coordinate_album_batch_companion_copy(&req),
+            "fixture must exercise the legacy per-item path"
+        );
+
+        let coord_dir = conversion_log_batch_coordination_album_dir(&req)
+            .expect("coordination dir");
+        let identity = conversion_log_batch_identity(&req, &coord_dir, None)
+            .expect("batch identity");
+        mark_conversion_log_batch_complete(&identity, 1).expect("durable completion marker");
+        assert!(coord_dir.is_dir(), "workspace exists before the companion pass");
+
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: dst,
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+
+        assert!(
+            !coord_dir.exists(),
+            "the last-finishing item of a durably complete uncoordinated batch cleans the workspace"
+        );
+    }
+
+    #[test]
+    fn uncoordinated_incomplete_batch_keeps_its_workspace() {
+        let _global_state = companion_batch_global_state_test_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        std::fs::create_dir_all(&out).expect("out");
+        let audio = source_dir.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+
+        let mut req = test_request(temp.path(), audio.clone());
+        req.output_root = out.clone();
+        req.companion.extensions = vec!["log".to_string()];
+        req.album_batch = Some(AlbumBatchContext::new(
+            super::chunk_2_1_3_postprocessing_gate_and_phase_tests::generated_test_batch_id(
+                "uncoordinated-incomplete",
+            ),
+            2,
+            out.join("Album"),
+            source_dir.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+
+        let coord_dir = conversion_log_batch_coordination_album_dir(&req)
+            .expect("coordination dir");
+        std::fs::create_dir_all(&coord_dir).expect("live workspace");
+
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: out.join("Album"),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+
+        assert!(
+            coord_dir.exists(),
+            "an incomplete batch's live workspace must never be cleaned by a sibling's companion pass"
         );
     }
 
