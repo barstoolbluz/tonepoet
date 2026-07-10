@@ -361,13 +361,30 @@ impl RealToolRunner {
                 // unrelated workers can continue reading already-cached
                 // versions. The in-progress marker above prevents concurrent
                 // first-use callers for the same binary from spawning duplicate
-                // probes; they wait briefly for this owner to publish the
-                // cached result.
-                let detected = detect_tool_version(binary, path);
-                let cache_value = detected.clone().unwrap_or_default();
-                if let Ok(mut cache) = self.version_cache.lock() {
-                    cache.insert(binary, cache_value);
+                // probes; they wait for this owner to publish the cached
+                // result. The publish guard fires on ALL exits — including a
+                // panic mid-probe — so waiters can never be wedged behind a
+                // permanently in-progress marker.
+                struct PublishOnDrop<'a> {
+                    cache: &'a Mutex<HashMap<ToolBinary, String>>,
+                    binary: ToolBinary,
+                    value: String,
                 }
+                impl Drop for PublishOnDrop<'_> {
+                    fn drop(&mut self) {
+                        if let Ok(mut cache) = self.cache.lock() {
+                            cache.insert(self.binary, std::mem::take(&mut self.value));
+                        }
+                    }
+                }
+                let mut publish = PublishOnDrop {
+                    cache: &self.version_cache,
+                    binary,
+                    value: String::new(),
+                };
+                let detected = detect_tool_version(binary, path);
+                publish.value = detected.clone().unwrap_or_default();
+                drop(publish);
                 return detected;
             }
 
@@ -402,7 +419,13 @@ impl RealToolRunner {
 }
 
 const TOOL_VERSION_DETECTION_TIMEOUT: Duration = Duration::from_millis(100);
-const TOOL_VERSION_CACHE_WAIT_TIMEOUT: Duration = Duration::from_millis(150);
+// Waiters must get the PUBLISHED answer for a once-per-binary probe rather
+// than fabricating "no version" under load: subprocess spawn can exceed
+// hundreds of milliseconds when the test suite (or a busy conversion) is
+// fork-storming, and a waiter that gives up records wrong provenance. The
+// probe publishes exactly once (unwind-safe), so this bound is a last-resort
+// escape hatch, not an expected path.
+const TOOL_VERSION_CACHE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_VERSION_CAPTURE_BYTES: u64 = 1024 * 1024;
 static TOOL_VERSION_CAPTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TOOL_VERSION_CACHE_IN_PROGRESS: &str = "\0tonepoet-tool-version-in-progress";
@@ -1328,10 +1351,47 @@ mod real_tool_runner_tests {
         let dir = std::env::temp_dir().join(unique);
         fs::create_dir_all(&dir).expect("script temp dir");
         let path = dir.join(name);
-        fs::write(&path, body).expect("write script");
+        // Inject a side-effect-free selfcheck arm right after the shebang so
+        // the ETXTBSY verify loop below can execute the script without
+        // touching any fixture state (several bodies mutate count files
+        // unconditionally).
+        let (shebang, rest) = body
+            .split_once('\n')
+            .expect("fixture scripts start with a shebang line");
+        let guarded = format!(
+            "{shebang}\nif [ \"$1\" = \"--tonepoet-fixture-selfcheck\" ]; then exit 0; fi\n{rest}"
+        );
+        fs::write(&path, guarded).expect("write script");
         let mut perms = fs::metadata(&path).expect("script metadata").permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).expect("chmod script");
+        // Write-then-exec is racy in a threaded test process: a concurrent
+        // test's fork can inherit this file's write fd for a moment, and a
+        // direct exec then fails with ETXTBSY ("Text file busy"). Verify the
+        // script is executable before handing it out; one successful exec
+        // proves no writer fd survives, and nothing rewrites the file after.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::process::Command::new(&path)
+                .arg("--tonepoet-fixture-selfcheck")
+                .output()
+            {
+                Ok(output) if output.status.success() => break,
+                Ok(output) => panic!(
+                    "fixture script selfcheck failed for {}: {:?}",
+                    path.display(),
+                    output.status
+                ),
+                // ETXTBSY (errno 26): a racing fork still holds the write fd.
+                Err(err) if err.raw_os_error() == Some(26) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!(
+                    "fixture script selfcheck could not execute {}: {err}",
+                    path.display()
+                ),
+            }
+        }
         path
     }
 
