@@ -1602,6 +1602,7 @@ fn run_check_tools() {
                     .args(args.as_slice())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
+                    .stdin(std::process::Stdio::null())
                     .status()
                     .is_ok();
                 let icon = if available { "+" } else { "-" };

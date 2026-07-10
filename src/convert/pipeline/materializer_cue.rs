@@ -4290,6 +4290,7 @@ FILE "side-b.flac" WAVE
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false)

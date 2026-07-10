@@ -25,6 +25,7 @@ pub fn detect_7z_binary() -> Option<&'static str> {
         .arg("--help")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
         .status()
         .is_ok()
     {
@@ -34,6 +35,7 @@ pub fn detect_7z_binary() -> Option<&'static str> {
     if Command::new("7z")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
         .status()
         .is_ok()
     {

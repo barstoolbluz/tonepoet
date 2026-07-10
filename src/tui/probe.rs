@@ -2577,6 +2577,7 @@ mod flac_metadata_writer {
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
             .status()
             .map(|_| true)
             .unwrap_or(false)
@@ -7726,6 +7727,7 @@ mod tests {
                 .arg(flag)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .stdin(std::process::Stdio::null())
                 .status()
                 .map(|status| status.success())
                 .unwrap_or(false)
@@ -7747,6 +7749,7 @@ mod tests {
                 "flac",
             ])
             .arg(path)
+            .stdin(std::process::Stdio::null())
             .status()
             .map_err(|err| format!("spawn ffmpeg for real FLAC fixture: {err}"))?;
         if status.success() {
@@ -7783,6 +7786,7 @@ mod tests {
                     "flac",
                 ])
                 .arg(path)
+                .stdin(std::process::Stdio::null())
                 .status()
                 .map_err(|err| format!("spawn ffmpeg for large FLAC fixture: {err}"))?;
             if !status.success() {
@@ -8315,6 +8319,7 @@ mod tests {
             .arg(named_user_entry)
             .arg("--")
             .arg(&path)
+            .stdin(std::process::Stdio::null())
             .status()
             .expect("run setfacl");
         if !status.success() {

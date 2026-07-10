@@ -2280,6 +2280,7 @@ fn tool_exists(cmd: &str) -> bool {
         .arg(cmd)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -2312,6 +2313,7 @@ pub async fn encode_corrected_track(
                 .arg("-c2000") // compression level: normal
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::null())
                 .status()
                 .await
                 .map_err(|e| format!("Failed to run mac: {}", e))?;
@@ -2461,6 +2463,7 @@ async fn copy_metadata_metaflac(src: &Path, dst: &Path) -> Result<(), String> {
         .arg(src)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
         .status()
         .await;
 
@@ -2471,6 +2474,7 @@ async fn copy_metadata_metaflac(src: &Path, dst: &Path) -> Result<(), String> {
                 .arg(dst)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .stdin(std::process::Stdio::null())
                 .status()
                 .await;
             let _ = std::fs::remove_file(&tmp_pic);

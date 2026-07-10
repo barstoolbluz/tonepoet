@@ -2705,6 +2705,7 @@ mod writeback_end_to_end_tests {
     fn tool_ok(tool: &str) -> bool {
         std::process::Command::new(tool).arg("-version")
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
             .status().map(|s| s.success()).unwrap_or(false)
     }
 
@@ -2722,7 +2723,7 @@ mod writeback_end_to_end_tests {
         assert!(std::process::Command::new("ffmpeg")
             .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
                    "sine=frequency=440:sample_rate=44100:duration=1", "-c:a", "flac"])
-            .arg(&image).status().expect("ffmpeg").success());
+            .arg(&image).stdin(std::process::Stdio::null()).status().expect("ffmpeg").success());
         let sidecar = temp.path().join("album.cue");
         std::fs::write(&sidecar,
             "REM DATE 1969\r\nPERFORMER \"Creedence Clearwater Revival\"\r\nTITLE \"Green River (DCC GZS-1064)\"\r\nFILE \"album.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    TITLE \"Stale One\"\r\n    INDEX 01 00:00:00\r\n  TRACK 02 AUDIO\r\n    TITLE \"Stale Two\"\r\n    INDEX 01 00:30:00\r\n",

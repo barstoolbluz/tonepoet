@@ -835,6 +835,7 @@ fn ffprobe_bluray_playlist_audio_streams(
     let input = format!("bluray:{}", source_path.display());
     let playlist_arg = playlist_number.to_string();
     let child = Command::new(ffprobe_path)
+        .stdin(std::process::Stdio::null())
         .args([
             "-v",
             "error",

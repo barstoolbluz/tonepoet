@@ -23,7 +23,10 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
         crossterm::terminal::LeaveAlternateScreen,
     );
 
-    // Run the editor, blocking until it exits.
+    // Run the editor, blocking until it exits. DELIBERATE stdin inheritance:
+    // the user's $EDITOR needs the terminal. This is the documented exemption
+    // from the subprocess stdin-nulling convention (see the sentinel test
+    // tests/subprocess_stdin_convention.rs).
     let status = Command::new(program)
         .args(&args)
         .arg(path)
@@ -170,6 +173,7 @@ fn detect_editor() -> Result<String, String> {
 fn which(cmd: &str) -> bool {
     Command::new("which")
         .arg(cmd)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

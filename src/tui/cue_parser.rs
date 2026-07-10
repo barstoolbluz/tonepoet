@@ -197,6 +197,7 @@ pub fn extract_single_image_tracks(
             .arg(&info.audio_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("wvunpack failed: {}", e))?;
         if !status.success() {
@@ -230,6 +231,7 @@ pub fn extract_single_image_tracks(
             .arg(&out_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("ffmpeg segment extract failed: {}", e))?;
 
@@ -251,6 +253,7 @@ pub fn can_ffmpeg_read(path: &Path) -> bool {
         .arg(path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

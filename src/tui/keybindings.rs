@@ -30443,6 +30443,7 @@ mod single_image_metadata_editor_regression_tests {
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
@@ -30468,6 +30469,7 @@ mod single_image_metadata_editor_regression_tests {
             .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
                    "sine=frequency=440:sample_rate=44100:duration=1", "-c:a", "flac"])
             .arg(&image)
+            .stdin(std::process::Stdio::null())
             .status()
             .expect("ffmpeg fixture");
         assert!(status.success());
