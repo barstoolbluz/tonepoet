@@ -162,6 +162,7 @@ where
     let start = Instant::now();
     let mut proc = tokio::process::Command::new(&binary_path);
     proc.args(&cmd.args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

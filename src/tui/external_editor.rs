@@ -86,7 +86,9 @@ pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
         crossterm::terminal::LeaveAlternateScreen,
     );
 
-    // Build and run command.
+    // Build and run command. DELIBERATE stdin inheritance, same exemption as
+    // the read-write editor spawn above: the user's $EDITOR needs the terminal
+    // (see tests/subprocess_stdin_convention.rs).
     let mut cmd = Command::new(program);
     cmd.args(&args);
     if let Some(flag) = readonly_flag {

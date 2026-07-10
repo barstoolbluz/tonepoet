@@ -253,7 +253,8 @@ impl ConversionCommand {
         });
 
         // Configure child process with piped outputs
-        cmd.stdout(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         // Spawn child process
@@ -332,7 +333,8 @@ impl ConversionCommand {
         }
 
         // Spawn with piped outputs
-        cmd.stdout(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
@@ -472,7 +474,8 @@ impl ConversionCommand {
         }
 
         // Spawn with piped outputs
-        cmd.stdout(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
@@ -535,7 +538,8 @@ impl ConversionCommand {
         }
 
         // Use spawn for progress updates
-        cmd.stdout(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         let child = cmd.spawn()?;
@@ -608,7 +612,8 @@ impl ConversionCommand {
         }
 
         // Use spawn for real-time progress updates
-        cmd.stdout(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         let child = cmd.spawn()?;

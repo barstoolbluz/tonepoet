@@ -151,6 +151,7 @@ impl ConversionBackend {
             "ssrc" => {
                 // ssrc always exits non-zero; just check if the binary is found
                 return std::process::Command::new(tool)
+                    .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status()
@@ -160,6 +161,7 @@ impl ConversionBackend {
         };
         std::process::Command::new(tool)
             .arg(arg)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()

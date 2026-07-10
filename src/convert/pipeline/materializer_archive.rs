@@ -947,7 +947,10 @@ async fn run_repackage_command<F>(
 where
     F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
 {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|err| format!("{label}: command not found or failed to start: {err}"))?;
