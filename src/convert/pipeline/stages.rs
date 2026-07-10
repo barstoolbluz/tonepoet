@@ -16605,6 +16605,16 @@ fn container_companion_snapshot_before_publish_best_effort(
         return None;
     }
     let extraction_root = companion_prepared_track_common_source_root(source)?;
+    // The snapshot exists to rescue companions from EXTRACTION STAGING that
+    // publish is about to delete. Disc-format track refs point back at the
+    // ORIGINAL container location (an ISO's parent, the disc root), which is
+    // not staging: those roots survive publish and flow through the regular
+    // ancestor-gated sweep instead. Snapshotting them here would bypass the
+    // dedication gate and re-open the bulk-directory sweep.
+    let home = companion_container_home(&req.container);
+    if normalize_path(&home).starts_with(normalize_path(&extraction_root)) {
+        return None;
+    }
     // The snapshot must OUTLIVE publish, which deletes the whole job staging
     // tree (extraction included). Place it beside the job stagings in the
     // durable staging parent; the returned StagingDir removes it on drop.
@@ -20133,6 +20143,50 @@ mod companion_copy_hardening_tests {
         assert_eq!(
             std::fs::read(album_dir.join("lineage.txt")).expect("lineage copied"),
             b"ripped from UK first press"
+        );
+    }
+
+    #[test]
+    fn original_location_roots_are_never_snapshotted() {
+        // Audit finding on the ancestor-rule round: the snapshot path must
+        // not bypass the dedication gate. Disc-format sources whose track
+        // refs resolve to the ORIGINAL container location (an ISO's bulk
+        // parent, a disc root) get no snapshot; only true extraction staging
+        // qualifies.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bulk = temp.path().join("iso-rips");
+        std::fs::create_dir_all(&bulk).expect("bulk");
+        let iso = bulk.join("album.iso");
+        std::fs::write(&iso, b"iso").expect("iso");
+        std::fs::write(bulk.join("stray.txt"), b"stray").expect("stray");
+
+        let mut req = test_request(temp.path(), iso.clone());
+        req.companion.extensions = vec!["txt".to_string()];
+        let source = test_prepared_source(
+            SourceKind::SacdIso,
+            iso.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(iso.clone()))],
+        );
+        assert!(
+            container_companion_snapshot_before_publish_best_effort(&req, &source).is_none(),
+            "an ISO's original parent directory must not be snapshotted"
+        );
+
+        let disc_root = temp.path().join("Film");
+        std::fs::create_dir_all(disc_root.join("BDMV")).expect("bdmv");
+        let inner = disc_root.join("BDMV").join("index.bdmv");
+        std::fs::write(&inner, b"idx").expect("idx");
+        std::fs::write(disc_root.join("notes.txt"), b"notes").expect("notes");
+        let mut bd_req = test_request(temp.path(), disc_root.clone());
+        bd_req.companion.extensions = vec!["txt".to_string()];
+        let bd_source = test_prepared_source(
+            SourceKind::BluRay,
+            disc_root.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(inner))],
+        );
+        assert!(
+            container_companion_snapshot_before_publish_best_effort(&bd_req, &bd_source).is_none(),
+            "a disc root survives publish; the regular sweep handles it without a snapshot"
         );
     }
 
