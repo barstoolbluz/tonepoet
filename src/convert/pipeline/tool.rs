@@ -587,6 +587,11 @@ pub(crate) fn detect_tool_version(binary: ToolBinary, path: &Path) -> Option<Str
 
     let spawn_result = std::process::Command::new(path)
         .args(version_command_args(binary))
+        // Same rule as every other subprocess (see the archive-hang fix): a
+        // tool that reads stdin on a version-ish invocation must get EOF, not
+        // an inherited terminal — a blocked probe wedges the version cache's
+        // in-progress marker and stalls every waiter.
+        .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn();
