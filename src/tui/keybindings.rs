@@ -1920,6 +1920,127 @@ fn handle_browse_inline_edit_key(
 }
 
 #[cfg(test)]
+mod metadata_auto_populate_alignment_tests {
+    use super::*;
+
+    fn entry(display_key: &str, item_key: lofty::tag::ItemKey, values: Vec<&str>) -> crate::tui::probe::TagEntry {
+        crate::tui::probe::TagEntry {
+            display_key: display_key.to_string(),
+            item_key,
+            value: String::new(),
+            original: String::new(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: values.iter().map(|v| v.to_string()).collect(),
+            per_file_originals: values.iter().map(|v| v.to_string()).collect(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    fn two_paths() -> Vec<std::path::PathBuf> {
+        vec![
+            std::path::PathBuf::from("/tmp/01 - One.flac"),
+            std::path::PathBuf::from("/tmp/02 - Two.flac"),
+        ]
+    }
+
+    #[test]
+    fn track_indexed_entries_are_skipped_without_panicking() {
+        // Regression for the reported main-thread panic
+        // ("index out of bounds: the len is 1 but the index is 1"):
+        // an entry synthesized from an embedded CUESHEET is TRACK-indexed and
+        // can be shorter than the path list; auto-populate must skip it, not
+        // index it by file position.
+        let paths = two_paths();
+        let mut entries = vec![entry(
+            "TITLE",
+            lofty::tag::ItemKey::TrackTitle,
+            vec!["Track-Indexed Title"],
+        )];
+
+        let populated = ensure_and_auto_populate_track_title_entries(
+            &mut entries,
+            &paths,
+            &[true, true],
+        );
+
+        let title = entries
+            .iter()
+            .find(|e| e.display_key == "TITLE")
+            .expect("title entry retained");
+        assert_eq!(
+            title.per_file_values,
+            vec!["Track-Indexed Title".to_string()],
+            "track-indexed entry must be left exactly as the reader built it"
+        );
+        let tn = entries
+            .iter()
+            .find(|e| e.display_key == "TRACKNUMBER")
+            .expect("tracknumber entry created");
+        assert_eq!(tn.per_file_values.len(), paths.len());
+        assert!(populated, "created aligned TRACKNUMBER slots are populated");
+        assert!(!tn.per_file_values[0].is_empty());
+        assert!(!tn.per_file_values[1].is_empty());
+    }
+
+    #[test]
+    fn aligned_empty_entries_are_populated_from_filenames() {
+        let paths = two_paths();
+        let mut entries = vec![
+            entry("TRACKNUMBER", lofty::tag::ItemKey::TrackNumber, vec!["", ""]),
+            entry("TITLE", lofty::tag::ItemKey::TrackTitle, vec!["", ""]),
+        ];
+
+        let populated = ensure_and_auto_populate_track_title_entries(
+            &mut entries,
+            &paths,
+            &[true, true],
+        );
+
+        assert!(populated);
+        let title = entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values, vec!["One".to_string(), "Two".to_string()]);
+        assert!(title.is_mixed, "distinct titles recalculate as mixed");
+        let tn = entries.iter().find(|e| e.display_key == "TRACKNUMBER").unwrap();
+        assert_eq!(tn.per_file_values.len(), 2);
+    }
+
+    #[test]
+    fn empty_per_file_vectors_do_not_panic_summary_recalculation() {
+        // A zero-length per-file vector is misaligned for any n >= 1 and must
+        // be skipped by both the populate loop and the summary recalculation
+        // (the second block's old recalc indexed [0] unguarded).
+        let paths = vec![std::path::PathBuf::from("/tmp/01 - Only.flac")];
+        let mut entries = vec![
+            entry("TRACKNUMBER", lofty::tag::ItemKey::TrackNumber, vec![]),
+            entry("TITLE", lofty::tag::ItemKey::TrackTitle, vec![]),
+        ];
+
+        let populated =
+            ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &[true]);
+
+        assert!(!populated, "misaligned entries are never written");
+        assert!(entries.iter().all(|e| e.per_file_values.is_empty()));
+    }
+
+    #[test]
+    fn write_blocked_files_are_not_auto_populated() {
+        let paths = two_paths();
+        let mut entries = vec![entry("TITLE", lofty::tag::ItemKey::TrackTitle, vec!["", ""])];
+
+        ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &[true, false]);
+
+        let title = entries.iter().find(|e| e.display_key == "TITLE").unwrap();
+        assert_eq!(title.per_file_values[0], "One");
+        assert_eq!(
+            title.per_file_values[1], "",
+            "write-blocked slots keep their placeholder"
+        );
+    }
+}
+
+#[cfg(test)]
 mod inline_edit_behavior_tests {
     use super::*;
     use crate::config::TonepoetConfig;
@@ -10832,6 +10953,122 @@ pub(super) fn install_archive_metadata_editor_payload(
     ));
 }
 
+/// Find-or-create the TRACKNUMBER/TITLE entries and fill their empty
+/// per-file slots from filename stems, for files writable this session.
+/// Returns true when anything was populated.
+///
+/// File-scope alignment invariant: an entry participates only when its
+/// per-file vectors are exactly paths-aligned. Entries synthesized from an
+/// embedded CUESHEET are indexed by TRACK position, not file position (the
+/// save path skips them for the same reason in
+/// apply_audio_tag_changes_with_save_blocks); indexing those by file
+/// position panics — the reported crash was `per_file_values[1]` on a
+/// one-slot per-track entry.
+fn ensure_and_auto_populate_track_title_entries(
+    entries: &mut Vec<super::probe::TagEntry>,
+    paths: &[std::path::PathBuf],
+    auto_populate_allowed: &[bool],
+) -> bool {
+    let n = paths.len();
+    let mut created_any = false;
+    let mut find_or_create = |entries: &mut Vec<super::probe::TagEntry>,
+                              display_key: &str,
+                              item_key: lofty::tag::ItemKey| {
+        match entries
+            .iter()
+            .position(|e| e.display_key.eq_ignore_ascii_case(display_key))
+        {
+            Some(idx) => idx,
+            None => {
+                entries.push(super::probe::TagEntry {
+                    display_key: display_key.to_string(),
+                    item_key,
+                    value: String::new(),
+                    original: String::new(),
+                    is_binary: false,
+                    is_mixed: false,
+                    per_file_values: vec![String::new(); n],
+                    per_file_originals: vec![String::new(); n],
+                    mb_proposed_value: None,
+                    mb_proposed_per_file: None,
+                });
+                created_any = true;
+                entries.len() - 1
+            }
+        }
+    };
+    let tn_idx = find_or_create(entries, "TRACKNUMBER", lofty::tag::ItemKey::TrackNumber);
+    let title_idx = find_or_create(entries, "TITLE", lofty::tag::ItemKey::TrackTitle);
+
+    let entry_is_file_aligned = |entry: &super::probe::TagEntry| {
+        entry.per_file_values.len() == n && entry.per_file_originals.len() == n
+    };
+    let tn_aligned = entry_is_file_aligned(&entries[tn_idx]);
+    let title_aligned = entry_is_file_aligned(&entries[title_idx]);
+
+    let mut did_auto_populate = false;
+    for i in 0..n {
+        if !auto_populate_allowed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let stem = paths[i].file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let (parsed_track, parsed_title) = super::probe::parse_title_from_filename(stem);
+
+        if tn_aligned && entries[tn_idx].per_file_values[i].is_empty() {
+            if let Some(t) = parsed_track {
+                entries[tn_idx].per_file_values[i] = t.to_string();
+                did_auto_populate = true;
+            }
+        }
+        if title_aligned && entries[title_idx].per_file_values[i].is_empty() {
+            if let Some(ref t) = parsed_title {
+                entries[title_idx].per_file_values[i] = t.clone();
+                did_auto_populate = true;
+            }
+        }
+    }
+
+    // Recalculate summary value/is_mixed for the entries this pass may have
+    // touched. Per-track (misaligned) entries were not touched; their
+    // track-indexed summaries must be left exactly as the reader built them.
+    for (idx, aligned) in [(tn_idx, tn_aligned), (title_idx, title_aligned)] {
+        if !aligned {
+            continue;
+        }
+        let all_same = entries[idx].per_file_values.windows(2).all(|w| w[0] == w[1]);
+        entries[idx].is_mixed = !all_same;
+        entries[idx].value = if !all_same {
+            "<multiple values>".to_string()
+        } else {
+            entries[idx].per_file_values.first().cloned().unwrap_or_default()
+        };
+    }
+
+    // Newly created TITLE/TRACKNUMBER should appear in standard position
+    // rather than appended at the end.
+    if created_any {
+        entries.sort_by(|a, b| {
+            let a_upper = a.display_key.to_ascii_uppercase();
+            let b_upper = b.display_key.to_ascii_uppercase();
+            let a_pos = super::probe::STANDARD_KEY_ORDER
+                .iter()
+                .position(|&k| k == a_upper);
+            let b_pos = super::probe::STANDARD_KEY_ORDER
+                .iter()
+                .position(|&k| k == b_upper);
+            match (a_pos, b_pos) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a_upper.cmp(&b_upper),
+            }
+        });
+    }
+
+    did_auto_populate
+}
+
+
 fn metadata_editor_state_from_loaded_files(
     app: &AppState,
     mut paths: Vec<std::path::PathBuf>,
@@ -10854,91 +11091,13 @@ fn metadata_editor_state_from_loaded_files(
         &app.preemph_results,
     );
 
-    let mut did_auto_populate = false;
-    {
-        let n = paths.len();
-        let tn_idx = entries
-            .iter()
-            .position(|e| e.display_key.eq_ignore_ascii_case("TRACKNUMBER"));
-        let title_idx = entries
-            .iter()
-            .position(|e| e.display_key.eq_ignore_ascii_case("TITLE"));
-
-        let tn_idx = match tn_idx {
-            Some(i) => i,
-            None => {
-                entries.push(crate::tui::probe::TagEntry {
-                    display_key: "TRACKNUMBER".to_string(),
-                    item_key: lofty::tag::ItemKey::TrackNumber,
-                    value: String::new(),
-                    original: String::new(),
-                    is_binary: false,
-                    is_mixed: false,
-                    per_file_values: vec![String::new(); n],
-                    per_file_originals: vec![String::new(); n],
-                    mb_proposed_value: None,
-                    mb_proposed_per_file: None,
-                });
-                entries.len() - 1
-            }
-        };
-        let title_idx = match title_idx {
-            Some(i) => i,
-            None => {
-                entries.push(crate::tui::probe::TagEntry {
-                    display_key: "TITLE".to_string(),
-                    item_key: lofty::tag::ItemKey::TrackTitle,
-                    value: String::new(),
-                    original: String::new(),
-                    is_binary: false,
-                    is_mixed: false,
-                    per_file_values: vec![String::new(); n],
-                    per_file_originals: vec![String::new(); n],
-                    mb_proposed_value: None,
-                    mb_proposed_per_file: None,
-                });
-                entries.len() - 1
-            }
-        };
-
-        let auto_populate_allowed: Vec<bool> = technical_details
-            .files
-            .iter()
-            .map(|file| file.file_facts.write_eligibility.is_writable())
-            .collect();
-        for i in 0..n {
-            if !auto_populate_allowed.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let stem = paths[i].file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let (parsed_track, parsed_title) = super::probe::parse_title_from_filename(stem);
-            if entries[tn_idx].per_file_values[i].is_empty() {
-                if let Some(t) = parsed_track {
-                    entries[tn_idx].per_file_values[i] = t.to_string();
-                    did_auto_populate = true;
-                }
-            }
-            if entries[title_idx].per_file_values[i].is_empty() {
-                if let Some(ref t) = parsed_title {
-                    entries[title_idx].per_file_values[i] = t.clone();
-                    did_auto_populate = true;
-                }
-            }
-        }
-
-        for idx in [tn_idx, title_idx] {
-            let all_same = entries[idx]
-                .per_file_values
-                .windows(2)
-                .all(|w| w[0] == w[1]);
-            entries[idx].is_mixed = !all_same;
-            entries[idx].value = if !all_same {
-                "<multiple values>".to_string()
-            } else {
-                entries[idx].per_file_values.first().cloned().unwrap_or_default()
-            };
-        }
-    }
+    let auto_populate_allowed: Vec<bool> = technical_details
+        .files
+        .iter()
+        .map(|file| file.file_facts.write_eligibility.is_writable())
+        .collect();
+    let did_auto_populate =
+        ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
 
     let file_labels = metadata_editor_file_labels(&paths, &entries);
     let mut state = super::app::MetadataEditorState::for_files(
@@ -11298,126 +11457,13 @@ pub fn open_metadata_editor(app: &mut AppState) {
     );
 
     // Auto-populate TITLE and TRACKNUMBER from filenames where missing.
-    let mut did_auto_populate = false;
-    {
-        let n = paths.len();
-
-        // Find or create TRACKNUMBER entry.
-        let tn_idx = entries
-            .iter()
-            .position(|e| e.display_key.to_ascii_uppercase() == "TRACKNUMBER");
-        let title_idx = entries
-            .iter()
-            .position(|e| e.display_key.to_ascii_uppercase() == "TITLE");
-
-        // Ensure TRACKNUMBER entry exists.
-        let tn_idx = match tn_idx {
-            Some(i) => i,
-            None => {
-                entries.push(super::probe::TagEntry {
-                    display_key: "TRACKNUMBER".to_string(),
-                    item_key: lofty::tag::ItemKey::TrackNumber,
-                    value: String::new(),
-                    original: String::new(),
-                    is_binary: false,
-                    is_mixed: false,
-                    per_file_values: vec![String::new(); n],
-                    per_file_originals: vec![String::new(); n],
-                    mb_proposed_value: None,
-                    mb_proposed_per_file: None,
-                });
-                entries.len() - 1
-            }
-        };
-
-        // Ensure TITLE entry exists.
-        let title_idx = match title_idx {
-            Some(i) => i,
-            None => {
-                entries.push(super::probe::TagEntry {
-                    display_key: "TITLE".to_string(),
-                    item_key: lofty::tag::ItemKey::TrackTitle,
-                    value: String::new(),
-                    original: String::new(),
-                    is_binary: false,
-                    is_mixed: false,
-                    per_file_values: vec![String::new(); n],
-                    per_file_originals: vec![String::new(); n],
-                    mb_proposed_value: None,
-                    mb_proposed_per_file: None,
-                });
-                entries.len() - 1
-            }
-        };
-
-        let auto_populate_allowed: Vec<bool> = technical_details
-            .files
-            .iter()
-            .map(|file| file.file_facts.write_eligibility.is_writable())
-            .collect();
-
-        // Parse filenames and fill empty values only for files that are
-        // writable in this editor session. A partial tag-read failure leaves placeholder
-        // slots in per_file_values for alignment, but those slots must not be
-        // auto-populated or later treated as real writable empty tags.
-        for i in 0..n {
-            if !auto_populate_allowed.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let stem = paths[i].file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let (parsed_track, parsed_title) = super::probe::parse_title_from_filename(stem);
-
-            if entries[tn_idx].per_file_values[i].is_empty() {
-                if let Some(t) = parsed_track {
-                    entries[tn_idx].per_file_values[i] = t.to_string();
-                    did_auto_populate = true;
-                }
-            }
-            if entries[title_idx].per_file_values[i].is_empty() {
-                if let Some(ref t) = parsed_title {
-                    entries[title_idx].per_file_values[i] = t.clone();
-                    did_auto_populate = true;
-                }
-            }
-        }
-
-        // Recalculate is_mixed and value for affected entries.
-        for idx in [tn_idx, title_idx] {
-            let all_same = entries[idx]
-                .per_file_values
-                .windows(2)
-                .all(|w| w[0] == w[1]);
-            entries[idx].is_mixed = !all_same;
-            let new_val = if !all_same {
-                "<multiple values>".to_string()
-            } else {
-                entries[idx].per_file_values[0].clone()
-            };
-            entries[idx].value = new_val;
-        }
-
-        // Re-sort entries so newly created TITLE/TRACKNUMBER appear in
-        // standard position (not appended at end).
-        if tn_idx >= entries.len() - 2 || title_idx >= entries.len() - 2 {
-            // Only needed if we actually pushed new entries.
-            entries.sort_by(|a, b| {
-                let a_upper = a.display_key.to_ascii_uppercase();
-                let b_upper = b.display_key.to_ascii_uppercase();
-                let a_pos = super::probe::STANDARD_KEY_ORDER
-                    .iter()
-                    .position(|&k| k == a_upper);
-                let b_pos = super::probe::STANDARD_KEY_ORDER
-                    .iter()
-                    .position(|&k| k == b_upper);
-                match (a_pos, b_pos) {
-                    (Some(ai), Some(bi)) => ai.cmp(&bi),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a_upper.cmp(&b_upper),
-                }
-            });
-        }
-    }
+    let auto_populate_allowed: Vec<bool> = technical_details
+        .files
+        .iter()
+        .map(|file| file.file_facts.write_eligibility.is_writable())
+        .collect();
+    let did_auto_populate =
+        ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
 
     // Build per-file context labels from sorted paths/entries.
     // Short labels: "D1.01" or "01" or filename stem (fallback).
