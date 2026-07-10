@@ -80,16 +80,28 @@ fn spawn_and_status_subprocesses_configure_stdin() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut violations = Vec::new();
     scan_dir(&root.join("src"), &mut violations);
-    // Workspace crates ship in the same binary and run the same tools.
-    for crate_entry in std::fs::read_dir(root.join("crates"))
-        .expect("read crates dir")
-        .flatten()
-    {
-        let src = crate_entry.path().join("src");
-        if src.is_dir() {
-            scan_dir(&src, &mut violations);
-        }
+    // Workspace members ship in the same binary and run the same tools.
+    // Derive them from Cargo.toml so members outside crates/ (e.g.
+    // tonepoet-pipeline at the repo root) stay covered.
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    let members_line = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("members"))
+        .expect("workspace members line in Cargo.toml");
+    let mut scanned_members = 0;
+    for member in members_line.split('"').skip(1).step_by(2) {
+        let src = root.join(member).join("src");
+        assert!(
+            src.is_dir(),
+            "workspace member '{member}' has no src/ — sentinel scan roots are stale"
+        );
+        scan_dir(&src, &mut violations);
+        scanned_members += 1;
     }
+    assert!(
+        scanned_members >= 8,
+        "expected to scan all workspace members, got {scanned_members} — members parse is broken"
+    );
     assert!(
         violations.is_empty(),
         "subprocess launches inheriting stdin (add .stdin(Stdio::null()) or annotate `DELIBERATE stdin inheritance`):\n{}",
