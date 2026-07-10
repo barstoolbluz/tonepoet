@@ -15725,6 +15725,8 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     };
 
     emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
+    let container_companion_snapshot =
+        container_companion_snapshot_before_publish_best_effort(&req, &source_value);
     match artifacts
         .as_ref()
         .ok_or(PublishError::StagingMissing)
@@ -15743,6 +15745,11 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             current_outcome = push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
+            copy_container_companion_snapshot_after_publish_best_effort(
+                &req,
+                container_companion_snapshot.as_ref(),
+                &album,
+            );
             copy_companion_artifacts_after_publish_best_effort(
                 &req,
                 &source_value,
@@ -16464,6 +16471,9 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     }
 
     emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
+    let container_companion_snapshot = source
+        .as_ref()
+        .and_then(|source_ref| container_companion_snapshot_before_publish_best_effort(&req, source_ref));
     match artifacts
         .as_ref()
         .ok_or(PublishError::StagingMissing)
@@ -16483,6 +16493,11 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
+            copy_container_companion_snapshot_after_publish_best_effort(
+                &req,
+                container_companion_snapshot.as_ref(),
+                &album,
+            );
             if let Some(source_ref) = source.as_ref() {
                 copy_companion_artifacts_after_publish_best_effort(
                     &req,
@@ -16566,6 +16581,87 @@ impl CompanionCopyStats {
 /// directory. Resolved album batches do not scan from that per-item hook; they
 /// wait until publish emits the album-batch completion signal, then scan the
 /// source grouping root once into the planner-resolved album directory.
+/// Companions that live INSIDE a self-contained container (lineage.txt,
+/// Artwork/ folders and the like extracted from a 7z/ISO) exist only in the
+/// materialization staging — which publish consumes before the companion
+/// pass runs. Snapshot the eligible files out of the extraction root while
+/// staging is still alive; the snapshot is swept into the published album
+/// afterwards. The snapshot uses the SAME sweep machinery both ways, so
+/// include/exclude lists, folder copying, and nested disc/extras rules apply
+/// exactly as they do for folder sources.
+fn container_companion_snapshot_before_publish_best_effort(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+) -> Option<StagingDir> {
+    match source.kind {
+        SourceKind::Archive
+        | SourceKind::SacdIso
+        | SourceKind::DvdAudio
+        | SourceKind::DvdVideo
+        | SourceKind::BluRay => {}
+        SourceKind::SingleFile | SourceKind::CueImage => return None,
+    }
+    if req.companion.is_empty() {
+        return None;
+    }
+    let extraction_root = companion_prepared_track_common_source_root(source)?;
+    // The snapshot must OUTLIVE publish, which deletes the whole job staging
+    // tree (extraction included). Place it beside the job stagings in the
+    // durable staging parent; the returned StagingDir removes it on drop.
+    let snapshot_parent = disk_staging_parent_for(req);
+    if let Err(err) = fs::create_dir_all(&snapshot_parent) {
+        log::warn!(
+            "container companion snapshot skipped for {}: cannot create staging parent {}: {err}",
+            req.item_id,
+            snapshot_parent.display()
+        );
+        return None;
+    }
+    let snapshot_root = unique_path(&snapshot_parent, ".tonepoet-companion-snapshot");
+    if let Err(err) = fs::create_dir_all(&snapshot_root) {
+        log::warn!(
+            "container companion snapshot skipped for {}: cannot create {}: {err}",
+            req.item_id,
+            snapshot_root.display()
+        );
+        return None;
+    }
+    let snapshot = StagingDir::new(snapshot_root, format!("{}-companion-snapshot", req.job_id));
+    let skip_set = companion_source_file_skip_set(req, source);
+    let stats = copy_companion_artifacts_from_source_dir_best_effort(
+        req,
+        &extraction_root,
+        &snapshot.root,
+        &skip_set,
+        &BTreeMap::new(),
+        &[],
+        req.item_id.as_str(),
+    );
+    if stats.copied == 0 {
+        return None;
+    }
+    Some(snapshot)
+}
+
+fn copy_container_companion_snapshot_after_publish_best_effort(
+    req: &PipelineRequest,
+    snapshot: Option<&StagingDir>,
+    published: &PublishedAlbum,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    copy_companion_artifacts_from_source_dir_best_effort(
+        req,
+        &snapshot.root,
+        &published.album_dir,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &[],
+        req.item_id.as_str(),
+    );
+}
+
 fn copy_companion_artifacts_after_publish_best_effort(
     req: &PipelineRequest,
     source: &PreparedSource,
@@ -19904,6 +20000,83 @@ mod companion_copy_hardening_tests {
         );
         assert!(!dst.join("disc 01").exists(), "pending retry must not invent fallback disc folders");
         assert!(!dst.join("disc 02").exists(), "pending retry must not invent fallback disc folders");
+    }
+
+    #[test]
+    fn container_internal_companions_survive_staging_cleanup_via_snapshot() {
+        // Regression: lineage.txt inside a 7z never reached the album because
+        // the companion pass ran after publish consumed the extraction
+        // staging. The snapshot captures eligible internals pre-publish and
+        // sweeps them into the album afterwards.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging_parent = temp.path().join(".tonepoet-staging");
+        let extraction = staging_parent.join("job-x").join("extracted").join("Album");
+        std::fs::create_dir_all(&extraction).expect("extraction root");
+        let staged_audio = extraction.join("01 - Track.flac");
+        std::fs::write(&staged_audio, b"audio").expect("staged audio");
+        std::fs::write(extraction.join("lineage.txt"), b"ripped from UK first press").expect("lineage");
+        std::fs::write(extraction.join("skipme.ini"), b"not in include list").expect("ini");
+
+        let container = temp.path().join("downloads").join("album.7z");
+        std::fs::create_dir_all(container.parent().unwrap()).expect("downloads");
+        std::fs::write(&container, b"archive").expect("container");
+
+        let mut req = test_request(temp.path(), container.clone());
+        req.companion.extensions = vec!["txt".to_string()];
+        let source = test_prepared_source(
+            SourceKind::Archive,
+            container,
+            vec![test_prepared_track(TrackSourceRef::StagedFile(staged_audio))],
+        );
+
+        let snapshot = container_companion_snapshot_before_publish_best_effort(&req, &source)
+            .expect("eligible internals produce a snapshot");
+        assert!(snapshot.root.join("lineage.txt").is_file());
+        assert!(!snapshot.root.join("skipme.ini").exists(), "include list respected");
+        assert!(!snapshot.root.join("01 - Track.flac").exists(), "source audio skipped");
+
+        // Publish consumes the JOB staging tree (extraction included) but the
+        // durable staging parent — where the snapshot lives — survives.
+        std::fs::remove_dir_all(staging_parent.join("job-x")).expect("simulate publish staging cleanup");
+        assert!(
+            snapshot.root.exists(),
+            "snapshot must live outside the publish-consumed job staging"
+        );
+
+        let album_dir = temp.path().join("out").join("Album");
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        let published = PublishedAlbum {
+            album_dir: album_dir.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        copy_container_companion_snapshot_after_publish_best_effort(&req, Some(&snapshot), &published);
+        assert_eq!(
+            std::fs::read(album_dir.join("lineage.txt")).expect("lineage copied"),
+            b"ripped from UK first press"
+        );
+    }
+
+    #[test]
+    fn single_file_sources_do_not_snapshot_their_source_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let src_dir = temp.path().join("album");
+        std::fs::create_dir_all(&src_dir).expect("src dir");
+        let audio = src_dir.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+        std::fs::write(src_dir.join("rip.log"), b"log").expect("log");
+
+        let mut req = test_request(temp.path(), audio.clone());
+        req.companion.extensions = vec!["log".to_string()];
+        let source = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        assert!(
+            container_companion_snapshot_before_publish_best_effort(&req, &source).is_none(),
+            "folder-shipped sources keep the direct parent sweep; no snapshot"
+        );
     }
 
     fn shared_downloads_dir_fixture(temp: &Path) -> (PathBuf, PathBuf) {
