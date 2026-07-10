@@ -23338,18 +23338,34 @@ fn strip_resolution_from_title_extra(extra: &str) -> String {
 
 fn looks_like_title_extra_metadata(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
-    // Region words ("US", "UK", "Japan", ...) are deliberately NOT evidence:
+    // Region words ("US", "UK", "Japan", ...) are never SUFFICIENT evidence:
     // a country-only parenthetical is album identity ("Aftermath (US)" and
-    // "Aftermath (UK)" are different albums) and must stay in the title.
-    // Region-bearing pressing designators still extract because they carry
-    // format/resolution/catalog evidence of their own ("Japan / SHM SACD ISO").
-    let has_format_or_region = [
+    // "Aftermath (UK)" are different albums) and must stay in the title. But
+    // they ARE evidence in company: "Perfect Strangers (Japan P28P 25067)" is
+    // a pressing designator whose catalog token alone (2 digits, no
+    // separator) is too weak to qualify. A region word plus a catalog-ish
+    // companion — a mixed letters+digits token, or a long digit run —
+    // extracts; a region beside plain words ("Live in Japan") does not.
+    let word_matches = |needles: &[&str]| {
+        lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+            .any(|word| needles.iter().any(|needle| word == *needle))
+    };
+    let has_format = word_matches(&[
         "blu-ray", "bluray", "dvd-a", "dvda", "dvd-v", "dvdv", "sacd", "shm", "shm-cd",
         "iso", "lp", "cd", "mfsl", "mofi",
         "mobile", "fidelity", "first-press", "pressing",
-    ]
-    .iter()
-    .any(|needle| lower.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-').any(|word| word == *needle));
+    ]);
+    let has_region = word_matches(&["japan", "us", "usa", "uk", "eu", "germany", "france"]);
+    let has_catalogish_companion = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .filter(|word| !word.is_empty())
+        .any(|word| {
+            let has_alpha = word.chars().any(|ch| ch.is_ascii_alphabetic());
+            let has_digit = word.chars().any(|ch| ch.is_ascii_digit());
+            (has_alpha && has_digit) || (!has_alpha && has_digit && word.len() >= 5)
+        });
+    let has_format_or_region = has_format || (has_region && has_catalogish_companion);
     let has_resolution = content
         .split(|ch: char| ch.is_whitespace() || ch == '/' || ch == ',' || ch == ';')
         .any(looks_like_resolution_fragment);
@@ -28662,6 +28678,29 @@ mod title_extra_tests {
     #[test]
     fn preserves_country_only_parenthetical() {
         assert!(extract_title_extra("Aftermath (US)").is_none());
+    }
+
+    #[test]
+    fn region_with_catalog_companion_extracts() {
+        // Regression: the country-only fix must not silence compound
+        // designators — the region word is evidence when a catalog-ish token
+        // accompanies it.
+        let (album, extra) =
+            extract_title_extra("Perfect Strangers (Japan P28P 25067)").unwrap();
+        assert_eq!(album, "Perfect Strangers");
+        assert_eq!(extra, "Japan P28P 25067");
+
+        let (album, extra) = extract_title_extra("Scorpio (Japan / CDSOL-3718)").unwrap();
+        assert_eq!(album, "Scorpio");
+        assert_eq!(extra, "Japan / CDSOL-3718");
+    }
+
+    #[test]
+    fn region_beside_plain_words_stays_in_the_title() {
+        // Title-identity parentheticals with region words but no catalog-ish
+        // companion are not pressing metadata.
+        assert!(extract_title_extra("Made in Japan (Live in Japan)").is_none());
+        assert!(extract_title_extra("Concert File (Live In USA 1959)").is_none());
     }
 
     #[test]
