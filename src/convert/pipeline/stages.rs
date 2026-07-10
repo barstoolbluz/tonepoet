@@ -16688,11 +16688,20 @@ fn copy_companion_artifacts_after_publish_best_effort(
         // once the batch is durably complete nothing else would clean that
         // workspace — the last-finishing item does it here. (Idempotent and
         // best-effort: concurrent finishers may both observe completion.)
-        if req.album_batch.is_some() && conversion_log_batch_is_durably_complete(req) {
-            cleanup_conversion_log_batch_coordination_after_success_best_effort(
+        // The stale sweep also retires completed/dead-owner workspaces left
+        // behind by earlier runs into the same output root; it skips the
+        // current batch and live same-process batches by design.
+        if req.album_batch.is_some() {
+            sweep_stale_completed_conversion_log_batch_coordination_for_request_best_effort(
                 req,
                 req.item_id.as_str(),
             );
+            if conversion_log_batch_is_durably_complete(req) {
+                cleanup_conversion_log_batch_coordination_after_success_best_effort(
+                    req,
+                    req.item_id.as_str(),
+                );
+            }
         }
     }
 }
@@ -20215,6 +20224,60 @@ mod companion_copy_hardening_tests {
         assert!(
             !coord_dir.exists(),
             "the last-finishing item of a durably complete uncoordinated batch cleans the workspace"
+        );
+    }
+
+    #[test]
+    fn uncoordinated_batch_retires_stale_completed_workspaces_from_earlier_runs() {
+        // Pre-fix runs left completed workspaces behind; a later conversion
+        // into the same output root (still on the uncoordinated path) must
+        // retire them via the stale sweep.
+        let _global_state = companion_batch_global_state_test_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        std::fs::create_dir_all(&out).expect("out");
+        let audio = source_dir.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("audio");
+
+        // A stale COMPLETED workspace from a dead "process" (generated-shape
+        // id whose owner cannot be alive).
+        let stale_id = "tonepoet-log-batch-v1-ffffffff-deadbeef-1";
+        let stale_dir = out
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(stale_id);
+        std::fs::create_dir_all(&stale_dir).expect("stale workspace");
+        std::fs::write(stale_dir.join("complete"), b"1\n").expect("stale marker");
+
+        let mut req = test_request(temp.path(), audio.clone());
+        req.output_root = out.clone();
+        req.companion.extensions = vec!["log".to_string()];
+        req.album_batch = Some(AlbumBatchContext::new(
+            super::chunk_2_1_3_postprocessing_gate_and_phase_tests::generated_test_batch_id(
+                "uncoordinated-retire",
+            ),
+            1,
+            out.join("Album"),
+            source_dir.clone(),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+
+        let prepared = test_prepared_source(
+            SourceKind::SingleFile,
+            audio.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(audio))],
+        );
+        let published = PublishedAlbum {
+            album_dir: out.join("Album"),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+
+        assert!(
+            !stale_dir.exists(),
+            "the uncoordinated companion pass retires stale completed workspaces"
         );
     }
 
