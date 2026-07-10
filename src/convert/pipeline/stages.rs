@@ -18102,13 +18102,74 @@ fn companion_source_dir(req: &PipelineRequest, source: &PreparedSource) -> Optio
         | SourceKind::SacdIso
         | SourceKind::DvdAudio
         | SourceKind::DvdVideo
-        | SourceKind::BluRay => track_root.or_else(|| {
-            [prepared_container_root, request_root, batch_root]
+        | SourceKind::BluRay => {
+            let home = companion_container_home(&req.container);
+            let home_dir = companion_existing_dir(&home);
+            [home_dir, track_root, prepared_container_root, request_root, batch_root]
                 .into_iter()
                 .flatten()
-                .find(|root| companion_dir_is_dedicated_to_container(root, &req.container))
-        }),
+                .find(|root| {
+                    // Roots that do not contain the container (its own disc
+                    // root, extraction staging) are safe by construction; a
+                    // root that CONTAINS it must prove dedication.
+                    !companion_root_is_proper_ancestor_of_home(root, &home)
+                        || companion_dir_is_dedicated_to_container(root, &req.container)
+                })
+        }
     }
+}
+
+/// A disc-structure directory name (the standardized children of optical
+/// disc roots). A container path that IS one of these directories has its
+/// companion home one level up, at the disc root.
+fn name_is_disc_structure(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "bdmv" | "video_ts" | "audio_ts")
+}
+
+/// True when `dir` is an optical disc root: it directly contains a
+/// BDMV/VIDEO_TS/AUDIO_TS child directory.
+fn directory_is_disc_structure_root(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.path().is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(name_is_disc_structure)
+    })
+}
+
+/// The directory whose contents "belong to" a self-contained container for
+/// companion purposes. For a container that IS a disc-structure directory
+/// (the user queued `.../Film/BDMV` directly), the home is the disc root one
+/// level up — that is where cover art and rip notes live. Everything else is
+/// its own home.
+fn companion_container_home(container: &Path) -> PathBuf {
+    if container.is_dir()
+        && container
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(name_is_disc_structure)
+    {
+        if let Some(parent) = container.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    container.to_path_buf()
+}
+
+/// True when `candidate` strictly contains `home` (is a proper ancestor).
+/// Extraction staging is never an ancestor of the original container, so
+/// staging-derived sweep roots pass untouched; a root that CONTAINS the
+/// container (the ISO's parent, a batch grouping dir) holds arbitrary
+/// unrelated files and must prove dedication before it may be swept.
+fn companion_root_is_proper_ancestor_of_home(candidate: &Path, home: &Path) -> bool {
+    let candidate = normalize_path(candidate);
+    let home = normalize_path(home);
+    home != candidate && home.starts_with(&candidate)
 }
 
 /// True when `dir` looks like a dedicated per-album home for `container`:
@@ -18126,12 +18187,22 @@ fn companion_dir_is_dedicated_to_container(dir: &Path, container: &Path) -> bool
         "ogg", "ape", "w64", "rf64", "dsf", "dff", "shn", "dts", "ac3",
     ];
     let container_identity = normalize_path(container);
+    let home_identity = normalize_path(&companion_container_home(container));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            let identity = normalize_path(&path);
+            if identity == container_identity || identity == home_identity {
+                continue;
+            }
+            // A sibling optical-disc root means this is a bulk rip
+            // directory, not a per-album home.
+            if directory_is_disc_structure_root(&path) {
+                return false;
+            }
             continue;
         }
         if normalize_path(&path) == container_identity {
@@ -18153,7 +18224,15 @@ fn companion_dir_is_dedicated_to_container(dir: &Path, container: &Path) -> bool
 /// dedicated-directory rule (see `companion_dir_is_dedicated_to_container`).
 fn companion_container_requires_dedicated_dir(container: &Path) -> bool {
     if container.is_dir() {
-        return false;
+        // Directory-shaped optical sources (a disc root holding BDMV/VIDEO_TS
+        // /AUDIO_TS, or one of those structure dirs queued directly) are
+        // self-contained: their batch grouping root is just "the directory
+        // holding the rip" and must prove dedication like any container file.
+        return container
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(name_is_disc_structure)
+            || directory_is_disc_structure_root(container);
     }
     let name = container
         .file_name()
@@ -20076,6 +20155,115 @@ mod companion_copy_hardening_tests {
         assert!(
             container_companion_snapshot_before_publish_best_effort(&req, &source).is_none(),
             "folder-shipped sources keep the direct parent sweep; no snapshot"
+        );
+    }
+
+    #[test]
+    fn iso_in_bulk_directory_gets_no_parent_sweep() {
+        // The non-batch exposure found in plan revalidation: disc-format
+        // track refs point back at the ORIGINAL container, so an ISO's
+        // "track root" is the ISO's parent — a bulk rip directory must not
+        // be swept just because it holds the ISO.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bulk = temp.path().join("iso-rips");
+        std::fs::create_dir_all(&bulk).expect("bulk dir");
+        let iso = bulk.join("Album (SACD).iso");
+        std::fs::write(&iso, b"iso bytes").expect("iso");
+        std::fs::write(bulk.join("Other Album (SACD).iso"), b"other iso").expect("sibling iso");
+        std::fs::write(bulk.join("stray-notes.txt"), b"stray").expect("stray");
+
+        let mut req = test_request(temp.path(), iso.clone());
+        req.companion.extensions = vec!["txt".to_string()];
+        let source = test_prepared_source(
+            SourceKind::SacdIso,
+            iso.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(iso.clone()))],
+        );
+        assert_eq!(
+            companion_source_dir(&req, &source),
+            None,
+            "an ISO in a bulk directory must not sweep its parent"
+        );
+
+        let dedicated = temp.path().join("Album Home");
+        std::fs::create_dir_all(&dedicated).expect("dedicated");
+        let solo_iso = dedicated.join("album.iso");
+        std::fs::write(&solo_iso, b"iso").expect("solo iso");
+        std::fs::write(dedicated.join("cover.jpg"), b"art").expect("cover");
+        let mut solo_req = test_request(temp.path(), solo_iso.clone());
+        solo_req.companion.extensions = vec!["jpg".to_string()];
+        let solo_source = test_prepared_source(
+            SourceKind::SacdIso,
+            solo_iso.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(solo_iso))],
+        );
+        assert_eq!(
+            companion_source_dir(&solo_req, &solo_source),
+            Some(dedicated),
+            "a dedicated per-album ISO home still sweeps beside the container"
+        );
+    }
+
+    #[test]
+    fn bdmv_container_sweeps_the_disc_root_beside_it() {
+        // Queuing .../Film/BDMV directly: the companion home is the disc
+        // root one level up, where cover art lives.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let disc_root = temp.path().join("Film (2004)");
+        let bdmv = disc_root.join("BDMV");
+        std::fs::create_dir_all(bdmv.join("STREAM")).expect("bdmv stream");
+        let stream = bdmv.join("STREAM").join("00000.m2ts");
+        std::fs::write(&stream, b"stream").expect("stream file");
+        std::fs::write(disc_root.join("cover.jpg"), b"art").expect("cover");
+
+        let mut req = test_request(temp.path(), bdmv.clone());
+        req.companion.extensions = vec!["jpg".to_string()];
+        let source = test_prepared_source(
+            SourceKind::BluRay,
+            bdmv.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(stream))],
+        );
+        assert_eq!(
+            companion_source_dir(&req, &source),
+            Some(disc_root),
+            "BDMV-as-container resolves to the disc root, not inside BDMV"
+        );
+    }
+
+    #[test]
+    fn disc_root_container_sweeps_its_own_interior_but_bulk_parent_is_gated() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bulk = temp.path().join("rips");
+        let film_a = bulk.join("Film A");
+        let film_b = bulk.join("Film B");
+        std::fs::create_dir_all(film_a.join("BDMV")).expect("film a");
+        std::fs::create_dir_all(film_b.join("VIDEO_TS")).expect("film b");
+        std::fs::write(bulk.join("stray.log"), b"stray").expect("stray");
+
+        // Batch finalizer gate: a disc-root directory container requires a
+        // dedicated grouping root; two disc roots side by side fail it.
+        assert!(companion_container_requires_dedicated_dir(&film_a));
+        assert!(companion_container_requires_dedicated_dir(&film_a.join("BDMV")));
+        assert!(
+            !companion_dir_is_dedicated_to_container(&bulk, &film_a),
+            "a sibling disc root disqualifies the shared parent"
+        );
+
+        // Its own interior stays sweepable: the disc root IS the home.
+        std::fs::write(film_a.join("cover.jpg"), b"art").expect("cover");
+        let mut req = test_request(temp.path(), film_a.clone());
+        req.companion.extensions = vec!["jpg".to_string()];
+        let inner = film_a.join("BDMV").join("index.bdmv");
+        std::fs::write(&inner, b"idx").expect("index");
+        let source = test_prepared_source(
+            SourceKind::BluRay,
+            film_a.clone(),
+            vec![test_prepared_track(TrackSourceRef::StagedFile(inner))],
+        );
+        assert_eq!(
+            companion_source_dir(&req, &source),
+            Some(film_a.clone()),
+            "a disc-root container sweeps its own interior regardless of the bulk parent"
         );
     }
 
