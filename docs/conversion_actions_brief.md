@@ -153,12 +153,19 @@ tolerate re-runs; we do not promise once-ever.
 
 ## Safety perimeter (named requirements, each needs its own test)
 
-- **SR-1 Pipeline internals are untouchable.** No action — especially
-  `delete`/`move`/`rename` with `*` — may match paths under `.tonepoet-*`
-  (batch workspaces, journals, write locks, companion snapshots) or the
-  pipeline-generated `conversion.log` / generated CUE sheets, unless a file
-  is explicitly named (not via wildcard). The motivating `*.log` example must
-  NOT rename `conversion.log`.
+- **SR-1 Pipeline internals are untouchable.** Wildcard targeting NEVER
+  matches dot-prefixed (hidden) entries, and recursion never descends into
+  dot-prefixed directories — the shell-glob convention. This is the complete
+  rule, verified against the internal-artifact namespace: ALL pipeline
+  internals are dot-prefixed but NOT all are `.tonepoet-*` — the family also
+  includes `.conversion-log-finalization.lock` (stages.rs:74),
+  `.<job>-<item>.run.lock` run locks, `.<album>.tmp-*` publish temp dirs
+  (stages.rs:24443), `*.wav.lock` siblings, and `.tmp.*` staging files, so a
+  prefix blocklist would leak. Additionally protected regardless of hidden
+  status: the pipeline-generated `conversion.log` and generated CUE sheets —
+  excluded from wildcard matches unless explicitly named (an exact,
+  wildcard-free target may touch anything; explicit naming is the escape
+  hatch). The motivating `*.log` example must NOT rename `conversion.log`.
 - **SR-2 Album-scope guard.** Album-scoped actions require the rendered album
   directory to be a proper subdirectory of the output root, created for this
   album. Flat layouts (tracks directly in output root) → actions are skipped
