@@ -32,7 +32,7 @@ scripts, and the script contract must be as trustworthy as the built-ins.
 | `copy` | Copy matched files/folders to a destination (within or outside the album dir). Preserve mtime; follow the companion-copy fidelity conventions. |
 | `move` | Copy semantics + source removal. MUST handle `EXDEV` (copy+fsync+verify+delete fallback) — the user's library spans `fuse.sshfs` mounts and cross-mount `rename(2)` fails there. |
 | `delete` | Remove matched files/folders. Rides the existing permanent-deletion guards (reject root paths, dot components, empty paths) plus the new source-protection rule (SR-3). |
-| `create_folder` | `mkdir -p` semantics (trivially idempotent). Name may use template variables. |
+| `create_folder` | `mkdir -p` semantics (trivially idempotent). Name may use template variables. Relative paths resolve against the phase's subject directory — album dir (post) / source dir (pre), the same rule as runscript's working directory; absolute paths allowed. |
 | `runscript` | Execute a user script with the environment contract below. |
 
 Modifier: every targeting action carries include globs AND exclude globs
@@ -150,7 +150,10 @@ tolerate re-runs; we do not promise once-ever.
 - stdin MUST be nulled — `tests/subprocess_stdin_convention.rs` scans all
   workspace sources and will fail any `.spawn()`/`.status()` without
   `.stdin(` configured. Working directory = album dir (post) / source dir
-  (pre). Mandatory timeout (configurable, sane default ~10 min). stdout/
+  (pre); for FILE sources (archive/ISO) the pre working directory is the
+  source's parent — scripts get `TONEPOET_SOURCE_PATH` and must not assume
+  the CWD is exclusive to this album. Mandatory timeout (configurable, sane
+  default ~10 min). stdout/
   stderr tails captured and surfaced in the item report. Non-zero exit =
   action failure.
 - Script path resolution: absolute and `~` accepted; bare relative resolves
@@ -166,12 +169,15 @@ tolerate re-runs; we do not promise once-ever.
 - **SR-1 Pipeline internals are untouchable.** Wildcard targeting NEVER
   matches dot-prefixed (hidden) entries, and recursion never descends into
   dot-prefixed directories — the shell-glob convention. This is the complete
-  rule, verified against the internal-artifact namespace: ALL pipeline
-  internals are dot-prefixed but NOT all are `.tonepoet-*` — the family also
+  rule, verified against the internal-artifact namespace: every internal
+  that can appear in an action's subject directory (album dir / output
+  root) is dot-prefixed, but NOT all are `.tonepoet-*` — the family also
   includes `.conversion-log-finalization.lock` (stages.rs:74),
   `.<job>-<item>.run.lock` run locks, `.<album>.tmp-*` publish temp dirs
-  (stages.rs:24443), `*.wav.lock` siblings, and `.tmp.*` staging files, so a
-  prefix blocklist would leak. Additionally protected regardless of hidden
+  (stages.rs:24443), and `.tmp.*` staging files, so a prefix blocklist
+  would leak. (Non-hidden internals exist but only inside materialization
+  staging — e.g. `*.wav.lock` in the decoded-image cache, stages.rs:1115 —
+  which is never an action subject.) Additionally protected regardless of hidden
   status: the pipeline-generated `conversion.log` and generated CUE sheets —
   excluded from wildcard matches unless explicitly named (an exact,
   wildcard-free target may touch anything; explicit naming is the escape
@@ -180,9 +186,11 @@ tolerate re-runs; we do not promise once-ever.
   directory to be a proper subdirectory of the output root, created for this
   album. Flat layouts (tracks directly in output root) → actions are skipped
   with a visible notice. Never glob a directory shared across albums.
-- **SR-3 Source protection.** `delete` and `move` refuse any path registered
-  as a conversion input of this batch (the context carries the exact source
-  path set) unless the action sets an explicit `allow_sources = true`.
+- **SR-3 Source protection.** `delete`, `move`, and `rename` refuse any path
+  registered as a conversion input of this batch (the context carries the
+  exact source path set) unless the action sets an explicit
+  `allow_sources = true`. Rename is included because a renamed source breaks
+  re-conversion of a persisted queue (recorded source paths go stale).
 - **SR-4 Pre-phase restrictions.** Pre-phase built-ins that mutate files are
   v1-limited to `runscript` and `create_folder`. Destructive built-ins
   (`rename`, case modes, `delete`, `move`) are post-only in v1 — a glob
