@@ -44,8 +44,10 @@ pieces are directly in the rename action's blast radius:
   symlink-escape defense pattern (staging-root confinement). Your capability
   layer should subsume or match this behavior.
 - `src/convert/pipeline/bluray_realize.rs` — `atomic_replace_file` (:761)
-  with platform-specific impls; `src/convert/cue_parser.rs` is already in the
-  base bundle and has its own `atomic_replace` (:1685). Atomic-replace is
+  with platform-specific impls; `src/convert/cue_parser.rs` (shipped in the
+  manifests addendum bundle — an earlier revision of this note wrongly said
+  it was in the base bundle) has its own `atomic_replace` (:1685).
+  Atomic-replace is
   currently duplicated per-site; a shared layer may rationalize it, but do
   not change those call sites' behavior in this feature.
 
