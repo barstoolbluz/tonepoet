@@ -66,6 +66,11 @@ one action shares the target/preview/collision/idempotency machinery
   confirm round-trip), config default pipeline, and the queue item's
   `PipelineRequest` (types.rs:436) so a restored queue
   (`~/.cache/tonepoet/conversion_queue.json`) behaves identically.
+  Backward compatibility is mandatory: the actions field must be
+  `#[serde(default)]` on BOTH `TuiPreset` (presets.rs — the existing
+  per-field-default pattern, no deny_unknown_fields) and `PipelineRequest`
+  (types.rs already uses `#[serde(default)]` throughout), so preset and
+  queue files written by older builds load unchanged.
 - No CLI flag surface in v1 (mirrors the companion-exclude precedent:
   TUI + presets only).
 
@@ -105,10 +110,15 @@ State the skip in the item status.
 (`RerunDecision`/`RerunReason`, rerun.rs:15/34). Policy: actions run only
 when the album actually PUBLISHED this run; an all-skipped album does not
 re-trigger them. To apply a pipeline to an already-converted album, add an
-explicit `:actions-run [dir]` command (vi command mode, command.rs) that runs
-the POST pipeline against an existing album directory on demand — this also
-serves as the safe way to test a pipeline against real files, and as the
-retroactive-library-application story.
+explicit `:actions-run [dir]` command (vi command mode, command.rs; the name
+is free — no existing `:actions*` command) that runs the POST pipeline
+against an existing album directory on demand — this also serves as the safe
+way to test a pipeline against real files, and as the
+retroactive-library-application story. Guard applicability for
+`:actions-run`: SR-1 (hidden-entry protection) and SR-5/SR-6 apply in full;
+SR-2/SR-3 have no batch context — the user's explicit directory choice IS
+the scope consent, but the command still refuses filesystem roots and
+requires the target to be a directory.
 
 **Failure semantics.** Pre-action failure fails the item BEFORE conversion
 starts (nothing irreversible has happened; the precondition was not met).
@@ -186,11 +196,17 @@ tolerate re-runs; we do not promise once-ever.
   planned op creates → same). Folder renames apply depth-first
   (children-before-parents) or re-resolve paths after directory ops.
 - **SR-6 Preview never executes.** Dry-run/preview never runs scripts —
-  script entries preview as "would run: <script>". Preview for post actions
-  at config time simulates the destination: planned audio outputs + planned
-  companion copies for the currently-selected source (the naming-template
-  preview already binds to the selected album — same pattern), labeled as
-  simulated.
+  script entries preview as "would run: <script>". Two preview levels,
+  don't conflate them: (a) template-STRING preview against canonical
+  example data — this pattern exists (`render_template_preview`,
+  src/tui/template_builder.rs:568, hardcoded Pink Floyd 35DP-4 example;
+  note it is NOT bound to the selected album and supports some tokens the
+  pipeline renderer does not — pin action tokens to the PIPELINE's set,
+  not that preview's). (b) The config-box dry-run against real file names —
+  this is NEW work: simulate the destination as planned audio outputs +
+  planned companion copies for the currently-selected source, labeled as
+  simulated. `:actions-run` previews against the real directory listing
+  before applying.
 - **SR-7 Sanitizer parity.** Template-mode rename uses the SAME component
   sanitizer the naming pipeline uses. The album-scoped folder path feeds
   values through `sanitize_component` (stages.rs:23451, applied inside
