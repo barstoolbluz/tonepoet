@@ -233,7 +233,9 @@ tolerate re-runs; we do not promise once-ever.
   a parallel one. What actions add on top: per-FILE disc inference for
   `%DISCNUMBER%`-family tokens (a matched file's disc comes from its disc
   subfolder / filename hints — the same evidence machinery `%DISC_FOLDER%`
-  uses; do not invent new detection). The track-scoped map for comparison
+  uses: `disc_number_from_template_component_name` stages.rs:22993 for
+  component names, `track_disc_number_hint` stages.rs:22794 for the track
+  side; do not invent new detection). The track-scoped map for comparison
   lives in `render_track_template` (stages.rs:22452).
 
 ## Reuse map (do not reinvent these)
@@ -282,8 +284,9 @@ tolerate re-runs; we do not promise once-ever.
 1. Motivating case: convert a multi-disc album with post
    `rename *.log *.cue` template
    `%ARTIST% - %ALBUM% (%TITLE_EXTRA%) [Disc %DISCNUMBER%]` → copied EAC
-   logs/cues renamed per disc, `conversion.log` NOT touched (SR-1), rename
-   runs once per album (not per track/disc), correct disc numbers per file.
+   logs/cues renamed per disc, `conversion.log` NOT touched and all hidden
+   entries (batch workspace, markers) untouched (SR-1), rename runs once per
+   album (not per track/disc), correct disc numbers per file.
 2. Re-run the same conversion (manifest skip) → actions do not re-fire;
    `:actions-run` against the existing album dir plans 0 ops (idempotent).
 3. Post `runscript` on a 2-disc batch → script executes exactly once, after
