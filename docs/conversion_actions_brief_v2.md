@@ -1,6 +1,18 @@
-# Brief: pre/post-conversion actions — user-authored file operations around the pipeline
+# Brief v2: pre/post-conversion actions — user-authored file operations around the pipeline
 
 Date: 2026-07-10
+
+**This document SUPERSEDES the earlier `conversion_actions_brief.md` draft you
+may have in context.** Where they conflict, this one governs — six audit
+passes corrected that draft, including: the disc token is `%DISCNUMBER%`
+(the draft's `%NDISCNUMBER%` does not exist), SR-1 is now a hidden-entry
+rule (the `.tonepoet-*` blocklist leaked), SR-6's claim about the existing
+preview binding to the selected album was false, SR-8 now points at the
+existing album-scoped token map instead of asking you to derive one, and
+SR-3 also covers `rename`. Discard the old draft entirely; read this one
+plus `docs/conversion_actions_supplement.md` (filesystem prior art,
+including an existing rename engine and file-task engine you must not
+reimplement blindly).
 
 ## The feature
 
@@ -303,7 +315,7 @@ tolerate re-runs; we do not promise once-ever.
 
 ## Files in this bundle
 
-- `docs/conversion_actions_brief.md` — this brief
+- `docs/conversion_actions_brief_v2.md` — this brief (supersedes `conversion_actions_brief.md`)
 - `conversion_actions_wizard.html` — the user's TUI mockup (wizard + config box)
 - `docs/disc_number_template_variables_brief.md`, `docs/disc_number_template_variables_implementation_notes.md` — prior art for template semantics + batch identity (context)
 - Pipeline: `src/convert/pipeline/{stages.rs, types.rs, tool.rs, rerun.rs, reporter.rs, errors.rs}`

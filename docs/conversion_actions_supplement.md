@@ -1,6 +1,6 @@
 # Supplement: filesystem prior art for the conversion-actions bundle
 
-Date: 2026-07-10. Companion to `docs/conversion_actions_brief.md` — answers
+Date: 2026-07-10. Companion to `docs/conversion_actions_brief_v2.md` — answers
 the implementer's question "is there a shared filesystem abstraction I should
 integrate with instead of inventing a parallel one?"
 
