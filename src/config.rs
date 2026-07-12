@@ -584,4 +584,3 @@ append_lineage_to_comment = false
     }
 
 }
-
