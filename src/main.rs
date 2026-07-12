@@ -731,6 +731,11 @@ async fn run_convert(
     } else if let Some(ref dir) = config.conversion.default_destination {
         options.output_dir = Some(dir.clone());
     }
+    // The config's default action pipeline applies when nothing more
+    // specific set one (same rule the TUI uses for its Output Options seed).
+    if options.actions.is_empty() {
+        options.actions = config.conversion.actions.clone();
+    }
 
     if let Some(rg) = &replaygain {
         options.replaygain_mode = parse_replaygain_mode(rg);
@@ -995,6 +1000,12 @@ async fn run_convert(
             "\nConversion complete: {}/{} succeeded, {} failed",
             completed, total, failed
         );
+        // A bare count is undiagnosable; name each failure once.
+        for item in q.all_items() {
+            if let tonepoet::convert::ConversionStatus::Failed { error, .. } = &item.status {
+                eprintln!("  failed: {} — {}", item.input_path.display(), error);
+            }
+        }
     }
 
     result.map_err(|e| anyhow::anyhow!("{}", e))

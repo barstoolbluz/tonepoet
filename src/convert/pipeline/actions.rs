@@ -4472,6 +4472,31 @@ pub(crate) fn acquire_blocking_album_publication_lock_for_album(
     acquire_shared_album_publication_lock(album_dir, true, false)
 }
 
+/// Blocking variants WITH action-execution authority: pipeline publishes of
+/// action-enabled albums run per-track under a shared worker pool and must
+/// serialize on the album (like the plain publication lock) rather than fail
+/// fast like the interactive :actions-run acquisitions.
+pub(crate) fn acquire_blocking_action_run_lock_for_album_in_output_root(
+    album_dir: &Path,
+    output_root: &Path,
+) -> Result<ExplicitActionRunLock, ActionError> {
+    acquire_shared_album_publication_lock_in_output_root(album_dir, output_root, true, true)
+}
+
+pub(crate) fn acquire_blocking_action_run_lock_for_album_under_output_capability(
+    album_dir: &Path,
+    logical_output_root: &Path,
+    output_root_capability: &PinnedDirectoryCapability,
+) -> Result<ExplicitActionRunLock, ActionError> {
+    acquire_shared_album_publication_lock_under_output_capability(
+        album_dir,
+        logical_output_root,
+        output_root_capability,
+        true,
+        true,
+    )
+}
+
 pub(crate) fn acquire_blocking_album_publication_lock_for_album_in_output_root(
     album_dir: &Path,
     output_root: &Path,

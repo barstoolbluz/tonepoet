@@ -29,6 +29,8 @@ use super::actions::{
     acquire_blocking_album_publication_lock_for_album_in_output_root,
     acquire_blocking_album_publication_lock_for_album_under_output_capability,
     acquire_explicit_action_run_lock_for_album,
+    acquire_blocking_action_run_lock_for_album_in_output_root,
+    acquire_blocking_action_run_lock_for_album_under_output_capability,
     acquire_explicit_action_run_lock_for_album_in_output_root,
     acquire_explicit_action_run_lock_for_album_under_output_capability,
     ensure_album_capability_has_no_unresolved_explicit_state,
@@ -11366,6 +11368,32 @@ fn cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
         }
     }
 
+    // Terminal action phase results (`actions-<phase>-<sha256>.result.json`)
+    // are part of the completed lifecycle this cleanup is retiring.
+    if let Ok(entries) = fs::read_dir(coord_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let terminal_result = name.starts_with("actions-")
+                && name.ends_with(".result.json");
+            if !terminal_result {
+                continue;
+            }
+            let path = entry.path();
+            match fs::remove_file(&path) {
+                Ok(()) => sync_parent_dir_best_effort(&path),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log::warn!(
+                        "conversion-log batch coordination cleanup could not remove terminal action result for {context}: {}: {error}",
+                        path.display()
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     for path in [
         conversion_log_fragment_dir(coord_dir),
         coord_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR),
@@ -18124,12 +18152,7 @@ fn collect_durable_action_reports_with_binding(
     ) {
         return Vec::new();
     }
-    let filesystem = CapabilityActionFilesystem::new();
     let scripts = ProcessGroupScriptRunner;
-    let engine = ActionEngine {
-        filesystem: &filesystem,
-        scripts: &scripts,
-    };
     let mut reports = Vec::new();
     let pre_context = match binding {
         Some(binding) => binding.output_root.try_clone().ok().and_then(|capability| {
@@ -18158,6 +18181,14 @@ fn collect_durable_action_reports_with_binding(
     });
     let contexts = [pre_context, post_context];
     for context in contexts.into_iter().flatten() {
+        // A fresh capability registry per context: pre and post pin the
+        // SAME scope ids ("subject", "source") to DIFFERENT directories, so
+        // sharing one filesystem across both fabricates scope conflicts.
+        let filesystem = CapabilityActionFilesystem::new();
+        let engine = ActionEngine {
+            filesystem: &filesystem,
+            scripts: &scripts,
+        };
         match engine.durable_phase_report(&req.actions, &context) {
             Ok(Some(report)) if !report.actions.is_empty() || !report.notices.is_empty() => {
                 reports.push(report)
@@ -18757,13 +18788,16 @@ fn acquire_album_action_authority_for_publish(
             Ok(AlbumActionPublishAuthority::FlatLayoutSkipped { reason })
         }
         ConversionActionAlbumScope::ProperSubdirectory => {
+            // Per-track publishes of an action-enabled album arrive
+            // concurrently from the worker pool; they must WAIT on the album
+            // authority (interactive acquisitions fail fast instead).
             let lock = match retained_output {
-                Some(binding) => acquire_explicit_action_run_lock_for_album_under_output_capability(
+                Some(binding) => acquire_blocking_action_run_lock_for_album_under_output_capability(
                     album_dir,
                     &binding.logical_root,
                     &binding.capability,
                 ),
-                None => acquire_explicit_action_run_lock_for_album_in_output_root(
+                None => acquire_blocking_action_run_lock_for_album_in_output_root(
                     album_dir,
                     &req.output_root,
                 ),
@@ -22396,6 +22430,35 @@ fn artifact_audio_parent_dirs(artifacts: &ArtifactSet) -> Vec<PathBuf> {
     }
 }
 
+
+/// Resolve a live descriptor-namespace route (`/proc/self/fd/N/rest`) to its
+/// stable filesystem path by reading the fd link — valid exactly while the
+/// descriptor is open, which record-writing guarantees. Non-routed paths
+/// return unchanged; a route that cannot be resolved returns None so callers
+/// fail closed instead of persisting a route that dies with the descriptor.
+fn resolve_descriptor_route_to_stable(path: &Path) -> Option<PathBuf> {
+    if !path.starts_with("/proc/self/fd") && !path.starts_with("/dev/fd") {
+        return Some(path.to_path_buf());
+    }
+    // Route anchor is /proc/self/fd/<N> (5 components counting the root) or
+    // /dev/fd/<N> (4). Read the live fd link and graft the remainder on.
+    let anchor_len = if path.starts_with("/proc/self/fd") { 5 } else { 4 };
+    let mut components = path.components();
+    let mut anchor = PathBuf::new();
+    for _ in 0..anchor_len {
+        anchor.push(components.next()?.as_os_str());
+    }
+    let target = std::fs::read_link(&anchor).ok()?;
+    if !target.is_absolute() {
+        return None;
+    }
+    let mut resolved = target;
+    for rest in components {
+        resolved.push(rest.as_os_str());
+    }
+    Some(resolved)
+}
+
 fn record_album_batch_disc_destinations_from_artifacts(
     req: &PipelineRequest,
     artifacts: Option<&ArtifactSet>,
@@ -22428,6 +22491,29 @@ fn record_album_batch_disc_destinations_from_artifacts(
             record.album_dir = record
                 .album_dir
                 .map(|path| binding.stable_path(&path));
+        }
+        // Durable records must NEVER carry descriptor-namespace routes: the
+        // binding's own descriptors may differ from the authority that built
+        // this published album, so resolve any residual route via the live
+        // fd link — and fail closed if that is impossible.
+        let mut route_unresolvable = false;
+        let mut resolve = |value: Option<PathBuf>| -> Option<PathBuf> {
+            value.and_then(|path| match resolve_descriptor_route_to_stable(&path) {
+                Some(stable) => Some(stable),
+                None => {
+                    route_unresolvable = true;
+                    None
+                }
+            })
+        };
+        record.path = resolve(record.path);
+        record.album_dir = resolve(record.album_dir);
+        if route_unresolvable {
+            log::warn!(
+                "companion batch disc-destination record skipped for {}: a descriptor route could not be resolved to a stable path",
+                req.item_id
+            );
+            continue;
         }
         if record.track_id.source_ordinal == 0 || record.track_id.track_number == 0 {
             log::warn!(
