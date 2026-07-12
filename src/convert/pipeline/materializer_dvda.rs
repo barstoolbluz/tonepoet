@@ -5898,6 +5898,7 @@ mod tests {
             .unwrap_or(DvdaGroupSelection::Default);
         PipelineRequest {
             job_id: "dvda-detect-test".to_string(),
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "dvda-detect-test".to_string(),
             container: path,
             source: SourceOptions {

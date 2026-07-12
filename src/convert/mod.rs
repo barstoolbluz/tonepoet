@@ -13,15 +13,18 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub mod classify;
+pub mod cap_fs;
 pub mod cue_parser;
 pub mod formats;
 pub mod queue_expansion;
 pub mod sacd;
+pub mod script_supervisor;
 pub mod labels;
 pub mod metadata;
 pub mod pipeline;
 pub mod processor;
 pub mod queue;
+pub mod rename_plan;
 pub mod renaming;
 pub mod simple_wizard;
 pub mod wizard;
@@ -209,7 +212,9 @@ fn validate_pipeline_request_queue_metadata(
 fn _status_progress_for_update(status: &ConversionStatus, progress_hint: f32) -> f32 {
     match status {
         ConversionStatus::Processing { progress, .. } => *progress,
-        ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
+        ConversionStatus::Completed { .. }
+        | ConversionStatus::CompletedWithActionErrors { .. }
+        | ConversionStatus::Partial { .. } => 100.0,
         ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
             progress_hint.clamp(0.0, 100.0)
         }
@@ -561,6 +566,7 @@ impl ConversionManager {
                         item.started_at = Some(chrono::Utc::now());
                     }
                     ConversionStatus::Completed { .. }
+                    | ConversionStatus::CompletedWithActionErrors { .. }
                     | ConversionStatus::Partial { .. }
                     | ConversionStatus::Failed { .. }
                     | ConversionStatus::Cancelled => {
@@ -569,6 +575,7 @@ impl ConversionManager {
                         item.completed_at = Some(chrono::Utc::now());
                         match &status {
                             ConversionStatus::Completed { output_path, .. }
+                            | ConversionStatus::CompletedWithActionErrors { output_path, .. }
                             | ConversionStatus::Partial { output_path, .. } => {
                                 item.output_path = Some(output_path.clone());
                             }
@@ -629,6 +636,7 @@ impl ConversionManager {
                             ),
                             ..
                         } | ConversionStatus::Completed { .. }
+                            | ConversionStatus::CompletedWithActionErrors { .. }
                             | ConversionStatus::Partial { .. }
                             | ConversionStatus::Failed { .. }
                             | ConversionStatus::Cancelled
@@ -678,6 +686,7 @@ impl ConversionManager {
                 if matches!(
                     &item.status,
                     ConversionStatus::Completed { .. }
+                        | ConversionStatus::CompletedWithActionErrors { .. }
                         | ConversionStatus::Partial { .. }
                         | ConversionStatus::Failed { .. }
                         | ConversionStatus::Cancelled
@@ -952,6 +961,7 @@ impl ConversionManager {
                             | ConversionStatus::Queued
                             | ConversionStatus::Paused
                             | ConversionStatus::Completed { .. }
+                            | ConversionStatus::CompletedWithActionErrors { .. }
                             | ConversionStatus::Failed { .. }
                     )
                 })
@@ -1069,6 +1079,7 @@ mod bluray_queue_admission_tests {
         };
 
         crate::convert::pipeline::PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: format!("job-{item_id}"),
             item_id: item_id.to_string(),
             container: path.to_path_buf(),

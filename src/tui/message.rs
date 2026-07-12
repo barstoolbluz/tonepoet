@@ -99,6 +99,21 @@ pub enum AppMessage {
     FilesScanned { paths: Vec<std::path::PathBuf> },
     /// Status message to show in the status bar
     StatusMessage(String),
+    /// Progress from background explicit-action preview preparation.
+    ActionsRunPreparationProgress {
+        preparation_id: String,
+        detail: String,
+    },
+    /// Completion of background explicit-action preview preparation.
+    ActionsRunPrepared {
+        preparation_id: String,
+        result: Result<crate::tui::conversion_actions_ui::ActionsRunState, String>,
+    },
+    /// Completion of an explicit `:actions-run` durable apply.
+    ActionsRunComplete {
+        invocation_id: String,
+        result: Result<crate::convert::pipeline::ActionPhaseReport, String>,
+    },
     /// Force a redraw
     Redraw,
     /// Result of asynchronous Browse regular-folder expansion for Convert/Queue

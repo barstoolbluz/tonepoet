@@ -97,6 +97,7 @@ fn request_for_fixture(
         .unwrap_or(DvdaGroupSelection::Default);
     PipelineRequest {
         job_id: "dvda-phase2-fixture-test".to_string(),
+        actions: crate::convert::pipeline::ActionPipeline::default(),
         item_id: normalized_fixture_name(fixture),
         container: fixture.to_path_buf(),
         source: SourceOptions {

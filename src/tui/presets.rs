@@ -70,6 +70,8 @@ pub struct TuiPreset {
     pub disc_subfolders: bool,
     #[serde(default)]
     pub write_log: bool,
+    #[serde(default, skip_serializing_if = "crate::convert::pipeline::ActionPipeline::is_empty")]
+    pub actions: crate::convert::pipeline::ActionPipeline,
 }
 
 impl TuiPreset {
@@ -116,6 +118,7 @@ impl TuiPreset {
             force_encode: *output_opts.force_encode.selected_value(),
             disc_subfolders: *output_opts.disc_subfolders.selected_value(),
             write_log: *output_opts.write_log.selected_value(),
+            actions: output_opts.actions.clone(),
         }
     }
 
@@ -179,6 +182,7 @@ impl TuiPreset {
         output_opts.force_encode.select_value(&self.force_encode);
         output_opts.disc_subfolders.select_value(&self.disc_subfolders);
         output_opts.write_log.select_value(&self.write_log);
+        output_opts.actions = self.actions.clone();
 
         if let Some(mm) = parse_merge(&self.merge) {
             output_opts.merge.select_value(&mm);
@@ -273,6 +277,7 @@ impl TuiPreset {
             force_encode: false,
             disc_subfolders: false,
             write_log: false,
+            actions: crate::convert::pipeline::ActionPipeline::default(),
         }
     }
 }
@@ -779,6 +784,65 @@ merge = "multi-file"
             restored_metadata.album_artist_for_conversion.as_deref(),
             Some("The Allman Brothers Band")
         );
+    }
+
+    #[test]
+    fn legacy_preset_without_actions_deserializes_with_empty_pipeline() {
+        let preset: TuiPreset = toml::from_str(
+            r#"
+name = "legacy-actions"
+version = 3
+format = "flac"
+sample_rate = 44100
+bit_depth = "24"
+dither = "tpdf"
+replaygain = "off"
+folder_template = "%ARTIST%/%ALBUM%"
+filename_template = "%TRACKNN% - %TITLE%.%EXT%"
+merge = "multi-file"
+"#,
+        )
+        .expect("preset without actions should deserialize");
+
+        assert!(preset.actions.is_empty());
+    }
+
+    #[test]
+    fn actions_round_trip_through_preset_capture_and_apply() {
+        use crate::convert::pipeline::{
+            ActionPipeline, ConversionAction, CreateFolderAction, RunScriptAction,
+        };
+
+        let format = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        output.actions = ActionPipeline {
+            pre: vec![ConversionAction::CreateFolder(CreateFolderAction {
+                path: PathBuf::from("prepared"),
+                continue_on_error: false,
+            })],
+            post: vec![ConversionAction::Runscript(RunScriptAction {
+                script: PathBuf::from("/usr/local/bin/catalog-album"),
+                args: vec!["--quiet".to_string()],
+                timeout_seconds: 45,
+                continue_on_error: true,
+            })],
+        };
+
+        let preset = TuiPreset::from_pill_state("actions", &format, &output, &metadata);
+        let encoded = toml::to_string(&preset).expect("serialize action preset");
+        let decoded: TuiPreset = toml::from_str(&encoded).expect("deserialize action preset");
+        assert_eq!(decoded.actions, output.actions);
+
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        decoded.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+        assert_eq!(restored_output.actions, output.actions);
     }
 
     #[test]

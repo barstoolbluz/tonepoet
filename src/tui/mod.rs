@@ -16,6 +16,7 @@ pub mod disc_browser_actions;
 pub mod command;
 pub mod context_menu;
 pub mod convert_actions;
+pub mod conversion_actions_ui;
 pub mod convert_screen;
 pub mod format_interactions;
 pub mod ctdb;

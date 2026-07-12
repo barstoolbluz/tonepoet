@@ -7558,6 +7558,7 @@ mod tests {
     ) -> PipelineRequest {
         PipelineRequest {
             job_id: "dvda-phase3-corpus".to_string(),
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "dvda-phase3-corpus".to_string(),
             container,
             source: SourceOptions {

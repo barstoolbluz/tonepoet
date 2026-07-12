@@ -2920,6 +2920,7 @@ FILE "album.flac" WAVE
     pub(super) fn test_request(container: &Path) -> PipelineRequest {
         PipelineRequest {
             job_id: "test-job".to_string(),
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "test-item".to_string(),
             container: container.to_path_buf(),
             source: SourceOptions {

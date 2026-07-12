@@ -306,6 +306,9 @@ pub struct ConversionSettings {
     pub scratch_memory_limit_percent: u8,
     /// Default archive password
     pub archive_password: Option<String>,
+    /// Default ordered pre/post conversion action pipeline.
+    #[serde(default, skip_serializing_if = "crate::convert::pipeline::ActionPipeline::is_empty")]
+    pub actions: crate::convert::pipeline::ActionPipeline,
     /// Append content from Lineage.txt to COMMENT tag
     pub append_lineage_to_comment: bool,
 }
@@ -339,6 +342,7 @@ impl Default for ConversionSettings {
             scratch_directory: None,
             scratch_memory_limit_percent: default_scratch_memory_limit_percent(),
             archive_password: None,
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             append_lineage_to_comment: false,
         }
     }

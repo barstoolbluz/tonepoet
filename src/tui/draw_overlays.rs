@@ -149,6 +149,12 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             let state = state.clone();
             draw_bulk_rename(f, &state, theme);
         }
+        ActiveOverlay::ConversionActionsWizard(ref state) => {
+            super::conversion_actions_ui::draw_wizard(f, state, theme);
+        }
+        ActiveOverlay::ActionsRun(ref state) => {
+            super::conversion_actions_ui::draw_actions_run(f, state, theme);
+        }
         ActiveOverlay::Analysis { scroll } => {
             draw_analysis(f, &app.analysis_results, scroll, theme);
         }
@@ -764,6 +770,15 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem, theme: s
         ConversionStatus::Completed { output_path, .. } => {
             format!("Completed -> {}", output_path.display())
         }
+        ConversionStatus::CompletedWithActionErrors {
+            output_path, errors, ..
+        } => {
+            format!(
+                "Completed with action errors ({}) -> {}",
+                errors.len(),
+                output_path.display()
+            )
+        }
         ConversionStatus::Partial {
             output_path,
             successful,
@@ -790,6 +805,9 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem, theme: s
     // Extract durable log path from terminal status variants.
     let log_path_str = match &item.status {
         ConversionStatus::Completed {
+            log_path: Some(p), ..
+        }
+        | ConversionStatus::CompletedWithActionErrors {
             log_path: Some(p), ..
         } => Some(p.display().to_string()),
         ConversionStatus::Partial { log_path, .. } => Some(log_path.display().to_string()),
@@ -838,6 +856,19 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem, theme: s
             Span::styled(status_str, Style::default().fg(theme.amber)),
         ]),
     ];
+
+    if let ConversionStatus::CompletedWithActionErrors { errors, .. } = &item.status {
+        lines.push(Line::from(vec![
+            Span::styled("Post-action errors: ", Style::default().fg(theme.text_muted)),
+            Span::styled(errors.len().to_string(), Style::default().fg(theme.warning)),
+        ]));
+        for error in errors {
+            lines.push(Line::from(Span::styled(
+                format!("  - {error}"),
+                Style::default().fg(theme.warning),
+            )));
+        }
+    }
 
     if let Some(log_path) = log_path_str {
         lines.push(Line::from(vec![

@@ -4244,6 +4244,7 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
                     matches!(
                         i.status,
                         ConversionStatus::Completed { .. }
+                            | ConversionStatus::CompletedWithActionErrors { .. }
                             | ConversionStatus::Partial { .. }
                             | ConversionStatus::Failed { .. }
                             | ConversionStatus::Cancelled
@@ -4349,6 +4350,92 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::ThemeBuilder(mut state) => {
             let action = super::theme_builder::handle_theme_builder_key(&mut *state, key);
             complete_theme_builder_action(app, state, action);
+        }
+        ActiveOverlay::ConversionActionsWizard(state) => {
+            match super::conversion_actions_ui::handle_wizard_key(*state, key) {
+                super::conversion_actions_ui::WizardKeyResult::Continue(mut state) => {
+                    super::conversion_actions_ui::refresh_wizard_preview_for_app(
+                        &mut state,
+                        app,
+                    );
+                    app.active_overlay = ActiveOverlay::ConversionActionsWizard(Box::new(state));
+                }
+                super::conversion_actions_ui::WizardKeyResult::Commit(pipeline) => {
+                    app.convert.output_options.actions = pipeline;
+                    app.preset.modified = true;
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("Conversion actions saved to Output Options");
+                }
+                super::conversion_actions_ui::WizardKeyResult::Cancel => {
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("Conversion actions unchanged");
+                }
+            }
+        }
+        ActiveOverlay::ActionsRun(mut state) => {
+            use super::conversion_actions_ui::ActionsRunStatus;
+            match key.code {
+                KeyCode::Esc if state.status == ActionsRunStatus::Preparing => {
+                    super::conversion_actions_ui::cancel_actions_run(&mut state);
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("Action preview preparation cancelled; nothing was executed");
+                }
+                KeyCode::Enter
+                    if matches!(
+                        state.status,
+                        ActionsRunStatus::Preview | ActionsRunStatus::RecoveryPreview
+                    ) =>
+                {
+                    super::conversion_actions_ui::start_actions_run(&mut state, tx);
+                    app.active_overlay = ActiveOverlay::ActionsRun(state);
+                }
+                KeyCode::Esc
+                    if matches!(state.status, ActionsRunStatus::Running | ActionsRunStatus::Cancelling) =>
+                {
+                    super::conversion_actions_ui::cancel_actions_run(&mut state);
+                    app.active_overlay = ActiveOverlay::ActionsRun(state);
+                }
+                KeyCode::Enter | KeyCode::Esc
+                    if matches!(
+                        state.status,
+                        ActionsRunStatus::Complete | ActionsRunStatus::Failed
+                    ) =>
+                {
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Enter | KeyCode::Esc if state.status == ActionsRunStatus::Stale => {
+                    match super::conversion_actions_ui::discard_actions_run_preview(&state) {
+                        Ok(()) => app.set_status(
+                            "Stale action preview retired; refresh before executing",
+                        ),
+                        Err(error) => app.set_status(format!(
+                            "Could not retire stale action preview safely: {error}"
+                        )),
+                    }
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                KeyCode::Esc
+                    if matches!(
+                        state.status,
+                        ActionsRunStatus::Preview | ActionsRunStatus::RecoveryPreview
+                    ) =>
+                {
+                    match super::conversion_actions_ui::discard_actions_run_preview(&state) {
+                        Ok(()) => app.set_status(if state.status == ActionsRunStatus::RecoveryPreview {
+                            "Recovery remains pending; no operation was resumed"
+                        } else {
+                            "Prepared action preview discarded; nothing was executed"
+                        }),
+                        Err(error) => app.set_status(format!(
+                            "Could not retire prepared action preview safely: {error}"
+                        )),
+                    }
+                    app.active_overlay = ActiveOverlay::None;
+                }
+                _ => {
+                    app.active_overlay = ActiveOverlay::ActionsRun(state);
+                }
+            }
         }
         ActiveOverlay::Confirmation { action, .. } => {
             match key.code {

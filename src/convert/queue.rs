@@ -105,6 +105,17 @@ pub enum ConversionStatus {
         #[serde(default)]
         log_path: Option<PathBuf>,
     },
+    /// Audio publication completed, but one or more post-conversion actions
+    /// failed. Published audio is retained; the action failures are terminal,
+    /// visible warnings rather than conversion-blocking failures.
+    CompletedWithActionErrors {
+        output_path: PathBuf,
+        /// Durable per-album run log, when one was written.
+        #[serde(default)]
+        log_path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        errors: Vec<String>,
+    },
     /// Completed with some tracks dropped (explicit partial opt-in).
     /// Terminal; never an alias for success.
     Partial {
@@ -355,6 +366,7 @@ impl ConversionItem {
         matches!(
             self.status,
             ConversionStatus::Completed { .. }
+                | ConversionStatus::CompletedWithActionErrors { .. }
                 | ConversionStatus::Partial { .. }
                 | ConversionStatus::Failed { .. }
                 | ConversionStatus::Cancelled
@@ -375,7 +387,9 @@ impl ConversionItem {
 fn _status_progress(status: &ConversionStatus) -> f32 {
     match status {
         ConversionStatus::Processing { progress, .. } => *progress,
-        ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
+        ConversionStatus::Completed { .. }
+        | ConversionStatus::CompletedWithActionErrors { .. }
+        | ConversionStatus::Partial { .. } => 100.0,
         ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => {
             0.0
         }
@@ -559,6 +573,7 @@ impl ConversionQueue {
                     }
                 }
                 ConversionStatus::Completed { .. }
+                | ConversionStatus::CompletedWithActionErrors { .. }
                 | ConversionStatus::Partial { .. }
                 | ConversionStatus::Failed { .. }
                 | ConversionStatus::Cancelled => {
@@ -606,7 +621,13 @@ impl ConversionQueue {
     pub fn completed_items(&self) -> usize {
         self.completed
             .iter()
-            .filter(|item| matches!(item.status, ConversionStatus::Completed { .. }))
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    ConversionStatus::Completed { .. }
+                        | ConversionStatus::CompletedWithActionErrors { .. }
+                )
+            })
             .count()
     }
 
@@ -639,10 +660,15 @@ impl ConversionQueue {
 
     /// Clear completed items only
     pub fn clear_completed(&mut self) {
-        self.items
-            .retain(|item| !matches!(item.status, ConversionStatus::Completed { .. }));
-        self.completed
-            .retain(|item| !matches!(item.status, ConversionStatus::Completed { .. }));
+        let is_completed = |item: &ConversionItem| {
+            matches!(
+                item.status,
+                ConversionStatus::Completed { .. }
+                    | ConversionStatus::CompletedWithActionErrors { .. }
+            )
+        };
+        self.items.retain(|item| !is_completed(item));
+        self.completed.retain(|item| !is_completed(item));
     }
 
     /// Clear all terminal items (Completed, Failed, Partial, Cancelled)
@@ -673,6 +699,7 @@ impl ConversionQueue {
             matches!(
                 item.status,
                 ConversionStatus::Completed { .. }
+                    | ConversionStatus::CompletedWithActionErrors { .. }
                     | ConversionStatus::Partial { .. }
                     | ConversionStatus::Failed { .. }
                     | ConversionStatus::Cancelled
@@ -858,6 +885,51 @@ mod cue_sidecar_override_queue_tests {
 
         let decoded: ConversionItem = serde_json::from_str(&json).expect("deserialize item");
         assert_eq!(decoded.cue_sidecar_override, Some(CueSidecarPolicy::EmbeddedOnly));
+    }
+
+    #[test]
+    fn conversion_actions_round_trip_through_queue_item_serde() {
+        use crate::convert::pipeline::{
+            ActionPipeline, ConversionAction, CreateFolderAction, RunScriptAction,
+        };
+
+        let mut item = ConversionItem::default();
+        item.id = "serde-actions".to_string();
+        item.input_path = PathBuf::from("/tmp/album/01.flac");
+        item.options.actions = ActionPipeline {
+            pre: vec![ConversionAction::CreateFolder(CreateFolderAction {
+                path: PathBuf::from("ready"),
+                continue_on_error: false,
+            })],
+            post: vec![ConversionAction::Runscript(RunScriptAction {
+                script: PathBuf::from("/usr/bin/true"),
+                args: vec!["literal argument".to_string()],
+                timeout_seconds: 30,
+                continue_on_error: false,
+            })],
+        };
+
+        let json = serde_json::to_string(&item).expect("serialize queue item with actions");
+        let decoded: ConversionItem = serde_json::from_str(&json).expect("deserialize queue item");
+        assert_eq!(decoded.options.actions, item.options.actions);
+    }
+
+    #[test]
+    fn legacy_queue_item_without_actions_deserializes_with_empty_pipeline() {
+        let mut item = ConversionItem::default();
+        item.id = "serde-legacy-no-actions".to_string();
+        item.input_path = PathBuf::from("/tmp/album/01.flac");
+
+        let mut value = serde_json::to_value(&item).expect("serialize baseline item");
+        value
+            .get_mut("options")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("queue options serialize as object")
+            .remove("actions");
+
+        let decoded: ConversionItem = serde_json::from_value(value)
+            .expect("deserialize legacy queue item without actions");
+        assert!(decoded.options.actions.is_empty());
     }
 
     #[test]

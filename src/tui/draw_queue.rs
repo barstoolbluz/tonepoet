@@ -96,6 +96,14 @@ fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::t
                     None
                 }
             }
+            ConversionStatus::CompletedWithActionErrors { output_path, .. } => {
+                let path = output_path.display().to_string();
+                if !path.is_empty() {
+                    Some((path, theme.warning))
+                } else {
+                    None
+                }
+            }
             ConversionStatus::Partial {
                 output_path,
                 successful,
@@ -351,6 +359,14 @@ fn render_item_status(item: &ConversionItem, _width: u16, theme: super::theme::T
             vec![Span::styled(
                 "Completed",
                 Style::default().fg(theme.green),
+            )],
+            Style::default(),
+        ),
+        ConversionStatus::CompletedWithActionErrors { errors, .. } => (
+            vec![Span::styled(
+                format!("Completed ({} action error{})", errors.len(),
+                    if errors.len() == 1 { "" } else { "s" }),
+                Style::default().fg(theme.warning),
             )],
             Style::default(),
         ),

@@ -103,6 +103,9 @@ pub fn build_pipeline_request_from_settings(
     Ok(PipelineRequest {
         job_id: format!("job-{}", item.id),
         item_id: item.id.clone(),
+        // The processor re-applies this via apply_conversion_options_request_contract;
+        // seed the same value so both builder paths agree.
+        actions: item.options.actions.clone(),
         container: item.input_path.clone(),
         source: SourceOptions {
             archive_password: item

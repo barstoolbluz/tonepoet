@@ -25,6 +25,7 @@ pub(crate) mod bluray_ts_demux;
 pub(crate) mod bluray_lpcm;
 pub(crate) mod bluray_wav_validate;
 pub(crate) mod bluray_realize;
+pub mod actions;
 pub mod errors;
 pub mod label_resolver;
 pub mod manifest;
@@ -53,6 +54,7 @@ pub mod transactional_state;
 pub mod types;
 pub mod unified_request;
 
+pub use actions::*;
 pub use errors::*;
 pub use label_resolver::*;
 pub use materializer_single::*;
@@ -84,6 +86,7 @@ mod tests {
 
     fn sample_request() -> PipelineRequest {
         PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-1".into(),
             item_id: "item-1".into(),
             container: PathBuf::from("/tmp/in.flac"),

@@ -708,6 +708,7 @@ mod tests {
     fn request(root: &Path) -> PipelineRequest {
         PipelineRequest {
             job_id: "job".to_string(),
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "item".to_string(),
             container: root.join("album.iso"),
             source: SourceOptions {

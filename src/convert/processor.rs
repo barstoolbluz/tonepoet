@@ -46,7 +46,8 @@ use crate::convert::pipeline::{
     TrackMetadata, TrackOutcome, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
 };
 use crate::convert::pipeline::stages::{
-    disk_staging_parent_for, pipeline_report_requests_scratch_disk_retry,
+    disk_staging_parent_for, independent_single_file_album_batch_lifecycle_key,
+    pipeline_report_requests_scratch_disk_retry, plan_album_dir_from_dispatch_metadata,
 };
 use crate::convert::pipeline::materializer_single::read_track_metadata as read_single_file_track_metadata;
 #[cfg(test)]
@@ -186,7 +187,9 @@ fn terminal_progress_for_status(
 ) -> f32 {
     match status {
         ConversionStatus::Processing { progress, .. } => *progress,
-        ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => 100.0,
+        ConversionStatus::Completed { .. }
+        | ConversionStatus::CompletedWithActionErrors { .. }
+        | ConversionStatus::Partial { .. } => 100.0,
         ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
             last_known_progress.unwrap_or(0.0).clamp(0.0, 100.0)
         }
@@ -201,6 +204,7 @@ struct IndependentSingleFileBatchKey {
     provisional_album_output_dir_key: String,
     target_format_key: String,
     naming_key: String,
+    lifecycle_policy_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +241,7 @@ fn apply_conversion_options_request_contract(
     request: &mut PipelineRequest,
     item: &ConversionItem,
 ) {
+    request.actions = item.options.actions.clone();
     if item.options.create_disc_subfolders {
         request.naming.template = naming_template_with_disc_subfolder(
             std::mem::take(&mut request.naming.template),
@@ -254,7 +259,9 @@ fn apply_conversion_options_request_contract(
     }
 }
 
-fn build_pipeline_request(item: &ConversionItem) -> ConversionResult<PipelineRequest> {
+pub(crate) fn build_pipeline_request(
+    item: &ConversionItem,
+) -> ConversionResult<PipelineRequest> {
     let mut request = raw_build_pipeline_request(item)?;
     apply_conversion_options_request_contract(&mut request, item);
     Ok(request)
@@ -326,20 +333,36 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
         let key = IndependentSingleFileBatchKey {
             source_grouping_root_key: normalized_path_key(&source_grouping_root),
             provisional_album_output_dir_key: normalized_path_key(&album_output_dir),
+            // Group by FOLDER-level identity only. Settings/lifecycle
+            // fingerprints deliberately stay OUT of the key: heterogeneous
+            // items in one album folder must land in ONE group so the
+            // mismatch detector below can suppress ordered logging for the
+            // whole folder — separate singleton batches over the same album
+            // dir would interleave two conversion.log authorities.
             target_format_key: format!(
-                "{:?}|{:?}|{:?}|{:?}",
+                "{:?}|{:?}|{:?}",
                 request.settings.target_format,
                 request.container_extension,
                 request.container_ffmpeg_flags,
-                request.companion
             ),
             naming_key: format!(
-                "{}|{:?}|{}",
+                "{}|{:?}|{}|{:?}",
                 request.naming.template,
                 request.naming.folder_template,
-                request.naming.per_album_subdir
+                request.naming.per_album_subdir,
+                request.naming.collision_policy,
             ),
+            // Constant: lifecycle policy participates in the MISMATCH
+            // detector (suppression), never in group identity (see above).
+            lifecycle_policy_key: String::new(),
         };
+        if let Err(error) = independent_single_file_album_batch_lifecycle_key(&request) {
+            log::error!(
+                "skipping album-batch preparation for {} because its lifecycle policy could not be serialized: {error}",
+                request.container.display()
+            );
+            continue;
+        }
         let candidate = IndependentSingleFileBatchCandidate {
             item_index,
             request,
@@ -391,9 +414,11 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
         if let Some(mismatched) = group.iter().find(|candidate| {
             conversion_settings_fingerprint_key(&candidate.request.settings)
                 != conversion_settings_fingerprint_key(&group[0].request.settings)
+                || independent_single_file_album_batch_lifecycle_key(&candidate.request).ok()
+                    != independent_single_file_album_batch_lifecycle_key(&group[0].request).ok()
         }) {
             log::error!(
-                "independent single-file album batch at {} cannot enable ordered fragment logging because {} has conversion settings that differ from the rest of the batch; suppressing legacy conversion.log append for this batch instead of mixing incompatible fragments",
+                "independent single-file album batch at {} cannot enable ordered fragment logging because {} has conversion settings or action/lifecycle policy that differ from the rest of the batch; suppressing legacy conversion.log append for this batch instead of mixing incompatible participants",
                 source_grouping_root.display(),
                 mismatched.request.container.display()
             );
@@ -507,13 +532,28 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
             requests.push(request);
         }
 
+        let planner_resolved_album_output_dir =
+            planner_resolved_album_output_dir_for_dispatch(&requests);
+        let dispatch_album_output_dir = planner_resolved_album_output_dir
+            .clone()
+            .unwrap_or_else(|| album_output_dir.clone());
+
         match prepare_independent_single_file_album_batch_for_dispatch(
             requests,
-            album_output_dir.clone(),
+            dispatch_album_output_dir.clone(),
             source_grouping_root.clone(),
         ) {
             Ok(dispatch) => {
-                for (item_index, request) in item_indices.into_iter().zip(dispatch.requests.into_iter()) {
+                for (item_index, mut request) in item_indices.into_iter().zip(dispatch.requests.into_iter()) {
+                    if planner_resolved_album_output_dir.is_some() {
+                        if let Some(batch) = request.album_batch.take() {
+                            request.album_batch = Some(
+                                batch.with_planner_resolved_album_output_dir(
+                                    dispatch_album_output_dir.clone(),
+                                ),
+                            );
+                        }
+                    }
                     if let Some(item) = items.get_mut(item_index) {
                         item.pipeline_request = Some(request);
                     }
@@ -702,6 +742,70 @@ fn batch_identity_probe_for_request(req: &PipelineRequest, source_kind: SourceKi
         .track_number
         .or_else(|| strict_track_number_from_dispatch_path(&req.container));
     probe
+}
+
+fn dispatch_track_metadata_for_output_planning(
+    req: &PipelineRequest,
+    source_kind: SourceKind,
+) -> Option<TrackMetadata> {
+    match source_kind {
+        SourceKind::SingleFile => Some(read_single_file_track_metadata(&req.container)),
+        SourceKind::CueImage => {
+            let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_sidecar_cue(
+                &req.container,
+            )
+            .or_else(|| crate::convert::cue_parser::parse_cue_file(&req.container).ok())?;
+            let first = cue.tracks.first();
+            let mut extra = BTreeMap::new();
+            if let Some(album) = cue.title.as_ref().filter(|value| !value.trim().is_empty()) {
+                extra.insert("album".to_string(), album.clone());
+            }
+            if let Some(catalog) = cue.catalog.as_ref().filter(|value| !value.trim().is_empty()) {
+                extra.insert("catalog".to_string(), catalog.clone());
+            }
+            Some(TrackMetadata {
+                title: first.and_then(|track| track.title.clone()),
+                artist: first
+                    .and_then(|track| track.performer.clone())
+                    .or_else(|| cue.performer.clone()),
+                album_artist: cue.performer.clone(),
+                date: cue.date.clone(),
+                track_number: first.map(|track| track.number),
+                disc_number: req
+                    .album_batch_track
+                    .as_ref()
+                    .and_then(|track| track.disc_number)
+                    .or_else(|| disc_number_from_dispatch_path(&req.container)),
+                extra,
+                ..TrackMetadata::default()
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Return an authoritative batch album directory only when every request can
+/// be planned from queue-time metadata through the canonical output planner
+/// and every result agrees. Any uncertainty deliberately leaves the batch
+/// provisional; the pipeline will then refuse unsafe early pre-action
+/// execution rather than racing a guessed destination against rerun recovery.
+fn planner_resolved_album_output_dir_for_dispatch(
+    requests: &[PipelineRequest],
+) -> Option<PathBuf> {
+    let mut resolved: Option<PathBuf> = None;
+    for req in requests {
+        let source_kind = detect_source_kind(req).ok()?;
+        let metadata = dispatch_track_metadata_for_output_planning(req, source_kind)?;
+        let album_dir = plan_album_dir_from_dispatch_metadata(req, source_kind, metadata).ok()?;
+        match resolved.as_ref() {
+            Some(existing) if normalized_path_key(existing) != normalized_path_key(&album_dir) => {
+                return None;
+            }
+            Some(_) => {}
+            None => resolved = Some(album_dir),
+        }
+    }
+    resolved
 }
 
 fn single_file_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
@@ -2118,7 +2222,9 @@ fn record_terminal_status(
     status: &ConversionStatus,
 ) {
     match status {
-        ConversionStatus::Completed { .. } | ConversionStatus::Partial { .. } => {
+        ConversionStatus::Completed { .. }
+        | ConversionStatus::CompletedWithActionErrors { .. }
+        | ConversionStatus::Partial { .. } => {
             pool.metrics().record_job_completed();
         }
         ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
@@ -3419,6 +3525,7 @@ mod tests {
 
     fn pipeline_request_for_processor_limit_test(root: &std::path::Path) -> PipelineRequest {
         PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "processor-limit-job".to_string(),
             item_id: "processor-limit-item".to_string(),
             container: root.join("input.flac"),
@@ -3732,6 +3839,7 @@ mod tests {
                     &disk_req.settings,
                 )),
                 manifest_path: None,
+                action_reports: Vec::new(),
             })
         }));
 
@@ -4042,6 +4150,7 @@ mod tests {
                         &disk_req.settings,
                     )),
                     manifest_path: None,
+                    action_reports: Vec::new(),
                 })
             }));
 
@@ -4307,6 +4416,7 @@ mod tests {
                     &disk_req.settings,
                 )),
                 manifest_path: None,
+                action_reports: Vec::new(),
             })
         }));
 
@@ -4499,6 +4609,65 @@ mod tests {
                 "heterogeneous settings must not share a fragment batch or fall back to completion-order conversion.log append"
             );
         }
+    }
+
+    #[test]
+    fn queued_folder_dispatch_splits_tracks_with_different_action_pipelines() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_01 = album_root.join("01 - First.flac");
+        let track_02 = album_root.join("02 - Second.flac");
+        std::fs::write(&track_01, b"not real audio; dispatch test only").expect("track 1 file");
+        std::fs::write(&track_02, b"not real audio; dispatch test only").expect("track 2 file");
+
+        let req_01 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-01",
+            "job-01",
+            track_01,
+        );
+        let mut req_02 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-02",
+            "job-02",
+            track_02,
+        );
+        let destructive_pipeline = crate::convert::pipeline::ActionPipeline {
+            pre: Vec::new(),
+            post: vec![crate::convert::pipeline::ConversionAction::CreateFolder(
+                crate::convert::pipeline::CreateFolderAction {
+                    path: PathBuf::from("post-action"),
+                    continue_on_error: false,
+                },
+            )],
+        };
+        req_02.actions = destructive_pipeline.clone();
+
+        let mut first = conversion_item_with_pipeline_request("item-01", req_01);
+        first.options.actions = crate::convert::pipeline::ActionPipeline::default();
+        let mut second = conversion_item_with_pipeline_request("item-02", req_02);
+        second.options.actions = destructive_pipeline.clone();
+        let mut items = vec![first, second];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let first_request = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("first request remains available");
+        let second_request = items[1]
+            .pipeline_request
+            .as_ref()
+            .expect("second request remains available");
+        assert!(first_request.album_batch.is_none());
+        assert!(second_request.album_batch.is_none());
+        assert_ne!(
+            independent_single_file_album_batch_lifecycle_key(first_request).unwrap(),
+            independent_single_file_album_batch_lifecycle_key(second_request).unwrap(),
+            "test setup must carry distinct canonical lifecycle contracts"
+        );
+        assert_eq!(second_request.actions, destructive_pipeline);
     }
 
     #[test]

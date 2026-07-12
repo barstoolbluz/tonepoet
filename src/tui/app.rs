@@ -3698,6 +3698,7 @@ pub struct OutputOptionsState {
     pub force_encode: PillState<bool>,
     pub disc_subfolders: PillState<bool>,
     pub write_log: PillState<bool>,
+    pub actions: crate::convert::pipeline::ActionPipeline,
     pub field_focus: OutputOptionsField,
     pub editing: Option<OutputOptionsField>,
     pub edit_input: crate::tui::text_input::TextInputState,
@@ -3728,6 +3729,7 @@ impl OutputOptionsState {
             force_encode,
             disc_subfolders,
             write_log,
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             field_focus: OutputOptionsField::DestPath,
             editing: None,
             edit_input: crate::tui::text_input::TextInputState::empty(),
@@ -3779,6 +3781,7 @@ impl OutputOptionsState {
         options.companion_extensions = extensions;
         options.companion_folders = folders;
         options.companion_exclude_files = self.parsed_companion_exclude_files();
+        options.actions = self.actions.clone();
         options.force_encode = *self.force_encode.selected_value();
         options.create_disc_subfolders = *self.disc_subfolders.selected_value();
         // Do not mutate the raw naming template here. Disc subfolders are a
@@ -4219,6 +4222,10 @@ pub enum ActiveOverlay {
     },
     /// Bulk rename wizard overlay. Boxed because the state is large.
     BulkRename(Box<BulkRenameState>),
+    /// Ordered pre/post conversion-actions editor.
+    ConversionActionsWizard(Box<crate::tui::conversion_actions_ui::ConversionActionsWizardState>),
+    /// Real-directory dry-run/apply surface for `:actions-run`.
+    ActionsRun(Box<crate::tui::conversion_actions_ui::ActionsRunState>),
     /// Analysis results overlay showing DR, peak, RMS, etc.
     Analysis {
         scroll: usize,
@@ -9093,6 +9100,7 @@ impl AppState {
 
         let mut output_options = OutputOptionsState::new();
         output_options.dest_path = config.conversion.default_destination.clone();
+        output_options.actions = config.conversion.actions.clone();
 
         let initial_screen = AppScreen::from_config_name(&config.ui.default_screen);
 

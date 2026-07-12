@@ -444,6 +444,10 @@ pub struct ConversionOptions {
     #[serde(default)]
     pub companion_exclude_files: Vec<String>,
 
+    /// Ordered pre/post conversion actions selected by config/preset/TUI.
+    #[serde(default, skip_serializing_if = "crate::convert::pipeline::ActionPipeline::is_empty")]
+    pub actions: crate::convert::pipeline::ActionPipeline,
+
     /// Force same-format re-encoding instead of passthrough - defaults to false
     #[serde(default)]
     pub force_encode: bool,
@@ -534,6 +538,7 @@ impl Default for ConversionOptions {
             companion_extensions: default_companion_extensions(),
             companion_folders: Vec::new(),
             companion_exclude_files: Vec::new(),
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             force_encode: false,
             create_disc_subfolders: false,
             album_artist_override: None,

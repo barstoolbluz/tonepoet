@@ -191,6 +191,9 @@ pub fn extract_wizard_settings(
 
     let options = ConversionOptions {
         pipeline_settings: None,
+        // The legacy wizard has no actions UI; conversions it configures run
+        // with an empty pipeline.
+        actions: crate::convert::pipeline::ActionPipeline::default(),
         output_format: format,
         quality,
         preserve_metadata: true, // Always preserve metadata
@@ -541,6 +544,7 @@ pub fn preset_to_conversion_options(
 
     ConversionOptions {
         pipeline_settings: None,
+        actions: crate::convert::pipeline::ActionPipeline::default(),
         output_format: format,
         quality,
         preserve_metadata: true,

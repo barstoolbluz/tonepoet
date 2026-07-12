@@ -2476,6 +2476,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     Some(output_path.display().to_string()),
                     None::<String>,
                 )),
+                crate::convert::ConversionStatus::CompletedWithActionErrors {
+                    output_path, errors, ..
+                } => Some((
+                    true,
+                    Some(output_path.display().to_string()),
+                    Some(format!("Post-action errors: {}", errors.join("; "))),
+                )),
                 crate::convert::ConversionStatus::Partial { output_path, .. } => Some((
                     true,
                     Some(output_path.display().to_string()),
@@ -2566,6 +2573,98 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         }
         AppMessage::StatusMessage(msg) => {
             app.set_status(msg);
+        }
+        AppMessage::ActionsRunPreparationProgress {
+            preparation_id,
+            detail,
+        } => {
+            let mut accepted = false;
+            if let super::app::ActiveOverlay::ActionsRun(state) = &mut app.active_overlay {
+                if state.preparation_id == preparation_id
+                    && matches!(
+                        state.status,
+                        super::conversion_actions_ui::ActionsRunStatus::Preparing
+                            | super::conversion_actions_ui::ActionsRunStatus::Cancelling
+                    )
+                {
+                    state.preview_lines.clear();
+                    state.preview_lines.push(detail.clone());
+                    accepted = true;
+                }
+            }
+            if accepted {
+                app.set_status(detail);
+            }
+        }
+        AppMessage::ActionsRunPrepared {
+            preparation_id,
+            result,
+        } => {
+            let matches_active = matches!(
+                &app.active_overlay,
+                super::app::ActiveOverlay::ActionsRun(state)
+                    if state.preparation_id == preparation_id
+                        && matches!(
+                            state.status,
+                            super::conversion_actions_ui::ActionsRunStatus::Preparing
+                                | super::conversion_actions_ui::ActionsRunStatus::Cancelling
+                        )
+            );
+            if matches_active {
+                match result {
+                    Ok(state) => {
+                        app.active_overlay =
+                            super::app::ActiveOverlay::ActionsRun(Box::new(state));
+                        app.set_status("Action dry run ready; press Enter to apply");
+                    }
+                    Err(error) => {
+                        if let super::app::ActiveOverlay::ActionsRun(state) =
+                            &mut app.active_overlay
+                        {
+                            state.status =
+                                super::conversion_actions_ui::ActionsRunStatus::Failed;
+                            state.error = Some(error.clone());
+                        }
+                        app.set_status(error);
+                    }
+                }
+            } else if let Ok(state) = result {
+                // The user cancelled or replaced the preparation overlay after
+                // the worker durably prepared a preview. Retire that unreviewed
+                // authority rather than leaving it to block publication.
+                if let Err(error) =
+                    super::conversion_actions_ui::discard_actions_run_preview(&state)
+                {
+                    app.set_status(format!(
+                        "Cancelled action preview could not be retired safely: {error}"
+                    ));
+                }
+            }
+        }
+        AppMessage::ActionsRunComplete { invocation_id, result } => {
+            let mut status_message = None;
+            if let super::app::ActiveOverlay::ActionsRun(state) = &mut app.active_overlay {
+                if state.invocation_id() == Some(invocation_id.as_str()) {
+                    super::conversion_actions_ui::complete_actions_run(state, result);
+                    status_message = Some(match state.status {
+                        super::conversion_actions_ui::ActionsRunStatus::Complete => {
+                            "Action pipeline completed".to_string()
+                        }
+                        super::conversion_actions_ui::ActionsRunStatus::Stale => {
+                            "Action preview is stale; nothing was executed. Refresh before applying"
+                                .to_string()
+                        }
+                        _ => "Action pipeline finished with errors; review the report".to_string(),
+                    });
+                }
+            }
+            if let Some(message) = status_message {
+                app.set_status(message);
+                if app.current_screen == super::app::AppScreen::Browse {
+                    app.browse.refresh_with_search(Some(tx));
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                }
+            }
         }
         AppMessage::Redraw => {} // Just triggers a redraw via the loop
         AppMessage::BrowseConvertExpansionComplete {

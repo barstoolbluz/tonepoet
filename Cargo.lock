@@ -2639,6 +2639,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rustfft",
+ "rustix 0.38.44",
  "sacd-rs",
  "serde",
  "serde_json",

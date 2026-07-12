@@ -154,6 +154,11 @@ impl BroadcastReporter {
 
     fn window(stage: PipelineStage) -> StageProgressWindow {
         match stage {
+            PipelineStage::PreActions => StageProgressWindow {
+                phase: crate::convert::ConversionPhase::Analyzing,
+                start: 0.0,
+                end: 0.0,
+            },
             PipelineStage::Materialize => StageProgressWindow {
                 phase: crate::convert::ConversionPhase::Extracting,
                 start: 0.0,
@@ -194,6 +199,11 @@ impl BroadcastReporter {
                 start: 95.0,
                 end: 98.0,
             },
+            PipelineStage::PostActions => StageProgressWindow {
+                phase: crate::convert::ConversionPhase::Finalizing,
+                start: 98.0,
+                end: 98.0,
+            },
             PipelineStage::DurableLog => StageProgressWindow {
                 phase: crate::convert::ConversionPhase::Finalizing,
                 start: 98.0,
@@ -204,6 +214,7 @@ impl BroadcastReporter {
 
     fn stage_label(stage: PipelineStage) -> &'static str {
         match stage {
+            PipelineStage::PreActions => "Running pre-conversion actions",
             PipelineStage::Materialize => "Extracting source",
             PipelineStage::PlanOutputs => "Analyzing outputs",
             PipelineStage::Convert => "Converting audio",
@@ -212,12 +223,14 @@ impl BroadcastReporter {
             PipelineStage::ReplayGain => "Calculating ReplayGain",
             PipelineStage::Features => "Writing sidecars",
             PipelineStage::Publish => "Publishing files",
+            PipelineStage::PostActions => "Running post-conversion actions",
             PipelineStage::DurableLog => "Writing conversion log",
         }
     }
 
     fn stage_complete_message(stage: PipelineStage) -> String {
         match stage {
+            PipelineStage::PreActions => "Pre-conversion actions complete".to_string(),
             PipelineStage::Materialize => "Source extracted".to_string(),
             PipelineStage::PlanOutputs => "Output plan ready".to_string(),
             PipelineStage::Convert => "Audio conversion complete".to_string(),
@@ -226,12 +239,14 @@ impl BroadcastReporter {
             PipelineStage::ReplayGain => "ReplayGain complete".to_string(),
             PipelineStage::Features => "Sidecars written".to_string(),
             PipelineStage::Publish => "Files published".to_string(),
+            PipelineStage::PostActions => "Post-conversion actions complete".to_string(),
             PipelineStage::DurableLog => "Conversion log written".to_string(),
         }
     }
 
     fn stage_skipped_message(stage: PipelineStage) -> String {
         match stage {
+            PipelineStage::PreActions => "Pre-conversion actions skipped".to_string(),
             PipelineStage::Materialize => "Source extraction skipped".to_string(),
             PipelineStage::PlanOutputs => "Output planning skipped".to_string(),
             PipelineStage::Convert => "Audio conversion skipped".to_string(),
@@ -240,6 +255,7 @@ impl BroadcastReporter {
             PipelineStage::ReplayGain => "ReplayGain skipped".to_string(),
             PipelineStage::Features => "Feature extraction skipped".to_string(),
             PipelineStage::Publish => "Publishing skipped".to_string(),
+            PipelineStage::PostActions => "Post-conversion actions skipped".to_string(),
             PipelineStage::DurableLog => "Conversion log skipped".to_string(),
         }
     }
@@ -329,6 +345,7 @@ impl BroadcastReporter {
                     Self::round_progress((*progress).max(state.last_progress))
                 }
                 crate::convert::ConversionStatus::Completed { .. }
+                | crate::convert::ConversionStatus::CompletedWithActionErrors { .. }
                 | crate::convert::ConversionStatus::Partial { .. } => 100.0,
                 crate::convert::ConversionStatus::Failed { .. }
                 | crate::convert::ConversionStatus::Cancelled => state.last_progress,

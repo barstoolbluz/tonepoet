@@ -61,6 +61,7 @@ rayon = "1"
 sha2 = "0.10"
 hex = "0.4"
 libc = "0.2"
+rustix = { version = "0.38", features = ["fs"] }
 md-5 = "0.10"
 encoding_rs = "0.8"
 getrandom = "0.2"

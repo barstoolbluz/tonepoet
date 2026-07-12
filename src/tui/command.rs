@@ -619,6 +619,9 @@ pub const COMMAND_NAMES: &[&str] = &[
     "rename-all",
     "renameall",
     "bulk-rename",
+    "actions",
+    "actions-run",
+    "actions-identity-import",
     "password",
     "pw",
     "analyze",
@@ -881,6 +884,15 @@ pub enum Command {
     Bookmarks(String),
     /// Open the bulk rename wizard for the current selection.
     BulkRename,
+    /// Open the ordered pre/post conversion-actions wizard.
+    Actions,
+    /// Preview and explicitly apply the configured POST action pipeline to an
+    /// existing album directory. No argument uses the current Browse directory.
+    ActionsRun(Option<String>),
+    /// Import a reviewed canonical action-identity payload for a pre-feature
+    /// album. No argument uses `.tonepoet-action-identity.import.json` in the
+    /// current Browse directory.
+    ActionsIdentityImport(Option<String>),
     /// Analyze selected audio file(s) — DR, peak, clipping, etc.
     /// `force`: if true, skip cache and re-analyze.
     Analyze {
@@ -1081,6 +1093,12 @@ impl std::fmt::Debug for Command {
             Command::Recent => f.write_str("Recent"),
             Command::Bookmarks(arg) => f.debug_tuple("Bookmarks").field(arg).finish(),
             Command::BulkRename => f.write_str("BulkRename"),
+            Command::Actions => f.write_str("Actions"),
+            Command::ActionsRun(path) => f.debug_tuple("ActionsRun").field(path).finish(),
+            Command::ActionsIdentityImport(path) => f
+                .debug_tuple("ActionsIdentityImport")
+                .field(path)
+                .finish(),
             Command::Analyze { force } => f.debug_struct("Analyze").field("force", force).finish(),
             Command::WriteDr => f.write_str("WriteDr"),
             Command::WriteRgTrack => f.write_str("WriteRgTrack"),
@@ -1300,6 +1318,13 @@ pub fn parse_command(input: &str) -> Command {
         "recent" | "recents" => Command::Recent,
         "bookmarks" | "bm" => Command::Bookmarks(args.to_string()),
         "rename-all" | "renameall" | "bulk-rename" => Command::BulkRename,
+        "actions" => Command::Actions,
+        "actions-run" => Command::ActionsRun(
+            (!args.trim().is_empty()).then(|| args.trim().to_string()),
+        ),
+        "actions-identity-import" => Command::ActionsIdentityImport(
+            (!args.trim().is_empty()).then(|| args.trim().to_string()),
+        ),
         "analyze" | "analysis" | "dr" => Command::Analyze { force: false },
         "analyze!" => Command::Analyze { force: true },
         "verify" | "test" => Command::Verify,
@@ -3549,6 +3574,37 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 surface_stale_selection_notice(app, dropped_stale_count);
             }
         }
+        Command::Actions => {
+            let mut state = super::conversion_actions_ui::ConversionActionsWizardState::new(
+                app.convert.output_options.actions.clone(),
+            );
+            super::conversion_actions_ui::refresh_wizard_preview_for_app(&mut state, app);
+            app.active_overlay = super::app::ActiveOverlay::ConversionActionsWizard(Box::new(state));
+            app.set_status("Editing conversion actions");
+        }
+        Command::ActionsRun(path) => {
+            let state = super::conversion_actions_ui::start_actions_run_preparation(
+                app.browse.current_dir.clone(),
+                app.convert.output_options.actions.clone(),
+                path,
+                tx,
+            );
+            app.active_overlay = super::app::ActiveOverlay::ActionsRun(Box::new(state));
+            app.set_status("Preparing exact action preview… Esc cancels");
+        }
+        Command::ActionsIdentityImport(path) => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":actions-identity-import only works on the browse screen");
+            } else {
+                match super::conversion_actions_ui::import_actions_identity(
+                    &app.browse.current_dir,
+                    path.as_deref(),
+                ) {
+                    Ok(message) => app.set_status(message),
+                    Err(error) => app.set_status(error),
+                }
+            }
+        }
         Command::WriteRgTrack | Command::WriteRgAlbum => {
             let album = matches!(cmd, Command::WriteRgAlbum);
             let paths: Vec<std::path::PathBuf> = app
@@ -5304,6 +5360,7 @@ fn execute_commit_with_source_options_transform(
                     existing_req.settings = pipeline_settings.clone();
                     existing_req.merge = options.merge_to_single;
                     existing_req.companion = companion_policy.clone();
+                    existing_req.actions = options.actions.clone();
                 } else {
                     let output_root = options.output_dir.clone()
                         .map(|p| crate::convert::pipeline::unified_request::expand_tilde(&p))
@@ -5314,6 +5371,7 @@ fn execute_commit_with_source_options_transform(
                                 .to_path_buf()
                         });
                     item.pipeline_request = Some(PipelineRequest {
+                        actions: options.actions.clone(),
                         worker_count: None,
                         scratch_staging: None,
                         job_id: format!("job-{}", item.id),
@@ -14262,5 +14320,24 @@ mod bulk_guard_behavior_tests {
         // completion status, without pinning the probe-dependent wording.
         assert!(status.starts_with("Ignored 2 stale selection marks outside the current directory; "));
         assert!(status.contains("review settings, then :commit or :Commit"));
+    }
+}
+
+
+#[cfg(test)]
+mod conversion_action_command_parser_tests {
+    use super::*;
+
+    #[test]
+    fn identity_import_command_preserves_optional_reviewed_source_path() {
+        // parse_command receives the input WITHOUT the leading ':'.
+        assert!(matches!(
+            parse_command("actions-identity-import"),
+            Command::ActionsIdentityImport(None)
+        ));
+        assert!(matches!(
+            parse_command("actions-identity-import reviewed identity.json"),
+            Command::ActionsIdentityImport(Some(path)) if path == "reviewed identity.json"
+        ));
     }
 }

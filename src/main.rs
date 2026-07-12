@@ -27,6 +27,30 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Internal process-tree supervisor for conversion action scripts.
+    #[command(name = "__action-script-supervisor", hide = true)]
+    InternalActionScriptSupervisor {
+        #[arg(long)]
+        runtime_fd: i32,
+        #[arg(long)]
+        control_fd: i32,
+        #[arg(long)]
+        event_fd: i32,
+        #[arg(long)]
+        script_fd: i32,
+        #[arg(long)]
+        working_directory_fd: i32,
+    },
+    /// Internal exec-gated launcher used by the script supervisor.
+    #[command(name = "__action-script-launcher", hide = true)]
+    InternalActionScriptLauncher {
+        #[arg(long)]
+        launch_fd: i32,
+        #[arg(long)]
+        cgroup_fd: Option<i32>,
+        #[arg(long)]
+        script_fd: i32,
+    },
     /// Convert audio files, directories, or archives
     Convert {
         /// Input files, directories, or archives
@@ -264,16 +288,66 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Keep the containment supervisor and launcher out of Tokio entirely.
+    // They deliberately own their complete child process topology; starting a
+    // multithreaded runtime first would create unrelated threads and process
+    // state before subreaper/cgroup/kqueue supervision is armed.
+    if let Commands::InternalActionScriptSupervisor {
+        runtime_fd,
+        control_fd,
+        event_fd,
+        script_fd,
+        working_directory_fd,
+    } = &cli.command
+    {
+        tonepoet::convert::script_supervisor::run_internal_supervisor(
+            *runtime_fd,
+            *control_fd,
+            *event_fd,
+            *script_fd,
+            *working_directory_fd,
+        )?;
+        return Ok(());
+    }
+    if let Commands::InternalActionScriptLauncher {
+        launch_fd,
+        cgroup_fd,
+        script_fd,
+    } = &cli.command
+    {
+        // The launcher inherits the SCRIPT's output descriptors; anything it
+        // prints would be captured as script output. Pre-exec failures are
+        // already reported through the launch readiness channel — exit
+        // nonzero silently instead of letting anyhow print to stderr.
+        if let Err(error) = tonepoet::convert::script_supervisor::run_internal_launcher(
+            *launch_fd,
+            *cgroup_fd,
+            *script_fd,
+        ) {
+            let _ = error; // reason travels via the readiness channel
+            std::process::exit(70);
+        }
+        return Ok(());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let log_level = if cli.verbose { "debug" } else { "info" };
     init_logging(log_level, matches!(&cli.command, Commands::Tui { .. }));
 
     let config = TonepoetConfig::load().unwrap_or_default();
 
     match cli.command {
+        Commands::InternalActionScriptSupervisor { .. }
+        | Commands::InternalActionScriptLauncher { .. } => unreachable!(),
         Commands::Tui { paths } => {
             run_tui(config, paths).await?;
         }
@@ -866,6 +940,17 @@ async fn run_convert(
                 ConversionStatus::Completed { output_path, .. } => {
                     pb.println(format!("  Completed: {}", output_path.display()));
                 }
+                ConversionStatus::CompletedWithActionErrors {
+                    output_path, errors, ..
+                } => {
+                    pb.println(format!(
+                        "  Completed with action errors: {}",
+                        output_path.display()
+                    ));
+                    for error in errors {
+                        pb.println(format!("    - {error}"));
+                    }
+                }
                 ConversionStatus::Partial {
                     output_path,
                     successful,
@@ -1076,6 +1161,7 @@ fn build_pipeline_request_template(
     };
 
     Some(PipelineRequest {
+        actions: tonepoet::convert::pipeline::ActionPipeline::default(),
         worker_count: None,
         scratch_staging: None,
         job_id: String::new(),     // filled per-item

@@ -6,8 +6,11 @@
 //! creates directories and moves files with a journal so that any mid-
 //! operation failure triggers a rollback to the original state.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::convert::rename_plan::{
+    plan_rename_transaction, RenameIntent, RenameTransactionPlan,
+};
 
 // ── Data structures ─────────────────────────────────────────────────
 
@@ -127,72 +130,49 @@ impl RenamePlan {
 ///
 /// Returns the number of conflicts (which block execution).
 pub fn validate_plan(plan: &mut RenamePlan) -> usize {
-    // Reset all statuses to Pending first (re-validation).
     for op in &mut plan.ops {
         op.status = OpStatus::Pending;
     }
 
-    // 1. Source == target (already correctly named)
     for op in &mut plan.ops {
         let full_target = plan.base_dir.join(&op.target_relative);
         if op.source == full_target {
             op.status = OpStatus::Skipped("already named correctly".into());
-            continue;
-        }
-        // Canonicalized comparison for case-insensitive filesystems.
-        if let (Ok(src), Ok(dst)) = (op.source.canonicalize(), full_target.canonicalize()) {
-            if src == dst {
-                op.status = OpStatus::Skipped("already named correctly".into());
-            }
-        }
-    }
-
-    // 2. Source doesn't exist (already moved in a previous run)
-    for op in &mut plan.ops {
-        if op.status == OpStatus::Pending && !op.source.exists() {
+        } else if !op.source.exists() {
             op.status = OpStatus::Skipped("source missing".into());
         }
     }
 
-    // 3. Target already exists. We conservatively skip ALL cases where
-    //    the target is already on disk, even if it's a source in another
-    //    op (swap scenario). True swaps (A→B, B→A) would require a temp-
-    //    file intermediary to avoid data loss from sequential renames;
-    //    we don't implement that. Users resolve swaps by editing per-line
-    //    to use intermediate names. For idempotent re-runs, the source
-    //    won't exist (caught in step 2 above), so this step only fires
-    //    for genuine collisions.
-    for i in 0..plan.ops.len() {
-        if plan.ops[i].status != OpStatus::Pending {
-            continue;
-        }
-        let full_target = plan.base_dir.join(&plan.ops[i].target_relative);
-        if full_target.exists() {
-            plan.ops[i].status = OpStatus::Skipped("target already exists".into());
-        }
-    }
+    let intents = plan
+        .ops
+        .iter()
+        .filter(|op| op.status == OpStatus::Pending)
+        .map(|op| RenameIntent {
+            source: op.source.clone(),
+            destination: plan.base_dir.join(&op.target_relative),
+        })
+        .collect::<Vec<_>>();
 
-    // 4. Detect duplicate targets among pending ops.
-    let mut target_counts: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, op) in plan.ops.iter().enumerate() {
-        if op.status == OpStatus::Pending {
-            target_counts
-                .entry(op.target_relative.to_lowercase()) // case-insensitive
-                .or_default()
-                .push(i);
-        }
-    }
-    let mut conflicts = 0;
-    for (_target, indices) in &target_counts {
-        if indices.len() > 1 {
-            for &i in indices {
-                plan.ops[i].status = OpStatus::Conflict;
-                conflicts += 1;
+    match plan_rename_transaction(&plan.base_dir, intents) {
+        Ok(_) => 0,
+        Err(error) => {
+            // Browse keeps a deliberately simple UI status model. The shared
+            // planner supplies the authoritative end-state validation; when it
+            // rejects the transaction, every still-pending row is marked as a
+            // conflict so the user cannot commit a partial subset accidentally.
+            let mut conflicts = 0;
+            for op in &mut plan.ops {
+                if op.status == OpStatus::Pending {
+                    op.status = OpStatus::Conflict;
+                    conflicts += 1;
+                }
             }
+            if conflicts == 0 && !plan.ops.is_empty() {
+                plan.ops[0].status = OpStatus::Skipped(error);
+            }
+            conflicts
         }
     }
-
-    conflicts
 }
 
 // ── Execution ───────────────────────────────────────────────────────
@@ -213,88 +193,247 @@ pub fn execute_plan(plan: &mut RenamePlan) -> Result<usize, String> {
         "execute_plan called with unresolved conflicts"
     );
 
-    // Phase 1: collect and create all needed target directories.
-    let dirs: Vec<PathBuf> = plan
+    let pending_indices = plan
         .ops
         .iter()
-        .filter(|op| op.status == OpStatus::Pending)
-        .filter_map(|op| {
-            let full = plan.base_dir.join(&op.target_relative);
-            full.parent().map(|p| p.to_path_buf())
-        })
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    for dir in &dirs {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            return Err(format!(
-                "failed to create directory {}: {}",
-                dir.display(),
-                e
-            ));
-        }
+        .enumerate()
+        .filter_map(|(index, op)| (op.status == OpStatus::Pending).then_some(index))
+        .collect::<Vec<_>>();
+    if pending_indices.is_empty() {
+        return Ok(0);
     }
 
-    // Phase 2: move files with journal for rollback.
-    let mut journal: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let transaction = plan_rename_transaction(
+        &plan.base_dir,
+        pending_indices.iter().map(|&index| RenameIntent {
+            source: plan.ops[index].source.clone(),
+            destination: plan.base_dir.join(&plan.ops[index].target_relative),
+        }),
+    )?;
 
-    for op in &mut plan.ops {
-        if op.status != OpStatus::Pending {
-            continue;
+    let workspace = unique_rename_workspace(&plan.base_dir)?;
+    std::fs::create_dir(&workspace).map_err(|error| {
+        format!(
+            "failed to create rename transaction workspace {}: {error}",
+            workspace.display()
+        )
+    })?;
+
+    let result = execute_shared_transaction(&transaction, &workspace);
+    let cleanup_result = std::fs::remove_dir(&workspace);
+    match (result, cleanup_result) {
+        (Ok(count), Ok(())) => {
+            for &index in &pending_indices {
+                plan.ops[index].status = OpStatus::Succeeded;
+            }
+            Ok(count)
+        }
+        (Ok(_), Err(error)) => Err(format!(
+            "rename completed but transaction workspace cleanup failed at {}: {error}",
+            workspace.display()
+        )),
+        (Err(error), _) => {
+            for &index in &pending_indices {
+                if plan.ops[index].status == OpStatus::Pending {
+                    plan.ops[index].status = OpStatus::Failed(error.clone());
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn unique_rename_workspace(base_dir: &Path) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..1024 {
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let candidate = base_dir.join(format!(
+            ".tonepoet-browse-rename-{}-{sequence}",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "could not allocate a rename transaction workspace under {}",
+        base_dir.display()
+    ))
+}
+
+fn execute_shared_transaction(
+    transaction: &RenameTransactionPlan,
+    workspace: &Path,
+) -> Result<usize, String> {
+    let staging_paths = transaction
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, _)| workspace.join(format!("entry-{index:06}")))
+        .collect::<Vec<_>>();
+    let mut staged = Vec::new();
+    let mut installed = Vec::new();
+
+    let operation = (|| {
+        for index in transaction.staging_order() {
+            let _entry = &transaction.entries[index];
+            let source = effective_source_after_ancestor_staging(
+                index,
+                transaction,
+                &staging_paths,
+                &staged,
+            );
+            if !source.exists() {
+                return Err(format!(
+                    "rename source changed after validation: {}",
+                    source.display()
+                ));
+            }
+            std::fs::rename(&source, &staging_paths[index]).map_err(|error| {
+                format!(
+                    "rename staging failed: {} -> {}: {error}",
+                    source.display(),
+                    staging_paths[index].display()
+                )
+            })?;
+            staged.push(index);
         }
 
-        let full_target = plan.base_dir.join(&op.target_relative);
-
-        match std::fs::rename(&op.source, &full_target) {
-            Ok(()) => {
-                journal.push((op.source.clone(), full_target));
-                op.status = OpStatus::Succeeded;
+        for index in transaction.installation_order() {
+            let entry = &transaction.entries[index];
+            if entry.destination.exists() {
+                return Err(format!(
+                    "rename destination appeared after staging: {}",
+                    entry.destination.display()
+                ));
             }
-            Err(e) => {
-                let err_msg = format!(
-                    "rename failed: {} -> {}: {}",
-                    op.source.display(),
-                    full_target.display(),
-                    e
-                );
-                op.status = OpStatus::Failed(err_msg.clone());
+            if let Some(parent) = entry.destination.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "failed to create rename destination directory {}: {error}",
+                        parent.display()
+                    )
+                })?;
+            }
+            std::fs::rename(&staging_paths[index], &entry.destination).map_err(|error| {
+                format!(
+                    "rename publish failed: {} -> {}: {error}",
+                    staging_paths[index].display(),
+                    entry.destination.display()
+                )
+            })?;
+            installed.push(index);
+        }
+        Ok(transaction.entries.len())
+    })();
 
-                // Rollback all previously-succeeded moves.
-                let mut rollback_errors = Vec::new();
-                for (original, moved_to) in journal.iter().rev() {
-                    if let Err(rb) = std::fs::rename(moved_to, original) {
+    match operation {
+        Ok(count) => Ok(count),
+        Err(primary) => {
+            let mut rollback_errors = Vec::new();
+            for &index in installed.iter().rev() {
+                let entry = &transaction.entries[index];
+                if entry.destination.exists() {
+                    if let Err(error) = std::fs::rename(&entry.destination, &staging_paths[index]) {
                         rollback_errors.push(format!(
-                            "{} -> {}: {}",
-                            moved_to.display(),
-                            original.display(),
-                            rb
+                            "{} -> {}: {error}",
+                            entry.destination.display(),
+                            staging_paths[index].display()
                         ));
                     }
                 }
-
-                // Reset succeeded ops to Pending (they've been rolled back).
-                for op in plan.ops.iter_mut() {
-                    if op.status == OpStatus::Succeeded {
-                        op.status = OpStatus::Pending;
+            }
+            for &index in staged.iter().rev() {
+                if !staging_paths[index].exists() {
+                    continue;
+                }
+                let restore_target = effective_restore_target(
+                    index,
+                    transaction,
+                    &staging_paths,
+                    &staged,
+                );
+                if let Some(parent) = restore_target.parent() {
+                    if let Err(error) = std::fs::create_dir_all(parent) {
+                        rollback_errors.push(format!(
+                            "create {} for rollback: {error}",
+                            parent.display()
+                        ));
+                        continue;
                     }
                 }
-
-                if rollback_errors.is_empty() {
-                    return Err(format!("{}. All previous renames rolled back.", err_msg));
-                } else {
-                    return Err(format!(
-                        "{}. Rollback partially failed: {}",
-                        err_msg,
-                        rollback_errors.join("; ")
+                if restore_target.exists() {
+                    rollback_errors.push(format!(
+                        "rollback target unexpectedly exists: {}",
+                        restore_target.display()
+                    ));
+                    continue;
+                }
+                if let Err(error) = std::fs::rename(&staging_paths[index], &restore_target) {
+                    rollback_errors.push(format!(
+                        "{} -> {}: {error}",
+                        staging_paths[index].display(),
+                        restore_target.display()
                     ));
                 }
             }
+            if rollback_errors.is_empty() {
+                Err(format!("{primary}. All staged renames rolled back."))
+            } else {
+                Err(format!(
+                    "{primary}. Rollback partially failed; preserved workspace {}: {}",
+                    workspace.display(),
+                    rollback_errors.join("; ")
+                ))
+            }
         }
     }
+}
 
-    let succeeded = journal.len();
-    Ok(succeeded)
+fn effective_source_after_ancestor_staging(
+    index: usize,
+    transaction: &RenameTransactionPlan,
+    staging_paths: &[PathBuf],
+    staged: &[usize],
+) -> PathBuf {
+    let source = &transaction.entries[index].source;
+    staged
+        .iter()
+        .filter_map(|&ancestor_index| {
+            let ancestor = &transaction.entries[ancestor_index].source;
+            source
+                .strip_prefix(ancestor)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(|relative| (ancestor.components().count(), staging_paths[ancestor_index].join(relative)))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| source.clone())
+}
+
+fn effective_restore_target(
+    index: usize,
+    transaction: &RenameTransactionPlan,
+    staging_paths: &[PathBuf],
+    staged: &[usize],
+) -> PathBuf {
+    let source = &transaction.entries[index].source;
+    staged
+        .iter()
+        .filter(|&&ancestor_index| ancestor_index != index && staging_paths[ancestor_index].exists())
+        .filter_map(|&ancestor_index| {
+            let ancestor = &transaction.entries[ancestor_index].source;
+            source
+                .strip_prefix(ancestor)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(|relative| (ancestor.components().count(), staging_paths[ancestor_index].join(relative)))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| source.clone())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

@@ -131,6 +131,7 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
     options.cue_generation_mode = config.conversion.cue_generation_mode.clone();
     options.force_encode = *output_opts.force_encode.selected_value();
     options.create_disc_subfolders = *output_opts.disc_subfolders.selected_value();
+    options.actions = output_opts.actions.clone();
     if let Some(settings) = options.pipeline_settings.as_mut() {
         settings.force_encode = *output_opts.force_encode.selected_value();
     }
@@ -254,6 +255,7 @@ pub fn try_pills_to_options(
         cue_generation_mode: config.conversion.cue_generation_mode.clone(),
         force_encode: *output_opts.force_encode.selected_value(),
         create_disc_subfolders: *output_opts.disc_subfolders.selected_value(),
+        actions: output_opts.actions.clone(),
         pipeline_settings: Some({
             let mut settings = pipeline_settings;
             settings.force_encode = *output_opts.force_encode.selected_value();
@@ -540,6 +542,7 @@ fn is_active_commit_item(item: &ConversionItem) -> bool {
     !matches!(
         item.status,
         ConversionStatus::Completed { .. }
+            | ConversionStatus::CompletedWithActionErrors { .. }
             | ConversionStatus::Failed { .. }
             | ConversionStatus::Cancelled
     )
@@ -696,7 +699,13 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
             let completed = q
                 .all_items()
                 .iter()
-                .filter(|i| matches!(i.status, ConversionStatus::Completed { .. }))
+                .filter(|i| {
+                    matches!(
+                        i.status,
+                        ConversionStatus::Completed { .. }
+                            | ConversionStatus::CompletedWithActionErrors { .. }
+                    )
+                })
                 .count();
             let failed = q
                 .all_items()

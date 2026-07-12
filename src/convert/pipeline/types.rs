@@ -14,6 +14,7 @@ use tonepoet_pipeline::PipelineSettings;
 
 use crate::disc::bluray_backend::BluRayAudioCoding;
 
+use super::actions::ActionPipeline;
 use super::memory_budget::{ScratchReservation, ScratchStagingConfig};
 
 fn deserialize_optional_nonzero_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
@@ -168,6 +169,11 @@ pub struct AlbumBatchContext {
     /// override is also present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resolved_identity: Option<BatchResolvedAlbumIdentity>,
+    /// Exact conversion-input paths for this batch. Action SR-3 consumes this
+    /// dispatcher-authored set rather than re-deriving inputs from tags or an
+    /// individual worker's materialized source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) source_paths: Vec<PathBuf>,
 }
 
 impl AlbumBatchContext {
@@ -193,6 +199,7 @@ impl AlbumBatchContext {
                 source_grouping_root.clone(),
             )),
             resolved_identity: None,
+            source_paths: Vec::new(),
             source_grouping_root,
         }
     }
@@ -232,6 +239,19 @@ impl AlbumBatchContext {
     pub(crate) fn with_resolved_identity(mut self, identity: BatchResolvedAlbumIdentity) -> Self {
         self.resolved_identity = if identity.is_empty() { None } else { Some(identity) };
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_source_paths(mut self, mut source_paths: Vec<PathBuf>) -> Self {
+        source_paths.sort();
+        source_paths.dedup();
+        self.source_paths = source_paths;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn source_paths(&self) -> &[PathBuf] {
+        &self.source_paths
     }
 
     #[must_use]
@@ -516,6 +536,10 @@ pub struct PipelineRequest {
     /// Companion files/folders copied best-effort after publish.
     #[serde(default, skip_serializing_if = "CompanionCopyPolicy::is_empty")]
     pub companion: CompanionCopyPolicy,
+    /// Ordered, durable pre/post conversion actions. Missing on older queue
+    /// records means no actions and therefore preserves legacy behavior.
+    #[serde(default, skip_serializing_if = "ActionPipeline::is_empty")]
+    pub actions: ActionPipeline,
     /// Container extension override. `None` = codec default extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_extension: Option<String>,
@@ -893,6 +917,8 @@ pub struct RedactedPipelineRequest {
     pub suppress_incremental_conversion_log_append: bool,
     pub expected_album_track_count: Option<usize>,
     pub companion: CompanionCopyPolicy,
+    #[serde(default, skip_serializing_if = "ActionPipeline::is_empty")]
+    pub actions: ActionPipeline,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -974,6 +1000,7 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
             suppress_incremental_conversion_log_append: req.suppress_incremental_conversion_log_append,
             expected_album_track_count: req.expected_album_track_count,
             companion: req.companion.clone(),
+            actions: req.actions.clone(),
         }
     }
 }
@@ -2120,6 +2147,7 @@ pub struct TrackRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PipelineStage {
+    PreActions,
     Materialize,
     PlanOutputs,
     Convert,
@@ -2128,6 +2156,7 @@ pub enum PipelineStage {
     ReplayGain,
     Features,
     Publish,
+    PostActions,
     DurableLog,
 }
 
@@ -2205,6 +2234,10 @@ pub struct PipelineReport {
     /// Path to the conversion manifest, if one was written during publish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<PathBuf>,
+    /// Complete durable pre/post action reports. Empty for legacy requests and
+    /// requests with no configured actions, preserving prior serialized output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub action_reports: Vec<super::actions::ActionPhaseReport>,
 }
 
 #[derive(Debug)]

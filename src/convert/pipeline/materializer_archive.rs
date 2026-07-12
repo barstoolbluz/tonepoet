@@ -2098,6 +2098,7 @@ mod tests {
         let container = root.join(archive_name);
         fs::write(&container, b"archive fixture").expect("archive fixture");
         PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: format!("job-{archive_name}"),
             item_id: format!("item-{archive_name}"),
             container,

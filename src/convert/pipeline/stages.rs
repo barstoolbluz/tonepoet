@@ -24,6 +24,26 @@ use super::errors::{
     PublishError, ReplayGainError, RequestValidationError, SourceDetectError, SourceDispatchError,
     ToolRunnerError,
 };
+use super::actions::{
+    acquire_blocking_album_publication_lock_for_album,
+    acquire_blocking_album_publication_lock_for_album_in_output_root,
+    acquire_blocking_album_publication_lock_for_album_under_output_capability,
+    acquire_explicit_action_run_lock_for_album,
+    acquire_explicit_action_run_lock_for_album_in_output_root,
+    acquire_explicit_action_run_lock_for_album_under_output_capability,
+    ensure_album_capability_has_no_unresolved_explicit_state,
+    ensure_album_publication_has_no_unresolved_explicit_state,
+    current_process_owner,
+    elect_action_runner,
+    owner_is_current_process, owner_liveness, release_current_process_owner_claim,
+    validate_owner_identity,
+    workspace_has_unresolved_action_state, ActionCancellation,
+    ActionContext, ActionElection,
+    ActionElectionIdentity, ActionEngine, ActionError, ActionPhase, ActionPipeline,
+    ActionPhaseReport, ActionResult, ActionResultStatus, ActionSemantics,
+    CapabilityActionFilesystem, ExplicitActionRunLock, OwnerLiveness, ProcessOwnerIdentity,
+    ProcessGroupScriptRunner,
+};
 use super::materializer_archive::ArchiveMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
@@ -46,6 +66,7 @@ use super::progress::{
 use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{CommandRecord, RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
+use crate::convert::cap_fs::PinnedDirectoryCapability;
 use crate::convert::ConversionStatus;
 use tonepoet_pipeline::{
     AacProfile, AudioFormat as PlannerAudioFormat, BitDepthTarget, DitherType,
@@ -73,11 +94,26 @@ const CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE: &str = "complete";
 const CONVERSION_LOG_VISIBLE_COMMIT_MARKER_FILE: &str = "visible-conversion-log-publish-in-progress";
 const CONVERSION_LOG_BATCH_FINALIZATION_LOCK_FILE: &str = ".conversion-log-finalization.lock";
 const CONVERSION_LOG_BATCH_WORKSPACE_STATE_FILE: &str = "state";
-const CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION: u8 = 1;
+const CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION: u8 = 4;
 const CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE: &str = "active";
 const CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE: &str = "complete";
 const CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED: &str = "failed";
 const CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ABANDONED: &str = "abandoned";
+const CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING: &str = "cleaning";
+const CONVERSION_LOG_BATCH_DRAIN_DIR: &str = ".tonepoet-participant-drain";
+const CONVERSION_LOG_BATCH_DRAIN_MANIFEST_FILE: &str = "manifest.json";
+const CONVERSION_LOG_BATCH_DRAIN_ACK_PREFIX: &str = "ack-";
+const CONVERSION_LOG_BATCH_DRAIN_ACK_SUFFIX: &str = ".json";
+const CONVERSION_LOG_BATCH_DRAIN_SCHEMA_VERSION: u8 = 1;
+const CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_FILE: &str = "post-actions-terminal.json";
+const CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_SCHEMA_VERSION: u8 = 1;
+const CONVERSION_ACTION_IDENTITY_FILE: &str = ".tonepoet-action-identity.json";
+const CONVERSION_ACTION_IDENTITY_TEMP_FILE: &str = ".tonepoet-action-identity.write.tmp";
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
+const CONVERSION_ACTION_IDENTITY_IMPORT_FILE: &str = ".tonepoet-action-identity.import.json";
+const CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE: &str =
+    ".tonepoet-action-identity.invalidate";
+const CONVERSION_ACTION_IDENTITY_SCHEMA_VERSION: u8 = 1;
 const CONVERSION_LOG_VISIBLE_TEMP_PREFIX: &str = ".conversion.log.tonepoet-visible.";
 const CONVERSION_LOG_VISIBLE_BACKUP_PREFIX: &str = ".conversion.log.tonepoet-visible-backup.";
 const COMPANION_BATCH_TRANSIENT_DIR: &str = ".tonepoet-companion-copy";
@@ -487,6 +523,43 @@ fn is_generated_conversion_log_batch_id(value: &str) -> bool {
 /// `AlbumBatchTrackContext`. This helper deliberately refuses to synthesize a
 /// track number from request enumeration order, because filesystem and queue
 /// iteration order are not authoritative album track order.
+#[derive(serde::Serialize)]
+struct IndependentSingleFileBatchLifecycleContract<'a> {
+    actions: &'a ActionPipeline,
+    failure_policy: &'a FailurePolicy,
+    publish: &'a PublishPolicy,
+    log: &'a LogPolicy,
+    stages: &'a StagePolicy,
+    companion: &'a CompanionCopyPolicy,
+    metadata_overrides: &'a RequestMetadataOverrides,
+    merge: bool,
+    source_track_selection: &'a TrackSelection,
+}
+
+/// Canonical compatibility identity for every per-item policy that can affect
+/// album-level election, participant drain, cleanup, or visible terminal
+/// semantics. Folder dispatch must split requests when this value differs.
+pub(crate) fn independent_single_file_album_batch_lifecycle_key(
+    req: &PipelineRequest,
+) -> Result<String, RequestValidationError> {
+    serde_json::to_string(&IndependentSingleFileBatchLifecycleContract {
+        actions: &req.actions,
+        failure_policy: &req.failure_policy,
+        publish: &req.publish,
+        log: &req.log,
+        stages: &req.stages,
+        companion: &req.companion,
+        metadata_overrides: &req.metadata_overrides,
+        merge: req.merge,
+        source_track_selection: &req.source.track_selection,
+    })
+    .map_err(|error| {
+        RequestValidationError::InvalidStagePolicy(format!(
+            "could not serialize independent album-batch lifecycle contract: {error}"
+        ))
+    })
+}
+
 pub fn prepare_independent_single_file_album_batch_for_dispatch(
     requests: Vec<PipelineRequest>,
     album_output_dir: PathBuf,
@@ -521,6 +594,17 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
         ));
     }
 
+    let expected_lifecycle = independent_single_file_album_batch_lifecycle_key(&requests[0])?;
+    for request in requests.iter().skip(1) {
+        let lifecycle = independent_single_file_album_batch_lifecycle_key(request)?;
+        if lifecycle != expected_lifecycle {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "independent single-file album batch contains incompatible action/lifecycle policy at {}; requests must be split before dispatch",
+                request.container.display()
+            )));
+        }
+    }
+
     let mut expected_track_count = 0_usize;
     for req in &requests {
         let kind = detect_source_kind(req).map_err(|err| {
@@ -543,6 +627,10 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
         ));
     }
     let normalized_grouping_root = normalize_path(&source_grouping_root);
+    let batch_source_paths = requests
+        .iter()
+        .map(|req| normalize_path(&req.container))
+        .collect::<Vec<_>>();
     let resolved_identity = requests
         .iter()
         .find_map(|req| req.batch_resolved_identity.clone());
@@ -556,6 +644,7 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
     if let Some(identity) = resolved_identity {
         album_batch = album_batch.with_resolved_identity(identity);
     }
+    album_batch = album_batch.with_source_paths(batch_source_paths);
 
     for req in requests.iter_mut() {
         let Some(dispatcher_track_context) = req.album_batch_track.clone() else {
@@ -2265,6 +2354,107 @@ pub fn plan_outputs(
     })
 }
 
+/// Resolve the album directory at the queue-dispatch boundary from the same
+/// metadata, enrichment, batch-identity, template renderer, sanitizer, and
+/// output planner used by the real conversion path.
+///
+/// This exists for one load-bearing reason: batch pre-actions must be elected
+/// and completed before any worker materializes, while manifest rerun skips
+/// must suppress those actions. A provisional source-folder guess cannot
+/// satisfy both requirements. Callers must compare the result for every member
+/// of a batch and only mark the batch directory planner-resolved when all
+/// members agree.
+pub(crate) fn plan_album_dir_from_dispatch_metadata(
+    req: &PipelineRequest,
+    source_kind: SourceKind,
+    metadata: TrackMetadata,
+) -> Result<PathBuf, String> {
+    let source = prepared_source_from_dispatch_metadata(req, source_kind, metadata);
+    let plan = plan_outputs(&source, req).map_err(|error| error.to_string())?;
+    if plan.album_dirs.len() > 1 {
+        return Err(format!(
+            "dispatch preflight produced multiple album roots for {}: {}",
+            req.container.display(),
+            plan.album_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(plan.album_dir)
+}
+
+/// Construct the same dispatcher-resolved source identity used by output
+/// planning without materializing audio. Pre actions and destination preview
+/// must call this helper rather than rebuilding naming-token identity.
+fn prepared_source_from_dispatch_metadata(
+    req: &PipelineRequest,
+    source_kind: SourceKind,
+    metadata: TrackMetadata,
+) -> PreparedSource {
+    let source_ordinal = req
+        .album_batch_track
+        .as_ref()
+        .map(|track| track.source_ordinal)
+        .unwrap_or(1);
+    let track_number = metadata
+        .track_number
+        .or_else(|| req.album_batch_track.as_ref().map(|track| track.track_number))
+        .filter(|number| *number > 0)
+        .unwrap_or(1);
+    let disc_number = metadata
+        .disc_number
+        .or_else(|| req.album_batch_track.as_ref().and_then(|track| track.disc_number));
+    let total_discs = metadata
+        .extra
+        .get("disctotal")
+        .or_else(|| metadata.extra.get("totaldiscs"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0);
+    let album = metadata
+        .extra
+        .get("album")
+        .cloned()
+        .filter(|value| !value.trim().is_empty());
+    let mut source = PreparedSource {
+        container: req.container.clone(),
+        kind: source_kind,
+        tracks: vec![PreparedTrack {
+            id: TrackId {
+                source_ordinal,
+                disc_number,
+                track_number,
+            },
+            source_ref: TrackSourceRef::StagedFile(req.container.clone()),
+            metadata: metadata.clone(),
+            expected_samples: None,
+            sample_rate: None,
+            source_audio: SourceAudioDescriptor::default(),
+            bit_depth: None,
+        }],
+        album_metadata: AlbumMetadata {
+            album,
+            album_artist: metadata.album_artist.clone(),
+            genre: metadata.genre.clone(),
+            date: metadata.date.clone(),
+            total_tracks: 1,
+            total_discs,
+            disc_number,
+            extra: metadata.extra,
+        },
+        provenance: ExtractionProvenance {
+            source_kind,
+            source_sha256: None,
+            tool_versions: BTreeMap::new(),
+            extracted_at: chrono::Utc::now(),
+        },
+    };
+    enrich_source_with_label_info(&mut source, &req.container, req);
+    apply_batch_identity_and_request_metadata(&mut source, req);
+    source
+}
+
 fn template_uses_track_scoped_disc_tokens(template: &str) -> bool {
     template_tokens_in(template).iter().any(|token| {
         matches!(
@@ -3737,7 +3927,22 @@ fn sync_file_before_metadata_replace(path: &Path) -> io::Result<()> {
 fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let parent = parent_dir_or_current(path);
     let dir = fs::File::open(parent)?;
-    dir.sync_all()
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        // Directory fsync is unsupported on descriptor-namespace routes
+        // (/proc/self/fd/N parents) and some special filesystems; real
+        // directories never report these errnos. Same tolerance as
+        // cap_fs::directory_sync_unsupported. (ENOTSUP aliases EOPNOTSUPP on
+        // Linux, hence the boolean form rather than a pattern.)
+        Err(error)
+            if error.raw_os_error().is_some_and(|code| {
+                code == libc::EINVAL || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+            }) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn replace_rewritten_metadata_file(path: &Path, tmp: &Path) -> io::Result<()> {
@@ -5320,6 +5525,7 @@ FILE "album.flac" WAVE
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
 
         PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: format!("matrix-{}", case.name),
             item_id: format!("matrix-{}", case.name),
             container: image.to_path_buf(),
@@ -6241,6 +6447,7 @@ fn stage_conversion_log_sidecars(
     let log_generated_at = chrono::Utc::now();
 
     if should_stage_conversion_log_fragment(outcome, source, req, &artifacts) {
+        ensure_conversion_log_batch_workspace_owned_for_request(req)?;
         // Fragment-backed independent source jobs must not build or stage a
         // visible per-source conversion.log. The hidden fragments are the only
         // conversion-log sidecars for this job; publish-time fragment counting
@@ -6651,6 +6858,7 @@ fn stage_pre_materialization_conversion_log_fragment(
             "pre-materialization album-batch conversion-log fragments require a stable batch coordination directory",
         )
     })?;
+    ensure_conversion_log_batch_workspace_owned_for_request(req)?;
     let settings_fingerprint =
         tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
     let generated_at = chrono::Utc::now();
@@ -7144,6 +7352,11 @@ struct ConversionLogBatchIdentity {
     source_context_path: String,
     source_context_kind: String,
     target_format: String,
+    /// Runtime-only descriptor-backed batch coordination directory. The
+    /// durable identity above remains canonical and stable across restarts;
+    /// this access route is never serialized.
+    #[serde(skip)]
+    runtime_coordination_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -7706,6 +7919,7 @@ fn conversion_log_batch_identity(
         source_context_path: normalized_source_context_path.display().to_string(),
         source_context_kind: source_context_kind.to_string(),
         target_format: req.settings.target_format.display_name().to_string(),
+        runtime_coordination_dir: None,
     })
 }
 
@@ -7881,9 +8095,14 @@ fn conversion_log_fragment_batch_identity_from_entries(
         if !is_conversion_log_fragment_role(&entry.role) {
             continue;
         }
-        let fragment = read_conversion_log_fragment_file(&entry.staged_path)?;
+        let mut fragment = read_conversion_log_fragment_file(&entry.staged_path)?;
+        fragment.batch_identity.runtime_coordination_dir = entry
+            .final_path
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
         match &identity {
-            Some(current) if *current != fragment.batch_identity => {
+            Some(current) if !conversion_log_batch_identities_match(current, &fragment.batch_identity) => {
                 return Err(PublishError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -7913,6 +8132,15 @@ fn finalize_conversion_log_batch_coordination_if_complete(
     let Some(identity) = target_identity else {
         return Ok(false);
     };
+    let coord_dir = conversion_log_batch_coordination_album_dir_from_identity(identity);
+    ensure_conversion_log_batch_workspace_owned(
+        &coord_dir,
+        &identity.conversion_log_batch_id,
+    )
+    .map_err(PublishError::io_at(
+        "establishing conversion-log batch ownership before finalization",
+        &coord_dir,
+    ))?;
     let _batch_workspace_guard =
         activate_conversion_log_batch_workspace_for_identity_best_effort(identity, "batch finalization");
     let lock_path = conversion_log_batch_finalization_lock_path(identity);
@@ -7973,7 +8201,10 @@ fn finalize_conversion_log_batch_coordination_if_complete_locked(
         record_assembled_conversion_log_entries(published_entries, &written_logs);
     }
 
-    mark_conversion_log_batch_complete(identity, expected_track_count)?;
+    let batch_successful = fragments
+        .iter()
+        .all(|fragment| fragment.summary.outcome == ConversionLogTrackOutcome::Success);
+    mark_conversion_log_batch_complete(identity, expected_track_count, batch_successful)?;
     cleanup_complete_conversion_log_fragments(
         &coord_album_dir,
         expected_track_count,
@@ -8145,22 +8376,26 @@ fn write_visible_conversion_log_publish_marker(
     writes: &[VisibleConversionLogWrite],
     bytes: &[u8],
 ) -> Result<(), PublishError> {
+    let output_root = visible_conversion_log_marker_output_root(marker_path)?;
     let marker = VisibleConversionLogPublishMarker {
-        schema_version: 1,
+        schema_version: 2,
         batch_id: identity.conversion_log_batch_id.clone(),
         expected_content_len: Some(bytes.len() as u64),
         expected_content_sha256: Some(super::manifest::sha256_hex(bytes)),
         entries: writes
             .iter()
-            .map(|write| VisibleConversionLogPublishMarkerEntry {
-                final_path: write.log_path.to_string_lossy().to_string(),
-                temp_path: write.temp_path.to_string_lossy().to_string(),
-                backup_path: write
-                    .backup_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().to_string()),
+            .map(|write| {
+                let relative = |path: &Path| -> Result<String, PublishError> {
+                    checked_relative_path(&output_root, path)
+                        .map(|path| path.to_string_lossy().to_string())
+                };
+                Ok(VisibleConversionLogPublishMarkerEntry {
+                    final_path: relative(&write.log_path)?,
+                    temp_path: relative(&write.temp_path)?,
+                    backup_path: write.backup_path.as_deref().map(relative).transpose()?,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, PublishError>>()?,
     };
     let mut bytes = serde_json::to_vec_pretty(&marker).map_err(|err| {
         PublishError::Io(io::Error::new(
@@ -8233,16 +8468,21 @@ fn cleanup_committed_visible_conversion_log_writes(
 
 fn cleanup_committed_visible_conversion_log_marker_entries(
     marker_path: &Path,
-    entries: &[VisibleConversionLogPublishMarkerEntry],
+    marker: &VisibleConversionLogPublishMarker,
 ) -> Result<(), PublishError> {
-    for entry in entries {
-        let temp_path = PathBuf::from(&entry.temp_path);
+    for entry in &marker.entries {
+        let temp_path = resolve_visible_conversion_log_marker_entry(marker_path, marker, &entry.temp_path)?;
         remove_file_if_exists(&temp_path).map_err(PublishError::io_at(
             "removing roll-forward visible conversion.log temp",
             &temp_path,
         ))?;
         sync_parent_dir_best_effort(&temp_path);
-        if let Some(backup_path) = entry.backup_path.as_ref().map(PathBuf::from) {
+        if let Some(backup_path) = entry
+            .backup_path
+            .as_deref()
+            .map(|path| resolve_visible_conversion_log_marker_entry(marker_path, marker, path))
+            .transpose()?
+        {
             remove_file_if_exists(&backup_path).map_err(PublishError::io_at(
                 "removing roll-forward visible conversion.log backup",
                 &backup_path,
@@ -8289,44 +8529,62 @@ fn visible_conversion_log_marker_output_root(marker_path: &Path) -> Result<PathB
     })
 }
 
+fn resolve_visible_conversion_log_marker_entry(
+    marker_path: &Path,
+    marker: &VisibleConversionLogPublishMarker,
+    raw: &str,
+) -> Result<PathBuf, PublishError> {
+    let output_root = visible_conversion_log_marker_output_root(marker_path)?;
+    let candidate = if marker.schema_version == 1 {
+        normalize_path(Path::new(raw))
+    } else {
+        let relative = Path::new(raw);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+            })
+        {
+            return Err(PublishError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "visible conversion.log marker {} contains unsafe relative path {}",
+                    marker_path.display(),
+                    raw
+                ),
+            )));
+        }
+        normalize_path(&output_root.join(relative))
+    };
+    if candidate != output_root && !path_is_under_root(&candidate, &output_root) {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "visible conversion.log marker {} contains path outside output root {}: {}",
+                marker_path.display(),
+                output_root.display(),
+                candidate.display()
+            ),
+        )));
+    }
+    Ok(candidate)
+}
+
 fn validate_visible_conversion_log_marker_paths(
     marker_path: &Path,
     marker: &VisibleConversionLogPublishMarker,
 ) -> Result<(), PublishError> {
-    let output_root = visible_conversion_log_marker_output_root(marker_path)?;
     for entry in &marker.entries {
-        validate_visible_conversion_log_marker_path(marker_path, &output_root, "final", &entry.final_path)?;
-        validate_visible_conversion_log_marker_path(marker_path, &output_root, "temp", &entry.temp_path)?;
+        let _ = resolve_visible_conversion_log_marker_entry(marker_path, marker, &entry.final_path)?;
+        let _ = resolve_visible_conversion_log_marker_entry(marker_path, marker, &entry.temp_path)?;
         if let Some(backup_path) = entry.backup_path.as_deref() {
-            validate_visible_conversion_log_marker_path(marker_path, &output_root, "backup", backup_path)?;
+            let _ = resolve_visible_conversion_log_marker_entry(marker_path, marker, backup_path)?;
         }
     }
     Ok(())
 }
 
-fn validate_visible_conversion_log_marker_path(
-    marker_path: &Path,
-    output_root: &Path,
-    label: &str,
-    raw: &str,
-) -> Result<(), PublishError> {
-    let path = normalize_path(Path::new(raw));
-    if path != *output_root && !path_is_under_root(&path, output_root) {
-        return Err(PublishError::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "visible conversion.log marker {} contains {} path outside output root {}: {}",
-                marker_path.display(),
-                label,
-                output_root.display(),
-                path.display()
-            ),
-        )));
-    }
-    Ok(())
-}
-
 fn visible_conversion_log_marker_finals_match(
+    marker_path: &Path,
     marker: &VisibleConversionLogPublishMarker,
 ) -> Result<bool, PublishError> {
     let Some(expected_len) = marker.expected_content_len else {
@@ -8339,7 +8597,7 @@ fn visible_conversion_log_marker_finals_match(
         return Ok(false);
     }
     for entry in &marker.entries {
-        let final_path = PathBuf::from(&entry.final_path);
+        let final_path = resolve_visible_conversion_log_marker_entry(marker_path, marker, &entry.final_path)?;
         if !visible_conversion_log_file_matches(&final_path, expected_len, expected_sha256)? {
             return Ok(false);
         }
@@ -8438,7 +8696,7 @@ fn repair_interrupted_visible_conversion_log_publish_marker(
                 ),
             ))
         })?;
-    if marker.schema_version != 1 {
+    if marker.schema_version != 1 && marker.schema_version != 2 {
         return Err(PublishError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -8450,15 +8708,19 @@ fn repair_interrupted_visible_conversion_log_publish_marker(
     }
     validate_visible_conversion_log_marker_paths(marker_path, &marker)?;
 
-    if visible_conversion_log_marker_finals_match(&marker)? {
-        cleanup_committed_visible_conversion_log_marker_entries(marker_path, &marker.entries)?;
+    if visible_conversion_log_marker_finals_match(marker_path, &marker)? {
+        cleanup_committed_visible_conversion_log_marker_entries(marker_path, &marker)?;
         return Ok(());
     }
 
-    for entry in marker.entries {
-        let final_path = PathBuf::from(entry.final_path);
-        let temp_path = PathBuf::from(entry.temp_path);
-        let backup_path = entry.backup_path.map(PathBuf::from);
+    for entry in &marker.entries {
+        let final_path = resolve_visible_conversion_log_marker_entry(marker_path, &marker, &entry.final_path)?;
+        let temp_path = resolve_visible_conversion_log_marker_entry(marker_path, &marker, &entry.temp_path)?;
+        let backup_path = entry
+            .backup_path
+            .as_deref()
+            .map(|path| resolve_visible_conversion_log_marker_entry(marker_path, &marker, path))
+            .transpose()?;
         match fs::remove_file(&temp_path) {
             Ok(()) => sync_parent_dir_best_effort(&temp_path),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -8523,8 +8785,29 @@ fn visible_conversion_log_album_dirs_from_fragments(
     identity: &ConversionLogBatchIdentity,
     fragments: &[ConversionLogFragment],
 ) -> Result<Vec<PathBuf>, PublishError> {
-    let output_root = conversion_log_batch_output_root_from_identity(identity);
-    let coordination_dir = conversion_log_batch_coordination_album_dir_from_identity(identity);
+    // Fragment identities are durable and therefore contain canonical lexical
+    // paths. `runtime_coordination_dir`, when present, is only a live access
+    // route rooted at the retained output descriptor. Validate every fragment
+    // against the durable namespace, then rebase it into the live namespace for
+    // filesystem I/O. Never compare or serialize `/proc/self/fd/N` routes as
+    // logical album identity.
+    let stable_coordination_dir =
+        conversion_log_batch_stable_coordination_album_dir_from_identity(identity);
+    let stable_output_root =
+        conversion_log_batch_stable_output_root_from_identity(identity);
+    let runtime_output_root = conversion_log_batch_output_root_from_identity(identity);
+    if identity.runtime_coordination_dir.is_some()
+        && (stable_output_root.is_none() || runtime_output_root.is_none())
+    {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion log batch {} has a retained coordination route that cannot be related to its durable output-root identity",
+                identity.conversion_log_batch_id
+            ),
+        )));
+    }
+
     let mut dirs = BTreeSet::new();
     for fragment in fragments {
         let Some(rendered_album_dir) = fragment.rendered_album_dir.as_deref() else {
@@ -8533,40 +8816,76 @@ fn visible_conversion_log_album_dirs_from_fragments(
         if rendered_album_dir.trim().is_empty() {
             continue;
         }
-        let album_dir = normalize_path(Path::new(rendered_album_dir));
-        if path_is_under_root(&album_dir, &coordination_dir) || album_dir == coordination_dir {
+        let stable_album_dir = normalize_path(Path::new(rendered_album_dir));
+        if path_is_under_root(&stable_album_dir, &stable_coordination_dir)
+            || stable_album_dir == stable_coordination_dir
+        {
             return Err(PublishError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "conversion log fragment for batch {} routes visible log into hidden coordination directory: {}",
                     identity.conversion_log_batch_id,
-                    album_dir.display()
+                    stable_album_dir.display()
                 ),
             )));
         }
-        if let Some(output_root) = output_root.as_ref() {
-            if album_dir != *output_root && !path_is_under_root(&album_dir, output_root) {
+
+        let live_album_dir = match (stable_output_root.as_ref(), runtime_output_root.as_ref()) {
+            (Some(stable_root), Some(runtime_root)) => {
+                if stable_album_dir != *stable_root
+                    && !path_is_under_root(&stable_album_dir, stable_root)
+                {
+                    return Err(PublishError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "conversion log fragment for batch {} routes visible log outside output root {}: {}",
+                            identity.conversion_log_batch_id,
+                            stable_root.display(),
+                            stable_album_dir.display()
+                        ),
+                    )));
+                }
+                let relative = stable_album_dir.strip_prefix(stable_root).map_err(|_| {
+                    PublishError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "conversion log fragment for batch {} cannot be rebased beneath retained output root {}: {}",
+                            identity.conversion_log_batch_id,
+                            stable_root.display(),
+                            stable_album_dir.display()
+                        ),
+                    ))
+                })?;
+                normalize_path(&runtime_root.join(relative))
+            }
+            (None, None) => stable_album_dir,
+            _ => {
                 return Err(PublishError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "conversion log fragment for batch {} routes visible log outside output root {}: {}",
-                        identity.conversion_log_batch_id,
-                        output_root.display(),
-                        album_dir.display()
+                        "conversion log batch {} has inconsistent stable/runtime output-root authority",
+                        identity.conversion_log_batch_id
                     ),
                 )));
             }
-        }
-        dirs.insert(album_dir);
+        };
+        dirs.insert(live_album_dir);
     }
     Ok(dirs.into_iter().collect())
 }
 
-fn conversion_log_batch_output_root_from_identity(
+fn conversion_log_batch_stable_coordination_album_dir_from_identity(
     identity: &ConversionLogBatchIdentity,
+) -> PathBuf {
+    normalize_path(Path::new(&identity.output_album_dir))
+}
+
+fn conversion_log_batch_output_root_from_coordination_dir(
+    coord_dir: &Path,
+    batch_id: &str,
 ) -> Option<PathBuf> {
-    let coord_dir = conversion_log_batch_coordination_album_dir_from_identity(identity);
-    let batch_id = sanitize_component(&identity.conversion_log_batch_id);
+    let coord_dir = normalize_path(coord_dir);
+    let batch_id = sanitize_component(batch_id);
     let is_batch_leaf = coord_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -8579,6 +8898,24 @@ fn conversion_log_batch_output_root_from_identity(
     (is_batch_leaf && is_coord_parent)
         .then(|| parent.parent().map(normalize_path))
         .flatten()
+}
+
+fn conversion_log_batch_stable_output_root_from_identity(
+    identity: &ConversionLogBatchIdentity,
+) -> Option<PathBuf> {
+    conversion_log_batch_output_root_from_coordination_dir(
+        &conversion_log_batch_stable_coordination_album_dir_from_identity(identity),
+        &identity.conversion_log_batch_id,
+    )
+}
+
+fn conversion_log_batch_output_root_from_identity(
+    identity: &ConversionLogBatchIdentity,
+) -> Option<PathBuf> {
+    conversion_log_batch_output_root_from_coordination_dir(
+        &conversion_log_batch_coordination_album_dir_from_identity(identity),
+        &identity.conversion_log_batch_id,
+    )
 }
 
 fn record_assembled_conversion_log_entries(
@@ -8656,9 +8993,26 @@ fn conversion_log_batch_coordination_album_dir(req: &PipelineRequest) -> Option<
 fn conversion_log_batch_coordination_album_dir_from_identity(
     identity: &ConversionLogBatchIdentity,
 ) -> PathBuf {
-    PathBuf::from(&identity.output_album_dir)
+    identity
+        .runtime_coordination_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&identity.output_album_dir))
 }
 
+fn conversion_log_batch_identities_match(
+    left: &ConversionLogBatchIdentity,
+    right: &ConversionLogBatchIdentity,
+) -> bool {
+    left.conversion_log_batch_id == right.conversion_log_batch_id
+        && left.settings_fingerprint == right.settings_fingerprint
+        && left.output_album_dir == right.output_album_dir
+        && left.source_grouping_root == right.source_grouping_root
+        && left.source_context_path == right.source_context_path
+        && left.source_context_kind == right.source_context_kind
+        && left.target_format == right.target_format
+}
+
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn conversion_log_batch_completion_marker_path(req: &PipelineRequest) -> Option<PathBuf> {
     Some(
         conversion_log_batch_coordination_album_dir(req)?
@@ -8676,7 +9030,17 @@ fn conversion_log_batch_completion_marker_path_from_identity(
 fn mark_conversion_log_batch_complete(
     identity: &ConversionLogBatchIdentity,
     expected_track_count: usize,
+    batch_successful: bool,
 ) -> Result<(), PublishError> {
+    let coord_dir = conversion_log_batch_coordination_album_dir_from_identity(identity);
+    ensure_conversion_log_batch_workspace_owned(
+        &coord_dir,
+        &identity.conversion_log_batch_id,
+    )
+    .map_err(PublishError::io_at(
+        "claiming conversion log batch workspace before completion",
+        &coord_dir,
+    ))?;
     let marker_path = conversion_log_batch_completion_marker_path_from_identity(identity);
     if let Some(parent) = marker_path.parent() {
         fs::create_dir_all(parent).map_err(PublishError::io_at(
@@ -8685,16 +9049,16 @@ fn mark_conversion_log_batch_complete(
         ))?;
     }
     let body = format!(
-        "schema=1\nbatch_id={}\nexpected_track_count={}\n",
+        "schema=2\nbatch_id={}\nexpected_track_count={}\nbatch_successful={}\n",
         identity.conversion_log_batch_id,
         expected_track_count,
+        batch_successful,
     );
     write_bytes_atomically(&marker_path, body.as_bytes()).map_err(PublishError::io_at(
         "writing conversion log batch completion marker",
         &marker_path,
     ))?;
     sync_parent_dir_best_effort(&marker_path);
-    let coord_dir = conversion_log_batch_coordination_album_dir_from_identity(identity);
     write_conversion_log_batch_workspace_state(&coord_dir, &identity.conversion_log_batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE)
         .map_err(PublishError::io_at(
             "writing conversion log batch workspace complete state",
@@ -8703,13 +9067,989 @@ fn mark_conversion_log_batch_complete(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversionLogBatchCompletionStatus {
+    Incomplete,
+    Successful,
+    NonSuccessful,
+    Invalid,
+}
+
+fn conversion_log_batch_completion_status(req: &PipelineRequest) -> ConversionLogBatchCompletionStatus {
+    let Some(coord_dir) = conversion_log_batch_coordination_album_dir(req) else {
+        return ConversionLogBatchCompletionStatus::Incomplete;
+    };
+    conversion_log_batch_completion_status_at(req, &coord_dir)
+}
+
+fn conversion_log_batch_completion_status_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> ConversionLogBatchCompletionStatus {
+    let Some(batch) = req.album_batch.as_ref() else {
+        return ConversionLogBatchCompletionStatus::Incomplete;
+    };
+    let path = coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE);
+    let body = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return ConversionLogBatchCompletionStatus::Incomplete;
+        }
+        Err(err) => {
+            log::warn!(
+                "conversion-log completion marker could not be read for {} at {}: {err}",
+                req.item_id,
+                path.display()
+            );
+            return ConversionLogBatchCompletionStatus::Invalid;
+        }
+    };
+
+    let mut values = BTreeMap::new();
+    for line in body.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return ConversionLogBatchCompletionStatus::Invalid;
+        };
+        if values.insert(key.trim(), value.trim()).is_some() {
+            return ConversionLogBatchCompletionStatus::Invalid;
+        }
+    }
+    if values.get("schema") != Some(&"2")
+        || values.get("batch_id") != Some(&batch.conversion_log_batch_id.trim())
+        || values
+            .get("expected_track_count")
+            .and_then(|value| value.parse::<usize>().ok())
+            != Some(batch.expected_track_count)
+    {
+        return ConversionLogBatchCompletionStatus::Invalid;
+    }
+    match values.get("batch_successful").copied() {
+        Some("true") => ConversionLogBatchCompletionStatus::Successful,
+        Some("false") => ConversionLogBatchCompletionStatus::NonSuccessful,
+        _ => ConversionLogBatchCompletionStatus::Invalid,
+    }
+}
+
 fn conversion_log_batch_is_durably_complete(req: &PipelineRequest) -> bool {
-    conversion_log_batch_completion_marker_path(req)
-        .is_some_and(|path| path.is_file())
+    matches!(
+        conversion_log_batch_completion_status(req),
+        ConversionLogBatchCompletionStatus::Successful
+            | ConversionLogBatchCompletionStatus::NonSuccessful
+    )
+}
+
+fn conversion_log_batch_is_durably_complete_at(req: &PipelineRequest, coord_dir: &Path) -> bool {
+    matches!(
+        conversion_log_batch_completion_status_at(req, coord_dir),
+        ConversionLogBatchCompletionStatus::Successful
+            | ConversionLogBatchCompletionStatus::NonSuccessful
+    )
+}
+
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
+fn conversion_log_batch_is_durably_successful(req: &PipelineRequest) -> bool {
+    conversion_log_batch_completion_status(req) == ConversionLogBatchCompletionStatus::Successful
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ConversionLogBatchDrainManifest {
+    schema_version: u8,
+    batch_id: String,
+    pipeline_sha256: String,
+    post_actions_required: bool,
+    expected_participants: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ConversionLogBatchPostActionTerminal {
+    schema_version: u8,
+    batch_id: String,
+    pipeline_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ConversionLogBatchDrainAck {
+    schema_version: u8,
+    batch_id: String,
+    pipeline_sha256: String,
+    participant_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConversionLogBatchDrainRequestAuthority {
+    manifest: ConversionLogBatchDrainManifest,
+    participant_id: String,
+}
+
+fn conversion_log_batch_drain_dir(coord_dir: &Path) -> PathBuf {
+    coord_dir.join(CONVERSION_LOG_BATCH_DRAIN_DIR)
+}
+
+fn conversion_log_batch_drain_manifest_path(coord_dir: &Path) -> PathBuf {
+    conversion_log_batch_drain_dir(coord_dir).join(CONVERSION_LOG_BATCH_DRAIN_MANIFEST_FILE)
+}
+
+fn conversion_log_batch_drain_ack_file_name(participant_id: &str) -> String {
+    format!(
+        "{CONVERSION_LOG_BATCH_DRAIN_ACK_PREFIX}{participant_id}{CONVERSION_LOG_BATCH_DRAIN_ACK_SUFFIX}"
+    )
+}
+
+fn conversion_log_batch_drain_ack_path(coord_dir: &Path, participant_id: &str) -> PathBuf {
+    conversion_log_batch_drain_dir(coord_dir)
+        .join(conversion_log_batch_drain_ack_file_name(participant_id))
+}
+
+fn conversion_log_batch_post_action_terminal_path(coord_dir: &Path) -> PathBuf {
+    coord_dir.join(CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_FILE)
+}
+
+fn validate_conversion_log_batch_post_action_terminal(
+    terminal: &ConversionLogBatchPostActionTerminal,
+    manifest: &ConversionLogBatchDrainManifest,
+) -> io::Result<()> {
+    if terminal.schema_version != CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_SCHEMA_VERSION
+        || terminal.batch_id != manifest.batch_id
+        || terminal.pipeline_sha256 != manifest.pipeline_sha256
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid conversion-log batch post-action terminal authority",
+        ));
+    }
+    Ok(())
+}
+
+fn read_conversion_log_batch_post_action_terminal(
+    coord_dir: &Path,
+    manifest: &ConversionLogBatchDrainManifest,
+) -> io::Result<Option<ConversionLogBatchPostActionTerminal>> {
+    let path = conversion_log_batch_post_action_terminal_path(coord_dir);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(_) => {
+            let bytes = read_regular_file_no_follow(&path)?;
+            let terminal: ConversionLogBatchPostActionTerminal =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "could not parse post-action terminal authority {}: {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            validate_conversion_log_batch_post_action_terminal(&terminal, manifest)?;
+            Ok(Some(terminal))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn mark_conversion_log_batch_post_actions_terminal(
+    req: &PipelineRequest,
+) -> io::Result<()> {
+    if req.album_batch.is_none()
+        || req.actions.post.is_empty()
+        || !conversion_actions_effective_for_request(req)?
+    {
+        return Ok(());
+    }
+    let coord_dir = conversion_log_batch_coordination_album_dir(req).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "post-action terminal authority requires a coordination directory",
+        )
+    })?;
+    mark_conversion_log_batch_post_actions_terminal_at(req, &coord_dir)
+}
+
+fn mark_conversion_log_batch_post_actions_terminal_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> io::Result<()> {
+    if req.album_batch.is_none()
+        || req.actions.post.is_empty()
+        || !conversion_actions_effective_for_request(req)?
+    {
+        return Ok(());
+    }
+    ensure_conversion_log_batch_workspace_owned_for_request_at(req, coord_dir)?;
+    let authority = conversion_log_batch_drain_request_authority(req)?;
+    let _ownership_lock = acquire_conversion_log_batch_workspace_ownership_lock(
+        &coord_dir,
+        &authority.manifest.batch_id,
+    )?;
+    let state = read_conversion_log_batch_workspace_state(&coord_dir)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "batch workspace state disappeared")
+    })?;
+    if state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+        || !state
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner_is_current_process(owner).unwrap_or(false))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "post-action terminal authority refused without current workspace ownership",
+        ));
+    }
+    let manifest = read_conversion_log_batch_drain_manifest(
+        &coord_dir,
+        &authority.manifest.batch_id,
+    )?;
+    if manifest != authority.manifest || !manifest.post_actions_required {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "post-action terminal authority conflicts with the durable batch manifest",
+        ));
+    }
+    let terminal = ConversionLogBatchPostActionTerminal {
+        schema_version: CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_SCHEMA_VERSION,
+        batch_id: manifest.batch_id.clone(),
+        pipeline_sha256: manifest.pipeline_sha256.clone(),
+    };
+    let path = conversion_log_batch_post_action_terminal_path(&coord_dir);
+    match read_conversion_log_batch_post_action_terminal(&coord_dir, &manifest) {
+        Ok(Some(existing)) if existing == terminal => return Ok(()),
+        Ok(Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("conflicting post-action terminal authority: {}", path.display()),
+            ));
+        }
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+    let bytes = serde_json::to_vec_pretty(&terminal).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not serialize post-action terminal authority: {error}"),
+        )
+    })?;
+    write_bytes_atomically(&path, &bytes)?;
+    sync_parent_dir(&path)
+}
+
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
+fn conversion_log_batch_post_actions_are_terminal(
+    req: &PipelineRequest,
+) -> io::Result<bool> {
+    if req.album_batch.is_none()
+        || req.actions.post.is_empty()
+        || !conversion_actions_effective_for_request(req)?
+    {
+        return Ok(true);
+    }
+    let coord_dir = conversion_log_batch_coordination_album_dir(req).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "post-action terminal lookup requires a coordination directory",
+        )
+    })?;
+    conversion_log_batch_post_actions_are_terminal_at(req, &coord_dir)
+}
+
+fn conversion_log_batch_post_actions_are_terminal_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> io::Result<bool> {
+    if req.album_batch.is_none()
+        || req.actions.post.is_empty()
+        || !conversion_actions_effective_for_request(req)?
+    {
+        return Ok(true);
+    }
+    let authority = conversion_log_batch_drain_request_authority(req)?;
+    let manifest = read_conversion_log_batch_drain_manifest(
+        &coord_dir,
+        &authority.manifest.batch_id,
+    )?;
+    if manifest != authority.manifest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "post-action terminal lookup found a conflicting batch manifest",
+        ));
+    }
+    Ok(read_conversion_log_batch_post_action_terminal(&coord_dir, &manifest)?.is_some())
+}
+
+fn conversion_log_batch_cleanup_lifecycle_is_complete(
+    coord_dir: &Path,
+    batch_id: &str,
+) -> io::Result<bool> {
+    if !conversion_log_batch_drain_is_complete(coord_dir, batch_id)? {
+        return Ok(false);
+    }
+    let manifest = read_conversion_log_batch_drain_manifest(coord_dir, batch_id)?;
+    if !manifest.post_actions_required {
+        return Ok(true);
+    }
+    Ok(read_conversion_log_batch_post_action_terminal(coord_dir, &manifest)?.is_some())
+}
+
+fn conversion_log_batch_drain_stable_path(path: &Path) -> String {
+    normalize_path(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn conversion_log_batch_drain_participant_id(path: &Path) -> String {
+    let body = format!(
+        "tonepoet-conversion-log-batch-participant-v1\n{}",
+        conversion_log_batch_drain_stable_path(path)
+    );
+    super::manifest::sha256_hex(body.as_bytes())
+}
+
+fn conversion_log_batch_drain_hex_identity_is_valid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn conversion_log_batch_drain_ordinal_participant_id(
+    batch_id: &str,
+    source_ordinal: u32,
+) -> String {
+    let body = format!(
+        "tonepoet-conversion-log-batch-ordinal-participant-v1\n{batch_id}\n{source_ordinal}"
+    );
+    super::manifest::sha256_hex(body.as_bytes())
+}
+
+fn conversion_log_batch_drain_expected_participants(
+    req: &PipelineRequest,
+) -> io::Result<(Vec<String>, String)> {
+    let batch = req.album_batch.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch participant drain authority requires album batch context",
+        )
+    })?;
+
+    if !batch.source_paths().is_empty() {
+        let mut expected = batch
+            .source_paths()
+            .iter()
+            .map(|path| conversion_log_batch_drain_participant_id(path))
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected.dedup();
+        if expected.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "album batch participant drain authority has no expected participants",
+            ));
+        }
+        let current = conversion_log_batch_drain_participant_id(&req.container);
+        if expected.binary_search(&current).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "request source {} is not a dispatcher-authored participant in album batch {}",
+                    req.container.display(),
+                    batch.conversion_log_batch_id
+                ),
+            ));
+        }
+        return Ok((expected, current));
+    }
+
+    // Compatibility for queue records written before `source_paths` became
+    // durable. A CUE-image batch is one worker even when it yields many tracks.
+    // Independent single-file batches can use the dispatcher-authored source
+    // ordinal/count contract. Any shape that cannot be proven is preserved for
+    // manual recovery rather than guessed from mutable paths or tags.
+    match detect_source_kind(req) {
+        Ok(SourceKind::CueImage) => {
+            let current = conversion_log_batch_drain_participant_id(&req.container);
+            Ok((vec![current.clone()], current))
+        }
+        Ok(SourceKind::SingleFile) => {
+            let track = req.album_batch_track.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "legacy single-file album batch {} has no dispatcher track identity for participant drain recovery",
+                        batch.conversion_log_batch_id
+                    ),
+                )
+            })?;
+            if track.source_ordinal == 0
+                || track.source_ordinal as usize > batch.expected_track_count
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy single-file batch participant source ordinal is outside the expected range",
+                ));
+            }
+            let expected_count = u32::try_from(batch.expected_track_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy single-file batch participant count exceeds the durable ordinal range",
+                )
+            })?;
+            let expected = (1..=expected_count)
+                .map(|ordinal| {
+                    conversion_log_batch_drain_ordinal_participant_id(
+                        &batch.conversion_log_batch_id,
+                        ordinal,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let current = conversion_log_batch_drain_ordinal_participant_id(
+                &batch.conversion_log_batch_id,
+                track.source_ordinal,
+            );
+            Ok((expected, current))
+        }
+        _ if batch.expected_track_count == 1 => {
+            let current = conversion_log_batch_drain_participant_id(&req.container);
+            Ok((vec![current.clone()], current))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "album batch {} has no dispatcher-authored source_paths and its participant set cannot be reconstructed safely",
+                batch.conversion_log_batch_id
+            ),
+        )),
+    }
+}
+
+fn conversion_log_batch_drain_request_authority(
+    req: &PipelineRequest,
+) -> io::Result<ConversionLogBatchDrainRequestAuthority> {
+    let batch = req.album_batch.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch participant drain authority requires album batch context",
+        )
+    })?;
+    let batch_id = batch.conversion_log_batch_id.trim();
+    if !is_generated_conversion_log_batch_id(batch_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch participant drain authority requires a generated dispatch batch id",
+        ));
+    }
+    let (expected_participants, participant_id) =
+        conversion_log_batch_drain_expected_participants(req)?;
+    let action_pipeline = req.actions.canonical_serialization().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not canonicalize action pipeline for batch drain authority: {error}"),
+        )
+    })?;
+    let settings_fingerprint =
+        tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings).to_string();
+    let body = format!(
+        concat!(
+            "tonepoet-conversion-log-batch-drain-v1\n",
+            "batch_id={}\n",
+            "expected_track_count={}\n",
+            "album_output_dir={}\n",
+            "source_grouping_root={}\n",
+            "output_root={}\n",
+            "settings_fingerprint={}\n",
+            "action_pipeline={}\n",
+            "participants={}\n"
+        ),
+        batch_id,
+        batch.expected_track_count,
+        conversion_log_batch_drain_stable_path(&batch.album_output_dir),
+        conversion_log_batch_drain_stable_path(&batch.source_grouping_root),
+        conversion_log_batch_drain_stable_path(&req.output_root),
+        settings_fingerprint,
+        action_pipeline,
+        expected_participants.join(","),
+    );
+    Ok(ConversionLogBatchDrainRequestAuthority {
+        manifest: ConversionLogBatchDrainManifest {
+            schema_version: CONVERSION_LOG_BATCH_DRAIN_SCHEMA_VERSION,
+            batch_id: batch_id.to_string(),
+            pipeline_sha256: super::manifest::sha256_hex(body.as_bytes()),
+            post_actions_required: !req.actions.post.is_empty()
+                && conversion_actions_effective_for_request(req)?,
+            expected_participants,
+        },
+        participant_id,
+    })
+}
+
+fn ensure_no_follow_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected a no-follow directory: {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path)?;
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("created path is not a no-follow directory: {}", path.display()),
+                ));
+            }
+            sync_parent_dir(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_regular_file_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected a regular no-follow file: {}", path.display()),
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() || !lock_handle_is_current(&opened_metadata, path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file changed while opening no-follow authority: {}", path.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn validate_conversion_log_batch_drain_manifest(
+    manifest: &ConversionLogBatchDrainManifest,
+    expected_batch_id: &str,
+) -> io::Result<()> {
+    if manifest.schema_version != CONVERSION_LOG_BATCH_DRAIN_SCHEMA_VERSION
+        || manifest.batch_id != expected_batch_id
+        || !is_generated_conversion_log_batch_id(&manifest.batch_id)
+        || !conversion_log_batch_drain_hex_identity_is_valid(&manifest.pipeline_sha256)
+        || manifest.expected_participants.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid conversion-log batch participant drain manifest identity",
+        ));
+    }
+    let mut canonical = manifest.expected_participants.clone();
+    if canonical
+        .iter()
+        .any(|value| !conversion_log_batch_drain_hex_identity_is_valid(value))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "conversion-log batch participant drain manifest contains an invalid participant id",
+        ));
+    }
+    canonical.sort();
+    canonical.dedup();
+    if canonical != manifest.expected_participants {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "conversion-log batch participant drain manifest is not sorted and unique",
+        ));
+    }
+    Ok(())
+}
+
+fn read_conversion_log_batch_drain_manifest(
+    coord_dir: &Path,
+    batch_id: &str,
+) -> io::Result<ConversionLogBatchDrainManifest> {
+    let path = conversion_log_batch_drain_manifest_path(coord_dir);
+    let bytes = read_regular_file_no_follow(&path)?;
+    let manifest: ConversionLogBatchDrainManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse batch participant drain manifest {}: {error}", path.display()),
+        )
+    })?;
+    validate_conversion_log_batch_drain_manifest(&manifest, batch_id)?;
+    Ok(manifest)
+}
+
+fn validate_conversion_log_batch_drain_ack(
+    ack: &ConversionLogBatchDrainAck,
+    manifest: &ConversionLogBatchDrainManifest,
+    expected_participant_id: &str,
+) -> io::Result<()> {
+    if ack.schema_version != CONVERSION_LOG_BATCH_DRAIN_SCHEMA_VERSION
+        || ack.batch_id != manifest.batch_id
+        || ack.pipeline_sha256 != manifest.pipeline_sha256
+        || ack.participant_id != expected_participant_id
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid conversion-log batch drain acknowledgment for participant {expected_participant_id}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_conversion_log_batch_drain_ack(
+    coord_dir: &Path,
+    manifest: &ConversionLogBatchDrainManifest,
+    participant_id: &str,
+) -> io::Result<ConversionLogBatchDrainAck> {
+    let path = conversion_log_batch_drain_ack_path(coord_dir, participant_id);
+    let bytes = read_regular_file_no_follow(&path)?;
+    let ack: ConversionLogBatchDrainAck = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse batch participant drain acknowledgment {}: {error}", path.display()),
+        )
+    })?;
+    validate_conversion_log_batch_drain_ack(&ack, manifest, participant_id)?;
+    Ok(ack)
+}
+
+fn validate_conversion_log_batch_drain_inventory(
+    coord_dir: &Path,
+    manifest: &ConversionLogBatchDrainManifest,
+) -> io::Result<BTreeSet<String>> {
+    let drain_dir = conversion_log_batch_drain_dir(coord_dir);
+    let metadata = fs::symlink_metadata(&drain_dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("batch participant drain authority is not a no-follow directory: {}", drain_dir.display()),
+        ));
+    }
+    let expected_names = manifest
+        .expected_participants
+        .iter()
+        .map(|participant| conversion_log_batch_drain_ack_file_name(participant))
+        .collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    for entry in fs::read_dir(&drain_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("batch participant drain authority contains a non-UTF-8 entry: {}", drain_dir.display()),
+            )
+        })?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("batch participant drain authority contains a non-regular entry: {}", entry.path().display()),
+            ));
+        }
+        if name == CONVERSION_LOG_BATCH_DRAIN_MANIFEST_FILE {
+            continue;
+        }
+        if !expected_names.contains(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("batch participant drain authority contains an unrecognized entry: {}", entry.path().display()),
+            ));
+        }
+        observed.insert(name);
+    }
+    Ok(observed)
+}
+
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
+fn ensure_conversion_log_batch_drain_manifest_for_request(
+    req: &PipelineRequest,
+) -> io::Result<ConversionLogBatchDrainRequestAuthority> {
+    let coord_dir = conversion_log_batch_coordination_album_dir(req).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch participant drain authority requires a coordination directory",
+        )
+    })?;
+    ensure_conversion_log_batch_drain_manifest_for_request_at(req, &coord_dir)
+}
+
+fn ensure_conversion_log_batch_drain_manifest_for_request_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> io::Result<ConversionLogBatchDrainRequestAuthority> {
+    let authority = conversion_log_batch_drain_request_authority(req)?;
+    let _ownership_lock = acquire_conversion_log_batch_workspace_ownership_lock(
+        &coord_dir,
+        &authority.manifest.batch_id,
+    )?;
+    let state = read_conversion_log_batch_workspace_state(&coord_dir)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("batch workspace state is missing: {}", coord_dir.display()),
+        )
+    })?;
+    if state.batch_id != authority.manifest.batch_id
+        || state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+        || !state
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner_is_current_process(owner).unwrap_or(false))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("batch participant drain authority is not owned by the current process: {}", coord_dir.display()),
+        ));
+    }
+
+    let drain_dir = conversion_log_batch_drain_dir(&coord_dir);
+    ensure_no_follow_directory(&drain_dir)?;
+    let manifest_path = conversion_log_batch_drain_manifest_path(&coord_dir);
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(_) => {
+            let existing = read_conversion_log_batch_drain_manifest(
+                &coord_dir,
+                &authority.manifest.batch_id,
+            )?;
+            if existing != authority.manifest {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("batch participant drain manifest conflicts with the current request: {}", manifest_path.display()),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let bytes = serde_json::to_vec_pretty(&authority.manifest).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("could not serialize batch participant drain manifest: {error}"),
+                )
+            })?;
+            write_bytes_atomically(&manifest_path, &bytes)?;
+            sync_parent_dir(&manifest_path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    validate_conversion_log_batch_drain_inventory(&coord_dir, &authority.manifest)?;
+    Ok(authority)
+}
+
+fn conversion_log_batch_drain_is_complete(
+    coord_dir: &Path,
+    batch_id: &str,
+) -> io::Result<bool> {
+    let drain_dir = conversion_log_batch_drain_dir(coord_dir);
+    match fs::symlink_metadata(&drain_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("batch participant drain authority is not a no-follow directory: {}", drain_dir.display()),
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    let manifest = read_conversion_log_batch_drain_manifest(coord_dir, batch_id)?;
+    let observed = validate_conversion_log_batch_drain_inventory(coord_dir, &manifest)?;
+    for participant_id in &manifest.expected_participants {
+        let name = conversion_log_batch_drain_ack_file_name(participant_id);
+        if !observed.contains(&name) {
+            return Ok(false);
+        }
+        read_conversion_log_batch_drain_ack(coord_dir, &manifest, participant_id)?;
+    }
+    Ok(true)
+}
+
+fn record_conversion_log_batch_participant_drained(
+    req: &PipelineRequest,
+) -> io::Result<bool> {
+    if req.album_batch.is_none() {
+        return Ok(true);
+    }
+    let coord_dir = conversion_log_batch_coordination_album_dir(req).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch participant drain acknowledgment requires a coordination directory",
+        )
+    })?;
+    record_conversion_log_batch_participant_drained_at(req, &coord_dir)
+}
+
+fn record_conversion_log_batch_participant_drained_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> io::Result<bool> {
+    if req.album_batch.is_none() {
+        return Ok(true);
+    }
+    ensure_conversion_log_batch_workspace_owned_for_request_at(req, coord_dir)?;
+    let authority = ensure_conversion_log_batch_drain_manifest_for_request_at(req, coord_dir)?;
+    let _ownership_lock = acquire_conversion_log_batch_workspace_ownership_lock(
+        &coord_dir,
+        &authority.manifest.batch_id,
+    )?;
+    let state = read_conversion_log_batch_workspace_state(&coord_dir)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "batch workspace state disappeared")
+    })?;
+    if state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+        || !state
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner_is_current_process(owner).unwrap_or(false))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "batch participant drain acknowledgment refused without current ownership",
+        ));
+    }
+    let manifest = read_conversion_log_batch_drain_manifest(
+        &coord_dir,
+        &authority.manifest.batch_id,
+    )?;
+    if manifest != authority.manifest {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "batch participant drain manifest changed before acknowledgment",
+        ));
+    }
+
+    let ack = ConversionLogBatchDrainAck {
+        schema_version: CONVERSION_LOG_BATCH_DRAIN_SCHEMA_VERSION,
+        batch_id: manifest.batch_id.clone(),
+        pipeline_sha256: manifest.pipeline_sha256.clone(),
+        participant_id: authority.participant_id.clone(),
+    };
+    let ack_path = conversion_log_batch_drain_ack_path(&coord_dir, &authority.participant_id);
+    match fs::symlink_metadata(&ack_path) {
+        Ok(_) => {
+            let existing = read_conversion_log_batch_drain_ack(
+                &coord_dir,
+                &manifest,
+                &authority.participant_id,
+            )?;
+            if existing != ack {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("conflicting batch participant drain acknowledgment: {}", ack_path.display()),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            use std::io::Write;
+            let bytes = serde_json::to_vec_pretty(&ack).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("could not serialize batch participant drain acknowledgment: {error}"),
+                )
+            })?;
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut file = options.open(&ack_path)?;
+            let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
+            if let Err(error) = write_result {
+                drop(file);
+                let removed = match fs::remove_file(&ack_path) {
+                    Ok(()) => sync_parent_dir(&ack_path).is_ok(),
+                    Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => true,
+                    Err(_) => false,
+                };
+                if !removed {
+                    log::warn!(
+                        "failed batch drain acknowledgment remained visible after write failure: {}",
+                        ack_path.display()
+                    );
+                }
+                return Err(error);
+            }
+            sync_parent_dir(&ack_path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    conversion_log_batch_drain_is_complete(&coord_dir, &manifest.batch_id)
+}
+
+fn cleanup_conversion_log_batch_drain_authority(
+    coord_dir: &Path,
+    batch_id: &str,
+) -> io::Result<()> {
+    let drain_dir = conversion_log_batch_drain_dir(coord_dir);
+    let metadata = match fs::symlink_metadata(&drain_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) => metadata,
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("batch participant drain authority is not a no-follow directory: {}", drain_dir.display()),
+        ));
+    }
+
+    let manifest_path = conversion_log_batch_drain_manifest_path(coord_dir);
+    let manifest = match fs::symlink_metadata(&manifest_path) {
+        Ok(_) => Some(read_conversion_log_batch_drain_manifest(coord_dir, batch_id)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let Some(manifest) = manifest else {
+        let mut entries = fs::read_dir(&drain_dir)?;
+        if entries.next().transpose()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("batch drain manifest is missing while authority entries remain: {}", drain_dir.display()),
+            ));
+        }
+        fs::remove_dir(&drain_dir)?;
+        sync_parent_dir(&drain_dir)?;
+        return Ok(());
+    };
+
+    validate_conversion_log_batch_drain_inventory(coord_dir, &manifest)?;
+    for participant_id in &manifest.expected_participants {
+        let ack_path = conversion_log_batch_drain_ack_path(coord_dir, participant_id);
+        match fs::remove_file(&ack_path) {
+            Ok(()) => sync_parent_dir(&ack_path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    // The manifest is the last object removed from the drain authority. Once
+    // the parent workspace is durably `cleaning`, its absence means the drain
+    // gate was already satisfied and cleanup may resume after a crash.
+    fs::remove_file(&manifest_path)?;
+    sync_parent_dir(&manifest_path)?;
+    fs::remove_dir(&drain_dir)?;
+    sync_parent_dir(&drain_dir)
 }
 
 fn sweep_stale_completed_conversion_log_batch_coordination_for_request_best_effort(
     req: &PipelineRequest,
+    context: &str,
+) {
+    sweep_stale_completed_conversion_log_batch_coordination_for_request_at_best_effort(
+        req,
+        &req.output_root,
+        context,
+    );
+}
+
+fn sweep_stale_completed_conversion_log_batch_coordination_for_request_at_best_effort(
+    req: &PipelineRequest,
+    output_root: &Path,
     context: &str,
 ) {
     let current_batch_id = req
@@ -8717,9 +10057,14 @@ fn sweep_stale_completed_conversion_log_batch_coordination_for_request_best_effo
         .as_ref()
         .map(|batch| batch.conversion_log_batch_id.trim())
         .filter(|value| !value.is_empty());
-    sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
-        &req.output_root,
+    let current_source_grouping_root = req
+        .album_batch
+        .as_ref()
+        .map(|batch| batch.source_grouping_root.to_string_lossy().into_owned());
+    sweep_stale_completed_conversion_log_batch_coordination_dirs_with_scope_best_effort(
+        output_root,
         current_batch_id,
+        current_source_grouping_root.as_deref(),
         context,
     );
 }
@@ -8729,17 +10074,33 @@ fn sweep_stale_completed_conversion_log_batch_coordination_for_identity_best_eff
     context: &str,
 ) {
     if let Some(output_root) = conversion_log_batch_output_root_from_identity(identity) {
-        sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
+        sweep_stale_completed_conversion_log_batch_coordination_dirs_with_scope_best_effort(
             &output_root,
             Some(identity.conversion_log_batch_id.as_str()),
+            Some(identity.source_grouping_root.as_str()),
             context,
         );
     }
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
     output_root: &Path,
     current_batch_id: Option<&str>,
+    context: &str,
+) {
+    sweep_stale_completed_conversion_log_batch_coordination_dirs_with_scope_best_effort(
+        output_root,
+        current_batch_id,
+        None,
+        context,
+    )
+}
+
+fn sweep_stale_completed_conversion_log_batch_coordination_dirs_with_scope_best_effort(
+    output_root: &Path,
+    current_batch_id: Option<&str>,
+    current_source_grouping_root: Option<&str>,
     context: &str,
 ) {
     let coord_root = normalize_path(output_root).join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
@@ -8755,9 +10116,39 @@ fn sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
         }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                // A stale-workspace sweep is destructive. A directory-entry
+                // error means the scan is incomplete, so this entire pass must
+                // fail closed rather than silently skipping an unknown child.
+                log::warn!(
+                    "conversion-log batch cleanup aborted incomplete scan for {context}: {}: {err}",
+                    coord_root.display()
+                );
+                return;
+            }
+        };
         let path = entry.path();
-        if !path.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                log::warn!(
+                    "conversion-log batch cleanup aborted because entry type could not be read for {context}: {}: {err}",
+                    path.display()
+                );
+                return;
+            }
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            if file_type.is_file() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') && name.ends_with(".workspace-ownership.lock") {
+                    remove_unheld_lock_file_best_effort(&path);
+                }
+            }
             continue;
         }
         let Some(batch_id) = path.file_name().and_then(|name| name.to_str()) else {
@@ -8777,10 +10168,10 @@ fn sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
             Ok(state) => state,
             Err(err) => {
                 log::warn!(
-                    "conversion-log batch cleanup could not read workspace state for {context}: {}: {err}; using conservative owner fallback",
+                    "conversion-log batch cleanup skipped unreadable workspace state for {context}: {}: {err}",
                     path.display()
                 );
-                None
+                continue;
             }
         };
         if state
@@ -8795,51 +10186,57 @@ fn sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
             continue;
         }
 
-        let has_completion_marker = path.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE).is_file();
-        let state_terminal = state
-            .as_ref()
-            .is_some_and(|state| conversion_log_batch_workspace_status_is_terminal(state.status.as_str()));
-        if !has_completion_marker
-            && !state_terminal
-            && conversion_log_batch_workspace_owner_may_be_live(batch_id, state.as_ref())
-        {
-            continue;
+        // Ownership is the first and load-bearing deletion/repair gate. Do
+        // not even repair a transaction marker in a workspace whose owner is
+        // alive, remote, legacy, absent, or otherwise unknown: on shared
+        // storage that would mutate another host's live coordination state.
+        if conversion_log_batch_workspace_owner_may_be_live(batch_id, state.as_ref()) {
+            let current_owner_inactive = |state: &ConversionLogBatchWorkspaceState| {
+                state
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner_is_current_process(owner).unwrap_or(false))
+                    && !conversion_log_batch_workspace_registered_active(batch_id)
+            };
+            let resumable_current_cleaning = state.as_ref().is_some_and(|state| {
+                state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+                    && current_owner_inactive(state)
+            });
+            // A TERMINAL workspace still claimed by this very process may be
+            // retired only by an OWNED RETRY: the pipeline wrappers pass a
+            // batch scope exactly when a real coordinated publish for this
+            // output root is underway in this process, which supersedes our
+            // own earlier terminal attempts. Bare/diagnostic sweeps pass no
+            // scope and preserve terminal recovery context (pinned by
+            // same_process_terminal_workspace_is_preserved_until_owned_retry).
+            let terminal_current_owner = current_source_grouping_root.is_some()
+                && state.as_ref().is_some_and(|state| {
+                    conversion_log_batch_workspace_status_is_terminal(&state.status)
+                        && current_owner_inactive(state)
+                });
+            if !resumable_current_cleaning && !terminal_current_owner {
+                continue;
+            }
         }
 
-        let marker_path = path.join(CONVERSION_LOG_VISIBLE_COMMIT_MARKER_FILE);
-        if let Err(err) = repair_interrupted_visible_conversion_log_publish_marker(&marker_path) {
+        if workspace_has_unresolved_action_state(&path) {
             log::warn!(
-                "conversion-log batch cleanup could not repair stale visible-log transaction for {context}: {}: {err:?}",
-                marker_path.display()
+                "conversion-log batch cleanup preserved stale workspace with unresolved or unreadable action state for {context}: {}",
+                path.display()
             );
             continue;
         }
 
-        let state_complete = state
-            .as_ref()
-            .is_some_and(|state| state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE);
-        if has_completion_marker || state_complete {
-            if conversion_log_batch_workspace_owner_may_be_live(batch_id, state.as_ref()) {
-                continue;
-            }
+        // Every retirement goes through the ownership-lock-protected,
+        // participant-drain-gated, state-last cleanup protocol. Dead active
+        // workspaces remain recoverable and are never reclassified as garbage
+        // merely because their original process exited.
+        if state.is_some() {
             cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
                 &path,
                 context,
+                ConversionLogBatchCleanupAuthority::CurrentOrProvenDeadLocalOwner,
             );
-            continue;
-        }
-
-        if conversion_log_batch_workspace_owner_may_be_live(batch_id, state.as_ref()) {
-            continue;
-        }
-
-        match fs::remove_dir_all(&path) {
-            Ok(()) => sync_parent_dir_best_effort(&path),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => log::warn!(
-                "conversion-log batch cleanup could not remove stale incomplete coordination dir for {context}: {}: {err}",
-                path.display()
-            ),
         }
     }
 
@@ -8854,25 +10251,52 @@ fn sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
     }
 }
 
-fn conversion_log_batch_id_owner_pid(batch_id: &str) -> Option<u32> {
-    let suffix = batch_id
-        .strip_prefix(CONVERSION_LOG_BATCH_ID_PREFIX)?
-        .strip_prefix('-')?;
-    let pid_hex = suffix.split('-').next()?;
-    u32::from_str_radix(pid_hex, 16).ok()
-}
-
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct ConversionLogBatchWorkspaceState {
     schema_version: u8,
     batch_id: String,
-    owner_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<ProcessOwnerIdentity>,
+    /// Schema-1 compatibility only. A PID without machine/boot/process-start
+    /// identity is never sufficient evidence of staleness on shared storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_pid: Option<u32>,
+    #[serde(default)]
+    ownership_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_owner_claim_id: Option<String>,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_started_unix_ms: Option<u128>,
     updated_unix_ms: u128,
 }
 
 fn conversion_log_batch_workspace_state_path(coord_dir: &Path) -> PathBuf {
     coord_dir.join(CONVERSION_LOG_BATCH_WORKSPACE_STATE_FILE)
+}
+
+fn conversion_log_batch_workspace_ownership_lock_path(
+    coord_dir: &Path,
+    batch_id: &str,
+) -> io::Result<PathBuf> {
+    let parent = coord_dir.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("conversion-log workspace has no coordination root: {}", coord_dir.display()),
+        )
+    })?;
+    Ok(parent.join(format!(
+        ".{}.workspace-ownership.lock",
+        sanitize_component(batch_id)
+    )))
+}
+
+fn acquire_conversion_log_batch_workspace_ownership_lock(
+    coord_dir: &Path,
+    batch_id: &str,
+) -> io::Result<FileLock> {
+    let path = conversion_log_batch_workspace_ownership_lock_path(coord_dir, batch_id)?;
+    acquire_blocking_file_lock(&path, true)
 }
 
 fn conversion_log_batch_workspace_updated_unix_ms() -> u128 {
@@ -8882,39 +10306,327 @@ fn conversion_log_batch_workspace_updated_unix_ms() -> u128 {
         .as_millis()
 }
 
-fn write_conversion_log_batch_workspace_state(
+fn persist_conversion_log_batch_workspace_state_locked(
     coord_dir: &Path,
-    batch_id: &str,
-    status: &str,
+    state: &ConversionLogBatchWorkspaceState,
+    creating: bool,
+    newly_registered_claim_id: Option<&str>,
 ) -> io::Result<()> {
-    fs::create_dir_all(coord_dir)?;
-    let state = ConversionLogBatchWorkspaceState {
-        schema_version: CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION,
-        batch_id: batch_id.to_string(),
-        owner_pid: std::process::id(),
-        status: status.to_string(),
-        updated_unix_ms: conversion_log_batch_workspace_updated_unix_ms(),
-    };
-    let bytes = serde_json::to_vec_pretty(&state).map_err(|err| {
+    let path = conversion_log_batch_workspace_state_path(coord_dir);
+    let bytes = serde_json::to_vec_pretty(state).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("could not serialize conversion-log batch workspace state: {err}"),
         )
     })?;
-    let path = conversion_log_batch_workspace_state_path(coord_dir);
-    write_bytes_atomically(&path, &bytes)?;
-    sync_parent_dir_best_effort(&path);
+
+    // Keep claim registration and durable publication coupled. In particular,
+    // do not release a newly registered claim if create_new made the ownership
+    // record visible but a later write/fsync failed: that record is ambiguous
+    // authority and must remain associated with this live process until a
+    // future locked recovery pass proves what happened.
+    let mut owner_record_published = false;
+    let result: io::Result<()> = (|| {
+        if creating {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            owner_record_published = true;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            sync_parent_dir(&path)?;
+        } else {
+            // Atomic replacement keeps the old complete ownership record in
+            // place if publication fails before rename. Once replacement has
+            // succeeded, however, the new claim may already be visible even
+            // if the following strict directory fsync fails. Mark it published
+            // before that fsync so we never release a live claim that durable
+            // recovery may subsequently observe.
+            write_bytes_atomically(&path, &bytes)?;
+            owner_record_published = true;
+            sync_parent_dir(&path)?;
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        if let Some(claim_id) = newly_registered_claim_id {
+            if creating && owner_record_published {
+                // We still hold the ownership lock and created this exact path.
+                // Retract the incomplete authority only if unlink + parent sync
+                // succeeds; otherwise retain the live claim so an ambiguous
+                // visible record cannot appear ownerless.
+                let retracted = match fs::remove_file(&path) {
+                    Ok(()) => sync_parent_dir(&path).is_ok(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    Err(_) => false,
+                };
+                if retracted {
+                    release_current_process_owner_claim(claim_id);
+                } else {
+                    log::warn!(
+                        "conversion-log workspace ownership publication failed after the state path became visible and could not be retracted; retaining in-process claim {} for fail-closed recovery: {}",
+                        claim_id,
+                        path.display()
+                    );
+                }
+            } else if owner_record_published {
+                // An atomic replacement became visible but its final parent
+                // sync failed. The old authority may already be gone, so do
+                // not release the newly published takeover claim. Retaining
+                // it is the only fail-closed relationship between the visible
+                // state and this live process.
+                log::warn!(
+                    "conversion-log workspace ownership replacement became visible but did not complete durably; retaining in-process claim {} for fail-closed recovery: {}",
+                    claim_id,
+                    path.display()
+                );
+            } else {
+                release_current_process_owner_claim(claim_id);
+            }
+        }
+    }
+    result
+}
+
+fn write_conversion_log_batch_workspace_state_locked(
+    coord_dir: &Path,
+    batch_id: &str,
+    status: &str,
+) -> io::Result<ConversionLogBatchWorkspaceState> {
+    if !conversion_log_batch_workspace_status_is_valid(status) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid conversion-log workspace status: {status}"),
+        ));
+    }
+    fs::create_dir_all(coord_dir)?;
+    sync_parent_dir(coord_dir)?;
+    if let Some(coordination_root) = coord_dir.parent() {
+        sync_parent_dir(coordination_root)?;
+    }
+
+    let existing = read_conversion_log_batch_workspace_state(coord_dir)?;
+    let creating = existing.is_none();
+    if creating {
+        let mut entries = fs::read_dir(coord_dir)?;
+        if entries.next().transpose()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "conversion-log workspace {} contains unowned state and cannot be claimed automatically",
+                    coord_dir.display()
+                ),
+            ));
+        }
+    }
+
+    let mut takeover_from = None;
+    let (owner, ownership_generation, previous_owner_claim_id, cleanup_started_unix_ms) =
+        match existing.as_ref() {
+            Some(existing) => {
+                if existing.batch_id != batch_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "conversion-log workspace {} belongs to batch {}, not {}",
+                            coord_dir.display(),
+                            existing.batch_id,
+                            batch_id
+                        ),
+                    ));
+                }
+                if !conversion_log_batch_workspace_transition_allowed(&existing.status, status) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "conversion-log workspace {} cannot transition from status {:?} to {:?}",
+                            coord_dir.display(),
+                            existing.status,
+                            status
+                        ),
+                    ));
+                }
+                let existing_owner = existing.owner.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "conversion-log workspace {} has legacy/unknown ownership and cannot be claimed automatically",
+                            coord_dir.display()
+                        ),
+                    )
+                })?;
+                let owner = if owner_is_current_process(existing_owner).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("could not validate conversion-log workspace owner: {error}"),
+                    )
+                })? {
+                    existing_owner.clone()
+                } else {
+                    match owner_liveness(existing_owner).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!("could not establish conversion-log workspace owner liveness: {error}"),
+                        )
+                    })? {
+                        OwnerLiveness::DeadLocal => {
+                            takeover_from = Some(existing_owner.claim_id.clone());
+                            current_process_owner().map_err(|error| {
+                                io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("could not establish takeover owner: {error}"),
+                                )
+                            })?
+                        }
+                        OwnerLiveness::Alive | OwnerLiveness::RemoteOrUnknown => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                format!(
+                                    "conversion-log workspace {} is owned by a live, remote, or indeterminate process claim {}",
+                                    coord_dir.display(),
+                                    existing_owner.claim_id
+                                ),
+                            ));
+                        }
+                    }
+                };
+                let generation = existing.ownership_generation.max(1)
+                    + u64::from(takeover_from.is_some());
+                let previous = takeover_from
+                    .clone()
+                    .or_else(|| existing.previous_owner_claim_id.clone());
+                let cleanup_started = if status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING {
+                    existing.cleanup_started_unix_ms.or_else(|| {
+                        Some(conversion_log_batch_workspace_updated_unix_ms())
+                    })
+                } else {
+                    existing.cleanup_started_unix_ms
+                };
+                (owner, generation, previous, cleanup_started)
+            }
+            None => {
+                let owner = current_process_owner().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("could not establish conversion-log workspace owner: {error}"),
+                    )
+                })?;
+                let cleanup_started = (status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING)
+                    .then(conversion_log_batch_workspace_updated_unix_ms);
+                (owner, 1, None, cleanup_started)
+            }
+        };
+
+    let newly_registered_claim_id =
+        (creating || takeover_from.is_some()).then(|| owner.claim_id.clone());
+    let state = ConversionLogBatchWorkspaceState {
+        schema_version: CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION,
+        batch_id: batch_id.to_string(),
+        owner: Some(owner),
+        owner_pid: None,
+        ownership_generation,
+        previous_owner_claim_id,
+        status: status.to_string(),
+        cleanup_started_unix_ms,
+        updated_unix_ms: conversion_log_batch_workspace_updated_unix_ms(),
+    };
+    persist_conversion_log_batch_workspace_state_locked(
+        coord_dir,
+        &state,
+        creating,
+        newly_registered_claim_id.as_deref(),
+    )?;
+    Ok(state)
+}
+
+fn write_conversion_log_batch_workspace_state(
+    coord_dir: &Path,
+    batch_id: &str,
+    status: &str,
+) -> io::Result<()> {
+    let _ownership_lock =
+        acquire_conversion_log_batch_workspace_ownership_lock(coord_dir, batch_id)?;
+    write_conversion_log_batch_workspace_state_locked(coord_dir, batch_id, status).map(|_| ())
+}
+
+fn ensure_conversion_log_batch_workspace_owned_for_request(
+    req: &PipelineRequest,
+) -> io::Result<()> {
+    let coord_dir = conversion_log_batch_coordination_album_dir(req).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion-log batch workspace ownership requires a coordination directory",
+        )
+    })?;
+    ensure_conversion_log_batch_workspace_owned_for_request_at(req, &coord_dir)
+}
+
+fn ensure_conversion_log_batch_workspace_owned_for_request_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> io::Result<()> {
+    let batch = req.album_batch.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion-log batch workspace ownership requires album batch context",
+        )
+    })?;
+    let batch_id = batch.conversion_log_batch_id.trim();
+    if !is_generated_conversion_log_batch_id(batch_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion-log batch workspace ownership requires a generated dispatch batch id",
+        ));
+    }
+    ensure_conversion_log_batch_workspace_owned(coord_dir, batch_id)?;
+    if conversion_actions_effective_for_request(req)? {
+        ensure_conversion_log_batch_drain_manifest_for_request_at(req, coord_dir)?;
+    }
     Ok(())
+}
+
+fn ensure_conversion_log_batch_workspace_owned(
+    coord_dir: &Path,
+    batch_id: &str,
+) -> io::Result<()> {
+    let _ownership_lock =
+        acquire_conversion_log_batch_workspace_ownership_lock(coord_dir, batch_id)?;
+    match read_conversion_log_batch_workspace_state(coord_dir)? {
+        Some(state) if state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING => {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "conversion-log workspace {} is completing durable cleanup and cannot accept new mutations",
+                    coord_dir.display()
+                ),
+            ))
+        }
+        Some(state) => write_conversion_log_batch_workspace_state_locked(
+            coord_dir,
+            batch_id,
+            &state.status,
+        )
+        .map(|_| ()),
+        None => write_conversion_log_batch_workspace_state_locked(
+            coord_dir,
+            batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+        )
+        .map(|_| ()),
+    }
 }
 
 fn read_conversion_log_batch_workspace_state(
     coord_dir: &Path,
 ) -> io::Result<Option<ConversionLogBatchWorkspaceState>> {
     let path = conversion_log_batch_workspace_state_path(coord_dir);
-    let bytes = match fs::read(&path) {
+    let bytes = match read_regular_file_no_follow(&path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     };
     let state = serde_json::from_slice::<ConversionLogBatchWorkspaceState>(&bytes).map_err(|err| {
         io::Error::new(
@@ -8922,7 +10634,7 @@ fn read_conversion_log_batch_workspace_state(
             format!("could not parse conversion-log batch workspace state {}: {err}", path.display()),
         )
     })?;
-    if state.schema_version != CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION {
+    if !matches!(state.schema_version, 1 | 2 | 3 | CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -8932,13 +10644,150 @@ fn read_conversion_log_batch_workspace_state(
             ),
         ));
     }
+    if !conversion_log_batch_workspace_status_is_valid(&state.status) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion-log batch workspace state {} has invalid status {:?}",
+                path.display(),
+                state.status
+            ),
+        ));
+    }
+    let directory_batch_id = coord_dir.file_name().and_then(|name| name.to_str());
+    if state.batch_id.trim().is_empty()
+        || directory_batch_id != Some(state.batch_id.as_str())
+        || !is_generated_conversion_log_batch_id(&state.batch_id)
+        || state.updated_unix_ms == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "conversion-log batch workspace state {} has inconsistent directory/batch/timestamp identity",
+                path.display()
+            ),
+        ));
+    }
+    if state.schema_version == 1 {
+        if state.owner.is_some() || !matches!(state.owner_pid, Some(pid) if pid > 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy conversion-log batch workspace state {} has malformed PID-only ownership",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if matches!(state.schema_version, 2 | 3 | CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION) {
+        if state.owner_pid.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conversion-log batch workspace state {} mixes strong and legacy ownership",
+                    path.display()
+                ),
+            ));
+        }
+        let owner = state.owner.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conversion-log batch workspace state {} is missing strong owner identity",
+                    path.display()
+                ),
+            )
+        })?;
+        validate_owner_identity(owner).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conversion-log batch workspace state {} has invalid owner identity: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    }
+    if state.schema_version == 2
+        && (state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+            || state.cleanup_started_unix_ms.is_some()
+            || state.ownership_generation != 0
+            || state.previous_owner_claim_id.is_some())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "schema-2 conversion-log workspace state {} contains schema-3 lifecycle fields",
+                path.display()
+            ),
+        ));
+    }
+    if matches!(state.schema_version, 3 | CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION) {
+        if state.ownership_generation == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conversion-log workspace state {} has no ownership generation",
+                    path.display()
+                ),
+            ));
+        }
+        if state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+            && state.cleanup_started_unix_ms.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cleaning conversion-log workspace state {} has no cleanup start timestamp",
+                    path.display()
+                ),
+            ));
+        }
+    }
     Ok(Some(state))
+}
+
+fn conversion_log_batch_workspace_status_is_valid(status: &str) -> bool {
+    status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE
+        || status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE
+        || status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED
+        || status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ABANDONED
+        || status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
 }
 
 fn conversion_log_batch_workspace_status_is_terminal(status: &str) -> bool {
     status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE
         || status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED
         || status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ABANDONED
+}
+
+fn conversion_log_batch_workspace_transition_allowed(from: &str, to: &str) -> bool {
+    match from {
+        CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE => {
+            to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE
+                || to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE
+                || to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED
+                || to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ABANDONED
+        }
+        CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE => {
+            to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE
+                || to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+        }
+        CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED => {
+            to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED
+                || to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE
+                || to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+        }
+        CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ABANDONED => {
+            to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ABANDONED
+                || to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE
+                || to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+        }
+        CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING => {
+            to == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+        }
+        _ => false,
+    }
 }
 
 fn mark_conversion_log_batch_workspace_status_for_identity_best_effort(
@@ -9058,10 +10907,13 @@ fn write_active_conversion_log_batch_workspace_state_unless_terminal_best_effort
             return;
         }
         Ok(_) => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination could not read workspace state before activation for {context}: {}: {err}; rewriting active state conservatively",
-            coord_dir.display()
-        ),
+        Err(err) => {
+            log::warn!(
+                "conversion-log batch coordination refused to activate unreadable workspace state for {context}: {}: {err}",
+                coord_dir.display()
+            );
+            return;
+        }
     }
 
     if let Err(err) = write_conversion_log_batch_workspace_state(
@@ -9112,6 +10964,19 @@ fn activate_conversion_log_batch_workspace_for_request_best_effort(
     req: &PipelineRequest,
     context: &str,
 ) -> Option<ConversionLogBatchWorkspaceActiveGuard> {
+    let coord_dir = conversion_log_batch_coordination_album_dir(req)?;
+    activate_conversion_log_batch_workspace_for_request_at_best_effort(
+        req,
+        &coord_dir,
+        context,
+    )
+}
+
+fn activate_conversion_log_batch_workspace_for_request_at_best_effort(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+    context: &str,
+) -> Option<ConversionLogBatchWorkspaceActiveGuard> {
     let batch_id = req
         .album_batch
         .as_ref()?
@@ -9121,7 +10986,6 @@ fn activate_conversion_log_batch_workspace_for_request_best_effort(
     if batch_id.is_empty() || !is_generated_conversion_log_batch_id(&batch_id) {
         return None;
     }
-    let coord_dir = conversion_log_batch_coordination_album_dir(req)?;
     {
         let mut guard = active_conversion_log_batch_workspaces()
             .lock()
@@ -9129,7 +10993,7 @@ fn activate_conversion_log_batch_workspace_for_request_best_effort(
         *guard.entry(batch_id.clone()).or_insert(0) += 1;
     }
     write_active_conversion_log_batch_workspace_state_unless_terminal_best_effort(
-        &coord_dir,
+        coord_dir,
         &batch_id,
         context,
     );
@@ -9144,23 +11008,31 @@ fn conversion_log_batch_workspace_owner_may_be_live(
         return true;
     }
     if let Some(state) = state {
-        if conversion_log_batch_workspace_status_is_terminal(state.status.as_str()) {
-            return false;
-        }
-        if state.owner_pid == std::process::id() {
-            // Same-process workspaces can be live while no short publish or
-            // finalization guard is held: one track may have published a
-            // fragment while sibling tracks are still converting. Treat
-            // non-terminal same-process state as live unless the owner has
-            // explicitly marked it failed/abandoned/complete.
+        let Some(owner) = state.owner.as_ref() else {
+            // Schema-1 state carries only a PID. On shared storage that PID is
+            // not local-authority evidence, so unknown ownership fails closed.
             return true;
-        }
-        return companion_temp_owner_may_be_live(state.owner_pid);
+        };
+        return match owner_liveness(owner) {
+            Ok(OwnerLiveness::Alive | OwnerLiveness::RemoteOrUnknown) => true,
+            Ok(OwnerLiveness::DeadLocal) => false,
+            Err(error) => {
+                log::warn!(
+                    "conversion-log batch cleanup could not establish owner liveness for {}: {error}",
+                    batch_id
+                );
+                true
+            }
+        };
     }
-    match conversion_log_batch_id_owner_pid(batch_id) {
-        Some(owner_pid) => companion_temp_owner_may_be_live(owner_pid),
-        None => true,
-    }
+    true
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConversionLogBatchCleanupAuthority {
+    CurrentProcessOwner,
+    CurrentProcessOwnerActionless,
+    CurrentOrProvenDeadLocalOwner,
 }
 
 fn cleanup_conversion_log_batch_coordination_after_success_best_effort(
@@ -9170,111 +11042,446 @@ fn cleanup_conversion_log_batch_coordination_after_success_best_effort(
     let Some(coord_dir) = conversion_log_batch_coordination_album_dir(req) else {
         return;
     };
-    cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(&coord_dir, context);
+    cleanup_conversion_log_batch_coordination_after_success_best_effort_at(req, &coord_dir, context);
+}
+
+fn cleanup_conversion_log_batch_coordination_after_success_best_effort_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+    context: &str,
+) {
+    cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+        coord_dir,
+        context,
+        match conversion_actions_effective_for_request(req) {
+            Ok(false) => ConversionLogBatchCleanupAuthority::CurrentProcessOwnerActionless,
+            Ok(true) | Err(_) => ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        },
+    );
 }
 
 fn cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
     coord_dir: &Path,
     context: &str,
+    authority: ConversionLogBatchCleanupAuthority,
 ) {
-    if !coord_dir.exists() {
+    match fs::symlink_metadata(coord_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup preserved non-directory or symlink workspace for {context}: {}",
+                coord_dir.display()
+            );
+            return;
+        }
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup preserved unreadable workspace for {context}: {}: {error}",
+                coord_dir.display()
+            );
+            return;
+        }
+    }
+
+    let initial_state = match read_conversion_log_batch_workspace_state(coord_dir) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            // The ownership record is deliberately the last object removed.
+            // Therefore an ownerless empty directory is a proven interrupted
+            // final rmdir and may be retired; any payload fails closed.
+            match fs::read_dir(coord_dir) {
+                Ok(mut entries) => {
+                    if entries.next().is_none() {
+                        match fs::remove_dir(coord_dir) {
+                            Ok(()) => sync_parent_dir_best_effort(coord_dir),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => log::warn!(
+                                "conversion-log batch coordination could not remove empty ownerless workspace for {context}: {}: {error}",
+                                coord_dir.display()
+                            ),
+                        }
+                    } else {
+                        log::warn!(
+                            "conversion-log batch coordination cleanup preserved nonempty ownerless workspace for {context}: {}",
+                            coord_dir.display()
+                        );
+                    }
+                }
+                Err(error) => log::warn!(
+                    "conversion-log batch coordination cleanup preserved unreadable ownerless workspace for {context}: {}: {error}",
+                    coord_dir.display()
+                ),
+            }
+            return;
+        }
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup preserved unreadable workspace state for {context}: {}: {error}",
+                coord_dir.display()
+            );
+            return;
+        }
+    };
+    let batch_id = initial_state.batch_id.clone();
+    let ownership_lock = match acquire_conversion_log_batch_workspace_ownership_lock(
+        coord_dir,
+        &batch_id,
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not acquire ownership lock for {context}: {}: {error}",
+                coord_dir.display()
+            );
+            return;
+        }
+    };
+
+    let state = match read_conversion_log_batch_workspace_state(coord_dir) {
+        Ok(Some(state)) if state.batch_id == batch_id => state,
+        Ok(Some(state)) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup preserved changed batch identity for {context}: {} now contains {}",
+                coord_dir.display(),
+                state.batch_id
+            );
+            return;
+        }
+        Ok(None) => return,
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not revalidate state for {context}: {}: {error}",
+                coord_dir.display()
+            );
+            return;
+        }
+    };
+    let Some(owner) = state.owner.as_ref() else {
+        log::warn!(
+            "conversion-log batch coordination cleanup preserved legacy/unknown owner for {context}: {}",
+            coord_dir.display()
+        );
+        return;
+    };
+    let ownership_authorized = match authority {
+        ConversionLogBatchCleanupAuthority::CurrentProcessOwner
+        | ConversionLogBatchCleanupAuthority::CurrentProcessOwnerActionless => {
+            owner_is_current_process(owner).unwrap_or(false)
+        }
+        ConversionLogBatchCleanupAuthority::CurrentOrProvenDeadLocalOwner => {
+            owner_is_current_process(owner).unwrap_or(false)
+                || matches!(owner_liveness(owner), Ok(OwnerLiveness::DeadLocal))
+        }
+    };
+    if !ownership_authorized {
+        log::warn!(
+            "conversion-log batch coordination cleanup preserved workspace without required ownership authority for {context}: {}",
+            coord_dir.display()
+        );
+        return;
+    }
+    if conversion_log_batch_workspace_registered_active(&batch_id) {
+        log::debug!(
+            "conversion-log batch coordination cleanup deferred until in-process batch participants drain for {context}: {}",
+            coord_dir.display()
+        );
         return;
     }
 
-    let marker = coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE);
-    match fs::remove_file(&marker) {
-        Ok(()) => sync_parent_dir_best_effort(&marker),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination cleanup could not remove completion marker for {context}: {}: {err}",
-            marker.display()
-        ),
+    // Re-publish the same lifecycle state while holding the ownership lock.
+    // This is the atomic dead-local takeover point used by restored queues and
+    // interrupted cleanup. Remote, live, legacy, or indeterminate ownership
+    // remains unclaimable.
+    let owned_state = match write_conversion_log_batch_workspace_state_locked(
+        coord_dir,
+        &batch_id,
+        &state.status,
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not take durable ownership for {context}: {}: {error}",
+                coord_dir.display()
+            );
+            return;
+        }
+    };
+    let resuming_cleaning =
+        owned_state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING;
+
+    if workspace_has_unresolved_action_state(coord_dir) {
+        log::warn!(
+            "conversion-log batch coordination cleanup preserved unresolved or unreadable action state for {context}: {}",
+            coord_dir.display()
+        );
+        return;
     }
 
-    let visible_marker = coord_dir.join(CONVERSION_LOG_VISIBLE_COMMIT_MARKER_FILE);
-    match fs::remove_file(&visible_marker) {
-        Ok(()) => sync_parent_dir_best_effort(&visible_marker),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination cleanup could not remove visible-log transaction marker for {context}: {}: {err}",
-            visible_marker.display()
-        ),
+    let cleaning_state = if resuming_cleaning {
+        owned_state
+    } else {
+        if !conversion_log_batch_workspace_status_is_terminal(&owned_state.status) {
+            // A dead active workspace is recovery state, not garbage. It may be
+            // taken over by the restored queue, but a sweeper must never turn
+            // mere owner death into terminal authorization. The one exception:
+            // an abandoned attempt of THIS live process (identity tuple is
+            // ours, claim released) — same-process retry supersedes it and no
+            // restart recovery can ever want it.
+            let abandoned_same_process = matches!(
+                authority,
+                ConversionLogBatchCleanupAuthority::CurrentOrProvenDeadLocalOwner
+            ) && owned_state
+                .owner
+                .as_ref()
+                .is_some_and(
+                    crate::convert::pipeline::actions::owner_is_abandoned_current_process_attempt,
+                );
+            if !abandoned_same_process {
+                log::warn!(
+                    "conversion-log batch coordination cleanup preserved non-terminal workspace for {context}: {} ({})",
+                    coord_dir.display(),
+                    owned_state.status
+                );
+                return;
+            }
+        }
+
+        if !matches!(
+            authority,
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwnerActionless
+        ) {
+            match conversion_log_batch_cleanup_lifecycle_is_complete(coord_dir, &batch_id) {
+                Ok(true) => {}
+                // A proven-dead LOCAL owner whose workspace never created a
+                // drain authority can never satisfy the drain gate — its
+                // participants were threads of the dead process. The durable
+                // terminal status is the only signal such a workspace will
+                // ever produce; without this, pre-drain-era leftovers are
+                // retained forever (the task-12 leak, reborn).
+                Ok(false)
+                    if matches!(
+                        authority,
+                        ConversionLogBatchCleanupAuthority::CurrentOrProvenDeadLocalOwner
+                    ) && !conversion_log_batch_drain_dir(coord_dir).exists() => {}
+                Ok(false) => {
+                    log::debug!(
+                        "conversion-log batch coordination cleanup deferred until every participant has drained and the post-action lifecycle is terminal for {context}: {}",
+                        coord_dir.display()
+                    );
+                    return;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "conversion-log batch coordination cleanup preserved invalid or unreadable participant/post-action lifecycle authority for {context}: {}: {error}",
+                        coord_dir.display()
+                    );
+                    return;
+                }
+            }
+        }
+
+        let marker_path = coord_dir.join(CONVERSION_LOG_VISIBLE_COMMIT_MARKER_FILE);
+        if let Err(error) = repair_interrupted_visible_conversion_log_publish_marker(&marker_path) {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not repair visible-log transaction for {context}: {}: {error:?}",
+                marker_path.display()
+            );
+            return;
+        }
+
+        match write_conversion_log_batch_workspace_state_locked(
+            coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                log::warn!(
+                    "conversion-log batch coordination cleanup could not durably enter cleaning state for {context}: {}: {error}",
+                    coord_dir.display()
+                );
+                return;
+            }
+        }
+    };
+
+    // `cleaning` is durable proof that the complete participant set had
+    // drained. A resumed cleanup may therefore remove acknowledgments that
+    // disappeared before the crash; the manifest remains last within this
+    // sub-authority, and the workspace owner record remains last overall.
+    if !matches!(
+        authority,
+        ConversionLogBatchCleanupAuthority::CurrentProcessOwnerActionless
+    ) {
+        if let Err(error) = cleanup_conversion_log_batch_drain_authority(coord_dir, &batch_id) {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not retire participant drain authority for {context}: {}: {error}",
+                coord_dir.display()
+            );
+            return;
+        }
     }
 
-    let hidden_log = coord_dir.join("conversion.log");
-    match fs::remove_file(&hidden_log) {
-        Ok(()) => sync_parent_dir_best_effort(&hidden_log),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination cleanup could not remove hidden log for {context}: {}: {err}",
-            hidden_log.display()
-        ),
+    // Remove validated terminal action authority only after the fail-closed
+    // unresolved-state veto and durable cleaning transition above.
+    super::actions::prune_terminal_action_journals_best_effort(coord_dir, 0);
+    let action_journals = coord_dir.join(".tonepoet-action-journals");
+    match fs::remove_dir(&action_journals) {
+        Ok(()) => sync_parent_dir_best_effort(&action_journals),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+            log::warn!(
+                "conversion-log batch coordination cleanup retained nonempty action authority for {context}: {}",
+                action_journals.display()
+            );
+            return;
+        }
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not remove action authority directory for {context}: {}: {error}",
+                action_journals.display()
+            );
+            return;
+        }
+    }
+
+    for path in [
+        coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE),
+        coord_dir.join(CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_FILE),
+        coord_dir.join(CONVERSION_LOG_VISIBLE_COMMIT_MARKER_FILE),
+        coord_dir.join("conversion.log"),
+        coord_dir.join(CONVERSION_LOG_BATCH_FINALIZATION_LOCK_FILE),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => sync_parent_dir_best_effort(&path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                log::warn!(
+                    "conversion-log batch coordination cleanup could not remove artifact for {context}: {}: {error}",
+                    path.display()
+                );
+                return;
+            }
+        }
+    }
+
+    for path in [
+        conversion_log_fragment_dir(coord_dir),
+        coord_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR),
+    ] {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => sync_parent_dir_best_effort(&path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                log::warn!(
+                    "conversion-log batch coordination cleanup could not remove directory for {context}: {}: {error}",
+                    path.display()
+                );
+                return;
+            }
+        }
+    }
+
+    if workspace_has_unresolved_action_state(coord_dir) {
+        log::warn!(
+            "conversion-log batch coordination cleanup observed new unresolved action authority during cleaning for {context}: {}",
+            coord_dir.display()
+        );
+        return;
     }
 
     let state_file = conversion_log_batch_workspace_state_path(coord_dir);
-    match fs::remove_file(&state_file) {
-        Ok(()) => sync_parent_dir_best_effort(&state_file),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination cleanup could not remove workspace state for {context}: {}: {err}",
-            state_file.display()
-        ),
-    }
-
-    let finalization_lock = coord_dir.join(CONVERSION_LOG_BATCH_FINALIZATION_LOCK_FILE);
-    match fs::remove_file(&finalization_lock) {
-        Ok(()) => sync_parent_dir_best_effort(&finalization_lock),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination cleanup could not remove finalization lock for {context}: {}: {err}",
-            finalization_lock.display()
-        ),
-    }
-
-    let fragment_dir = conversion_log_fragment_dir(&coord_dir);
-    match fs::remove_dir(&fragment_dir) {
-        Ok(()) => sync_parent_dir_best_effort(&fragment_dir),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination cleanup could not remove empty fragment dir for {context}: {}: {err}",
-            fragment_dir.display()
-        ),
-    }
-
-    let quarantine = coord_dir.join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR);
-    match fs::remove_dir_all(&quarantine) {
-        Ok(()) => sync_parent_dir_best_effort(&quarantine),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination cleanup could not remove quarantine for {context}: {}: {err}",
-            quarantine.display()
-        ),
-    }
-
-    match fs::remove_dir(&coord_dir) {
-        Ok(()) => sync_parent_dir_best_effort(&coord_dir),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-        Err(err) => log::warn!(
-            "conversion-log batch coordination cleanup could not remove empty batch dir for {context}: {}: {err}",
+    let only_state_remains = match fs::read_dir(coord_dir) {
+        Ok(entries) => {
+            let mut only_state = true;
+            let mut saw_state = false;
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        log::warn!(
+                            "conversion-log batch coordination cleanup could not complete final inventory for {context}: {}: {error}",
+                            coord_dir.display()
+                        );
+                        return;
+                    }
+                };
+                if entry.path() == state_file {
+                    saw_state = true;
+                } else {
+                    only_state = false;
+                }
+            }
+            only_state && saw_state
+        }
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not inventory final workspace for {context}: {}: {error}",
+                coord_dir.display()
+            );
+            return;
+        }
+    };
+    if !only_state_remains {
+        log::warn!(
+            "conversion-log batch coordination cleanup preserved cleaning workspace with unrecognized remaining artifacts for {context}: {}",
             coord_dir.display()
-        ),
+        );
+        return;
     }
 
+    // The owner/state record is the last object removed from the workspace.
+    match fs::remove_file(&state_file) {
+        Ok(()) => {
+            sync_parent_dir_best_effort(&state_file);
+            if let Some(owner) = cleaning_state.owner.as_ref() {
+                release_current_process_owner_claim(&owner.claim_id);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            log::warn!(
+                "conversion-log batch coordination cleanup lost its final ownership state before authorized removal for {context}: {}",
+                state_file.display()
+            );
+            return;
+        }
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not remove final ownership state for {context}: {}: {error}",
+                state_file.display()
+            );
+            return;
+        }
+    }
+    match fs::remove_dir(coord_dir) {
+        Ok(()) => sync_parent_dir_best_effort(coord_dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup removed ownership state but could not remove now-empty workspace for {context}: {}: {error}",
+                coord_dir.display()
+            );
+            return;
+        }
+    }
+
+    drop(ownership_lock);
     if let Some(parent) = coord_dir.parent() {
         match fs::remove_dir(parent) {
             Ok(()) => sync_parent_dir_best_effort(parent),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-            Err(err) => log::warn!(
-                "conversion-log batch coordination cleanup could not remove empty coordination root for {context}: {}: {err}",
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => log::warn!(
+                "conversion-log batch coordination could not remove empty coordination root for {context}: {}: {error}",
                 parent.display()
             ),
         }
     }
 }
-
 fn conversion_log_fragment_quarantine_dir(album_dir: &Path, reason: &str) -> PathBuf {
     album_dir
         .join(CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR)
@@ -9387,16 +11594,18 @@ fn read_matching_conversion_log_fragment_files(
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
         match read_conversion_log_fragment_file(&path) {
-            Ok(fragment) if fragment.batch_identity == *target_identity => {
-                files.push(ConversionLogFragmentFile { path, fragment });
-            }
-            Ok(fragment) => {
-                let reason = if fragment.batch_identity.conversion_log_batch_id == target_identity.conversion_log_batch_id {
-                    "mismatched-fragment-batch-fingerprint"
+            Ok(mut fragment) => {
+                fragment.batch_identity.runtime_coordination_dir = Some(album_dir.to_path_buf());
+                if conversion_log_batch_identities_match(&fragment.batch_identity, target_identity) {
+                    files.push(ConversionLogFragmentFile { path, fragment });
                 } else {
-                    "stale-fragment-batch"
-                };
-                quarantine_conversion_log_fragment_file(&path, reason);
+                    let reason = if fragment.batch_identity.conversion_log_batch_id == target_identity.conversion_log_batch_id {
+                        "mismatched-fragment-batch-fingerprint"
+                    } else {
+                        "stale-fragment-batch"
+                    };
+                    quarantine_conversion_log_fragment_file(&path, reason);
+                }
             }
             Err(err) => {
                 log::warn!("ignoring unreadable conversion log fragment {}: {err}", path.display());
@@ -10175,7 +12384,7 @@ fn quarantined_conversion_log_fragment_belongs_to_finalized_album(
     fragment: &ConversionLogFragment,
     target_identity: &ConversionLogBatchIdentity,
 ) -> bool {
-    fragment.batch_identity == *target_identity
+    conversion_log_batch_identities_match(&fragment.batch_identity, target_identity)
         || fragment.batch_identity.conversion_log_batch_id == target_identity.conversion_log_batch_id
         || (fragment.batch_identity.output_album_dir == target_identity.output_album_dir
             && fragment.batch_identity.source_grouping_root == target_identity.source_grouping_root
@@ -10464,6 +12673,7 @@ fn finalize_incomplete_conversion_log_batch_if_needed(
             cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
                 &album_dir,
                 context,
+                ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
             );
         }
 
@@ -12137,6 +14347,7 @@ fn block_reason_label(reason: &BlockReason) -> String {
 
 fn pipeline_stage_label(stage: PipelineStage) -> &'static str {
     match stage {
+        PipelineStage::PreActions => "PreActions",
         PipelineStage::Materialize => "Materialize",
         PipelineStage::PlanOutputs => "PlanOutputs",
         PipelineStage::Convert => "Convert",
@@ -12145,6 +14356,7 @@ fn pipeline_stage_label(stage: PipelineStage) -> &'static str {
         PipelineStage::ReplayGain => "ReplayGain",
         PipelineStage::Features => "Features",
         PipelineStage::Publish => "Publish",
+        PipelineStage::PostActions => "PostActions",
         PipelineStage::DurableLog => "DurableLog",
     }
 }
@@ -12610,13 +14822,30 @@ fn planned_album_dirs(plan: &AlbumPlan) -> Vec<PathBuf> {
     }
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn publish_album_output_for_plan(
+    staging: StagingDir,
+    artifacts: &ArtifactSet,
+    req: &PipelineRequest,
+    plan: &AlbumPlan,
+    policy: PublishPolicy,
+    manifest: Option<&super::manifest::ConversionManifest>,
+) -> Result<PublishedAlbum, PublishError> {
+    publish_album_output_for_plan_with_authority(
+        staging, artifacts, req, plan, policy, manifest, None, None, false,
+    )
+}
+
+fn publish_album_output_for_plan_with_authority(
     mut staging: StagingDir,
     artifacts: &ArtifactSet,
     req: &PipelineRequest,
     plan: &AlbumPlan,
     policy: PublishPolicy,
     manifest: Option<&super::manifest::ConversionManifest>,
+    authority: Option<&ExplicitActionRunLock>,
+    multi_root_authorities: Option<&[ExplicitActionRunLock]>,
+    reject_late_action_authority: bool,
 ) -> Result<PublishedAlbum, PublishError> {
     let album_dirs = planned_album_dirs(plan);
     if album_dirs.len() <= 1 {
@@ -12625,7 +14854,27 @@ fn publish_album_output_for_plan(
             .map(PathBuf::as_path)
             .unwrap_or(plan.album_dir.as_path());
         let publish_plan = build_publish_plan(artifacts, req, album_dir)?;
-        return publish_album_output(staging, &publish_plan, policy, manifest);
+        return publish_album_output_with_authority(
+            staging,
+            &publish_plan,
+            policy,
+            manifest,
+            authority,
+            reject_late_action_authority,
+            false,
+        );
+    }
+    if let Some(authorities) = multi_root_authorities {
+        if authorities.len() != album_dirs.len() {
+            return Err(PublishError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "multi-root publication authority count {} does not match rendered root count {}",
+                    authorities.len(),
+                    album_dirs.len()
+                ),
+            )));
+        }
     }
 
     // Multi-root plans are produced when the user deliberately places
@@ -12639,15 +14888,52 @@ fn publish_album_output_for_plan(
         staging.disarm();
     }
 
-    let output_root = normalize_path(&req.output_root);
+    let logical_output_root = normalize_path(&req.output_root);
+    let output_root = match multi_root_authorities.and_then(|locks| locks.first()) {
+        Some(lock) => lock
+            .descriptor_relative_output_root()
+            .map_err(|error| {
+                PublishError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("could not bind multi-root transaction to retained output root: {error}"),
+                ))
+            })?
+            .ok_or_else(|| {
+                PublishError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    "multi-root action authority lacks retained output-root capability",
+                ))
+            })?,
+        None => logical_output_root.clone(),
+    };
     fs::create_dir_all(&output_root).map_err(PublishError::io_at("creating output root for multi-root publish", &output_root))?;
     let multi_lock_path = output_root.join(".tonepoet-multi-root-publish.lock");
     let _multi_root_lock = acquire_blocking_file_lock(&multi_lock_path, true).map_err(PublishError::Io)?;
     repair_interrupted_multi_root_publishes(&output_root)?;
 
-    let coordination_fragment_entries = coordination_fragment_entries_from_artifacts(artifacts, req)?;
+    let mut coordination_fragment_entries = coordination_fragment_entries_from_artifacts(artifacts, req)?;
+    if output_root != logical_output_root {
+        for entry in &mut coordination_fragment_entries {
+            entry.final_path = rebase_action_path(
+                &entry.final_path,
+                &logical_output_root,
+                &output_root,
+            );
+        }
+    }
     let coordination_fragment_identity =
         conversion_log_fragment_batch_identity_from_entries(&coordination_fragment_entries)?;
+    if let Some(identity) = coordination_fragment_identity.as_ref() {
+        let coord_dir = conversion_log_batch_coordination_album_dir_from_identity(identity);
+        ensure_conversion_log_batch_workspace_owned(
+            &coord_dir,
+            &identity.conversion_log_batch_id,
+        )
+        .map_err(PublishError::io_at(
+            "establishing conversion-log batch ownership before multi-root publish",
+            &coord_dir,
+        ))?;
+    }
     let coordination_expected_track_count = if coordination_fragment_entries.is_empty() {
         0
     } else {
@@ -12699,10 +14985,26 @@ fn publish_album_output_for_plan(
                 return Err(err);
             }
         };
+        let mut transaction_plan = publish_plan.clone();
+        if output_root != logical_output_root {
+            transaction_plan.album_dir = rebase_action_path(
+                &publish_plan.album_dir,
+                &logical_output_root,
+                &output_root,
+            );
+            for entry in &mut transaction_plan.entries {
+                entry.final_path = rebase_action_path(
+                    &entry.final_path,
+                    &logical_output_root,
+                    &output_root,
+                );
+            }
+        }
         groups.push(MultiRootPublishGroup {
             index,
             group_root,
             publish_plan,
+            transaction_plan,
         });
     }
 
@@ -12739,6 +15041,15 @@ fn publish_album_output_for_plan(
                 }
                 cleanup_multi_root_group_roots(&groups);
                 cleanup_successful_staging(staging);
+                if output_root != logical_output_root {
+                    for entry in &mut published_entries {
+                        entry.final_path = rebase_action_path(
+                            &entry.final_path,
+                            &output_root,
+                            &logical_output_root,
+                        );
+                    }
+                }
                 return Ok(PublishedAlbum {
                     album_dir: plan.album_dir.clone(),
                     entries: published_entries,
@@ -12771,16 +15082,34 @@ fn publish_album_output_for_plan(
     let mut manifest_path = None;
     let publish_result = (|| -> Result<(), PublishError> {
         for group in &groups {
-            txn.prepare_root(&group.publish_plan.album_dir, policy.overwrite)?;
+            txn.prepare_root(&group.transaction_plan.album_dir, policy.overwrite)?;
             let group_staging = StagingDir::new(
                 group.group_root.clone(),
                 format!("{}-multi-publish-{:03}", staging.job_id, group.index),
             );
-            let published = publish_album_output(
+            let group_authority = multi_root_authorities.and_then(|authorities| {
+                authorities.iter().find(|lock| {
+                    absolute_normalized_action_path(lock.canonical_album_dir())
+                        == absolute_normalized_action_path(&group.publish_plan.album_dir)
+                })
+            });
+            if multi_root_authorities.is_some() && group_authority.is_none() {
+                return Err(PublishError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "missing ordered publication authority for rendered root {}",
+                        group.publish_plan.album_dir.display()
+                    ),
+                )));
+            }
+            let published = publish_album_output_with_authority(
                 group_staging,
                 &group.publish_plan,
                 leaf_policy.clone(),
                 if manifest_path.is_none() { manifest } else { None },
+                group_authority,
+                false,
+                true,
             )?;
             if manifest_path.is_none() {
                 manifest_path = published.manifest_path.clone();
@@ -12837,6 +15166,15 @@ fn publish_album_output_for_plan(
         guard.disarm_failure_mark();
     }
     cleanup_successful_staging(staging);
+    if output_root != logical_output_root {
+        for entry in &mut published_entries {
+            entry.final_path = rebase_action_path(
+                &entry.final_path,
+                &output_root,
+                &logical_output_root,
+            );
+        }
+    }
     Ok(PublishedAlbum {
         album_dir: plan.album_dir.clone(),
         entries: published_entries,
@@ -12848,7 +15186,12 @@ fn publish_album_output_for_plan(
 struct MultiRootPublishGroup {
     index: usize,
     group_root: PathBuf,
+    /// Stable logical plan used by the descriptor-bound leaf publisher and
+    /// returned in reports.
     publish_plan: PublishPlan,
+    /// Runtime-only plan rooted beneath the retained output descriptor for
+    /// umbrella preflight, rollback, and recovery state.
+    transaction_plan: PublishPlan,
 }
 
 fn cleanup_multi_root_group_roots(groups: &[MultiRootPublishGroup]) {
@@ -13040,7 +15383,7 @@ fn existing_multi_root_payload_matches_destinations(
     let mut published_entries = Vec::new();
     let mut saw_payload = false;
     for group in groups {
-        let Some(mut group_entries) = existing_publish_plan_payload_matches_destinations(&group.publish_plan)? else {
+        let Some(mut group_entries) = existing_publish_plan_payload_matches_destinations(&group.transaction_plan)? else {
             return Ok(None);
         };
         saw_payload = true;
@@ -13080,7 +15423,7 @@ fn preflight_multi_root_destinations(
 ) -> Result<(), PublishError> {
     let mut roots = BTreeSet::new();
     for group in groups {
-        let root = normalize_path(&group.publish_plan.album_dir);
+        let root = normalize_path(&group.transaction_plan.album_dir);
         if !roots.insert(root.clone()) {
             return Err(PublishError::DestinationExists(root.display().to_string()));
         }
@@ -13448,10 +15791,214 @@ fn copy_staged_entry_for_multi_root_publish(
 }
 
 pub fn publish_album_output(
+    staging: StagingDir,
+    plan: &PublishPlan,
+    policy: PublishPolicy,
+    manifest: Option<&super::manifest::ConversionManifest>,
+) -> Result<PublishedAlbum, PublishError> {
+    publish_album_output_with_authority(staging, plan, policy, manifest, None, false, false)
+}
+
+fn publish_album_output_with_authority(
+    staging: StagingDir,
+    plan: &PublishPlan,
+    policy: PublishPolicy,
+    manifest: Option<&super::manifest::ConversionManifest>,
+    authority: Option<&ExplicitActionRunLock>,
+    reject_late_action_authority: bool,
+    target_prepared_absent: bool,
+) -> Result<PublishedAlbum, PublishError> {
+    // Every publication is rooted at the exact parent directory descriptor
+    // that owns the shared album lock.  Action-enabled callers lend their
+    // already-held transition authority; ordinary publishers acquire the same
+    // proven capability-relative primitive here.  No publication operation
+    // below follows the caller's lexical parent after this point.
+    let owned_authority;
+    let authority = match authority {
+        Some(authority) => authority,
+        None => {
+            let parent = parent_dir_or_current(&plan.album_dir);
+            fs::create_dir_all(parent)
+                .map_err(PublishError::io_at("creating publish parent dir", parent))?;
+            owned_authority = acquire_blocking_album_publication_lock_for_album(&plan.album_dir)
+                .map_err(|error| {
+                    PublishError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("could not acquire descriptor-bound album publication authority: {error}"),
+                    ))
+                })?;
+            &owned_authority
+        }
+    };
+
+    if target_prepared_absent {
+        if absolute_normalized_action_path(&plan.album_dir)
+            != absolute_normalized_action_path(authority.canonical_album_dir())
+        {
+            return Err(PublishError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "prepared multi-root authority for {} cannot publish {}",
+                    authority.canonical_album_dir().display(),
+                    plan.album_dir.display()
+                ),
+            )));
+        }
+        authority
+            .validate_prepared_publication_target_absent()
+            .map_err(|error| {
+                PublishError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("prepared multi-root publication target changed: {error}"),
+                ))
+            })?;
+    } else {
+        authority.validate_album_dir(&plan.album_dir).map_err(|error| {
+            PublishError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("album publication authority does not match publish plan: {error}"),
+            ))
+        })?;
+        authority.revalidate_publication_target().map_err(|error| {
+            PublishError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("album publication authority became stale before mutation: {error}"),
+            ))
+        })?;
+    }
+    let bound_album_dir = authority.descriptor_relative_album_dir().map_err(|error| {
+        PublishError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            format!("could not bind publication to retained album parent: {error}"),
+        ))
+    })?;
+    let logical_output_root = authority.logical_output_root().map(Path::to_path_buf);
+    let bound_output_root = authority
+        .descriptor_relative_output_root()
+        .map_err(|error| {
+            PublishError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("could not bind coordination state to retained output root: {error}"),
+            ))
+        })?;
+    // Test fault injection sees the LOGICAL plan: hooks match on durable
+    // album paths, which the bound (descriptor-route) plan no longer carries.
+    #[cfg(test)]
+    if let Some(error) = injected_publish_error_for_test(&staging, plan) {
+        return Err(PublishError::Io(io::Error::new(io::ErrorKind::Other, error)));
+    }
+    let mut bound_plan = plan.clone();
+    match (logical_output_root.as_deref(), bound_output_root.as_deref()) {
+        (Some(logical_root), Some(bound_root)) => {
+            // Rebase every publication target under the output transaction,
+            // not only the album payload. Conversion-log fragments, batch
+            // state, election artifacts, and visible-log finalization must
+            // reach the same retained output-root object.
+            bound_plan.album_dir = rebase_action_path(&plan.album_dir, logical_root, bound_root);
+            for entry in &mut bound_plan.entries {
+                entry.final_path = rebase_action_path(&entry.final_path, logical_root, bound_root);
+            }
+        }
+        _ => {
+            bound_plan.album_dir = bound_album_dir.clone();
+            for entry in &mut bound_plan.entries {
+                if let Ok(relative) = entry.final_path.strip_prefix(&plan.album_dir) {
+                    entry.final_path = bound_album_dir.join(relative);
+                }
+            }
+        }
+    }
+
+    let mut published = publish_album_output_bound(
+        staging,
+        &bound_plan,
+        policy,
+        manifest,
+        Some(&plan.album_dir),
+        Some(authority),
+        reject_late_action_authority,
+    )
+    .map_err(|error| {
+        // Errors from the bound run carry live descriptor-namespace routes
+        // (/proc/self/fd/N/...). Report the durable logical paths instead —
+        // fd routes are meaningless once the descriptor closes.
+        match (logical_output_root.as_deref(), bound_output_root.as_deref()) {
+            (Some(logical_root), Some(bound_root)) => {
+                rebase_publish_error_paths(error, bound_root, logical_root)
+            }
+            _ => rebase_publish_error_paths(error, &bound_album_dir, &plan.album_dir),
+        }
+    })?;
+    published.album_dir = plan.album_dir.clone();
+    match (logical_output_root.as_deref(), bound_output_root.as_deref()) {
+        (Some(logical_root), Some(bound_root)) => {
+            for entry in &mut published.entries {
+                entry.final_path = rebase_action_path(&entry.final_path, bound_root, logical_root);
+            }
+            if let Some(path) = published.manifest_path.as_mut() {
+                *path = rebase_action_path(path, bound_root, logical_root);
+            }
+        }
+        _ => {
+            for entry in &mut published.entries {
+                if let Ok(relative) = entry.final_path.strip_prefix(&bound_album_dir) {
+                    entry.final_path = plan.album_dir.join(relative);
+                }
+            }
+            if let Some(path) = published.manifest_path.as_mut() {
+                if let Ok(relative) = path.strip_prefix(&bound_album_dir) {
+                    *path = plan.album_dir.join(relative);
+                }
+            }
+        }
+    }
+    Ok(published)
+}
+
+
+/// Translate live descriptor-namespace routes inside a publish error back to
+/// their durable logical paths (the inverse of the plan rebase applied for
+/// I/O). String-level: every variant carries its path textually.
+fn rebase_publish_error_paths(
+    error: PublishError,
+    bound_root: &Path,
+    logical_root: &Path,
+) -> PublishError {
+    let bound = bound_root.display().to_string();
+    let logical = logical_root.display().to_string();
+    let swap = |value: String| value.replace(&bound, &logical);
+    match error {
+        PublishError::DestinationExists(path) => PublishError::DestinationExists(swap(path)),
+        PublishError::PathOutsideOutputRoot(path) => {
+            PublishError::PathOutsideOutputRoot(swap(path))
+        }
+        PublishError::CrossDeviceCopy(message) => PublishError::CrossDeviceCopy(swap(message)),
+        PublishError::AtomicRename(message) => PublishError::AtomicRename(swap(message)),
+        PublishError::BackupFailed(message) => PublishError::BackupFailed(swap(message)),
+        PublishError::RollbackFailed(message) => PublishError::RollbackFailed(swap(message)),
+        PublishError::IoAt { op, path, source } => PublishError::IoAt {
+            op,
+            path: match path.strip_prefix(bound_root) {
+                Ok(relative) => logical_root.join(relative),
+                Err(_) => path,
+            },
+            source,
+        },
+        other => other,
+    }
+}
+
+fn publish_album_output_bound(
     mut staging: StagingDir,
     plan: &PublishPlan,
     policy: PublishPolicy,
     manifest: Option<&super::manifest::ConversionManifest>,
+    // The manifest's track paths live in the DURABLE logical namespace; when
+    // the plan has been rebased onto a descriptor route, relativization must
+    // still use the logical album dir.
+    manifest_album_dir: Option<&Path>,
+    authority: Option<&ExplicitActionRunLock>,
+    reject_late_action_authority: bool,
 ) -> Result<PublishedAlbum, PublishError> {
     // A failed publish preserves disk staging for diagnostics/retry: every
     // error return below drops `staging`, and an armed drop would delete the
@@ -13475,6 +16022,28 @@ pub fn publish_album_output(
     }
 
     let fragment_batch_identity = plan_conversion_log_fragment_batch_identity(plan)?;
+    if let Some(identity) = fragment_batch_identity.as_ref() {
+        let coord_dir = conversion_log_batch_coordination_album_dir_from_identity(identity);
+        // Ownership state lives only in dedicated per-batch workspaces
+        // (…/.tonepoet-batch/<batch-id>, whose final component IS the batch
+        // id). Legacy/degenerate identities that coordinate directly in an
+        // album directory have no workspace to own — and writing ownership
+        // state there would trip the workspace's own identity invariants.
+        let dedicated_workspace = coord_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == identity.conversion_log_batch_id);
+        if dedicated_workspace {
+            ensure_conversion_log_batch_workspace_owned(
+                &coord_dir,
+                &identity.conversion_log_batch_id,
+            )
+            .map_err(PublishError::io_at(
+                "establishing conversion-log batch ownership before publish",
+                &coord_dir,
+            ))?;
+        }
+    }
     let mut batch_workspace_guard = fragment_batch_identity.as_ref().map(|identity| {
         activate_conversion_log_batch_publish_attempt_for_identity_best_effort(identity, "publish")
     });
@@ -13501,7 +16070,19 @@ pub fn publish_album_output(
         .map(sanitize_component)
         .unwrap_or_else(|| "album".to_string());
     cleanup_stale_publish_lock_artifacts(final_parent, &album_name);
-    let _publish_lock = acquire_publish_lock(&plan.album_dir)?;
+    // The wrapper always supplies a descriptor-bound authority.  Keeping a
+    // second pathname lock here would reintroduce an independent lock domain.
+    debug_assert!(authority.is_some());
+    if reject_late_action_authority
+        && (plan.album_dir.join(CONVERSION_ACTION_IDENTITY_FILE).exists()
+            || plan.album_dir.join(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE).exists()
+            || plan.album_dir.join(".tonepoet-actions-manual").exists())
+    {
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "action identity/manual authority appeared while actionless publication was waiting for the album lock; retry publication under identity authority",
+        )));
+    }
     let marker_path = final_parent.join(format!(".{album_name}.publish-in-progress"));
     let incremental_marker_path = final_parent.join(format!(
         ".{album_name}.incremental-publish-in-progress"
@@ -13671,7 +16252,8 @@ pub fn publish_album_output(
     // post-publish path in PublishedAlbum so PipelineReport cannot contain a
     // stale temp-directory manifest path.
     let manifest_path = if let Some(manifest) = manifest {
-        match super::manifest::write_manifest_for_publish(&temp_dir, &plan.album_dir, manifest) {
+        let relativization_album_dir = manifest_album_dir.unwrap_or(plan.album_dir.as_path());
+        match super::manifest::write_manifest_for_publish(&temp_dir, relativization_album_dir, manifest) {
             Ok(_written_manifest_path) => Some(super::manifest::manifest_path(&plan.album_dir)),
             Err(err) => {
                 log::warn!("manifest write failed (non-fatal): {err}");
@@ -14547,6 +17129,1051 @@ fn request_batch_resolved_identity(req: &PipelineRequest) -> Option<&BatchResolv
         .or_else(|| req.album_batch.as_ref().and_then(|batch| batch.resolved_identity()))
 }
 
+struct PipelineActionCancellation<'a>(&'a CancellationToken);
+
+impl ActionCancellation for PipelineActionCancellation<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+}
+
+#[derive(Debug)]
+struct PipelineActionExecution {
+    report: ActionPhaseReport,
+    error: Option<String>,
+    recoverable_interruption: bool,
+}
+
+fn absolute_normalized_action_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        normalize_path(path)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| normalize_path(&cwd.join(path)))
+            .unwrap_or_else(|_| normalize_path(path))
+    }
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConversionActionAlbumScope {
+    Disabled,
+    ProperSubdirectory,
+    FlatLayoutSkipped { reason: String },
+}
+
+fn conversion_action_planned_album_dir(req: &PipelineRequest) -> PathBuf {
+    req.album_batch
+        .as_ref()
+        .map(|batch| absolute_normalized_action_path(&batch.album_output_dir))
+        .unwrap_or_else(|| {
+            let output_root = absolute_normalized_action_path(&req.output_root);
+            if req.naming.per_album_subdir {
+                output_root.join(sanitize_component(&req.item_id))
+            } else {
+                output_root
+            }
+        })
+}
+
+/// This decision is deliberately lexical and side-effect free. It must run
+/// before action capabilities, locks, identity sidecars, journals, or batch
+/// drain authority are created. A trusted configured symlink route is opened
+/// only after a proper album subdirectory has been established.
+fn conversion_action_album_scope(
+    req: &PipelineRequest,
+    album_dir: &Path,
+) -> Result<ConversionActionAlbumScope, String> {
+    if req.actions.is_empty() {
+        return Ok(ConversionActionAlbumScope::Disabled);
+    }
+    let output_root = absolute_normalized_action_path(&req.output_root);
+    let album_dir = absolute_normalized_action_path(album_dir);
+    if album_dir == output_root {
+        return Ok(ConversionActionAlbumScope::FlatLayoutSkipped {
+            reason: format!(
+                "conversion actions skipped: flat output layout uses the shared output root {}",
+                output_root.display()
+            ),
+        });
+    }
+    if !album_dir.starts_with(&output_root) {
+        return Err(format!(
+            "conversion actions refused: rendered album directory must be inside output root ({} vs {})",
+            album_dir.display(),
+            output_root.display()
+        ));
+    }
+    Ok(ConversionActionAlbumScope::ProperSubdirectory)
+}
+
+fn conversion_action_scope_for_request(
+    req: &PipelineRequest,
+) -> Result<ConversionActionAlbumScope, String> {
+    conversion_action_album_scope(req, &conversion_action_planned_album_dir(req))
+}
+
+fn conversion_actions_effective_for_request(req: &PipelineRequest) -> io::Result<bool> {
+    conversion_action_scope_for_request(req)
+        .map(|scope| matches!(scope, ConversionActionAlbumScope::ProperSubdirectory))
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))
+}
+
+fn action_run_identity(req: &PipelineRequest) -> String {
+    req.album_batch
+        .as_ref()
+        .map(|batch| batch.conversion_log_batch_id.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{}:{}", req.job_id, req.item_id))
+}
+
+fn action_album_identity(req: &PipelineRequest, album_dir: &Path) -> String {
+    let mut identity = String::from("tonepoet-action-album-v1\n");
+    identity.push_str("album_dir=");
+    identity.push_str(&absolute_normalized_action_path(album_dir).to_string_lossy());
+    identity.push('\n');
+    if let Some(batch) = req.album_batch.as_ref() {
+        identity.push_str("batch_id=");
+        identity.push_str(batch.conversion_log_batch_id.trim());
+        identity.push('\n');
+        identity.push_str("source_root=");
+        identity.push_str(&absolute_normalized_action_path(&batch.source_grouping_root).to_string_lossy());
+        identity.push('\n');
+    } else {
+        identity.push_str("source=");
+        identity.push_str(&absolute_normalized_action_path(&req.container).to_string_lossy());
+        identity.push('\n');
+    }
+    identity
+}
+
+fn action_coordination_dir(req: &PipelineRequest) -> PathBuf {
+    conversion_log_batch_coordination_album_dir(req).unwrap_or_else(|| {
+        absolute_normalized_action_path(&req.output_root)
+            .join(".tonepoet-actions")
+            .join(sanitize_component(&format!("{}-{}", req.job_id, req.item_id)))
+    })
+}
+
+fn action_semantics() -> ActionSemantics {
+    ActionSemantics {
+        wildcard_matches: conversion_action_wildcard_matches,
+        render_template: conversion_action_render_template,
+        sanitize_component: conversion_action_sanitize_component,
+        fixcaps: crate::convert::renaming::capitalize_title,
+        disc_number_for_path: conversion_action_disc_number_for_path,
+    }
+}
+
+fn action_protected_sources(req: &PipelineRequest) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    if let Some(batch) = req.album_batch.as_ref() {
+        for source in batch.source_paths() {
+            paths.insert(absolute_normalized_action_path(source));
+        }
+    }
+    if paths.is_empty() {
+        paths.insert(absolute_normalized_action_path(&req.container));
+    }
+    paths
+}
+
+fn canonicalize_trusted_action_route(path: &Path) -> Result<PathBuf, ActionError> {
+    let absolute = absolute_normalized_action_path(path);
+    let mut existing = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = existing.file_name().ok_or_else(|| {
+                    ActionError::UnsafePath(format!(
+                        "configured action route has no existing ancestor: {}",
+                        absolute.display()
+                    ))
+                })?;
+                suffix.push(component.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    ActionError::UnsafePath(format!(
+                        "configured action route has no parent: {}",
+                        absolute.display()
+                    ))
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut resolved = fs::canonicalize(existing)?;
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn rebase_action_path(
+    path: &Path,
+    lexical_root: &Path,
+    trusted_root: &Path,
+) -> PathBuf {
+    let absolute = absolute_normalized_action_path(path);
+    absolute
+        .strip_prefix(lexical_root)
+        .map(|relative| trusted_root.join(relative))
+        .unwrap_or(absolute)
+}
+
+#[derive(Debug)]
+struct PipelineOutputCapability {
+    logical_root: PathBuf,
+    capability: PinnedDirectoryCapability,
+}
+
+impl PipelineOutputCapability {
+    fn capture_for_actions(req: &PipelineRequest) -> Result<Option<Self>, ActionError> {
+        if req.actions.is_empty() {
+            return Ok(None);
+        }
+        match conversion_action_scope_for_request(req).map_err(ActionError::Conflict)? {
+            ConversionActionAlbumScope::Disabled | ConversionActionAlbumScope::FlatLayoutSkipped { .. } => {
+                return Ok(None);
+            }
+            ConversionActionAlbumScope::ProperSubdirectory => {}
+        }
+        let logical_root = absolute_normalized_action_path(&req.output_root);
+        fs::create_dir_all(&logical_root)?;
+        let capability = PinnedDirectoryCapability::open_trusted(&logical_root)?;
+        Ok(Some(Self {
+            logical_root,
+            capability,
+        }))
+    }
+
+    #[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
+    fn try_clone(&self) -> Result<Self, ActionError> {
+        Ok(Self {
+            logical_root: self.logical_root.clone(),
+            capability: self.capability.try_clone()?,
+        })
+    }
+
+    #[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
+    fn io_path(&self, stable: &Path) -> Result<PathBuf, ActionError> {
+        let stable = absolute_normalized_action_path(stable);
+        let relative = stable.strip_prefix(&self.logical_root).map_err(|_| {
+            ActionError::UnsafePath(format!(
+                "coordination path {} is outside retained output root {}",
+                stable.display(),
+                self.logical_root.display()
+            ))
+        })?;
+        Ok(self.capability.descriptor_path()?.join(relative))
+    }
+}
+
+fn pre_action_context(req: &PipelineRequest) -> Result<ActionContext, ActionError> {
+    pre_action_context_with_output_capability(req, None)
+}
+
+fn pre_action_context_with_output_capability(
+    req: &PipelineRequest,
+    retained_output: Option<&PipelineOutputCapability>,
+) -> Result<ActionContext, ActionError> {
+    let source_path = absolute_normalized_action_path(&req.container);
+    let source_is_directory = source_path.is_dir();
+    let subject_dir = if source_is_directory {
+        source_path.clone()
+    } else {
+        source_path.parent().map(Path::to_path_buf).ok_or_else(|| {
+            ActionError::UnsafePath(format!(
+                "pre-action source has no parent directory: {}",
+                source_path.display()
+            ))
+        })?
+    };
+    let lexical_output_root = absolute_normalized_action_path(&req.output_root);
+    let output_root = retained_output
+        .map(|binding| binding.logical_root.clone())
+        .unwrap_or(canonicalize_trusted_action_route(&req.output_root)?);
+    let album_dir = req
+        .album_batch
+        .as_ref()
+        .map(|batch| {
+            rebase_action_path(
+                &batch.album_output_dir,
+                &lexical_output_root,
+                &output_root,
+            )
+        })
+        .unwrap_or_else(|| output_root.join(sanitize_component(&req.item_id)));
+    let coordination_dir = if retained_output.is_some() {
+        absolute_normalized_action_path(&action_coordination_dir(req))
+    } else {
+        canonicalize_trusted_action_route(&action_coordination_dir(req))?
+    };
+    let journal_dir = coordination_dir.join(".tonepoet-action-journals");
+
+    let mut retained_output_capability = None;
+    let mut retained_journal_capability = None;
+    let mut coordination_io_dir = None;
+    if let Some(binding) = retained_output {
+        let coordination_relative = coordination_dir.strip_prefix(&binding.logical_root).map_err(|_| {
+            ActionError::UnsafePath(format!(
+                "pre-action coordination root {} is outside retained output root {}",
+                coordination_dir.display(),
+                binding.logical_root.display()
+            ))
+        })?;
+        let coordination_capability = binding
+            .capability
+            .open_directory_descendant(coordination_relative, true, 0o700)?;
+        coordination_io_dir = Some(
+            binding
+                .capability
+                .descriptor_path()?
+                .join(coordination_relative),
+        );
+        let journal_capability = coordination_capability.open_directory_child(
+            std::ffi::OsStr::new(".tonepoet-action-journals"),
+            true,
+            0o700,
+        )?;
+        retained_journal_capability = Some(Arc::new(journal_capability));
+        retained_output_capability = Some(Arc::new(binding.capability.try_clone()?));
+    }
+
+    Ok(ActionContext {
+        run_identity: action_run_identity(req),
+        album_identity: action_album_identity(req, &album_dir),
+        phase: ActionPhase::Pre,
+        subject_dir,
+        source_path,
+        source_is_directory,
+        output_root,
+        album_dir,
+        environment_album_dir: None,
+        retained_album_capability: None,
+        retained_output_capability,
+        retained_journal_capability,
+        coordination_io_dir,
+        protected_sources: action_protected_sources(req),
+        protected_generated_paths: BTreeSet::new(),
+        album_tokens: conversion_action_request_tokens(req)?,
+        disc_count: request_batch_resolved_identity(req).and_then(|identity| identity.total_discs),
+        journal_dir,
+        explicit_scope: false,
+        semantics: action_semantics(),
+    })
+}
+
+pub(crate) fn conversion_action_pre_preview_context(
+    req: &PipelineRequest,
+) -> Result<ActionContext, ActionError> {
+    match conversion_action_scope_for_request(req) {
+        Ok(ConversionActionAlbumScope::ProperSubdirectory) => {}
+        Ok(ConversionActionAlbumScope::Disabled) => {
+            return Err(ActionError::Conflict(
+                "pre-action preview requires a configured action pipeline".to_string(),
+            ));
+        }
+        Ok(ConversionActionAlbumScope::FlatLayoutSkipped { reason }) => {
+            return Err(ActionError::Conflict(reason));
+        }
+        Err(error) => return Err(ActionError::Conflict(error)),
+    }
+    let mut context = pre_action_context(req)?;
+    context.run_identity = format!("wizard-preview:{}", req.item_id);
+    context.explicit_scope = true;
+    Ok(context)
+}
+
+fn post_action_context(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    artifacts: Option<&ArtifactSet>,
+    published: &PublishedAlbum,
+) -> Result<ActionContext, ActionError> {
+    let stable_album_dir = absolute_normalized_action_path(&published.album_dir);
+    post_action_context_with_capabilities(
+        req,
+        source,
+        artifacts,
+        published,
+        &stable_album_dir,
+        None,
+        None,
+    )
+}
+
+/// Build a post-action context with stable durable logical paths while
+/// injecting exact retained directory objects for live I/O. Descriptor
+/// namespace routes are runtime access mechanisms only and never enter the
+/// journal, election identity, or durable report.
+fn post_action_context_with_capabilities(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    artifacts: Option<&ArtifactSet>,
+    published: &PublishedAlbum,
+    stable_album_dir: &Path,
+    retained_album: Option<PinnedDirectoryCapability>,
+    retained_output: Option<PinnedDirectoryCapability>,
+) -> Result<ActionContext, ActionError> {
+    let source_path = absolute_normalized_action_path(&req.container);
+    let lexical_album_dir = absolute_normalized_action_path(&published.album_dir);
+    let album_dir = absolute_normalized_action_path(stable_album_dir);
+    let output_root = absolute_normalized_action_path(&req.output_root);
+    let coordination_dir = absolute_normalized_action_path(&action_coordination_dir(req));
+    let journal_dir = coordination_dir.join(".tonepoet-action-journals");
+
+    let mut retained_output_capability = None;
+    let mut retained_journal_capability = None;
+    let mut coordination_io_dir = None;
+    if let Some(output_capability) = retained_output {
+        let coordination_relative = coordination_dir.strip_prefix(&output_root).map_err(|_| {
+            ActionError::UnsafePath(format!(
+                "post-action coordination root {} is outside retained output root {}",
+                coordination_dir.display(),
+                output_root.display()
+            ))
+        })?;
+        let coordination_capability = output_capability
+            .open_directory_descendant(coordination_relative, true, 0o700)?;
+        coordination_io_dir = Some(
+            output_capability
+                .descriptor_path()?
+                .join(coordination_relative),
+        );
+        let journal_capability = coordination_capability.open_directory_child(
+            std::ffi::OsStr::new(".tonepoet-action-journals"),
+            true,
+            0o700,
+        )?;
+        retained_journal_capability = Some(Arc::new(journal_capability));
+        retained_output_capability = Some(Arc::new(output_capability));
+    }
+
+    let mut protected_generated_paths = BTreeSet::new();
+    protected_generated_paths.insert(album_dir.join("conversion.log"));
+    protected_generated_paths.insert(conversion_action_identity_path(&album_dir));
+    if let Some(artifacts) = artifacts {
+        for sidecar in &artifacts.sidecars {
+            if matches!(&sidecar.kind, SidecarKind::ConversionLog | SidecarKind::CueSheet) {
+                protected_generated_paths.insert(rebase_action_path(
+                    &sidecar.final_path,
+                    &lexical_album_dir,
+                    &album_dir,
+                ));
+            }
+        }
+    }
+    for entry in &published.entries {
+        if matches!(
+            &entry.role,
+            PublishRole::Sidecar(SidecarKind::ConversionLog | SidecarKind::CueSheet)
+        ) {
+            protected_generated_paths.insert(rebase_action_path(
+                &entry.final_path,
+                &lexical_album_dir,
+                &album_dir,
+            ));
+        }
+    }
+    Ok(ActionContext {
+        run_identity: action_run_identity(req),
+        album_identity: action_album_identity(req, &album_dir),
+        phase: ActionPhase::Post,
+        subject_dir: album_dir.clone(),
+        source_path,
+        source_is_directory: req.container.is_dir(),
+        output_root,
+        album_dir: album_dir.clone(),
+        environment_album_dir: Some(album_dir),
+        retained_album_capability: retained_album.map(Arc::new),
+        retained_output_capability,
+        retained_journal_capability,
+        coordination_io_dir,
+        protected_sources: action_protected_sources(req),
+        protected_generated_paths,
+        album_tokens: conversion_action_album_tokens(source, &req.settings),
+        disc_count: source
+            .album_metadata
+            .total_discs
+            .or_else(|| {
+                request_batch_resolved_identity(req).and_then(|identity| identity.total_discs)
+            }),
+        journal_dir,
+        explicit_scope: false,
+        semantics: action_semantics(),
+    })
+}
+
+fn published_album_from_manifest_skip(
+    album_dir: &Path,
+    manifest: &super::manifest::ConversionManifest,
+    manifest_path: PathBuf,
+) -> Result<PublishedAlbum, String> {
+    let mut entries = Vec::with_capacity(manifest.tracks.len());
+    for track in &manifest.tracks {
+        let final_path = super::manifest::resolve_manifest_output_path(album_dir, &track.output_path)
+            .map_err(|error| format!(
+                "manifest skip contains an unsafe output path {}: {error}",
+                track.output_path.display()
+            ))?;
+        entries.push(PublishedEntry {
+            final_path,
+            role: PublishRole::Audio,
+            bytes: track.output_size,
+        });
+    }
+    Ok(PublishedAlbum {
+        album_dir: album_dir.to_path_buf(),
+        entries,
+        manifest_path: Some(manifest_path),
+    })
+}
+
+async fn finalize_manifest_skip(
+    req: &PipelineRequest,
+    reporter: &dyn PipelineReporter,
+    source: PreparedSource,
+    plan: AlbumPlan,
+    mut stages: Vec<StageRecord>,
+    manifest: super::manifest::ConversionManifest,
+    manifest_path: PathBuf,
+) -> PipelineReport {
+    let published = match published_album_from_manifest_skip(
+        &plan.album_dir,
+        &manifest,
+        manifest_path,
+    ) {
+        Ok(published) => Some(published),
+        Err(error) => {
+            let record = stage_record(PipelineStage::Publish, StageOutcome::Failed(error));
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            stages.push(record);
+            None
+        }
+    };
+    if published.is_some() {
+        if !req.actions.pre.is_empty() {
+            let record = stage_record(PipelineStage::PreActions, StageOutcome::Skipped);
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            stages.push(record);
+        }
+        let publish_record = stage_record(PipelineStage::Publish, StageOutcome::Skipped);
+        emit_stage_finished(reporter, &req.item_id, publish_record.clone()).await;
+        stages.push(publish_record);
+        if !req.actions.post.is_empty() {
+            let outcome = post_action_outcome_with_terminal_authority(
+                req,
+                None,
+                StageOutcome::Skipped,
+                true,
+            );
+            let record = stage_record(PipelineStage::PostActions, outcome);
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            stages.push(record);
+        }
+    }
+    let outcome = if published.is_some() {
+        AlbumOutcome::Complete {
+            tracks: Vec::new(),
+            stages,
+        }
+    } else {
+        AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::PublishFailed,
+        }
+    };
+    finalize_report(
+        req,
+        reporter,
+        Some(source),
+        Some(plan),
+        None,
+        published,
+        outcome,
+    )
+    .await
+}
+
+enum PreMaterializationActionOutcome {
+    Continue { ran_pre_actions: bool },
+    Finished(PipelineReport),
+}
+
+async fn finalize_pre_materialization_manifest_skip(
+    req: &PipelineRequest,
+    reporter: &dyn PipelineReporter,
+    album_dir: PathBuf,
+    manifest: super::manifest::ConversionManifest,
+    manifest_path: PathBuf,
+    mut stages: Vec<StageRecord>,
+) -> PipelineReport {
+    let published = match published_album_from_manifest_skip(
+        &album_dir,
+        &manifest,
+        manifest_path,
+    ) {
+        Ok(published) => Some(published),
+        Err(error) => {
+            let record = stage_record(PipelineStage::Publish, StageOutcome::Failed(error));
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            stages.push(record);
+            None
+        }
+    };
+
+    if published.is_some() {
+        for stage in [
+            PipelineStage::PreActions,
+            PipelineStage::Materialize,
+            PipelineStage::PlanOutputs,
+            PipelineStage::Publish,
+            PipelineStage::PostActions,
+        ] {
+            let configured = match stage {
+                PipelineStage::PreActions => !req.actions.pre.is_empty(),
+                PipelineStage::PostActions => !req.actions.post.is_empty(),
+                _ => true,
+            };
+            if configured {
+                let outcome = if stage == PipelineStage::PostActions {
+                    post_action_outcome_with_terminal_authority(
+                        req,
+                        None,
+                        StageOutcome::Skipped,
+                        true,
+                    )
+                } else {
+                    StageOutcome::Skipped
+                };
+                let record = stage_record(stage, outcome);
+                emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+                stages.push(record);
+            }
+        }
+    }
+
+    let plan = AlbumPlan {
+        album_dir,
+        album_dirs: Vec::new(),
+        entries: Vec::new(),
+    };
+    let outcome = if published.is_some() {
+        AlbumOutcome::Complete {
+            tracks: Vec::new(),
+            stages,
+        }
+    } else {
+        AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::PublishFailed,
+        }
+    };
+    finalize_report(req, reporter, None, Some(plan), None, published, outcome).await
+}
+
+/// For a batch with pre-actions, perform the rerun decision and elected pre
+/// phase before any worker enters source materialization. The dispatcher must
+/// have persisted an album directory produced by the canonical planner; a
+/// provisional directory is rejected rather than allowing pre-actions to race
+/// a later manifest skip or run against the wrong album identity.
+async fn prepare_batch_pre_actions_before_materialization(
+    req: &PipelineRequest,
+    retained_output: Option<&PipelineOutputCapability>,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    stages: &mut Vec<StageRecord>,
+) -> PreMaterializationActionOutcome {
+    if req.actions.pre.is_empty() || req.album_batch.is_none() {
+        return PreMaterializationActionOutcome::Continue {
+            ran_pre_actions: false,
+        };
+    }
+    let batch = req.album_batch.as_ref().expect("checked above");
+    if !batch.album_output_dir_is_planner_resolved() {
+        let message = format!(
+            "pre-actions require a canonical dispatch-time album directory before materialization; batch {} still has provisional output {}",
+            batch.conversion_log_batch_id,
+            batch.album_output_dir.display(),
+        );
+        let record = stage_record(PipelineStage::PreActions, StageOutcome::Failed(message));
+        emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages: std::mem::take(stages),
+            reason: BlockReason::RequiredStageFailure(PipelineStage::PreActions),
+        };
+        let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+            req,
+            &outcome,
+        );
+        return PreMaterializationActionOutcome::Finished(
+            finalize_report(req, reporter, None, None, None, published, outcome).await,
+        );
+    }
+
+    let album_dir = normalize_path(&batch.album_output_dir);
+    if let super::rerun::RerunDecision::Skip {
+        manifest,
+        manifest_path,
+    } = super::rerun::decide_rerun(&album_dir, &req.settings, req.publish.overwrite)
+    {
+        return PreMaterializationActionOutcome::Finished(
+            finalize_pre_materialization_manifest_skip(
+                req,
+                reporter,
+                album_dir,
+                manifest,
+                manifest_path,
+                std::mem::take(stages),
+            )
+            .await,
+        );
+    }
+
+    let record = execute_pre_actions_stage(req, retained_output, reporter, cancel).await;
+    let failed = matches!(record.outcome, StageOutcome::Failed(_));
+    stages.push(record);
+    if failed {
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages: std::mem::take(stages),
+            reason: BlockReason::RequiredStageFailure(PipelineStage::PreActions),
+        };
+        let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+            req,
+            &outcome,
+        );
+        return PreMaterializationActionOutcome::Finished(
+            finalize_report(req, reporter, None, None, None, published, outcome).await,
+        );
+    }
+
+    PreMaterializationActionOutcome::Continue {
+        ran_pre_actions: true,
+    }
+}
+
+struct PreparedActionElection {
+    coordination_dir: PathBuf,
+    election_identity: ActionElectionIdentity,
+    election: ActionElection,
+}
+
+fn prepare_action_election(
+    req: &PipelineRequest,
+    context: &ActionContext,
+) -> Result<PreparedActionElection, ActionError> {
+    let pipeline = &req.actions;
+    let election_identity = ActionElectionIdentity::new(
+        context.run_identity.clone(),
+        context.album_identity.clone(),
+        context.phase,
+        pipeline,
+    )?;
+    // Durable action identity remains the stable logical path in `context`.
+    // Runtime coordination I/O may instead use a descriptor-backed route that
+    // reaches the exact retained output-root object. Never persist that route
+    // in a journal or election identity.
+    let coordination_dir = context
+        .coordination_io_dir
+        .clone()
+        .unwrap_or_else(|| action_coordination_dir(req));
+    if let Some(batch) = req.album_batch.as_ref() {
+        let batch_id = batch.conversion_log_batch_id.trim();
+        if !batch_id.is_empty() && is_generated_conversion_log_batch_id(batch_id) {
+            ensure_conversion_log_batch_workspace_owned_for_request_at(req, &coordination_dir)
+                .map_err(|error| {
+                    ActionError::Election(format!(
+                        "could not establish strong parent workspace ownership and participant drain authority before {} actions: {error}",
+                        context.phase.as_str()
+                    ))
+                })?;
+        }
+    }
+    let election = with_album_publish_lock_for_companion_copy(&coordination_dir, || {
+        elect_action_runner(&coordination_dir, &election_identity, true)
+    })
+    .map_err(|error| ActionError::Election(error.to_string()))??;
+    Ok(PreparedActionElection {
+        coordination_dir,
+        election_identity,
+        election,
+    })
+}
+
+
+/// Diagnosable phase-failure summary: the phase name plus every recorded
+/// per-action error. "completed with errors" without WHICH errors is
+/// undiagnosable in the field.
+fn action_phase_error_summary(
+    report: &crate::convert::pipeline::actions::ActionPhaseReport,
+    phase: &str,
+) -> String {
+    let mut details: Vec<String> = report
+        .actions
+        .iter()
+        .filter_map(|action| {
+            action
+                .error
+                .as_ref()
+                .map(|error| format!("action {} ({}): {error}", action.index + 1, action.kind))
+        })
+        .collect();
+    if details.is_empty() {
+        details.push("no per-action detail recorded".to_string());
+    }
+    format!("{phase} action phase completed with errors: {}", details.join("; "))
+}
+
+fn execute_prepared_action_election(
+    req: &PipelineRequest,
+    context: &ActionContext,
+    cancel: &CancellationToken,
+    prepared: PreparedActionElection,
+) -> Result<PipelineActionExecution, ActionError> {
+    let pipeline = &req.actions;
+    let cancellation = PipelineActionCancellation(cancel);
+    let filesystem = CapabilityActionFilesystem::new();
+    let scripts = ProcessGroupScriptRunner;
+    let engine = ActionEngine {
+        filesystem: &filesystem,
+        scripts: &scripts,
+    };
+    let coordination_dir = prepared.coordination_dir;
+    let election_identity = prepared.election_identity;
+    let mut next_election = Some(prepared.election);
+
+    loop {
+        let election = match next_election.take() {
+            Some(election) => election,
+            None => with_album_publish_lock_for_companion_copy(&coordination_dir, || {
+                elect_action_runner(&coordination_dir, &election_identity, true)
+            })
+            .map_err(|error| ActionError::Election(error.to_string()))??,
+        };
+
+        match election {
+            ActionElection::Complete(report) => {
+                return Ok(PipelineActionExecution {
+                    error: report.has_errors().then(|| {
+                        action_phase_error_summary(&report, context.phase.as_str())
+                    }),
+                    recoverable_interruption: report.recovery_required,
+                    report,
+                });
+            }
+            ActionElection::Wait(waiter) => {
+                match waiter.wait(&cancellation, Duration::from_millis(100)) {
+                    Ok(report) => {
+                        return Ok(PipelineActionExecution {
+                            error: report.has_errors().then(|| {
+                                action_phase_error_summary(&report, context.phase.as_str())
+                            }),
+                            recoverable_interruption: report.recovery_required,
+                            report,
+                        });
+                    }
+                    Err(ActionError::Election(message))
+                        if message.contains("must re-elect")
+                            || message.contains("disappeared without a durable result") =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            ActionElection::Runner(guard) => {
+                let execution = engine.execute_phase(pipeline, context, &cancellation);
+                let report = match &execution {
+                    Ok(report) => report.clone(),
+                    Err(error) => engine
+                        .durable_phase_report(pipeline, context)?
+                        .unwrap_or_else(|| {
+                            phase_level_action_failure_report(
+                                pipeline,
+                                context.phase,
+                                error.to_string(),
+                            )
+                        }),
+                };
+                match execution {
+                    Ok(_) => {
+                        with_album_publish_lock_for_companion_copy(&coordination_dir, || {
+                            guard.finish(&report)
+                        })
+                        .map_err(|error| ActionError::Election(error.to_string()))??;
+                        return Ok(PipelineActionExecution {
+                            error: report.has_errors().then(|| {
+                                action_phase_error_summary(&report, context.phase.as_str())
+                            }),
+                            recoverable_interruption: report.recovery_required,
+                            report,
+                        });
+                    }
+                    Err(error @ ActionError::Interrupted(_)) => {
+                        with_album_publish_lock_for_companion_copy(&coordination_dir, || {
+                            guard.release_for_recovery()
+                        })
+                        .map_err(|lock_error| ActionError::Election(lock_error.to_string()))??;
+                        return Ok(PipelineActionExecution {
+                            report,
+                            error: Some(error.to_string()),
+                            recoverable_interruption: true,
+                        });
+                    }
+                    Err(error) => {
+                        with_album_publish_lock_for_companion_copy(&coordination_dir, || {
+                            guard.finish(&report)
+                        })
+                        .map_err(|lock_error| ActionError::Election(lock_error.to_string()))??;
+                        return Ok(PipelineActionExecution {
+                            report,
+                            error: Some(error.to_string()),
+                            recoverable_interruption: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_elected_action_phase(
+    req: &PipelineRequest,
+    context: &ActionContext,
+    cancel: &CancellationToken,
+) -> Result<PipelineActionExecution, ActionError> {
+    if req.actions.for_phase(context.phase).is_empty() {
+        return Ok(PipelineActionExecution {
+            report: ActionPhaseReport {
+                phase: Some(context.phase),
+                ..ActionPhaseReport::default()
+            },
+            error: None,
+            recoverable_interruption: false,
+        });
+    }
+    let prepared = prepare_action_election(req, context)?;
+    execute_prepared_action_election(req, context, cancel, prepared)
+}
+
+fn phase_level_action_failure_report(
+    pipeline: &super::actions::ActionPipeline,
+    phase: ActionPhase,
+    error: String,
+) -> ActionPhaseReport {
+    let actions = pipeline
+        .for_phase(phase)
+        .iter()
+        .enumerate()
+        .map(|(index, action)| ActionResult {
+            index,
+            kind: action.kind_name().to_string(),
+            status: if index == 0 {
+                ActionResultStatus::Failed
+            } else {
+                ActionResultStatus::SkippedAfterFailure
+            },
+            operations: Vec::new(),
+            error: Some(if index == 0 {
+                error.clone()
+            } else {
+                "phase stopped before this action after an earlier phase-level failure"
+                    .to_string()
+            }),
+            notices: Vec::new(),
+        })
+        .collect();
+    ActionPhaseReport {
+        phase: Some(phase),
+        actions,
+        notices: vec![error],
+        recovery_required: false,
+        cancelled: false,
+    }
+}
+
+fn collect_durable_action_reports(
+    req: &PipelineRequest,
+    source: Option<&PreparedSource>,
+    published: Option<&PublishedAlbum>,
+) -> Vec<ActionPhaseReport> {
+    collect_durable_action_reports_with_binding(req, source, published, None)
+}
+
+fn collect_durable_action_reports_with_binding(
+    req: &PipelineRequest,
+    source: Option<&PreparedSource>,
+    published: Option<&PublishedAlbum>,
+    binding: Option<&PublicationCapabilityBinding>,
+) -> Vec<ActionPhaseReport> {
+    if matches!(
+        conversion_action_scope_for_request(req),
+        Ok(ConversionActionAlbumScope::Disabled)
+            | Ok(ConversionActionAlbumScope::FlatLayoutSkipped { .. })
+    ) {
+        return Vec::new();
+    }
+    let filesystem = CapabilityActionFilesystem::new();
+    let scripts = ProcessGroupScriptRunner;
+    let engine = ActionEngine {
+        filesystem: &filesystem,
+        scripts: &scripts,
+    };
+    let mut reports = Vec::new();
+    let pre_context = match binding {
+        Some(binding) => binding.output_root.try_clone().ok().and_then(|capability| {
+            let retained_output = PipelineOutputCapability {
+                logical_root: binding.logical_output_root.clone(),
+                capability,
+            };
+            pre_action_context_with_output_capability(req, Some(&retained_output)).ok()
+        }),
+        None => pre_action_context(req).ok(),
+    };
+    let post_context = source.zip(published).and_then(|(source, published)| {
+        match binding {
+            Some(binding) => post_action_context_with_capabilities(
+                req,
+                source,
+                None,
+                published,
+                &binding.logical_album_dir,
+                binding.album.try_clone().ok(),
+                binding.output_root.try_clone().ok(),
+            )
+            .ok(),
+            None => post_action_context(req, source, None, published).ok(),
+        }
+    });
+    let contexts = [pre_context, post_context];
+    for context in contexts.into_iter().flatten() {
+        match engine.durable_phase_report(&req.actions, &context) {
+            Ok(Some(report)) if !report.actions.is_empty() || !report.notices.is_empty() => {
+                reports.push(report)
+            }
+            Ok(_) => {}
+            Err(error) => reports.push(ActionPhaseReport {
+                phase: Some(context.phase),
+                notices: vec![format!("durable action report validation failed: {error}")],
+                recovery_required: true,
+                ..ActionPhaseReport::default()
+            }),
+        }
+    }
+    reports
+}
+
 fn remove_preserved_source_album_artist_tag(album: &mut AlbumMetadata) {
     album
         .extra
@@ -14674,6 +18301,7 @@ pub struct ScheduledAlbum {
     pub source: PreparedSource,
     pub plan: AlbumPlan,
     pub stages: Vec<StageRecord>,
+    action_output: Option<PipelineOutputCapability>,
     _run_lock: FileLock,
 }
 
@@ -14718,8 +18346,822 @@ pub(crate) fn scheduled_album_for_test(
         source,
         plan,
         stages,
+        action_output: None,
         _run_lock: run_lock,
     }
+}
+
+async fn execute_pre_actions_stage(
+    req: &PipelineRequest,
+    retained_output: Option<&PipelineOutputCapability>,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+) -> StageRecord {
+    emit_stage_started(reporter, &req.item_id, PipelineStage::PreActions).await;
+    let outcome = match conversion_action_scope_for_request(req) {
+        Ok(ConversionActionAlbumScope::FlatLayoutSkipped { reason }) => {
+            log::warn!("{reason}");
+            StageOutcome::Skipped
+        }
+        Ok(ConversionActionAlbumScope::Disabled) => StageOutcome::Skipped,
+        Err(error) => StageOutcome::Failed(error),
+        Ok(ConversionActionAlbumScope::ProperSubdirectory) => {
+            match pre_action_context_with_output_capability(req, retained_output)
+                .and_then(|context| run_elected_action_phase(req, &context, cancel))
+            {
+                Ok(execution) if execution.error.is_none() && !execution.report.has_errors() => {
+                    StageOutcome::Ok
+                }
+                Ok(execution) => StageOutcome::Failed(execution.error.unwrap_or_else(|| {
+                    if execution.recoverable_interruption {
+                        "pre actions were interrupted after mutation; durable recovery is required"
+                            .to_string()
+                    } else {
+                        "pre action pipeline completed with errors".to_string()
+                    }
+                })),
+                Err(error) => StageOutcome::Failed(error.to_string()),
+            }
+        }
+    };
+    let record = stage_record(PipelineStage::PreActions, outcome);
+    emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+    record
+}
+
+fn post_action_outcome_with_terminal_authority(
+    req: &PipelineRequest,
+    coordination_io_dir: Option<&Path>,
+    outcome: StageOutcome,
+    terminal: bool,
+) -> StageOutcome {
+    if !terminal {
+        return outcome;
+    }
+    let terminal_result = match coordination_io_dir {
+        Some(coord_dir) => mark_conversion_log_batch_post_actions_terminal_at(req, coord_dir),
+        None => mark_conversion_log_batch_post_actions_terminal(req),
+    };
+    match terminal_result {
+        Ok(()) => outcome,
+        Err(error) => {
+            let authority_error = format!(
+                "post-action result could not be committed to durable batch lifecycle authority: {error}"
+            );
+            match outcome {
+                StageOutcome::Failed(message) => {
+                    StageOutcome::Failed(format!("{message}; {authority_error}"))
+                }
+                StageOutcome::Ok | StageOutcome::Skipped => StageOutcome::Failed(authority_error),
+            }
+        }
+    }
+}
+
+
+#[derive(Debug)]
+struct ActionCoordinationIoBinding {
+    _output_root: PinnedDirectoryCapability,
+    io_dir: PathBuf,
+}
+
+impl ActionCoordinationIoBinding {
+    fn capture(
+        req: &PipelineRequest,
+        lock: &ExplicitActionRunLock,
+    ) -> Result<Self, ActionError> {
+        let logical_output_root = lock.logical_output_root().ok_or_else(|| {
+            ActionError::Conflict(
+                "action transition lacks a retained logical output root".to_string(),
+            )
+        })?;
+        let output_root = lock.retained_output_root()?.ok_or_else(|| {
+            ActionError::Conflict(
+                "action transition lacks a retained output-root capability".to_string(),
+            )
+        })?;
+        let stable = absolute_normalized_action_path(&action_coordination_dir(req));
+        let relative = stable.strip_prefix(logical_output_root).map_err(|_| {
+            ActionError::UnsafePath(format!(
+                "action coordination directory {} is outside retained output root {}",
+                stable.display(),
+                logical_output_root.display()
+            ))
+        })?;
+        let _coordination = output_root.open_directory_descendant(relative, true, 0o700)?;
+        let io_dir = output_root.descriptor_path()?.join(relative);
+        Ok(Self {
+            _output_root: output_root,
+            io_dir,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PublicationCapabilityBinding {
+    logical_output_root: PathBuf,
+    output_root: PinnedDirectoryCapability,
+    logical_album_dir: PathBuf,
+    album: PinnedDirectoryCapability,
+}
+
+impl PublicationCapabilityBinding {
+    fn capture(
+        lock: &ExplicitActionRunLock,
+        logical_album_dir: &Path,
+    ) -> Result<Option<Self>, PublishError> {
+        let Some(logical_output_root) = lock.logical_output_root().map(Path::to_path_buf) else {
+            return Ok(None);
+        };
+        let output_root = lock.retained_output_root().map_err(|error| {
+            PublishError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("could not retain output coordination capability: {error}"),
+            ))
+        })?.ok_or_else(|| {
+            PublishError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "publication authority lost its output coordination capability",
+            ))
+        })?;
+        let album = lock.retained_publication_album().map_err(|error| {
+            PublishError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("could not retain published album capability: {error}"),
+            ))
+        })?;
+        Ok(Some(Self {
+            logical_output_root,
+            output_root,
+            logical_album_dir: absolute_normalized_action_path(logical_album_dir),
+            album,
+        }))
+    }
+
+    fn coordination_dir(&self, req: &PipelineRequest) -> Result<PathBuf, io::Error> {
+        let stable = conversion_log_batch_coordination_album_dir(req).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "conversion-log batch coordination requires album batch context",
+            )
+        })?;
+        let relative = stable.strip_prefix(&self.logical_output_root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "coordination directory {} is outside retained output root {}",
+                    stable.display(),
+                    self.logical_output_root.display()
+                ),
+            )
+        })?;
+        let _coordination = self
+            .output_root
+            .open_directory_descendant(relative, true, 0o700)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        self.output_root
+            .descriptor_path()
+            .map(|root| root.join(relative))
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
+    }
+
+    fn io_path(&self, stable: &Path) -> Result<PathBuf, io::Error> {
+        let stable = absolute_normalized_action_path(stable);
+        if stable == self.logical_album_dir || path_is_under_root(&stable, &self.logical_album_dir) {
+            let relative = stable.strip_prefix(&self.logical_album_dir).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "album path rebase failed")
+            })?;
+            return self
+                .album
+                .descriptor_path()
+                .map(|root| root.join(relative))
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()));
+        }
+        let relative = stable.strip_prefix(&self.logical_output_root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "transaction path {} is outside retained output root {}",
+                    stable.display(),
+                    self.logical_output_root.display()
+                ),
+            )
+        })?;
+        self.output_root
+            .descriptor_path()
+            .map(|root| root.join(relative))
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
+    }
+
+    fn stable_path(&self, runtime: &Path) -> PathBuf {
+        if let Ok(album_root) = self.album.descriptor_path() {
+            if let Ok(relative) = runtime.strip_prefix(&album_root) {
+                return self.logical_album_dir.join(relative);
+            }
+        }
+        if let Ok(output_root) = self.output_root.descriptor_path() {
+            if let Ok(relative) = runtime.strip_prefix(&output_root) {
+                return self.logical_output_root.join(relative);
+            }
+        }
+        runtime.to_path_buf()
+    }
+}
+
+#[derive(Debug)]
+enum AlbumActionPublishAuthority {
+    NoActionsUntracked,
+    NoActionsLocked {
+        lock: Option<ExplicitActionRunLock>,
+        retire_identity_after_publish: bool,
+    },
+    FlatLayoutSkipped { reason: String },
+    MultiRootTransition {
+        locks: Vec<ExplicitActionRunLock>,
+        retire_identity_after_publish: Vec<bool>,
+        post_skip_reason: Option<String>,
+    },
+    Locked(Option<ExplicitActionRunLock>),
+}
+
+impl AlbumActionPublishAuthority {
+    fn lock(&self) -> Option<&ExplicitActionRunLock> {
+        match self {
+            Self::Locked(lock) | Self::NoActionsLocked { lock, .. } => lock.as_ref(),
+            Self::NoActionsUntracked
+            | Self::FlatLayoutSkipped { .. }
+            | Self::MultiRootTransition { .. } => None,
+        }
+    }
+
+    fn take_lock(&mut self) -> Option<ExplicitActionRunLock> {
+        match self {
+            Self::Locked(lock) | Self::NoActionsLocked { lock, .. } => lock.take(),
+            Self::NoActionsUntracked
+            | Self::FlatLayoutSkipped { .. }
+            | Self::MultiRootTransition { .. } => None,
+        }
+    }
+
+    fn release_publication_lock(&mut self) {
+        if let Some(lock) = match self {
+            Self::Locked(lock) | Self::NoActionsLocked { lock, .. } => lock.as_mut(),
+            Self::NoActionsUntracked
+            | Self::FlatLayoutSkipped { .. }
+            | Self::MultiRootTransition { .. } => None,
+        } {
+            lock.release_publication_authority();
+        }
+    }
+
+    fn release_all_authority(&mut self) {
+        drop(self.take_lock());
+        self.release_multi_root_authority();
+    }
+
+    fn multi_root_locks(&self) -> Option<&[ExplicitActionRunLock]> {
+        match self {
+            Self::MultiRootTransition { locks, .. } => Some(locks),
+            _ => None,
+        }
+    }
+
+    fn release_multi_root_authority(&mut self) {
+        if let Self::MultiRootTransition { locks, .. } = self {
+            locks.clear();
+        }
+    }
+
+    fn reject_late_action_authority(&self) -> bool {
+        matches!(self, Self::NoActionsUntracked)
+    }
+}
+
+fn published_album_bound_to_authority(
+    published: &PublishedAlbum,
+    lock: &ExplicitActionRunLock,
+) -> Result<PublishedAlbum, PublishError> {
+    let bound_album_dir = lock.descriptor_relative_album_dir().map_err(|error| {
+        PublishError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            format!("could not bind published album to retained authority: {error}"),
+        ))
+    })?;
+    let lexical_album_dir = absolute_normalized_action_path(&published.album_dir);
+    let mut bound = published.clone();
+    bound.album_dir = bound_album_dir.clone();
+    for entry in &mut bound.entries {
+        entry.final_path = rebase_action_path(
+            &entry.final_path,
+            &lexical_album_dir,
+            &bound_album_dir,
+        );
+    }
+    if let Some(manifest_path) = bound.manifest_path.as_mut() {
+        *manifest_path = rebase_action_path(
+            manifest_path,
+            &lexical_album_dir,
+            &bound_album_dir,
+        );
+    }
+    Ok(bound)
+}
+
+fn prepare_identity_transition_for_publish_locked(
+    album_dir: &Path,
+    lock: &ExplicitActionRunLock,
+    publication_kind: &str,
+) -> Result<bool, PublishError> {
+    let _recovered_invalidation = recover_identity_invalidation_locked(album_dir, lock)
+        .map_err(|error| PublishError::Io(io::Error::new(io::ErrorKind::Other, error)))?;
+    ensure_album_publication_has_no_unresolved_explicit_state(lock, album_dir).map_err(|error| {
+        PublishError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "{publication_kind} album publish found unresolved manual recovery authority: {error}"
+            ),
+        ))
+    })?;
+    let album = lock.album_capability().map_err(|error| {
+        PublishError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            format!("could not retain publication album capability: {error}"),
+        ))
+    })?;
+    let identity_present = album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE))
+        .map_err(|error| {
+            PublishError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("could not inspect canonical action identity: {error}"),
+            ))
+        })?
+        .is_some();
+    if identity_present {
+        stage_identity_invalidation_locked(album_dir, lock)
+            .map_err(|error| PublishError::Io(io::Error::new(io::ErrorKind::Other, error)))?;
+    }
+    Ok(identity_present)
+}
+
+fn acquire_album_action_authority_for_publish(
+    req: &PipelineRequest,
+    album_dir: &Path,
+    retained_output: Option<&PipelineOutputCapability>,
+) -> Result<AlbumActionPublishAuthority, PublishError> {
+    match conversion_action_album_scope(req, album_dir).map_err(|message| {
+        PublishError::Io(io::Error::new(io::ErrorKind::InvalidInput, message))
+    })? {
+        ConversionActionAlbumScope::Disabled => {
+            // Preserve the historical empty-pipeline path unless the album
+            // already carries action identity/recovery authority. The normal
+            // publisher's existing shared-filesystem album lock serializes the
+            // first identity import. After taking that lock, publication
+            // rechecks that no authority appeared; if one did, it aborts before
+            // mutation and the retry enters the locked transition below.
+            let has_action_authority = album_dir.is_dir()
+                && (album_dir.join(CONVERSION_ACTION_IDENTITY_FILE).exists()
+                    || album_dir.join(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE).exists()
+                    || album_dir.join(".tonepoet-actions-manual").exists());
+            if !has_action_authority {
+                return Ok(AlbumActionPublishAuthority::NoActionsUntracked);
+            }
+            let lock = match retained_output {
+                Some(binding) => acquire_explicit_action_run_lock_for_album_under_output_capability(
+                    album_dir,
+                    &binding.logical_root,
+                    &binding.capability,
+                ),
+                None => acquire_explicit_action_run_lock_for_album_in_output_root(
+                    album_dir,
+                    &req.output_root,
+                ),
+            }.map_err(|error| {
+                PublishError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "could not serialize actionless album republication with existing identity/manual authority: {error}"
+                    ),
+                ))
+            })?;
+            let retire_identity_after_publish =
+                prepare_identity_transition_for_publish_locked(album_dir, &lock, "actionless")?;
+            Ok(AlbumActionPublishAuthority::NoActionsLocked {
+                lock: Some(lock),
+                retire_identity_after_publish,
+            })
+        }
+        ConversionActionAlbumScope::FlatLayoutSkipped { reason } => {
+            // SR-2: make the flat-layout decision before opening any action
+            // authority or persisting any action-owned file in the shared root.
+            Ok(AlbumActionPublishAuthority::FlatLayoutSkipped { reason })
+        }
+        ConversionActionAlbumScope::ProperSubdirectory => {
+            let lock = match retained_output {
+                Some(binding) => acquire_explicit_action_run_lock_for_album_under_output_capability(
+                    album_dir,
+                    &binding.logical_root,
+                    &binding.capability,
+                ),
+                None => acquire_explicit_action_run_lock_for_album_in_output_root(
+                    album_dir,
+                    &req.output_root,
+                ),
+            }.map_err(|error| {
+                PublishError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "could not acquire stable album identity/manual-run authority before publish: {error}"
+                    ),
+                ))
+            })?;
+            if album_dir.is_dir() {
+                let _identity_was_present =
+                    prepare_identity_transition_for_publish_locked(album_dir, &lock, "action-enabled")?;
+            }
+            Ok(AlbumActionPublishAuthority::Locked(Some(lock)))
+        }
+    }
+}
+
+fn acquire_album_action_authority_for_plan(
+    req: &PipelineRequest,
+    plan: &AlbumPlan,
+    retained_output: Option<&PipelineOutputCapability>,
+) -> Result<AlbumActionPublishAuthority, PublishError> {
+    let mut album_dirs = planned_album_dirs(plan);
+    if album_dirs.len() <= 1 {
+        return acquire_album_action_authority_for_publish(req, &plan.album_dir, retained_output);
+    }
+    if req.actions.is_empty() {
+        return Ok(AlbumActionPublishAuthority::NoActionsUntracked);
+    }
+
+    album_dirs.sort_by(|left, right| {
+        absolute_normalized_action_path(left).cmp(&absolute_normalized_action_path(right))
+    });
+    album_dirs.dedup_by(|left, right| {
+        absolute_normalized_action_path(left) == absolute_normalized_action_path(right)
+    });
+
+    // A configured pre-only pipeline must not disable a supported multi-root
+    // layout. Hold every rendered root's shared-filesystem publication lock in
+    // deterministic order across the umbrella transaction. Post actions have
+    // no unambiguous single album scope, so they are explicitly skipped after
+    // successful publication rather than turning publication into a failure.
+    let mut locks = Vec::with_capacity(album_dirs.len());
+    let mut retire_identity_after_publish = Vec::with_capacity(album_dirs.len());
+    for album_dir in &album_dirs {
+        let lock = match retained_output {
+            Some(binding) => acquire_blocking_album_publication_lock_for_album_under_output_capability(
+                album_dir,
+                &binding.logical_root,
+                &binding.capability,
+            ),
+            None => acquire_blocking_album_publication_lock_for_album_in_output_root(
+                album_dir,
+                &req.output_root,
+            ),
+        }
+        .map_err(|error| {
+            PublishError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "could not acquire ordered multi-root publication authority for {}: {error}",
+                    album_dir.display()
+                ),
+            ))
+        })?;
+        let retire = if album_dir.is_dir() {
+            prepare_identity_transition_for_publish_locked(
+                album_dir,
+                &lock,
+                "multi-root action pipeline",
+            )?
+        } else {
+            false
+        };
+        locks.push(lock);
+        retire_identity_after_publish.push(retire);
+    }
+
+    let post_skip_reason = (!req.actions.post.is_empty()).then(|| {
+        format!(
+            "post actions were skipped because this conversion publishes {} independent rendered album roots and has no single safe post-action album scope",
+            album_dirs.len()
+        )
+    });
+    Ok(AlbumActionPublishAuthority::MultiRootTransition {
+        locks,
+        retire_identity_after_publish,
+        post_skip_reason,
+    })
+}
+
+fn retire_multi_root_action_identities(
+    published: &PublishedAlbum,
+    authority: &AlbumActionPublishAuthority,
+) -> Result<Option<String>, String> {
+    let AlbumActionPublishAuthority::MultiRootTransition {
+        locks,
+        retire_identity_after_publish,
+        post_skip_reason,
+    } = authority
+    else {
+        return Ok(None);
+    };
+    if locks.len() != retire_identity_after_publish.len() {
+        return Err("multi-root identity retirement authority is internally inconsistent".to_string());
+    }
+    for (lock, retire) in locks.iter().zip(retire_identity_after_publish) {
+        if *retire {
+            retire_conversion_action_identity_locked(published, lock).map_err(|error| {
+                format!(
+                    "could not retire stale action identity for multi-root album {}: {error}",
+                    lock.canonical_album_dir().display()
+                )
+            })?;
+        }
+    }
+    Ok(post_skip_reason.clone())
+}
+
+async fn execute_post_actions_stage(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    artifacts: Option<&ArtifactSet>,
+    published: &PublishedAlbum,
+    authority: &mut AlbumActionPublishAuthority,
+    gate: PostActionGate,
+    album_is_fully_successful: bool,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+) -> Option<StageRecord> {
+    // Pre-only pipelines do not require a post-publication identity. If an
+    // earlier generation carried one, retire it under the publication lock;
+    // otherwise preserve the historical no-post-actions path.
+    if req.actions.post.is_empty() {
+        let retirement = match authority {
+            AlbumActionPublishAuthority::NoActionsLocked {
+                lock: Some(lock),
+                retire_identity_after_publish: true,
+            } => retire_conversion_action_identity_locked(published, lock),
+            AlbumActionPublishAuthority::MultiRootTransition { .. } => {
+                retire_multi_root_action_identities(published, authority).map(|_| ())
+            }
+            _ => Ok(()),
+        };
+        authority.release_all_authority();
+        if let Err(error) = retirement {
+            emit_stage_started(reporter, &req.item_id, PipelineStage::PostActions).await;
+            let record = stage_record(
+                PipelineStage::PostActions,
+                StageOutcome::Failed(format!(
+                    "publication could not retire stale action identity: {error}"
+                )),
+            );
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            return Some(record);
+        }
+        return None;
+    }
+
+    if matches!(authority, AlbumActionPublishAuthority::MultiRootTransition { .. }) {
+        emit_stage_started(reporter, &req.item_id, PipelineStage::PostActions).await;
+        let result = retire_multi_root_action_identities(published, authority);
+        authority.release_all_authority();
+        let outcome = match result {
+            Ok(Some(reason)) => {
+                log::warn!("{reason}");
+                StageOutcome::Skipped
+            }
+            Ok(None) => StageOutcome::Skipped,
+            Err(error) => StageOutcome::Failed(error),
+        };
+        let record = stage_record(PipelineStage::PostActions, outcome);
+        emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+        return Some(record);
+    }
+
+    if let AlbumActionPublishAuthority::FlatLayoutSkipped { reason } = authority {
+        if req.actions.post.is_empty() {
+            return None;
+        }
+        log::warn!("{reason}");
+        emit_stage_started(reporter, &req.item_id, PipelineStage::PostActions).await;
+        let record = stage_record(PipelineStage::PostActions, StageOutcome::Skipped);
+        emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+        return Some(record);
+    }
+
+    if authority.lock().is_none() {
+        let record = stage_record(
+            PipelineStage::PostActions,
+            StageOutcome::Failed(
+                "action-enabled conversion reached identity persistence without album authority"
+                    .to_string(),
+            ),
+        );
+        emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+        return Some(record);
+    }
+
+    let action_coordination = match authority
+        .lock()
+        .map(|lock| ActionCoordinationIoBinding::capture(req, lock))
+        .transpose()
+    {
+        Ok(binding) => binding,
+        Err(error) => {
+            authority.release_all_authority();
+            let record = stage_record(
+                PipelineStage::PostActions,
+                StageOutcome::Failed(format!(
+                    "post actions refused because output-root coordination could not be retained: {error}"
+                )),
+            );
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            return Some(record);
+        }
+    };
+
+    // Establish ownership and the immutable participant/post-action lifecycle
+    // manifest before an elected post action can reach any terminal result.
+    if req.album_batch.is_some() && !req.actions.post.is_empty() {
+        let ownership_result = match action_coordination.as_ref() {
+            Some(binding) => ensure_conversion_log_batch_workspace_owned_for_request_at(
+                req,
+                &binding.io_dir,
+            ),
+            None => ensure_conversion_log_batch_workspace_owned_for_request(req),
+        };
+        if let Err(error) = ownership_result {
+            authority.release_all_authority();
+            let record = stage_record(
+                PipelineStage::PostActions,
+                StageOutcome::Failed(format!(
+                    "post actions refused because batch recovery/drain authority could not be established: {error}"
+                )),
+            );
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            return Some(record);
+        }
+    }
+
+    if album_is_fully_successful {
+        let persist_result = authority
+            .lock()
+            .ok_or_else(|| {
+                "action-enabled conversion lost album authority before identity persistence"
+                    .to_string()
+            })
+            .and_then(|identity_lock| {
+                persist_conversion_action_identity_locked(req, source, published, identity_lock)
+            });
+        if let Err(error) = persist_result {
+            authority.release_all_authority();
+            let outcome = post_action_outcome_with_terminal_authority(
+                req,
+                action_coordination.as_ref().map(|binding| binding.io_dir.as_path()),
+                StageOutcome::Failed(format!(
+                    "actions refused because canonical action identity could not be persisted: {error}"
+                )),
+                !req.actions.post.is_empty(),
+            );
+            let record = stage_record(PipelineStage::PostActions, outcome);
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            return Some(record);
+        }
+    }
+
+    if req.actions.post.is_empty() {
+        authority.release_all_authority();
+        return None;
+    }
+    if !album_is_fully_successful {
+        authority.release_all_authority();
+        let outcome = post_action_outcome_with_terminal_authority(
+            req,
+            action_coordination.as_ref().map(|binding| binding.io_dir.as_path()),
+            StageOutcome::Failed(
+                "post actions skipped because the album did not complete successfully".to_string(),
+            ),
+            true,
+        );
+        let record = stage_record(PipelineStage::PostActions, outcome);
+        emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+        return Some(record);
+    }
+
+    match gate {
+        PostActionGate::NotReady => {
+            authority.release_all_authority();
+            return None;
+        }
+        PostActionGate::Failed => {
+            authority.release_all_authority();
+            let outcome = post_action_outcome_with_terminal_authority(
+                req,
+                action_coordination.as_ref().map(|binding| binding.io_dir.as_path()),
+                StageOutcome::Failed(
+                    "post actions skipped because companion finalization did not satisfy its warning-free success gate"
+                        .to_string(),
+                ),
+                true,
+            );
+            let record = stage_record(PipelineStage::PostActions, outcome);
+            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+            return Some(record);
+        }
+        PostActionGate::Ready => {}
+    }
+
+    emit_stage_started(reporter, &req.item_id, PipelineStage::PostActions).await;
+
+    // While the publication lock is still held, pin the exact published album
+    // object and establish the durable election/claim that authorizes the post
+    // phase. The lock is then released before any waiter polling, filesystem
+    // action, or arbitrary script executes. The retained album descriptor keeps
+    // every action path bound to the published object across parent renames or
+    // mount/path replacement.
+    let prepared = (|| -> Result<
+        (
+            PinnedDirectoryCapability,
+            ActionContext,
+            PreparedActionElection,
+        ),
+        ActionError,
+    > {
+        let identity_lock = authority.lock().ok_or_else(|| {
+            ActionError::Conflict(
+                "post-action transition lost album publication authority".to_string(),
+            )
+        })?;
+        let retained_album = identity_lock.retained_publication_album()?;
+        let retained_output = identity_lock.retained_output_root()?.ok_or_else(|| {
+            ActionError::Conflict(
+                "post-action transition lost retained output-root capability".to_string(),
+            )
+        })?;
+        let context = post_action_context_with_capabilities(
+            req,
+            source,
+            artifacts,
+            published,
+            identity_lock.canonical_album_dir(),
+            Some(retained_album.try_clone()?),
+            Some(retained_output),
+        )?;
+        let election = prepare_action_election(req, &context)?;
+        Ok((retained_album, context, election))
+    })();
+
+    if prepared.is_ok() {
+        authority.release_publication_lock();
+    } else {
+        authority.release_all_authority();
+    }
+
+    let (outcome, terminal) = match prepared.and_then(
+        |(retained_album, context, election)| {
+            let execution = execute_prepared_action_election(req, &context, cancel, election);
+            // Keep the descriptor alive through the complete action phase.
+            drop(retained_album);
+            execution
+        },
+    ) {
+        Ok(execution) if execution.error.is_none() && !execution.report.has_errors() => {
+            (StageOutcome::Ok, true)
+        }
+        Ok(execution) => {
+            let recoverable_interruption = execution.recoverable_interruption;
+            let message = execution.error.unwrap_or_else(|| {
+                if recoverable_interruption {
+                    "post actions were interrupted after mutation; durable recovery is required"
+                        .to_string()
+                } else {
+                    "post action pipeline completed with errors".to_string()
+                }
+            });
+            (StageOutcome::Failed(message), !recoverable_interruption)
+        }
+        Err(error) => {
+            // Election/ownership/journal errors are not a terminal action
+            // decision. Preserve the workspace so a restored queue or manual
+            // recovery can re-establish authority and retry safely.
+            (StageOutcome::Failed(error.to_string()), false)
+        }
+    };
+    authority.release_all_authority();
+    let outcome = post_action_outcome_with_terminal_authority(
+        req,
+        action_coordination.as_ref().map(|binding| binding.io_dir.as_path()),
+        outcome,
+        terminal,
+    );
+    let record = stage_record(PipelineStage::PostActions, outcome);
+    emit_stage_finished(reporter, &req.item_id, record.clone()).await;
+    Some(record)
 }
 
 /// Run validation, staging setup, source materialization, and output planning.
@@ -14768,6 +19210,50 @@ pub async fn prepare_pipeline_item_for_scheduler(
             finalize_report(&req, reporter, source, plan, None, published, outcome).await,
         );
     }
+
+    let action_output = match PipelineOutputCapability::capture_for_actions(&req) {
+        Ok(binding) => binding,
+        Err(error) => {
+            emit_stage_started(reporter, &item_id, PipelineStage::PreActions).await;
+            let record = stage_record(
+                PipelineStage::PreActions,
+                StageOutcome::Failed(format!(
+                    "could not retain one output/coordination root for the action transaction: {error}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed: Vec::new(),
+                stages,
+                reason: BlockReason::RequiredStageFailure(PipelineStage::PreActions),
+            };
+            let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+                &req,
+                &outcome,
+            );
+            return ScheduledMaterialization::Finished(
+                finalize_report(&req, reporter, source, plan, None, published, outcome).await,
+            );
+        }
+    };
+
+    let pre_actions_ran_before_materialization =
+        match prepare_batch_pre_actions_before_materialization(
+            &req,
+            action_output.as_ref(),
+            reporter,
+            cancel,
+            &mut stages,
+        )
+        .await
+        {
+            PreMaterializationActionOutcome::Continue { ran_pre_actions } => ran_pre_actions,
+            PreMaterializationActionOutcome::Finished(report) => {
+                return ScheduledMaterialization::Finished(report)
+            }
+        };
 
     conservative_output_capacity_preflight(&req);
 
@@ -14932,6 +19418,70 @@ pub async fn prepare_pipeline_item_for_scheduler(
         }
     };
 
+    if let super::rerun::RerunDecision::Skip {
+        manifest,
+        manifest_path,
+    } = super::rerun::decide_rerun(
+        &album_plan.album_dir,
+        &req.settings,
+        req.publish.overwrite,
+    ) {
+        if !pre_actions_ran_before_materialization {
+            return ScheduledMaterialization::Finished(
+                finalize_manifest_skip(
+                    &req,
+                    reporter,
+                    prepared,
+                    album_plan,
+                    stages,
+                    manifest,
+                    manifest_path,
+                )
+                .await,
+            );
+        }
+        log::warn!(
+            "manifest became skippable after this run durably completed pre-actions; proceeding with publication so actions are never attributed to an all-skipped run: job_id={}, item_id={}, album_dir={}",
+            req.job_id,
+            req.item_id,
+            album_plan.album_dir.display(),
+        );
+    }
+
+    if !req.actions.pre.is_empty() && !pre_actions_ran_before_materialization {
+        let record = execute_pre_actions_stage(&req, action_output.as_ref(), reporter, cancel).await;
+        let failed = matches!(record.outcome, StageOutcome::Failed(_));
+        stages.push(record);
+        if failed {
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed: Vec::new(),
+                stages,
+                reason: BlockReason::RequiredStageFailure(PipelineStage::PreActions),
+            };
+            let published = publish_terminal_conversion_log_fragment_if_needed(
+                &req,
+                Some(&prepared),
+                None,
+                &outcome,
+                staging,
+                Some(runner),
+            );
+            return ScheduledMaterialization::Finished(
+                finalize_report(
+                    &req,
+                    reporter,
+                    Some(prepared),
+                    Some(album_plan),
+                    None,
+                    published,
+                    outcome,
+                )
+                .await,
+            );
+        }
+    }
+
     ScheduledMaterialization::Ready(ScheduledAlbum {
         item_id,
         req,
@@ -14939,6 +19489,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
         source: prepared,
         plan: album_plan,
         stages,
+        action_output,
         _run_lock,
     })
 }
@@ -15416,6 +19967,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> PipelineReport {
+    let action_output = album.action_output;
     let req = album.req;
     let item_id = req.item_id.clone();
     let staging = album.staging;
@@ -15425,6 +19977,9 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     let source = Some(source_value.clone());
     let plan = Some(plan_value.clone());
     let mut published = None;
+    // Assigned in the publish Ok arm; the Err arm diverges, so no initial
+    // value is ever read.
+    let publication_binding;
 
     emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
     let converted = convert_result_from_scheduled_outputs(&source_value, track_outputs, &req);
@@ -15731,31 +20286,73 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         .as_ref()
         .ok_or(PublishError::StagingMissing)
         .and_then(|artifact_set| {
-            publish_album_output_for_plan(
+            let identity_lock =
+                acquire_album_action_authority_for_plan(&req, &plan_value, action_output.as_ref())?;
+            let album = publish_album_output_for_plan_with_authority(
                 staging,
                 artifact_set,
                 &req,
                 &plan_value,
                 req.publish.clone(),
                 conversion_manifest.as_ref(),
-            )
+                identity_lock.lock(),
+                identity_lock.multi_root_locks(),
+                identity_lock.reject_late_action_authority(),
+            )?;
+            let transition_album = match identity_lock.lock() {
+                Some(lock) => published_album_bound_to_authority(&album, lock)?,
+                None => album.clone(),
+            };
+            let binding = match identity_lock.lock() {
+                Some(lock) => PublicationCapabilityBinding::capture(lock, &album.album_dir)?,
+                None => match identity_lock.multi_root_locks().and_then(|locks| locks.first()) {
+                    Some(lock) => PublicationCapabilityBinding::capture(
+                        lock,
+                        lock.canonical_album_dir(),
+                    )?,
+                    None => None,
+                },
+            };
+            Ok((album, transition_album, identity_lock, binding))
         })
     {
-        Ok(album) => {
+        Ok((album, transition_album, mut identity_lock, binding)) => {
+            publication_binding = binding;
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             current_outcome = push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
             copy_container_companion_snapshot_after_publish_best_effort(
                 &req,
                 container_companion_snapshot.as_ref(),
-                &album,
+                &transition_album,
             );
-            copy_companion_artifacts_after_publish_best_effort(
+            let post_action_gate = copy_companion_artifacts_after_publish_best_effort(
                 &req,
                 &source_value,
                 artifacts.as_ref(),
-                &album,
+                &transition_album,
+                publication_binding.as_ref(),
             );
+            let album_is_fully_successful = matches!(current_outcome, AlbumOutcome::Complete { .. });
+            if let Some(action_record) = execute_post_actions_stage(
+                &req,
+                &source_value,
+                artifacts.as_ref(),
+                &transition_album,
+                &mut identity_lock,
+                post_action_gate,
+                album_is_fully_successful,
+                reporter,
+                cancel,
+            )
+            .await
+            {
+                // Post-action failure never rewrites a successful publication
+                // into a blocked album. The failed record remains visible in
+                // the completed outcome and the durable action report carries
+                // per-operation/script details.
+                push_stage(&mut current_outcome, action_record);
+            }
             published = Some(album);
         }
         Err(err) => {
@@ -15773,7 +20370,17 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         }
     }
 
-    finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await
+    finalize_report_with_binding(
+        &req,
+        reporter,
+        source,
+        plan,
+        artifacts,
+        published,
+        current_outcome,
+        publication_binding,
+    )
+    .await
 }
 
 /// Run the staged pipeline for one queue item. `process_item` does not call
@@ -15872,6 +20479,9 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     let mut plan = None;
     let mut artifacts = None;
     let mut published = None;
+    // Assigned in the publish Ok arm; the Err arm diverges, so no initial
+    // value is ever read.
+    let publication_binding;
     #[allow(unused_assignments)]
     let mut tracks = Vec::new();
     let mut stages = Vec::new();
@@ -15906,6 +20516,46 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         );
         return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
     }
+
+    let action_output = match PipelineOutputCapability::capture_for_actions(&req) {
+        Ok(binding) => binding,
+        Err(error) => {
+            emit_stage_started(reporter, &item_id, PipelineStage::PreActions).await;
+            let record = stage_record(
+                PipelineStage::PreActions,
+                StageOutcome::Failed(format!(
+                    "could not retain one output/coordination root for the action transaction: {error}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed: Vec::new(),
+                stages,
+                reason: BlockReason::RequiredStageFailure(PipelineStage::PreActions),
+            };
+            let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+                &req,
+                &outcome,
+            );
+            return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
+        }
+    };
+
+    let pre_actions_ran_before_materialization =
+        match prepare_batch_pre_actions_before_materialization(
+            &req,
+            action_output.as_ref(),
+            reporter,
+            cancel,
+            &mut stages,
+        )
+        .await
+        {
+            PreMaterializationActionOutcome::Continue { ran_pre_actions } => ran_pre_actions,
+            PreMaterializationActionOutcome::Finished(report) => return report,
+        };
 
     conservative_output_capacity_preflight(&req);
 
@@ -16109,6 +20759,67 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             );
             return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
                 .await;
+        }
+    }
+
+    if let super::rerun::RerunDecision::Skip {
+        manifest,
+        manifest_path,
+    } = super::rerun::decide_rerun(
+        &plan.as_ref().expect("plan present").album_dir,
+        &req.settings,
+        req.publish.overwrite,
+    ) {
+        if !pre_actions_ran_before_materialization {
+            return finalize_manifest_skip(
+                &req,
+                reporter,
+                source.take().expect("source present"),
+                plan.take().expect("plan present"),
+                stages,
+                manifest,
+                manifest_path,
+            )
+            .await;
+        }
+        log::warn!(
+            "manifest became skippable after this run durably completed pre-actions; proceeding with publication so actions are never attributed to an all-skipped run: job_id={}, item_id={}, album_dir={}",
+            req.job_id,
+            req.item_id,
+            plan.as_ref().expect("plan present").album_dir.display(),
+        );
+    }
+
+    if !req.actions.pre.is_empty() && !pre_actions_ran_before_materialization {
+        let record = execute_pre_actions_stage(&req, action_output.as_ref(), reporter, cancel).await;
+        let failed = matches!(record.outcome, StageOutcome::Failed(_));
+        stages.push(record);
+        if failed {
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed: Vec::new(),
+                stages,
+                reason: BlockReason::RequiredStageFailure(PipelineStage::PreActions),
+            };
+            return_before_failure_publication_if_retryable_scratch!(outcome.clone());
+            published = publish_terminal_conversion_log_fragment_if_needed(
+                &req,
+                source.as_ref(),
+                None,
+                &outcome,
+                staging,
+                Some(runner),
+            );
+            return finalize_report(
+                &req,
+                reporter,
+                source,
+                plan,
+                artifacts,
+                published,
+                outcome,
+            )
+            .await;
         }
     }
 
@@ -16479,32 +21190,80 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         .ok_or(PublishError::StagingMissing)
         .and_then(|artifact_set| {
             let planned = plan.as_ref().ok_or(PublishError::StagingMissing)?;
-            publish_album_output_for_plan(
+            let identity_lock =
+                acquire_album_action_authority_for_plan(&req, planned, action_output.as_ref())?;
+            let album = publish_album_output_for_plan_with_authority(
                 staging,
                 artifact_set,
                 &req,
                 planned,
                 req.publish.clone(),
                 None,
-            )
+                identity_lock.lock(),
+                identity_lock.multi_root_locks(),
+                identity_lock.reject_late_action_authority(),
+            )?;
+            let transition_album = match identity_lock.lock() {
+                Some(lock) => published_album_bound_to_authority(&album, lock)?,
+                None => album.clone(),
+            };
+            let binding = match identity_lock.lock() {
+                Some(lock) => PublicationCapabilityBinding::capture(lock, &album.album_dir)?,
+                None => match identity_lock.multi_root_locks().and_then(|locks| locks.first()) {
+                    Some(lock) => PublicationCapabilityBinding::capture(
+                        lock,
+                        lock.canonical_album_dir(),
+                    )?,
+                    None => None,
+                },
+            };
+            Ok((album, transition_album, identity_lock, binding))
         })
     {
-        Ok(album) => {
+        Ok((album, transition_album, mut identity_lock, binding)) => {
+            publication_binding = binding;
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
+            // Publish is conversion-blocking and belongs in the aggregated
+            // conversion outcome. Post actions do not: their stage record is
+            // appended afterward so a failed post action remains visible as
+            // "completed with action errors" without rewriting a successful
+            // conversion into a blocked conversion.
+            current_outcome = aggregate_album_outcome(
+                tracks.clone(),
+                stages.clone(),
+                req.failure_policy,
+            );
             copy_container_companion_snapshot_after_publish_best_effort(
                 &req,
                 container_companion_snapshot.as_ref(),
-                &album,
+                &transition_album,
             );
             if let Some(source_ref) = source.as_ref() {
-                copy_companion_artifacts_after_publish_best_effort(
+                let post_action_gate = copy_companion_artifacts_after_publish_best_effort(
                     &req,
                     source_ref,
                     artifacts.as_ref(),
-                    &album,
+                    &transition_album,
+                    publication_binding.as_ref(),
                 );
+                let album_is_fully_successful = matches!(current_outcome, AlbumOutcome::Complete { .. });
+                if let Some(action_record) = execute_post_actions_stage(
+                    &req,
+                    source_ref,
+                    artifacts.as_ref(),
+                    &transition_album,
+                    &mut identity_lock,
+                    post_action_gate,
+                    album_is_fully_successful,
+                    reporter,
+                    cancel,
+                )
+                .await
+                {
+                    push_stage(&mut current_outcome, action_record);
+                }
             }
             published = Some(album);
         }
@@ -16535,8 +21294,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         }
     }
 
-    current_outcome = aggregate_album_outcome(tracks, stages, req.failure_policy);
-    finalize_report(
+    finalize_report_with_binding(
         &req,
         reporter,
         source,
@@ -16544,6 +21302,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         artifacts,
         published,
         current_outcome,
+        publication_binding,
     )
     .await
 }
@@ -16553,6 +21312,35 @@ struct CompanionCopyStats {
     copied: usize,
     skipped: usize,
     warnings: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostActionGate {
+    /// The album-batch completion/finalization signal has not arrived yet.
+    NotReady,
+    /// Companion finalization reached the exact warning-free success state.
+    Ready,
+    /// Companion finalization ran or was attempted but did not satisfy its
+    /// existing `is_fully_successful` predicate.
+    Failed,
+}
+
+fn batch_post_action_completion_gate(
+    req: &PipelineRequest,
+    coordination_io_dir: Option<&Path>,
+) -> PostActionGate {
+    if req.album_batch.is_none() {
+        return PostActionGate::Ready;
+    }
+    let status = coordination_io_dir
+        .map(|coord_dir| conversion_log_batch_completion_status_at(req, coord_dir))
+        .unwrap_or_else(|| conversion_log_batch_completion_status(req));
+    match status {
+        ConversionLogBatchCompletionStatus::Successful => PostActionGate::Ready,
+        ConversionLogBatchCompletionStatus::Incomplete => PostActionGate::NotReady,
+        ConversionLogBatchCompletionStatus::NonSuccessful
+        | ConversionLogBatchCompletionStatus::Invalid => PostActionGate::Failed,
+    }
 }
 
 impl CompanionCopyStats {
@@ -16677,31 +21465,73 @@ fn copy_companion_artifacts_after_publish_best_effort(
     source: &PreparedSource,
     artifacts: Option<&ArtifactSet>,
     published: &PublishedAlbum,
-) {
-    if should_coordinate_album_batch_companion_copy(req) {
-        copy_album_batch_companion_artifacts_once_ready_best_effort(req, artifacts, published);
+    binding: Option<&PublicationCapabilityBinding>,
+) -> PostActionGate {
+    let coordination_io_dir = if req.album_batch.is_some() {
+        match binding.map(|binding| binding.coordination_dir(req)).transpose() {
+            Ok(path) => path,
+            Err(error) => {
+                log::error!(
+                    "companion finalization refused an unbound coordination fallback for {}: {error}",
+                    req.item_id
+                );
+                return PostActionGate::Failed;
+            }
+        }
     } else {
-        copy_companion_artifacts_best_effort(req, source, artifacts, published);
-        // Album batches WITHOUT a resolved identity take this legacy per-item
-        // path, but they still own a log-coordination workspace under
-        // .tonepoet-batch/. The coordinated finalizer never runs for them, so
-        // once the batch is durably complete nothing else would clean that
-        // workspace — the last-finishing item does it here. (Idempotent and
-        // best-effort: concurrent finishers may both observe completion.)
-        // The stale sweep also retires completed/dead-owner workspaces left
-        // behind by earlier runs into the same output root; it skips the
-        // current batch and live same-process batches by design.
-        if req.album_batch.is_some() {
-            sweep_stale_completed_conversion_log_batch_coordination_for_request_best_effort(
-                req,
-                req.item_id.as_str(),
+        None
+    };
+    let output_io_root = match binding
+        .map(|binding| binding.io_path(&req.output_root))
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => {
+            log::error!(
+                "companion finalization refused an unbound output-root fallback for {}: {error}",
+                req.item_id
             );
-            if conversion_log_batch_is_durably_complete(req) {
-                cleanup_conversion_log_batch_coordination_after_success_best_effort(
+            return PostActionGate::Failed;
+        }
+    };
+    let coordination_io_dir = coordination_io_dir.as_deref();
+    let output_io_root = output_io_root.as_deref();
+
+    if should_coordinate_album_batch_companion_copy(req) {
+        copy_album_batch_companion_artifacts_once_ready_with_binding_best_effort(
+            req,
+            artifacts,
+            published,
+            binding,
+            coordination_io_dir,
+            output_io_root,
+        )
+    } else {
+        let stats = copy_companion_artifacts_best_effort(req, source, artifacts, published);
+        // Album batches without a resolved identity still participate in the
+        // same durable terminal protocol. Sweep unrelated stale workspaces
+        // here, but never clean the current batch from a companion-copy path:
+        // only per-worker finalization may acknowledge the participant, and
+        // only the last acknowledged terminal participant may begin cleanup.
+        if req.album_batch.is_some() {
+            match output_io_root {
+                Some(output_root) => {
+                    sweep_stale_completed_conversion_log_batch_coordination_for_request_at_best_effort(
+                        req,
+                        output_root,
+                        req.item_id.as_str(),
+                    );
+                }
+                None => sweep_stale_completed_conversion_log_batch_coordination_for_request_best_effort(
                     req,
                     req.item_id.as_str(),
-                );
+                ),
             }
+        }
+        if !stats.is_fully_successful() {
+            PostActionGate::Failed
+        } else {
+            batch_post_action_completion_gate(req, coordination_io_dir)
         }
     }
 }
@@ -16717,37 +21547,97 @@ fn copy_album_batch_companion_artifacts_once_ready_best_effort(
     req: &PipelineRequest,
     artifacts: Option<&ArtifactSet>,
     published: &PublishedAlbum,
-) {
+) -> PostActionGate {
+    copy_album_batch_companion_artifacts_once_ready_with_binding_best_effort(
+        req,
+        artifacts,
+        published,
+        None,
+        None,
+        None,
+    )
+}
+
+fn copy_album_batch_companion_artifacts_once_ready_with_binding_best_effort(
+    req: &PipelineRequest,
+    artifacts: Option<&ArtifactSet>,
+    published: &PublishedAlbum,
+    binding: Option<&PublicationCapabilityBinding>,
+    coordination_io_dir: Option<&Path>,
+    output_io_root: Option<&Path>,
+) -> PostActionGate {
     if !should_coordinate_album_batch_companion_copy(req) {
-        return;
+        return PostActionGate::NotReady;
     }
 
     let Some(batch) = req.album_batch.as_ref() else {
-        return;
+        return PostActionGate::NotReady;
     };
     let context = format!("album batch {}", batch.conversion_log_batch_id.trim());
-    let _batch_workspace_guard =
-        activate_conversion_log_batch_workspace_for_request_best_effort(req, context.as_str());
-    sweep_stale_completed_conversion_log_batch_coordination_for_request_best_effort(
-        req,
-        context.as_str(),
-    );
+    let ownership_result = match coordination_io_dir {
+        Some(coord_dir) => ensure_conversion_log_batch_workspace_owned_for_request_at(req, coord_dir),
+        None => ensure_conversion_log_batch_workspace_owned_for_request(req),
+    };
+    if let Err(error) = ownership_result {
+        log::error!(
+            "companion finalization refused to mutate unowned conversion-log batch workspace for {context}: {error}"
+        );
+        return PostActionGate::Failed;
+    }
+    let _batch_workspace_guard = match coordination_io_dir {
+        Some(coord_dir) => activate_conversion_log_batch_workspace_for_request_at_best_effort(
+            req,
+            coord_dir,
+            context.as_str(),
+        ),
+        None => activate_conversion_log_batch_workspace_for_request_best_effort(
+            req,
+            context.as_str(),
+        ),
+    };
+    match output_io_root {
+        Some(output_root) => {
+            sweep_stale_completed_conversion_log_batch_coordination_for_request_at_best_effort(
+                req,
+                output_root,
+                context.as_str(),
+            );
+        }
+        None => sweep_stale_completed_conversion_log_batch_coordination_for_request_best_effort(
+            req,
+            context.as_str(),
+        ),
+    }
     let completion_observed = album_batch_companion_finalization_signal(req, published)
-        || album_batch_companion_durable_finalization_signal(req, published);
+        || album_batch_companion_durable_finalization_signal(
+            req,
+            published,
+            coordination_io_dir,
+        );
 
     if req.companion.is_empty() {
         if completion_observed {
-            cleanup_conversion_log_batch_coordination_after_success_best_effort(req, context.as_str());
+            return batch_post_action_completion_gate(req, coordination_io_dir);
         }
-        return;
+        return PostActionGate::NotReady;
     }
 
-    record_album_batch_disc_destinations_from_artifacts(req, artifacts, published);
+    record_album_batch_disc_destinations_from_artifacts(
+        req,
+        artifacts,
+        published,
+        binding,
+        output_io_root,
+    );
     if completion_observed {
-        mark_companion_batch_finalization_pending_best_effort(req, context.as_str());
+        mark_companion_batch_finalization_pending_at_best_effort(
+            req,
+            output_io_root,
+            context.as_str(),
+        );
     }
-    if !(completion_observed || companion_batch_finalization_pending(req)) {
-        return;
+    if !(completion_observed || companion_batch_finalization_pending_at(req, output_io_root)) {
+        return PostActionGate::NotReady;
     }
 
     let source_dir = batch.source_grouping_root.clone();
@@ -16759,14 +21649,17 @@ fn copy_album_batch_companion_artifacts_once_ready_best_effort(
             req.container.display(),
             source_dir.display()
         );
-        cleanup_conversion_log_batch_coordination_after_success_best_effort(req, context.as_str());
-        return;
+        return batch_post_action_completion_gate(req, coordination_io_dir);
     }
     let finalization_key = companion_batch_finalization_key(req, published, batch);
-    let finalization_lock_dir = companion_batch_finalization_lock_dir(req)
+    let finalization_lock_dir = companion_batch_finalization_lock_dir_at(
+        req,
+        coordination_io_dir,
+        output_io_root,
+    )
         .unwrap_or_else(|| published.album_dir.clone());
 
-    if let Err(err) = with_album_publish_lock_for_companion_copy(&finalization_lock_dir, || {
+    match with_album_publish_lock_for_companion_copy(&finalization_lock_dir, || {
         sweep_companion_batch_stale_temp_state_best_effort(&published.album_dir, context.as_str());
 
         if companion_batch_finalized_in_this_run(finalization_key.as_str()) {
@@ -16775,28 +21668,43 @@ fn copy_album_batch_companion_artifacts_once_ready_best_effort(
                 context
             );
             clean_companion_batch_transient_state_after_success_best_effort(&published.album_dir, context.as_str());
-            clean_companion_batch_disc_destinations_after_success_best_effort(req, context.as_str());
-            cleanup_conversion_log_batch_coordination_after_success_best_effort(req, context.as_str());
-            return;
+            clean_companion_batch_disc_destinations_after_success_at_best_effort(
+                req,
+                output_io_root,
+                context.as_str(),
+            );
+            return batch_post_action_completion_gate(req, coordination_io_dir);
         }
 
-        let rendered_destinations = match companion_batch_disc_destinations(req) {
+        let rendered_destinations = match companion_batch_disc_destinations_at(
+            req,
+            binding,
+            output_io_root,
+        ) {
             CompanionBatchDiscDestinationReadiness::Ready(destinations) => destinations,
             CompanionBatchDiscDestinationReadiness::Incomplete { observed, expected } => {
-                mark_companion_batch_finalization_pending_best_effort(req, context.as_str());
+                mark_companion_batch_finalization_pending_at_best_effort(
+                    req,
+                    output_io_root,
+                    context.as_str(),
+                );
                 log::warn!(
                     "companion copy finalization deferred for {}: durable rendered-path records are incomplete ({observed}/{expected}); pending marker retained so a later destination-record writer will retry finalization instead of relying on a one-shot last-track signal",
                     context
                 );
-                return;
+                return PostActionGate::NotReady;
             }
             CompanionBatchDiscDestinationReadiness::Unavailable => {
-                mark_companion_batch_finalization_pending_best_effort(req, context.as_str());
+                mark_companion_batch_finalization_pending_at_best_effort(
+                    req,
+                    output_io_root,
+                    context.as_str(),
+                );
                 log::warn!(
                     "companion copy finalization deferred for {}: durable rendered-path records are unavailable; refusing to scan with recomputed disc destinations",
                     context
                 );
-                return;
+                return PostActionGate::NotReady;
             }
         };
 
@@ -16815,55 +21723,96 @@ fn copy_album_batch_companion_artifacts_once_ready_best_effort(
         if stats.is_fully_successful() {
             remember_companion_batch_finalized_in_this_run(finalization_key);
             clean_companion_batch_transient_state_after_success_best_effort(&published.album_dir, context.as_str());
-            clean_companion_batch_disc_destinations_after_success_best_effort(req, context.as_str());
-            cleanup_conversion_log_batch_coordination_after_success_best_effort(req, context.as_str());
+            clean_companion_batch_disc_destinations_after_success_at_best_effort(
+                req,
+                output_io_root,
+                context.as_str(),
+            );
+            batch_post_action_completion_gate(req, coordination_io_dir)
         } else {
-            mark_companion_batch_finalization_pending_best_effort(req, context.as_str());
+            mark_companion_batch_finalization_pending_at_best_effort(
+                req,
+                output_io_root,
+                context.as_str(),
+            );
             log::warn!(
                 "companion copy not marked finalized for {}: scan/copy completed with {} warning(s); pending marker retained so a later finalizer call will rescan",
                 context,
                 stats.warnings
             );
+            PostActionGate::Failed
         }
     }) {
-        mark_companion_batch_finalization_pending_best_effort(req, context.as_str());
-        log::warn!(
-            "companion copy skipped for {}: could not acquire batch companion finalization lock for {}: {err}",
-            context,
-            finalization_lock_dir.display()
-        );
+        Ok(gate) => gate,
+        Err(err) => {
+            mark_companion_batch_finalization_pending_at_best_effort(
+                req,
+                output_io_root,
+                context.as_str(),
+            );
+            log::warn!(
+                "companion copy skipped for {}: could not acquire batch companion finalization lock for {}: {err}",
+                context,
+                finalization_lock_dir.display()
+            );
+            PostActionGate::Failed
+        }
     }
 }
 
 
-fn companion_batch_finalization_lock_dir(req: &PipelineRequest) -> Option<PathBuf> {
-    conversion_log_batch_coordination_album_dir(req)
-        .or_else(|| companion_batch_disc_destination_records_dir(req))
+fn companion_batch_finalization_lock_dir_at(
+    req: &PipelineRequest,
+    coordination_io_dir: Option<&Path>,
+    output_io_root: Option<&Path>,
+) -> Option<PathBuf> {
+    coordination_io_dir
+        .map(Path::to_path_buf)
+        .or_else(|| companion_batch_disc_destination_records_dir_at(req, output_io_root))
 }
 
-fn with_album_publish_lock_for_companion_copy(
+fn with_album_publish_lock_for_companion_copy<T>(
     album_dir: &Path,
-    operation: impl FnOnce(),
-) -> Result<(), PublishError> {
+    operation: impl FnOnce() -> T,
+) -> Result<T, PublishError> {
     let _publish_lock = acquire_publish_lock(album_dir)?;
-    operation();
-    Ok(())
+    Ok(operation())
 }
 
-fn companion_batch_pending_finalization_path(req: &PipelineRequest) -> Option<PathBuf> {
+fn companion_batch_pending_finalization_path_at(
+    req: &PipelineRequest,
+    output_io_root: Option<&Path>,
+) -> Option<PathBuf> {
     Some(
-        companion_batch_disc_destination_records_dir(req)?
+        companion_batch_disc_destination_records_dir_at(req, output_io_root)?
             .join(COMPANION_BATCH_PENDING_FINALIZATION_MARKER_FILE),
     )
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn companion_batch_finalization_pending(req: &PipelineRequest) -> bool {
-    companion_batch_pending_finalization_path(req)
+    companion_batch_finalization_pending_at(req, None)
+}
+
+fn companion_batch_finalization_pending_at(
+    req: &PipelineRequest,
+    output_io_root: Option<&Path>,
+) -> bool {
+    companion_batch_pending_finalization_path_at(req, output_io_root)
         .is_some_and(|path| path.is_file())
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn mark_companion_batch_finalization_pending_best_effort(req: &PipelineRequest, context: &str) {
-    let Some(path) = companion_batch_pending_finalization_path(req) else {
+    mark_companion_batch_finalization_pending_at_best_effort(req, None, context)
+}
+
+fn mark_companion_batch_finalization_pending_at_best_effort(
+    req: &PipelineRequest,
+    output_io_root: Option<&Path>,
+    context: &str,
+) {
+    let Some(path) = companion_batch_pending_finalization_path_at(req, output_io_root) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -16903,6 +21852,7 @@ fn mark_companion_batch_finalization_pending_best_effort(req: &PipelineRequest, 
 fn album_batch_companion_durable_finalization_signal(
     req: &PipelineRequest,
     published: &PublishedAlbum,
+    coordination_io_dir: Option<&Path>,
 ) -> bool {
     if req.album_batch.is_none() {
         return false;
@@ -16912,7 +21862,10 @@ fn album_batch_companion_durable_finalization_signal(
     // conversion_log_batch_id, not in whichever rendered album root this track
     // happened to publish. This keeps `%ALBUM% (CD%DISCNUMBER%)` from splitting
     // conversion-log completion and companion finalization by disc.
-    if conversion_log_batch_is_durably_complete(req) {
+    if coordination_io_dir
+        .map(|coord_dir| conversion_log_batch_is_durably_complete_at(req, coord_dir))
+        .unwrap_or_else(|| conversion_log_batch_is_durably_complete(req))
+    {
         return true;
     }
 
@@ -17046,22 +21999,40 @@ fn companion_batch_disc_destination_record_dir_name(req: &PipelineRequest) -> Op
     Some(format!("{batch_id}{COMPANION_BATCH_DISC_DESTINATIONS_DIR_SUFFIX}"))
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn companion_batch_disc_destination_records_dir(req: &PipelineRequest) -> Option<PathBuf> {
+    companion_batch_disc_destination_records_dir_at(req, None)
+}
+
+fn companion_batch_disc_destination_records_dir_at(
+    req: &PipelineRequest,
+    output_io_root: Option<&Path>,
+) -> Option<PathBuf> {
     Some(
-        req.output_root
+        output_io_root
+            .unwrap_or(&req.output_root)
             .join(COMPANION_BATCH_TRANSIENT_DIR)
             .join(companion_batch_disc_destination_record_dir_name(req)?),
     )
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn companion_batch_legacy_disc_destinations_path(req: &PipelineRequest) -> Option<PathBuf> {
+    companion_batch_legacy_disc_destinations_path_at(req, None)
+}
+
+fn companion_batch_legacy_disc_destinations_path_at(
+    req: &PipelineRequest,
+    output_io_root: Option<&Path>,
+) -> Option<PathBuf> {
     let batch = req.album_batch.as_ref()?;
     let batch_id = sanitize_component(batch.conversion_log_batch_id.trim());
     if batch_id.is_empty() {
         return None;
     }
     Some(
-        req.output_root
+        output_io_root
+            .unwrap_or(&req.output_root)
             .join(COMPANION_BATCH_TRANSIENT_DIR)
             .join(format!("{batch_id}.disc-destinations.json")),
     )
@@ -17079,12 +22050,21 @@ fn companion_batch_disc_destination_record_file_name(track_id: &TrackId) -> Stri
     )
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn companion_batch_disc_destination_record_path(
     req: &PipelineRequest,
     track_id: &TrackId,
 ) -> Option<PathBuf> {
+    companion_batch_disc_destination_record_path_at(req, track_id, None)
+}
+
+fn companion_batch_disc_destination_record_path_at(
+    req: &PipelineRequest,
+    track_id: &TrackId,
+    output_io_root: Option<&Path>,
+) -> Option<PathBuf> {
     Some(
-        companion_batch_disc_destination_records_dir(req)?
+        companion_batch_disc_destination_records_dir_at(req, output_io_root)?
             .join(companion_batch_disc_destination_record_file_name(track_id)),
     )
 }
@@ -17183,16 +22163,33 @@ fn create_companion_batch_disc_destination_record_temp(
     ))
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn write_companion_batch_disc_destination_record(
     req: &PipelineRequest,
     record: CompanionBatchDiscDestinationRecord,
 ) -> io::Result<()> {
+    write_companion_batch_disc_destination_record_at(req, record, None)
+}
+
+fn write_companion_batch_disc_destination_record_at(
+    req: &PipelineRequest,
+    record: CompanionBatchDiscDestinationRecord,
+    output_io_root: Option<&Path>,
+) -> io::Result<()> {
     let record = record.normalized();
-    let final_path = companion_batch_disc_destination_record_path(req, &record.track_id)
+    let final_path = companion_batch_disc_destination_record_path_at(
+        req,
+        &record.track_id,
+        output_io_root,
+    )
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing companion batch id"))?;
     let dir = parent_dir_or_current(&final_path);
     fs::create_dir_all(dir)?;
-    sweep_companion_batch_disc_destination_record_temps_best_effort(req, "record write");
+    sweep_companion_batch_disc_destination_record_temps_at_best_effort(
+        req,
+        output_io_root,
+        "record write",
+    );
 
     if final_path.exists() {
         let existing = read_companion_batch_disc_destination_record_from_path(&final_path)?;
@@ -17239,11 +22236,20 @@ fn write_companion_batch_disc_destination_record(
     }
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn sweep_companion_batch_disc_destination_record_temps_best_effort(
     req: &PipelineRequest,
     context: &str,
 ) {
-    let Some(dir) = companion_batch_disc_destination_records_dir(req) else {
+    sweep_companion_batch_disc_destination_record_temps_at_best_effort(req, None, context)
+}
+
+fn sweep_companion_batch_disc_destination_record_temps_at_best_effort(
+    req: &PipelineRequest,
+    output_io_root: Option<&Path>,
+    context: &str,
+) {
+    let Some(dir) = companion_batch_disc_destination_records_dir_at(req, output_io_root) else {
         return;
     };
     if !dir.is_dir() {
@@ -17289,10 +22295,18 @@ fn sweep_companion_batch_disc_destination_record_temps_best_effort(
     }
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn read_companion_batch_disc_destination_records(
     req: &PipelineRequest,
 ) -> io::Result<Vec<CompanionBatchDiscDestinationRecord>> {
-    let Some(dir) = companion_batch_disc_destination_records_dir(req) else {
+    read_companion_batch_disc_destination_records_at(req, None)
+}
+
+fn read_companion_batch_disc_destination_records_at(
+    req: &PipelineRequest,
+    output_io_root: Option<&Path>,
+) -> io::Result<Vec<CompanionBatchDiscDestinationRecord>> {
+    let Some(dir) = companion_batch_disc_destination_records_dir_at(req, output_io_root) else {
         return Ok(Vec::new());
     };
     let entries = match fs::read_dir(&dir) {
@@ -17386,6 +22400,8 @@ fn record_album_batch_disc_destinations_from_artifacts(
     req: &PipelineRequest,
     artifacts: Option<&ArtifactSet>,
     published: &PublishedAlbum,
+    binding: Option<&PublicationCapabilityBinding>,
+    output_io_root: Option<&Path>,
 ) {
     let Some(artifacts) = artifacts else {
         return;
@@ -17406,7 +22422,13 @@ fn record_album_batch_disc_destinations_from_artifacts(
         }
     }
 
-    for record in records {
+    for mut record in records {
+        if let Some(binding) = binding {
+            record.path = record.path.map(|path| binding.stable_path(&path));
+            record.album_dir = record
+                .album_dir
+                .map(|path| binding.stable_path(&path));
+        }
         if record.track_id.source_ordinal == 0 || record.track_id.track_number == 0 {
             log::warn!(
                 "companion batch disc-destination record skipped for {}: invalid track identity {:?}",
@@ -17415,7 +22437,11 @@ fn record_album_batch_disc_destinations_from_artifacts(
             );
             continue;
         }
-        if let Err(err) = write_companion_batch_disc_destination_record(req, record) {
+        if let Err(err) = write_companion_batch_disc_destination_record_at(
+            req,
+            record,
+            output_io_root,
+        ) {
             log::warn!(
                 "companion batch disc-destination record write skipped for {} under {}: {err}",
                 req.item_id,
@@ -17438,13 +22464,22 @@ enum CompanionBatchDiscDestinationReadiness {
     Unavailable,
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn companion_batch_disc_destinations(req: &PipelineRequest) -> CompanionBatchDiscDestinationReadiness {
+    companion_batch_disc_destinations_at(req, None, None)
+}
+
+fn companion_batch_disc_destinations_at(
+    req: &PipelineRequest,
+    binding: Option<&PublicationCapabilityBinding>,
+    output_io_root: Option<&Path>,
+) -> CompanionBatchDiscDestinationReadiness {
     let expected = req
         .album_batch
         .as_ref()
         .map(|batch| batch.expected_track_count)
         .unwrap_or(0);
-    let records = match read_companion_batch_disc_destination_records(req) {
+    let records = match read_companion_batch_disc_destination_records_at(req, output_io_root) {
         Ok(records) => records,
         Err(err) => {
             log::warn!(
@@ -17486,6 +22521,20 @@ fn companion_batch_disc_destinations(req: &PipelineRequest) -> CompanionBatchDis
     let mut album_dirs = BTreeSet::new();
     for record in records_by_track.into_values() {
         if let Some(album_dir) = record.album_dir {
+            let album_dir = match binding {
+                Some(binding) => match binding.io_path(&album_dir) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        log::warn!(
+                            "companion batch disc routing unavailable for {}: stable album destination {} is outside the retained transaction root: {error}",
+                            req.item_id,
+                            album_dir.display()
+                        );
+                        return CompanionBatchDiscDestinationReadiness::Unavailable;
+                    }
+                },
+                None => album_dir,
+            };
             album_dirs.insert(normalize_path(&album_dir));
         }
         let Some(disc) = record.disc.filter(|value| *value > 0) else {
@@ -17499,6 +22548,20 @@ fn companion_batch_disc_destinations(req: &PipelineRequest) -> CompanionBatchDis
                 disc
             );
             return CompanionBatchDiscDestinationReadiness::Unavailable;
+        };
+        let path = match binding {
+            Some(binding) => match binding.io_path(&path) {
+                Ok(path) => path,
+                Err(error) => {
+                    log::warn!(
+                        "companion batch disc routing unavailable for {}: stable rendered destination {} is outside the retained transaction root: {error}",
+                        req.item_id,
+                        path.display()
+                    );
+                    return CompanionBatchDiscDestinationReadiness::Unavailable;
+                }
+            },
+            None => path,
         };
         merge_disc_destination(&mut destinations, disc, path);
     }
@@ -17532,8 +22595,17 @@ fn album_level_companion_dir_from_rendered_audio_parent(path: &Path) -> PathBuf 
     }
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn clean_companion_batch_disc_destinations_after_success_best_effort(req: &PipelineRequest, context: &str) {
-    if let Some(path) = companion_batch_legacy_disc_destinations_path(req) {
+    clean_companion_batch_disc_destinations_after_success_at_best_effort(req, None, context)
+}
+
+fn clean_companion_batch_disc_destinations_after_success_at_best_effort(
+    req: &PipelineRequest,
+    output_io_root: Option<&Path>,
+    context: &str,
+) {
+    if let Some(path) = companion_batch_legacy_disc_destinations_path_at(req, output_io_root) {
         match fs::remove_file(&path) {
             Ok(()) => sync_parent_dir_best_effort(&path),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -17545,7 +22617,7 @@ fn clean_companion_batch_disc_destinations_after_success_best_effort(req: &Pipel
         }
     }
 
-    let Some(dir) = companion_batch_disc_destination_records_dir(req) else {
+    let Some(dir) = companion_batch_disc_destination_records_dir_at(req, output_io_root) else {
         return;
     };
     if !dir.exists() {
@@ -17785,9 +22857,9 @@ fn copy_companion_artifacts_best_effort(
     source: &PreparedSource,
     artifacts: Option<&ArtifactSet>,
     published: &PublishedAlbum,
-) {
+) -> CompanionCopyStats {
     if req.companion.is_empty() {
-        return;
+        return CompanionCopyStats::default();
     }
 
     let Some(source_dir) = companion_source_dir(req, source) else {
@@ -17795,7 +22867,9 @@ fn copy_companion_artifacts_best_effort(
             "companion copy skipped for {}: unable to resolve source directory",
             req.item_id
         );
-        return;
+        let mut stats = CompanionCopyStats::default();
+        stats.warning();
+        return stats;
     };
     let source_file_skip_set = companion_source_file_skip_set(req, source);
     let disc_destinations = artifacts
@@ -17809,7 +22883,7 @@ fn copy_companion_artifacts_best_effort(
         &disc_destinations,
         &[],
         req.item_id.as_str(),
-    );
+    )
 }
 
 fn copy_companion_artifacts_from_source_dir_best_effort(
@@ -19146,6 +24220,137 @@ fn companion_temp_owner_process_exists(_pid: u32) -> bool {
 #[cfg(test)]
 mod companion_copy_hardening_tests {
     use super::*;
+    use crate::convert::cap_fs::ScopeId;
+    use crate::convert::pipeline::actions::{
+        ActionFilesystem, ConversionAction, CreateFolderAction, RunScriptAction,
+    };
+
+    #[test]
+    fn retained_output_capability_keeps_durable_action_paths_stable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        // Production dispatches per-FILE requests even for folder batches;
+        // a bare directory container never reaches source-kind detection.
+        let source_file = source_dir.join("01.flac");
+        std::fs::write(&source_file, b"audio").expect("source file");
+        let mut request = test_request(temp.path(), source_file);
+        request.actions.pre.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Prepared"),
+            continue_on_error: false,
+        }));
+
+        let retained = PipelineOutputCapability::capture_for_actions(&request)
+            .expect("capture output capability")
+            .expect("configured action pipeline retains output root");
+        let context = pre_action_context_with_output_capability(&request, Some(&retained))
+            .expect("pre action context");
+
+        for path in [
+            &context.subject_dir,
+            &context.source_path,
+            &context.output_root,
+            &context.album_dir,
+            &context.journal_dir,
+        ] {
+            let rendered = path.to_string_lossy();
+            assert!(!rendered.contains("/proc/self/fd/"));
+            assert!(!rendered.contains("/dev/fd/"));
+        }
+
+        let filesystem = CapabilityActionFilesystem::new();
+        filesystem
+            .pin_existing_capability(
+                ScopeId::new("output").expect("scope id"),
+                &context.output_root,
+                context
+                    .retained_output_capability
+                    .as_deref()
+                    .expect("retained output capability"),
+            )
+            .expect("pin stable output root to retained descriptor");
+        filesystem
+            .pin_existing_capability(
+                ScopeId::new("journal").expect("scope id"),
+                &context.journal_dir,
+                context
+                    .retained_journal_capability
+                    .as_deref()
+                    .expect("retained journal capability"),
+            )
+            .expect("pin stable journal root to retained descriptor");
+        let records = filesystem.scope_records().expect("scope records");
+        assert!(!records.is_empty());
+        for record in records {
+            let rendered = record.logical_path.to_string_lossy();
+            assert!(!rendered.contains("/proc/self/fd/"));
+            assert!(!rendered.contains("/dev/fd/"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_coordination_and_companion_state_follow_retained_output_after_replacement() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path.clone());
+        request.actions.post.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        request.album_batch = Some(AlbumBatchContext::new(
+            new_conversion_log_batch_id(),
+            1,
+            request.output_root.join("Album"),
+            source_path.parent().expect("source parent").to_path_buf(),
+        ));
+        // Production dispatch always authors the track identity contract for
+        // single-file batch items; drain recovery requires it.
+        request.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+        std::fs::create_dir_all(&request.output_root).expect("output root");
+        let retained = PipelineOutputCapability::capture_for_actions(&request)
+            .expect("capture output capability")
+            .expect("configured action retains output root");
+
+        let moved_output = temp.path().join("retained-output");
+        std::fs::rename(&request.output_root, &moved_output).expect("rename output root");
+        std::fs::create_dir_all(&request.output_root).expect("replacement output root");
+
+        let runtime_output = retained
+            .capability
+            .descriptor_path()
+            .expect("descriptor output route");
+        let stable_coord = conversion_log_batch_coordination_album_dir(&request)
+            .expect("stable coordination path");
+        let relative_coord = stable_coord
+            .strip_prefix(&request.output_root)
+            .expect("coordination relative to stable output root");
+        let runtime_coord = runtime_output.join(relative_coord);
+        ensure_conversion_log_batch_workspace_owned_for_request_at(&request, &runtime_coord)
+            .expect("descriptor-bound batch workspace");
+        mark_companion_batch_finalization_pending_at_best_effort(
+            &request,
+            Some(&runtime_output),
+            "replacement test",
+        );
+
+        assert!(moved_output
+            .join(relative_coord)
+            .join(CONVERSION_LOG_BATCH_WORKSPACE_STATE_FILE)
+            .is_file());
+        let pending_relative = companion_batch_pending_finalization_path_at(
+            &request,
+            Some(&runtime_output),
+        )
+        .expect("pending path")
+        .strip_prefix(&runtime_output)
+        .expect("pending relative path")
+        .to_path_buf();
+        assert!(moved_output.join(&pending_relative).is_file());
+        assert!(!request.output_root.join(relative_coord).exists());
+        assert!(!request.output_root.join(pending_relative).exists());
+    }
 
     #[test]
     fn existing_directory_source_root_is_not_promoted_to_parent() {
@@ -19271,6 +24476,7 @@ mod companion_copy_hardening_tests {
 
     fn test_request(root: &Path, container: PathBuf) -> PipelineRequest {
         PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "companion-test-job".to_string(),
             item_id: "companion-test-item".to_string(),
             container,
@@ -19333,6 +24539,716 @@ mod companion_copy_hardening_tests {
             container_ffmpeg_flags: Vec::new(),
             companion: CompanionCopyPolicy::default(),
         }
+    }
+
+    #[test]
+    fn actionless_publish_preflight_stages_only_recoverable_identity_invalidation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let request = test_request(temp.path(), source_path);
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+
+        assert!(request.actions.is_empty());
+        assert!(matches!(
+            acquire_album_action_authority_for_publish(&request, &album, None)
+                .expect("actionless preflight"),
+            AlbumActionPublishAuthority::NoActionsUntracked
+        ));
+        assert!(!album.join(CONVERSION_ACTION_IDENTITY_FILE).exists());
+        assert!(!album.join(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE).exists());
+        assert!(!album.join(".tonepoet-actions-manual").exists());
+        assert!(!request.output_root.join(".tonepoet-action-locks").exists());
+        assert!(!request
+            .output_root
+            .join(".tonepoet-action-lock-registry.lock")
+            .exists());
+    }
+
+    #[test]
+    fn actionless_publish_uses_existing_parent_authority_namespace() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let request = test_request(temp.path(), source_path);
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+        std::fs::create_dir_all(request.output_root.join(".tonepoet-action-locks"))
+            .expect("unrelated parent namespace");
+
+        assert!(matches!(
+            acquire_album_action_authority_for_publish(&request, &album, None)
+                .expect("unrelated namespace must not create per-album authority"),
+            AlbumActionPublishAuthority::NoActionsUntracked
+        ));
+        assert!(!album.join(CONVERSION_ACTION_IDENTITY_FILE).exists());
+        assert!(!album.join(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE).exists());
+        assert!(!album.join(".tonepoet-actions-manual").exists());
+    }
+
+    #[test]
+    fn action_enabled_republication_invalidates_old_identity_before_publish() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"new audio").expect("source");
+        let mut request = test_request(temp.path(), source_path);
+        request.actions.post.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+        std::fs::write(
+            album.join(CONVERSION_ACTION_IDENTITY_FILE),
+            b"old generation identity",
+        )
+        .expect("seed identity");
+
+        let authority = acquire_album_action_authority_for_publish(&request, &album, None)
+            .expect("action-enabled republication authority");
+        assert!(matches!(authority, AlbumActionPublishAuthority::Locked(_)));
+        assert!(
+            album.join(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE).is_file(),
+            "the old canonical identity must be durably invalidated before album mutation"
+        );
+        assert!(
+            acquire_explicit_action_run_lock_for_album(&album).is_err(),
+            "manual execution must remain serialized for the publication window"
+        );
+    }
+
+    #[tokio::test]
+    async fn actionless_republication_with_existing_identity_is_serialized_and_retires_it() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"new audio").expect("source");
+        let request = test_request(temp.path(), source_path);
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+        let identity = album.join(CONVERSION_ACTION_IDENTITY_FILE);
+        std::fs::write(&identity, b"stale prior identity").expect("seed identity");
+
+        let mut authority = acquire_album_action_authority_for_publish(&request, &album, None)
+            .expect("actionless republication authority");
+        assert!(matches!(
+            &authority,
+            AlbumActionPublishAuthority::NoActionsLocked {
+                retire_identity_after_publish: true,
+                ..
+            }
+        ));
+        assert!(
+            acquire_explicit_action_run_lock_for_album(&album).is_err(),
+            "manual execution must remain serialized for the full publication window"
+        );
+
+        let source = prepared_source_from_dispatch_metadata(
+            &request,
+            SourceKind::SingleFile,
+            TrackMetadata::default(),
+        );
+        let published = PublishedAlbum {
+            album_dir: album.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+        let cancellation = CancellationToken::new();
+        assert!(
+            execute_post_actions_stage(
+                &request,
+                &source,
+                None,
+                &published,
+                &mut authority,
+                PostActionGate::Ready,
+                true,
+                &reporter,
+                &cancellation,
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            !identity.exists(),
+            "successful actionless republication must retire stale canonical action identity"
+        );
+        assert!(
+            !album.join(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE).exists(),
+            "successful publication must retire its durable invalidation marker"
+        );
+
+        drop(authority);
+        acquire_explicit_action_run_lock_for_album(&album)
+            .expect("manual authority becomes available only after publication releases it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actionless_preflight_accepts_symlinked_configured_output_root_with_shared_authority() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let real_output = temp.path().join("real-output");
+        std::fs::create_dir_all(real_output.join("Album")).expect("real album");
+        let alias = temp.path().join("output-alias");
+        symlink(&real_output, &alias).expect("output alias");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path);
+        request.output_root = alias.clone();
+
+        assert!(matches!(
+            acquire_album_action_authority_for_publish(&request, &alias.join("Album"), None)
+                .expect("symlinked actionless output root remains valid"),
+            AlbumActionPublishAuthority::NoActionsUntracked
+        ));
+        assert!(!real_output.join(".tonepoet-action-locks").exists());
+        assert!(!real_output
+            .join(".tonepoet-action-lock-registry.lock")
+            .exists());
+        assert!(!real_output
+            .join("Album")
+            .join(CONVERSION_ACTION_IDENTITY_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn actionless_preflight_detects_existing_active_manual_lock_without_new_album_artifacts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let request = test_request(temp.path(), source_path);
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+        let _manual = acquire_explicit_action_run_lock_for_album(&album)
+            .expect("seed existing manual authority");
+
+        assert!(matches!(
+            acquire_album_action_authority_for_publish(&request, &album, None)
+                .expect("empty-pipeline preflight must retain the historical path"),
+            AlbumActionPublishAuthority::NoActionsUntracked
+        ));
+        assert!(!album.join(CONVERSION_ACTION_IDENTITY_FILE).exists());
+        assert!(!album.join(".tonepoet-actions-manual").exists());
+    }
+
+
+    #[test]
+    fn actionless_publish_preflight_changes_only_identity_invalidation_authority() {
+        fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+            fn walk(root: &Path, current: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+                let mut entries = std::fs::read_dir(current)
+                    .expect("read tree")
+                    .map(|entry| entry.expect("tree entry"))
+                    .collect::<Vec<_>>();
+                entries.sort_by_key(|entry| entry.file_name());
+                for entry in entries {
+                    let path = entry.path();
+                    let relative = path.strip_prefix(root).expect("relative").to_path_buf();
+                    let file_type = entry.file_type().expect("file type");
+                    if file_type.is_dir() {
+                        out.push((relative.clone(), Vec::new()));
+                        walk(root, &path, out);
+                    } else if file_type.is_file() {
+                        out.push((relative, std::fs::read(path).expect("file bytes")));
+                    }
+                }
+            }
+            let mut result = Vec::new();
+            walk(root, root, &mut result);
+            result
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let request = test_request(temp.path(), source_path);
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(album.join("disc 01")).expect("album tree");
+        std::fs::write(album.join("disc 01/01.flac"), b"published-audio").expect("audio");
+        std::fs::write(album.join("cover.jpg"), b"artwork").expect("artwork");
+        let before = snapshot(&album);
+
+        assert!(matches!(
+            acquire_album_action_authority_for_publish(&request, &album, None)
+                .expect("actionless preflight"),
+            AlbumActionPublishAuthority::NoActionsUntracked
+        ));
+
+        let after = snapshot(&album);
+        assert_eq!(after, before);
+        assert!(!album.join(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE).exists());
+        assert!(!album.join(CONVERSION_ACTION_IDENTITY_FILE).exists());
+        assert!(!album.join(".tonepoet-actions-manual").exists());
+    }
+
+    #[test]
+    fn actionless_album_batch_ownership_does_not_create_action_drain_state() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path.clone());
+        let album = request.output_root.join("Album");
+        request.album_batch = Some(AlbumBatchContext::new(
+            new_conversion_log_batch_id(),
+            1,
+            album,
+            source_path.parent().expect("source parent").to_path_buf(),
+        ));
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&request)
+            .expect("ordinary conversion-log ownership");
+        let coordination = conversion_log_batch_coordination_album_dir(&request)
+            .expect("coordination directory");
+        assert!(coordination.is_dir());
+        assert!(!conversion_log_batch_drain_dir(&coordination).exists());
+        assert!(!conversion_log_batch_drain_manifest_path(&coordination).exists());
+        assert!(!coordination.join(CONVERSION_ACTION_IDENTITY_FILE).exists());
+    }
+
+    #[test]
+    fn flat_layout_action_preflight_creates_no_action_authority() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path.clone());
+        std::fs::create_dir_all(&request.output_root).expect("flat output root");
+        request.actions.post.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        request.album_batch = Some(AlbumBatchContext::new(
+            new_conversion_log_batch_id(),
+            1,
+            request.output_root.clone(),
+            source_path.parent().expect("source parent").to_path_buf(),
+        ));
+
+        let authority = acquire_album_action_authority_for_publish(
+            &request,
+            &request.output_root,
+            None,
+        )
+        .expect("flat layout is skipped rather than locked");
+        assert!(matches!(
+            authority,
+            AlbumActionPublishAuthority::FlatLayoutSkipped { .. }
+        ));
+        assert!(!request
+            .output_root
+            .join(CONVERSION_ACTION_IDENTITY_FILE)
+            .exists());
+        assert!(!request.output_root.join(".tonepoet-actions-manual").exists());
+        assert!(!request.output_root.join(".tonepoet-action-locks").exists());
+        assert!(!request
+            .output_root
+            .join(".tonepoet-action-lock-registry.lock")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn flat_layout_pre_actions_skip_before_journal_or_lock_creation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path.clone());
+        std::fs::create_dir_all(&request.output_root).expect("flat output root");
+        request.actions.pre.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        request.album_batch = Some(AlbumBatchContext::new(
+            new_conversion_log_batch_id(),
+            1,
+            request.output_root.clone(),
+            source_path.parent().expect("source parent").to_path_buf(),
+        ));
+        let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+        let cancellation = CancellationToken::new();
+
+        let record = execute_pre_actions_stage(&request, None, &reporter, &cancellation).await;
+        assert_eq!(record.outcome, StageOutcome::Skipped);
+        assert!(!request.output_root.join("Created").exists());
+        assert!(!request.output_root.join(".tonepoet-actions-manual").exists());
+        assert!(!request.output_root.join(".tonepoet-action-locks").exists());
+        assert!(!action_coordination_dir(&request).exists());
+    }
+
+    #[tokio::test]
+    async fn flat_layout_post_actions_skip_before_identity_or_journal_creation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path.clone());
+        request.naming.per_album_subdir = false;
+        std::fs::create_dir_all(&request.output_root).expect("flat output root");
+        request.actions.post.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        let mut authority = acquire_album_action_authority_for_publish(
+            &request,
+            &request.output_root,
+            None,
+        )
+        .expect("flat action authority decision");
+        let source = prepared_source_from_dispatch_metadata(
+            &request,
+            SourceKind::SingleFile,
+            TrackMetadata::default(),
+        );
+        let published = PublishedAlbum {
+            album_dir: request.output_root.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+        let cancellation = CancellationToken::new();
+
+        let record = execute_post_actions_stage(
+            &request,
+            &source,
+            None,
+            &published,
+            &mut authority,
+            PostActionGate::Ready,
+            true,
+            &reporter,
+            &cancellation,
+        )
+        .await
+        .expect("visible flat-layout skip stage");
+        assert_eq!(record.outcome, StageOutcome::Skipped);
+        assert!(!request.output_root.join("Created").exists());
+        assert!(!request
+            .output_root
+            .join(CONVERSION_ACTION_IDENTITY_FILE)
+            .exists());
+        assert!(!request.output_root.join(".tonepoet-actions-manual").exists());
+        assert!(!request.output_root.join(".tonepoet-action-locks").exists());
+    }
+
+    #[test]
+    fn flat_layout_batch_ownership_creates_no_action_drain_manifest() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path.clone());
+        std::fs::create_dir_all(&request.output_root).expect("flat output root");
+        request.actions.post.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        request.album_batch = Some(AlbumBatchContext::new(
+            new_conversion_log_batch_id(),
+            1,
+            request.output_root.clone(),
+            source_path.parent().expect("source parent").to_path_buf(),
+        ));
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&request)
+            .expect("ordinary conversion-log workspace remains available");
+        let coordination = conversion_log_batch_coordination_album_dir(&request)
+            .expect("coordination directory");
+        assert!(!conversion_log_batch_drain_manifest_path(&coordination).exists());
+        assert!(!conversion_log_batch_drain_dir(&coordination).exists());
+        assert!(!request
+            .output_root
+            .join(CONVERSION_ACTION_IDENTITY_FILE)
+            .exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn post_script_runs_after_publication_lock_release_under_action_authority() {
+        use crate::convert::pipeline::actions::RunScriptAction;
+        use std::os::unix::fs::PermissionsExt;
+
+        // The supervisor re-execs the production binary; a libtest main
+        // cannot serve that role. Same value in every test => idempotent.
+        let helper = std::env::current_exe()
+            .expect("current test executable")
+            .parent()
+            .and_then(|deps| deps.parent())
+            .map(|debug| debug.join("tonepoet"))
+            .expect("derive production binary path");
+        if !helper.is_file() {
+            eprintln!("skipping: production binary not built at {}", helper.display());
+            return;
+        }
+        std::env::set_var("TONEPOET_SCRIPT_SUPERVISOR_HELPER", &helper);
+        let flock_available = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v flock >/dev/null 2>&1")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !flock_available {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path.clone());
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+        let publication_lock = request.output_root.join(".Album.lock");
+        let script_marker = temp.path().join("script-observed-unlocked-publication.marker");
+        let environment_marker = temp.path().join("script-album-environment.txt");
+        let script = temp.path().join("probe-publication-lock.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\nexec 9>\"{}\"\nflock -n 9\nrm -f \"{}\"\nprintf ok > \"{}\"\nprintf %s \"$TONEPOET_ALBUM_DIR\" > \"{}\"\n",
+                publication_lock.display(),
+                publication_lock.display(),
+                script_marker.display(),
+                environment_marker.display(),
+            ),
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        request.actions.post.push(ConversionAction::Runscript(RunScriptAction {
+            script,
+            args: Vec::new(),
+            timeout_seconds: 30,
+            continue_on_error: false,
+        }));
+
+        let source = prepared_source_from_dispatch_metadata(
+            &request,
+            SourceKind::SingleFile,
+            TrackMetadata::default(),
+        );
+        let published = PublishedAlbum {
+            album_dir: album.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        let mut authority = acquire_album_action_authority_for_publish(&request, &album, None)
+            .expect("action authority");
+        let transition_album = published_album_bound_to_authority(
+            &published,
+            authority.lock().expect("locked authority"),
+        )
+        .expect("bound published album");
+        let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+        let cancellation = CancellationToken::new();
+
+        let record = execute_post_actions_stage(
+            &request,
+            &source,
+            None,
+            &transition_album,
+            &mut authority,
+            PostActionGate::Ready,
+            true,
+            &reporter,
+            &cancellation,
+        )
+        .await
+        .expect("post action stage");
+
+        let _ = env_logger::builder().is_test(true).try_init();
+        assert_eq!(record.outcome, StageOutcome::Ok);
+        assert!(
+            script_marker.is_file(),
+            "the script must be able to take the ordinary album publication lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&environment_marker).expect("album environment marker"),
+            album.to_string_lossy().to_string(),
+            "script environment must preserve the stable published album path while execution uses the retained descriptor-backed working directory"
+        );
+        assert!(
+            !request.output_root.join(".Album.actions.lock").exists(),
+            "action-execution authority must be retired after terminal completion"
+        );
+    }
+
+    #[test]
+    fn action_enabled_identity_persistence_remains_capability_bound() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path.clone());
+        request.actions.post.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+        let source = prepared_source_from_dispatch_metadata(
+            &request,
+            SourceKind::SingleFile,
+            TrackMetadata::default(),
+        );
+        let published = PublishedAlbum {
+            album_dir: album.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        let authority = acquire_album_action_authority_for_publish(&request, &album, None)
+            .expect("action-enabled authority");
+        let AlbumActionPublishAuthority::Locked(Some(lock)) = authority else {
+            panic!("action-enabled album must acquire a stable authority lock");
+        };
+        persist_conversion_action_identity_locked(&request, &source, &published, &lock)
+            .expect("persist canonical identity");
+        assert!(album.join(CONVERSION_ACTION_IDENTITY_FILE).is_file());
+    }
+
+    #[test]
+    fn actions_run_retires_identity_invalidated_by_interrupted_publication() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let mut request = test_request(temp.path(), source_path);
+        request.actions.post.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        let album = request.output_root.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+        let source = prepared_source_from_dispatch_metadata(
+            &request,
+            SourceKind::SingleFile,
+            TrackMetadata::default(),
+        );
+        let published = PublishedAlbum {
+            album_dir: album.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+        let lock = acquire_explicit_action_run_lock_for_album(&album)
+            .expect("manual identity authority");
+        persist_conversion_action_identity_locked(&request, &source, &published, &lock)
+            .expect("persist canonical identity");
+        stage_identity_invalidation_locked(&album, &lock)
+            .expect("stage interrupted-publication invalidation");
+
+        let error = conversion_action_explicit_identity_locked(&album, &lock)
+            .expect_err("invalidated identity must never be returned to :actions-run");
+        assert!(error.contains("interrupted publication invalidated"));
+        assert!(
+            !album.join(CONVERSION_ACTION_IDENTITY_FILE).exists(),
+            "the stale canonical identity must be retired"
+        );
+        assert!(
+            !album
+                .join(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE)
+                .exists(),
+            "the recovered invalidation marker must be retired after stale identity removal"
+        );
+    }
+
+    #[test]
+    fn pre_action_identity_tokens_are_exactly_canonical_output_tokens() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("Album.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        let request = test_request(temp.path(), source_path);
+        let source = prepared_source_from_dispatch_metadata(
+            &request,
+            SourceKind::SingleFile,
+            TrackMetadata::default(),
+        );
+
+        assert_eq!(
+            conversion_action_request_tokens(&request)
+                .expect("canonical pre-action identity"),
+            conversion_action_album_tokens(&source, &request.settings),
+            "pre-action identity must delegate to the canonical naming token builder"
+        );
+    }
+
+    #[test]
+    fn reviewed_identity_import_publishes_sidecar_backed_canonical_manual_identity() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let target = temp.path().join("published-album");
+        std::fs::create_dir_all(&target).expect("target");
+
+        let mut album_tokens: BTreeMap<String, String> = canonical_action_token_names()
+            .into_iter()
+            .map(|name| (name.to_string(), String::new()))
+            .collect();
+        album_tokens.insert("ARTIST".to_string(), "Deep Purple".to_string());
+        album_tokens.insert("ALBUM_ARTIST".to_string(), "Deep Purple".to_string());
+        album_tokens.insert("ALBUM".to_string(), "Nobody's Perfect".to_string());
+        album_tokens.insert("TITLE_EXTRA".to_string(), "Japan - SHM".to_string());
+        album_tokens.insert("YEAR".to_string(), "1988".to_string());
+        album_tokens.insert("FORMAT".to_string(), "flac".to_string());
+        album_tokens.insert("DISCNUMBER".to_string(), "1".to_string());
+        album_tokens.insert("NNDISCNUMBER".to_string(), "01".to_string());
+        album_tokens.insert("NNNDISCNUMBER".to_string(), "001".to_string());
+        album_tokens.insert("DISCTOTAL".to_string(), "2".to_string());
+        album_tokens.insert("DISC_FOLDER".to_string(), "disc 01".to_string());
+
+        let import_path = target.join(CONVERSION_ACTION_IDENTITY_IMPORT_FILE);
+        let payload = ConversionActionIdentityPayload {
+            schema_version: CONVERSION_ACTION_IDENTITY_SCHEMA_VERSION,
+            album_tokens: album_tokens.clone(),
+            disc_count: Some(2),
+        };
+        std::fs::write(
+            &import_path,
+            serde_json::to_vec_pretty(&payload).expect("serialize reviewed import"),
+        )
+        .expect("write reviewed import");
+
+        let imported = import_conversion_action_identity(&target, &import_path)
+            .expect("reviewed import must publish canonical sidecar");
+        let reread = conversion_action_explicit_identity(&target)
+            .expect("manual identity must come from the canonical sidecar");
+
+        assert_eq!(imported.album_tokens, album_tokens);
+        assert_eq!(reread.album_tokens, album_tokens);
+        assert_eq!(reread.disc_count, Some(2));
+        assert_eq!(reread.payload_sha256, imported.payload_sha256);
+        assert_eq!(
+            reread.album_identity,
+            format!("published:{}", reread.payload_sha256)
+        );
+        assert!(reread.album_tokens.contains_key("ALBUM_ARTIST"));
+        assert!(!reread.album_tokens.contains_key("ALBUMARTIST"));
+        assert!(conversion_action_identity_path(&target).is_file());
+    }
+
+    #[test]
+    fn destination_preview_contains_planned_audio_and_companion_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("01 - Track.flac");
+        std::fs::write(&source_path, b"audio").expect("source");
+        std::fs::write(temp.path().join("cover.jpg"), b"cover").expect("cover");
+        let mut request = test_request(temp.path(), source_path);
+        request.companion.extensions = vec![".jpg".to_string()];
+        let mut metadata = TrackMetadata {
+            title: Some("Track".to_string()),
+            artist: Some("Artist".to_string()),
+            album_artist: Some("Artist".to_string()),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+        metadata
+            .extra
+            .insert("album".to_string(), "Album".to_string());
+
+        let preview = conversion_action_destination_preview(&request, vec![metadata])
+            .expect("destination preview");
+
+        assert_eq!(preview.audio_count, 1);
+        assert_eq!(preview.companion_count, 1);
+        assert!(preview.entries.iter().any(|(path, is_dir)| {
+            !*is_dir && path.extension().and_then(|value| value.to_str()) == Some("jpg")
+        }));
+        assert!(preview.entries.iter().any(|(path, is_dir)| {
+            !*is_dir && path.extension().and_then(|value| value.to_str()) != Some("jpg")
+        }));
     }
 
     fn test_prepared_track(source_ref: TrackSourceRef) -> PreparedTrack {
@@ -20206,7 +26122,14 @@ mod companion_copy_hardening_tests {
             .expect("coordination dir");
         let identity = conversion_log_batch_identity(&req, &coord_dir, None)
             .expect("batch identity");
-        mark_conversion_log_batch_complete(&identity, 1).expect("durable completion marker");
+        // Production establishes workspace ownership during publish; the
+        // success-cleanup path requires it (dead-owner hardening).
+        ensure_conversion_log_batch_workspace_owned(
+            &coord_dir,
+            &identity.conversion_log_batch_id,
+        )
+        .expect("workspace ownership");
+        mark_conversion_log_batch_complete(&identity, 1, true).expect("durable completion marker");
         assert!(coord_dir.is_dir(), "workspace exists before the companion pass");
 
         let prepared = test_prepared_source(
@@ -20219,8 +26142,34 @@ mod companion_copy_hardening_tests {
             entries: Vec::new(),
             manifest_path: None,
         };
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
+        // The companion pass itself must NOT clean the live batch (the
+        // terminal protocol owns that); the workspace survives it.
+        assert!(
+            coord_dir.is_dir(),
+            "companion copy never cleans the current batch's workspace"
+        );
+
+        // Task-12 guarantee, expressed through the current terminal
+        // protocol: the last acknowledged terminal participant of a
+        // durably complete uncoordinated batch retires the workspace.
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &identity.conversion_log_batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("complete state");
+        assert!(
+            record_conversion_log_batch_participant_drained(&req)
+                .expect("terminal acknowledgment"),
+            "the only expected participant closes the drain gate"
+        );
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "uncoordinated last participant cleanup",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
         assert!(
             !coord_dir.exists(),
             "the last-finishing item of a durably complete uncoordinated batch cleans the workspace"
@@ -20241,13 +26190,18 @@ mod companion_copy_hardening_tests {
         let audio = source_dir.join("01.flac");
         std::fs::write(&audio, b"audio").expect("audio");
 
-        // A stale COMPLETED workspace from a dead "process" (generated-shape
-        // id whose owner cannot be alive).
+        // A stale COMPLETED workspace whose recorded owner is provably dead
+        // (ownership state written under a bogus boot identity).
         let stale_id = "tonepoet-log-batch-v1-ffffffff-deadbeef-1";
         let stale_dir = out
             .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
             .join(stale_id);
-        std::fs::create_dir_all(&stale_dir).expect("stale workspace");
+        super::publish_lock_soundness_tests::write_test_workspace_state_with_owner(
+            &stale_dir,
+            stale_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+            super::publish_lock_soundness_tests::provably_dead_local_test_owner(),
+        );
         std::fs::write(stale_dir.join("complete"), b"1\n").expect("stale marker");
 
         let mut req = test_request(temp.path(), audio.clone());
@@ -20273,7 +26227,7 @@ mod companion_copy_hardening_tests {
             entries: Vec::new(),
             manifest_path: None,
         };
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         assert!(
             !stale_dir.exists(),
@@ -20319,7 +26273,7 @@ mod companion_copy_hardening_tests {
             entries: Vec::new(),
             manifest_path: None,
         };
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         assert!(
             coord_dir.exists(),
@@ -20789,7 +26743,7 @@ mod companion_copy_hardening_tests {
             manifest_path: None,
         };
 
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         assert!(
             !dst.join("disc 01").join("disc1.log").exists(),
@@ -20854,7 +26808,7 @@ mod companion_copy_hardening_tests {
         .expect("stale temp");
 
         reset_album_batch_companion_scan_attempts();
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         let first_layout = sorted_relative_regular_files(&dst);
         assert!(
             !dst.join(COMPANION_BATCH_TRANSIENT_DIR).exists(),
@@ -20867,7 +26821,7 @@ mod companion_copy_hardening_tests {
         );
 
         reset_companion_batch_finalized_in_this_run_for_tests();
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         let rerun_layout = sorted_relative_regular_files(&dst);
         assert_eq!(
             first_layout, rerun_layout,
@@ -20882,7 +26836,7 @@ mod companion_copy_hardening_tests {
         );
 
         std::fs::remove_dir_all(&source_dir).expect("source removed after in-run finalization");
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         let second_layout = sorted_relative_regular_files(&dst);
 
         assert_eq!(rerun_layout, second_layout, "rerunning companion finalization in the same process must be idempotent");
@@ -20946,7 +26900,7 @@ mod companion_copy_hardening_tests {
         seed_companion_batch_disc_destinations(&req, &[(1, cd1.clone()), (2, cd2.clone())]);
 
         reset_album_batch_companion_scan_attempts();
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         for root in [&cd1, &cd2] {
             assert_eq!(
@@ -20993,7 +26947,7 @@ mod companion_copy_hardening_tests {
         );
 
         reset_album_batch_companion_scan_attempts();
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         assert!(
             !companion_batch_finalized_in_this_run(companion_batch_finalization_key(&req, &published, req.album_batch.as_ref().expect("album batch")).as_str()),
             "failed or interrupted batch companion scans must not record successful in-run finalization"
@@ -21008,7 +26962,7 @@ mod companion_copy_hardening_tests {
         std::fs::write(&audio, b"audio").expect("audio");
         std::fs::write(source_dir.join("disc 01").join("rip.log"), b"log").expect("log");
 
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         assert_eq!(
             std::fs::read(dst.join("disc 01").join("rip.log")).expect("copied log"),
             b"log"
@@ -21059,7 +27013,7 @@ mod companion_copy_hardening_tests {
         let key = companion_batch_finalization_key(&req, &published, req.album_batch.as_ref().expect("album batch"));
 
         reset_album_batch_companion_scan_attempts();
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         assert_eq!(
             std::fs::read(dst_disc1.join("rip.log")).expect("destination retained"),
@@ -21073,7 +27027,7 @@ mod companion_copy_hardening_tests {
         assert_eq!(album_batch_companion_scan_attempts(), 1);
 
         std::fs::remove_dir_all(&source_dir).expect("source removed before retry");
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         assert_eq!(
             album_batch_companion_scan_attempts(),
             2,
@@ -21125,7 +27079,7 @@ mod companion_copy_hardening_tests {
         );
 
         reset_album_batch_companion_scan_attempts();
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         assert!(!transient_dir.join(COMPANION_BATCH_LEGACY_COMPLETION_MARKER_FILE).exists());
         assert!(!transient_dir.join(".album-batch.done.tonepoet-copy.1.2.tmp").exists());
@@ -21167,7 +27121,7 @@ mod companion_copy_hardening_tests {
         );
 
         reset_album_batch_companion_scan_attempts();
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         assert_eq!(album_batch_companion_scan_attempts(), 1);
         assert!(dst.join("disc 01").join("rip.log").is_file());
         assert!(
@@ -21184,7 +27138,7 @@ mod companion_copy_hardening_tests {
             &req_with_m3u,
             &[(1, dst.join("disc 01")), (2, dst.join("disc 02"))],
         );
-        copy_companion_artifacts_after_publish_best_effort(&req_with_m3u, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req_with_m3u, &prepared, None, &published, None);
         assert_eq!(
             album_batch_companion_scan_attempts(),
             2,
@@ -21196,7 +27150,7 @@ mod companion_copy_hardening_tests {
         );
 
         std::fs::remove_dir_all(&source_dir).expect("source removed after updated in-run finalization");
-        copy_companion_artifacts_after_publish_best_effort(&req_with_m3u, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req_with_m3u, &prepared, None, &published, None);
         assert_eq!(
             album_batch_companion_scan_attempts(),
             2,
@@ -21237,14 +27191,14 @@ mod companion_copy_hardening_tests {
         );
 
         reset_album_batch_companion_scan_attempts();
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         assert_eq!(album_batch_companion_scan_attempts(), 1);
         assert_eq!(
             std::fs::read(dst.join("disc 01").join("rip.log")).expect("copied log"),
             b"log"
         );
 
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         assert_eq!(
             album_batch_companion_scan_attempts(),
             1,
@@ -21278,7 +27232,7 @@ mod companion_copy_hardening_tests {
             &fresh_attempt_req,
             &[(1, dst.join("disc 01")), (2, dst.join("disc 02"))],
         );
-        copy_companion_artifacts_after_publish_best_effort(&fresh_attempt_req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&fresh_attempt_req, &prepared, None, &published, None);
         assert_eq!(
             album_batch_companion_scan_attempts(),
             2,
@@ -21289,7 +27243,7 @@ mod companion_copy_hardening_tests {
             b"new log"
         );
 
-        copy_companion_artifacts_after_publish_best_effort(&fresh_attempt_req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&fresh_attempt_req, &prepared, None, &published, None);
         assert_eq!(
             album_batch_companion_scan_attempts(),
             2,
@@ -21340,7 +27294,7 @@ mod companion_copy_hardening_tests {
             &[(1, dst.join("disc 01")), (2, dst.join("disc 02"))],
         );
 
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         assert_eq!(std::fs::read(dst.join("disc 01").join("disc1.cue")).expect("disc1 cue"), b"cue1");
         assert_eq!(std::fs::read(dst.join("disc 02").join("disc2.cue")).expect("disc2 cue"), b"cue2");
@@ -21416,7 +27370,7 @@ mod companion_copy_hardening_tests {
             manifest_path: None,
         };
 
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         assert_eq!(std::fs::read(dst.join("rip.log")).expect("copied log"), b"log");
     }
@@ -21477,7 +27431,7 @@ mod companion_copy_hardening_tests {
             .expect("silent-signal batch coordination dir");
         let fragment_dir = conversion_log_fragment_dir(&coord_dir);
         std::fs::create_dir_all(&fragment_dir).expect("fragment dir represents incomplete hidden batch state");
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
         assert!(
             !dst.join("disc 01").join("disc1.log").exists(),
             "with conversion logs disabled, hidden fragments still gate companion finalization"
@@ -21490,9 +27444,9 @@ mod companion_copy_hardening_tests {
         let _ = std::fs::remove_dir_all(&fragment_dir);
         let identity = conversion_log_batch_identity(&req, &coord_dir, None)
             .expect("silent-signal batch identity");
-        mark_conversion_log_batch_complete(&identity, 2).expect("silent completion marker");
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, Some(&artifacts1), &published);
-        copy_companion_artifacts_after_publish_best_effort(&req2, &prepared, Some(&artifacts2), &published);
+        mark_conversion_log_batch_complete(&identity, 2, true).expect("silent completion marker");
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, Some(&artifacts1), &published, None);
+        copy_companion_artifacts_after_publish_best_effort(&req2, &prepared, Some(&artifacts2), &published, None);
         assert_eq!(std::fs::read(dst.join("disc 01").join("disc1.log")).expect("disc 1 companion"), b"log1");
         assert_eq!(std::fs::read(dst.join("disc 02").join("disc2.log")).expect("disc 2 companion"), b"log2");
     }
@@ -21529,7 +27483,7 @@ mod companion_copy_hardening_tests {
             manifest_path: None,
         };
 
-        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published);
+        copy_companion_artifacts_after_publish_best_effort(&req, &prepared, None, &published, None);
 
         assert_eq!(
             std::fs::read(dst.join("rip.log")).expect("copied log"),
@@ -21918,6 +27872,42 @@ mod companion_copy_hardening_tests {
 }
 
 
+fn action_reports_have_terminal_post_phase(reports: &[ActionPhaseReport]) -> bool {
+    reports.iter().any(|report| {
+        report.phase == Some(ActionPhase::Post) && !report.recovery_required
+    })
+}
+
+fn action_reports_require_recovery(reports: &[ActionPhaseReport]) -> bool {
+    reports.iter().any(|report| report.recovery_required)
+}
+
+fn conversion_log_batch_action_lifecycle_allows_cleanup(req: &PipelineRequest) -> bool {
+    let Some(coord_dir) = conversion_log_batch_coordination_album_dir(req) else {
+        return false;
+    };
+    conversion_log_batch_action_lifecycle_allows_cleanup_at(req, &coord_dir)
+}
+
+fn conversion_log_batch_action_lifecycle_allows_cleanup_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> bool {
+    if !conversion_log_batch_is_durably_complete_at(req, coord_dir) {
+        return false;
+    }
+    match conversion_log_batch_post_actions_are_terminal_at(req, coord_dir) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch cleanup preserved unreadable or conflicting post-action lifecycle authority for {}: {error}",
+                req.item_id
+            );
+            false
+        }
+    }
+}
+
 fn pipeline_report_manifest_path(published: &Option<PublishedAlbum>) -> Option<std::path::PathBuf> {
     published
         .as_ref()
@@ -21931,7 +27921,30 @@ async fn finalize_report(
     plan: Option<AlbumPlan>,
     artifacts: Option<ArtifactSet>,
     published: Option<PublishedAlbum>,
+    outcome: AlbumOutcome,
+) -> PipelineReport {
+    finalize_report_with_binding(
+        req,
+        reporter,
+        source,
+        plan,
+        artifacts,
+        published,
+        outcome,
+        None,
+    )
+    .await
+}
+
+async fn finalize_report_with_binding(
+    req: &PipelineRequest,
+    reporter: &dyn PipelineReporter,
+    source: Option<PreparedSource>,
+    plan: Option<AlbumPlan>,
+    artifacts: Option<ArtifactSet>,
+    published: Option<PublishedAlbum>,
     mut outcome: AlbumOutcome,
+    binding: Option<PublicationCapabilityBinding>,
 ) -> PipelineReport {
     let item_id = req.item_id.clone();
     let mut durable_log = None;
@@ -21959,19 +27972,28 @@ async fn finalize_report(
             scratch_retry_intent: None,
             settings_fingerprint: Some(settings_fingerprint),
             manifest_path: pipeline_report_manifest_path(&published),
+            action_reports: collect_durable_action_reports_with_binding(req, source.as_ref(), published.as_ref(), binding.as_ref()),
         };
         // Write the log alongside the album artifacts when possible,
         // fall back to the configured log root for blocked/failed jobs.
         let effective_log = match &published {
             Some(album) => LogPolicy {
-                root: album.album_dir.clone(),
+                root: binding
+                    .as_ref()
+                    .and_then(|binding| binding.io_path(&album.album_dir).ok())
+                    .unwrap_or_else(|| album.album_dir.clone()),
                 ..req.log.clone()
             },
             None => req.log.clone(),
         };
         match write_durable_log(&report_to_write, &effective_log) {
             Ok(path) => {
-                durable_log = Some(path);
+                durable_log = Some(
+                    binding
+                        .as_ref()
+                        .map(|binding| binding.stable_path(&path))
+                        .unwrap_or(path),
+                );
                 outcome = logged_outcome;
                 emit_stage_finished(reporter, &item_id, ok_record).await;
             }
@@ -22010,6 +28032,114 @@ async fn finalize_report(
         .emit(PipelineEvent::Terminal { item_id, status })
         .await;
 
+    let action_reports = collect_durable_action_reports_with_binding(req, source.as_ref(), published.as_ref(), binding.as_ref());
+    let coordination_io_dir = binding
+        .as_ref()
+        .and_then(|binding| binding.coordination_dir(req).ok());
+
+    // A non-successful batch cannot enter post actions. Commit that terminal
+    // decision explicitly so the durable lifecycle gate can distinguish it
+    // from a successful batch whose elected post action has not run yet. For
+    // successful batches, retry a missing terminal marker when the durable
+    // action report proves that the post phase itself reached a terminal
+    // result. Marker failure remains fail-closed and prevents cleanup.
+    if req.album_batch.is_some()
+        && !req.actions.post.is_empty()
+        && conversion_actions_effective_for_request(req).unwrap_or(false)
+        && !action_reports_require_recovery(&action_reports)
+    {
+        let completion_status = coordination_io_dir
+            .as_deref()
+            .map(|coord_dir| conversion_log_batch_completion_status_at(req, coord_dir))
+            .unwrap_or_else(|| conversion_log_batch_completion_status(req));
+        let should_mark_terminal = match completion_status {
+            ConversionLogBatchCompletionStatus::NonSuccessful => true,
+            ConversionLogBatchCompletionStatus::Successful => {
+                action_reports_have_terminal_post_phase(&action_reports)
+            }
+            ConversionLogBatchCompletionStatus::Incomplete
+            | ConversionLogBatchCompletionStatus::Invalid => false,
+        };
+        if should_mark_terminal {
+            let terminal_result = match coordination_io_dir.as_deref() {
+                Some(coord_dir) => mark_conversion_log_batch_post_actions_terminal_at(req, coord_dir),
+                None => mark_conversion_log_batch_post_actions_terminal(req),
+            };
+            if let Err(error) = terminal_result {
+                log::warn!(
+                    "conversion-log batch could not commit terminal post-action lifecycle authority for {}: {error}",
+                    req.item_id
+                );
+            }
+        }
+    }
+
+    if !conversion_actions_effective_for_request(req).unwrap_or(true) {
+        // Preserve the no-effective-actions lifecycle exactly: no action drain manifest,
+        // no acknowledgments, no post-action terminal marker. Once the ordinary
+        // batch registry and durable completion state say the batch is done,
+        // use the actionless cleanup branch.
+        if req.album_batch.is_some()
+            && coordination_io_dir
+                .as_deref()
+                .map(|coord_dir| conversion_log_batch_is_durably_complete_at(req, coord_dir))
+                .unwrap_or_else(|| conversion_log_batch_is_durably_complete(req))
+        {
+            match coordination_io_dir.as_deref() {
+                Some(coord_dir) => cleanup_conversion_log_batch_coordination_after_success_best_effort_at(
+                    req,
+                    coord_dir,
+                    "terminal actionless report",
+                ),
+                None => cleanup_conversion_log_batch_coordination_after_success_best_effort(
+                    req,
+                    "terminal actionless report",
+                ),
+            }
+        }
+    } else {
+        let participant_drain_complete = if req.album_batch.is_some()
+            && !action_reports_require_recovery(&action_reports)
+        {
+            let drain_result = match coordination_io_dir.as_deref() {
+                Some(coord_dir) => record_conversion_log_batch_participant_drained_at(req, coord_dir),
+                None => record_conversion_log_batch_participant_drained(req),
+            };
+            match drain_result {
+                Ok(complete) => complete,
+                Err(error) => {
+                    log::warn!(
+                        "conversion-log batch participant drain acknowledgment failed for {}: {error}",
+                        req.item_id
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let durable_complete = coordination_io_dir
+            .as_deref()
+            .map(|coord_dir| conversion_log_batch_is_durably_complete_at(req, coord_dir))
+            .unwrap_or_else(|| conversion_log_batch_is_durably_complete(req));
+        let lifecycle_complete = coordination_io_dir
+            .as_deref()
+            .map(|coord_dir| conversion_log_batch_action_lifecycle_allows_cleanup_at(req, coord_dir))
+            .unwrap_or_else(|| conversion_log_batch_action_lifecycle_allows_cleanup(req));
+        if participant_drain_complete && durable_complete && lifecycle_complete {
+            match coordination_io_dir.as_deref() {
+                Some(coord_dir) => cleanup_conversion_log_batch_coordination_after_success_best_effort_at(
+                    req,
+                    coord_dir,
+                    "terminal report participant drain",
+                ),
+                None => cleanup_conversion_log_batch_coordination_after_success_best_effort(
+                    req,
+                    "terminal report participant drain",
+                ),
+            }
+        }
+    }
     PipelineReport {
         request: RedactedPipelineRequest::from(req),
         source,
@@ -22021,6 +28151,7 @@ async fn finalize_report(
         durable_log,
         scratch_retry_intent: None,
         settings_fingerprint: Some(settings_fingerprint),
+        action_reports,
     }
 }
 
@@ -22031,9 +28162,11 @@ async fn finalize_report(
 /// Aggregate per-track records + stage records into an `AlbumOutcome`.
 ///
 /// Rules:
-/// - A `StageRecord` with `StageOutcome::Failed` always blocks ->
-///   `Blocked` with `RequiredStageFailure`. Disabled stages reach
-///   aggregation as `StageOutcome::Skipped` and never block.
+/// - A conversion-stage `StageRecord` with `StageOutcome::Failed` blocks ->
+///   `Blocked` with `RequiredStageFailure`. `PostActions` is explicitly
+///   non-blocking after successful publication: its failed record remains in
+///   a `Complete` outcome and maps to `CompletedWithActionErrors`. Disabled
+///   stages reach aggregation as `StageOutcome::Skipped` and never block.
 /// - Otherwise, with no failed tracks -> `Complete`.
 /// - With failed tracks: `FailAlbumOnAnyTrackFailure` -> `Blocked`
 ///   (`TrackFailures`); `AllowPartialAlbum` -> `Partial`.
@@ -22048,8 +28181,11 @@ pub fn aggregate_album_outcome(
 
     if let Some(failed_stage) = stages
         .iter()
-        .find(|s| matches!(s.outcome, StageOutcome::Failed(_)))
-        .map(|s| s.stage)
+        .find(|record| {
+            record.stage != PipelineStage::PostActions
+                && matches!(record.outcome, StageOutcome::Failed(_))
+        })
+        .map(|record| record.stage)
     {
         return AlbumOutcome::Blocked {
             successful,
@@ -22082,8 +28218,8 @@ pub fn aggregate_album_outcome(
 }
 
 /// Map a finished `AlbumOutcome` to a terminal `ConversionStatus`.
-/// `Complete` -> `Completed`, `Partial` -> `Partial`, `Blocked` ->
-/// `Failed`.
+/// `Complete` -> `Completed` or `CompletedWithActionErrors`, `Partial` ->
+/// `Partial`, and `Blocked` -> `Failed`.
 pub fn map_album_outcome(
     outcome: &AlbumOutcome,
     published: Option<&PublishedAlbum>,
@@ -22093,10 +28229,29 @@ pub fn map_album_outcome(
     let log_path = durable_log.map(|p| p.to_path_buf());
 
     match outcome {
-        AlbumOutcome::Complete { .. } => ConversionStatus::Completed {
-            output_path,
-            log_path,
-        },
+        AlbumOutcome::Complete { stages, .. } => {
+            let errors = stages
+                .iter()
+                .filter_map(|record| match (&record.stage, &record.outcome) {
+                    (PipelineStage::PostActions, StageOutcome::Failed(error)) => {
+                        Some(error.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if errors.is_empty() {
+                ConversionStatus::Completed {
+                    output_path,
+                    log_path,
+                }
+            } else {
+                ConversionStatus::CompletedWithActionErrors {
+                    output_path,
+                    log_path,
+                    errors,
+                }
+            }
+        }
         AlbumOutcome::Partial {
             successful, failed, ..
         } => ConversionStatus::Partial {
@@ -22115,6 +28270,53 @@ pub fn map_album_outcome(
                 None => format!("album blocked: {:?}", reason),
             };
             ConversionStatus::Failed { error, log_path }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod post_action_status_regressions {
+    use super::*;
+
+    #[test]
+    fn completed_album_with_failed_post_action_has_explicit_terminal_warning_status() {
+        let output = PathBuf::from("/tmp/published-album");
+        let log = PathBuf::from("/tmp/published-album/conversion.log");
+        let outcome = aggregate_album_outcome(
+            Vec::new(),
+            vec![stage_record(
+                PipelineStage::PostActions,
+                StageOutcome::Failed("post action pipeline completed with errors".to_string()),
+            )],
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+        );
+        assert!(
+            matches!(outcome, AlbumOutcome::Complete { .. }),
+            "post-action failure must never reclassify published audio as blocked"
+        );
+        let published = PublishedAlbum {
+            album_dir: output.clone(),
+            entries: Vec::new(),
+            manifest_path: None,
+        };
+
+        match map_album_outcome(&outcome, Some(&published), Some(&log)) {
+            ConversionStatus::CompletedWithActionErrors {
+                output_path,
+                log_path,
+                errors,
+            } => {
+                assert_eq!(output_path, output);
+                assert_eq!(log_path, Some(log));
+                assert_eq!(
+                    errors,
+                    vec!["post action pipeline completed with errors".to_string()]
+                );
+            }
+            other => panic!(
+                "failed post actions must remain visible without blocking published audio; got {other:?}"
+            ),
         }
     }
 }
@@ -22585,6 +28787,21 @@ fn render_folder_template_with_track<T: TemplateRenderTarget + ?Sized>(
     track: Option<&PreparedTrack>,
     target: &T,
 ) -> PathBuf {
+    let tokens = folder_template_token_map(template, source, track, target);
+    let rendered = render_template_with_tokens(template, &tokens, None, &source.album_metadata.extra);
+    path_from_template_components(&rendered)
+}
+
+/// Build the canonical album-scope token map used by both output naming and
+/// conversion actions. Keeping this construction in one function is
+/// load-bearing: actions must consume the exact resolved identity and
+/// sanitization rules that selected the published album path.
+fn folder_template_token_map<T: TemplateRenderTarget + ?Sized>(
+    template: &str,
+    source: &PreparedSource,
+    track: Option<&PreparedTrack>,
+    target: &T,
+) -> BTreeMap<String, String> {
     let artist = source
         .album_metadata
         .album_artist
@@ -22643,9 +28860,925 @@ fn render_folder_template_with_track<T: TemplateRenderTarget + ?Sized>(
     tokens.insert("BITDEPTH".to_string(), bit_depth);
     tokens.insert("EXT".to_string(), String::new());
     insert_disc_template_tokens(&mut tokens, source, track);
+    tokens
+}
 
-    let rendered = render_template_with_tokens(template, &tokens, None, &source.album_metadata.extra);
-    path_from_template_components(&rendered)
+const ACTION_IDENTITY_TEMPLATE: &str = "%ARTIST%/%ALBUM_ARTIST%/%ALBUM%/%TITLE_EXTRA%/%YEAR%/%GENRE%/%CATALOG%/%FORMAT%/%SAMPLERATE%/%BITDEPTH%/%DISCNUMBER%/%NNDISCNUMBER%/%NNNDISCNUMBER%/%DISCTOTAL%/%DISC_FOLDER%";
+
+pub(crate) fn conversion_action_album_tokens(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> BTreeMap<String, String> {
+    folder_template_token_map(
+        ACTION_IDENTITY_TEMPLATE,
+        source,
+        None,
+        settings,
+    )
+}
+
+/// Pre actions run before materialization, but their identity must still be
+/// produced by the canonical output-naming token builder. Build the same
+/// dispatcher-resolved synthetic source used by destination preflight, then
+/// delegate to `conversion_action_album_tokens`; no second token derivation is
+/// permitted here.
+pub(crate) fn conversion_action_request_tokens(
+    req: &PipelineRequest,
+) -> Result<BTreeMap<String, String>, ActionError> {
+    let source_kind = detect_source_kind(req).map_err(|error| {
+        ActionError::UnsafePath(format!(
+            "cannot resolve canonical pre-action source identity: {error}"
+        ))
+    })?;
+    let source = prepared_source_from_dispatch_metadata(
+        req,
+        source_kind,
+        TrackMetadata::default(),
+    );
+    Ok(conversion_action_album_tokens(&source, &req.settings))
+}
+
+/// Durable canonical identity exported by a successful conversion for later
+/// explicit `:actions-run` use. The payload is exactly the canonical token map
+/// used by post actions; manual execution never reconstructs identity from the
+/// directory name or mutable TUI metadata.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ConversionActionIdentityPayload {
+    schema_version: u8,
+    album_tokens: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disc_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ConversionActionIdentityRecord {
+    payload: ConversionActionIdentityPayload,
+    payload_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConversionActionExplicitIdentity {
+    pub(crate) album_tokens: BTreeMap<String, String>,
+    pub(crate) disc_count: Option<u32>,
+    pub(crate) payload_sha256: String,
+    pub(crate) run_identity: String,
+    pub(crate) album_identity: String,
+}
+
+fn conversion_action_identity_path(album_dir: &Path) -> PathBuf {
+    album_dir.join(CONVERSION_ACTION_IDENTITY_FILE)
+}
+
+fn canonical_action_token_names() -> BTreeSet<&'static str> {
+    [
+        "ARTIST",
+        "ALBUM_ARTIST",
+        "ALBUM",
+        "TITLE_EXTRA",
+        "YEAR",
+        "GENRE",
+        "CATALOG",
+        "FORMAT",
+        "SAMPLERATE",
+        "BITDEPTH",
+        "EXT",
+        "DISCNUMBER",
+        "NNDISCNUMBER",
+        "NNNDISCNUMBER",
+        "DISCTOTAL",
+        "DISC_FOLDER",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn validate_conversion_action_identity_record(
+    record: &ConversionActionIdentityRecord,
+) -> Result<(), String> {
+    if record.payload.schema_version != CONVERSION_ACTION_IDENTITY_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported action identity schema {}",
+            record.payload.schema_version
+        ));
+    }
+    let token_names: BTreeSet<_> = record
+        .payload
+        .album_tokens
+        .keys()
+        .map(String::as_str)
+        .collect();
+    if token_names != canonical_action_token_names()
+        || record.payload.album_tokens.contains_key("ALBUMARTIST")
+    {
+        return Err("action identity does not contain the exact canonical token set".to_string());
+    }
+    if record
+        .payload
+        .album_tokens
+        .get("ALBUM")
+        .map_or(true, |value| value.trim().is_empty())
+    {
+        return Err("action identity has an empty canonical ALBUM token".to_string());
+    }
+    if record.payload.disc_count == Some(0) {
+        return Err("action identity has an invalid zero disc count".to_string());
+    }
+    let bytes = serde_json::to_vec(&record.payload)
+        .map_err(|error| format!("could not serialize action identity payload: {error}"))?;
+    if super::manifest::sha256_hex(&bytes) != record.payload_sha256 {
+        return Err("action identity payload checksum mismatch".to_string());
+    }
+    Ok(())
+}
+
+fn conversion_action_identity_record(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+) -> Result<ConversionActionIdentityRecord, String> {
+    let disc_count = source
+        .album_metadata
+        .total_discs
+        .or_else(|| {
+            request_batch_resolved_identity(req)
+                .and_then(|identity| identity.total_discs)
+        })
+        .filter(|value| *value > 0);
+    let payload = ConversionActionIdentityPayload {
+        schema_version: CONVERSION_ACTION_IDENTITY_SCHEMA_VERSION,
+        album_tokens: conversion_action_album_tokens(source, &req.settings),
+        disc_count,
+    };
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|error| format!("could not serialize action identity payload: {error}"))?;
+    Ok(ConversionActionIdentityRecord {
+        payload,
+        payload_sha256: super::manifest::sha256_hex(&bytes),
+    })
+}
+
+fn stage_identity_invalidation_locked(
+    album_dir: &Path,
+    identity_lock: &ExplicitActionRunLock,
+) -> Result<(), String> {
+    identity_lock
+        .validate_album_dir(album_dir)
+        .map_err(|error| format!("identity invalidation does not hold matching authority: {error}"))?;
+    let album = identity_lock
+        .album_capability()
+        .map_err(|error| format!("could not retain album for identity invalidation: {error}"))?;
+    if album
+        .read_regular_child_optional(std::ffi::OsStr::new(
+            CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE,
+        ))
+        .map_err(|error| format!("could not inspect identity invalidation marker: {error}"))?
+        .is_none()
+    {
+        album
+            .write_regular_child_create_new_durable(
+                std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE),
+                b"album-publication-invalidates-canonical-identity\n",
+                0o600,
+            )
+            .map_err(|error| format!("could not persist identity invalidation marker: {error}"))?;
+    }
+    Ok(())
+}
+
+fn clear_identity_invalidation_marker_locked(
+    _album_dir: &Path,
+    identity_lock: &ExplicitActionRunLock,
+) -> Result<(), String> {
+    // The retained authority itself is the capability proof. Reopening a
+    // lexical album path here would reintroduce the parent-replacement race
+    // after publication has already committed through the descriptor route.
+    let album = identity_lock
+        .album_capability()
+        .map_err(|error| format!("could not retain album for identity invalidation cleanup: {error}"))?;
+    if let Some((_, marker_identity)) = album
+        .read_regular_child_optional(std::ffi::OsStr::new(
+            CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE,
+        ))
+        .map_err(|error| format!("could not inspect identity invalidation marker: {error}"))?
+    {
+        album
+            .remove_regular_child_if_identity(
+                std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE),
+                marker_identity,
+            )
+            .map_err(|error| format!("could not retire identity invalidation marker: {error}"))?;
+    }
+    Ok(())
+}
+
+fn recover_identity_invalidation_locked(
+    album_dir: &Path,
+    identity_lock: &ExplicitActionRunLock,
+) -> Result<bool, String> {
+    identity_lock
+        .validate_album_dir(album_dir)
+        .map_err(|error| format!("identity invalidation recovery lacks matching authority: {error}"))?;
+    let album = identity_lock
+        .album_capability()
+        .map_err(|error| format!("could not retain album for identity invalidation recovery: {error}"))?;
+    let Some((_, marker_identity)) = album
+        .read_regular_child_optional(std::ffi::OsStr::new(
+            CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE,
+        ))
+        .map_err(|error| format!("could not inspect identity invalidation marker: {error}"))?
+    else {
+        return Ok(false);
+    };
+    if let Some((_, identity)) = album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE))
+        .map_err(|error| format!("could not inspect invalidated canonical identity: {error}"))?
+    {
+        album
+            .remove_regular_child_if_identity(
+                std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE),
+                identity,
+            )
+            .map_err(|error| format!("could not retire invalidated canonical identity: {error}"))?;
+    }
+    album
+        .remove_regular_child_if_identity(
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE),
+            marker_identity,
+        )
+        .map_err(|error| format!("could not retire identity invalidation marker: {error}"))?;
+    Ok(true)
+}
+
+fn retire_conversion_action_identity_locked(
+    _published: &PublishedAlbum,
+    identity_lock: &ExplicitActionRunLock,
+) -> Result<(), String> {
+    let _album_dir = identity_lock.canonical_album_dir().to_path_buf();
+    let album = identity_lock
+        .album_capability()
+        .map_err(|error| format!("could not retain republished album capability: {error}"))?;
+    ensure_album_capability_has_no_unresolved_explicit_state(&album).map_err(|error| {
+        format!(
+            "stale identity retirement refused unresolved manual recovery authority: {error}"
+        )
+    })?;
+    if album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_TEMP_FILE))
+        .map_err(|error| format!("could not inspect action identity write authority: {error}"))?
+        .is_some()
+    {
+        return Err(
+            "an unresolved canonical identity write temporary requires recovery".to_string(),
+        );
+    }
+    if let Some((_, identity)) = album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE))
+        .map_err(|error| format!("could not inspect stale canonical identity: {error}"))?
+    {
+        album
+            .remove_regular_child_if_identity(
+                std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE),
+                identity,
+            )
+            .map_err(|error| format!("could not retire stale canonical identity: {error}"))?;
+    }
+    if let Some((_, marker_identity)) = album
+        .read_regular_child_optional(std::ffi::OsStr::new(
+            CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE,
+        ))
+        .map_err(|error| format!("could not inspect identity invalidation marker: {error}"))?
+    {
+        album
+            .remove_regular_child_if_identity(
+                std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_INVALIDATION_FILE),
+                marker_identity,
+            )
+            .map_err(|error| format!("could not retire identity invalidation marker: {error}"))?;
+    }
+    Ok(())
+}
+
+fn persist_conversion_action_identity_locked(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    _published: &PublishedAlbum,
+    identity_lock: &ExplicitActionRunLock,
+) -> Result<(), String> {
+    let album_dir = identity_lock.canonical_album_dir().to_path_buf();
+    match conversion_action_album_scope(req, &album_dir)? {
+        ConversionActionAlbumScope::ProperSubdirectory => {}
+        ConversionActionAlbumScope::Disabled => {
+            return Err(
+                "canonical action identity must not be persisted for an empty action pipeline"
+                    .to_string(),
+            );
+        }
+        ConversionActionAlbumScope::FlatLayoutSkipped { reason } => {
+            return Err(format!(
+                "canonical action identity must not be persisted for a flat output layout: {reason}"
+            ));
+        }
+    }
+    let album = identity_lock
+        .album_capability()
+        .map_err(|error| format!("could not retain published album capability: {error}"))?;
+    let record = conversion_action_identity_record(req, source)?;
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| format!("could not serialize action identity: {error}"))?;
+
+    ensure_album_capability_has_no_unresolved_explicit_state(&album).map_err(|error| {
+        format!(
+            "canonical action identity changed while unresolved manual recovery authority exists: {error}"
+        )
+    })?;
+
+    let existing = album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE))
+        .map_err(|error| format!("could not read canonical action identity through album capability: {error}"))?;
+    if let Some((existing_bytes, _)) = existing.as_ref() {
+        let existing_record: ConversionActionIdentityRecord = serde_json::from_slice(existing_bytes)
+            .map_err(|error| format!("could not parse canonical action identity: {error}"))?;
+        validate_conversion_action_identity_record(&existing_record)?;
+        if existing_record == record {
+            clear_identity_invalidation_marker_locked(&album_dir, identity_lock)?;
+            return Ok(());
+        }
+    }
+    if album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_TEMP_FILE))
+        .map_err(|error| format!("could not inspect action identity write authority: {error}"))?
+        .is_some()
+    {
+        return Err("an unresolved canonical identity write temporary requires recovery".to_string());
+    }
+    let temporary_identity = album
+        .write_regular_child_create_new_durable(
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_TEMP_FILE),
+            &bytes,
+            0o600,
+        )
+        .map_err(|error| format!("could not stage canonical action identity: {error}"))?;
+    let publish_result = match existing {
+        Some((_, destination_identity)) => album.replace_regular_child(
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_TEMP_FILE),
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE),
+            temporary_identity,
+            Some(destination_identity),
+        ),
+        None => album.publish_regular_child_no_clobber(
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_TEMP_FILE),
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE),
+            temporary_identity,
+        ),
+    };
+    publish_result.map_err(|error| format!("could not publish canonical action identity: {error}"))?;
+    clear_identity_invalidation_marker_locked(&album_dir, identity_lock)
+}
+
+fn conversion_action_explicit_identity_from_record(
+    record: ConversionActionIdentityRecord,
+) -> ConversionActionExplicitIdentity {
+    ConversionActionExplicitIdentity {
+        album_tokens: record.payload.album_tokens,
+        disc_count: record.payload.disc_count,
+        payload_sha256: record.payload_sha256.clone(),
+        run_identity: format!("manual-published:{}", record.payload_sha256),
+        album_identity: format!("published:{}", record.payload_sha256),
+    }
+}
+
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
+pub(crate) fn conversion_action_explicit_identity(
+    target: &Path,
+) -> Result<ConversionActionExplicitIdentity, String> {
+    let lock = acquire_explicit_action_run_lock_for_album(target)
+        .map_err(|error| format!("could not acquire canonical identity authority: {error}"))?;
+    let canonical_target = lock.canonical_album_dir().to_path_buf();
+    conversion_action_explicit_identity_locked(&canonical_target, &lock)
+}
+
+pub(crate) fn conversion_action_explicit_identity_locked(
+    target: &Path,
+    lock: &ExplicitActionRunLock,
+) -> Result<ConversionActionExplicitIdentity, String> {
+    lock.validate_album_dir(target)
+        .map_err(|error| format!("canonical identity reader does not hold matching album authority: {error}"))?;
+    if recover_identity_invalidation_locked(target, lock)? {
+        return Err(format!(
+            ":actions-run refused stale canonical identity for {} because an interrupted publication invalidated it. The invalid identity was retired; republish the album or review and import a new canonical identity before retrying",
+            target.display()
+        ));
+    }
+    let album = lock
+        .album_capability()
+        .map_err(|error| format!("could not retain album capability while reading canonical identity: {error}"))?;
+    let (bytes, _) = album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE))
+        .map_err(|error| format!("could not read canonical action identity safely: {error}"))?
+        .ok_or_else(|| format!(
+            ":actions-run requires canonical album identity at {}. For a pre-feature album, review an identity import and run :actions-identity-import",
+            target.join(CONVERSION_ACTION_IDENTITY_FILE).display()
+        ))?;
+    let record: ConversionActionIdentityRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("could not parse canonical action identity: {error}"))?;
+    validate_conversion_action_identity_record(&record)?;
+    Ok(conversion_action_explicit_identity_from_record(record))
+}
+
+/// Explicit, reviewable migration path for albums published before canonical
+/// action identity sidecars existed. The import document is the payload only:
+/// `{ "schema_version": 1, "album_tokens": { ... }, "disc_count": 2 }`.
+/// Tonepoet validates the exact canonical token set, computes the checksum, and
+/// publishes the normal sidecar while holding the same lock as `:actions-run`.
+pub(crate) fn import_conversion_action_identity(
+    target: &Path,
+    import_path: &Path,
+) -> Result<ConversionActionExplicitIdentity, String> {
+    let target = target.canonicalize().map_err(|error| {
+        format!("cannot resolve identity-import target {}: {error}", target.display())
+    })?;
+    if !target.is_dir() || target.parent().is_none() {
+        return Err(format!(
+            "identity-import target must be a non-root album directory: {}",
+            target.display()
+        ));
+    }
+    let import_path = if import_path.is_absolute() {
+        import_path.to_path_buf()
+    } else {
+        target.join(import_path)
+    };
+    let manual_lock = acquire_explicit_action_run_lock_for_album(&target)
+        .map_err(|error| format!("could not acquire shared action-identity/manual-run lock: {error}"))?;
+    let canonical_target = manual_lock.canonical_album_dir().to_path_buf();
+    let _recovered_invalidation =
+        recover_identity_invalidation_locked(&canonical_target, &manual_lock)?;
+    let album = manual_lock
+        .album_capability()
+        .map_err(|error| format!("could not retain identity-import album capability: {error}"))?;
+    if album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE))
+        .map_err(|error| format!("could not inspect canonical action identity: {error}"))?
+        .is_some()
+    {
+        return Err(format!(
+            "canonical action identity already exists at {}; import refuses to replace it",
+            canonical_target.join(CONVERSION_ACTION_IDENTITY_FILE).display()
+        ));
+    }
+    if album
+        .read_regular_child_optional(std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_TEMP_FILE))
+        .map_err(|error| format!("could not inspect canonical identity temporary: {error}"))?
+        .is_some()
+    {
+        return Err("identity import found an unresolved canonical identity write temporary".to_string());
+    }
+    ensure_album_capability_has_no_unresolved_explicit_state(&album).map_err(|error| {
+        format!(
+            "identity import refused while unresolved manual action authority exists: {error}"
+        )
+    })?;
+    let bytes = read_regular_file_no_follow(&import_path).map_err(|error| {
+        format!("could not read reviewed identity import {} safely: {error}", import_path.display())
+    })?;
+    let payload: ConversionActionIdentityPayload = serde_json::from_slice(&bytes).map_err(|error| {
+        format!("could not parse reviewed identity import {}: {error}", import_path.display())
+    })?;
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|error| format!("could not serialize reviewed identity payload: {error}"))?;
+    let record = ConversionActionIdentityRecord {
+        payload,
+        payload_sha256: super::manifest::sha256_hex(&payload_bytes),
+    };
+    validate_conversion_action_identity_record(&record)?;
+    let record_bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| format!("could not serialize canonical action identity: {error}"))?;
+    let temporary_identity = album
+        .write_regular_child_create_new_durable(
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_TEMP_FILE),
+            &record_bytes,
+            0o600,
+        )
+        .map_err(|error| format!("could not stage canonical action identity: {error}"))?;
+    album
+        .publish_regular_child_no_clobber(
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_TEMP_FILE),
+            std::ffi::OsStr::new(CONVERSION_ACTION_IDENTITY_FILE),
+            temporary_identity,
+        )
+        .map_err(|error| format!("could not publish canonical action identity: {error}"))?;
+    Ok(conversion_action_explicit_identity_from_record(record))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConversionActionDestinationPreview {
+    pub(crate) album_dir: PathBuf,
+    /// Paths relative to `album_dir`; `true` denotes a directory placeholder.
+    pub(crate) entries: Vec<(PathBuf, bool)>,
+    pub(crate) album_tokens: BTreeMap<String, String>,
+    pub(crate) disc_count: Option<u32>,
+    pub(crate) audio_count: usize,
+    pub(crate) companion_count: usize,
+    pub(crate) omitted_other_album_roots: usize,
+}
+
+/// Simulate the post-publish filesystem presented to conversion actions.
+/// This calls the real output planner and the same companion selection policy;
+/// it never creates the configured output directory or copies source data.
+pub(crate) fn conversion_action_destination_preview(
+    req: &PipelineRequest,
+    track_metadata: Vec<TrackMetadata>,
+) -> Result<ConversionActionDestinationPreview, String> {
+    let source_kind = detect_source_kind(req).map_err(|error| error.to_string())?;
+    let metadata = if track_metadata.is_empty() {
+        vec![TrackMetadata::default()]
+    } else {
+        track_metadata
+    };
+    let mut source = prepared_source_from_dispatch_metadata(
+        req,
+        source_kind,
+        metadata.first().cloned().unwrap_or_default(),
+    );
+    source.tracks = metadata
+        .into_iter()
+        .enumerate()
+        .map(|(index, metadata)| {
+            let track_number = metadata
+                .track_number
+                .filter(|value| *value > 0)
+                .unwrap_or(index as u32 + 1);
+            PreparedTrack {
+                id: TrackId {
+                    source_ordinal: index as u32 + 1,
+                    disc_number: metadata.disc_number,
+                    track_number,
+                },
+                source_ref: TrackSourceRef::StagedFile(req.container.clone()),
+                metadata,
+                expected_samples: None,
+                sample_rate: None,
+                source_audio: SourceAudioDescriptor::default(),
+                bit_depth: None,
+            }
+        })
+        .collect();
+    source.album_metadata.total_tracks = source.tracks.len() as u32;
+    source.album_metadata.total_discs = source
+        .album_metadata
+        .total_discs
+        .or_else(|| source.tracks.iter().filter_map(|track| track.metadata.disc_number).max());
+    apply_batch_identity_and_request_metadata(&mut source, req);
+
+    let plan = plan_outputs(&source, req).map_err(|error| error.to_string())?;
+    let album_dir = normalize_path(&plan.album_dir);
+    let album_roots = if plan.album_dirs.is_empty() {
+        vec![album_dir.clone()]
+    } else {
+        plan.album_dirs.iter().map(|path| normalize_path(path)).collect()
+    };
+    let omitted_other_album_roots = album_roots
+        .iter()
+        .filter(|root| **root != album_dir)
+        .count();
+    let mut entries = BTreeMap::<PathBuf, bool>::new();
+    let mut audio_count = 0usize;
+    for output in &plan.entries {
+        let output = normalize_path(&output.final_path);
+        if let Ok(relative) = output.strip_prefix(&album_dir) {
+            entries.insert(relative.to_path_buf(), false);
+            audio_count += 1;
+        }
+    }
+
+    let mut companion_count = 0usize;
+    if !req.companion.is_empty() {
+        if let Some(source_dir) = companion_source_dir(req, &source) {
+            let extensions = normalized_companion_extension_set(&req.companion.extensions);
+            let folders = normalized_companion_folder_set(&req.companion.folders);
+            let excludes = normalized_companion_exclude_file_set(&req.companion.exclude_files);
+            let skips = companion_source_file_skip_set(req, &source);
+            let disc_destinations = preview_disc_destinations(&source, &plan);
+            let destinations = companion_folder_destination_dirs(&album_dir, &album_roots);
+            let before = entries.len();
+            preview_companion_loose_files(
+                &source_dir,
+                &destinations,
+                &album_dir,
+                &extensions,
+                &excludes,
+                &skips,
+                &mut entries,
+            )?;
+            preview_nested_companion_files(
+                &source_dir,
+                &destinations,
+                &album_dir,
+                &extensions,
+                &excludes,
+                &folders,
+                &skips,
+                &disc_destinations,
+                &mut entries,
+            )?;
+            preview_companion_folders(
+                &source_dir,
+                &destinations,
+                &album_dir,
+                &folders,
+                &mut entries,
+            )?;
+            companion_count = entries.len().saturating_sub(before);
+        }
+    }
+
+    Ok(ConversionActionDestinationPreview {
+        album_dir,
+        entries: entries.into_iter().collect(),
+        album_tokens: conversion_action_album_tokens(&source, &req.settings),
+        disc_count: source.album_metadata.total_discs,
+        audio_count,
+        companion_count,
+        omitted_other_album_roots,
+    })
+}
+
+fn preview_disc_destinations(
+    source: &PreparedSource,
+    plan: &AlbumPlan,
+) -> BTreeMap<u32, PathBuf> {
+    let by_track = plan
+        .entries
+        .iter()
+        .filter_map(|entry| entry.final_path.parent().map(|parent| (entry.track_id.clone(), normalize_path(parent))))
+        .collect::<BTreeMap<_, _>>();
+    let mut destinations = BTreeMap::new();
+    for track in &source.tracks {
+        if let (Some(disc), Some(parent)) = (
+            track_disc_number_hint(source, track).filter(|value| *value > 0),
+            by_track.get(&track.id),
+        ) {
+            destinations.entry(disc).or_insert_with(|| parent.clone());
+        }
+    }
+    destinations
+}
+
+fn preview_insert_destination(
+    destination: &Path,
+    album_dir: &Path,
+    is_dir: bool,
+    entries: &mut BTreeMap<PathBuf, bool>,
+) {
+    let destination = normalize_path(destination);
+    if let Ok(relative) = destination.strip_prefix(album_dir) {
+        if !relative.as_os_str().is_empty() {
+            entries.insert(relative.to_path_buf(), is_dir);
+        }
+    }
+}
+
+fn preview_companion_loose_files(
+    source_dir: &Path,
+    destinations: &[PathBuf],
+    album_dir: &Path,
+    extensions: &BTreeSet<String>,
+    excludes: &BTreeSet<String>,
+    skips: &BTreeSet<PathBuf>,
+    entries: &mut BTreeMap<PathBuf, bool>,
+) -> Result<(), String> {
+    if extensions.is_empty() {
+        return Ok(());
+    }
+    let source_entries = fs::read_dir(source_dir)
+        .map_err(|error| format!("cannot scan companion source {}: {error}", source_dir.display()))?;
+    for entry in source_entries {
+        let entry = entry.map_err(|error| format!("cannot read companion directory entry: {error}"))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!("cannot inspect companion {}: {error}", entry.path().display())
+        })?;
+        if file_type.is_symlink() || !file_type.is_file() || skips.contains(&normalize_path(&entry.path())) {
+            continue;
+        }
+        let entry_path = entry.path();
+        let Some(extension) = entry_path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !extensions.contains(&format!(".{}", extension.to_ascii_lowercase())) {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| companion_exclude_matches(excludes, &name.to_ascii_lowercase()))
+        {
+            continue;
+        }
+        for destination in destinations {
+            preview_insert_destination(
+                &destination.join(entry.file_name()),
+                album_dir,
+                false,
+                entries,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn preview_nested_companion_files(
+    source_dir: &Path,
+    destinations: &[PathBuf],
+    album_dir: &Path,
+    extensions: &BTreeSet<String>,
+    excludes: &BTreeSet<String>,
+    folders: &BTreeSet<String>,
+    skips: &BTreeSet<PathBuf>,
+    disc_destinations: &BTreeMap<u32, PathBuf>,
+    entries: &mut BTreeMap<PathBuf, bool>,
+) -> Result<(), String> {
+    if extensions.is_empty() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source_dir)
+        .map_err(|error| format!("cannot scan companion source {}: {error}", source_dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read companion directory entry: {error}"))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!("cannot inspect companion {}: {error}", entry.path().display())
+        })?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if folders.contains(&companion_folder_match_key(&name)) {
+            continue;
+        }
+        let nested_destinations = if let Some(disc) = disc_number_from_template_component_name(&name) {
+            disc_destinations.get(&disc).cloned().into_iter().collect::<Vec<_>>()
+        } else if name.eq_ignore_ascii_case("extra") || name.eq_ignore_ascii_case("extras") {
+            destinations.iter().map(|destination| destination.join(&name)).collect()
+        } else {
+            Vec::new()
+        };
+        preview_companion_loose_files(
+            &entry.path(),
+            &nested_destinations,
+            album_dir,
+            extensions,
+            excludes,
+            skips,
+            entries,
+        )?;
+    }
+    Ok(())
+}
+
+fn preview_companion_folders(
+    source_dir: &Path,
+    destinations: &[PathBuf],
+    album_dir: &Path,
+    folders: &BTreeSet<String>,
+    entries: &mut BTreeMap<PathBuf, bool>,
+) -> Result<(), String> {
+    if folders.is_empty() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source_dir)
+        .map_err(|error| format!("cannot scan companion source {}: {error}", source_dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read companion directory entry: {error}"))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!("cannot inspect companion {}: {error}", entry.path().display())
+        })?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let entry_name = entry.file_name();
+        let Some(name) = entry_name.to_str() else {
+            continue;
+        };
+        if !folders.contains(&companion_folder_match_key(name)) {
+            continue;
+        }
+        for destination in destinations {
+            preview_companion_tree(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                album_dir,
+                entries,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn preview_companion_tree(
+    source: &Path,
+    destination: &Path,
+    album_dir: &Path,
+    entries: &mut BTreeMap<PathBuf, bool>,
+) -> Result<(), String> {
+    preview_insert_destination(destination, album_dir, true, entries);
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("cannot scan companion folder {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read companion folder entry: {error}"))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!("cannot inspect companion {}: {error}", entry.path().display())
+        })?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let child_destination = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            preview_companion_tree(&entry.path(), &child_destination, album_dir, entries)?;
+        } else if file_type.is_file() {
+            preview_insert_destination(&child_destination, album_dir, false, entries);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn conversion_action_render_template(
+    template: &str,
+    tokens: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    validate_template(template)?;
+    Ok(render_template_with_tokens(template, tokens, None, &BTreeMap::new()))
+}
+
+pub(crate) fn conversion_action_wildcard_matches(pattern: &str, name: &str) -> bool {
+    companion_wildcard_matches(
+        &pattern.to_ascii_lowercase(),
+        &name.to_ascii_lowercase(),
+    )
+}
+
+pub(crate) fn conversion_action_sanitize_component(value: &str) -> String {
+    sanitize_component(value)
+}
+
+/// Disc number from an EMBEDDED designator anywhere in a name (e.g.
+/// `Album (Japan) [Disc 01]`), not only a designator-prefixed component.
+/// The designator word must sit on a non-alphanumeric boundary so e.g.
+/// "acdc" never matches.
+fn disc_number_from_embedded_designator(name: &str) -> Option<u32> {
+    let lower = name.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for prefix in ["disc", "disk", "cd"] {
+        let mut search = 0;
+        while let Some(rel) = lower[search..].find(prefix) {
+            let start = search + rel;
+            search = start + prefix.len();
+            let boundary_ok = start == 0
+                || !bytes[start - 1].is_ascii_alphanumeric();
+            if !boundary_ok {
+                continue;
+            }
+            let rest = &lower[start + prefix.len()..];
+            let rest = rest.trim_start();
+            let rest = rest
+                .strip_prefix('-')
+                .or_else(|| rest.strip_prefix('_'))
+                .or_else(|| rest.strip_prefix('.'))
+                .unwrap_or(rest)
+                .trim_start();
+            let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            if let Ok(number) = digits.parse::<u32>() {
+                if number > 0 {
+                    return Some(number);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn conversion_action_disc_number_for_path(path: &Path) -> Option<u32> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|stem| {
+            disc_number_from_template_component_name(stem)
+                .or_else(|| disc_number_from_embedded_designator(stem))
+        })
+        .or_else(|| {
+            path.ancestors().skip(1).find_map(|ancestor| {
+                ancestor
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .and_then(disc_number_from_template_component_name)
+            })
+        })
+}
+
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
+pub(crate) fn conversion_action_path_is_under_root(path: &Path, root: &Path) -> bool {
+    path_is_under_root(path, root)
 }
 
 fn album_and_title_extra_for_template(
@@ -24623,21 +31756,38 @@ fn is_stale_publish_lock_candidate(name: &str, hidden_current: &str, legacy_curr
 }
 
 fn remove_unheld_lock_file_best_effort(path: &Path) {
-    let Ok(metadata) = fs::metadata(path) else {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
     };
-    if !metadata.is_file() {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return;
     }
 
-    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(path) else {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(file) = options.open(path) else {
         return;
     };
     match file.try_lock_exclusive() {
         Ok(()) => {
+            let held = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => return,
+            };
+            if !lock_handle_is_current(&held, path) {
+                return;
+            }
+            // Remove the directory entry while this exact inode remains
+            // exclusively locked. Unlock-before-unlink would strand a waiter
+            // on the old inode while a newcomer creates and locks a replacement.
+            remove_lock_path_best_effort(path);
             let _ = file.unlock();
             drop(file);
-            remove_lock_path_best_effort(path);
         }
         Err(err) if is_lock_contention(&err) => {}
         Err(err) => {
@@ -24647,16 +31797,22 @@ fn remove_unheld_lock_file_best_effort(path: &Path) {
 }
 
 fn acquire_publish_lock(album_dir: &Path) -> Result<AlbumPublishLock, PublishError> {
-    let hidden_lock_path = album_lock_path(album_dir);
-    let legacy_lock_path = legacy_album_lock_path(album_dir);
+    let parent = parent_dir_or_current(album_dir);
+    fs::create_dir_all(parent)
+        .map_err(PublishError::io_at("creating publish parent dir", parent))?;
+    let authority = acquire_blocking_album_publication_lock_for_album(album_dir).map_err(|error| {
+        PublishError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            format!("could not acquire descriptor-bound album publication lock: {error}"),
+        ))
+    })?;
 
-    // The album publish lock uses a stable hidden path only while publish is
-    // active. The path is removed when the guard drops so successful conversions
-    // do not leave user-visible internal artifacts behind.
-    let hidden = acquire_blocking_file_lock(&hidden_lock_path, true).map_err(PublishError::Io)?;
-    remove_lock_path_best_effort(&legacy_lock_path);
-
-    Ok(AlbumPublishLock { hidden: Some(hidden) })
+    // Best-effort cleanup of the pre-capability legacy spelling.  It is never
+    // used as authority by this build.
+    remove_lock_path_best_effort(&legacy_album_lock_path(album_dir));
+    Ok(AlbumPublishLock {
+        authority: Some(authority),
+    })
 }
 
 fn acquire_run_lock(
@@ -24721,12 +31877,14 @@ fn acquire_file_lock(lock_path: &Path, busy_message: &str) -> Result<FileLock, L
     let parent = parent_dir_or_current(lock_path);
     fs::create_dir_all(parent).map_err(LockAcquireError::Io)?;
     loop {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(lock_path)
-            .map_err(LockAcquireError::Io)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(lock_path).map_err(LockAcquireError::Io)?;
 
         match file.try_lock_exclusive() {
             Ok(()) => {
@@ -24755,11 +31913,14 @@ fn acquire_blocking_file_lock(lock_path: &Path, remove_on_drop: bool) -> io::Res
     let parent = parent_dir_or_current(lock_path);
     fs::create_dir_all(parent)?;
     loop {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(lock_path)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(lock_path)?;
 
         file.lock_exclusive()?;
         let held = file.metadata()?;
@@ -24779,6 +31940,7 @@ fn acquire_blocking_file_lock(lock_path: &Path, remove_on_drop: bool) -> io::Res
     }
 }
 
+#[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn album_lock_path(album_dir: &Path) -> PathBuf {
     match album_dir.file_name().and_then(|name| name.to_str()) {
         Some(name) => album_dir.with_file_name(format!(".{name}.lock")),
@@ -24827,13 +31989,13 @@ struct FileLock {
 }
 
 struct AlbumPublishLock {
-    hidden: Option<FileLock>,
+    authority: Option<ExplicitActionRunLock>,
 }
 
 impl Drop for AlbumPublishLock {
     fn drop(&mut self) {
-        if let Some(hidden) = self.hidden.take() {
-            drop(hidden);
+        if let Some(authority) = self.authority.take() {
+            drop(authority);
         }
     }
 }
@@ -25475,7 +32637,13 @@ fn stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
         // much more likely to be the final output filesystem, not scratch. Only
         // retry publish failures when the message explicitly names staging.root
         // above. Durable-log and output-planning failures are outside scratch.
-        PipelineStage::Publish | PipelineStage::DurableLog | PipelineStage::PlanOutputs => false,
+        // Action phases never write to scratch staging: pre-actions run
+        // against the source, post-actions against the published album dir.
+        PipelineStage::Publish
+        | PipelineStage::DurableLog
+        | PipelineStage::PlanOutputs
+        | PipelineStage::PreActions
+        | PipelineStage::PostActions => false,
     }
 }
 
@@ -25543,6 +32711,7 @@ fn retryable_scratch_failure_report_without_publication(
     outcome: AlbumOutcome,
 ) -> PipelineReport {
     let original_error = scratch_retry_original_error_from_outcome(&outcome);
+    let action_reports = collect_durable_action_reports(req, source.as_ref(), None);
     PipelineReport {
         request: RedactedPipelineRequest::from(req),
         source,
@@ -25554,6 +32723,7 @@ fn retryable_scratch_failure_report_without_publication(
         scratch_retry_intent: Some(ScratchRetryIntent { original_error }),
         settings_fingerprint: Some(tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings)),
         manifest_path: None,
+        action_reports,
     }
 }
 
@@ -26349,6 +33519,7 @@ mod pipeline_test_helpers {
 
     pub(super) fn log_test_request() -> PipelineRequest {
         PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-1".to_string(),
             item_id: "item-1".to_string(),
             container: PathBuf::from("/tmp/input.7z"),
@@ -27435,6 +34606,9 @@ mod naming_template_tests {
         generated_current_process_test_batch_id, generated_test_batch_id,
         write_fragment_json,
     };
+    use crate::convert::pipeline::actions::{
+        ConversionAction, CreateFolderAction, RunScriptAction,
+    };
 
     pub(super) fn template_source() -> PreparedSource {
         let mut album_extra = BTreeMap::new();
@@ -27489,6 +34663,7 @@ mod naming_template_tests {
 
     pub(super) fn template_request(folder_template: Option<String>) -> PipelineRequest {
         PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-test".to_string(),
             item_id: "item-test".to_string(),
             container: PathBuf::from("/tmp/container.7z"),
@@ -27624,6 +34799,69 @@ mod naming_template_tests {
             .expect("existing parent directory is not an album collision");
         assert_eq!(published.album_dir, plan.album_dir);
         assert!(plan.entries[0].final_path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn authority_bound_publish_cannot_be_redirected_after_revalidation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM% (%YEAR%)".to_string()));
+        req.output_root = temp.path().join("out");
+        let plan = plan_outputs(&source, &req).unwrap();
+        let original_parent = plan.album_dir.parent().expect("album parent").to_path_buf();
+        std::fs::create_dir_all(&original_parent).expect("original parent");
+
+        let staging = StagingDir::new(
+            temp.path().join("staging-capability-race"),
+            "publish-capability-race".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+        let publish_plan = build_publish_plan(&artifacts, &req, &plan.album_dir)
+            .expect("publish plan");
+        let authority = acquire_explicit_action_run_lock_for_album(&plan.album_dir)
+            .expect("descriptor-bound authority");
+
+        let retired_parent = temp.path().join("retained-original-parent");
+        let hook_parent = original_parent.clone();
+        let hook_retired = retired_parent.clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        let hook_fired = Arc::clone(&fired);
+        let staging_scope = staging.root.clone();
+        let _hook = set_publish_fault_hook_for_test(Box::new(move |candidate, _| {
+            if candidate.root == staging_scope && !hook_fired.swap(true, Ordering::SeqCst) {
+                std::fs::rename(&hook_parent, &hook_retired)
+                    .expect("replace lexical parent after authority revalidation");
+                std::fs::create_dir_all(&hook_parent).expect("replacement parent");
+            }
+            None
+        }));
+
+        publish_album_output_with_authority(
+            staging,
+            &publish_plan,
+            req.publish.clone(),
+            None,
+            Some(&authority),
+            false,
+            false,
+        )
+        .expect("publication stays rooted at retained parent capability");
+
+        let album_name = plan.album_dir.file_name().expect("album name");
+        let retained_album = retired_parent.join(album_name);
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(
+            retained_album.join("01 - Right Off.flac").is_file(),
+            "publication must mutate the parent object that owns the authority"
+        );
+        assert!(
+            !original_parent.join(album_name).exists(),
+            "replacement lexical parent must remain untouched"
+        );
     }
 
     #[test]
@@ -28115,6 +35353,125 @@ mod naming_template_tests {
         assert!(req.output_root.join("A Tribute to Jack Johnson (CD1)/01 - Disc One.flac").exists());
         assert!(req.output_root.join("A Tribute to Jack Johnson (CD2)/01 - Disc Two.flac").exists());
         assert!(!req.output_root.join("disc 01").exists());
+    }
+
+    #[test]
+    fn pre_only_actions_preserve_supported_multi_root_publication() {
+        use crate::convert::pipeline::actions::RunScriptAction;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (_source, mut req, plan, staging, artifacts) =
+            multi_root_template_fixture(&temp, "multi-root-pre-only-actions");
+        let script = temp.path().join("pre.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexit 0\n").expect("pre script");
+        req.actions.pre.push(ConversionAction::Runscript(RunScriptAction {
+            script,
+            args: Vec::new(),
+            timeout_seconds: 30,
+            continue_on_error: false,
+        }));
+        let retained_output = PipelineOutputCapability::capture_for_actions(&req)
+            .expect("capture action output capability")
+            .expect("configured pre action retains output root");
+        let mut authority = acquire_album_action_authority_for_plan(
+            &req,
+            &plan,
+            Some(&retained_output),
+        )
+        .expect("ordered multi-root authority");
+        assert!(matches!(
+            &authority,
+            AlbumActionPublishAuthority::MultiRootTransition {
+                post_skip_reason: None,
+                ..
+            }
+        ));
+
+        let published = publish_album_output_for_plan_with_authority(
+            staging,
+            &artifacts,
+            &req,
+            &plan,
+            req.publish.clone(),
+            None,
+            authority.lock(),
+            authority.multi_root_locks(),
+            authority.reject_late_action_authority(),
+        )
+        .expect("pre-only actions must not turn multi-root publication into PublishFailed");
+        assert_eq!(published.entries.len(), 2);
+        assert_eq!(
+            retire_multi_root_action_identities(&published, &authority)
+                .expect("retire any prior identities"),
+            None
+        );
+        authority.release_all_authority();
+        assert!(req
+            .output_root
+            .join("A Tribute to Jack Johnson (CD1)/01 - Disc One.flac")
+            .is_file());
+        assert!(req
+            .output_root
+            .join("A Tribute to Jack Johnson (CD2)/01 - Disc Two.flac")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn multi_root_post_actions_are_visibly_skipped_after_successful_publication() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (source, mut req, plan, staging, artifacts) =
+            multi_root_template_fixture(&temp, "multi-root-post-actions");
+        req.actions.post.push(ConversionAction::CreateFolder(CreateFolderAction {
+            path: PathBuf::from("Created"),
+            continue_on_error: false,
+        }));
+        let retained_output = PipelineOutputCapability::capture_for_actions(&req)
+            .expect("capture action output capability")
+            .expect("configured post action retains output root");
+        let mut authority = acquire_album_action_authority_for_plan(
+            &req,
+            &plan,
+            Some(&retained_output),
+        )
+        .expect("ordered multi-root authority");
+        let published = publish_album_output_for_plan_with_authority(
+            staging,
+            &artifacts,
+            &req,
+            &plan,
+            req.publish.clone(),
+            None,
+            authority.lock(),
+            authority.multi_root_locks(),
+            authority.reject_late_action_authority(),
+        )
+        .expect("multi-root payload publication succeeds before post-action policy");
+        let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+        let cancellation = CancellationToken::new();
+        let record = execute_post_actions_stage(
+            &req,
+            &source,
+            Some(&artifacts),
+            &published,
+            &mut authority,
+            PostActionGate::Ready,
+            true,
+            &reporter,
+            &cancellation,
+        )
+        .await
+        .expect("post-action policy is visible in the stage report");
+
+        assert_eq!(record.outcome, StageOutcome::Skipped);
+        assert!(req
+            .output_root
+            .join("A Tribute to Jack Johnson (CD1)/01 - Disc One.flac")
+            .is_file());
+        assert!(req
+            .output_root
+            .join("A Tribute to Jack Johnson (CD2)/01 - Disc Two.flac")
+            .is_file());
+        assert!(!req.output_root.join("Created").exists());
     }
 
     #[test]
@@ -29340,6 +36697,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         overwrite: OverwritePolicy,
     ) -> PipelineRequest {
         PipelineRequest {
+            actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-2-1-3".to_string(),
             item_id: format!("item-{:?}", policy),
             container: root.join("input.flac"),
@@ -29548,6 +36906,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             album: ScheduledAlbum {
                 req,
                 item_id: "item".to_string(),
+                action_output: None,
                 staging,
                 source,
                 plan,
@@ -31028,6 +38387,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_context_path: source_root,
             source_context_kind: "folder album batch".to_string(),
             target_format: "FLAC".to_string(),
+            runtime_coordination_dir: None,
         }
     }
 
@@ -31070,6 +38430,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 .to_string(),
             source_context_kind: source_context_kind.to_string(),
             target_format: req.settings.target_format.display_name().to_string(),
+            runtime_coordination_dir: None,
         }
     }
 
@@ -31983,6 +39344,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         (req, plan, published)
     }
 
+
+
     #[tokio::test]
     async fn per_disc_album_folder_independent_batch_uses_stable_completion_root_and_finalizes_companions() {
         let _global_state = companion_batch_global_state_test_lock();
@@ -32185,6 +39548,28 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         // durable OUTCOME is the cleaned workspace plus the rendered logs.
         let coord_dir = conversion_log_batch_coordination_album_dir(&req2)
             .expect("per-disc batch coordination dir");
+        // Companion finalization no longer cleans directly: retirement runs
+        // through the per-worker terminal protocol — same migration as the
+        // uncoordinated task-12 tests.
+        let terminal_batch_id = req2
+            .album_batch
+            .as_ref()
+            .expect("batch context")
+            .conversion_log_batch_id
+            .clone();
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &terminal_batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("terminal workspace status");
+        // Actionless batches never author drain authority; their cleanup
+        // authority skips the drain lifecycle entirely.
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "per-disc terminal cleanup",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwnerActionless,
+        );
         assert!(
             !coord_dir.exists(),
             "successful finalization cleans the per-dispatch coordination workspace"
@@ -34189,6 +41574,43 @@ Source-aware setting: yes
     }
 
     #[test]
+    fn dispatch_helper_rejects_mixed_action_lifecycle_contracts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let first = real_fragment_unbatched_request_with_track(
+            temp.path(),
+            "mixed-actions-a",
+            1,
+            None,
+            1,
+        );
+        let mut second = real_fragment_unbatched_request_with_track(
+            temp.path(),
+            "mixed-actions-b",
+            2,
+            None,
+            2,
+        );
+        second.actions.post.push(crate::convert::pipeline::ConversionAction::CreateFolder(
+            crate::convert::pipeline::CreateFolderAction {
+                path: PathBuf::from("after-conversion"),
+                continue_on_error: false,
+            },
+        ));
+
+        let error = prepare_independent_single_file_album_batch_for_dispatch(
+            vec![first, second],
+            real_fragment_album_dir(temp.path()),
+            real_fragment_source_root(temp.path()),
+        )
+        .expect_err("mixed action pipelines must never share one album batch");
+
+        assert!(
+            error.to_string().contains("incompatible action/lifecycle policy"),
+            "error should identify the lifecycle-contract mismatch: {error}"
+        );
+    }
+
+    #[test]
     fn explicit_deterministic_batch_id_is_rejected_by_dispatch_helper() {
         let temp = tempfile::tempdir().expect("temp dir");
         let err = prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
@@ -34512,7 +41934,15 @@ Source-aware setting: yes
         let batch_one = req_one.album_batch.as_ref().expect("first request album batch");
         let batch_two = req_two.album_batch.as_ref().expect("second request album batch");
         assert_eq!(batch_one.conversion_log_batch_id, generated_test_batch_id(batch_id));
-        assert_eq!(batch_one, batch_two);
+        // The batch IDENTITY is shared; `source_paths` is a per-dispatch
+        // participant inventory and this fixture synthesizes distinct peer
+        // files per call, so it is deliberately excluded from the equality.
+        assert_eq!(batch_one.conversion_log_batch_id, batch_two.conversion_log_batch_id);
+        assert_eq!(batch_one.expected_track_count, batch_two.expected_track_count);
+        assert_eq!(batch_one.album_output_dir, batch_two.album_output_dir);
+        assert_eq!(batch_one.source_grouping_root, batch_two.source_grouping_root);
+        assert_eq!(batch_one.source_context, batch_two.source_context);
+        assert_eq!(batch_one.resolved_identity(), batch_two.resolved_identity());
         assert_ne!(
             req_one.job_id, req_two.job_id,
             "per-track jobs may keep distinct job identifiers while sharing one conversion-log batch"
@@ -36300,7 +43730,9 @@ mod validate_encoded_output_tests {
 #[cfg(test)]
 mod publish_lock_soundness_tests {
     use super::*;
-    use super::chunk_2_1_3_postprocessing_gate_and_phase_tests::generated_current_process_test_batch_id;
+    use super::chunk_2_1_3_postprocessing_gate_and_phase_tests::{
+        generated_current_process_test_batch_id, generated_test_batch_id,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -36394,7 +43826,123 @@ mod publish_lock_soundness_tests {
             source_context_path: output_root.join("source").display().to_string(),
             source_context_kind: "folder".to_string(),
             target_format: "FLAC".to_string(),
+            runtime_coordination_dir: None,
         }
+    }
+
+    pub(super) fn provably_dead_local_test_owner() -> ProcessOwnerIdentity {
+        let mut owner = current_process_owner().expect("current owner");
+        release_current_process_owner_claim(&owner.claim_id);
+        owner.boot_identity = format!("dead-boot-{}", owner.boot_identity);
+        owner
+    }
+
+    pub(super) fn write_test_workspace_state_with_owner(
+        coord_dir: &Path,
+        batch_id: &str,
+        status: &str,
+        owner: ProcessOwnerIdentity,
+    ) {
+        std::fs::create_dir_all(coord_dir).expect("coord dir");
+        let state = ConversionLogBatchWorkspaceState {
+            schema_version: CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION,
+            batch_id: batch_id.to_string(),
+            owner: Some(owner),
+            owner_pid: None,
+            ownership_generation: 1,
+            previous_owner_claim_id: None,
+            status: status.to_string(),
+            cleanup_started_unix_ms: None,
+            updated_unix_ms: conversion_log_batch_workspace_updated_unix_ms(),
+        };
+        std::fs::write(
+            conversion_log_batch_workspace_state_path(coord_dir),
+            serde_json::to_vec_pretty(&state).expect("serialize workspace state"),
+        )
+        .expect("write workspace state");
+    }
+
+    fn write_test_batch_drain_authority(
+        coord_dir: &Path,
+        batch_id: &str,
+        expected_count: usize,
+        acknowledged_count: usize,
+    ) {
+        write_test_batch_drain_authority_with_post_actions(
+            coord_dir,
+            batch_id,
+            expected_count,
+            acknowledged_count,
+            false,
+        );
+    }
+
+    fn write_test_batch_drain_authority_with_post_actions(
+        coord_dir: &Path,
+        batch_id: &str,
+        expected_count: usize,
+        acknowledged_count: usize,
+        post_actions_required: bool,
+    ) {
+        assert!(acknowledged_count <= expected_count);
+        let drain_dir = conversion_log_batch_drain_dir(coord_dir);
+        std::fs::create_dir_all(&drain_dir).expect("drain dir");
+        let mut expected_participants = (0..expected_count)
+            .map(|index| {
+                super::super::manifest::sha256_hex(
+                    format!("test-participant-{batch_id}-{index}").as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected_participants.sort();
+        let manifest = ConversionLogBatchDrainManifest {
+            schema_version: CONVERSION_LOG_BATCH_DRAIN_SCHEMA_VERSION,
+            batch_id: batch_id.to_string(),
+            pipeline_sha256: super::super::manifest::sha256_hex(b"test-pipeline"),
+            post_actions_required,
+            expected_participants,
+        };
+        std::fs::write(
+            conversion_log_batch_drain_manifest_path(coord_dir),
+            serde_json::to_vec_pretty(&manifest).expect("serialize drain manifest"),
+        )
+        .expect("write drain manifest");
+        for participant_id in manifest
+            .expected_participants
+            .iter()
+            .take(acknowledged_count)
+        {
+            let ack = ConversionLogBatchDrainAck {
+                schema_version: CONVERSION_LOG_BATCH_DRAIN_SCHEMA_VERSION,
+                batch_id: batch_id.to_string(),
+                pipeline_sha256: manifest.pipeline_sha256.clone(),
+                participant_id: participant_id.clone(),
+            };
+            std::fs::write(
+                conversion_log_batch_drain_ack_path(coord_dir, participant_id),
+                serde_json::to_vec_pretty(&ack).expect("serialize drain ack"),
+            )
+            .expect("write drain ack");
+        }
+    }
+
+    fn write_test_post_action_terminal_authority(coord_dir: &Path, batch_id: &str) {
+        let manifest = read_conversion_log_batch_drain_manifest(coord_dir, batch_id)
+            .expect("read drain manifest");
+        assert!(
+            manifest.post_actions_required,
+            "post-action terminal authority requires a post-action batch manifest"
+        );
+        let terminal = ConversionLogBatchPostActionTerminal {
+            schema_version: CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_SCHEMA_VERSION,
+            batch_id: batch_id.to_string(),
+            pipeline_sha256: manifest.pipeline_sha256.clone(),
+        };
+        std::fs::write(
+            conversion_log_batch_post_action_terminal_path(coord_dir),
+            serde_json::to_vec_pretty(&terminal).expect("serialize terminal authority"),
+        )
+        .expect("write terminal authority");
     }
 
     fn v11_coordination_test_fragment(
@@ -36487,22 +44035,108 @@ mod publish_lock_soundness_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn visible_conversion_log_finalization_follows_retained_output_after_replacement() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = "tonepoet-log-batch-v1-retained-visible-root";
+        let stable_coord = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(batch_id);
+        let stable_disc_one = output_root.join("WarGames (CD1)");
+        let stable_disc_two = output_root.join("WarGames (CD2)");
+        std::fs::create_dir_all(&stable_coord).expect("coord dir");
+        std::fs::create_dir_all(&stable_disc_one).expect("disc one root");
+        std::fs::create_dir_all(&stable_disc_two).expect("disc two root");
+
+        let retained_output = PinnedDirectoryCapability::open_trusted(&output_root)
+            .expect("retain output root");
+        let runtime_output = retained_output
+            .descriptor_path()
+            .expect("descriptor output route");
+        let moved_output = temp.path().join("retained-output");
+        std::fs::rename(&output_root, &moved_output).expect("rename retained output root");
+        std::fs::create_dir_all(&output_root).expect("replacement output root");
+        std::fs::create_dir_all(output_root.join("WarGames (CD1)"))
+            .expect("replacement disc one");
+        std::fs::create_dir_all(output_root.join("WarGames (CD2)"))
+            .expect("replacement disc two");
+
+        let mut identity = v11_coordination_test_identity(&output_root, batch_id);
+        identity.runtime_coordination_dir = Some(
+            runtime_output
+                .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+                .join(batch_id),
+        );
+        let fragments = vec![
+            v11_coordination_test_fragment(&identity, &stable_disc_one, 1),
+            v11_coordination_test_fragment(&identity, &stable_disc_two, 2),
+        ];
+
+        write_batch_conversion_log_to_rendered_album_dirs(
+            &identity,
+            &fragments,
+            b"descriptor-bound assembled conversion log
+",
+        )
+        .expect("visible logs follow retained output root");
+
+        assert_eq!(
+            std::fs::read(moved_output.join("WarGames (CD1)").join("conversion.log"))
+                .expect("retained disc one log"),
+            b"descriptor-bound assembled conversion log
+"
+        );
+        assert_eq!(
+            std::fs::read(moved_output.join("WarGames (CD2)").join("conversion.log"))
+                .expect("retained disc two log"),
+            b"descriptor-bound assembled conversion log
+"
+        );
+        assert!(
+            !output_root.join("WarGames (CD1)").join("conversion.log").exists(),
+            "replacement output root must not receive disc one visible log"
+        );
+        assert!(
+            !output_root.join("WarGames (CD2)").join("conversion.log").exists(),
+            "replacement output root must not receive disc two visible log"
+        );
+        assert!(
+            !moved_output
+                .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+                .join(batch_id)
+                .join(CONVERSION_LOG_VISIBLE_COMMIT_MARKER_FILE)
+                .exists(),
+            "successful descriptor-bound visible-log finalization removes its marker"
+        );
+    }
+
     #[test]
     fn successful_batch_coordination_cleanup_removes_per_dispatch_workspace() {
         let temp = tempfile::tempdir().expect("temp dir");
         let output_root = temp.path().join("out");
-        let batch_id = "tonepoet-log-batch-v1-cleanup";
+        let batch_id = generated_current_process_test_batch_id("cleanup");
+        let batch_id = batch_id.as_str();
         let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
         let coord_dir = coord_root.join(batch_id);
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("owned complete workspace state");
         std::fs::create_dir_all(conversion_log_fragment_dir(&coord_dir)).expect("fragment dir");
         std::fs::write(coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE), b"complete")
             .expect("complete marker");
         std::fs::write(coord_dir.join("conversion.log"), b"hidden stale log")
             .expect("hidden log");
+        write_test_batch_drain_authority(&coord_dir, batch_id, 1, 1);
 
         cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
             &coord_dir,
             "test cleanup",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
         );
 
         assert!(
@@ -36524,6 +44158,12 @@ mod publish_lock_soundness_tests {
         let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
         let stale_batch_id = "tonepoet-log-batch-v1-0-dead-1";
         let stale_dir = coord_root.join(stale_batch_id);
+        write_test_workspace_state_with_owner(
+            &stale_dir,
+            stale_batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+            provably_dead_local_test_owner(),
+        );
         std::fs::create_dir_all(conversion_log_fragment_dir(&stale_dir)).expect("stale fragment dir");
         std::fs::write(
             stale_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE),
@@ -36532,6 +44172,7 @@ mod publish_lock_soundness_tests {
         .expect("stale complete marker");
         std::fs::write(stale_dir.join("conversion.log"), b"hidden stale log")
             .expect("hidden stale log");
+        write_test_batch_drain_authority(&stale_dir, stale_batch_id, 1, 1);
 
         sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
             &output_root,
@@ -36549,16 +44190,45 @@ mod publish_lock_soundness_tests {
         );
     }
 
+
     #[test]
-    fn same_process_inactive_generated_batch_workspace_is_swept_on_retry() {
+    fn completed_workspace_without_strong_owner_is_preserved() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
+        let batch_id = generated_test_batch_id("ownerless-complete");
+        let coord_dir = coord_root.join(&batch_id);
+        std::fs::create_dir_all(&coord_dir).expect("coord dir");
+        std::fs::write(
+            coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE),
+            b"schema=1\n",
+        )
+        .expect("completion marker");
+        std::fs::write(coord_dir.join("unknown-authority"), b"preserve")
+            .expect("unknown authority");
+
+        sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
+            &output_root,
+            None,
+            "ownerless completed workspace regression",
+        );
+
+        assert!(
+            coord_dir.exists(),
+            "completion alone must not authorize deletion when parent ownership is unknown"
+        );
+    }
+
+    #[test]
+    fn same_process_terminal_workspace_is_preserved_until_owned_retry_resolves_it() {
         let temp = tempfile::tempdir().expect("temp dir");
         let output_root = temp.path().join("out");
         let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
         let stale_batch_id = generated_current_process_test_batch_id("same-process-old-failed-batch");
         let stale_dir = coord_root.join(&stale_batch_id);
-        std::fs::create_dir_all(conversion_log_fragment_dir(&stale_dir)).expect("stale fragment dir");
         write_conversion_log_batch_workspace_state(&stale_dir, &stale_batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED)
             .expect("same-process failed state");
+        std::fs::create_dir_all(conversion_log_fragment_dir(&stale_dir)).expect("stale fragment dir");
         std::fs::write(
             conversion_log_fragment_dir(&stale_dir).join("fragment.json"),
             b"{}",
@@ -36572,12 +44242,12 @@ mod publish_lock_soundness_tests {
         );
 
         assert!(
-            !stale_dir.exists(),
-            "same-process handled-failure retries must remove old failed generated batch workspaces even though their PID is still live"
+            stale_dir.exists(),
+            "a live strong owner must protect terminal workspace state until an owned retry or explicit recovery resolves it"
         );
         assert!(
-            !coord_root.exists(),
-            "empty .tonepoet-batch parent must be removed after same-process stale cleanup"
+            conversion_log_fragment_dir(&stale_dir).join("fragment.json").exists(),
+            "the sweeper must not erase terminal recovery context while its strong owner is live"
         );
     }
 
@@ -36588,9 +44258,9 @@ mod publish_lock_soundness_tests {
         let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
         let active_batch_id = generated_current_process_test_batch_id("same-process-active-batch");
         let active_dir = coord_root.join(&active_batch_id);
-        std::fs::create_dir_all(conversion_log_fragment_dir(&active_dir)).expect("active fragment dir");
         write_conversion_log_batch_workspace_state(&active_dir, &active_batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE)
             .expect("active state");
+        std::fs::create_dir_all(conversion_log_fragment_dir(&active_dir)).expect("active fragment dir");
 
         {
             let mut active = active_conversion_log_batch_workspaces()
@@ -36624,13 +44294,13 @@ mod publish_lock_soundness_tests {
         let live_batch_id = generated_current_process_test_batch_id("same-process-live-between-tracks");
         let live_dir = coord_root.join(&live_batch_id);
         let fragment_dir = conversion_log_fragment_dir(&live_dir);
-        std::fs::create_dir_all(&fragment_dir).expect("live fragment dir");
         write_conversion_log_batch_workspace_state(
             &live_dir,
             &live_batch_id,
             CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
         )
         .expect("live active state");
+        std::fs::create_dir_all(&fragment_dir).expect("live fragment dir");
         std::fs::write(fragment_dir.join("track-0001.json"), b"partial fragment")
             .expect("partial fragment");
 
@@ -36655,7 +44325,7 @@ mod publish_lock_soundness_tests {
     }
 
     #[test]
-    fn publish_attempt_failure_marks_same_process_active_workspace_sweepable() {
+    fn publish_attempt_failure_remains_owned_and_recoverable() {
         let temp = tempfile::tempdir().expect("temp dir");
         let output_root = temp.path().join("out");
         let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
@@ -36693,13 +44363,10 @@ mod publish_lock_soundness_tests {
         );
 
         assert!(
-            !failed_dir.exists(),
-            "same-process retry must sweep an old publish attempt that failed after activation"
+            failed_dir.exists(),
+            "a live owner must retain failed publish state for deterministic retry instead of allowing recursive stale cleanup"
         );
-        assert!(
-            !coord_root.exists(),
-            "empty .tonepoet-batch parent must be removed after failed-attempt cleanup"
-        );
+        assert!(coord_root.exists());
     }
 
     #[test]
@@ -36732,6 +44399,776 @@ mod publish_lock_soundness_tests {
             CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
             "late same-batch hooks must not resurrect a terminal failed workspace as active"
         );
+    }
+
+    #[test]
+    fn dead_local_workspace_owner_is_atomically_taken_over_for_action_recovery() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("dead-owner-takeover");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        let old_owner = provably_dead_local_test_owner();
+        let old_claim = old_owner.claim_id.clone();
+        write_test_workspace_state_with_owner(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+            old_owner,
+        );
+        let action_dir = coord_dir.join(".tonepoet-action-journals");
+        std::fs::create_dir_all(&action_dir).expect("action authority dir");
+        std::fs::write(action_dir.join("recovery-witness"), b"preserve")
+            .expect("recovery witness");
+
+        ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id)
+            .expect("dead local owner should transfer under the ownership lock");
+        let state = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read state")
+            .expect("state exists");
+        let owner = state.owner.expect("strong owner");
+        assert!(owner_is_current_process(&owner).expect("current ownership check"));
+        assert_eq!(state.ownership_generation, 2);
+        assert_eq!(state.previous_owner_claim_id.as_deref(), Some(old_claim.as_str()));
+        assert!(
+            action_dir.join("recovery-witness").exists(),
+            "takeover must preserve child action recovery authority"
+        );
+        release_current_process_owner_claim(&owner.claim_id);
+    }
+
+    #[test]
+    fn request_level_dead_owner_takeover_preserves_action_and_drain_authority() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let source_root = temp.path().join("source");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&source_root).expect("source root");
+        let source = source_root.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+        let batch_id = generated_current_process_test_batch_id("request-dead-owner-takeover");
+        let batch = AlbumBatchContext::new(
+            batch_id.clone(),
+            1,
+            output_root.join("Album"),
+            source_root,
+        )
+        .with_source_paths(vec![source.clone()]);
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.output_root = output_root;
+        req.container = source;
+        req.album_batch = Some(batch);
+        // Drain-manifest authority exists only for action-effective requests
+        // (actionless batches use the actionless cleanup authority instead);
+        // this test's whole point is preserving ACTION authority.
+        req.actions.post.push(
+            crate::convert::pipeline::actions::ConversionAction::CreateFolder(
+                crate::convert::pipeline::actions::CreateFolderAction {
+                    path: PathBuf::from("Prepared"),
+                    continue_on_error: false,
+                },
+            ),
+        );
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&req)
+            .expect("create request-level ownership and drain authority");
+        let coord_dir = conversion_log_batch_coordination_album_dir(&req)
+            .expect("coordination directory");
+        let original = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read original state")
+            .expect("original state");
+        if let Some(owner) = original.owner.as_ref() {
+            release_current_process_owner_claim(&owner.claim_id);
+        }
+        write_test_workspace_state_with_owner(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+            provably_dead_local_test_owner(),
+        );
+        let action_dir = coord_dir.join(".tonepoet-action-journals");
+        std::fs::create_dir_all(&action_dir).expect("action authority dir");
+        std::fs::write(action_dir.join("recovery-witness"), b"preserve")
+            .expect("recovery witness");
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&req)
+            .expect("restored request should atomically take over dead-local ownership");
+        let recovered = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read recovered state")
+            .expect("recovered state");
+        let owner = recovered.owner.expect("strong recovered owner");
+        assert!(owner_is_current_process(&owner).expect("current owner"));
+        assert_eq!(recovered.ownership_generation, 2);
+        assert!(conversion_log_batch_drain_manifest_path(&coord_dir).is_file());
+        assert!(action_dir.join("recovery-witness").is_file());
+        release_current_process_owner_claim(&owner.claim_id);
+    }
+
+    #[test]
+    fn remote_workspace_owner_cannot_be_taken_over_for_action_recovery() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("remote-owner-takeover");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        let mut owner = current_process_owner().expect("current owner");
+        release_current_process_owner_claim(&owner.claim_id);
+        owner.machine_identity = format!("remote-{}", owner.machine_identity);
+        owner.host_identity = format!("remote-{}", owner.host_identity);
+        write_test_workspace_state_with_owner(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+            owner,
+        );
+
+        let error = ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id)
+            .expect_err("remote ownership must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn interrupted_cleaning_is_resumed_and_owner_state_remains_last() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("resume-cleaning");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        let owner = provably_dead_local_test_owner();
+        std::fs::create_dir_all(&coord_dir).expect("coord dir");
+        let state = ConversionLogBatchWorkspaceState {
+            schema_version: CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION,
+            batch_id: batch_id.clone(),
+            owner: Some(owner),
+            owner_pid: None,
+            ownership_generation: 1,
+            previous_owner_claim_id: None,
+            status: CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING.to_string(),
+            cleanup_started_unix_ms: Some(conversion_log_batch_workspace_updated_unix_ms()),
+            updated_unix_ms: conversion_log_batch_workspace_updated_unix_ms(),
+        };
+        std::fs::write(
+            conversion_log_batch_workspace_state_path(&coord_dir),
+            serde_json::to_vec_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+        write_test_batch_drain_authority(&coord_dir, &batch_id, 2, 1);
+
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "interrupted cleaning regression",
+            ConversionLogBatchCleanupAuthority::CurrentOrProvenDeadLocalOwner,
+        );
+        assert!(!coord_dir.exists(), "dead-owner cleaning state should resume to completion");
+    }
+
+    #[test]
+    fn cleanup_preserves_ownership_state_when_unknown_artifacts_prevent_completion() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("state-last-cleanup");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("write complete state");
+        std::fs::write(coord_dir.join("unknown-authority"), b"preserve")
+            .expect("unknown artifact");
+        write_test_batch_drain_authority(&coord_dir, &batch_id, 1, 1);
+
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "state-last cleanup regression",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
+        let state = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read retained state")
+            .expect("ownership state must remain");
+        assert_eq!(state.status, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING);
+        assert!(coord_dir.join("unknown-authority").exists());
+        if let Some(owner) = state.owner.as_ref() {
+            release_current_process_owner_claim(&owner.claim_id);
+        }
+    }
+
+    #[test]
+    fn last_durable_participant_acknowledgment_authorizes_same_run_cleanup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let source_root = temp.path().join("source");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&source_root).expect("source root");
+        let source_one = source_root.join("01.flac");
+        let source_two = source_root.join("02.flac");
+        std::fs::write(&source_one, b"one").expect("source one");
+        std::fs::write(&source_two, b"two").expect("source two");
+        let batch_id = generated_current_process_test_batch_id("two-participant-drain");
+        let batch = AlbumBatchContext::new(
+            batch_id.clone(),
+            2,
+            output_root.join("Album"),
+            source_root.clone(),
+        )
+        .with_source_paths(vec![source_one.clone(), source_two.clone()]);
+
+        let mut first = super::pipeline_test_helpers::log_test_request();
+        first.output_root = output_root.clone();
+        first.log.root = output_root.join("logs");
+        first.container = source_one;
+        first.album_batch = Some(batch.clone());
+        let mut second = first.clone();
+        second.item_id = "item-2".to_string();
+        second.container = source_two;
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&first)
+            .expect("establish batch authority");
+        let coord_dir = conversion_log_batch_coordination_album_dir(&first)
+            .expect("coordination directory");
+        assert!(
+            !record_conversion_log_batch_participant_drained(&first)
+                .expect("first acknowledgment"),
+            "the first worker must acknowledge while the batch is still active without authorizing cleanup"
+        );
+        assert!(coord_dir.exists());
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("complete state");
+        assert!(
+            record_conversion_log_batch_participant_drained(&second)
+                .expect("second acknowledgment"),
+            "the final expected worker should close the durable drain gate"
+        );
+
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "last participant same-run cleanup regression",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
+        assert!(
+            !coord_dir.exists(),
+            "the last finalized worker may retire the terminal workspace in the same process lifetime"
+        );
+    }
+
+    #[test]
+    fn terminal_post_action_and_last_participant_cleanup_in_the_same_run() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let source_root = temp.path().join("source");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&source_root).expect("source root");
+        let source_one = source_root.join("01.flac");
+        let source_two = source_root.join("02.flac");
+        std::fs::write(&source_one, b"one").expect("source one");
+        std::fs::write(&source_two, b"two").expect("source two");
+        let batch_id = generated_current_process_test_batch_id("post-action-same-run-cleanup");
+        let batch = AlbumBatchContext::new(
+            batch_id.clone(),
+            2,
+            output_root.join("Album"),
+            source_root,
+        )
+        .with_source_paths(vec![source_one.clone(), source_two.clone()]);
+
+        let mut first = super::pipeline_test_helpers::log_test_request();
+        first.output_root = output_root;
+        first.container = source_one;
+        first.album_batch = Some(batch.clone());
+        first.actions.post = vec![super::super::actions::ConversionAction::CreateFolder(
+            super::super::actions::CreateFolderAction {
+                path: PathBuf::from("post-action-finished"),
+                continue_on_error: false,
+            },
+        )];
+        let mut second = first.clone();
+        second.item_id = "item-2".to_string();
+        second.container = source_two;
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&first)
+            .expect("establish post-action batch authority");
+        let coord_dir = conversion_log_batch_coordination_album_dir(&first)
+            .expect("coordination directory");
+        assert!(
+            !record_conversion_log_batch_participant_drained(&first)
+                .expect("first acknowledgment")
+        );
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("complete state");
+        mark_conversion_log_batch_post_actions_terminal(&second)
+            .expect("commit terminal post-action lifecycle authority");
+        assert!(
+            record_conversion_log_batch_participant_drained(&second)
+                .expect("second acknowledgment")
+        );
+        assert!(
+            conversion_log_batch_cleanup_lifecycle_is_complete(&coord_dir, &batch_id)
+                .expect("read complete lifecycle")
+        );
+
+        cleanup_conversion_log_batch_coordination_after_success_best_effort(
+            &second,
+            "post-action same-run cleanup regression",
+        );
+        assert!(
+            !coord_dir.exists(),
+            "the last finalized worker must clean a terminal post-action batch without waiting for a later process"
+        );
+    }
+
+    #[test]
+    fn terminal_workspace_with_incomplete_participant_drain_is_preserved() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("incomplete-participant-drain");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("write complete state");
+        write_test_batch_drain_authority(&coord_dir, &batch_id, 2, 1);
+
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "incomplete participant drain regression",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
+
+        let state = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read retained state")
+            .expect("state retained");
+        assert_eq!(
+            state.status,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+            "cleanup must not enter cleaning until every expected participant has acknowledged finalization"
+        );
+        assert!(conversion_log_batch_drain_dir(&coord_dir).exists());
+        if let Some(owner) = state.owner.as_ref() {
+            release_current_process_owner_claim(&owner.claim_id);
+        }
+    }
+
+    #[test]
+    fn post_action_batch_requires_terminal_authority_before_same_run_cleanup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("post-action-terminal-gate");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("write complete state");
+        write_test_batch_drain_authority_with_post_actions(
+            &coord_dir,
+            &batch_id,
+            2,
+            2,
+            true,
+        );
+
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "missing post-action terminal authority regression",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
+        let state = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read retained state")
+            .expect("state retained");
+        assert_eq!(state.status, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE);
+        assert!(conversion_log_batch_drain_dir(&coord_dir).exists());
+
+        write_test_post_action_terminal_authority(&coord_dir, &batch_id);
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "terminal post-action same-run cleanup regression",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
+        assert!(
+            !coord_dir.exists(),
+            "complete drain plus exact post-action terminal authority should permit same-run cleanup"
+        );
+    }
+
+    #[test]
+    fn malformed_post_action_terminal_authority_fails_closed_before_cleaning() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("invalid-post-action-terminal");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("write complete state");
+        write_test_batch_drain_authority_with_post_actions(
+            &coord_dir,
+            &batch_id,
+            1,
+            1,
+            true,
+        );
+        let invalid = ConversionLogBatchPostActionTerminal {
+            schema_version: CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_SCHEMA_VERSION,
+            batch_id: batch_id.clone(),
+            pipeline_sha256: super::super::manifest::sha256_hex(b"different-pipeline"),
+        };
+        std::fs::write(
+            conversion_log_batch_post_action_terminal_path(&coord_dir),
+            serde_json::to_vec_pretty(&invalid).expect("serialize invalid terminal authority"),
+        )
+        .expect("write invalid terminal authority");
+
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "invalid post-action terminal authority regression",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
+        let state = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read retained state")
+            .expect("state retained");
+        assert_eq!(state.status, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE);
+        assert!(conversion_log_batch_drain_dir(&coord_dir).exists());
+        if let Some(owner) = state.owner.as_ref() {
+            release_current_process_owner_claim(&owner.claim_id);
+        }
+    }
+
+    #[test]
+    fn unrecognized_participant_drain_artifact_fails_closed_before_cleaning() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("unknown-drain-artifact");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("write complete state");
+        write_test_batch_drain_authority(&coord_dir, &batch_id, 1, 1);
+        std::fs::write(
+            conversion_log_batch_drain_dir(&coord_dir).join("unknown-authority"),
+            b"preserve",
+        )
+        .expect("unknown drain artifact");
+
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "unknown participant drain artifact regression",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
+
+        let state = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read retained state")
+            .expect("state retained");
+        assert_eq!(state.status, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE);
+        assert!(
+            conversion_log_batch_drain_dir(&coord_dir)
+                .join("unknown-authority")
+                .exists(),
+            "unknown drain authority must never be deleted opportunistically"
+        );
+        if let Some(owner) = state.owner.as_ref() {
+            release_current_process_owner_claim(&owner.claim_id);
+        }
+    }
+
+    #[test]
+    fn terminal_post_action_report_is_the_same_run_cleanup_gate() {
+        let terminal = ActionPhaseReport {
+            phase: Some(ActionPhase::Post),
+            recovery_required: false,
+            ..ActionPhaseReport::default()
+        };
+        assert!(action_reports_have_terminal_post_phase(&[terminal]));
+
+        let unresolved = ActionPhaseReport {
+            phase: Some(ActionPhase::Post),
+            recovery_required: true,
+            ..ActionPhaseReport::default()
+        };
+        assert!(!action_reports_have_terminal_post_phase(&[unresolved]));
+        assert!(!action_reports_have_terminal_post_phase(&[ActionPhaseReport {
+            phase: Some(ActionPhase::Pre),
+            recovery_required: false,
+            ..ActionPhaseReport::default()
+        }]));
+    }
+
+    #[test]
+    fn remote_active_workspace_owner_fails_closed_on_shared_storage() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
+        let batch_id = generated_current_process_test_batch_id("remote-active-owner");
+        let coord_dir = coord_root.join(&batch_id);
+        std::fs::create_dir_all(&coord_dir).expect("coord dir");
+        let mut owner = current_process_owner().expect("current owner");
+        owner.machine_identity = format!("remote-{}", owner.machine_identity);
+        owner.host_identity = format!("remote-{}", owner.host_identity);
+        let state = ConversionLogBatchWorkspaceState {
+            schema_version: CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION,
+            batch_id: batch_id.clone(),
+            owner: Some(owner),
+            owner_pid: None,
+            ownership_generation: 1,
+            previous_owner_claim_id: None,
+            status: CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE.to_string(),
+            cleanup_started_unix_ms: None,
+            updated_unix_ms: conversion_log_batch_workspace_updated_unix_ms(),
+        };
+        std::fs::write(
+            conversion_log_batch_workspace_state_path(&coord_dir),
+            serde_json::to_vec_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+        std::fs::create_dir_all(conversion_log_fragment_dir(&coord_dir)).expect("fragment dir");
+        std::fs::write(
+            conversion_log_fragment_dir(&coord_dir).join("track-0001.json"),
+            b"partial",
+        )
+        .expect("fragment");
+
+        sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
+            &output_root,
+            None,
+            "remote owner regression",
+        );
+
+        assert!(coord_dir.exists(), "unknown remote ownership must veto deletion");
+        assert!(
+            conversion_log_fragment_dir(&coord_dir)
+                .join("track-0001.json")
+                .exists(),
+            "remote active state must remain intact"
+        );
+    }
+
+    #[test]
+    fn remote_terminal_workspace_owner_also_fails_closed_on_shared_storage() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
+        let batch_id = generated_current_process_test_batch_id("remote-terminal-owner");
+        let coord_dir = coord_root.join(&batch_id);
+        std::fs::create_dir_all(&coord_dir).expect("coord dir");
+        let mut owner = current_process_owner().expect("current owner");
+        owner.machine_identity = format!("remote-{}", owner.machine_identity);
+        owner.host_identity = format!("remote-{}", owner.host_identity);
+        let state = ConversionLogBatchWorkspaceState {
+            schema_version: CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION,
+            batch_id: batch_id.clone(),
+            owner: Some(owner),
+            owner_pid: None,
+            ownership_generation: 1,
+            previous_owner_claim_id: None,
+            status: CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED.to_string(),
+            cleanup_started_unix_ms: None,
+            updated_unix_ms: conversion_log_batch_workspace_updated_unix_ms(),
+        };
+        std::fs::write(
+            conversion_log_batch_workspace_state_path(&coord_dir),
+            serde_json::to_vec_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+        std::fs::write(coord_dir.join("failure-context"), b"retain me")
+            .expect("failure context");
+
+        sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
+            &output_root,
+            None,
+            "remote terminal owner regression",
+        );
+
+        assert!(coord_dir.exists(), "remote terminal ownership must veto deletion");
+        assert!(
+            coord_dir.join("failure-context").exists(),
+            "terminal status is not proof that a remote owner has relinquished recovery state"
+        );
+    }
+
+    #[test]
+    fn explicit_success_cleanup_refuses_foreign_owner_even_when_terminal() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let batch_id = generated_current_process_test_batch_id("foreign-explicit-cleanup");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        std::fs::create_dir_all(&coord_dir).expect("coord dir");
+        let mut owner = current_process_owner().expect("current owner");
+        owner.machine_identity = format!("remote-{}", owner.machine_identity);
+        owner.host_identity = format!("remote-{}", owner.host_identity);
+        let state = ConversionLogBatchWorkspaceState {
+            schema_version: CONVERSION_LOG_BATCH_WORKSPACE_STATE_SCHEMA_VERSION,
+            batch_id,
+            owner: Some(owner),
+            owner_pid: None,
+            ownership_generation: 1,
+            previous_owner_claim_id: None,
+            status: CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE.to_string(),
+            cleanup_started_unix_ms: None,
+            updated_unix_ms: conversion_log_batch_workspace_updated_unix_ms(),
+        };
+        std::fs::write(
+            conversion_log_batch_workspace_state_path(&coord_dir),
+            serde_json::to_vec_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+        std::fs::write(coord_dir.join("foreign-authority"), b"preserve")
+            .expect("foreign authority");
+
+        cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
+            &coord_dir,
+            "foreign explicit cleanup regression",
+            ConversionLogBatchCleanupAuthority::CurrentProcessOwner,
+        );
+
+        assert!(
+            coord_dir.join("foreign-authority").exists(),
+            "terminal status must not let explicit cleanup remove a foreign owner's workspace"
+        );
+    }
+
+    #[test]
+    fn conversion_log_workspace_terminal_transition_matrix_is_recovery_safe() {
+        assert!(conversion_log_batch_workspace_transition_allowed(
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+        ));
+        assert!(conversion_log_batch_workspace_transition_allowed(
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        ));
+        assert!(conversion_log_batch_workspace_transition_allowed(
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ABANDONED,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        ));
+        assert!(!conversion_log_batch_workspace_transition_allowed(
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+        ));
+        assert!(!conversion_log_batch_workspace_transition_allowed(
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+        ));
+    }
+
+    #[test]
+    fn owned_failed_workspace_can_complete_but_completed_workspace_cannot_regress() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let batch_id = generated_current_process_test_batch_id("terminal-transition-write");
+        let coord_dir = temp
+            .path()
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+        )
+        .expect("failed state");
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("owned recovery may complete a failed workspace");
+
+        let regression = write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+        )
+        .expect_err("completed workspace must not regress to failed");
+        assert_eq!(regression.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            read_conversion_log_batch_workspace_state(&coord_dir)
+                .expect("read state")
+                .expect("state exists")
+                .status,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE
+        );
+    }
+
+    #[test]
+    fn completed_workspace_with_unreadable_action_authority_is_preserved() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let coord_root = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
+        let batch_id = generated_current_process_test_batch_id("malformed-action-authority");
+        let coord_dir = coord_root.join(&batch_id);
+        write_test_workspace_state_with_owner(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+            provably_dead_local_test_owner(),
+        );
+        std::fs::write(
+            coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE),
+            b"schema=2\n",
+        )
+        .expect("completion marker");
+        let action_dir = coord_dir.join(".tonepoet-action-journals");
+        std::fs::create_dir_all(&action_dir).expect("action dir");
+        std::fs::write(action_dir.join("actions-bad.journal.json"), b"not-json")
+            .expect("malformed journal");
+
+        sweep_stale_completed_conversion_log_batch_coordination_dirs_best_effort(
+            &output_root,
+            None,
+            "action authority regression",
+        );
+
+        assert!(
+            coord_dir.exists(),
+            "malformed or unreadable action recovery authority must fail closed"
+        );
+    }
+
+    #[test]
+    fn nonempty_unowned_workspace_cannot_be_claimed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let coord_dir = temp.path().join("unowned-workspace");
+        std::fs::create_dir_all(&coord_dir).expect("coord dir");
+        std::fs::write(coord_dir.join("foreign-fragment"), b"foreign").expect("foreign file");
+
+        let error = write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            "tonepoet-log-batch-v1-dead-beef-1",
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+        )
+        .expect_err("nonempty unowned workspace must not be claimed");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(coord_dir.join("foreign-fragment").exists());
     }
 
     #[test]
