@@ -14274,7 +14274,11 @@ fn collect_terminal_action_journals(
         if !name.starts_with("actions-") || !name.ends_with(".journal.json") {
             continue;
         }
-        let journal_path = entry.path();
+        // The pruner may be invoked through a live descriptor route; journal
+        // authority comparisons and removals use the STABLE path.
+        let Some(journal_path) = resolve_descriptor_route_to_stable(&entry.path()) else {
+            continue;
+        };
         let bytes = match fs::read(&journal_path) {
             Ok(bytes) => bytes,
             Err(_) => continue,
@@ -14382,6 +14386,34 @@ fn collect_terminal_action_journals(
     }
 }
 
+/// Resolve a live descriptor-namespace route (`/proc/self/fd/N/rest`) to its
+/// stable filesystem path by reading the fd link — valid exactly while the
+/// descriptor is open, which record-writing guarantees. Non-routed paths
+/// return unchanged; a route that cannot be resolved returns None so callers
+/// fail closed instead of persisting a route that dies with the descriptor.
+pub(crate) fn resolve_descriptor_route_to_stable(path: &Path) -> Option<PathBuf> {
+    if !path.starts_with("/proc/self/fd") && !path.starts_with("/dev/fd") {
+        return Some(path.to_path_buf());
+    }
+    // Route anchor is /proc/self/fd/<N> (5 components counting the root) or
+    // /dev/fd/<N> (4). Read the live fd link and graft the remainder on.
+    let anchor_len = if path.starts_with("/proc/self/fd") { 5 } else { 4 };
+    let mut components = path.components();
+    let mut anchor = PathBuf::new();
+    for _ in 0..anchor_len {
+        anchor.push(components.next()?.as_os_str());
+    }
+    let target = std::fs::read_link(&anchor).ok()?;
+    if !target.is_absolute() {
+        return None;
+    }
+    let mut resolved = target;
+    for rest in components {
+        resolved.push(rest.as_os_str());
+    }
+    Some(resolved)
+}
+
 fn workspace_has_unresolved_action_state_inner(path: &Path, depth: usize) -> bool {
     // Coordination trees are shallow in normal operation. The cap protects a
     // generic stale sweeper from adversarially deep directory structures while
@@ -14460,7 +14492,12 @@ fn workspace_has_unresolved_action_state_inner(path: &Path, depth: usize) -> boo
                 Ok(journal) => journal,
                 Err(_) => return true,
             };
-            if validate_resolved_terminal_journal_authority(&journal, &entry.path()).is_err() {
+            // Cleanup may scan through a live descriptor route; the journal
+            // records its STABLE path, so authority comparison must use it.
+            let Some(stable_path) = resolve_descriptor_route_to_stable(&entry.path()) else {
+                return true;
+            };
+            if validate_resolved_terminal_journal_authority(&journal, &stable_path).is_err() {
                 return true;
             }
             continue;
@@ -14474,7 +14511,10 @@ fn workspace_has_unresolved_action_state_inner(path: &Path, depth: usize) -> boo
                 Ok(result) => result,
                 Err(_) => return true,
             };
-            let report = match read_valid_result(&entry.path(), &result.election, None) {
+            let Some(stable_result_path) = resolve_descriptor_route_to_stable(&entry.path()) else {
+                return true;
+            };
+            let report = match read_valid_result(&stable_result_path, &result.election, None) {
                 Ok(report) => report,
                 Err(_) => return true,
             };

@@ -30,6 +30,7 @@ use super::actions::{
     acquire_blocking_album_publication_lock_for_album_under_output_capability,
     acquire_explicit_action_run_lock_for_album,
     acquire_blocking_action_run_lock_for_album_in_output_root,
+    resolve_descriptor_route_to_stable,
     acquire_blocking_action_run_lock_for_album_under_output_capability,
     acquire_explicit_action_run_lock_for_album_in_output_root,
     acquire_explicit_action_run_lock_for_album_under_output_capability,
@@ -10413,15 +10414,27 @@ fn write_conversion_log_batch_workspace_state_locked(
     let existing = read_conversion_log_batch_workspace_state(coord_dir)?;
     let creating = existing.is_none();
     if creating {
-        let mut entries = fs::read_dir(coord_dir)?;
-        if entries.next().transpose()?.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "conversion-log workspace {} contains unowned state and cannot be claimed automatically",
-                    coord_dir.display()
-                ),
-            ));
+        for entry in fs::read_dir(coord_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // The journal-root BOOTSTRAP artifacts legitimately precede
+            // ownership: the pre-action flow pins the recoverable journal
+            // root (creating `.tonepoet-action-journals` plus its durable
+            // materialization-authority marker) before the first ownership
+            // claim (round-3 pre-first-journal window design). Anything
+            // else is unowned payload and fails closed.
+            let bootstrap_artifact = name == ".tonepoet-action-journals"
+                || name.starts_with(".tonepoet-root-authority-");
+            if !bootstrap_artifact {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "conversion-log workspace {} contains unowned state and cannot be claimed automatically",
+                        coord_dir.display()
+                    ),
+                ));
+            }
         }
     }
 
@@ -22431,33 +22444,6 @@ fn artifact_audio_parent_dirs(artifacts: &ArtifactSet) -> Vec<PathBuf> {
 }
 
 
-/// Resolve a live descriptor-namespace route (`/proc/self/fd/N/rest`) to its
-/// stable filesystem path by reading the fd link — valid exactly while the
-/// descriptor is open, which record-writing guarantees. Non-routed paths
-/// return unchanged; a route that cannot be resolved returns None so callers
-/// fail closed instead of persisting a route that dies with the descriptor.
-fn resolve_descriptor_route_to_stable(path: &Path) -> Option<PathBuf> {
-    if !path.starts_with("/proc/self/fd") && !path.starts_with("/dev/fd") {
-        return Some(path.to_path_buf());
-    }
-    // Route anchor is /proc/self/fd/<N> (5 components counting the root) or
-    // /dev/fd/<N> (4). Read the live fd link and graft the remainder on.
-    let anchor_len = if path.starts_with("/proc/self/fd") { 5 } else { 4 };
-    let mut components = path.components();
-    let mut anchor = PathBuf::new();
-    for _ in 0..anchor_len {
-        anchor.push(components.next()?.as_os_str());
-    }
-    let target = std::fs::read_link(&anchor).ok()?;
-    if !target.is_absolute() {
-        return None;
-    }
-    let mut resolved = target;
-    for rest in components {
-        resolved.push(rest.as_os_str());
-    }
-    Some(resolved)
-}
 
 fn record_album_batch_disc_destinations_from_artifacts(
     req: &PipelineRequest,
