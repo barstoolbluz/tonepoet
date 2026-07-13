@@ -52,8 +52,10 @@ Empty pipeline renders dim: `pipeline    ▸ none`.
 
 ## Deliverable 2 — reshape the wizard to the two-dialog flow
 
-The mockup (`conversion_actions_wizard.html`, directional not pixel-exact) is
-authoritative for STRUCTURE; two panes fit small terminals better than three.
+The ASCII mockups BELOW are authoritative for structure (they were derived
+from the user's HTML mockup, which is not included in this bundle; treat the
+layouts as directional, not pixel-exact). Two panes fit small terminals
+better than three.
 
 ### Dialog A — the pipeline view
 
