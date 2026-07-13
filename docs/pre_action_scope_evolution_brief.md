@@ -57,10 +57,13 @@ object; the anchor legitimately evolved across the materialization boundary.
 The existing tolerance in the `matches` computation accepts materialization
 only when the RETAINED capability kept the parent-anchored shape
 (`existing.materialization_token.is_some() && existing.base_relative ==
-base_relative`). It does not accept the evolved direct anchor, in either the
-retained-capability branch or the reopen branch (both emit the same
-"conflicts with an already retained capability" error; both were probed and
-the retained branch is the one firing here).
+base_relative`). Note that `materialized_matches` is only one conjunct:
+`matches` also requires full equality of acquisition_path, base_relative,
+device/inode, and token, so the evolved direct anchor fails those regardless
+— relaxing `materialized_matches` alone cannot be the fix. Neither the
+retained-capability branch nor the reopen branch accepts the evolution (both
+emit the same "conflicts with an already retained capability" error; both
+were probed and the retained branch is the one firing here, 38/38).
 
 ## The design question (yours to decide, since this is your capability model)
 
@@ -68,7 +71,8 @@ Under what conditions may a journal scope record that was parent-anchored
 with a materialization token validate against a retained DIRECT capability
 for the same logical path? The unforgeable link should presumably run
 through the durable materialization authority
-(`.tonepoet-root-authority-<scope>-…`, `MATERIALIZATION_AUTHORITY_PREFIX` in
+(`.tonepoet-root-authority-<sha256(scope_id, base_relative)>`,
+`materialization_authority_name` / `MATERIALIZATION_AUTHORITY_PREFIX` in
 cap_fs.rs): the token in the journal record must authenticate against the
 authority record, and the retained direct capability's object identity must
 match what that authority attests was materialized. A pure
