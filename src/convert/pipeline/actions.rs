@@ -13390,6 +13390,10 @@ fn validate_journal(
     } else {
         let mut view = context.clone();
         view.source_path = journal.source_path.clone();
+        // Batch members are per-track FILE jobs; a directory source occurs
+        // only when the subject itself was the source (folder-source shape),
+        // which the equality below reconstructs from the journal's own
+        // already-validated fields.
         view.source_is_directory = journal.source_path == journal.subject_dir;
         elected_view = view;
         &elected_view
