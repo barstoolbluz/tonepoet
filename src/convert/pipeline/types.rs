@@ -2012,6 +2012,12 @@ pub enum PublishRole {
     Sidecar(SidecarKind),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishedBatchCompletion {
+    Successful,
+    NonSuccessful,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishedAlbum {
     pub album_dir: PathBuf,
@@ -2019,6 +2025,12 @@ pub struct PublishedAlbum {
     /// Path to the manifest file written during publish, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<PathBuf>,
+    /// Ephemeral batch-finalization authority returned by the publisher that
+    /// observed or committed the durable completion marker. This is internal
+    /// control-plane state: reports serialize the durable published paths, not
+    /// a process-local handoff used to open the post-action gate.
+    #[serde(skip)]
+    pub(crate) batch_completion: Option<PublishedBatchCompletion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

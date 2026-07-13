@@ -3828,6 +3828,7 @@ mod tests {
                     album_dir: hook_disk_album_dir.clone(),
                     entries: Vec::new(),
                     manifest_path: None,
+                    batch_completion: None,
                 }),
                 outcome: AlbumOutcome::Complete {
                     tracks: Vec::new(),
@@ -4139,6 +4140,7 @@ mod tests {
                         album_dir: hook_album_dir.clone(),
                         entries: Vec::new(),
                         manifest_path: None,
+                        batch_completion: None,
                     }),
                     outcome: AlbumOutcome::Complete {
                         tracks: Vec::new(),
@@ -4405,6 +4407,7 @@ mod tests {
                     album_dir: disk_req.output_root.join("unexpected-disk-retry"),
                     entries: Vec::new(),
                     manifest_path: None,
+                    batch_completion: None,
                 }),
                 outcome: AlbumOutcome::Complete {
                     tracks: Vec::new(),
