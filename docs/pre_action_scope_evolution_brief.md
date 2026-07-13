@@ -75,11 +75,22 @@ match what that authority attests was materialized. A pure
 logical-path-string match would open a scope-substitution hole (rename a
 hostile directory into place) and is not acceptable.
 
-Note `validate_scope_records` has a related-but-distinct transition comment
-("a token-authenticated logical root may have materialized after the last
-journal generation") — the accepted shape there also predates this
-evolution. Both readers (restore + validate) and both branches (retained +
-reopen) need a consistent rule.
+Two related transition rules already exist, and both preserve the parent
+anchor rather than accepting the evolved direct anchor:
+- `restore_scope_records`, retained-capability branch: comment "a
+  token-authenticated logical root may have materialized after the last
+  journal generation" — accepts a retained descriptor whose record still
+  says materialized `None`, but only when the retained capability kept the
+  parent-anchored shape (`materialization_token.is_some()` and equal
+  `base_relative`).
+- `validate_scope_records`: comment "a token-authenticated root may have
+  been published in the crash window after the prior generation" — permits
+  materialized identity to advance None -> Some under the same
+  shape-preserving condition, else fails with "scope … no longer identifies
+  the journal-bound directory".
+
+Both readers (restore + validate) and both restore branches (retained +
+reopen) need one consistent rule for the evolved direct anchor.
 
 ## Deliverable
 
