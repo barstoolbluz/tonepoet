@@ -94,6 +94,153 @@ fn test_maybe_fail_journal_persist() -> Result<(), ActionError> {
     })
 }
 
+
+#[cfg(test)]
+#[derive(Debug)]
+struct DurableReportPauseHook {
+    claimed: std::sync::atomic::AtomicBool,
+    entered: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+static DURABLE_REPORT_PAUSE_HOOKS: OnceLock<
+    Mutex<BTreeMap<PathBuf, std::sync::Weak<DurableReportPauseHook>>>,
+> = OnceLock::new();
+
+/// Per-journal deterministic test control for pausing exactly one durable
+/// report reader after the journal has been loaded but before capability scope
+/// restoration/authentication. The registry is weak and keyed by the unique
+/// journal path, so parallel tests do not serialize one another and dropping
+/// the control reclaims the entry.
+#[cfg(test)]
+pub(crate) struct DurableReportPauseControl {
+    journal_path: PathBuf,
+    hook: Arc<DurableReportPauseHook>,
+    entered: Mutex<std::sync::mpsc::Receiver<()>>,
+    resume: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl DurableReportPauseControl {
+    pub(crate) fn wait_until_paused(&self) {
+        self.entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv_timeout(Duration::from_secs(10))
+            .expect("durable report reader did not reach the installed journal-load pause");
+    }
+
+    pub(crate) fn resume(&self) {
+        self.resume
+            .send(())
+            .expect("paused durable report reader disappeared before resume");
+    }
+}
+
+#[cfg(test)]
+impl Drop for DurableReportPauseControl {
+    fn drop(&mut self) {
+        let Some(registry) = DURABLE_REPORT_PAUSE_HOOKS.get() else {
+            return;
+        };
+        let Ok(mut registry) = registry.lock() else {
+            return;
+        };
+        let hook = Arc::downgrade(&self.hook);
+        if registry
+            .get(&self.journal_path)
+            .is_some_and(|registered| registered.ptr_eq(&hook))
+        {
+            registry.remove(&self.journal_path);
+        }
+        registry.retain(|_, registered| registered.strong_count() > 0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_durable_report_pause_after_journal_load(
+    pipeline: &ActionPipeline,
+    context: &ActionContext,
+) -> Result<DurableReportPauseControl, ActionError> {
+    let pipeline_serialized = pipeline.canonical_serialization()?;
+    let pipeline_sha256 = sha256_hex(pipeline_serialized.as_bytes());
+    let journal_path = action_journal_path(context, &pipeline_sha256)?;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let hook = Arc::new(DurableReportPauseHook {
+        claimed: std::sync::atomic::AtomicBool::new(false),
+        entered: entered_tx,
+        resume: Mutex::new(resume_rx),
+    });
+    let registry = DURABLE_REPORT_PAUSE_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registry = registry.lock().map_err(|_| {
+        ActionError::Contradiction(
+            "durable-report pause-hook registry mutex poisoned".to_string(),
+        )
+    })?;
+    registry.retain(|_, registered| registered.strong_count() > 0);
+    if registry
+        .get(&journal_path)
+        .and_then(std::sync::Weak::upgrade)
+        .is_some()
+    {
+        return Err(ActionError::Contradiction(format!(
+            "a durable-report pause hook is already installed for {}",
+            journal_path.display()
+        )));
+    }
+    registry.insert(journal_path.clone(), Arc::downgrade(&hook));
+    Ok(DurableReportPauseControl {
+        journal_path,
+        hook,
+        entered: Mutex::new(entered_rx),
+        resume: resume_tx,
+    })
+}
+
+#[cfg(test)]
+fn test_pause_durable_report_after_journal_load(
+    journal_path: &Path,
+) -> Result<(), ActionError> {
+    let hook = DURABLE_REPORT_PAUSE_HOOKS
+        .get()
+        .and_then(|registry| registry.lock().ok())
+        .and_then(|mut registry| {
+            registry.retain(|_, registered| registered.strong_count() > 0);
+            registry.get(journal_path).and_then(std::sync::Weak::upgrade)
+        });
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    if hook
+        .claimed
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok(());
+    }
+    hook.entered.send(()).map_err(|_| {
+        ActionError::Contradiction(
+            "durable-report pause controller disappeared before journal validation".to_string(),
+        )
+    })?;
+    hook.resume
+        .lock()
+        .map_err(|_| {
+            ActionError::Contradiction(
+                "durable-report pause receiver mutex poisoned".to_string(),
+            )
+        })?
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|error| {
+            ActionError::Contradiction(format!(
+                "durable-report pause did not receive a deterministic resume signal: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -336,6 +483,12 @@ pub struct ActionContext {
     pub album_tokens: BTreeMap<String, String>,
     pub disc_count: Option<u32>,
     pub journal_dir: PathBuf,
+    /// Album-batch source grouping root. When present, subject/source
+    /// capability scopes anchor here so every participant of the batch pins
+    /// IDENTICAL scope roots regardless of which disc subdirectory its own
+    /// track lives in — a per-track anchor would make the elected runner's
+    /// journal unvalidatable by participants from sibling disc directories.
+    pub batch_source_scope_root: Option<PathBuf>,
     pub explicit_scope: bool,
     pub semantics: ActionSemantics,
 }
@@ -921,6 +1074,7 @@ fn script_verification_metadata_matches(before: CapMetadata, after: CapMetadata)
 
 pub trait ActionFilesystem: Send + Sync {
     fn pin_root(&self, id: ScopeId, path: &Path) -> Result<(), ActionError>;
+    fn pin_materializable_root(&self, id: ScopeId, path: &Path) -> Result<(), ActionError>;
     fn first_materialization_boundary(&self, path: &Path) -> Result<PathBuf, ActionError>;
     fn pin_existing_capability(
         &self,
@@ -960,6 +1114,20 @@ pub trait ActionFilesystem: Send + Sync {
         records: &[ScopeRecord],
         expected_roots: &[(ScopeId, PathBuf)],
     ) -> Result<(), ActionError>;
+    fn attest_materialized_scope_from_retained_direct_anchor(
+        &self,
+        record: &ScopeRecord,
+    ) -> Result<(), ActionError>;
+    fn retire_materialization_authorities_for_scope_records(
+        &self,
+        records: &[ScopeRecord],
+    ) -> Result<(), ActionError>;
+    fn retire_materialization_authorities_for_scope_records_after_terminal_marker(
+        &self,
+        records: &[ScopeRecord],
+    ) -> Result<(), ActionError> {
+        self.retire_materialization_authorities_for_scope_records(records)
+    }
     fn bootstrap_read_optional(&self, path: &Path) -> Result<Option<Vec<u8>>, ActionError>;
     fn entry_identity(&self, path: &Path) -> Result<Option<CapEntryIdentity>, ActionError>;
     fn read_bytes_with_identity_optional(
@@ -1069,6 +1237,11 @@ impl ActionFilesystem for CapabilityActionFilesystem {
         Ok(())
     }
 
+    fn pin_materializable_root(&self, id: ScopeId, path: &Path) -> Result<(), ActionError> {
+        self.capabilities.pin_materializable_root(id, path)?;
+        Ok(())
+    }
+
     fn first_materialization_boundary(&self, path: &Path) -> Result<PathBuf, ActionError> {
         CapabilityFilesystem::first_materialization_boundary(path).map_err(Into::into)
     }
@@ -1145,6 +1318,33 @@ impl ActionFilesystem for CapabilityActionFilesystem {
     ) -> Result<(), ActionError> {
         self.capabilities
             .restore_scope_records(records, expected_roots)
+            .map_err(Into::into)
+    }
+
+    fn attest_materialized_scope_from_retained_direct_anchor(
+        &self,
+        record: &ScopeRecord,
+    ) -> Result<(), ActionError> {
+        self.capabilities
+            .attest_materialized_scope_from_retained_direct_anchor(record)
+            .map_err(Into::into)
+    }
+
+    fn retire_materialization_authorities_for_scope_records(
+        &self,
+        records: &[ScopeRecord],
+    ) -> Result<(), ActionError> {
+        self.capabilities
+            .retire_materialization_authorities_for_scope_records(records)
+            .map_err(Into::into)
+    }
+
+    fn retire_materialization_authorities_for_scope_records_after_terminal_marker(
+        &self,
+        records: &[ScopeRecord],
+    ) -> Result<(), ActionError> {
+        self.capabilities
+            .retire_materialization_authorities_for_scope_records_after_terminal_marker(records)
             .map_err(Into::into)
     }
 
@@ -2871,6 +3071,53 @@ impl<'a> ActionEngine<'a> {
         result
     }
 
+
+    fn attest_pre_album_scope_from_retained_publication(
+        &self,
+        context: &ActionContext,
+        records: &[ScopeRecord],
+    ) -> Result<(), ActionError> {
+        if context.phase != ActionPhase::Pre || context.retained_album_capability.is_none() {
+            return Ok(());
+        }
+        for record in records.iter().filter(|record| record.id.as_str() == "album") {
+            self.filesystem
+                .attest_materialized_scope_from_retained_direct_anchor(record)?;
+        }
+        Ok(())
+    }
+
+    /// Load the PRE journal (if any) through the retained publication
+    /// capabilities and publish the album's materialized identity attestation.
+    /// The publish path calls this while the publication authority is bound,
+    /// so the attestation exists before any participant finalizes and
+    /// validates the journal without live album capabilities (e.g. a failed
+    /// item's no-binding finalize arriving ahead of every with-binding one).
+    pub fn attest_pre_album_scope_for_publication(
+        &self,
+        pipeline: &ActionPipeline,
+        context: &ActionContext,
+    ) -> Result<(), ActionError> {
+        validate_context_syntax(context)?;
+        if context.phase != ActionPhase::Pre
+            || pipeline.for_phase(context.phase).is_empty()
+        {
+            return Ok(());
+        }
+        let pipeline_serialized = pipeline.canonical_serialization()?;
+        let pipeline_sha256 = sha256_hex(pipeline_serialized.as_bytes());
+        let journal_path = action_journal_path(context, &pipeline_sha256)?;
+        let store = JournalStore::new(journal_path, self.filesystem)?;
+        let retained_live_context = prepare_context_for_journal_read(self.filesystem, context)?;
+        if !retained_live_context {
+            return Ok(());
+        }
+        let Some((journal, _from_write_temporary)) = load_journal_bound(&store)? else {
+            return Ok(());
+        };
+        self.attest_pre_album_scope_from_retained_publication(context, &journal.capability_roots)
+    }
+
     /// Read the durable report associated with this exact pipeline/context.
     /// This is primarily used by orchestration to surface a complete report
     /// when execution returns a terminal error. A foreign, changed, malformed,
@@ -2895,6 +3142,8 @@ impl<'a> ActionEngine<'a> {
         let pipeline_serialized = pipeline.canonical_serialization()?;
         let pipeline_sha256 = sha256_hex(pipeline_serialized.as_bytes());
         let journal_path = action_journal_path(context, &pipeline_sha256)?;
+        #[cfg(test)]
+        let test_journal_path = journal_path.clone();
         let store = JournalStore::new(journal_path, self.filesystem)?;
         let retained_live_context = prepare_context_for_journal_read(self.filesystem, context)?;
         let loaded = if retained_live_context {
@@ -2905,7 +3154,13 @@ impl<'a> ActionEngine<'a> {
         let Some((journal, _from_write_temporary)) = loaded else {
             return Ok(None);
         };
+        #[cfg(test)]
+        test_pause_durable_report_after_journal_load(&test_journal_path)?;
         if retained_live_context {
+            self.attest_pre_album_scope_from_retained_publication(
+                context,
+                &journal.capability_roots,
+            )?;
             prepare_retained_pipeline_capabilities(self.filesystem, pipeline, context)?;
             self.filesystem.restore_scope_records(
                 &journal.capability_roots,
@@ -2931,6 +3186,89 @@ impl<'a> ActionEngine<'a> {
             &pipeline_sha256,
         )?;
         Ok(Some(report_from_journal(&journal)?))
+    }
+
+    /// Retire PRE materialization authorities only after orchestration has
+    /// reached the terminal batch cleanup gate. The first pass reloads the
+    /// durable journal through retained publication descriptors and removes
+    /// authority files only after authenticating the journal token, scope/base
+    /// identity, and retained published object identity. Marked retries load the
+    /// journal without live album capabilities and remove only remaining
+    /// scope/token/base-authenticated authority files because the durable marker
+    /// proves that object-identity validation already completed.
+    pub fn retire_terminal_materialization_authorities(
+        &self,
+        pipeline: &ActionPipeline,
+        context: &ActionContext,
+        before_authority_unlink: Option<&dyn Fn() -> Result<(), ActionError>>,
+        authority_retirement_previously_marked: bool,
+    ) -> Result<(), ActionError> {
+        validate_context_syntax(context)?;
+        if pipeline.for_phase(context.phase).is_empty() {
+            return Ok(());
+        }
+        let pipeline_serialized = pipeline.canonical_serialization()?;
+        let pipeline_sha256 = sha256_hex(pipeline_serialized.as_bytes());
+        let journal_path = action_journal_path(context, &pipeline_sha256)?;
+        let store = JournalStore::new(journal_path, self.filesystem)?;
+
+        if authority_retirement_previously_marked {
+            // The orchestration layer durably records this state only after a
+            // previous pass validated the terminal PRE journal against the
+            // retained published object. If that process then died before
+            // workspace cleanup, retry must not depend on reopening the album
+            // path: the user may have deleted the album after authority
+            // retirement began. Load the durable journal without preparing live
+            // scope capabilities and retry only descriptor-relative removal of
+            // any remaining scope/token/base-authenticated authority files.
+            let Some((journal, _from_write_temporary)) = load_journal_bootstrap(&store)? else {
+                return Ok(());
+            };
+            self.filesystem
+                .retire_materialization_authorities_for_scope_records_after_terminal_marker(
+                    &journal.capability_roots,
+                )?;
+            return Ok(());
+        }
+
+        let retained_live_context = prepare_context_for_journal_read(self.filesystem, context)?;
+        let loaded = if retained_live_context {
+            load_journal_bound(&store)?
+        } else {
+            load_journal_bootstrap(&store)?
+        };
+        let Some((journal, _from_write_temporary)) = loaded else {
+            return Ok(());
+        };
+        if !retained_live_context {
+            return Ok(());
+        }
+
+        self.attest_pre_album_scope_from_retained_publication(
+            context,
+            &journal.capability_roots,
+        )?;
+        prepare_retained_pipeline_capabilities(self.filesystem, pipeline, context)?;
+        self.filesystem.restore_scope_records(
+            &journal.capability_roots,
+            &expected_capability_roots(pipeline, context, &journal.capability_roots)?,
+        )?;
+        prepare_pipeline_capabilities(self.filesystem, pipeline, context)?;
+        self.filesystem.validate_scope_records(&journal.capability_roots)?;
+        validate_journal(
+            &journal,
+            self.filesystem,
+            context,
+            pipeline,
+            &pipeline_serialized,
+            &pipeline_sha256,
+        )?;
+        if let Some(before_authority_unlink) = before_authority_unlink {
+            before_authority_unlink()?;
+        }
+        self.filesystem
+            .retire_materialization_authorities_for_scope_records(&journal.capability_roots)?;
+        Ok(())
     }
 
     /// Validate all durable authority beneath an explicit/manual action root.
@@ -6077,7 +6415,11 @@ fn expected_capability_roots(
     context: &ActionContext,
     recorded_roots: &[ScopeRecord],
 ) -> Result<Vec<(ScopeId, PathBuf)>, ActionError> {
-    let source_root = if context.source_is_directory {
+    // Mirror prepare_context_capabilities: album batches anchor the source
+    // scope at the shared grouping root.
+    let source_root = if let Some(root) = context.batch_source_scope_root.clone() {
+        root
+    } else if context.source_is_directory {
         context.source_path.clone()
     } else {
         context.source_path.parent().ok_or_else(|| {
@@ -6228,7 +6570,12 @@ fn prepare_context_capabilities(
     ] {
         reject_ephemeral_descriptor_namespace_path(label, path)?;
     }
-    let source_root = if context.source_is_directory {
+    // Album batches pin the source scope at the shared grouping root so every
+    // participant registers the identical scope identity (see
+    // `batch_source_scope_root` on ActionContext).
+    let source_root = if let Some(root) = context.batch_source_scope_root.as_deref() {
+        root
+    } else if context.source_is_directory {
         context.source_path.as_path()
     } else {
         context.source_path.parent().ok_or_else(|| {
@@ -6265,6 +6612,8 @@ fn prepare_context_capabilities(
             }
         } else if name == "journal" {
             filesystem.pin_recoverable_internal_root(id, path)?;
+        } else if name == "album" && context.phase == ActionPhase::Pre {
+            filesystem.pin_materializable_root(id, path)?;
         } else {
             filesystem.pin_root(id, path)?;
         }
@@ -7054,6 +7403,36 @@ fn plan_script(
     })
 }
 
+
+/// Compare a journal-recorded script environment against the validating
+/// context. The elected writer's own validation is exact. A batch member
+/// reading the album-scoped journal recomputes every key, but per-request
+/// album-token VALUES (TONEPOET_<token>) legitimately differ between the
+/// elected track and the reader's track; key set and every other value stay
+/// strict.
+fn script_environment_matches(
+    recorded: &BTreeMap<String, String>,
+    context: &ActionContext,
+    exempt_request_token_values: bool,
+) -> bool {
+    let expected = build_script_environment(context);
+    if !exempt_request_token_values {
+        return recorded == &expected;
+    }
+    if recorded.len() != expected.len() {
+        return false;
+    }
+    let token_keys: BTreeSet<String> = context
+        .album_tokens
+        .keys()
+        .map(|token| format!("TONEPOET_{}", token.to_ascii_uppercase()))
+        .filter(|key| valid_environment_key(key))
+        .collect();
+    recorded.iter().all(|(key, value)| match expected.get(key) {
+        None => false,
+        Some(expected_value) => value == expected_value || token_keys.contains(key),
+    })
+}
 
 fn build_script_environment(context: &ActionContext) -> BTreeMap<String, String> {
     let mut environment = BTreeMap::new();
@@ -8205,6 +8584,7 @@ impl<'a> ActionEngine<'a> {
                     claim_id,
                     action_index,
                     operation_index,
+                    false,
                 )?;
                 let expected_capability_paths =
                     capability_paths_for_operation(self.filesystem, &operation.plan)?;
@@ -12917,11 +13297,31 @@ fn validate_journal(
         .map_err(|error| ActionError::InvalidJournal(format!(
             "journal capability roots do not match retained descriptors: {error}"
         )))?;
+    // Album-batch action journals are album-scoped: one elected participant
+    // writes the journal, and EVERY participant of the same run/album may
+    // validate it during finalize. Those readers legitimately carry their own
+    // track as `source_path`; require it to be a member of the same validated
+    // subject directory instead of the elected track. Explicit/manual scopes
+    // keep the exact single-context binding.
+    let source_path_matches = journal.source_path == context.source_path
+        || (!context.explicit_scope
+            && match context.batch_source_scope_root.as_deref() {
+                // Album batch: any member track under the shared grouping
+                // root may validate the elected writer's journal.
+                Some(root) => {
+                    journal.source_path.starts_with(root)
+                        && context.source_path.starts_with(root)
+                }
+                None => {
+                    journal.source_path.parent().is_some()
+                        && journal.source_path.parent() == context.source_path.parent()
+                }
+            });
     if journal.run_identity != context.run_identity
         || journal.album_identity != context.album_identity
         || journal.phase != context.phase
         || journal.subject_dir != context.subject_dir
-        || journal.source_path != context.source_path
+        || !source_path_matches
         || journal.output_root != context.output_root
         || journal.album_dir != context.album_dir
     {
@@ -12980,6 +13380,21 @@ fn validate_journal(
     validate_mutation_path(&journal.journal_path, false)?;
     validate_mutation_path(&journal.journal_write_temporary, false)?;
 
+    // Per-operation renderings (script environment, template expansion) were
+    // produced by the ELECTED writer's context. A batch reader validating with
+    // its own member track must compare against the writer's view, so
+    // substitute the journal's already-validated source before the loop.
+    let elected_view;
+    let operation_context = if journal.source_path == context.source_path {
+        context
+    } else {
+        let mut view = context.clone();
+        view.source_path = journal.source_path.clone();
+        view.source_is_directory = journal.source_path == journal.subject_dir;
+        elected_view = view;
+        &elected_view
+    };
+
     for (index, (slot, configured)) in journal.actions.iter().zip(actions).enumerate() {
         if slot.index != index {
             return Err(ActionError::InvalidJournal(
@@ -13012,7 +13427,7 @@ fn validate_journal(
                     index + 1
                 )));
             }
-            validate_planning_precondition_shapes(configured, plan, context)?;
+            validate_planning_precondition_shapes(configured, plan, operation_context)?;
             validate_planning_precondition_identities(plan)?;
             for (operation_index, (planned, durable)) in plan
                 .operations
@@ -13034,10 +13449,11 @@ fn validate_journal(
                 validate_operation_paths(
                     durable,
                     configured,
-                    context,
+                    operation_context,
                     &journal.claim_id,
                     index,
                     operation_index,
+                    journal.source_path != context.source_path,
                 )?;
                 let expected_capability_paths =
                     capability_paths_for_operation(filesystem, &durable.plan)?;
@@ -13552,6 +13968,7 @@ fn validate_operation_paths(
     claim_id: &str,
     action_index: usize,
     operation_index: usize,
+    batch_member_reader: bool,
 ) -> Result<(), ActionError> {
     for path in operation.plan.all_paths() {
         validate_mutation_path(path, false)?;
@@ -13813,7 +14230,7 @@ fn validate_operation_paths(
                 || args != &action.args
                 || working_directory != &context.subject_dir
                 || timeout_seconds != &action.timeout_seconds
-                || environment != &build_script_environment(context)
+                || !script_environment_matches(environment, context, batch_member_reader)
                 || environment.keys().any(|key| !valid_environment_key(key))
                 || runtime_directory
                     != &script_runtime_directory(context, claim_id, action_index, operation_index)?
@@ -16657,6 +17074,7 @@ mod conversion_actions_tests {
                 album_tokens: tokens,
                 disc_count: Some(2),
                 journal_dir: self.journal_dir.clone(),
+                batch_source_scope_root: None,
                 explicit_scope: false,
                 semantics: test_semantics(),
             }
@@ -18180,6 +18598,7 @@ mod conversion_actions_tests {
             album_tokens: BTreeMap::new(),
             disc_count: None,
             journal_dir: logical_journal.clone(),
+            batch_source_scope_root: None,
             explicit_scope: false,
             semantics: test_semantics(),
         };

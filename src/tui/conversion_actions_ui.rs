@@ -221,6 +221,7 @@ pub fn refresh_wizard_preview_for_app(
         album_tokens: layout.album_tokens,
         disc_count: layout.disc_count,
         journal_dir: temporary.path().join(".tonepoet-action-preview-journals"),
+        batch_source_scope_root: None,
         explicit_scope: true,
         semantics: ui_action_semantics(),
     };
@@ -1167,6 +1168,7 @@ fn explicit_context_from_identity(
         album_tokens: identity.album_tokens,
         disc_count: identity.disc_count,
         journal_dir: target.join(".tonepoet-actions-manual"),
+        batch_source_scope_root: None,
         explicit_scope: true,
         semantics: ui_action_semantics(),
     })

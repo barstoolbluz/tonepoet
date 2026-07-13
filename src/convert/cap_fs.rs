@@ -18,12 +18,12 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use uuid::Uuid;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
-use std::sync::{MutexGuard, OnceLock};
+use std::sync::MutexGuard;
 
 #[cfg(all(test, target_os = "linux"))]
 static FORCE_OPENAT2_FALLBACK: AtomicBool = AtomicBool::new(false);
@@ -35,6 +35,31 @@ static FALLBACK_COMPONENT_OPENS: AtomicU64 = AtomicU64::new(0);
 static DIRECTORY_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static DIRECTORY_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+static MATERIALIZATION_AUTHORITY_LOCKS: OnceLock<Mutex<HashMap<AuthorityLockKey, Weak<AuthorityLockState>>>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AuthorityLockKey {
+    parent_device: u64,
+    parent_inode: u64,
+    authority_name_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+struct AuthorityLockState {
+    locked: Mutex<bool>,
+    available: Condvar,
+}
+
+impl AuthorityLockState {
+    fn new() -> Self {
+        Self {
+            locked: Mutex::new(false),
+            available: Condvar::new(),
+        }
+    }
+}
+
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,6 +481,12 @@ const DIRECTORY_CACHE_CAPACITY: usize = 128;
 const MATERIALIZATION_STAGE_PREFIX: &str = ".tonepoet-root-stage-";
 const MATERIALIZATION_MARKER: &str = ".tonepoet-root-owner";
 const MATERIALIZATION_AUTHORITY_PREFIX: &str = ".tonepoet-root-authority-";
+const MATERIALIZATION_AUTHORITY_READY_PREFIX: &str = ".tonepoet-root-authority-ready-";
+const MATERIALIZATION_AUTHORITY_WRITING_PREFIX: &str = ".tonepoet-root-authority-writing-";
+const MATERIALIZATION_AUTHORITY_LOCK_PREFIX: &str = ".tonepoet-materialization-lock-";
+const MATERIALIZATION_MARKER_READY_PREFIX: &str = ".tonepoet-root-owner-ready-";
+const MATERIALIZATION_MARKER_WRITING_PREFIX: &str = ".tonepoet-root-owner-writing-";
+const MATERIALIZATION_AUTHORITY_SCHEMA: &str = "tonepoet-materialization-authority-v2";
 
 #[derive(Debug)]
 struct CachedDirectory {
@@ -1089,6 +1120,107 @@ impl CapabilityFilesystem {
         })
     }
 
+
+    /// Acquire `requested` like `pin_root`, but for an absent logical root also
+    /// create or adopt a durable bootstrap authority in the retained ancestor.
+    ///
+    /// This is for Tonepoet-owned roots, such as the PRE album output root,
+    /// whose directory may be materialized later by the conversion publisher
+    /// rather than by an action operation. Plain `pin_root` remains non-mutating
+    /// for arbitrary user-selected roots; this entry point records enough
+    /// durable authority for a later retained direct descriptor to be bound to
+    /// the original parent-anchored journal scope without treating the scope as
+    /// a per-run recoverable root.
+    pub fn pin_materializable_root(
+        &self,
+        id: ScopeId,
+        requested: impl AsRef<Path>,
+    ) -> Result<ScopedPath, CapFsError> {
+        let requested = normalize_absolute(requested.as_ref())?;
+        {
+            let registry = self.registry.lock().map_err(|_| {
+                CapFsError::Contradiction("capability registry mutex poisoned".to_string())
+            })?;
+            if let Some(existing) = registry.by_id.get(&id) {
+                if existing.logical_path != requested {
+                    return Err(CapFsError::ScopeConflict(format!(
+                        "scope {} was requested for a different logical root",
+                        id.as_str()
+                    )));
+                }
+                return Ok(ScopedPath {
+                    scope: id,
+                    relative: RelativePath::new(Path::new(""))?,
+                });
+            }
+        }
+
+        let (opened_path, remainder, fd) = open_nearest_existing_directory(&requested)?;
+        let metadata = fstat_fd(fd.as_raw_fd())?;
+        if metadata.file_type != CapFileType::Directory {
+            return Err(CapFsError::InvalidPath(format!(
+                "capability root is not a directory: {}",
+                opened_path.display()
+            )));
+        }
+
+        let base_relative = RelativePath::new(remainder)?;
+        let (materialization_token, materialization_authority_name) = if base_relative.is_empty() {
+            (None, None)
+        } else {
+            let authority_name = materialization_authority_name(&id, &base_relative);
+            let token = create_or_adopt_materialization_authority(
+                fd.as_raw_fd(),
+                &authority_name,
+                &id,
+                &base_relative,
+            )?;
+            (Some(token), Some(authority_name))
+        };
+
+        let root = Arc::new(CapabilityRoot {
+            id: id.clone(),
+            acquisition_path: opened_path,
+            logical_path: requested.clone(),
+            base_relative,
+            fd,
+            device: metadata.device,
+            inode: metadata.inode,
+            materialization_token,
+            materialization_authority_name,
+            recoverable: false,
+            logical_root: Mutex::new(None),
+        });
+        let mut registry = self.registry.lock().map_err(|_| {
+            CapFsError::Contradiction("capability registry mutex poisoned".to_string())
+        })?;
+        if let Some(existing) = registry.by_id.get(&id) {
+            if existing.logical_path != requested
+                || existing.acquisition_path != root.acquisition_path
+                || existing.base_relative != root.base_relative
+                || existing.device != root.device
+                || existing.inode != root.inode
+                || existing.materialization_token != root.materialization_token
+                || existing.materialization_authority_name != root.materialization_authority_name
+            {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} was concurrently bound to a different materializable root",
+                    id.as_str()
+                )));
+            }
+            return Ok(ScopedPath {
+                scope: id,
+                relative: RelativePath::new(Path::new(""))?,
+            });
+        }
+        registry.by_path.entry(requested).or_default().insert(id.clone());
+        registry.by_id.insert(id.clone(), root);
+        Ok(ScopedPath {
+            scope: id,
+            relative: RelativePath::new(Path::new(""))?,
+        })
+    }
+
     /// Determine the narrow first-publication boundary for a logical root.
     ///
     /// If the complete root already exists, the root itself is returned. If
@@ -1171,10 +1303,13 @@ impl CapabilityFilesystem {
         let parent_metadata = fstat_fd(parent_fd.as_raw_fd())?;
         let base_relative = RelativePath::new(Path::new(name))?;
         let authority_name = materialization_authority_name(&id, &base_relative);
-        let authority_token = read_materialization_authority(
+        let authority_record = read_materialization_authority(
             parent_fd.as_raw_fd(),
             &authority_name,
         )?;
+        if let Some(authority) = authority_record.as_ref() {
+            authority.validate_for_scope(&id, &base_relative)?;
+        }
 
         let mut staged_tokens = Vec::new();
         for entry in read_directory_entries(duplicate_fd(parent_fd.as_raw_fd())?)? {
@@ -1231,13 +1366,44 @@ impl CapabilityFilesystem {
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                     0,
                 )?;
+                let observed = fstat_fd(logical.as_raw_fd())?;
                 match read_materialization_marker(logical.as_raw_fd())? {
-                    None if authority_token.is_none() => return self.pin_root(id, requested),
+                    None if authority_record.is_none() => return self.pin_root(id, requested),
                     None => {
-                        return Err(CapFsError::ScopeConflict(format!(
-                            "internal-root bootstrap authority remains but the published owner marker is absent: {}",
-                            requested.display()
-                        )))
+                        let authority = authority_record.as_ref().ok_or_else(|| {
+                            CapFsError::ScopeConflict(format!(
+                                "published internal root has no durable bootstrap authority: {}",
+                                requested.display()
+                            ))
+                        })?;
+                        // Without the owner marker the only authentication is
+                        // the attested object identity (immutable bootstrap or
+                        // the separate no-clobber attestation).
+                        let attested = match authority.materialized_identity() {
+                            Some(identity) => Some(identity),
+                            None => attested_identity_for_authority(
+                                parent_fd.as_raw_fd(),
+                                &authority_name,
+                                &id,
+                                &base_relative,
+                                authority.token(),
+                            )?,
+                        };
+                        if attested != Some((observed.device, observed.inode)) {
+                            return Err(CapFsError::ScopeConflict(format!(
+                                "internal-root bootstrap authority does not attest the published root: {}",
+                                requested.display()
+                            )));
+                        }
+                        (
+                            authority.token().to_string(),
+                            Some(RetainedLogicalRoot {
+                                marker_parent: None,
+                                fd: logical,
+                                device: observed.device,
+                                inode: observed.inode,
+                            }),
+                        )
                     }
                     Some(marker) => {
                         let marker = std::str::from_utf8(&marker).map_err(|_| {
@@ -1250,19 +1416,42 @@ impl CapabilityFilesystem {
                                 "recoverable internal-root marker has an invalid token".to_string(),
                             ));
                         }
-                        let authority = authority_token.as_deref().ok_or_else(|| {
+                        let authority = authority_record.as_ref().ok_or_else(|| {
                             CapFsError::ScopeConflict(format!(
                                 "published internal root has no durable bootstrap authority: {}",
                                 requested.display()
                             ))
                         })?;
-                        if authority != marker {
+                        if authority.token() != marker {
                             return Err(CapFsError::ScopeConflict(format!(
                                 "internal-root bootstrap authority and owner marker disagree: {}",
                                 requested.display()
                             )));
                         }
-                        let observed = fstat_fd(logical.as_raw_fd())?;
+                        // The token-bound owner marker authenticates this
+                        // publication. An attested identity (bootstrap or the
+                        // separate attestation) must still match when present;
+                        // its absence is the legitimate crash window between
+                        // marker publication and identity attestation, per the
+                        // adopts-publication-before-first-scope-record spec.
+                        let attested = match authority.materialized_identity() {
+                            Some(identity) => Some(identity),
+                            None => attested_identity_for_authority(
+                                parent_fd.as_raw_fd(),
+                                &authority_name,
+                                &id,
+                                &base_relative,
+                                authority.token(),
+                            )?,
+                        };
+                        if attested.is_some_and(|identity| {
+                            identity != (observed.device, observed.inode)
+                        }) {
+                            return Err(CapFsError::ScopeConflict(format!(
+                                "internal-root bootstrap authority does not attest the published root: {}",
+                                requested.display()
+                            )));
+                        }
                         (
                             marker.to_string(),
                             Some(RetainedLogicalRoot {
@@ -1276,16 +1465,15 @@ impl CapabilityFilesystem {
                 }
             }
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                let token = match authority_token {
-                    Some(token) => token,
+                let token = match authority_record.as_ref() {
+                    Some(authority) => authority.token().to_string(),
                     None if staged_tokens.is_empty() => {
-                        let token = Uuid::new_v4().simple().to_string();
-                        create_materialization_authority(
+                        create_or_adopt_materialization_authority(
                             parent_fd.as_raw_fd(),
                             &authority_name,
-                            &token,
-                        )?;
-                        token
+                            &id,
+                            &base_relative,
+                        )?
                     }
                     None => {
                         return Err(CapFsError::ScopeConflict(format!(
@@ -1317,7 +1505,16 @@ impl CapabilityFilesystem {
                             | libc::O_NOFOLLOW,
                         0,
                     )?;
-                    claim_or_verify_materialization_stage(stage.as_raw_fd(), &token)?;
+                    let expected_identity = authority_record
+                        .as_ref()
+                        .and_then(MaterializationAuthority::materialized_identity);
+                    claim_or_verify_materialization_stage(
+                        parent_fd.as_raw_fd(),
+                        &authority_name,
+                        stage.as_raw_fd(),
+                        &token,
+                        expected_identity,
+                    )?;
                 }
                 (token, None)
             }
@@ -1803,65 +2000,80 @@ impl CapabilityFilesystem {
             // reopen the logical pathname merely to rediscover the same
             // object. This is the capability-bound path used after a parent
             // rename or mount/path replacement.
-            {
+            let existing = {
                 let registry = self.registry.lock().map_err(|_| {
                     CapFsError::Contradiction(
                         "capability registry mutex poisoned".to_string(),
                     )
                 })?;
-                if let Some(existing) = registry.by_id.get(&record.id) {
-                    let existing_materialized = if existing.base_relative.is_empty() {
-                        Some((existing.device, existing.inode))
-                    } else {
-                        existing
-                            .logical_root
-                            .lock()
-                            .map_err(|_| {
-                                CapFsError::Contradiction(
-                                    "logical-root capability mutex poisoned".to_string(),
-                                )
-                            })?
-                            .as_ref()
-                            .map(|retained| (retained.device, retained.inode))
-                    };
-                    // Match the same durable transition accepted by
-                    // `validate_scope_records`: a token-authenticated logical
-                    // root may have materialized after the last journal
-                    // generation.  An exact retained descriptor for that root
-                    // is authoritative and must not be discarded merely
-                    // because the previous record still contains `None`.
-                    let materialized_matches = match materialized_identity {
-                        Some(expected) => existing_materialized == Some(expected),
-                        None => {
-                            existing_materialized.is_none()
-                                || (existing.materialization_token.is_some()
-                                    && existing.base_relative == base_relative)
-                        }
-                    };
-                    let matches = existing.acquisition_path
-                        == normalize_absolute(&record.acquisition_path)?
-                        && existing.logical_path == *logical_path
-                        && existing.base_relative == base_relative
-                        && existing.device == record.device
-                        && existing.inode == record.inode
-                        && existing.materialization_token == materialization_token
-                        && existing.materialization_authority_name
-                            == materialization_authority_name
-                        && materialized_matches;
-                    // Tonepoet-private recoverable roots (journal/recovery
-                    // dirs) are recreated per run; a record from a prior
-                    // generation may carry the retired object's identity.
-                    // The retained current entry is authoritative.
-                    let prior_generation_of_recoverable = existing.recoverable
-                        && existing.logical_path == *logical_path;
-                    if !matches && !prior_generation_of_recoverable {
-                        return Err(CapFsError::ScopeConflict(format!(
-                            "scope {} conflicts with an already retained capability",
-                            record.id.as_str()
-                        )));
+                registry.by_id.get(&record.id).cloned()
+            };
+            if let Some(existing) = existing {
+                let existing_materialized = if existing.base_relative.is_empty() {
+                    Some((existing.device, existing.inode))
+                } else {
+                    existing
+                        .logical_root
+                        .lock()
+                        .map_err(|_| {
+                            CapFsError::Contradiction(
+                                "logical-root capability mutex poisoned".to_string(),
+                            )
+                        })?
+                        .as_ref()
+                        .map(|retained| (retained.device, retained.inode))
+                };
+                // Match the same durable transition accepted by
+                // `validate_scope_records`: a token-authenticated logical
+                // root may have materialized after the last journal
+                // generation. An exact retained descriptor for that root
+                // is authoritative and must not be discarded merely
+                // because the previous record still contains `None`.
+                let materialized_matches = match materialized_identity {
+                    Some(expected) => existing_materialized == Some(expected),
+                    None => {
+                        existing_materialized.is_none()
+                            || (existing.materialization_token.is_some()
+                                && existing.base_relative == base_relative)
                     }
-                    continue;
+                };
+                let shape_preserving_matches = existing.acquisition_path
+                    == normalize_absolute(&record.acquisition_path)?
+                    && existing.logical_path == *logical_path
+                    && existing.base_relative == base_relative
+                    && existing.device == record.device
+                    && existing.inode == record.inode
+                    && existing.materialization_token == materialization_token
+                    && existing.materialization_authority_name
+                        == materialization_authority_name
+                    && materialized_matches;
+                // Tonepoet-private recoverable roots (journal/recovery
+                // dirs) are recreated per run; a record from a prior
+                // generation may carry the retired object's identity.
+                // The retained current entry is authoritative.
+                let prior_generation_of_recoverable = existing.recoverable
+                    && existing.logical_path == *logical_path;
+                let evolved_direct_anchor_matches = if !shape_preserving_matches
+                    && !prior_generation_of_recoverable
+                {
+                    let authority_parent = self.retained_authority_parent_for_record(record)?;
+                    authenticate_evolved_direct_anchor(
+                        record,
+                        logical_path,
+                        &existing,
+                        authority_parent,
+                    )?
+                } else {
+                    false
+                };
+                let matches = shape_preserving_matches || evolved_direct_anchor_matches;
+                if !matches && !prior_generation_of_recoverable {
+                    return Err(CapFsError::ScopeConflict(format!(
+                        "scope {} conflicts with an already retained capability",
+                        record.id.as_str()
+                    )));
                 }
+                continue;
             }
 
             let retained_ancestor = {
@@ -1934,21 +2146,43 @@ impl CapabilityFilesystem {
                     record.id.as_str()
                 )));
             }
-            if let (Some(authority_name), Some(token)) = (
+            let authority_record = if let (Some(authority_name), Some(token)) = (
                 materialization_authority_name.as_ref(),
                 materialization_token.as_deref(),
             ) {
-                if let Some(observed) =
-                    read_materialization_authority(fd.as_raw_fd(), authority_name)?
-                {
-                    if observed.as_str() != token {
+                match read_materialization_authority(fd.as_raw_fd(), authority_name)? {
+                    Some(authority) => {
+                        authority.validate_for_scope(&record.id, &base_relative)?;
+                        if authority.token() != token {
+                            return Err(CapFsError::ScopeConflict(format!(
+                                "scope {} bootstrap authority does not match its journal token",
+                                record.id.as_str()
+                            )));
+                        }
+                        if let (Some(journal), Some(attested)) = (
+                            materialized_identity,
+                            authority.materialized_identity(),
+                        ) {
+                            if journal != attested {
+                                return Err(CapFsError::ScopeConflict(format!(
+                                    "scope {} bootstrap authority contradicts its journal materialized identity",
+                                    record.id.as_str()
+                                )));
+                            }
+                        }
+                        Some(authority)
+                    }
+                    None if materialized_identity.is_some() => None,
+                    None => {
                         return Err(CapFsError::ScopeConflict(format!(
-                            "scope {} bootstrap authority does not match its journal token",
+                            "scope {} bootstrap authority is missing",
                             record.id.as_str()
                         )));
                     }
                 }
-            }
+            } else {
+                None
+            };
 
             let logical_root = if base_relative.is_empty() {
                 if materialized_identity != Some((metadata.device, metadata.inode)) {
@@ -2024,7 +2258,20 @@ impl CapabilityFilesystem {
                                         | libc::O_NOFOLLOW,
                                     0,
                                 )?;
-                                claim_or_verify_materialization_stage(stage.as_raw_fd(), token)?;
+                                let expected_identity = authority_record
+                                    .as_ref()
+                                    .and_then(MaterializationAuthority::materialized_identity);
+                                let synchronization_authority_name =
+                                    materialization_authority_name.clone().unwrap_or_else(|| {
+                                        self::materialization_authority_name(&record.id, &base_relative)
+                                    });
+                                claim_or_verify_materialization_stage(
+                                    fd.as_raw_fd(),
+                                    &synchronization_authority_name,
+                                    stage.as_raw_fd(),
+                                    token,
+                                    expected_identity,
+                                )?;
                                 None
                             }
                             Ok(_) => {
@@ -2037,10 +2284,36 @@ impl CapabilityFilesystem {
                         }
                     }
                     Ok(observed) if observed.file_type == CapFileType::Directory => {
+                        // The bootstrap authority is immutable; the identity
+                        // is published as a separate no-clobber attestation.
+                        // Consult it, then let the token-bound owner marker
+                        // (verified inside open_published_materialized_root)
+                        // authenticate the publication when no identity has
+                        // been attested yet — the legitimate crash/ordering
+                        // window before the first attesting participant.
+                        let mut expected_identity = authority_record
+                            .as_ref()
+                            .and_then(MaterializationAuthority::materialized_identity)
+                            .or(materialized_identity);
+                        if expected_identity.is_none() {
+                            let attestation_authority_name = materialization_authority_name
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    self::materialization_authority_name(&record.id, &base_relative)
+                                });
+                            expected_identity = attested_identity_for_authority(
+                                fd.as_raw_fd(),
+                                &attestation_authority_name,
+                                &record.id,
+                                &base_relative,
+                                token,
+                            )?;
+                        }
                         let (marker_parent, current) = open_published_materialized_root(
                             fd.as_raw_fd(),
                             &components,
                             token,
+                            expected_identity,
                         )?;
                         let observed = fstat_fd(current.as_raw_fd())?;
                         Some(RetainedLogicalRoot {
@@ -2095,7 +2368,21 @@ impl CapabilityFilesystem {
                 // current entry.
                 let prior_generation_of_recoverable =
                     existing.recoverable && existing.logical_path == *logical_path;
-                if mismatch && !prior_generation_of_recoverable {
+                let evolved_direct_anchor_matches =
+                    if mismatch && !prior_generation_of_recoverable {
+                        authenticate_evolved_direct_anchor(
+                            record,
+                            logical_path,
+                            existing,
+                            None,
+                        )?
+                    } else {
+                        false
+                    };
+                if mismatch
+                    && !evolved_direct_anchor_matches
+                    && !prior_generation_of_recoverable
+                {
                     return Err(CapFsError::ScopeConflict(format!(
                         "scope {} conflicts with an already retained capability",
                         record.id.as_str()
@@ -2254,6 +2541,148 @@ impl CapabilityFilesystem {
         sync_fd_best_effort(descriptor.as_raw_fd())
     }
 
+    fn retained_authority_parent_for_record(
+        &self,
+        record: &ScopeRecord,
+    ) -> Result<Option<OwnedFd>, CapFsError> {
+        let acquisition_path = normalize_absolute(&record.acquisition_path)?;
+        let registry = self.registry.lock().map_err(|_| {
+            CapFsError::Contradiction("capability registry mutex poisoned".to_string())
+        })?;
+        for root in registry.by_id.values() {
+            if root.base_relative.is_empty()
+                && root.logical_path == acquisition_path
+                && root.device == record.device
+                && root.inode == record.inode
+            {
+                return Ok(Some(duplicate_fd(root.fd.as_raw_fd())?));
+            }
+        }
+        Ok(None)
+    }
+
+
+    /// Bind a prior parent-anchored journal record to a retained direct root by
+    /// upgrading its bootstrap authority to an identity-bearing attestation.
+    ///
+    /// Callers use this only after the conversion publisher has retained the
+    /// exact album directory descriptor under the publication lock. The update
+    /// is descriptor-relative to the journal-bound authority parent and records
+    /// the retained direct descriptor's device/inode before normal restore and
+    /// validation apply the common evolved-anchor rule.
+    pub fn attest_materialized_scope_from_retained_direct_anchor(
+        &self,
+        record: &ScopeRecord,
+    ) -> Result<(), CapFsError> {
+        let base_relative = RelativePath::new(record.base_relative.as_path())?;
+        if base_relative.is_empty() {
+            return Ok(());
+        }
+        let Some(token) = record.materialization_token.as_deref() else {
+            return Ok(());
+        };
+        if !valid_materialization_token(token) {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} has an invalid materialization token",
+                record.id.as_str()
+            )));
+        }
+        let authority_name = match record.materialization_authority_name.as_deref() {
+            Some(name) => {
+                let name = OsString::from(name);
+                validate_component(&name)?;
+                let expected = materialization_authority_name(&record.id, &base_relative);
+                if name != expected {
+                    return Err(CapFsError::ScopeConflict(format!(
+                        "scope {} has a foreign materialization authority name",
+                        record.id.as_str()
+                    )));
+                }
+                name
+            }
+            None => return Ok(()),
+        };
+        if let (Some(device), Some(inode)) = (record.materialized_device, record.materialized_inode) {
+            let retained = {
+                let registry = self.registry.lock().map_err(|_| {
+                    CapFsError::Contradiction(
+                        "capability registry mutex poisoned".to_string(),
+                    )
+                })?;
+                registry.by_id.get(&record.id).cloned()
+            };
+            if let Some(retained) = retained {
+                if retained.base_relative.is_empty()
+                    && retained.logical_path == normalize_absolute(&record.logical_path)?
+                    && retained.device == device
+                    && retained.inode == inode
+                {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+        if record.materialized_device.is_some() || record.materialized_inode.is_some() {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} has a partial materialized-root identity",
+                record.id.as_str()
+            )));
+        }
+
+        let retained = {
+            let registry = self.registry.lock().map_err(|_| {
+                CapFsError::Contradiction(
+                    "capability registry mutex poisoned".to_string(),
+                )
+            })?;
+            registry.by_id.get(&record.id).cloned()
+        };
+        let Some(retained) = retained else { return Ok(()); };
+        if !retained.base_relative.is_empty()
+            || retained.logical_path != normalize_absolute(&record.logical_path)?
+            || retained.materialization_token.is_some()
+            || retained.materialization_authority_name.is_some()
+        {
+            return Ok(());
+        }
+        let authority_parent = match self.retained_authority_parent_for_record(record)? {
+            Some(fd) => verify_authority_parent_for_record(
+                record,
+                &normalize_absolute(&record.logical_path)?,
+                fd,
+            )?,
+            None => open_authority_parent_for_record(record, &record.logical_path)?,
+        };
+        let authority = read_materialization_authority(authority_parent.as_raw_fd(), &authority_name)?
+            .ok_or_else(|| CapFsError::ScopeConflict(format!(
+                "scope {} bootstrap authority is missing",
+                record.id.as_str()
+            )))?;
+        authority.validate_for_scope(&record.id, &base_relative)?;
+        if authority.token() != token {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} bootstrap authority does not match its journal token",
+                record.id.as_str()
+            )));
+        }
+        match authority.materialized_identity() {
+            Some((device, inode)) if device == retained.device && inode == retained.inode => Ok(()),
+            Some(_) => Err(CapFsError::ScopeConflict(format!(
+                "scope {} bootstrap authority attests a different materialized directory",
+                record.id.as_str()
+            ))),
+            None => attest_materialization_authority(
+                authority_parent.as_raw_fd(),
+                &authority_name,
+                &record.id,
+                &base_relative,
+                token,
+                retained.device,
+                retained.inode,
+            ),
+        }
+    }
+
     pub fn validate_scope_records(&self, expected: &[ScopeRecord]) -> Result<(), CapFsError> {
         let current = self.scope_records()?;
         let current: BTreeMap<_, _> = current
@@ -2331,8 +2760,35 @@ impl CapabilityFilesystem {
                     entry.recoverable && entry.logical_path == record.logical_path
                 })
             };
-            if (!stable_fields_match || !materialized_matches)
-                && !prior_generation_of_recoverable
+            let needs_evolved_direct_anchor =
+                (!stable_fields_match || !materialized_matches)
+                    && !prior_generation_of_recoverable;
+            let evolved_direct_anchor_matches = if needs_evolved_direct_anchor {
+                let entry = {
+                    let registry = self.registry.lock().map_err(|_| {
+                        CapFsError::Contradiction(
+                            "capability registry mutex poisoned".to_string(),
+                        )
+                    })?;
+                    registry.by_id.get(&record.id).cloned()
+                };
+                match entry.as_ref() {
+                    Some(entry) => {
+                        let authority_parent = self.retained_authority_parent_for_record(record)?;
+                        authenticate_evolved_direct_anchor(
+                            record,
+                            &observed.logical_path,
+                            entry,
+                            authority_parent,
+                        )?
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if needs_evolved_direct_anchor
+                && !evolved_direct_anchor_matches
             {
                 return Err(CapFsError::ScopeConflict(format!(
                     "scope {} no longer identifies the journal-bound directory",
@@ -2364,6 +2820,24 @@ impl CapabilityFilesystem {
             CapFsError::Contradiction("non-empty base path had no components".to_string())
         })?;
         let token = root.materialization_token.as_deref();
+        let authority_record = match (root.materialization_authority_name.as_ref(), token) {
+            (Some(authority_name), Some(token)) => {
+                match read_materialization_authority(root.fd.as_raw_fd(), authority_name)? {
+                    Some(authority) => {
+                        authority.validate_for_scope(&root.id, &root.base_relative)?;
+                        if authority.token() != token {
+                            return Err(CapFsError::ScopeConflict(format!(
+                                "logical-root bootstrap authority does not match its token: {}",
+                                root.logical_path.display()
+                            )));
+                        }
+                        Some(authority)
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
 
         // Recovery may observe a root that was atomically published after the
         // previous journal generation but before its device/inode was durable.
@@ -2383,8 +2857,29 @@ impl CapabilityFilesystem {
                         root.logical_path.display()
                     ))
                 })?;
-                let (marker_parent, logical) =
-                    open_published_materialized_root(root.fd.as_raw_fd(), &components, token)?;
+                let mut expected_identity = authority_record
+                    .as_ref()
+                    .and_then(MaterializationAuthority::materialized_identity);
+                if expected_identity.is_none() {
+                    if let Some(authority_name) = root.materialization_authority_name.as_ref() {
+                        // Identity may live only in the separate no-clobber
+                        // attestation; when neither exists, the token-bound
+                        // owner marker below still authenticates adoption.
+                        expected_identity = attested_identity_for_authority(
+                            root.fd.as_raw_fd(),
+                            authority_name,
+                            &root.id,
+                            &root.base_relative,
+                            token,
+                        )?;
+                    }
+                }
+                let (marker_parent, logical) = open_published_materialized_root(
+                    root.fd.as_raw_fd(),
+                    &components,
+                    token,
+                    expected_identity,
+                )?;
                 let observed = fstat_fd(logical.as_raw_fd())?;
                 *retained = Some(RetainedLogicalRoot {
                     fd: duplicate_fd(logical.as_raw_fd())?,
@@ -2422,7 +2917,20 @@ impl CapabilityFilesystem {
             0,
         ) {
             Ok(stage) => {
-                claim_or_verify_materialization_stage(stage.as_raw_fd(), token)?;
+                let expected_identity = authority_record
+                    .as_ref()
+                    .and_then(MaterializationAuthority::materialized_identity);
+                let synchronization_authority_name = root
+                    .materialization_authority_name
+                    .clone()
+                    .unwrap_or_else(|| materialization_authority_name(&root.id, &root.base_relative));
+                claim_or_verify_materialization_stage(
+                    root.fd.as_raw_fd(),
+                    &synchronization_authority_name,
+                    stage.as_raw_fd(),
+                    token,
+                    expected_identity,
+                )?;
                 stage
             }
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
@@ -2436,7 +2944,16 @@ impl CapabilityFilesystem {
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                     0,
                 )?;
-                create_materialization_marker(stage.as_raw_fd(), token)?;
+                let synchronization_authority_name = root
+                    .materialization_authority_name
+                    .clone()
+                    .unwrap_or_else(|| materialization_authority_name(&root.id, &root.base_relative));
+                create_materialization_marker(
+                    root.fd.as_raw_fd(),
+                    &synchronization_authority_name,
+                    stage.as_raw_fd(),
+                    token,
+                )?;
                 stage
             }
             Err(error) => return Err(error.into()),
@@ -2467,6 +2984,18 @@ impl CapabilityFilesystem {
             current = next;
         }
         sync_fd_best_effort(current.as_raw_fd())?;
+        let observed = fstat_fd(current.as_raw_fd())?;
+        if let Some(authority_name) = root.materialization_authority_name.as_ref() {
+            attest_materialization_authority(
+                root.fd.as_raw_fd(),
+                authority_name,
+                &root.id,
+                &root.base_relative,
+                token,
+                observed.device,
+                observed.inode,
+            )?;
+        }
 
         #[cfg(test)]
         run_race_hook(RacePoint::BeforeRename);
@@ -2527,7 +3056,16 @@ impl CapabilityFilesystem {
                 continue;
             };
 
+            let synchronization_authority_name = root
+                .materialization_authority_name
+                .clone()
+                .unwrap_or_else(|| materialization_authority_name(&root.id, &root.base_relative));
             if let Some(marker_parent) = retained_root.marker_parent.as_ref() {
+                let marker_lock = acquire_authority_exclusive_lock(
+                    root.fd.as_raw_fd(),
+                    &synchronization_authority_name,
+                    "logical-root owner-marker retirement",
+                )?;
                 match read_materialization_marker(marker_parent.as_raw_fd())? {
                     None => {}
                     Some(observed) if observed == token.as_bytes() => {
@@ -2540,7 +3078,6 @@ impl CapabilityFilesystem {
                             )));
                         }
                         unlinkat_component(marker_parent.as_raw_fd(), marker, false)?;
-                        sync_fd_best_effort(marker_parent.as_raw_fd())?;
                     }
                     Some(_) => {
                         return Err(CapFsError::ScopeConflict(format!(
@@ -2549,36 +3086,410 @@ impl CapabilityFilesystem {
                         )))
                     }
                 }
+                cleanup_interrupted_regular_file_temporaries(
+                    marker_parent.as_raw_fd(),
+                    OsStr::new(MATERIALIZATION_MARKER),
+                    MATERIALIZATION_MARKER_WRITING_PREFIX,
+                    MATERIALIZATION_MARKER_READY_PREFIX,
+                )?;
+                sync_fd_best_effort(marker_parent.as_raw_fd())?;
+                // Roots without a bootstrap authority still use the same
+                // deterministic authority identity for marker synchronization.
+                // With no authority records to retire later, remove that lock
+                // pathname now as the final marker-transaction mutation.
+                if root.materialization_authority_name.is_none() {
+                    marker_lock.retire_path_last(root.fd.as_raw_fd())?;
+                }
                 // Dropping this descriptor after the identity-bearing journal
                 // generation is durable cannot redirect any later cleanup.
                 retained_root.marker_parent = None;
             }
 
             if let Some(authority_name) = root.materialization_authority_name.as_ref() {
-                match read_materialization_authority(root.fd.as_raw_fd(), authority_name)? {
-                    None => {}
-                    Some(observed) if observed.as_str() == token => {
-                        let metadata =
-                            fstatat_no_follow(root.fd.as_raw_fd(), authority_name)?;
-                        if metadata.file_type != CapFileType::Regular {
-                            return Err(CapFsError::ScopeConflict(format!(
-                                "logical-root bootstrap authority changed type: {}",
-                                root.logical_path.display()
-                            )));
-                        }
-                        unlinkat_component(root.fd.as_raw_fd(), authority_name, false)?;
-                        sync_fd_best_effort(root.fd.as_raw_fd())?;
-                    }
-                    Some(_) => {
-                        return Err(CapFsError::ScopeConflict(format!(
-                            "logical-root bootstrap authority does not match its journal token: {}",
-                            root.logical_path.display()
-                        )))
-                    }
-                }
+                self.retire_materialization_authority_files(
+                    root.fd.as_raw_fd(),
+                    authority_name,
+                    &root.id,
+                    &root.base_relative,
+                    token,
+                    retained_root.device,
+                    retained_root.inode,
+                    &root.logical_path,
+                    false,
+                )?;
             }
         }
         Ok(())
+    }
+
+    pub fn retire_materialization_authorities_for_scope_records(
+        &self,
+        records: &[ScopeRecord],
+    ) -> Result<(), CapFsError> {
+        self.retire_materialization_authorities_for_scope_records_impl(records, false)
+    }
+
+    pub fn retire_materialization_authorities_for_scope_records_after_terminal_marker(
+        &self,
+        records: &[ScopeRecord],
+    ) -> Result<(), CapFsError> {
+        self.retire_materialization_authorities_for_scope_records_after_terminal_marker_impl(records)
+    }
+
+    fn retire_materialization_authorities_for_scope_records_impl(
+        &self,
+        records: &[ScopeRecord],
+        terminal_retirement_marked: bool,
+    ) -> Result<(), CapFsError> {
+        for record in records {
+            let base_relative = RelativePath::new(record.base_relative.as_path())?;
+            if base_relative.is_empty() {
+                continue;
+            }
+            let Some(token) = record.materialization_token.as_deref() else {
+                continue;
+            };
+            if !valid_materialization_token(token) {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} has an invalid materialization token",
+                    record.id.as_str()
+                )));
+            }
+            let Some(authority_name) = record.materialization_authority_name.as_deref() else {
+                continue;
+            };
+            let authority_name = OsString::from(authority_name);
+            validate_component(&authority_name)?;
+            let expected_authority_name = materialization_authority_name(&record.id, &base_relative);
+            if authority_name != expected_authority_name {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} has a foreign materialization authority name",
+                    record.id.as_str()
+                )));
+            }
+            let retained = {
+                let registry = self.registry.lock().map_err(|_| {
+                    CapFsError::Contradiction(
+                        "capability registry mutex poisoned".to_string(),
+                    )
+                })?;
+                registry.by_id.get(&record.id).cloned()
+            };
+            let Some(retained) = retained else { continue; };
+            if !retained.base_relative.is_empty()
+                || retained.logical_path != normalize_absolute(&record.logical_path)?
+                || retained.materialization_token.is_some()
+                || retained.materialization_authority_name.is_some()
+            {
+                continue;
+            }
+            let parent = match self.retained_authority_parent_for_record(record)? {
+                Some(fd) => verify_authority_parent_for_record(
+                    record,
+                    &normalize_absolute(&record.logical_path)?,
+                    fd,
+                )?,
+                None => open_authority_parent_for_record(record, &record.logical_path)?,
+            };
+            self.retire_materialization_authority_files(
+                parent.as_raw_fd(),
+                &authority_name,
+                &record.id,
+                &base_relative,
+                token,
+                retained.device,
+                retained.inode,
+                &retained.logical_path,
+                terminal_retirement_marked,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn retire_materialization_authorities_for_scope_records_after_terminal_marker_impl(
+        &self,
+        records: &[ScopeRecord],
+    ) -> Result<(), CapFsError> {
+        for record in records {
+            let base_relative = RelativePath::new(record.base_relative.as_path())?;
+            if base_relative.is_empty() {
+                continue;
+            }
+            let Some(token) = record.materialization_token.as_deref() else {
+                continue;
+            };
+            if !valid_materialization_token(token) {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} has an invalid materialization token",
+                    record.id.as_str()
+                )));
+            }
+            let Some(authority_name) = record.materialization_authority_name.as_deref() else {
+                continue;
+            };
+            let authority_name = OsString::from(authority_name);
+            validate_component(&authority_name)?;
+            let expected_authority_name = materialization_authority_name(&record.id, &base_relative);
+            if authority_name != expected_authority_name {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} has a foreign materialization authority name",
+                    record.id.as_str()
+                )));
+            }
+            let parent = match self.retained_authority_parent_for_record(record)? {
+                Some(fd) => verify_authority_parent_for_record(
+                    record,
+                    &normalize_absolute(&record.logical_path)?,
+                    fd,
+                )?,
+                None => open_authority_parent_for_record(record, &record.logical_path)?,
+            };
+            self.retire_materialization_authority_files_after_terminal_marker(
+                parent.as_raw_fd(),
+                &authority_name,
+                &record.id,
+                &base_relative,
+                token,
+                &normalize_absolute(&record.logical_path)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn retire_materialization_authority_files(
+        &self,
+        dirfd: RawFd,
+        authority_name: &OsStr,
+        id: &ScopeId,
+        base: &RelativePath,
+        token: &str,
+        device: u64,
+        inode: u64,
+        logical_path: &Path,
+        terminal_retirement_marked: bool,
+    ) -> Result<(), CapFsError> {
+        let lock = acquire_authority_exclusive_lock(
+            dirfd,
+            authority_name,
+            "logical-root materialization authority retirement",
+        )?;
+        let identity_name = materialization_identity_attestation_name(authority_name);
+        let bootstrap = read_materialization_authority(dirfd, authority_name)?;
+        let identity = read_materialization_identity_attestation(dirfd, authority_name)?;
+        let mut attested_identity = None;
+        if let Some(observed) = bootstrap.as_ref() {
+            observed.validate_for_scope(id, base)?;
+            if observed.token() != token {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "logical-root bootstrap authority token mismatch before retirement: {}",
+                    logical_path.display()
+                )));
+            }
+            attested_identity = observed.materialized_identity();
+        }
+        if let Some(observed) = identity.as_ref() {
+            observed.validate_for_scope(id, base)?;
+            if observed.token() != token {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "logical-root materialization identity token mismatch before retirement: {}",
+                    logical_path.display()
+                )));
+            }
+            let Some(identity_value) = observed.materialized_identity() else {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "logical-root materialization identity lacks object identity before retirement: {}",
+                    logical_path.display()
+                )));
+            };
+            if let Some(existing) = attested_identity {
+                if existing != identity_value {
+                    return Err(CapFsError::ScopeConflict(format!(
+                        "logical-root bootstrap authority and identity attestation disagree before retirement: {}",
+                        logical_path.display()
+                    )));
+                }
+            }
+            attested_identity = Some(identity_value);
+        }
+        match attested_identity {
+            Some((observed_device, observed_inode))
+                if observed_device == device && observed_inode == inode => {}
+            Some(_) => {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "logical-root materialization authority attests a different root before retirement: {}",
+                    logical_path.display()
+                )))
+            }
+            None if bootstrap.is_none() && identity.is_none() => {
+                // A prior retirement attempt may have removed both immutable
+                // authority records and died before retiring the stable lock
+                // pathname. Callers reach this point only after the materialized
+                // identity is durable in the journal (and, for terminal album
+                // cleanup, after the retirement record is durable), so continue
+                // through temporary cleanup and remove the exact locked inode as
+                // the final mutation.
+            }
+            None if terminal_retirement_marked && bootstrap.is_some() && identity.is_none() => {
+                // A durable terminal retirement record is written only after a
+                // prior pass validated the PRE journal and retained publication
+                // descriptor, then began authority retirement. This branch is
+                // therefore limited to retrying an interrupted retirement from
+                // an older identity-first unlink order: the identity-bearing
+                // attestation has already been removed, and the remaining
+                // token-only bootstrap can only keep future conversions stuck.
+            }
+            None => {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "logical-root materialization authority lacks identity before retirement: {}",
+                    logical_path.display()
+                )))
+            }
+        }
+
+        // Remove the token-only bootstrap before the identity-bearing
+        // attestation. Crash states are then resumable: both files authenticate
+        // normally before the first unlink; after the bootstrap unlink, the
+        // identity record still carries the scope/token/base/object identity;
+        // after both unlinks, retirement is complete. The terminal-marker
+        // retry branch above covers the identity-first partial state left by
+        // older interrupted builds.
+        if bootstrap.is_some() {
+            let metadata = fstatat_no_follow(dirfd, authority_name)?;
+            if metadata.file_type != CapFileType::Regular {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "logical-root bootstrap authority changed type before retirement: {}",
+                    logical_path.display()
+                )));
+            }
+            unlinkat_component(dirfd, authority_name, false)?;
+        }
+        if identity.is_some() {
+            let metadata = fstatat_no_follow(dirfd, &identity_name)?;
+            if metadata.file_type != CapFileType::Regular {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "logical-root materialization identity changed type before retirement: {}",
+                    logical_path.display()
+                )));
+            }
+            unlinkat_component(dirfd, &identity_name, false)?;
+        }
+        cleanup_interrupted_regular_file_temporaries(
+            dirfd,
+            authority_name,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        )?;
+        cleanup_interrupted_regular_file_temporaries(
+            dirfd,
+            &identity_name,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        )?;
+        sync_fd_best_effort(dirfd)?;
+        // The stable lock pathname is part of the same durable retirement
+        // transaction. Unlink it only after every authority record and
+        // authority-scoped temporary is gone, while this exact inode remains
+        // exclusively locked. A blocked opener revalidates after `flock` and
+        // retries on any replacement inode, so terminal removal cannot split
+        // the lock domain.
+        lock.retire_path_last(dirfd)
+    }
+
+    fn retire_materialization_authority_files_after_terminal_marker(
+        &self,
+        dirfd: RawFd,
+        authority_name: &OsStr,
+        id: &ScopeId,
+        base: &RelativePath,
+        token: &str,
+        logical_path: &Path,
+    ) -> Result<(), CapFsError> {
+        let lock = acquire_authority_exclusive_lock(
+            dirfd,
+            authority_name,
+            "terminal logical-root materialization authority retirement",
+        )?;
+        let identity_name = materialization_identity_attestation_name(authority_name);
+        let bootstrap = read_materialization_authority(dirfd, authority_name)?;
+        let identity = read_materialization_identity_attestation(dirfd, authority_name)?;
+
+        if let Some(observed) = bootstrap.as_ref() {
+            observed.validate_for_scope(id, base)?;
+            if observed.token() != token {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "terminal logical-root bootstrap authority token mismatch before retirement: {}",
+                    logical_path.display()
+                )));
+            }
+        }
+        if let Some(observed) = identity.as_ref() {
+            observed.validate_for_scope(id, base)?;
+            if observed.token() != token {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "terminal logical-root materialization identity token mismatch before retirement: {}",
+                    logical_path.display()
+                )));
+            }
+            let Some(identity_value) = observed.materialized_identity() else {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "terminal logical-root materialization identity lacks object identity before retirement: {}",
+                    logical_path.display()
+                )));
+            };
+            if let Some(bootstrap_identity) = bootstrap
+                .as_ref()
+                .and_then(MaterializationAuthority::materialized_identity)
+            {
+                if bootstrap_identity != identity_value {
+                    return Err(CapFsError::ScopeConflict(format!(
+                        "terminal logical-root bootstrap authority and identity attestation disagree before retirement: {}",
+                        logical_path.display()
+                    )));
+                }
+            }
+        }
+
+        // A terminal retirement record is durable proof that an earlier pass
+        // validated the PRE journal against the retained published object and
+        // began authority retirement. Retry must therefore be independent of
+        // the album pathname: the album may have been deleted after the
+        // authority files were partly or wholly unlinked but before workspace
+        // cleanup finished. Any remaining files still have to authenticate
+        // scope/base/token; conflicting files fail closed.
+        if bootstrap.is_some() {
+            let metadata = fstatat_no_follow(dirfd, authority_name)?;
+            if metadata.file_type != CapFileType::Regular {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "terminal logical-root bootstrap authority changed type before retirement: {}",
+                    logical_path.display()
+                )));
+            }
+            unlinkat_component(dirfd, authority_name, false)?;
+        }
+        if identity.is_some() {
+            let metadata = fstatat_no_follow(dirfd, &identity_name)?;
+            if metadata.file_type != CapFileType::Regular {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "terminal logical-root materialization identity changed type before retirement: {}",
+                    logical_path.display()
+                )));
+            }
+            unlinkat_component(dirfd, &identity_name, false)?;
+        }
+        cleanup_interrupted_regular_file_temporaries(
+            dirfd,
+            authority_name,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        )?;
+        cleanup_interrupted_regular_file_temporaries(
+            dirfd,
+            &identity_name,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        )?;
+        sync_fd_best_effort(dirfd)?;
+        lock.retire_path_last(dirfd)
     }
 
     pub fn metadata_no_follow(&self, path: &ScopedPath) -> Result<Option<CapMetadata>, CapFsError> {
@@ -4198,8 +5109,255 @@ fn open_owned(path: &Path, flags: i32, mode: u32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterializationAuthority {
+    scope_id: Option<String>,
+    base_hex: Option<String>,
+    token: String,
+    materialized_identity: Option<(u64, u64)>,
+}
+
+impl MaterializationAuthority {
+    fn legacy_token(token: String) -> Self {
+        Self {
+            scope_id: None,
+            base_hex: None,
+            token,
+            materialized_identity: None,
+        }
+    }
+
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn materialized_identity(&self) -> Option<(u64, u64)> {
+        self.materialized_identity
+    }
+
+    fn validate_for_scope(
+        &self,
+        id: &ScopeId,
+        base: &RelativePath,
+    ) -> Result<(), CapFsError> {
+        if let Some(scope_id) = self.scope_id.as_deref() {
+            if scope_id != id.as_str() {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} bootstrap authority names a different scope",
+                    id.as_str()
+                )));
+            }
+        }
+        if let Some(base_hex) = self.base_hex.as_deref() {
+            if base_hex != materialization_base_hex(base).as_str() {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} bootstrap authority names a different logical root",
+                    id.as_str()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn authenticate_evolved_direct_anchor(
+    record: &ScopeRecord,
+    logical_path: &Path,
+    retained: &CapabilityRoot,
+    authority_parent: Option<OwnedFd>,
+) -> Result<bool, CapFsError> {
+    let logical_path = normalize_absolute(logical_path)?;
+    let record_logical_path = normalize_absolute(&record.logical_path)?;
+    let base_relative = RelativePath::new(record.base_relative.as_path())?;
+    if base_relative.is_empty()
+        || !retained.base_relative.is_empty()
+        || retained.logical_path != logical_path
+        || record_logical_path != logical_path
+        || retained.materialization_token.is_some()
+        || retained.materialization_authority_name.is_some()
+    {
+        return Ok(false);
+    }
+
+    let token = match record.materialization_token.as_deref() {
+        Some(token) if valid_materialization_token(token) => token,
+        Some(_) => {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} has an invalid materialization token",
+                record.id.as_str()
+            )))
+        }
+        None => return Ok(false),
+    };
+    let authority_name = match record.materialization_authority_name.as_deref() {
+        Some(name) => {
+            let name = OsString::from(name);
+            validate_component(&name)?;
+            let expected = materialization_authority_name(&record.id, &base_relative);
+            if name != expected {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} has a foreign materialization authority name",
+                    record.id.as_str()
+                )));
+            }
+            name
+        }
+        None => {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} evolved direct anchor has no bootstrap authority",
+                record.id.as_str()
+            )))
+        }
+    };
+    let journal_identity = match (record.materialized_device, record.materialized_inode) {
+        (Some(device), Some(inode)) => Some((device, inode)),
+        (None, None) => None,
+        _ => {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} has a partial materialized-root identity",
+                record.id.as_str()
+            )))
+        }
+    };
+    if let Some((device, inode)) = journal_identity {
+        if retained.device != device || retained.inode != inode {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} evolved direct anchor identifies a different materialized directory",
+                record.id.as_str()
+            )));
+        }
+    }
+
+    let authority_parent_fd = match authority_parent {
+        Some(fd) => verify_authority_parent_for_record(record, &logical_path, fd)?,
+        None => open_authority_parent_for_record(record, &logical_path)?,
+    };
+    let bootstrap = read_materialization_authority(authority_parent_fd.as_raw_fd(), &authority_name)?;
+    let attestation = read_materialization_identity_attestation(
+        authority_parent_fd.as_raw_fd(),
+        &authority_name,
+    )?;
+
+    if bootstrap.is_none()
+        && attestation.is_none()
+        && journal_identity == Some((retained.device, retained.inode))
+    {
+        return Ok(true);
+    }
+
+    let mut attested_identity = None;
+    if let Some(authority) = bootstrap.as_ref() {
+        authority.validate_for_scope(&record.id, &base_relative)?;
+        if authority.token() != token {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} bootstrap authority does not match its journal token",
+                record.id.as_str()
+            )));
+        }
+        attested_identity = authority.materialized_identity();
+    } else if journal_identity.is_none() {
+        return Err(CapFsError::ScopeConflict(format!(
+            "scope {} bootstrap authority is missing",
+            record.id.as_str()
+        )));
+    }
+
+    if let Some(identity) = attestation.as_ref() {
+        identity.validate_for_scope(&record.id, &base_relative)?;
+        if identity.token() != token {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} materialization identity attestation does not match its journal token",
+                record.id.as_str()
+            )));
+        }
+        let Some(identity_value) = identity.materialized_identity() else {
+            return Err(CapFsError::ScopeConflict(format!(
+                "scope {} materialization identity attestation has no object identity",
+                record.id.as_str()
+            )));
+        };
+        if let Some(existing) = attested_identity {
+            if existing != identity_value {
+                return Err(CapFsError::ScopeConflict(format!(
+                    "scope {} bootstrap authority and identity attestation disagree",
+                    record.id.as_str()
+                )));
+            }
+        }
+        attested_identity = Some(identity_value);
+    }
+
+    // Parent+token -> direct-anchor evolution is accepted only when a durable,
+    // descriptor-relative identity attestation, recomputed from the journal
+    // scope id and base-relative path, binds the token to the materialized
+    // directory's device/inode and that identity matches the retained direct
+    // descriptor. The bootstrap token is immutable; the identity is published
+    // as a separate no-clobber attestation so concurrent finalizers converge or
+    // fail closed instead of overwriting one another. After the identity-bearing
+    // journal generation is durable and terminal cleanup retires the authority
+    // files, the journal's own materialized identity is sufficient. A logical
+    // path string or movable marker file is never treated as object identity.
+    match attested_identity {
+        Some((device, inode)) if retained.device == device && retained.inode == inode => Ok(true),
+        Some(_) => Err(CapFsError::ScopeConflict(format!(
+            "scope {} materialization authority attests a different materialized directory",
+            record.id.as_str()
+        ))),
+        None if journal_identity == Some((retained.device, retained.inode)) => Ok(true),
+        None => Err(CapFsError::ScopeConflict(format!(
+            "scope {} materialization authority has no materialized-root identity",
+            record.id.as_str()
+        ))),
+    }
+}
+
+fn open_authority_parent_for_record(
+    record: &ScopeRecord,
+    logical_path: &Path,
+) -> Result<OwnedFd, CapFsError> {
+    let acquisition_path = normalize_absolute(&record.acquisition_path)?;
+    let authority_parent = open_absolute_directory(&acquisition_path)?;
+    verify_authority_parent_for_record(record, logical_path, authority_parent)
+}
+
+fn verify_authority_parent_for_record(
+    record: &ScopeRecord,
+    logical_path: &Path,
+    authority_parent: OwnedFd,
+) -> Result<OwnedFd, CapFsError> {
+    let acquisition_path = normalize_absolute(&record.acquisition_path)?;
+    let metadata = fstat_fd(authority_parent.as_raw_fd())?;
+    if metadata.file_type != CapFileType::Directory
+        || metadata.device != record.device
+        || metadata.inode != record.inode
+    {
+        return Err(CapFsError::ScopeConflict(format!(
+            "scope {} bootstrap authority parent no longer has the journal-bound identity",
+            record.id.as_str()
+        )));
+    }
+    let expected_base = logical_path.strip_prefix(&acquisition_path).map_err(|_| {
+        CapFsError::ScopeConflict(format!(
+            "scope {} bootstrap authority parent is not an ancestor of its logical root",
+            record.id.as_str()
+        ))
+    })?;
+    if RelativePath::new(expected_base)? != record.base_relative {
+        return Err(CapFsError::ScopeConflict(format!(
+            "scope {} has contradictory bootstrap authority metadata",
+            record.id.as_str()
+        )));
+    }
+    Ok(authority_parent)
+}
+
 fn valid_materialization_token(token: &str) -> bool {
     token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn materialization_base_hex(base: &RelativePath) -> String {
+    hex::encode(base.as_path().as_os_str().as_bytes())
 }
 
 fn materialization_stage_name(token: &str) -> OsString {
@@ -4218,53 +5376,467 @@ fn materialization_authority_name(id: &ScopeId, base: &RelativePath) -> OsString
     name
 }
 
-fn create_materialization_authority(
-    dirfd: RawFd,
-    name: &OsStr,
+fn materialization_identity_attestation_name(authority_name: &OsStr) -> OsString {
+    let mut name = OsString::from(authority_name);
+    name.push(".identity");
+    name
+}
+
+fn serialize_materialization_authority(
+    id: &ScopeId,
+    base: &RelativePath,
     token: &str,
-) -> Result<(), CapFsError> {
+    materialized_identity: Option<(u64, u64)>,
+) -> Result<Vec<u8>, CapFsError> {
     if !valid_materialization_token(token) {
         return Err(CapFsError::InvalidPath(
             "invalid logical-root bootstrap authority token".to_string(),
         ));
     }
-    match openat_owned(
+    let (device, inode) = materialized_identity
+        .map(|(device, inode)| (device.to_string(), inode.to_string()))
+        .unwrap_or_else(|| (String::new(), String::new()));
+    Ok(format!(
+        "{}\nscope={}\nbase={}\ntoken={}\nmaterialized_device={}\nmaterialized_inode={}\n",
+        MATERIALIZATION_AUTHORITY_SCHEMA,
+        id.as_str(),
+        materialization_base_hex(base),
+        token,
+        device,
+        inode,
+    )
+    .into_bytes())
+}
+
+fn parse_materialization_authority(bytes: &[u8]) -> Result<MaterializationAuthority, CapFsError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        CapFsError::ScopeConflict(
+            "logical-root bootstrap authority record is not UTF-8".to_string(),
+        )
+    })?;
+    let trimmed = text.trim_end_matches('\n');
+    if valid_materialization_token(trimmed) {
+        return Ok(MaterializationAuthority::legacy_token(trimmed.to_string()));
+    }
+    let mut lines = trimmed.lines();
+    match lines.next() {
+        Some(schema) if schema == MATERIALIZATION_AUTHORITY_SCHEMA => {}
+        _ => {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root bootstrap authority has an invalid schema".to_string(),
+            ))
+        }
+    }
+    let mut fields = BTreeMap::new();
+    for line in lines {
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            CapFsError::ScopeConflict(
+                "logical-root bootstrap authority has a malformed field".to_string(),
+            )
+        })?;
+        if fields.insert(key, value).is_some() {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root bootstrap authority has duplicate fields".to_string(),
+            ));
+        }
+    }
+    let scope_id = fields.get("scope").ok_or_else(|| {
+        CapFsError::ScopeConflict(
+            "logical-root bootstrap authority is missing its scope".to_string(),
+        )
+    })?;
+    ScopeId::new((*scope_id).to_string())?;
+    let base_hex = fields.get("base").ok_or_else(|| {
+        CapFsError::ScopeConflict(
+            "logical-root bootstrap authority is missing its base path".to_string(),
+        )
+    })?;
+    let base_bytes = hex::decode(*base_hex).map_err(|_| {
+        CapFsError::ScopeConflict(
+            "logical-root bootstrap authority base path is not hex".to_string(),
+        )
+    })?;
+    RelativePath::new(PathBuf::from(OsString::from_vec(base_bytes)))?;
+    let token = fields.get("token").ok_or_else(|| {
+        CapFsError::ScopeConflict(
+            "logical-root bootstrap authority is missing its token".to_string(),
+        )
+    })?;
+    if !valid_materialization_token(*token) {
+        return Err(CapFsError::ScopeConflict(
+            "logical-root bootstrap authority token is invalid".to_string(),
+        ));
+    }
+    let device = *fields.get("materialized_device").unwrap_or(&"");
+    let inode = *fields.get("materialized_inode").unwrap_or(&"");
+    let materialized_identity = match (device.is_empty(), inode.is_empty()) {
+        (true, true) => None,
+        (false, false) => Some((
+            device.parse::<u64>().map_err(|_| {
+                CapFsError::ScopeConflict(
+                    "logical-root bootstrap authority device is invalid".to_string(),
+                )
+            })?,
+            inode.parse::<u64>().map_err(|_| {
+                CapFsError::ScopeConflict(
+                    "logical-root bootstrap authority inode is invalid".to_string(),
+                )
+            })?,
+        )),
+        _ => {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root bootstrap authority has a partial materialized identity".to_string(),
+            ))
+        }
+    };
+    Ok(MaterializationAuthority {
+        scope_id: Some((*scope_id).to_string()),
+        base_hex: Some((*base_hex).to_string()),
+        token: (*token).to_string(),
+        materialized_identity,
+    })
+}
+
+
+fn create_or_adopt_materialization_authority(
+    dirfd: RawFd,
+    name: &OsStr,
+    id: &ScopeId,
+    base: &RelativePath,
+) -> Result<String, CapFsError> {
+    let _lock = acquire_authority_exclusive_lock(dirfd, name, "logical-root bootstrap authority")?;
+    if read_materialization_identity_attestation(dirfd, name)?.is_some() {
+        return Err(CapFsError::ScopeConflict(
+            "logical-root bootstrap authority already has a materialized identity while the logical root is absent".to_string(),
+        ));
+    }
+    if let Some(authority) = read_materialization_authority(dirfd, name)? {
+        authority.validate_for_scope(id, base)?;
+        if authority.materialized_identity().is_some() {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root bootstrap authority already attests a materialized root while the logical root is absent".to_string(),
+            ));
+        }
+        cleanup_interrupted_regular_file_temporaries(
+            dirfd,
+            name,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        )?;
+        return Ok(authority.token().to_string());
+    }
+    if let Some(token) = adopt_ready_materialization_authority(dirfd, name, id, base)? {
+        cleanup_interrupted_regular_file_temporaries(
+            dirfd,
+            name,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        )?;
+        return Ok(token);
+    }
+    cleanup_interrupted_regular_file_temporaries(
         dirfd,
         name,
-        libc::O_WRONLY
-            | libc::O_CREAT
-            | libc::O_EXCL
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW,
+        MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+        MATERIALIZATION_AUTHORITY_READY_PREFIX,
+    )?;
+    let token = Uuid::new_v4().simple().to_string();
+    let bytes = serialize_materialization_authority(id, base, &token, None)?;
+    let ready_name = write_ready_regular_file(
+        dirfd,
+        name,
+        &bytes,
         0o600,
-    ) {
-        Ok(fd) => {
-            let mut file = File::from(fd);
-            file.write_all(token.as_bytes())?;
-            file.flush()?;
-            file.sync_all()?;
+        MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+        MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        "logical-root bootstrap authority",
+    )?;
+    match linkat_no_follow(dirfd, &ready_name, dirfd, name) {
+        Ok(()) => {
             sync_fd_best_effort(dirfd)?;
-            Ok(())
+            let _ = unlinkat_component(dirfd, &ready_name, false);
+            cleanup_interrupted_regular_file_temporaries(
+                dirfd,
+                name,
+                MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+                MATERIALIZATION_AUTHORITY_READY_PREFIX,
+            )?;
+            Ok(token)
         }
         Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
-            match read_materialization_authority(dirfd, name)? {
-                Some(observed) if observed.as_str() == token => Ok(()),
-                Some(_) => Err(CapFsError::ScopeConflict(
-                    "logical-root bootstrap authority token mismatch".to_string(),
-                )),
-                None => Err(CapFsError::Contradiction(
+            let authority = read_materialization_authority(dirfd, name)?.ok_or_else(|| {
+                CapFsError::Contradiction(
                     "logical-root bootstrap authority disappeared after EEXIST".to_string(),
-                )),
-            }
+                )
+            })?;
+            authority.validate_for_scope(id, base)?;
+            let _ = unlinkat_component(dirfd, &ready_name, false);
+            cleanup_interrupted_regular_file_temporaries(
+                dirfd,
+                name,
+                MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+                MATERIALIZATION_AUTHORITY_READY_PREFIX,
+            )?;
+            Ok(authority.token().to_string())
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+fn adopt_ready_materialization_authority(
+    dirfd: RawFd,
+    name: &OsStr,
+    id: &ScopeId,
+    base: &RelativePath,
+) -> Result<Option<String>, CapFsError> {
+    validate_component(name)?;
+    let target_prefix = ready_file_prefix(MATERIALIZATION_AUTHORITY_READY_PREFIX, name);
+    let mut candidates = read_directory_entry_names_matching_prefixes(
+        duplicate_fd(dirfd)?,
+        &[target_prefix.as_bytes()],
+    )?;
+    candidates.sort();
+    let mut valid = Vec::new();
+    for candidate in candidates {
+        let observed = read_small_regular_file(
+            dirfd,
+            &candidate,
+            8192,
+            "logical-root bootstrap authority",
+        )?
+        .ok_or_else(|| CapFsError::Contradiction(
+            "logical-root bootstrap authority ready temporary disappeared".to_string(),
+        ))?;
+        let authority = parse_materialization_authority(&observed)?;
+        authority.validate_for_scope(id, base)?;
+        if authority.materialized_identity().is_some() {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root bootstrap authority ready temporary already attests a materialized root while the logical root is absent".to_string(),
+            ));
+        }
+        valid.push((candidate, authority.token().to_string()));
+    }
+    let Some((candidate, token)) = valid.into_iter().next() else {
+        return Ok(None);
+    };
+    match linkat_no_follow(dirfd, &candidate, dirfd, name) {
+        Ok(()) => {
+            sync_fd_best_effort(dirfd)?;
+            let _ = unlinkat_component(dirfd, &candidate, false);
+            sync_fd_best_effort(dirfd)?;
+            Ok(Some(token))
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+            let final_authority = read_materialization_authority(dirfd, name)?.ok_or_else(|| {
+                CapFsError::Contradiction(
+                    "logical-root bootstrap authority disappeared after EEXIST".to_string(),
+                )
+            })?;
+            final_authority.validate_for_scope(id, base)?;
+            let _ = unlinkat_component(dirfd, &candidate, false);
+            sync_fd_best_effort(dirfd)?;
+            Ok(Some(final_authority.token().to_string()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+fn create_materialization_authority(
+    dirfd: RawFd,
+    name: &OsStr,
+    id: &ScopeId,
+    base: &RelativePath,
+    token: &str,
+) -> Result<(), CapFsError> {
+    let bytes = serialize_materialization_authority(id, base, token, None)?;
+    atomic_create_regular_file_no_clobber(
+        dirfd,
+        name,
+        name,
+        &bytes,
+        0o600,
+        MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+        MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        "logical-root bootstrap authority",
+        |observed| {
+            let authority = parse_materialization_authority(observed)?;
+            authority.validate_for_scope(id, base)?;
+            Ok(authority.token() == token && authority.materialized_identity().is_none())
+        },
+    )
+}
+
+fn attest_materialization_authority(
+    dirfd: RawFd,
+    name: &OsStr,
+    id: &ScopeId,
+    base: &RelativePath,
+    token: &str,
+    device: u64,
+    inode: u64,
+) -> Result<(), CapFsError> {
+    let _lock = acquire_authority_exclusive_lock(
+        dirfd,
+        name,
+        "logical-root materialization identity attestation",
+    )?;
+    let bootstrap = read_materialization_authority(dirfd, name)?.ok_or_else(|| {
+        CapFsError::ScopeConflict(
+            "logical-root bootstrap authority is missing before identity attestation".to_string(),
+        )
+    })?;
+    bootstrap.validate_for_scope(id, base)?;
+    if bootstrap.token() != token {
+        return Err(CapFsError::ScopeConflict(
+            "logical-root bootstrap authority token mismatch before identity attestation".to_string(),
+        ));
+    }
+    if let Some(existing) = bootstrap.materialized_identity() {
+        if existing != (device, inode) {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root bootstrap authority already attests a different root".to_string(),
+            ));
+        }
+    }
+
+    let identity_name = materialization_identity_attestation_name(name);
+    let bytes = serialize_materialization_authority(id, base, token, Some((device, inode)))?;
+    atomic_create_regular_file_no_clobber_locked(
+        dirfd,
+        &identity_name,
+        &bytes,
+        0o600,
+        MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+        MATERIALIZATION_AUTHORITY_READY_PREFIX,
+        "logical-root materialization identity attestation",
+        |observed| {
+            let authority = parse_materialization_authority(observed)?;
+            authority.validate_for_scope(id, base)?;
+            Ok(authority.token() == token
+                && authority.materialized_identity() == Some((device, inode)))
+        },
+    )?;
+    match read_materialization_identity_attestation(dirfd, name)? {
+        Some(authority)
+            if authority.token() == token
+                && authority.materialized_identity() == Some((device, inode)) => Ok(()),
+        Some(_) => Err(CapFsError::ScopeConflict(
+            "logical-root materialization identity attestation mismatch after publication".to_string(),
+        )),
+        None => Err(CapFsError::Contradiction(
+            "logical-root materialization identity attestation vanished after publication".to_string(),
+        )),
     }
 }
 
 fn read_materialization_authority(
     dirfd: RawFd,
     name: &OsStr,
-) -> Result<Option<String>, CapFsError> {
+) -> Result<Option<MaterializationAuthority>, CapFsError> {
+    match read_small_regular_file(dirfd, name, 8192, "logical-root bootstrap authority")? {
+        Some(bytes) => parse_materialization_authority(&bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn read_materialization_identity_attestation(
+    dirfd: RawFd,
+    authority_name: &OsStr,
+) -> Result<Option<MaterializationAuthority>, CapFsError> {
+    let identity_name = materialization_identity_attestation_name(authority_name);
+    match read_small_regular_file(
+        dirfd,
+        &identity_name,
+        8192,
+        "logical-root materialization identity attestation",
+    )? {
+        Some(bytes) => parse_materialization_authority(&bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Read, authenticate, and unwrap the durable identity attestation for one
+/// authority. Returns `None` when no attestation was published; fails closed
+/// on a scope/token mismatch or an identity-less attestation record.
+fn attested_identity_for_authority(
+    dirfd: RawFd,
+    authority_name: &OsStr,
+    id: &ScopeId,
+    base: &RelativePath,
+    token: &str,
+) -> Result<Option<(u64, u64)>, CapFsError> {
+    let Some(attestation) =
+        read_materialization_identity_attestation(dirfd, authority_name)?
+    else {
+        return Ok(None);
+    };
+    attestation.validate_for_scope(id, base)?;
+    if attestation.token() != token {
+        return Err(CapFsError::ScopeConflict(format!(
+            "scope {} materialization identity attestation does not match its authority token",
+            id.as_str()
+        )));
+    }
+    match attestation.materialized_identity() {
+        Some(identity) => Ok(Some(identity)),
+        None => Err(CapFsError::ScopeConflict(format!(
+            "scope {} materialization identity attestation has no object identity",
+            id.as_str()
+        ))),
+    }
+}
+
+fn create_materialization_marker(
+    authority_parent_fd: RawFd,
+    authority_name: &OsStr,
+    marker_dirfd: RawFd,
+    token: &str,
+) -> Result<(), CapFsError> {
+    if !valid_materialization_token(token) {
+        return Err(CapFsError::InvalidPath(
+            "invalid logical-root materialization token".to_string(),
+        ));
+    }
+    let _lock = acquire_authority_exclusive_lock(
+        authority_parent_fd,
+        authority_name,
+        "logical-root materialization marker",
+    )?;
+    create_materialization_marker_locked(marker_dirfd, token)
+}
+
+fn create_materialization_marker_locked(
+    marker_dirfd: RawFd,
+    token: &str,
+) -> Result<(), CapFsError> {
+    atomic_create_regular_file_no_clobber_locked(
+        marker_dirfd,
+        OsStr::new(MATERIALIZATION_MARKER),
+        token.as_bytes(),
+        0o600,
+        MATERIALIZATION_MARKER_WRITING_PREFIX,
+        MATERIALIZATION_MARKER_READY_PREFIX,
+        "logical-root materialization marker",
+        |observed| Ok(observed == token.as_bytes()),
+    )
+}
+
+fn read_materialization_marker(dirfd: RawFd) -> Result<Option<Vec<u8>>, CapFsError> {
+    read_small_regular_file(
+        dirfd,
+        OsStr::new(MATERIALIZATION_MARKER),
+        128,
+        "logical-root materialization marker",
+    )
+}
+
+fn read_small_regular_file(
+    dirfd: RawFd,
+    name: &OsStr,
+    max_len: u64,
+    description: &str,
+) -> Result<Option<Vec<u8>>, CapFsError> {
     validate_component(name)?;
     let fd = match openat_owned(
         dirfd,
@@ -4277,76 +5849,11 @@ fn read_materialization_authority(
         Err(error) => return Err(error.into()),
     };
     let metadata = fstat_fd(fd.as_raw_fd())?;
-    if metadata.file_type != CapFileType::Regular || metadata.length > 128 {
-        return Err(CapFsError::ScopeConflict(
-            "logical-root bootstrap authority is not a small regular file".to_string(),
-        ));
-    }
-    let mut file = File::from(fd);
-    let mut bytes = Vec::with_capacity(metadata.length as usize);
-    file.read_to_end(&mut bytes)?;
-    let token = String::from_utf8(bytes).map_err(|_| {
-        CapFsError::ScopeConflict(
-            "logical-root bootstrap authority token is not UTF-8".to_string(),
-        )
-    })?;
-    if !valid_materialization_token(&token) {
-        return Err(CapFsError::ScopeConflict(
-            "logical-root bootstrap authority token is invalid".to_string(),
-        ));
-    }
-    Ok(Some(token))
-}
-
-fn create_materialization_marker(dirfd: RawFd, token: &str) -> Result<(), CapFsError> {
-    if !valid_materialization_token(token) {
-        return Err(CapFsError::InvalidPath(
-            "invalid logical-root materialization token".to_string(),
-        ));
-    }
-    let marker = OsStr::new(MATERIALIZATION_MARKER);
-    match openat_owned(
-        dirfd,
-        marker,
-        libc::O_WRONLY
-            | libc::O_CREAT
-            | libc::O_EXCL
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW,
-        0o600,
-    ) {
-        Ok(fd) => {
-            let mut file = File::from(fd);
-            file.write_all(token.as_bytes())?;
-            file.flush()?;
-            file.sync_all()?;
-            sync_fd_best_effort(dirfd)?;
-            Ok(())
-        }
-        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
-            verify_materialization_marker(dirfd, token)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn read_materialization_marker(dirfd: RawFd) -> Result<Option<Vec<u8>>, CapFsError> {
-    let marker = OsStr::new(MATERIALIZATION_MARKER);
-    let fd = match openat_owned(
-        dirfd,
-        marker,
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        0,
-    ) {
-        Ok(fd) => fd,
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let metadata = fstat_fd(fd.as_raw_fd())?;
-    if metadata.file_type != CapFileType::Regular || metadata.length > 128 {
-        return Err(CapFsError::ScopeConflict(
-            "logical-root materialization marker is not a small regular file".to_string(),
-        ));
+    if metadata.file_type != CapFileType::Regular || metadata.length > max_len {
+        return Err(CapFsError::ScopeConflict(format!(
+            "{} is not a small regular file",
+            description
+        )));
     }
     let mut file = File::from(fd);
     let mut bytes = Vec::with_capacity(metadata.length as usize);
@@ -4354,46 +5861,692 @@ fn read_materialization_marker(dirfd: RawFd) -> Result<Option<Vec<u8>>, CapFsErr
     Ok(Some(bytes))
 }
 
-fn verify_materialization_marker(dirfd: RawFd, token: &str) -> Result<(), CapFsError> {
-    match read_materialization_marker(dirfd)? {
-        Some(bytes) if bytes == token.as_bytes() => Ok(()),
-        Some(_) => Err(CapFsError::ScopeConflict(
-            "logical-root materialization marker token mismatch".to_string(),
-        )),
-        None => Err(CapFsError::ScopeConflict(
-            "logical-root staging directory has no owner marker".to_string(),
-        )),
+
+/// Materialization-authority metadata uses a two-layer lock protocol.
+///
+/// Lock identity is descriptor-rooted: the process key is the retained
+/// authority-parent directory's `(device, inode)` plus the digest of the
+/// deterministic bootstrap-authority filename.  The cross-process lock is a
+/// deterministic regular file in that retained parent, named from the same
+/// digest and opened with `openat(..., O_NOFOLLOW)` for every guard.  Each open
+/// therefore creates an independent open file description; unlike `dup()` of
+/// the parent descriptor, unlocking one authority guard cannot release another
+/// guard's kernel lock.
+///
+/// Lock files are stable for the lifetime of an authority transaction. They are
+/// never unlinked on ordinary guard release. Terminal cleanup may retire the
+/// pathname only after durable workspace state proves the authority artifacts
+/// were retired, while holding the exact lock inode, and only as the final
+/// operation in that authority critical section. Every waiter revalidates the
+/// locked inode against the descriptor-relative pathname after `flock`; a waiter
+/// awakened on an unlinked old inode therefore retries on the current inode
+/// instead of entering a split lock domain.
+///
+/// Ordering is: briefly access the weak keyed-lock registry; acquire the
+/// authority-specific process mutex; independently open and validate the
+/// authority-specific lock object relative to the retained parent; acquire its
+/// `flock`; perform bounded authority metadata I/O; release in reverse order.
+/// The registry mutex is never held while waiting or doing I/O.  Callers hold at
+/// most one authority lock, so no materialization-lock cycle exists.  Scripts,
+/// conversion, callbacks, journal traversal, and workspace cleanup remain
+/// outside these critical sections.  Equivalent publications converge through
+/// immutable/no-clobber records; conflicting publications fail closed; durable
+/// ready temporaries preserve crash-idempotent retry at every mutation boundary.
+struct AuthorityExclusiveLock {
+    key: AuthorityLockKey,
+    state: Arc<AuthorityLockState>,
+    fd: OwnedFd,
+    lock_name: OsString,
+    held: bool,
+}
+
+impl AuthorityExclusiveLock {
+    fn release(&mut self) {
+        if !self.held {
+            return;
+        }
+        let _ = unsafe { libc::flock(self.fd.as_raw_fd(), libc::LOCK_UN) };
+        release_authority_process_lock(&self.key, &self.state);
+        self.held = false;
+    }
+
+    /// Remove the descriptor-relative lock pathname while this exact inode is
+    /// still exclusively locked. The unlink is the linearization point and the
+    /// final filesystem mutation in this authority transaction; release follows
+    /// immediately without another metadata operation. A waiter awakened on the
+    /// unlinked inode fails post-flock pathname revalidation and retries on the
+    /// current inode, so no two protected metadata sections overlap.
+    ///
+    /// Authority-record removals are synced before this method is called, and
+    /// the lock-path unlink is followed by a parent-directory sync before the
+    /// guard reports success. A failure or crash before that durability boundary
+    /// leaves the terminal workspace available for an idempotent retry.
+    fn retire_path_last(mut self, dirfd: RawFd) -> Result<(), CapFsError> {
+        if !authority_lock_fd_is_current(dirfd, &self.lock_name, self.fd.as_raw_fd())? {
+            return Err(CapFsError::ScopeConflict(
+                "materialization authority lock pathname changed before terminal retirement"
+                    .to_string(),
+            ));
+        }
+        unlinkat_component(dirfd, &self.lock_name, false)?;
+        // Make the terminal namespace removal durable before reporting success.
+        // A new transaction may create and lock a replacement inode after the
+        // unlink linearization point; syncing the retained parent does not
+        // mutate that transaction's authority state and cannot weaken its lock.
+        sync_fd_best_effort(dirfd)?;
+        self.release();
+        Ok(())
     }
 }
 
+impl Drop for AuthorityExclusiveLock {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn materialization_authority_lock_key(
+    dirfd: RawFd,
+    authority_name: &OsStr,
+) -> Result<AuthorityLockKey, CapFsError> {
+    validate_component(authority_name)?;
+    let metadata = fstat_fd(dirfd)?;
+    if metadata.file_type != CapFileType::Directory {
+        return Err(CapFsError::ScopeConflict(
+            "logical-root authority parent is not a directory".to_string(),
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(authority_name.as_bytes());
+    let digest = hasher.finalize();
+    let mut authority_name_digest = [0u8; 32];
+    authority_name_digest.copy_from_slice(&digest);
+    Ok(AuthorityLockKey {
+        parent_device: metadata.device,
+        parent_inode: metadata.inode,
+        authority_name_digest,
+    })
+}
+
+fn materialization_authority_lock_name(key: &AuthorityLockKey) -> OsString {
+    let mut encoded = String::with_capacity(MATERIALIZATION_AUTHORITY_LOCK_PREFIX.len() + 64);
+    encoded.push_str(MATERIALIZATION_AUTHORITY_LOCK_PREFIX);
+    for byte in key.authority_name_digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    OsString::from(encoded)
+}
+
+fn materialization_authority_lock_state(
+    key: &AuthorityLockKey,
+) -> Result<Arc<AuthorityLockState>, CapFsError> {
+    let registry = MATERIALIZATION_AUTHORITY_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().map_err(|_| {
+        CapFsError::Contradiction(
+            "materialization authority lock registry mutex poisoned".to_string(),
+        )
+    })?;
+    registry.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(state) = registry.get(key).and_then(Weak::upgrade) {
+        return Ok(state);
+    }
+    let state = Arc::new(AuthorityLockState::new());
+    registry.insert(key.clone(), Arc::downgrade(&state));
+    Ok(state)
+}
+
+fn prune_materialization_authority_lock_registry(
+    key: &AuthorityLockKey,
+    retiring: Option<&Arc<AuthorityLockState>>,
+) {
+    let Some(registry) = MATERIALIZATION_AUTHORITY_LOCKS.get() else {
+        return;
+    };
+    let Ok(mut registry) = registry.lock() else {
+        return;
+    };
+    if let Some(retiring) = retiring {
+        let retiring_weak = Arc::downgrade(retiring);
+        let remove = registry.get(key).is_some_and(|weak| {
+            weak.ptr_eq(&retiring_weak) && weak.strong_count() <= 1
+        });
+        if remove {
+            registry.remove(key);
+        }
+    }
+    registry.retain(|_, weak| weak.strong_count() > 0);
+}
+
+#[cfg(test)]
+fn materialization_authority_lock_registry_has_live_state(key: &AuthorityLockKey) -> bool {
+    MATERIALIZATION_AUTHORITY_LOCKS
+        .get()
+        .and_then(|registry| registry.lock().ok())
+        .and_then(|registry| registry.get(key).and_then(Weak::upgrade))
+        .is_some()
+}
+
+fn authority_lock_stat(fd: RawFd) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fstat` initializes `stat` on success and `fd` is live.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: initialized by successful `fstat`.
+    Ok(unsafe { stat.assume_init() })
+}
+
+
+fn authority_lock_mode_is_private(mode: libc::mode_t) -> bool {
+    let mode = mode & 0o777;
+    mode != 0 && mode & !0o600 == 0
+}
+
+fn validate_authority_lock_object(fd: RawFd) -> Result<CapEntryIdentity, CapFsError> {
+    let stat = authority_lock_stat(fd)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(CapFsError::ScopeConflict(
+            "materialization authority lock object is not a regular file".to_string(),
+        ));
+    }
+    // Lock objects are private synchronization metadata. Refuse foreign owners,
+    // writable group/other permissions, hard-link aliases, or payload-bearing
+    // files so a substituted object cannot silently join or split lock domains.
+    // Allow st_nlink == 0 here: terminal retirement may unlink the pathname
+    // after a waiter has opened the old inode but before it reaches `flock`.
+    // The post-flock descriptor-relative revalidation below treats that stale
+    // inode as non-authoritative and retries against the current lock pathname.
+    if stat.st_uid != unsafe { libc::geteuid() }
+        || !authority_lock_mode_is_private(stat.st_mode)
+        || stat.st_nlink > 1
+        || stat.st_size != 0
+    {
+        return Err(CapFsError::ScopeConflict(
+            "materialization authority lock object has foreign ownership, non-private mode, links, or content"
+                .to_string(),
+        ));
+    }
+    Ok(CapEntryIdentity {
+        file_type: CapFileType::Regular,
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
+}
+
+fn open_authority_lock_file(
+    dirfd: RawFd,
+    key: &AuthorityLockKey,
+) -> Result<(OwnedFd, OsString), CapFsError> {
+    let name = materialization_authority_lock_name(key);
+    validate_component(&name)?;
+    let create_flags = libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let fd = match openat_owned(dirfd, &name, create_flags, 0o600) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() == Some(libc::EACCES) => {
+            match openat_owned(
+                dirfd,
+                &name,
+                libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            ) {
+                Ok(fd) => fd,
+                Err(write_error) if write_error.raw_os_error() == Some(libc::EACCES) => {
+                    openat_owned(
+                        dirfd,
+                        &name,
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                        0,
+                    )?
+                }
+                Err(write_error) => return Err(write_error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_authority_lock_object(fd.as_raw_fd())?;
+    Ok((fd, name))
+}
+
+fn authority_lock_fd_is_current(
+    dirfd: RawFd,
+    lock_name: &OsStr,
+    fd: RawFd,
+) -> Result<bool, CapFsError> {
+    let stat = authority_lock_stat(fd)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || !authority_lock_mode_is_private(stat.st_mode)
+        || stat.st_size != 0
+    {
+        return Err(CapFsError::ScopeConflict(
+            "materialization authority lock object changed ownership, mode, type, or content"
+                .to_string(),
+        ));
+    }
+    // Terminal retirement unlinks the exact locked inode before releasing its
+    // flock. A waiter that already opened that inode wakes with st_nlink == 0;
+    // this is the expected stale-inode signal and must cause a descriptor-rooted
+    // re-open, not a foreign-state conflict. Any additional hard link remains
+    // fail-closed.
+    if stat.st_nlink == 0 {
+        return Ok(false);
+    }
+    if stat.st_nlink != 1 {
+        return Err(CapFsError::ScopeConflict(
+            "materialization authority lock object has foreign hard-link aliases".to_string(),
+        ));
+    }
+    let held = CapEntryIdentity {
+        file_type: CapFileType::Regular,
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    };
+    match fstatat_no_follow(dirfd, lock_name) {
+        Ok(current) if current.file_type != CapFileType::Regular => Err(
+            CapFsError::ScopeConflict(
+                "materialization authority lock pathname changed type".to_string(),
+            ),
+        ),
+        Ok(current) => Ok(current.device == held.device && current.inode == held.inode),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn release_authority_process_lock(
+    key: &AuthorityLockKey,
+    state: &Arc<AuthorityLockState>,
+) {
+    let mut locked = state
+        .locked
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *locked = false;
+    state.available.notify_one();
+    drop(locked);
+    prune_materialization_authority_lock_registry(key, Some(state));
+}
+
+fn acquire_authority_exclusive_lock_with_mode(
+    dirfd: RawFd,
+    authority_name: &OsStr,
+    description: &str,
+    nonblocking: bool,
+) -> Result<AuthorityExclusiveLock, CapFsError> {
+    let key = materialization_authority_lock_key(dirfd, authority_name)?;
+    let state = materialization_authority_lock_state(&key)?;
+    let mut locked = state.locked.lock().map_err(|_| {
+        CapFsError::Contradiction(
+            "materialization authority lock mutex poisoned".to_string(),
+        )
+    })?;
+    if nonblocking && *locked {
+        drop(locked);
+        prune_materialization_authority_lock_registry(&key, Some(&state));
+        return Err(CapFsError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("materialization authority is already locked for {description}"),
+        )));
+    }
+    while *locked {
+        locked = state.available.wait(locked).map_err(|_| {
+            CapFsError::Contradiction(
+                "materialization authority lock mutex poisoned".to_string(),
+            )
+        })?;
+    }
+    *locked = true;
+    drop(locked);
+
+    // Path replacement is expected only when terminal cleanup retires the
+    // previous lock inode while a waiter is asleep. Bound retries so hostile or
+    // continuously changing lock metadata fails closed instead of spinning.
+    const MAX_LOCK_PATH_RETRIES: usize = 16;
+    let mut path_retries = 0usize;
+    loop {
+        let (fd, lock_name) = match open_authority_lock_file(dirfd, &key) {
+            Ok(opened) => opened,
+            Err(error) => {
+                release_authority_process_lock(&key, &state);
+                return Err(error);
+            }
+        };
+        let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+        loop {
+            if unsafe { libc::flock(fd.as_raw_fd(), operation) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            release_authority_process_lock(&key, &state);
+            return Err(CapFsError::Io(io::Error::new(
+                error.kind(),
+                format!("could not lock materialization authority for {description}: {error}"),
+            )));
+        }
+
+        match authority_lock_fd_is_current(dirfd, &lock_name, fd.as_raw_fd()) {
+            Ok(true) => {
+                return Ok(AuthorityExclusiveLock {
+                    key,
+                    state,
+                    fd,
+                    lock_name,
+                    held: true,
+                })
+            }
+            Ok(false) => {
+                // Terminal cleanup unlinked this inode while this opener was
+                // waiting. A lock on that orphan is not authoritative; retry
+                // against the current descriptor-relative pathname while still
+                // holding the same process-local authority mutex.
+                let _ = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_UN) };
+                drop(fd);
+                path_retries += 1;
+                if path_retries >= MAX_LOCK_PATH_RETRIES {
+                    release_authority_process_lock(&key, &state);
+                    return Err(CapFsError::ScopeConflict(format!(
+                        "materialization authority lock pathname changed repeatedly for {description}"
+                    )));
+                }
+                continue;
+            }
+            Err(error) => {
+                let _ = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_UN) };
+                release_authority_process_lock(&key, &state);
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn acquire_authority_exclusive_lock(
+    dirfd: RawFd,
+    authority_name: &OsStr,
+    description: &str,
+) -> Result<AuthorityExclusiveLock, CapFsError> {
+    acquire_authority_exclusive_lock_with_mode(dirfd, authority_name, description, false)
+}
+
+#[cfg(test)]
+fn try_acquire_authority_exclusive_lock(
+    dirfd: RawFd,
+    authority_name: &OsStr,
+    description: &str,
+) -> Result<AuthorityExclusiveLock, CapFsError> {
+    acquire_authority_exclusive_lock_with_mode(dirfd, authority_name, description, true)
+}
+
+#[cfg(test)]
+fn atomic_create_regular_file_no_clobber<F>(
+    dirfd: RawFd,
+    lock_name: &OsStr,
+    name: &OsStr,
+    bytes: &[u8],
+    mode: u32,
+    writing_prefix: &str,
+    ready_prefix: &str,
+    description: &str,
+    equivalent: F,
+) -> Result<(), CapFsError>
+where
+    F: Fn(&[u8]) -> Result<bool, CapFsError>,
+{
+    let _lock = acquire_authority_exclusive_lock(dirfd, lock_name, description)?;
+    atomic_create_regular_file_no_clobber_locked(
+        dirfd,
+        name,
+        bytes,
+        mode,
+        writing_prefix,
+        ready_prefix,
+        description,
+        equivalent,
+    )
+}
+
+fn atomic_create_regular_file_no_clobber_locked<F>(
+    dirfd: RawFd,
+    name: &OsStr,
+    bytes: &[u8],
+    mode: u32,
+    writing_prefix: &str,
+    ready_prefix: &str,
+    description: &str,
+    equivalent: F,
+) -> Result<(), CapFsError>
+where
+    F: Fn(&[u8]) -> Result<bool, CapFsError>,
+{
+    validate_component(name)?;
+    if let Some(observed) = read_small_regular_file(dirfd, name, 8192, description)? {
+        return if equivalent(&observed)? {
+            cleanup_interrupted_regular_file_temporaries(dirfd, name, writing_prefix, ready_prefix)?;
+            Ok(())
+        } else {
+            Err(CapFsError::ScopeConflict(format!(
+                "{} content mismatch",
+                description
+            )))
+        };
+    }
+    if install_ready_regular_file(dirfd, name, ready_prefix, description, &equivalent)? {
+        cleanup_interrupted_regular_file_temporaries(dirfd, name, writing_prefix, ready_prefix)?;
+        return Ok(());
+    }
+    cleanup_interrupted_regular_file_temporaries(dirfd, name, writing_prefix, ready_prefix)?;
+    let ready_name = write_ready_regular_file(
+        dirfd,
+        name,
+        bytes,
+        mode,
+        writing_prefix,
+        ready_prefix,
+        description,
+    )?;
+    match linkat_no_follow(dirfd, &ready_name, dirfd, name) {
+        Ok(()) => {
+            sync_fd_best_effort(dirfd)?;
+            let _ = unlinkat_component(dirfd, &ready_name, false);
+            cleanup_interrupted_regular_file_temporaries(dirfd, name, writing_prefix, ready_prefix)?;
+            sync_fd_best_effort(dirfd)?;
+            Ok(())
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+            let observed = read_small_regular_file(dirfd, name, 8192, description)?
+                .ok_or_else(|| CapFsError::Contradiction(format!(
+                    "{} disappeared after EEXIST",
+                    description
+                )))?;
+            let _ = unlinkat_component(dirfd, &ready_name, false);
+            if equivalent(&observed)? {
+                cleanup_interrupted_regular_file_temporaries(dirfd, name, writing_prefix, ready_prefix)?;
+                sync_fd_best_effort(dirfd)?;
+                Ok(())
+            } else {
+                Err(CapFsError::ScopeConflict(format!(
+                    "{} content mismatch",
+                    description
+                )))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_ready_regular_file<F>(
+    dirfd: RawFd,
+    name: &OsStr,
+    ready_prefix: &str,
+    description: &str,
+    equivalent: &F,
+) -> Result<bool, CapFsError>
+where
+    F: Fn(&[u8]) -> Result<bool, CapFsError>,
+{
+    let target_prefix = ready_file_prefix(ready_prefix, name);
+    let mut candidates = read_directory_entry_names_matching_prefixes(
+        duplicate_fd(dirfd)?,
+        &[target_prefix.as_bytes()],
+    )?;
+    candidates.sort();
+    for candidate in candidates {
+        let observed = read_small_regular_file(dirfd, &candidate, 1024, description)?;
+        let Some(observed) = observed else { continue; };
+        if !equivalent(&observed)? {
+            return Err(CapFsError::ScopeConflict(format!(
+                "{} interrupted temporary is foreign or malformed",
+                description
+            )));
+        }
+        match linkat_no_follow(dirfd, &candidate, dirfd, name) {
+            Ok(()) => {
+                sync_fd_best_effort(dirfd)?;
+                let _ = unlinkat_component(dirfd, &candidate, false);
+                sync_fd_best_effort(dirfd)?;
+                return Ok(true);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                let final_bytes = read_small_regular_file(dirfd, name, 8192, description)?
+                    .ok_or_else(|| CapFsError::Contradiction(format!(
+                        "{} disappeared after EEXIST",
+                        description
+                    )))?;
+                if equivalent(&final_bytes)? {
+                    let _ = unlinkat_component(dirfd, &candidate, false);
+                    sync_fd_best_effort(dirfd)?;
+                    return Ok(true);
+                }
+                return Err(CapFsError::ScopeConflict(format!(
+                    "{} content mismatch",
+                    description
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+fn write_ready_regular_file(
+    dirfd: RawFd,
+    final_name: &OsStr,
+    bytes: &[u8],
+    mode: u32,
+    writing_prefix: &str,
+    ready_prefix: &str,
+    _description: &str,
+) -> Result<OsString, CapFsError> {
+    let nonce = Uuid::new_v4().simple().to_string();
+    let mut writing_name = OsString::from(ready_file_prefix(writing_prefix, final_name));
+    writing_name.push(&nonce);
+    let mut ready_name = OsString::from(ready_file_prefix(ready_prefix, final_name));
+    ready_name.push(&nonce);
+    let fd = openat_owned(
+        dirfd,
+        &writing_name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        mode,
+    )?;
+    let mut file = File::from(fd);
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    match platform_rename_no_clobber(dirfd, &writing_name, dirfd, &ready_name) {
+        Ok(()) => {
+            sync_fd_best_effort(dirfd)?;
+            Ok(ready_name)
+        }
+        Err(error) => {
+            let _ = unlinkat_component(dirfd, &writing_name, false);
+            Err(CapFsError::Io(error))
+        }
+    }
+}
+
+
+fn cleanup_interrupted_regular_file_temporaries(
+    dirfd: RawFd,
+    final_name: &OsStr,
+    writing_prefix: &str,
+    ready_prefix: &str,
+) -> Result<(), CapFsError> {
+    let prefixes = [
+        ready_file_prefix(writing_prefix, final_name),
+        ready_file_prefix(ready_prefix, final_name),
+    ];
+    let entries = read_directory_entry_names_matching_prefixes(
+        duplicate_fd(dirfd)?,
+        &[prefixes[0].as_bytes(), prefixes[1].as_bytes()],
+    )?;
+    for name in entries {
+        if fstatat_no_follow(dirfd, &name)?.file_type != CapFileType::Regular {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root bootstrap temporary changed type".to_string(),
+            ));
+        }
+        let _ = unlinkat_component(dirfd, &name, false);
+    }
+    sync_fd_best_effort(dirfd)
+}
+
+fn ready_file_prefix(prefix: &str, final_name: &OsStr) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(final_name.as_bytes());
+    let mut value = String::from(prefix);
+    value.push_str(&hex::encode(hasher.finalize()));
+    value.push('-');
+    value
+}
+
 fn claim_or_verify_materialization_stage(
+    authority_parent_fd: RawFd,
+    authority_name: &OsStr,
     dirfd: RawFd,
     token: &str,
+    expected_identity: Option<(u64, u64)>,
 ) -> Result<(), CapFsError> {
+    let _lock = acquire_authority_exclusive_lock(
+        authority_parent_fd,
+        authority_name,
+        "logical-root staging ownership",
+    )?;
     match read_materialization_marker(dirfd)? {
-        Some(bytes) if bytes == token.as_bytes() => Ok(()),
-        Some(_) => Err(CapFsError::ScopeConflict(
-            "logical-root staging marker token mismatch".to_string(),
-        )),
+        Some(bytes) if bytes == token.as_bytes() => {}
+        Some(_) => {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root staging marker token mismatch".to_string(),
+            ))
+        }
         None => {
-            // The only anonymous interval is mkdirat -> marker fsync.  The
-            // random, journal-known stage name plus an empty no-follow-opened
-            // directory is sufficient to resume that exact interrupted step.
-            // Any content before ownership is established is contradictory.
-            if !read_directory_entries(duplicate_fd(dirfd)?)?.is_empty() {
+            if directory_has_entries(duplicate_fd(dirfd)?)? {
                 return Err(CapFsError::ScopeConflict(
                     "unmarked logical-root staging directory is not empty".to_string(),
                 ));
             }
-            create_materialization_marker(dirfd, token)
+            create_materialization_marker_locked(dirfd, token)?;
         }
     }
+    if let Some((device, inode)) = expected_identity {
+        let observed = fstat_fd(dirfd)?;
+        if observed.device != device || observed.inode != inode {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root staging directory does not match its materialization authority".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn open_published_materialized_root(
     acquisition_fd: RawFd,
     components: &[OsString],
     token: &str,
+    expected_identity: Option<(u64, u64)>,
 ) -> Result<(OwnedFd, OwnedFd), CapFsError> {
     if !valid_materialization_token(token) {
         return Err(CapFsError::ScopeConflict(
@@ -4409,7 +6562,25 @@ fn open_published_materialized_root(
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         0,
     )?;
-    verify_materialization_marker(top.as_raw_fd(), token)?;
+    match read_materialization_marker(top.as_raw_fd())? {
+        Some(bytes) if bytes == token.as_bytes() => {}
+        Some(_) => {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root materialization marker token mismatch".to_string(),
+            ))
+        }
+        // Publication paths outside the capability materializer (ordinary
+        // album publish) create the logical root without an owner marker.
+        // The attested device/inode identity below is then the required
+        // authentication; a marker-less root WITHOUT an attested identity
+        // stays fail-closed.
+        None if expected_identity.is_none() => {
+            return Err(CapFsError::ScopeConflict(
+                "logical-root staging directory has no owner marker".to_string(),
+            ))
+        }
+        None => {}
+    }
     let mut current = duplicate_fd(top.as_raw_fd())?;
     for component in components.iter().skip(1) {
         current = openat_owned(
@@ -4422,6 +6593,15 @@ fn open_published_materialized_root(
         if metadata.file_type != CapFileType::Directory {
             return Err(CapFsError::ScopeConflict(
                 "published logical-root path contains a non-directory component".to_string(),
+            ));
+        }
+    }
+    if let Some((device, inode)) = expected_identity {
+        let observed = fstat_fd(current.as_raw_fd())?;
+        if observed.device != device || observed.inode != inode {
+            return Err(CapFsError::ScopeConflict(
+                "published logical-root path does not match its materialization authority"
+                    .to_string(),
             ));
         }
     }
@@ -4442,6 +6622,21 @@ fn openat_owned(dirfd: RawFd, name: &OsStr, flags: i32, mode: u32) -> io::Result
 fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: `fd` remains owned by the caller; `dup` returns a new descriptor.
     let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+/// Duplicate a descriptor WITHOUT close-on-exec, at fd >= 3, so a child
+/// process (e.g. a shebang interpreter reopening `/proc/self/fd/<n>` after
+/// exec) can still reach it. Unsafe stays confined to this module; the only
+/// in-tree consumer is the self-contained lifecycle test runner.
+#[cfg(test)]
+pub(crate) fn duplicate_fd_inheritable(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: `fd` remains owned by the caller; a successful F_DUPFD returns
+    // a new descriptor that we immediately take ownership of.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
     if duplicate < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -4594,6 +6789,87 @@ impl Drop for DirectoryStream {
     fn drop(&mut self) {
         // SAFETY: `DirectoryStream` uniquely owns the live DIR pointer.
         unsafe { libc::closedir(self.0) };
+    }
+}
+
+fn read_directory_entry_names_matching_prefixes(
+    directory: OwnedFd,
+    prefixes: &[&[u8]],
+) -> Result<Vec<OsString>, CapFsError> {
+    let raw = directory.as_raw_fd();
+    let duplicate = duplicate_fd(raw)?;
+    let raw_duplicate = duplicate.as_raw_fd();
+    std::mem::forget(duplicate);
+    // SAFETY: ownership of `raw_duplicate` transfers to `DIR*`; the RAII guard
+    // closes it on every success and error path. The original fd remains live.
+    let dir = unsafe { libc::fdopendir(raw_duplicate) };
+    if dir.is_null() {
+        // SAFETY: fdopendir failed and therefore did not consume the descriptor.
+        unsafe { libc::close(raw_duplicate) };
+        return Err(io::Error::last_os_error().into());
+    }
+    let stream = DirectoryStream(dir);
+    // SAFETY: `stream.0` is a live DIR pointer.
+    unsafe { libc::rewinddir(stream.0) };
+    let mut names = Vec::new();
+    loop {
+        set_errno_zero();
+        // SAFETY: `stream` owns a live DIR pointer. The returned dirent is
+        // consumed before the next call to readdir.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) == 0 {
+                break;
+            }
+            return Err(error.into());
+        }
+        // SAFETY: d_name is NUL-terminated for the live dirent.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." || !prefixes.iter().any(|prefix| bytes.starts_with(prefix)) {
+            continue;
+        }
+        let name = OsString::from_vec(bytes.to_vec());
+        validate_component(&name)?;
+        names.push(name);
+    }
+    Ok(names)
+}
+
+fn directory_has_entries(directory: OwnedFd) -> Result<bool, CapFsError> {
+    let raw = directory.as_raw_fd();
+    let duplicate = duplicate_fd(raw)?;
+    let raw_duplicate = duplicate.as_raw_fd();
+    std::mem::forget(duplicate);
+    // SAFETY: ownership of `raw_duplicate` transfers to `DIR*`; the RAII guard
+    // closes it on every success and error path. The original fd remains live.
+    let dir = unsafe { libc::fdopendir(raw_duplicate) };
+    if dir.is_null() {
+        // SAFETY: fdopendir failed and therefore did not consume the descriptor.
+        unsafe { libc::close(raw_duplicate) };
+        return Err(io::Error::last_os_error().into());
+    }
+    let stream = DirectoryStream(dir);
+    // SAFETY: `stream.0` is a live DIR pointer.
+    unsafe { libc::rewinddir(stream.0) };
+    loop {
+        set_errno_zero();
+        // SAFETY: `stream` owns a live DIR pointer. The returned dirent is
+        // consumed before the next call to readdir.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) == 0 {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
+        // SAFETY: d_name is NUL-terminated for the live dirent.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            return Ok(true);
+        }
     }
 }
 
@@ -4879,6 +7155,174 @@ fn cap_to_io(error: CapFsError) -> io::Error {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    const LOCK_CHILD_MODE_ENV: &str = "TONEPOET_TEST_AUTHORITY_LOCK_CHILD_MODE";
+    #[cfg(target_os = "linux")]
+    const LOCK_CHILD_PARENT_ENV: &str = "TONEPOET_TEST_AUTHORITY_LOCK_CHILD_PARENT";
+    #[cfg(target_os = "linux")]
+    const LOCK_CHILD_AUTHORITY_ENV: &str = "TONEPOET_TEST_AUTHORITY_LOCK_CHILD_AUTHORITY";
+
+    #[cfg(target_os = "linux")]
+    fn lock_child_command(
+        parent: &Path,
+        authority: &OsStr,
+        mode: &str,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("current test executable"),
+        );
+        command
+            .arg("--ignored")
+            .arg("materialization_authority_lock_child_helper")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(LOCK_CHILD_MODE_ENV, mode)
+            .env(LOCK_CHILD_PARENT_ENV, parent)
+            .env(LOCK_CHILD_AUTHORITY_ENV, authority);
+        command
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_lock_child_try(parent: &Path, authority: &OsStr) -> String {
+        let output = lock_child_command(parent, authority, "try")
+            .output()
+            .expect("run authority-lock child");
+        assert!(
+            output.status.success(),
+            "authority-lock child failed: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn materialization_authority_lock_child_helper() {
+        use std::io::{BufRead as _, Write as _};
+
+        let Ok(mode) = std::env::var(LOCK_CHILD_MODE_ENV) else {
+            // Purpose-built child entrypoint. It is ignored during ordinary test
+            // execution and does nothing when explicitly run without its parent
+            // protocol environment.
+            return;
+        };
+        let parent = PathBuf::from(
+            std::env::var_os(LOCK_CHILD_PARENT_ENV).expect("lock child parent"),
+        );
+        let authority = OsString::from(
+            std::env::var_os(LOCK_CHILD_AUTHORITY_ENV).expect("lock child authority"),
+        );
+        let dir = open_absolute_directory(&parent).expect("open lock child parent");
+        match mode.as_str() {
+            "try" => match try_acquire_authority_exclusive_lock(
+                dir.as_raw_fd(),
+                &authority,
+                "external-process nonblocking regression",
+            ) {
+                Ok(_guard) => println!("LOCK_CHILD_ACQUIRED"),
+                Err(CapFsError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                    println!("LOCK_CHILD_BLOCKED")
+                }
+                Err(error) => panic!("unexpected lock-child result: {error}"),
+            },
+            "block" => {
+                match try_acquire_authority_exclusive_lock(
+                    dir.as_raw_fd(),
+                    &authority,
+                    "external-process blocking preflight",
+                ) {
+                    Err(CapFsError::Io(error))
+                        if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Ok(_) => panic!("child unexpectedly acquired held authority in preflight"),
+                    Err(error) => panic!("unexpected blocking preflight result: {error}"),
+                }
+                println!("LOCK_CHILD_BLOCKED");
+                std::io::stdout().flush().expect("flush blocked handshake");
+                let _guard = acquire_authority_exclusive_lock(
+                    dir.as_raw_fd(),
+                    &authority,
+                    "external-process blocking regression",
+                )
+                .expect("child acquires after parent release");
+                println!("LOCK_CHILD_ACQUIRED");
+                std::io::stdout().flush().expect("flush acquired handshake");
+            }
+            "hold" => {
+                let _guard = acquire_authority_exclusive_lock(
+                    dir.as_raw_fd(),
+                    &authority,
+                    "external-process independent-authority hold",
+                )
+                .expect("child acquires held authority");
+                println!("LOCK_CHILD_ACQUIRED");
+                std::io::stdout().flush().expect("flush hold handshake");
+                let mut release = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut release)
+                    .expect("read hold release handshake");
+            }
+            "acquire_abort" => {
+                let _guard = acquire_authority_exclusive_lock(
+                    dir.as_raw_fd(),
+                    &authority,
+                    "external-process crash-release regression",
+                )
+                .expect("child acquires before abort");
+                println!("LOCK_CHILD_ACQUIRED");
+                std::io::stdout().flush().expect("flush crash handshake");
+                std::process::abort();
+            }
+            "wait_on_open_inode" => {
+                let key = materialization_authority_lock_key(dir.as_raw_fd(), &authority)
+                    .expect("derive child authority lock key");
+                let (fd, lock_name) = open_authority_lock_file(dir.as_raw_fd(), &key)
+                    .expect("open child authority lock inode before blocking");
+                let operation = libc::LOCK_EX | libc::LOCK_NB;
+                assert_ne!(
+                    unsafe { libc::flock(fd.as_raw_fd(), operation) },
+                    0,
+                    "child unexpectedly acquired parent-held lock inode"
+                );
+                let error = io::Error::last_os_error();
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                let opened = fstat_fd(fd.as_raw_fd()).expect("stat child-opened lock inode");
+                println!("LOCK_CHILD_OPENED_BLOCKED:{}:{}", opened.device, opened.inode);
+                std::io::stdout().flush().expect("flush opened-blocked handshake");
+                loop {
+                    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                        break;
+                    }
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        panic!("child failed waiting on opened lock inode: {error}");
+                    }
+                }
+                assert!(
+                    !authority_lock_fd_is_current(dir.as_raw_fd(), &lock_name, fd.as_raw_fd())
+                        .expect("revalidate child-opened lock inode"),
+                    "terminal retirement must make the old opened lock inode non-authoritative"
+                );
+                println!("LOCK_CHILD_STALE_INODE");
+                std::io::stdout().flush().expect("flush stale-inode handshake");
+                let _ = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_UN) };
+                drop(fd);
+                let _guard = acquire_authority_exclusive_lock(
+                    dir.as_raw_fd(),
+                    &authority,
+                    "external-process retry after terminal lock retirement",
+                )
+                .expect("child rebinds to current authority lock inode");
+                println!("LOCK_CHILD_REBOUND_ACQUIRED");
+                std::io::stdout().flush().expect("flush rebound handshake");
+            }
+            other => panic!("unknown authority-lock child mode {other}"),
+        }
+    }
 
     #[test]
     fn first_materialization_boundary_coalesces_siblings_only_while_parent_is_missing() {
@@ -5912,6 +8356,639 @@ mod tests {
     }
 
     #[test]
+    fn parent_token_record_validates_against_retained_direct_anchor() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        std::fs::create_dir(&parent).unwrap();
+
+        let first = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        first
+            .pin_recoverable_internal_root(scope.clone(), &logical)
+            .unwrap();
+        let pre_materialization_records = first.scope_records().unwrap();
+        assert!(!pre_materialization_records[0].base_relative.is_empty());
+        assert!(pre_materialization_records[0]
+            .materialization_token
+            .is_some());
+        assert!(pre_materialization_records[0]
+            .materialization_authority_name
+            .is_some());
+
+        first.materialize_scope(&scope, 0o755).unwrap();
+        assert!(logical.join(MATERIALIZATION_MARKER).is_file());
+
+        let retained_direct = CapabilityFilesystem::new();
+        retained_direct
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        retained_direct
+            .restore_scope_records(&pre_materialization_records, &[(scope.clone(), logical)])
+            .unwrap();
+        retained_direct
+            .validate_scope_records(&pre_materialization_records)
+            .unwrap();
+    }
+
+    #[test]
+    fn evolved_direct_anchor_rejects_replaced_logical_directory() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        let substituted_original = parent.join("Album.original");
+        std::fs::create_dir(&parent).unwrap();
+
+        let first = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        first
+            .pin_recoverable_internal_root(scope.clone(), &logical)
+            .unwrap();
+        let pre_materialization_records = first.scope_records().unwrap();
+        first.materialize_scope(&scope, 0o755).unwrap();
+        std::fs::rename(&logical, &substituted_original).unwrap();
+        std::fs::create_dir(&logical).unwrap();
+        std::fs::copy(
+            substituted_original.join(MATERIALIZATION_MARKER),
+            logical.join(MATERIALIZATION_MARKER),
+        )
+        .unwrap();
+
+        let retained_direct = CapabilityFilesystem::new();
+        retained_direct
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        assert!(matches!(
+            retained_direct.restore_scope_records(
+                &pre_materialization_records,
+                &[(scope, logical.clone())]
+            ),
+            Err(CapFsError::ScopeConflict(_))
+        ));
+        assert!(substituted_original.join(MATERIALIZATION_MARKER).is_file());
+        assert!(logical.join(MATERIALIZATION_MARKER).is_file());
+    }
+
+    #[test]
+    fn durable_identity_validates_evolved_direct_anchor_after_authority_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        std::fs::create_dir(&parent).unwrap();
+
+        let first = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        first
+            .pin_recoverable_internal_root(scope.clone(), &logical)
+            .unwrap();
+        first.materialize_scope(&scope, 0o755).unwrap();
+        let identity_records = first.scope_records().unwrap();
+        assert!(identity_records[0].materialized_device.is_some());
+        let authority_name = identity_records[0]
+            .materialization_authority_name
+            .as_deref()
+            .unwrap()
+            .to_string();
+        let identity_name = materialization_identity_attestation_name(OsStr::new(&authority_name));
+        first.finalize_materialized_roots().unwrap();
+        assert!(!parent.join(&authority_name).exists());
+        assert!(!parent.join(Path::new(&identity_name)).exists());
+        assert!(!logical.join(MATERIALIZATION_MARKER).exists());
+
+        let retained_direct = CapabilityFilesystem::new();
+        retained_direct
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        retained_direct
+            .restore_scope_records(&identity_records, &[(scope.clone(), logical)])
+            .unwrap();
+        retained_direct
+            .validate_scope_records(&identity_records)
+            .unwrap();
+    }
+
+    #[test]
+    fn evolved_direct_anchor_rejects_missing_or_foreign_authority() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        std::fs::create_dir(&parent).unwrap();
+
+        let first = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        first
+            .pin_recoverable_internal_root(scope.clone(), &logical)
+            .unwrap();
+        let pre_materialization_records = first.scope_records().unwrap();
+        let token = pre_materialization_records[0]
+            .materialization_token
+            .as_deref()
+            .unwrap()
+            .to_string();
+        let authority_name = pre_materialization_records[0]
+            .materialization_authority_name
+            .as_deref()
+            .unwrap()
+            .to_string();
+        let authority = parent.join(&authority_name);
+        assert!(authority.is_file());
+        first.materialize_scope(&scope, 0o755).unwrap();
+
+        std::fs::remove_file(&authority).unwrap();
+        let retained_direct = CapabilityFilesystem::new();
+        retained_direct
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        assert!(matches!(
+            retained_direct.validate_scope_records(&pre_materialization_records),
+            Err(CapFsError::ScopeConflict(_))
+        ));
+        assert!(matches!(
+            retained_direct.restore_scope_records(
+                &pre_materialization_records,
+                &[(scope.clone(), logical.clone())]
+            ),
+            Err(CapFsError::ScopeConflict(_))
+        ));
+
+        let foreign = "00000000000000000000000000000000";
+        assert_ne!(foreign, token);
+        std::fs::write(&authority, foreign.as_bytes()).unwrap();
+        let retained_direct = CapabilityFilesystem::new();
+        retained_direct
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        assert!(matches!(
+            retained_direct.validate_scope_records(&pre_materialization_records),
+            Err(CapFsError::ScopeConflict(_))
+        ));
+        assert!(matches!(
+            retained_direct.restore_scope_records(
+                &pre_materialization_records,
+                &[(scope, logical)]
+            ),
+            Err(CapFsError::ScopeConflict(_))
+        ));
+    }
+
+
+
+    #[test]
+    fn production_pre_album_materializable_pin_attests_retained_publication_capability() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        std::fs::create_dir(&parent).unwrap();
+
+        let first = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        first.pin_materializable_root(scope.clone(), &logical).unwrap();
+        let pre_records = first.scope_records().unwrap();
+        assert_eq!(pre_records.len(), 1);
+        assert!(!pre_records[0].base_relative.is_empty());
+        assert!(pre_records[0].materialization_token.is_some());
+        assert!(pre_records[0].materialization_authority_name.is_some());
+        assert!(pre_records[0].materialized_device.is_none());
+        drop(first);
+
+        // Model the production conversion publisher: it creates the album root
+        // outside the PRE action filesystem, then hands finalization an exact
+        // retained album descriptor from the publication lock.
+        std::fs::create_dir(&logical).unwrap();
+        let retained_publication = CapabilityFilesystem::new();
+        retained_publication
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        retained_publication
+            .attest_materialized_scope_from_retained_direct_anchor(&pre_records[0])
+            .unwrap();
+        retained_publication
+            .restore_scope_records(&pre_records, &[(scope.clone(), logical.clone())])
+            .unwrap();
+        retained_publication
+            .validate_scope_records(&pre_records)
+            .unwrap();
+
+        let authority_name = pre_records[0]
+            .materialization_authority_name
+            .as_deref()
+            .unwrap();
+        let parent_fd = open_absolute_directory(&parent).unwrap();
+        let authority = read_materialization_authority(
+            parent_fd.as_raw_fd(),
+            OsStr::new(authority_name),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(authority.materialized_identity(), None);
+        let identity = read_materialization_identity_attestation(
+            parent_fd.as_raw_fd(),
+            OsStr::new(authority_name),
+        )
+        .unwrap()
+        .unwrap();
+        let retained_record = retained_publication.scope_records().unwrap();
+        assert_eq!(
+            identity.materialized_identity(),
+            Some((
+                retained_record[0].materialized_device.unwrap(),
+                retained_record[0].materialized_inode.unwrap(),
+            ))
+        );
+    }
+
+    #[test]
+    fn terminal_retirement_removes_album_authority_and_allows_fresh_reconversion() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        std::fs::create_dir(&parent).unwrap();
+
+        let first = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        first.pin_materializable_root(scope.clone(), &logical).unwrap();
+        let pre_records = first.scope_records().unwrap();
+        let authority_name = pre_records[0]
+            .materialization_authority_name
+            .as_deref()
+            .unwrap()
+            .to_string();
+        let identity_name = materialization_identity_attestation_name(OsStr::new(&authority_name));
+        let parent_fd = open_absolute_directory(&parent).unwrap();
+        let lock_key = materialization_authority_lock_key(
+            parent_fd.as_raw_fd(),
+            OsStr::new(&authority_name),
+        )
+        .unwrap();
+        let lock_name = materialization_authority_lock_name(&lock_key);
+        assert!(parent.join(&lock_name).is_file());
+        drop(first);
+
+        std::fs::create_dir(&logical).unwrap();
+        let retained_publication = CapabilityFilesystem::new();
+        retained_publication
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        retained_publication
+            .attest_materialized_scope_from_retained_direct_anchor(&pre_records[0])
+            .unwrap();
+        assert!(parent.join(&authority_name).is_file());
+        assert!(parent.join(Path::new(&identity_name)).is_file());
+        retained_publication
+            .restore_scope_records(&pre_records, &[(scope.clone(), logical.clone())])
+            .unwrap();
+        retained_publication
+            .validate_scope_records(&pre_records)
+            .unwrap();
+        retained_publication
+            .retire_materialization_authorities_for_scope_records(&pre_records)
+            .unwrap();
+        assert!(!parent.join(&authority_name).exists());
+        assert!(!parent.join(Path::new(&identity_name)).exists());
+        assert!(!parent.join(&lock_name).exists());
+
+        std::fs::remove_dir(&logical).unwrap();
+        let second = CapabilityFilesystem::new();
+        second.pin_materializable_root(scope.clone(), &logical).unwrap();
+        let second_records = second.scope_records().unwrap();
+        assert!(second_records[0].materialization_token.is_some());
+        assert!(parent.join(&authority_name).is_file());
+        assert!(parent.join(&lock_name).is_file());
+    }
+
+    #[test]
+    fn terminal_retirement_retries_partial_authority_unlink_states() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        std::fs::create_dir(&parent).unwrap();
+
+        let first = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        first.pin_materializable_root(scope.clone(), &logical).unwrap();
+        let pre_records = first.scope_records().unwrap();
+        let authority_name = pre_records[0]
+            .materialization_authority_name
+            .as_deref()
+            .unwrap()
+            .to_string();
+        let identity_name = materialization_identity_attestation_name(OsStr::new(&authority_name));
+        drop(first);
+
+        std::fs::create_dir(&logical).unwrap();
+        let retained_publication = CapabilityFilesystem::new();
+        retained_publication
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        retained_publication
+            .attest_materialized_scope_from_retained_direct_anchor(&pre_records[0])
+            .unwrap();
+        retained_publication
+            .restore_scope_records(&pre_records, &[(scope.clone(), logical.clone())])
+            .unwrap();
+        retained_publication
+            .validate_scope_records(&pre_records)
+            .unwrap();
+
+        // New retirement order is bootstrap first. A crash after that unlink
+        // leaves the identity-bearing attestation, which is independently
+        // sufficient to authenticate and finish retirement.
+        std::fs::remove_file(parent.join(&authority_name)).unwrap();
+        assert!(parent.join(Path::new(&identity_name)).is_file());
+        retained_publication
+            .retire_materialization_authorities_for_scope_records(&pre_records)
+            .unwrap();
+        assert!(!parent.join(&authority_name).exists());
+        assert!(!parent.join(Path::new(&identity_name)).exists());
+
+        // Recreate the authority pair and model the old, unsafe identity-first
+        // partial state. Without the durable terminal marker this remains
+        // fail-closed; with the marker, retry may remove the token-only
+        // bootstrap because a previous pass already validated the publication.
+        std::fs::remove_dir(&logical).unwrap();
+        let second_pre = CapabilityFilesystem::new();
+        second_pre.pin_materializable_root(scope.clone(), &logical).unwrap();
+        let second_records = second_pre.scope_records().unwrap();
+        drop(second_pre);
+        std::fs::create_dir(&logical).unwrap();
+        let second_retained = CapabilityFilesystem::new();
+        second_retained
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        second_retained
+            .attest_materialized_scope_from_retained_direct_anchor(&second_records[0])
+            .unwrap();
+        second_retained
+            .restore_scope_records(&second_records, &[(scope.clone(), logical.clone())])
+            .unwrap();
+        second_retained.validate_scope_records(&second_records).unwrap();
+        let second_authority_name = second_records[0]
+            .materialization_authority_name
+            .as_deref()
+            .unwrap()
+            .to_string();
+        let second_identity_name =
+            materialization_identity_attestation_name(OsStr::new(&second_authority_name));
+        std::fs::remove_file(parent.join(Path::new(&second_identity_name))).unwrap();
+        assert!(matches!(
+            second_retained.retire_materialization_authorities_for_scope_records(&second_records),
+            Err(CapFsError::ScopeConflict(_))
+        ));
+        assert!(parent.join(&second_authority_name).is_file());
+        second_retained
+            .retire_materialization_authorities_for_scope_records_after_terminal_marker(
+                &second_records,
+            )
+            .unwrap();
+        assert!(!parent.join(&second_authority_name).exists());
+        assert!(!parent.join(Path::new(&second_identity_name)).exists());
+    }
+
+    #[test]
+    fn terminal_marker_retry_does_not_require_retained_album_or_live_path() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        std::fs::create_dir(&parent).unwrap();
+
+        let pre = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        pre.pin_materializable_root(scope.clone(), &logical).unwrap();
+        let pre_records = pre.scope_records().unwrap();
+        let authority_name = pre_records[0]
+            .materialization_authority_name
+            .as_deref()
+            .unwrap()
+            .to_string();
+        let identity_name = materialization_identity_attestation_name(OsStr::new(&authority_name));
+        drop(pre);
+
+        std::fs::create_dir(&logical).unwrap();
+        let published = CapabilityFilesystem::new();
+        published.pin_existing_root(scope.clone(), &logical).unwrap();
+        published
+            .attest_materialized_scope_from_retained_direct_anchor(&pre_records[0])
+            .unwrap();
+        assert!(parent.join(&authority_name).is_file());
+        assert!(parent.join(Path::new(&identity_name)).is_file());
+
+        // After the terminal retirement marker is durable, retrying authority
+        // retirement must not depend on the album path still existing or on a
+        // retained publication descriptor. The remaining authority files
+        // authenticate themselves by scope, base-relative path, token, and the
+        // identity-bearing attestation written before the marker.
+        std::fs::remove_dir(&logical).unwrap();
+        let cleanup = CapabilityFilesystem::new();
+        cleanup
+            .retire_materialization_authorities_for_scope_records_after_terminal_marker(
+                &pre_records,
+            )
+            .unwrap();
+        assert!(!parent.join(&authority_name).exists());
+        assert!(!parent.join(Path::new(&identity_name)).exists());
+    }
+
+    #[test]
+    fn identity_attestation_is_no_clobber_and_fails_closed_on_conflict() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        std::fs::create_dir(&parent).unwrap();
+        let parent_fd = open_absolute_directory(&parent).unwrap();
+        let scope = ScopeId::new("album").unwrap();
+        let base = RelativePath::new("Album").unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let name = materialization_authority_name(&scope, &base);
+        create_materialization_authority(parent_fd.as_raw_fd(), &name, &scope, &base, token)
+            .unwrap();
+        let identity_name = materialization_identity_attestation_name(&name);
+        let foreign = serialize_materialization_authority(&scope, &base, token, Some((7, 9)))
+            .unwrap();
+        atomic_create_regular_file_no_clobber(
+            parent_fd.as_raw_fd(),
+            &name,
+            &identity_name,
+            &foreign,
+            0o600,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+            "logical-root materialization identity attestation",
+            |_| Ok(true),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            attest_materialization_authority(
+                parent_fd.as_raw_fd(),
+                &name,
+                &scope,
+                &base,
+                token,
+                11,
+                13,
+            ),
+            Err(CapFsError::ScopeConflict(_))
+        ));
+        let observed = read_materialization_identity_attestation(parent_fd.as_raw_fd(), &name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.materialized_identity(), Some((7, 9)));
+    }
+
+    #[test]
+    fn retained_publication_attestation_does_not_authenticate_later_path_substitution() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        let logical = parent.join("Album");
+        let original = parent.join("Album.original");
+        std::fs::create_dir(&parent).unwrap();
+
+        let first = CapabilityFilesystem::new();
+        let scope = ScopeId::new("album").unwrap();
+        first.pin_materializable_root(scope.clone(), &logical).unwrap();
+        let pre_records = first.scope_records().unwrap();
+        drop(first);
+
+        std::fs::create_dir(&logical).unwrap();
+        let retained_original = CapabilityFilesystem::new();
+        retained_original
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        std::fs::rename(&logical, &original).unwrap();
+        std::fs::create_dir(&logical).unwrap();
+
+        retained_original
+            .attest_materialized_scope_from_retained_direct_anchor(&pre_records[0])
+            .unwrap();
+
+        let replacement = CapabilityFilesystem::new();
+        replacement
+            .pin_existing_root(scope.clone(), &logical)
+            .unwrap();
+        assert!(matches!(
+            replacement.restore_scope_records(&pre_records, &[(scope, logical)]),
+            Err(CapFsError::ScopeConflict(_))
+        ));
+    }
+
+    #[test]
+    fn materialization_authority_adopts_valid_ready_temp_with_unknown_restart_token() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        std::fs::create_dir(&parent).unwrap();
+        let parent_fd = open_absolute_directory(&parent).unwrap();
+        let scope = ScopeId::new("album").unwrap();
+        let base = RelativePath::new("Album").unwrap();
+        let old_token = "0123456789abcdef0123456789abcdef";
+        let name = materialization_authority_name(&scope, &base);
+        let bytes = serialize_materialization_authority(&scope, &base, old_token, None).unwrap();
+        let ready = write_ready_regular_file(
+            parent_fd.as_raw_fd(),
+            &name,
+            &bytes,
+            0o600,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+            "logical-root bootstrap authority",
+        )
+        .unwrap();
+        assert!(parent.join(Path::new(&ready)).is_file());
+
+        let adopted = create_or_adopt_materialization_authority(
+            parent_fd.as_raw_fd(),
+            &name,
+            &scope,
+            &base,
+        )
+        .unwrap();
+        assert_eq!(adopted, old_token);
+        assert!(!parent.join(Path::new(&ready)).exists());
+        let authority = read_materialization_authority(parent_fd.as_raw_fd(), &name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.token(), old_token);
+        assert_eq!(authority.materialized_identity(), None);
+    }
+
+    #[test]
+    fn materialization_authority_installs_valid_interrupted_ready_temp() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        std::fs::create_dir(&parent).unwrap();
+        let parent_fd = open_absolute_directory(&parent).unwrap();
+        let scope = ScopeId::new("album").unwrap();
+        let base = RelativePath::new("Album").unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let name = materialization_authority_name(&scope, &base);
+        let bytes = serialize_materialization_authority(&scope, &base, token, None).unwrap();
+        let ready = write_ready_regular_file(
+            parent_fd.as_raw_fd(),
+            &name,
+            &bytes,
+            0o600,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+            "logical-root bootstrap authority",
+        )
+        .unwrap();
+        assert!(parent.join(Path::new(&ready)).is_file());
+
+        create_materialization_authority(parent_fd.as_raw_fd(), &name, &scope, &base, token)
+            .unwrap();
+        assert!(!parent.join(Path::new(&ready)).exists());
+        let authority = read_materialization_authority(parent_fd.as_raw_fd(), &name)
+            .unwrap()
+            .unwrap();
+        authority.validate_for_scope(&scope, &base).unwrap();
+        assert_eq!(authority.token(), token);
+        assert_eq!(authority.materialized_identity(), None);
+    }
+
+    #[test]
+    fn materialization_marker_installs_valid_interrupted_ready_temp() {
+        let temp = TempDir::new().unwrap();
+        let stage = temp.path().join("stage");
+        std::fs::create_dir(&stage).unwrap();
+        let stage_fd = open_absolute_directory(&stage).unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let marker = OsStr::new(MATERIALIZATION_MARKER);
+        let ready = write_ready_regular_file(
+            stage_fd.as_raw_fd(),
+            marker,
+            token.as_bytes(),
+            0o600,
+            MATERIALIZATION_MARKER_WRITING_PREFIX,
+            MATERIALIZATION_MARKER_READY_PREFIX,
+            "logical-root materialization marker",
+        )
+        .unwrap();
+        assert!(stage.join(Path::new(&ready)).is_file());
+
+        let parent_fd = open_absolute_directory(temp.path()).unwrap();
+        let scope = ScopeId::new("marker-test").unwrap();
+        let base = RelativePath::new(PathBuf::from("stage")).unwrap();
+        let authority_name = materialization_authority_name(&scope, &base);
+        create_materialization_marker(
+            parent_fd.as_raw_fd(),
+            &authority_name,
+            stage_fd.as_raw_fd(),
+            token,
+        )
+        .unwrap();
+        assert!(!stage.join(Path::new(&ready)).exists());
+        assert!(std::fs::read_dir(&stage).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .as_bytes()
+                .starts_with(MATERIALIZATION_AUTHORITY_LOCK_PREFIX.as_bytes())
+        }));
+        assert_eq!(
+            read_materialization_marker(stage_fd.as_raw_fd()).unwrap().unwrap(),
+            token.as_bytes().to_vec()
+        );
+    }
+
+    #[test]
     fn recovery_resumes_token_owned_stage_before_publication() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -6165,6 +9242,899 @@ mod tests {
         );
         assert!(matches!(result, Err(CapFsError::ScopeConflict(_))));
         assert!(!logical.exists());
+    }
+
+
+    #[test]
+    fn materialization_authority_locks_are_keyed_and_reclaimed() {
+        let temp = TempDir::new().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let left_fd = open_absolute_directory(&left).unwrap();
+        let right_fd = open_absolute_directory(&right).unwrap();
+        let name = OsStr::new(".tonepoet-root-authority-test");
+        let left_key = materialization_authority_lock_key(left_fd.as_raw_fd(), name).unwrap();
+        let right_key = materialization_authority_lock_key(right_fd.as_raw_fd(), name).unwrap();
+        assert!(!materialization_authority_lock_registry_has_live_state(&left_key));
+        assert!(!materialization_authority_lock_registry_has_live_state(&right_key));
+        {
+            let _left = acquire_authority_exclusive_lock(
+                left_fd.as_raw_fd(),
+                name,
+                "left test authority",
+            )
+            .unwrap();
+            let _right = acquire_authority_exclusive_lock(
+                right_fd.as_raw_fd(),
+                name,
+                "right test authority",
+            )
+            .unwrap();
+            assert!(materialization_authority_lock_registry_has_live_state(&left_key));
+            assert!(materialization_authority_lock_registry_has_live_state(&right_key));
+        }
+        assert!(!materialization_authority_lock_registry_has_live_state(&left_key));
+        assert!(!materialization_authority_lock_registry_has_live_state(&right_key));
+
+        // Repeated use of one identity must not leave a permanent registry
+        // entry in a long-running process.
+        for _ in 0..64 {
+            let guard = acquire_authority_exclusive_lock(
+                left_fd.as_raw_fd(),
+                name,
+                "registry reclamation cycle",
+            )
+            .unwrap();
+            assert!(materialization_authority_lock_registry_has_live_state(&left_key));
+            drop(guard);
+            assert!(!materialization_authority_lock_registry_has_live_state(&left_key));
+        }
+    }
+
+    #[test]
+    fn materialization_authority_lock_identity_includes_authority_name() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        let dir = open_absolute_directory(&temp.path().join("out")).unwrap();
+        let first = OsStr::new(".tonepoet-root-authority-first");
+        let second = OsStr::new(".tonepoet-root-authority-second");
+        let first_key = materialization_authority_lock_key(dir.as_raw_fd(), first).unwrap();
+        let second_key = materialization_authority_lock_key(dir.as_raw_fd(), second).unwrap();
+        assert_ne!(first_key, second_key);
+    }
+
+    #[test]
+    fn different_authorities_under_same_parent_use_distinct_lock_inodes() {
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let first = OsStr::new(".tonepoet-root-authority-first-lock-inode");
+        let second = OsStr::new(".tonepoet-root-authority-second-lock-inode");
+        let first_key = materialization_authority_lock_key(dir.as_raw_fd(), first).unwrap();
+        let second_key = materialization_authority_lock_key(dir.as_raw_fd(), second).unwrap();
+        let (first_fd, _) = open_authority_lock_file(dir.as_raw_fd(), &first_key).unwrap();
+        let (second_fd, _) = open_authority_lock_file(dir.as_raw_fd(), &second_key).unwrap();
+        let first_meta = fstat_fd(first_fd.as_raw_fd()).unwrap();
+        let second_meta = fstat_fd(second_fd.as_raw_fd()).unwrap();
+        assert_ne!((first_meta.device, first_meta.inode), (second_meta.device, second_meta.inode));
+        assert!(temp.path().join(materialization_authority_lock_name(&first_key)).is_file());
+        assert!(temp.path().join(materialization_authority_lock_name(&second_key)).is_file());
+    }
+
+    #[test]
+    fn unrelated_authorities_under_same_parent_do_not_serialize_in_process() {
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let first = OsStr::new(".tonepoet-root-authority-first-concurrent");
+        let second = OsStr::new(".tonepoet-root-authority-second-concurrent");
+        let first_guard = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            first,
+            "first unrelated authority",
+        )
+        .unwrap();
+        let second_guard = try_acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            second,
+            "second unrelated authority",
+        )
+        .expect("unrelated authorities in one parent must not share a process or kernel lock");
+        drop(second_guard);
+        drop(first_guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_lock_object_rejects_symlink_and_directory_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-lock-object-validation");
+        let key = materialization_authority_lock_key(dir.as_raw_fd(), authority).unwrap();
+        let lock_name = materialization_authority_lock_name(&key);
+
+        symlink("target", temp.path().join(&lock_name)).unwrap();
+        assert!(open_authority_lock_file(dir.as_raw_fd(), &key).is_err());
+        std::fs::remove_file(temp.path().join(&lock_name)).unwrap();
+
+        std::fs::create_dir(temp.path().join(&lock_name)).unwrap();
+        assert!(open_authority_lock_file(dir.as_raw_fd(), &key).is_err());
+        std::fs::remove_dir(temp.path().join(&lock_name)).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(temp.path().join(&lock_name), b"payload").unwrap();
+        std::fs::set_permissions(
+            temp.path().join(&lock_name),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(open_authority_lock_file(dir.as_raw_fd(), &key).is_err());
+        std::fs::remove_file(temp.path().join(&lock_name)).unwrap();
+
+        std::fs::write(temp.path().join(&lock_name), b"").unwrap();
+        std::fs::set_permissions(
+            temp.path().join(&lock_name),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(open_authority_lock_file(dir.as_raw_fd(), &key).is_err());
+        std::fs::remove_file(temp.path().join(&lock_name)).unwrap();
+
+        let hardlink_source = temp.path().join("hardlink-source");
+        std::fs::write(&hardlink_source, b"").unwrap();
+        std::fs::set_permissions(
+            &hardlink_source,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::hard_link(&hardlink_source, temp.path().join(&lock_name)).unwrap();
+        assert!(open_authority_lock_file(dir.as_raw_fd(), &key).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_lock_object_accepts_private_owner_modes_and_rejects_zero_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-lock-private-mode");
+        let key = materialization_authority_lock_key(dir.as_raw_fd(), authority).unwrap();
+        let lock_name = materialization_authority_lock_name(&key);
+        let lock_path = temp.path().join(&lock_name);
+
+        for mode in [0o400, 0o200] {
+            std::fs::write(&lock_path, b"").unwrap();
+            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let (fd, observed_name) = open_authority_lock_file(dir.as_raw_fd(), &key).unwrap();
+            assert_eq!(observed_name, lock_name);
+            assert_eq!(authority_lock_stat(fd.as_raw_fd()).unwrap().st_mode & 0o777, mode);
+            drop(fd);
+            std::fs::remove_file(&lock_path).unwrap();
+        }
+
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            open_authority_lock_file(dir.as_raw_fd(), &key).is_err(),
+            "an unusable zero-mode lock object must fail closed"
+        );
+    }
+
+    #[test]
+    fn same_materialization_authority_holds_one_process_lock() {
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let name = OsStr::new(".tonepoet-root-authority-same");
+        let key = materialization_authority_lock_key(dir.as_raw_fd(), name).unwrap();
+        let state = materialization_authority_lock_state(&key).unwrap();
+        assert!(!*state.locked.lock().unwrap());
+        let guard = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            name,
+            "same-authority serialization regression",
+        )
+        .unwrap();
+        assert!(*state.locked.lock().unwrap());
+        drop(guard);
+        assert!(!*state.locked.lock().unwrap());
+        drop(state);
+        prune_materialization_authority_lock_registry(&key, None);
+    }
+
+
+    #[test]
+    fn same_authority_serializes_threads_without_timing_assumptions() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().to_path_buf();
+        let dir = open_absolute_directory(&parent).unwrap();
+        let authority = OsString::from(".tonepoet-root-authority-thread-serialization");
+        let holder = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            &authority,
+            "same-process thread holder",
+        )
+        .unwrap();
+
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let thread_parent = parent.clone();
+        let thread_authority = authority.clone();
+        let waiter = std::thread::spawn(move || {
+            let thread_dir = open_absolute_directory(&thread_parent).unwrap();
+            match try_acquire_authority_exclusive_lock(
+                thread_dir.as_raw_fd(),
+                &thread_authority,
+                "same-process nonblocking probe",
+            ) {
+                Err(CapFsError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("same-authority thread entered while the holder was active"),
+                Err(error) => panic!("unexpected same-authority probe result: {error}"),
+            }
+            blocked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let _guard = acquire_authority_exclusive_lock(
+                thread_dir.as_raw_fd(),
+                &thread_authority,
+                "same-process waiter after release",
+            )
+            .unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        blocked_rx.recv().unwrap();
+        assert!(acquired_rx.try_recv().is_err());
+        drop(holder);
+        release_tx.send(()).unwrap();
+        acquired_rx.recv().unwrap();
+        waiter.join().unwrap();
+    }
+
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cross_process_authority_locks_are_per_authority_and_guard_release_isolated() {
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let authority_a = OsStr::new(".tonepoet-root-authority-cross-process-a");
+        let authority_b = OsStr::new(".tonepoet-root-authority-cross-process-b");
+
+        let guard_a = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority_a,
+            "authority A guard-release isolation",
+        )
+        .unwrap();
+        let guard_b = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority_b,
+            "authority B guard-release isolation",
+        )
+        .unwrap();
+
+        assert!(run_lock_child_try(temp.path(), authority_a).contains("LOCK_CHILD_BLOCKED"));
+        assert!(run_lock_child_try(temp.path(), authority_b).contains("LOCK_CHILD_BLOCKED"));
+
+        drop(guard_a);
+        assert!(
+            run_lock_child_try(temp.path(), authority_a).contains("LOCK_CHILD_ACQUIRED"),
+            "a different authority under the same parent must become independently available"
+        );
+        assert!(
+            run_lock_child_try(temp.path(), authority_b).contains("LOCK_CHILD_BLOCKED"),
+            "dropping authority A must not release authority B's kernel lock"
+        );
+
+        drop(guard_b);
+        assert!(run_lock_child_try(temp.path(), authority_b).contains("LOCK_CHILD_ACQUIRED"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn different_authorities_can_be_held_by_different_processes_concurrently() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::process::Stdio;
+
+        let temp = TempDir::new().unwrap();
+        let authority_a = OsStr::new(".tonepoet-root-authority-process-a");
+        let authority_b = OsStr::new(".tonepoet-root-authority-process-b");
+        let mut holder = lock_child_command(temp.path(), authority_a, "hold")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn independent-authority holder");
+        let stdout = holder.stdout.take().expect("holder stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "authority-A holder exited before acquire handshake"
+            );
+            if line.contains("LOCK_CHILD_ACQUIRED") {
+                break;
+            }
+        }
+
+        assert!(
+            run_lock_child_try(temp.path(), authority_a).contains("LOCK_CHILD_BLOCKED"),
+            "same-authority external opener must remain excluded"
+        );
+        assert!(
+            run_lock_child_try(temp.path(), authority_b).contains("LOCK_CHILD_ACQUIRED"),
+            "different authorities under one retained parent must not share a cross-process lock"
+        );
+
+        holder
+            .stdin
+            .take()
+            .expect("holder stdin")
+            .write_all(b"release\n")
+            .expect("release authority-A holder");
+        let status = holder.wait().expect("wait for independent-authority holder");
+        assert!(status.success(), "independent-authority holder failed: {status:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_authority_blocks_across_processes_then_acquires_after_release() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-cross-process-blocking");
+        let holder = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority,
+            "parent blocking holder",
+        )
+        .unwrap();
+
+        let mut child = lock_child_command(temp.path(), authority, "block")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn blocking lock child");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0, "child exited before block handshake");
+            if line.contains("LOCK_CHILD_BLOCKED") {
+                break;
+            }
+        }
+        assert!(child.try_wait().unwrap().is_none(), "child must remain blocked while holder is live");
+
+        drop(holder);
+        loop {
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0, "child exited before acquire handshake");
+            if line.contains("LOCK_CHILD_ACQUIRED") {
+                break;
+            }
+        }
+        let output = child.wait_with_output().expect("wait for lock child");
+        assert!(
+            output.status.success(),
+            "blocking lock child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_releases_authority_lock_when_holder_process_aborts() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+
+        let temp = TempDir::new().unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-crash-release");
+        let mut child = lock_child_command(temp.path(), authority, "acquire_abort")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn crashing lock child");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0, "child exited before acquire handshake");
+            if line.contains("LOCK_CHILD_ACQUIRED") {
+                break;
+            }
+        }
+        let status = child.wait().expect("wait for aborted child");
+        assert!(!status.success(), "abort helper must terminate abnormally");
+
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let _recovered = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority,
+            "retry after holder death",
+        )
+        .expect("kernel lock must be released when holder process dies");
+    }
+
+    #[test]
+    fn authority_lock_inode_is_stable_across_ordinary_guard_release() {
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-stable-lock-inode");
+        let first = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority,
+            "stable lock inode first guard",
+        )
+        .unwrap();
+        let first_identity = fstat_fd(first.fd.as_raw_fd()).unwrap();
+        let lock_path = temp.path().join(&first.lock_name);
+        assert!(lock_path.is_file());
+        drop(first);
+        assert!(lock_path.is_file(), "ordinary release must not unlink the lock object");
+
+        let second = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority,
+            "stable lock inode second guard",
+        )
+        .unwrap();
+        let second_identity = fstat_fd(second.fd.as_raw_fd()).unwrap();
+        assert_eq!(
+            (first_identity.device, first_identity.inode),
+            (second_identity.device, second_identity.inode),
+            "ordinary acquire/drop cycles must converge on one stable lock inode"
+        );
+    }
+
+    #[test]
+    fn authority_lock_preflock_validation_accepts_unlinked_stale_inode_for_retry() {
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-preflock-stale-inode");
+        let key = materialization_authority_lock_key(dir.as_raw_fd(), authority).unwrap();
+        let (fd, lock_name) = open_authority_lock_file(dir.as_raw_fd(), &key).unwrap();
+        let old_identity = fstat_fd(fd.as_raw_fd()).unwrap();
+        unlinkat_component(dir.as_raw_fd(), &lock_name, false).unwrap();
+
+        // This is the terminal-retirement race V12 missed: an opener can hold a
+        // descriptor for the old lock inode before that inode is unlinked, then
+        // reach pre-flock validation after the unlink. It must not fail as
+        // foreign state; after flock, normal revalidation will reject the stale
+        // inode and retry against the current descriptor-relative pathname.
+        validate_authority_lock_object(fd.as_raw_fd()).unwrap();
+        assert!(authority_lock_stat(fd.as_raw_fd()).unwrap().st_nlink == 0);
+        assert!(
+            !authority_lock_fd_is_current(dir.as_raw_fd(), &lock_name, fd.as_raw_fd()).unwrap(),
+            "unlinked lock inode must be treated as stale, not authoritative"
+        );
+
+        drop(fd);
+        let rebound = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority,
+            "pre-flock stale-inode retry rebound",
+        )
+        .unwrap();
+        let rebound_identity = fstat_fd(rebound.fd.as_raw_fd()).unwrap();
+        assert_ne!(
+            (old_identity.device, old_identity.inode),
+            (rebound_identity.device, rebound_identity.inode),
+            "retry must rebind to a fresh authoritative lock inode"
+        );
+    }
+
+    #[test]
+    fn authority_lock_remains_descriptor_rooted_after_parent_path_replacement() {
+        let temp = TempDir::new().unwrap();
+        let original = temp.path().join("out");
+        let retained = temp.path().join("retained-out");
+        std::fs::create_dir(&original).unwrap();
+        let dir = open_absolute_directory(&original).unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-retained-parent");
+        let key = materialization_authority_lock_key(dir.as_raw_fd(), authority).unwrap();
+        let lock_name = materialization_authority_lock_name(&key);
+
+        std::fs::rename(&original, &retained).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let _guard = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority,
+            "retained parent replacement regression",
+        )
+        .unwrap();
+        assert!(retained.join(&lock_name).is_file());
+        assert!(
+            !original.join(&lock_name).exists(),
+            "replacement lexical parent must not receive descriptor-rooted lock metadata"
+        );
+    }
+
+    #[test]
+    fn authority_lock_registry_does_not_reclaim_a_live_state() {
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-live-registry-state");
+        let key = materialization_authority_lock_key(dir.as_raw_fd(), authority).unwrap();
+        let state = materialization_authority_lock_state(&key).unwrap();
+        let live_waiter_reference = state.clone();
+        prune_materialization_authority_lock_registry(&key, Some(&state));
+        let same = materialization_authority_lock_state(&key).unwrap();
+        assert!(
+            Arc::ptr_eq(&state, &same),
+            "registry pruning must not create split process-local mutexes while a guard or waiter holds the state"
+        );
+        drop(same);
+        drop(live_waiter_reference);
+        drop(state);
+        prune_materialization_authority_lock_registry(&key, None);
+    }
+
+    #[test]
+    fn terminal_lock_retirement_waits_for_active_authority_transaction() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().to_path_buf();
+        let dir = open_absolute_directory(&parent).unwrap();
+        let scope = ScopeId::new("album").unwrap();
+        let base = RelativePath::new("Album").unwrap();
+        let authority = materialization_authority_name(&scope, &base);
+        let token = "0123456789abcdef0123456789abcdef";
+        let holder = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            &authority,
+            "active attestation transaction",
+        )
+        .unwrap();
+        let lock_path = parent.join(&holder.lock_name);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let parent_for_thread = parent.clone();
+        let authority_for_thread = authority.clone();
+        let scope_for_thread = scope.clone();
+        let base_for_thread = base.clone();
+        let thread = std::thread::spawn(move || {
+            let fd = open_absolute_directory(&parent_for_thread).unwrap();
+            started_tx.send(()).unwrap();
+            let filesystem = CapabilityFilesystem::new();
+            let result = filesystem.retire_materialization_authority_files_after_terminal_marker(
+                fd.as_raw_fd(),
+                &authority_for_thread,
+                &scope_for_thread,
+                &base_for_thread,
+                token,
+                &parent_for_thread.join("Album"),
+            );
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.try_recv().is_err());
+        assert!(lock_path.exists(), "retirement cannot unlink an actively locked inode");
+        drop(holder);
+        done_rx.recv().unwrap().unwrap();
+        thread.join().unwrap();
+        assert!(!lock_path.exists(), "quiescent terminal retirement removes the lock pathname");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_lock_retirement_rebinds_waiter_open_on_old_inode() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+
+        let temp = TempDir::new().unwrap();
+        let dir = open_absolute_directory(temp.path()).unwrap();
+        let authority = OsStr::new(".tonepoet-root-authority-retired-waiter-rebind");
+        let holder = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority,
+            "terminal waiter-rebind holder",
+        )
+        .unwrap();
+        let old_identity = fstat_fd(holder.fd.as_raw_fd()).unwrap();
+        let lock_path = temp.path().join(&holder.lock_name);
+
+        let mut child = lock_child_command(temp.path(), authority, "wait_on_open_inode")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn waiter on old authority lock inode");
+        let stdout = child.stdout.take().expect("waiter stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "waiter exited before opening the old lock inode"
+            );
+            if line.contains("LOCK_CHILD_OPENED_BLOCKED") {
+                break;
+            }
+        }
+
+        holder.retire_path_last(dir.as_raw_fd()).unwrap();
+        // The terminal unlink is also what releases the blocked waiter, which
+        // rebinds by recreating this pathname — racing a plain !exists()
+        // check. Race-free form: the OLD inode must be gone from the
+        // namespace; any surviving pathname must be the waiter's rebound one.
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(current) = std::fs::symlink_metadata(&lock_path) {
+                assert_ne!(
+                    (current.dev(), current.ino()),
+                    (old_identity.device, old_identity.inode),
+                    "terminal unlink is the old transaction's final mutation"
+                );
+            }
+        }
+
+        let mut saw_stale = false;
+        let mut saw_rebound = false;
+        while !saw_rebound {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "waiter exited before rebinding to the current lock inode"
+            );
+            saw_stale |= line.contains("LOCK_CHILD_STALE_INODE");
+            saw_rebound |= line.contains("LOCK_CHILD_REBOUND_ACQUIRED");
+        }
+        assert!(saw_stale, "waiter must reject the unlinked old lock inode");
+        let output = child.wait_with_output().expect("wait for rebound child");
+        assert!(
+            output.status.success(),
+            "waiter-rebind child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let current = std::fs::metadata(&lock_path).expect("rebound lock pathname");
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            (current.dev(), current.ino()),
+            (old_identity.device, old_identity.inode),
+            "rebound acquisition must use the new authoritative lock inode"
+        );
+        let cleanup = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            authority,
+            "cleanup rebound lock inode",
+        )
+        .unwrap();
+        cleanup.retire_path_last(dir.as_raw_fd()).unwrap();
+        assert!(!lock_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn competing_participant_cannot_remove_a_live_ready_authority_temporary() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        std::fs::create_dir(&parent).unwrap();
+        let dir = open_absolute_directory(&parent).unwrap();
+        let scope = ScopeId::new("album").unwrap();
+        let base = RelativePath::new("Album").unwrap();
+        let authority = materialization_authority_name(&scope, &base);
+        let token = "0123456789abcdef0123456789abcdef";
+        let bytes = serialize_materialization_authority(&scope, &base, token, None).unwrap();
+
+        let holder = acquire_authority_exclusive_lock(
+            dir.as_raw_fd(),
+            &authority,
+            "live ready-authority temporary owner",
+        )
+        .unwrap();
+        let ready = write_ready_regular_file(
+            dir.as_raw_fd(),
+            &authority,
+            &bytes,
+            0o600,
+            MATERIALIZATION_AUTHORITY_WRITING_PREFIX,
+            MATERIALIZATION_AUTHORITY_READY_PREFIX,
+            "live ready-authority temporary",
+        )
+        .unwrap();
+        let ready_path = parent.join(Path::new(&ready));
+        assert!(ready_path.is_file());
+        assert!(
+            run_lock_child_try(&parent, &authority).contains("LOCK_CHILD_BLOCKED"),
+            "a competing process must not enter reconciliation while the ready temporary is live"
+        );
+        assert!(
+            ready_path.is_file(),
+            "a blocked participant cannot delete another participant's live ready temporary"
+        );
+
+        drop(holder);
+        let adopted = create_or_adopt_materialization_authority(
+            dir.as_raw_fd(),
+            &authority,
+            &scope,
+            &base,
+        )
+        .unwrap();
+        assert_eq!(adopted, token);
+        assert!(!ready_path.exists());
+        assert_eq!(
+            read_materialization_authority(dir.as_raw_fd(), &authority)
+                .unwrap()
+                .unwrap()
+                .token(),
+            token
+        );
+    }
+
+    #[test]
+    fn concurrent_equivalent_bootstrap_creation_converges() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        std::fs::create_dir(&parent).unwrap();
+        let scope = ScopeId::new("album").unwrap();
+        let base = RelativePath::new("Album").unwrap();
+        let name = materialization_authority_name(&scope, &base);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let parent = parent.clone();
+                let scope = scope.clone();
+                let base = base.clone();
+                let name = name.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let fd = open_absolute_directory(&parent).unwrap();
+                    barrier.wait();
+                    create_or_adopt_materialization_authority(
+                        fd.as_raw_fd(),
+                        &name,
+                        &scope,
+                        &base,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let tokens = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tokens[0], tokens[1]);
+        let fd = open_absolute_directory(&parent).unwrap();
+        let authority = read_materialization_authority(fd.as_raw_fd(), &name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.token(), tokens[0]);
+        assert_eq!(authority.materialized_identity(), None);
+    }
+
+    #[test]
+    fn concurrent_equivalent_identity_attestation_converges() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        std::fs::create_dir(&parent).unwrap();
+        let fd = open_absolute_directory(&parent).unwrap();
+        let scope = ScopeId::new("album").unwrap();
+        let base = RelativePath::new("Album").unwrap();
+        let name = materialization_authority_name(&scope, &base);
+        let token = create_or_adopt_materialization_authority(
+            fd.as_raw_fd(),
+            &name,
+            &scope,
+            &base,
+        )
+        .unwrap();
+        drop(fd);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let parent = parent.clone();
+                let scope = scope.clone();
+                let base = base.clone();
+                let name = name.clone();
+                let token = token.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let fd = open_absolute_directory(&parent).unwrap();
+                    barrier.wait();
+                    attest_materialization_authority(
+                        fd.as_raw_fd(),
+                        &name,
+                        &scope,
+                        &base,
+                        &token,
+                        19,
+                        1690,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let fd = open_absolute_directory(&parent).unwrap();
+        let identity = read_materialization_identity_attestation(fd.as_raw_fd(), &name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.materialized_identity(), Some((19, 1690)));
+    }
+
+    #[test]
+    fn concurrent_conflicting_identity_attestation_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("out");
+        std::fs::create_dir(&parent).unwrap();
+        let fd = open_absolute_directory(&parent).unwrap();
+        let scope = ScopeId::new("album").unwrap();
+        let base = RelativePath::new("Album").unwrap();
+        let name = materialization_authority_name(&scope, &base);
+        let token = create_or_adopt_materialization_authority(
+            fd.as_raw_fd(),
+            &name,
+            &scope,
+            &base,
+        )
+        .unwrap();
+        drop(fd);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let identities = [(19, 1690), (19, 1691)];
+        let handles = identities
+            .iter()
+            .copied()
+            .map(|(device, inode)| {
+                let parent = parent.clone();
+                let scope = scope.clone();
+                let base = base.clone();
+                let name = name.clone();
+                let token = token.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let fd = open_absolute_directory(&parent).unwrap();
+                    barrier.wait();
+                    attest_materialization_authority(
+                        fd.as_raw_fd(),
+                        &name,
+                        &scope,
+                        &base,
+                        &token,
+                        device,
+                        inode,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(CapFsError::ScopeConflict(_))))
+                .count(),
+            1
+        );
+        let fd = open_absolute_directory(&parent).unwrap();
+        let identity = read_materialization_identity_attestation(fd.as_raw_fd(), &name)
+            .unwrap()
+            .unwrap()
+            .materialized_identity()
+            .unwrap();
+        assert!(identities.contains(&identity));
     }
 
     #[test]

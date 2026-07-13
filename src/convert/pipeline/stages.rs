@@ -43,10 +43,12 @@ use super::actions::{
     workspace_has_unresolved_action_state, ActionCancellation,
     ActionContext, ActionElection,
     ActionElectionIdentity, ActionEngine, ActionError, ActionPhase, ActionPipeline,
-    ActionPhaseReport, ActionResult, ActionResultStatus, ActionSemantics,
+    ActionPhaseReport, ActionResult, ActionResultStatus, ActionScriptRunner, ActionSemantics,
     CapabilityActionFilesystem, ExplicitActionRunLock, OwnerLiveness, ProcessOwnerIdentity,
     ProcessGroupScriptRunner,
 };
+#[cfg(all(test, target_os = "linux"))]
+use super::actions::{ScriptInvocation, ScriptOutcome};
 use super::materializer_archive::ArchiveMaterializer;
 use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
@@ -110,6 +112,55 @@ const CONVERSION_LOG_BATCH_DRAIN_ACK_SUFFIX: &str = ".json";
 const CONVERSION_LOG_BATCH_DRAIN_SCHEMA_VERSION: u8 = 1;
 const CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_FILE: &str = "post-actions-terminal.json";
 const CONVERSION_LOG_BATCH_POST_ACTION_TERMINAL_SCHEMA_VERSION: u8 = 1;
+const CONVERSION_LOG_BATCH_MATERIALIZATION_AUTHORITY_RETIREMENT_FILE: &str =
+    "materialization-authorities-retired.json";
+const CONVERSION_LOG_BATCH_MATERIALIZATION_AUTHORITY_RETIREMENT_SCHEMA_VERSION: u8 = 1;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalCleanupInterruptionPoint {
+    AfterCleaningStateCommitted,
+    AfterRetirementRecordRemoved,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TERMINAL_CLEANUP_INTERRUPTION: std::cell::Cell<Option<TerminalCleanupInterruptionPoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct TerminalCleanupInterruptionGuard;
+
+#[cfg(test)]
+impl TerminalCleanupInterruptionGuard {
+    fn install(point: TerminalCleanupInterruptionPoint) -> Self {
+        TEST_TERMINAL_CLEANUP_INTERRUPTION.with(|slot| {
+            assert!(slot.get().is_none(), "terminal cleanup interruption already installed");
+            slot.set(Some(point));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TerminalCleanupInterruptionGuard {
+    fn drop(&mut self) {
+        TEST_TERMINAL_CLEANUP_INTERRUPTION.with(|slot| slot.set(None));
+    }
+}
+
+#[cfg(test)]
+fn test_interrupt_terminal_cleanup(point: TerminalCleanupInterruptionPoint) -> bool {
+    TEST_TERMINAL_CLEANUP_INTERRUPTION.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
 const CONVERSION_ACTION_IDENTITY_FILE: &str = ".tonepoet-action-identity.json";
 const CONVERSION_ACTION_IDENTITY_TEMP_FILE: &str = ".tonepoet-action-identity.write.tmp";
 #[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
@@ -9235,6 +9286,13 @@ struct ConversionLogBatchPostActionTerminal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ConversionLogBatchMaterializationAuthorityRetirement {
+    schema_version: u8,
+    batch_id: String,
+    pipeline_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct ConversionLogBatchDrainAck {
     schema_version: u8,
     batch_id: String,
@@ -9392,6 +9450,158 @@ fn mark_conversion_log_batch_post_actions_terminal_at(
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("could not serialize post-action terminal authority: {error}"),
+        )
+    })?;
+    write_bytes_atomically(&path, &bytes)?;
+    sync_parent_dir(&path)
+}
+
+
+fn conversion_log_batch_materialization_authority_retirement_path(coord_dir: &Path) -> PathBuf {
+    coord_dir.join(CONVERSION_LOG_BATCH_MATERIALIZATION_AUTHORITY_RETIREMENT_FILE)
+}
+
+fn validate_conversion_log_batch_materialization_authority_retirement(
+    retired: &ConversionLogBatchMaterializationAuthorityRetirement,
+    manifest: &ConversionLogBatchDrainManifest,
+) -> io::Result<()> {
+    if retired.schema_version
+        != CONVERSION_LOG_BATCH_MATERIALIZATION_AUTHORITY_RETIREMENT_SCHEMA_VERSION
+        || retired.batch_id != manifest.batch_id
+        || retired.pipeline_sha256 != manifest.pipeline_sha256
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid conversion-log batch materialization-authority retirement record",
+        ));
+    }
+    Ok(())
+}
+
+fn read_conversion_log_batch_materialization_authority_retirement(
+    coord_dir: &Path,
+    manifest: &ConversionLogBatchDrainManifest,
+) -> io::Result<Option<ConversionLogBatchMaterializationAuthorityRetirement>> {
+    let path = conversion_log_batch_materialization_authority_retirement_path(coord_dir);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(_) => {
+            let bytes = read_regular_file_no_follow(&path)?;
+            let retired: ConversionLogBatchMaterializationAuthorityRetirement =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "could not parse materialization-authority retirement record {}: {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            validate_conversion_log_batch_materialization_authority_retirement(&retired, manifest)?;
+            Ok(Some(retired))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn conversion_log_batch_materialization_authorities_retired_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> io::Result<bool> {
+    if req.album_batch.is_none() || !conversion_actions_effective_for_request(req)? {
+        return Ok(false);
+    }
+    let marker_path = conversion_log_batch_materialization_authority_retirement_path(coord_dir);
+    match fs::symlink_metadata(&marker_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if read_conversion_log_batch_workspace_state(coord_dir)?
+                .as_ref()
+                .is_some_and(|state| state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING)
+            {
+                // The durable cleaning state is written only after the terminal
+                // drain/lifecycle gate has passed and authority retirement has
+                // returned successfully. Cleanup may remove the retirement
+                // record as a recognized penultimate artifact before deleting
+                // the final workspace state; a crash in that narrow window must
+                // resume cleanup rather than revalidating intentionally retired
+                // authority files.
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        Ok(_) => {}
+        Err(error) => return Err(error),
+    }
+    let authority = conversion_log_batch_drain_request_authority(req)?;
+    let manifest = read_conversion_log_batch_drain_manifest(coord_dir, &authority.manifest.batch_id)?;
+    if manifest != authority.manifest {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "batch participant drain manifest changed before retirement lookup",
+        ));
+    }
+    read_conversion_log_batch_materialization_authority_retirement(coord_dir, &manifest)
+        .map(|value| value.is_some())
+}
+
+fn mark_conversion_log_batch_materialization_authorities_retired_at(
+    req: &PipelineRequest,
+    coord_dir: &Path,
+) -> io::Result<()> {
+    if req.album_batch.is_none() || !conversion_actions_effective_for_request(req)? {
+        return Ok(());
+    }
+    ensure_conversion_log_batch_workspace_owned_for_request_at(req, coord_dir)?;
+    let authority = conversion_log_batch_drain_request_authority(req)?;
+    let _ownership_lock = acquire_conversion_log_batch_workspace_ownership_lock(
+        coord_dir,
+        &authority.manifest.batch_id,
+    )?;
+    let state = read_conversion_log_batch_workspace_state(coord_dir)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "batch workspace state disappeared")
+    })?;
+    if state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+        || !state
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner_is_current_process(owner).unwrap_or(false))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "materialization-authority retirement record refused without current ownership",
+        ));
+    }
+    let manifest = read_conversion_log_batch_drain_manifest(coord_dir, &authority.manifest.batch_id)?;
+    if manifest != authority.manifest {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "batch participant drain manifest changed before retirement record",
+        ));
+    }
+    let retired = ConversionLogBatchMaterializationAuthorityRetirement {
+        schema_version: CONVERSION_LOG_BATCH_MATERIALIZATION_AUTHORITY_RETIREMENT_SCHEMA_VERSION,
+        batch_id: manifest.batch_id.clone(),
+        pipeline_sha256: manifest.pipeline_sha256.clone(),
+    };
+    let path = conversion_log_batch_materialization_authority_retirement_path(coord_dir);
+    match read_conversion_log_batch_materialization_authority_retirement(coord_dir, &manifest) {
+        Ok(Some(existing)) if existing == retired => return Ok(()),
+        Ok(Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "conflicting materialization-authority retirement record: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+    let bytes = serde_json::to_vec_pretty(&retired).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not serialize materialization-authority retirement record: {error}"),
         )
     })?;
     write_bytes_atomically(&path, &bytes)?;
@@ -11384,6 +11594,42 @@ fn cleanup_conversion_log_batch_coordination_dir_after_success_best_effort(
             }
         }
     };
+
+    #[cfg(test)]
+    if test_interrupt_terminal_cleanup(
+        TerminalCleanupInterruptionPoint::AfterCleaningStateCommitted,
+    ) {
+        return;
+    }
+
+    // The terminal authority-retirement record is validated against the drain
+    // manifest before `cleaning` is committed. Remove it now, while that
+    // manifest is still present. From this durable boundary onward the cleaning
+    // state itself proves that authority records, authority-scoped temporaries,
+    // and the stable authority lock pathname were retired successfully. This
+    // ordering keeps every crash state resumable: before this unlink, retry can
+    // validate the record through the manifest; after it, retry can rely on the
+    // cleaning state without needing drain metadata that may be removed next.
+    let authority_retirement_record =
+        conversion_log_batch_materialization_authority_retirement_path(coord_dir);
+    match fs::remove_file(&authority_retirement_record) {
+        Ok(()) => sync_parent_dir_best_effort(&authority_retirement_record),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            log::warn!(
+                "conversion-log batch coordination cleanup could not remove materialization-authority retirement record for {context}: {}: {error}",
+                authority_retirement_record.display()
+            );
+            return;
+        }
+    }
+
+    #[cfg(test)]
+    if test_interrupt_terminal_cleanup(
+        TerminalCleanupInterruptionPoint::AfterRetirementRecordRemoved,
+    ) {
+        return;
+    }
 
     // `cleaning` is durable proof that the complete participant set had
     // drained. A resumed cleanup may therefore remove acknowledgments that
@@ -17447,6 +17693,10 @@ fn rebase_action_path(
 struct PipelineOutputCapability {
     logical_root: PathBuf,
     capability: PinnedDirectoryCapability,
+    /// Exact published album descriptor when this binding comes from the
+    /// publication authority. Initial PRE execution before conversion leaves
+    /// this unset because the album root does not exist yet.
+    album: Option<PinnedDirectoryCapability>,
 }
 
 impl PipelineOutputCapability {
@@ -17466,6 +17716,7 @@ impl PipelineOutputCapability {
         Ok(Some(Self {
             logical_root,
             capability,
+            album: None,
         }))
     }
 
@@ -17474,6 +17725,11 @@ impl PipelineOutputCapability {
         Ok(Self {
             logical_root: self.logical_root.clone(),
             capability: self.capability.try_clone()?,
+            album: self
+                .album
+                .as_ref()
+                .map(PinnedDirectoryCapability::try_clone)
+                .transpose()?,
         })
     }
 
@@ -17501,7 +17757,18 @@ fn pre_action_context_with_output_capability(
 ) -> Result<ActionContext, ActionError> {
     let source_path = absolute_normalized_action_path(&req.container);
     let source_is_directory = source_path.is_dir();
-    let subject_dir = if source_is_directory {
+    // Album batches anchor the pre-action subject (and subject/source
+    // capability scopes) at the batch source grouping root, NOT the track's
+    // own directory: participants of a multi-disc batch live in sibling disc
+    // subdirectories, and per-track anchors would give every participant a
+    // different scope identity for the SAME album-scoped journal.
+    let batch_source_scope_root = req
+        .album_batch
+        .as_ref()
+        .map(|batch| absolute_normalized_action_path(&batch.source_grouping_root));
+    let subject_dir = if let Some(root) = batch_source_scope_root.clone() {
+        root
+    } else if source_is_directory {
         source_path.clone()
     } else {
         source_path.parent().map(Path::to_path_buf).ok_or_else(|| {
@@ -17533,10 +17800,27 @@ fn pre_action_context_with_output_capability(
     };
     let journal_dir = coordination_dir.join(".tonepoet-action-journals");
 
+    let mut retained_album_capability = None;
     let mut retained_output_capability = None;
     let mut retained_journal_capability = None;
     let mut coordination_io_dir = None;
     if let Some(binding) = retained_output {
+        let album_relative = album_dir.strip_prefix(&binding.logical_root).map_err(|_| {
+            ActionError::UnsafePath(format!(
+                "pre-action album root {} is outside retained output root {}",
+                album_dir.display(),
+                binding.logical_root.display()
+            ))
+        })?;
+        if let Some(album) = binding.album.as_ref() {
+            retained_album_capability = Some(Arc::new(album.try_clone()?));
+        } else {
+            match binding.capability.open_directory_descendant(album_relative, false, 0o755) {
+                Ok(album_capability) => retained_album_capability = Some(Arc::new(album_capability)),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let coordination_relative = coordination_dir.strip_prefix(&binding.logical_root).map_err(|_| {
             ActionError::UnsafePath(format!(
                 "pre-action coordination root {} is outside retained output root {}",
@@ -17572,7 +17856,7 @@ fn pre_action_context_with_output_capability(
         output_root,
         album_dir,
         environment_album_dir: None,
-        retained_album_capability: None,
+        retained_album_capability,
         retained_output_capability,
         retained_journal_capability,
         coordination_io_dir,
@@ -17581,6 +17865,7 @@ fn pre_action_context_with_output_capability(
         album_tokens: conversion_action_request_tokens(req)?,
         disc_count: request_batch_resolved_identity(req).and_then(|identity| identity.total_discs),
         journal_dir,
+        batch_source_scope_root,
         explicit_scope: false,
         semantics: action_semantics(),
     })
@@ -17722,6 +18007,10 @@ fn post_action_context_with_capabilities(
                 request_batch_resolved_identity(req).and_then(|identity| identity.total_discs)
             }),
         journal_dir,
+        batch_source_scope_root: req
+            .album_batch
+            .as_ref()
+            .map(|batch| absolute_normalized_action_path(&batch.source_grouping_root)),
         explicit_scope: false,
         semantics: action_semantics(),
     })
@@ -18057,19 +18346,19 @@ fn action_phase_error_summary(
     format!("{phase} action phase completed with errors: {}", details.join("; "))
 }
 
-fn execute_prepared_action_election(
+fn execute_prepared_action_election_with_runner(
     req: &PipelineRequest,
     context: &ActionContext,
     cancel: &CancellationToken,
     prepared: PreparedActionElection,
+    scripts: &dyn ActionScriptRunner,
 ) -> Result<PipelineActionExecution, ActionError> {
     let pipeline = &req.actions;
     let cancellation = PipelineActionCancellation(cancel);
     let filesystem = CapabilityActionFilesystem::new();
-    let scripts = ProcessGroupScriptRunner;
     let engine = ActionEngine {
         filesystem: &filesystem,
-        scripts: &scripts,
+        scripts,
     };
     let coordination_dir = prepared.coordination_dir;
     let election_identity = prepared.election_identity;
@@ -18170,10 +18459,11 @@ fn execute_prepared_action_election(
     }
 }
 
-fn run_elected_action_phase(
+fn run_elected_action_phase_with_runner(
     req: &PipelineRequest,
     context: &ActionContext,
     cancel: &CancellationToken,
+    scripts: &dyn ActionScriptRunner,
 ) -> Result<PipelineActionExecution, ActionError> {
     if req.actions.for_phase(context.phase).is_empty() {
         return Ok(PipelineActionExecution {
@@ -18186,7 +18476,7 @@ fn run_elected_action_phase(
         });
     }
     let prepared = prepare_action_election(req, context)?;
-    execute_prepared_action_election(req, context, cancel, prepared)
+    execute_prepared_action_election_with_runner(req, context, cancel, prepared, scripts)
 }
 
 fn phase_level_action_failure_report(
@@ -18225,12 +18515,84 @@ fn phase_level_action_failure_report(
     }
 }
 
+fn phase_level_recovery_required_report(
+    pipeline: &super::actions::ActionPipeline,
+    phase: ActionPhase,
+    error: String,
+) -> ActionPhaseReport {
+    let mut report = phase_level_action_failure_report(pipeline, phase, error);
+    report.recovery_required = true;
+    report
+}
+
+fn pre_action_context_for_publication_binding(
+    req: &PipelineRequest,
+    binding: &PublicationCapabilityBinding,
+) -> Result<ActionContext, ActionError> {
+    let retained_output = PipelineOutputCapability {
+        logical_root: binding.logical_output_root.clone(),
+        capability: binding.output_root.try_clone()?,
+        album: Some(binding.album.try_clone()?),
+    };
+    pre_action_context_with_output_capability(req, Some(&retained_output))
+}
+
+fn post_action_context_for_publication_binding(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    published: &PublishedAlbum,
+    binding: &PublicationCapabilityBinding,
+) -> Result<ActionContext, ActionError> {
+    post_action_context_with_capabilities(
+        req,
+        source,
+        None,
+        published,
+        &binding.logical_album_dir,
+        Some(binding.album.try_clone()?),
+        Some(binding.output_root.try_clone()?),
+    )
+}
+
 fn collect_durable_action_reports(
     req: &PipelineRequest,
     source: Option<&PreparedSource>,
     published: Option<&PublishedAlbum>,
 ) -> Vec<ActionPhaseReport> {
     collect_durable_action_reports_with_binding(req, source, published, None)
+}
+
+/// Publish-time album identity attestation. While the publication authority
+/// is bound, publish the album's materialized identity attestation from the
+/// PRE journal's parent-anchored scope record. Publication precedes every
+/// finalize that can observe the album, so this closes the finalize-order
+/// window where a no-binding participant (e.g. a failed item) validates the
+/// pre journal before any with-binding finalizer has attested. The attestation
+/// is no-clobber: concurrent publishers converge or fail closed.
+fn attest_publication_album_scope_best_effort(
+    req: &PipelineRequest,
+    binding: Option<&PublicationCapabilityBinding>,
+) {
+    let Some(binding) = binding else { return };
+    if req.actions.for_phase(ActionPhase::Pre).is_empty() {
+        return;
+    }
+    let result = (|| -> Result<(), ActionError> {
+        let context = pre_action_context_for_publication_binding(req, binding)?;
+        let filesystem = CapabilityActionFilesystem::new();
+        let scripts = ProcessGroupScriptRunner;
+        let engine = ActionEngine {
+            filesystem: &filesystem,
+            scripts: &scripts,
+        };
+        engine.attest_pre_album_scope_for_publication(&req.actions, &context)
+    })();
+    if let Err(error) = result {
+        log::warn!(
+            "publish-time album identity attestation failed for {}: {error}",
+            req.item_id
+        );
+    }
 }
 
 fn collect_durable_action_reports_with_binding(
@@ -18246,33 +18608,99 @@ fn collect_durable_action_reports_with_binding(
     ) {
         return Vec::new();
     }
-    let scripts = ProcessGroupScriptRunner;
     let mut reports = Vec::new();
-    let pre_context = match binding {
-        Some(binding) => binding.output_root.try_clone().ok().and_then(|capability| {
-            let retained_output = PipelineOutputCapability {
-                logical_root: binding.logical_output_root.clone(),
-                capability,
-            };
-            pre_action_context_with_output_capability(req, Some(&retained_output)).ok()
-        }),
-        None => pre_action_context(req).ok(),
+    let retirement_coord_dir = match binding {
+        Some(binding) => match binding.coordination_dir(req) {
+            Ok(coord_dir) => Some(coord_dir),
+            Err(error) => {
+                reports.push(phase_level_recovery_required_report(
+                    &req.actions,
+                    ActionPhase::Pre,
+                    format!(
+                        "durable action coordination context construction failed: {error}"
+                    ),
+                ));
+                None
+            }
+        },
+        None => conversion_log_batch_coordination_album_dir(req),
     };
-    let post_context = source.zip(published).and_then(|(source, published)| {
+    if let Some(coord_dir) = retirement_coord_dir.as_deref() {
+        match conversion_log_batch_materialization_authorities_retired_at(req, coord_dir) {
+            Ok(true) => return Vec::new(),
+            Ok(false) => {}
+            Err(error) => reports.push(phase_level_recovery_required_report(
+                &req.actions,
+                ActionPhase::Pre,
+                format!("terminal materialization-authority retirement record is invalid: {error}"),
+            )),
+        }
+    }
+    let scripts = ProcessGroupScriptRunner;
+    let pre_context = if req.actions.for_phase(ActionPhase::Pre).is_empty() {
+        None
+    } else {
         match binding {
-            Some(binding) => post_action_context_with_capabilities(
+            Some(binding) => match pre_action_context_for_publication_binding(req, binding) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    reports.push(phase_level_recovery_required_report(
+                        &req.actions,
+                        ActionPhase::Pre,
+                        format!("durable pre-action context construction failed: {error}"),
+                    ));
+                    None
+                }
+            },
+            None => match pre_action_context(req) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    reports.push(phase_level_recovery_required_report(
+                        &req.actions,
+                        ActionPhase::Pre,
+                        format!("durable pre-action context construction failed: {error}"),
+                    ));
+                    None
+                }
+            },
+        }
+    };
+    let post_context = if req.actions.for_phase(ActionPhase::Post).is_empty() {
+        None
+    } else {
+        match (source, published) {
+            (Some(source), Some(published)) => match binding {
+            Some(binding) => match post_action_context_for_publication_binding(
                 req,
                 source,
-                None,
                 published,
-                &binding.logical_album_dir,
-                binding.album.try_clone().ok(),
-                binding.output_root.try_clone().ok(),
-            )
-            .ok(),
-            None => post_action_context(req, source, None, published).ok(),
+                binding,
+            ) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    reports.push(phase_level_recovery_required_report(
+                        &req.actions,
+                        ActionPhase::Post,
+                        format!("durable post-action context construction failed: {error}"),
+                    ));
+                    None
+                }
+            },
+            None => match post_action_context(req, source, None, published) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    reports.push(phase_level_recovery_required_report(
+                        &req.actions,
+                        ActionPhase::Post,
+                        format!("durable post-action context construction failed: {error}"),
+                    ));
+                    None
+                }
+            },
+        },
+            _ => None,
         }
-    });
+    };
     let contexts = [pre_context, post_context];
     for context in contexts.into_iter().flatten() {
         // A fresh capability registry per context: pre and post pin the
@@ -18476,11 +18904,12 @@ pub(crate) fn scheduled_album_for_test(
     }
 }
 
-async fn execute_pre_actions_stage(
+async fn execute_pre_actions_stage_with_runner(
     req: &PipelineRequest,
     retained_output: Option<&PipelineOutputCapability>,
     reporter: &dyn PipelineReporter,
     cancel: &CancellationToken,
+    scripts: &dyn ActionScriptRunner,
 ) -> StageRecord {
     emit_stage_started(reporter, &req.item_id, PipelineStage::PreActions).await;
     let outcome = match conversion_action_scope_for_request(req) {
@@ -18492,7 +18921,7 @@ async fn execute_pre_actions_stage(
         Err(error) => StageOutcome::Failed(error),
         Ok(ConversionActionAlbumScope::ProperSubdirectory) => {
             match pre_action_context_with_output_capability(req, retained_output)
-                .and_then(|context| run_elected_action_phase(req, &context, cancel))
+                .and_then(|context| run_elected_action_phase_with_runner(req, &context, cancel, scripts))
             {
                 Ok(execution) if execution.error.is_none() && !execution.report.has_errors() => {
                     StageOutcome::Ok
@@ -18512,6 +18941,16 @@ async fn execute_pre_actions_stage(
     let record = stage_record(PipelineStage::PreActions, outcome);
     emit_stage_finished(reporter, &req.item_id, record.clone()).await;
     record
+}
+
+async fn execute_pre_actions_stage(
+    req: &PipelineRequest,
+    retained_output: Option<&PipelineOutputCapability>,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+) -> StageRecord {
+    let scripts = ProcessGroupScriptRunner;
+    execute_pre_actions_stage_with_runner(req, retained_output, reporter, cancel, &scripts).await
 }
 
 fn post_action_outcome_with_terminal_authority(
@@ -19014,7 +19453,7 @@ fn retire_multi_root_action_identities(
     Ok(post_skip_reason.clone())
 }
 
-async fn execute_post_actions_stage(
+async fn execute_post_actions_stage_with_runner(
     req: &PipelineRequest,
     source: &PreparedSource,
     artifacts: Option<&ArtifactSet>,
@@ -19024,6 +19463,7 @@ async fn execute_post_actions_stage(
     album_is_fully_successful: bool,
     reporter: &dyn PipelineReporter,
     cancel: &CancellationToken,
+    scripts: &dyn ActionScriptRunner,
 ) -> Option<StageRecord> {
     // Pre-only pipelines do not require a post-publication identity. If an
     // earlier generation carried one, retire it under the publication lock;
@@ -19092,6 +19532,22 @@ async fn execute_post_actions_stage(
         );
         emit_stage_finished(reporter, &req.item_id, record.clone()).await;
         return Some(record);
+    }
+
+    // While the album authority is held, publish the PRE journal's album
+    // identity attestation. Every participant passes here before its
+    // finalize, so a no-binding finalize (or one arriving before the
+    // binding owner's) can authenticate the publish-created album root.
+    if let Some(lock) = authority.lock() {
+        match PublicationCapabilityBinding::capture(lock, lock.canonical_album_dir()) {
+            Ok(attest_binding) => {
+                attest_publication_album_scope_best_effort(req, attest_binding.as_ref())
+            }
+            Err(error) => log::warn!(
+                "post-stage album identity attestation binding failed for {}: {error}",
+                req.item_id
+            ),
+        }
     }
 
     let action_coordination = match authority
@@ -19252,7 +19708,13 @@ async fn execute_post_actions_stage(
 
     let (outcome, terminal) = match prepared.and_then(
         |(retained_album, context, election)| {
-            let execution = execute_prepared_action_election(req, &context, cancel, election);
+            let execution = execute_prepared_action_election_with_runner(
+                req,
+                &context,
+                cancel,
+                election,
+                scripts,
+            );
             // Keep the descriptor alive through the complete action phase.
             drop(retained_album);
             execution
@@ -19290,6 +19752,33 @@ async fn execute_post_actions_stage(
     let record = stage_record(PipelineStage::PostActions, outcome);
     emit_stage_finished(reporter, &req.item_id, record.clone()).await;
     Some(record)
+}
+
+async fn execute_post_actions_stage(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    artifacts: Option<&ArtifactSet>,
+    published: &PublishedAlbum,
+    authority: &mut AlbumActionPublishAuthority,
+    gate: PostActionGate,
+    album_is_fully_successful: bool,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+) -> Option<StageRecord> {
+    let scripts = ProcessGroupScriptRunner;
+    execute_post_actions_stage_with_runner(
+        req,
+        source,
+        artifacts,
+        published,
+        authority,
+        gate,
+        album_is_fully_successful,
+        reporter,
+        cancel,
+        &scripts,
+    )
+    .await
 }
 
 /// Run validation, staging setup, source materialization, and output planning.
@@ -20446,6 +20935,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     {
         Ok((album, transition_album, mut identity_lock, binding)) => {
             publication_binding = binding;
+            attest_publication_album_scope_best_effort(&req, publication_binding.as_ref());
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             current_outcome = push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
@@ -21350,6 +21840,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     {
         Ok((album, transition_album, mut identity_lock, binding)) => {
             publication_binding = binding;
+            attest_publication_album_scope_best_effort(&req, publication_binding.as_ref());
             let record = stage_record(PipelineStage::Publish, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
@@ -25479,30 +25970,6 @@ mod companion_copy_hardening_tests {
         use crate::convert::pipeline::actions::RunScriptAction;
         use std::os::unix::fs::PermissionsExt;
 
-        // The supervisor re-execs the production binary; a libtest main
-        // cannot serve that role. Same value in every test => idempotent.
-        let helper = std::env::current_exe()
-            .expect("current test executable")
-            .parent()
-            .and_then(|deps| deps.parent())
-            .map(|debug| debug.join("tonepoet"))
-            .expect("derive production binary path");
-        if !helper.is_file() {
-            eprintln!("skipping: production binary not built at {}", helper.display());
-            return;
-        }
-        std::env::set_var("TONEPOET_SCRIPT_SUPERVISOR_HELPER", &helper);
-        let flock_available = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("command -v flock >/dev/null 2>&1")
-            .stdin(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !flock_available {
-            return;
-        }
-
         let temp = tempfile::tempdir().expect("temp dir");
         let source_path = temp.path().join("source.flac");
         std::fs::write(&source_path, b"audio").expect("source");
@@ -25555,7 +26022,9 @@ mod companion_copy_hardening_tests {
         let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
         let cancellation = CancellationToken::new();
 
-        let record = execute_post_actions_stage(
+        let scripts =
+            super::publish_lock_soundness_tests::SelfContainedLifecycleScriptRunner;
+        let record = execute_post_actions_stage_with_runner(
             &request,
             &source,
             None,
@@ -25565,11 +26034,11 @@ mod companion_copy_hardening_tests {
             true,
             &reporter,
             &cancellation,
+            &scripts,
         )
         .await
         .expect("post action stage");
 
-        let _ = env_logger::builder().is_test(true).try_init();
         assert_eq!(record.outcome, StageOutcome::Ok);
         assert!(
             script_marker.is_file(),
@@ -28412,6 +28881,94 @@ mod companion_copy_hardening_tests {
 }
 
 
+fn terminal_publication_binding_from_current_album(
+    req: &PipelineRequest,
+) -> Result<PublicationCapabilityBinding, ActionError> {
+    let context = pre_action_context(req)?;
+    let output_root = PinnedDirectoryCapability::open_trusted(&context.output_root)?;
+    let album_relative = context.album_dir.strip_prefix(&context.output_root).map_err(|_| {
+        ActionError::UnsafePath(format!(
+            "terminal album root {} is outside retained output root {}",
+            context.album_dir.display(),
+            context.output_root.display()
+        ))
+    })?;
+    let album = output_root.open_directory_descendant(album_relative, false, 0o755)?;
+    Ok(PublicationCapabilityBinding {
+        logical_output_root: context.output_root,
+        output_root,
+        logical_album_dir: context.album_dir,
+        album,
+    })
+}
+
+fn retire_terminal_action_materialization_authorities_with_binding(
+    req: &PipelineRequest,
+    binding: Option<&PublicationCapabilityBinding>,
+    coord_dir: Option<&Path>,
+) -> Result<(), ActionError> {
+    if matches!(
+        conversion_action_scope_for_request(req),
+        Ok(ConversionActionAlbumScope::Disabled)
+            | Ok(ConversionActionAlbumScope::FlatLayoutSkipped { .. })
+    ) {
+        return Ok(());
+    }
+    if req.album_batch.is_none() || !conversion_actions_effective_for_request(req).unwrap_or(true) {
+        return Ok(());
+    }
+    let coord_dir = match coord_dir {
+        Some(coord_dir) => coord_dir.to_path_buf(),
+        None => conversion_log_batch_coordination_album_dir(req).ok_or_else(|| {
+            ActionError::Contradiction(
+                "terminal materialization-authority retirement requires a coordination directory"
+                    .to_string(),
+            )
+        })?,
+    };
+    let previously_marked = conversion_log_batch_materialization_authorities_retired_at(
+        req,
+        &coord_dir,
+    )?;
+    let fallback_binding;
+    let context = if previously_marked {
+        // The terminal retirement record proves that a prior pass already
+        // validated the journal against the retained published album and began
+        // authority retirement. Retrying that transaction must not require the
+        // current album pathname to remain present: a crash can leave the
+        // workspace around after authority unlink, and the user may delete the
+        // album before cleanup resumes. The engine's marked-retry branch loads
+        // the durable journal directly and removes only remaining
+        // scope/token/base-authenticated authority files.
+        pre_action_context(req)?
+    } else {
+        let binding = match binding {
+            Some(binding) => binding,
+            None => {
+                fallback_binding = terminal_publication_binding_from_current_album(req)?;
+                &fallback_binding
+            }
+        };
+        pre_action_context_for_publication_binding(req, binding)?
+    };
+    let filesystem = CapabilityActionFilesystem::new();
+    let scripts = ProcessGroupScriptRunner;
+    let engine = ActionEngine {
+        filesystem: &filesystem,
+        scripts: &scripts,
+    };
+    let mark_retired = || -> Result<(), ActionError> {
+        mark_conversion_log_batch_materialization_authorities_retired_at(req, &coord_dir)
+            .map_err(ActionError::Io)
+    };
+    engine.retire_terminal_materialization_authorities(
+        &req.actions,
+        &context,
+        Some(&mark_retired),
+        previously_marked,
+    )
+}
+
 fn action_reports_have_terminal_post_phase(reports: &[ActionPhaseReport]) -> bool {
     reports.iter().any(|report| {
         report.phase == Some(ActionPhase::Post) && !report.recovery_required
@@ -28637,6 +29194,40 @@ async fn finalize_report_with_binding(
                 ),
             }
         }
+    } else if req.album_batch.is_some()
+        && !action_reports_require_recovery(&action_reports)
+        && coordination_io_dir
+            .clone()
+            .or_else(|| conversion_log_batch_coordination_album_dir(req))
+            .as_deref()
+            .is_some_and(|coord_dir| {
+                read_conversion_log_batch_workspace_state(coord_dir)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|state| {
+                        state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING
+                            && state.owner.as_ref().is_some_and(|owner| {
+                                owner_is_current_process(owner).unwrap_or(false)
+                            })
+                    })
+            })
+    {
+        // A prior participant durably entered the cleaning state and was
+        // interrupted. The workspace refuses new mutations (including drain
+        // re-acknowledgment) in that state, so resume the terminal deletion
+        // directly: the cleanup path revalidates ownership and every durable
+        // gate itself before removing anything.
+        match coordination_io_dir.as_deref() {
+            Some(coord_dir) => cleanup_conversion_log_batch_coordination_after_success_best_effort_at(
+                req,
+                coord_dir,
+                "terminal cleaning-state resume",
+            ),
+            None => cleanup_conversion_log_batch_coordination_after_success_best_effort(
+                req,
+                "terminal cleaning-state resume",
+            ),
+        }
     } else {
         let participant_drain_complete = if req.album_batch.is_some()
             && !action_reports_require_recovery(&action_reports)
@@ -28667,16 +29258,28 @@ async fn finalize_report_with_binding(
             .map(|coord_dir| conversion_log_batch_action_lifecycle_allows_cleanup_at(req, coord_dir))
             .unwrap_or_else(|| conversion_log_batch_action_lifecycle_allows_cleanup(req));
         if participant_drain_complete && durable_complete && lifecycle_complete {
-            match coordination_io_dir.as_deref() {
-                Some(coord_dir) => cleanup_conversion_log_batch_coordination_after_success_best_effort_at(
-                    req,
-                    coord_dir,
-                    "terminal report participant drain",
-                ),
-                None => cleanup_conversion_log_batch_coordination_after_success_best_effort(
-                    req,
-                    "terminal report participant drain",
-                ),
+            match retire_terminal_action_materialization_authorities_with_binding(
+                req,
+                binding.as_ref(),
+                coordination_io_dir.as_deref(),
+            ) {
+                Ok(()) => match coordination_io_dir.as_deref() {
+                    Some(coord_dir) => cleanup_conversion_log_batch_coordination_after_success_best_effort_at(
+                        req,
+                        coord_dir,
+                        "terminal report participant drain",
+                    ),
+                    None => cleanup_conversion_log_batch_coordination_after_success_best_effort(
+                        req,
+                        "terminal report participant drain",
+                    ),
+                },
+                Err(error) => {
+                    log::warn!(
+                        "conversion-log batch preserved terminal workspace for {}: materialization authority retirement failed: {error}",
+                        req.item_id
+                    );
+                }
             }
         }
     }
@@ -45286,6 +45889,1578 @@ mod publish_lock_soundness_tests {
             !coord_dir.exists(),
             "the last finalized worker must clean a terminal post-action batch without waiting for a later process"
         );
+    }
+
+
+    #[cfg(target_os = "linux")]
+    struct PrePostLifecycleE2eFixture {
+        _temp: tempfile::TempDir,
+        output_root: PathBuf,
+        source_root: PathBuf,
+        album_dir: PathBuf,
+        pre_marker: PathBuf,
+        post_marker: PathBuf,
+        pre_script: PathBuf,
+        post_script: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PrePostLifecycleE2eFixture {
+        fn new(label: &str, participant_count: usize) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::tempdir().expect("temp dir");
+            let output_root = temp.path().join("out");
+            let source_root = temp.path().join("source");
+            std::fs::create_dir_all(&output_root).expect("output root");
+            std::fs::create_dir_all(&source_root).expect("source root");
+            for index in 1..=participant_count {
+                std::fs::write(
+                    source_root.join(format!("{index:02}.flac")),
+                    format!("audio-{index}\n"),
+                )
+                .expect("source fixture");
+            }
+
+            let pre_marker = temp.path().join(format!("{label}.pre.invocations"));
+            let post_marker = temp.path().join(format!("{label}.post.invocations"));
+            let pre_script = temp.path().join(format!("{label}.pre.sh"));
+            let post_script = temp.path().join(format!("{label}.post.sh"));
+            std::fs::write(
+                &pre_script,
+                format!(
+                    "#!/bin/sh\nset -eu\nprintf 'pre:%s\\n' \"${{TONEPOET_ACTION_PHASE:-unknown}}\" >> '{}'\n",
+                    pre_marker.display()
+                ),
+            )
+            .expect("pre script");
+            std::fs::write(
+                &post_script,
+                format!(
+                    "#!/bin/sh\nset -eu\nprintf 'post:%s\\n' \"${{TONEPOET_ACTION_PHASE:-unknown}}\" >> '{}'\n",
+                    post_marker.display()
+                ),
+            )
+            .expect("post script");
+            for script in [&pre_script, &post_script] {
+                let mut permissions = std::fs::metadata(script)
+                    .expect("script metadata")
+                    .permissions();
+                permissions.set_mode(0o700);
+                std::fs::set_permissions(script, permissions).expect("script executable");
+            }
+
+            Self {
+                album_dir: output_root.join("Album"),
+                _temp: temp,
+                output_root,
+                source_root,
+                pre_marker,
+                post_marker,
+                pre_script,
+                post_script,
+            }
+        }
+
+        fn source_path(&self, ordinal: usize) -> PathBuf {
+            self.source_root.join(format!("{ordinal:02}.flac"))
+        }
+
+        fn request(
+            &self,
+            batch_id: &str,
+            participant_count: usize,
+            ordinal: usize,
+            disc_number: Option<u32>,
+        ) -> PipelineRequest {
+            let mut req = super::pipeline_test_helpers::log_test_request();
+            req.job_id = format!("pre-post-e2e-{batch_id}-{ordinal}");
+            req.item_id = format!("pre-post-e2e-item-{ordinal}");
+            req.container = self.source_path(ordinal);
+            req.output_root = self.output_root.clone();
+            req.log.root = self._temp.path().join("logs").join(batch_id);
+            req.log.write_json_log = false;
+            req.stages.metadata = StageRequirement::Disabled;
+            req.stages.replaygain = StageRequirement::Disabled;
+            req.stages.features = StageRequirement::Disabled;
+            req.actions.pre = vec![super::super::actions::ConversionAction::Runscript(
+                super::super::actions::RunScriptAction {
+                    script: self.pre_script.clone(),
+                    args: Vec::new(),
+                    timeout_seconds: 30,
+                    continue_on_error: false,
+                },
+            )];
+            req.actions.post = vec![super::super::actions::ConversionAction::Runscript(
+                super::super::actions::RunScriptAction {
+                    script: self.post_script.clone(),
+                    args: Vec::new(),
+                    timeout_seconds: 30,
+                    continue_on_error: false,
+                },
+            )];
+            let sources = (1..=participant_count)
+                .map(|index| self.source_path(index))
+                .collect::<Vec<_>>();
+            req.album_batch = Some(
+                AlbumBatchContext::new(
+                    batch_id.to_string(),
+                    participant_count,
+                    self.album_dir.clone(),
+                    self.source_root.clone(),
+                )
+                .with_source_paths(sources),
+            );
+            req.album_batch_track = Some(AlbumBatchTrackContext::new(
+                u32::try_from(ordinal).expect("ordinal"),
+                disc_number,
+                u32::try_from(ordinal).expect("track number"),
+            ));
+            req
+        }
+
+        fn marker_count(path: &Path) -> usize {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        }
+
+        fn pre_count(&self) -> usize {
+            Self::marker_count(&self.pre_marker)
+        }
+
+        fn post_count(&self) -> usize {
+            Self::marker_count(&self.post_marker)
+        }
+
+        fn assert_pre_journal_present(&self, req: &PipelineRequest) {
+            let coord_dir = conversion_log_batch_coordination_album_dir(req)
+                .expect("coordination directory");
+            let journal_dir = coord_dir.join(".tonepoet-action-journals");
+            let entries = std::fs::read_dir(&journal_dir)
+                .expect("pre journal directory")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                entries.iter().any(|name| name.starts_with("actions-pre-") && name.ends_with(".journal.json")),
+                "PRE journal must still be available at durable finalization start: {entries:?}"
+            );
+        }
+
+        fn authority_side_files(&self) -> Vec<PathBuf> {
+            fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with(".tonepoet-root-authority-")
+                        || name.starts_with(".tonepoet-root-authority-ready-")
+                        || name.starts_with(".tonepoet-root-authority-writing-")
+                        || name == ".tonepoet-root-owner"
+                        || name.starts_with(".tonepoet-root-owner-ready-")
+                        || name.starts_with(".tonepoet-root-owner-writing-")
+                        || name.starts_with(".tonepoet-root-stage-")
+                        || name.starts_with(".tonepoet-materialization-lock-")
+                        || name == "materialization-authorities-retired.json"
+                        || name == "materialization-authority-locks-retired.json"
+                    {
+                        out.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+                    }
+                    if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                        walk(root, &path, out);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            if self.output_root.exists() {
+                walk(&self.output_root, &self.output_root, &mut out);
+            }
+            out.sort();
+            out
+        }
+
+        fn assert_no_authority_or_coordination_residue(&self) {
+            assert!(
+                self.authority_side_files().is_empty(),
+                "materialization authority residue must be zero: {:?}",
+                self.authority_side_files()
+            );
+            assert!(
+                !self.output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR).exists(),
+                "empty coordination parent must be removed after terminal cleanup"
+            );
+        }
+
+        fn assert_bootstrap_authority_exists(&self) {
+            let files = self.authority_side_files();
+            assert!(
+                files.iter().any(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(".tonepoet-root-authority-")
+                                && !name.starts_with(".tonepoet-root-authority-ready-")
+                                && !name.starts_with(".tonepoet-root-authority-writing-")
+                                && !name.ends_with(".identity")
+                        })
+                }),
+                "PRE album materializable root must create a bootstrap authority: {files:?}"
+            );
+        }
+
+        fn remove_bootstrap_authorities(&self) {
+            for path in self.authority_side_files() {
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name.starts_with(".tonepoet-root-authority-")
+                    && !name.starts_with(".tonepoet-root-authority-ready-")
+                    && !name.starts_with(".tonepoet-root-authority-writing-")
+                    && !name.ends_with(".identity")
+                {
+                    let _ = std::fs::remove_file(self.output_root.join(path));
+                }
+            }
+        }
+
+        fn remove_identity_attestations(&self) {
+            for path in self.authority_side_files() {
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name.starts_with(".tonepoet-root-authority-") && name.ends_with(".identity") {
+                    let _ = std::fs::remove_file(self.output_root.join(path));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Default)]
+    pub(super) struct SelfContainedLifecycleScriptRunner;
+
+    #[cfg(target_os = "linux")]
+    impl SelfContainedLifecycleScriptRunner {
+        fn descriptor(
+            invocation: &ScriptInvocation,
+        ) -> crate::convert::script_supervisor::ContainmentDescriptor {
+            use crate::convert::script_supervisor::{
+                ContainmentBackend, ContainmentConfidence, HostBootIdentity,
+                StableProcessIdentity,
+            };
+
+            let runtime_directory = invocation.runtime_identity.expect(
+                "lifecycle runner receives runtime identity after private directory creation",
+            );
+            crate::convert::script_supervisor::ContainmentDescriptor {
+                schema_version: 1,
+                token: invocation.containment_token.clone(),
+                backend: ContainmentBackend::LinuxSubreaper,
+                confidence: ContainmentConfidence::ProcessTreeObserved,
+                host: HostBootIdentity {
+                    machine_identity: "lifecycle-test-machine".to_string(),
+                    host_identity: "lifecycle-test-host".to_string(),
+                    boot_identity: "lifecycle-test-boot".to_string(),
+                },
+                supervisor: StableProcessIdentity {
+                    pid: std::process::id(),
+                    start_identity: "lifecycle-test-supervisor".to_string(),
+                },
+                leader: StableProcessIdentity {
+                    pid: std::process::id(),
+                    start_identity: "lifecycle-test-script".to_string(),
+                },
+                runtime_directory,
+                cgroup: None,
+                session_id: None,
+                warning: Some(
+                    "self-contained lifecycle test runner; production supervisor is outside the supplied slice"
+                        .to_string(),
+                ),
+            }
+        }
+
+        fn bounded_tail(mut bytes: Vec<u8>) -> Vec<u8> {
+            const MAX_TAIL: usize = 16 * 1024;
+            if bytes.len() > MAX_TAIL {
+                bytes.drain(..bytes.len() - MAX_TAIL);
+            }
+            bytes
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ActionScriptRunner for SelfContainedLifecycleScriptRunner {
+        fn run(
+            &self,
+            invocation: &ScriptInvocation,
+            cancellation: &dyn ActionCancellation,
+            observer: &mut dyn FnMut(
+                &crate::convert::script_supervisor::ScriptLifecycleEvent,
+            ) -> Result<(), ActionError>,
+        ) -> Result<ScriptOutcome, ActionError> {
+            use crate::convert::script_supervisor::{
+                OutputCaptureSummary, OutputCaptureTerminal, ScriptLifecycleEvent,
+            };
+            use std::os::unix::process::ExitStatusExt;
+
+            if cancellation.is_cancelled() {
+                return Err(ActionError::Interrupted(
+                    "lifecycle test script cancelled before launch".to_string(),
+                ));
+            }
+            let descriptor = Self::descriptor(invocation);
+            observer(&ScriptLifecycleEvent::ContainmentPrepared {
+                schema_version: 1,
+                descriptor: descriptor.clone(),
+            })?;
+            observer(&ScriptLifecycleEvent::UserCodeReleased {
+                schema_version: 1,
+                leader: descriptor.leader.clone(),
+            })?;
+
+            use std::os::fd::AsRawFd as _;
+
+            let retained_script = invocation.retained_script.as_ref().ok_or_else(|| {
+                ActionError::InvalidJournal(
+                    "self-contained lifecycle runner requires the retained reviewed script descriptor"
+                        .to_string(),
+                )
+            })?;
+            let retained_working_directory = invocation
+                .retained_working_directory
+                .as_ref()
+                .ok_or_else(|| {
+                    ActionError::InvalidJournal(
+                        "self-contained lifecycle runner requires the retained working-directory descriptor"
+                            .to_string(),
+                    )
+                })?;
+            let observed_script = crate::convert::cap_fs::metadata_for_open_file(retained_script)?;
+            if invocation.expected_script.filesystem.device.is_some_and(|device| {
+                device != observed_script.device
+            }) || invocation.expected_script.filesystem.inode.is_some_and(|inode| {
+                inode != observed_script.inode
+            }) {
+                return Err(ActionError::Conflict(
+                    "retained lifecycle-test script descriptor no longer matches the reviewed object"
+                        .to_string(),
+                ));
+            }
+
+            // The supplied slice does not include the production supervisor
+            // binary. Execute the exact descriptor retained by the production
+            // action engine instead of reopening the script pathname. The
+            // inheritable (non-CLOEXEC) duplicate lets a shebang interpreter
+            // reopen `/proc/self/fd/<n>` after exec; the unsafe fcntl lives in
+            // cap_fs with the rest of the descriptor primitives.
+            let inherited_script = crate::convert::cap_fs::duplicate_fd_inheritable(
+                retained_script.as_raw_fd(),
+            )
+            .map_err(ActionError::Io)?;
+            let script_path = PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                inherited_script.as_raw_fd()
+            ));
+            let working_directory = PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                retained_working_directory.as_raw_fd()
+            ));
+            let output = std::process::Command::new(&script_path)
+                .args(&invocation.args)
+                .current_dir(&working_directory)
+                .envs(&invocation.environment)
+                .output()
+                .map_err(|error| {
+                    ActionError::Script(format!(
+                        "self-contained lifecycle script launch failed for retained {}: {error}",
+                        invocation.script.display()
+                    ))
+                })?;
+            drop(inherited_script);
+            let raw_wait_status = output.status.into_raw();
+            observer(&ScriptLifecycleEvent::LeaderExited {
+                schema_version: 1,
+                raw_wait_status,
+            })?;
+            observer(&ScriptLifecycleEvent::ContainmentEmpty {
+                schema_version: 1,
+                confidence: descriptor.confidence,
+            })?;
+            let output_capture = OutputCaptureSummary {
+                stdout: OutputCaptureTerminal::Complete,
+                stderr: OutputCaptureTerminal::Complete,
+            };
+            observer(&ScriptLifecycleEvent::OutputCaptureCompleted {
+                schema_version: 1,
+                summary: output_capture.clone(),
+            })?;
+
+            Ok(ScriptOutcome {
+                status: std::process::ExitStatus::from_raw(raw_wait_status),
+                stdout_tail: Self::bounded_tail(output.stdout),
+                stderr_tail: Self::bounded_tail(output.stderr),
+                timed_out: false,
+                cancelled: false,
+                started: true,
+                descriptor,
+                containment_empty: true,
+                background_descendants: false,
+                output_capture,
+            })
+        }
+
+        fn recover(
+            &self,
+            _request: &crate::convert::script_supervisor::ScriptRecoveryRequest,
+            _observer: &mut dyn FnMut(
+                &crate::convert::script_supervisor::ScriptLifecycleEvent,
+            ) -> Result<(), ActionError>,
+        ) -> Result<crate::convert::script_supervisor::ScriptRecoveryOutcome, ActionError> {
+            Ok(crate::convert::script_supervisor::ScriptRecoveryOutcome::ContainmentAlreadyEmpty)
+        }
+
+        fn cleanup(
+            &self,
+            _request: &crate::convert::script_supervisor::ScriptRecoveryRequest,
+        ) -> Result<(), ActionError> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_pre_post_lifecycle_once(
+        fixture: &PrePostLifecycleE2eFixture,
+        label: &str,
+        participant_count: usize,
+        disc_numbers: &[Option<u32>],
+        finalization_order: &[usize],
+        binding_owner: usize,
+    ) -> Vec<PipelineReport> {
+        assert_eq!(disc_numbers.len(), participant_count);
+        assert_eq!(finalization_order.len(), participant_count);
+        let pre_count_before = fixture.pre_count();
+        let post_count_before = fixture.post_count();
+        let batch_id = generated_current_process_test_batch_id(label);
+        let requests = (1..=participant_count)
+            .map(|ordinal| fixture.request(&batch_id, participant_count, ordinal, disc_numbers[ordinal - 1]))
+            .collect::<Vec<_>>();
+        let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+        let cancellation = CancellationToken::new();
+        let scripts = SelfContainedLifecycleScriptRunner;
+
+        for request in &requests {
+            let record = execute_pre_actions_stage_with_runner(
+                request,
+                None,
+                &reporter,
+                &cancellation,
+                &scripts,
+            )
+            .await;
+            assert_eq!(record.outcome, StageOutcome::Ok, "PRE action stage for {}", request.item_id);
+        }
+        assert_eq!(
+            fixture.pre_count(),
+            pre_count_before + 1,
+            "batch-level PRE runscript must be elected exactly once for this batch"
+        );
+        fixture.assert_bootstrap_authority_exists();
+
+        std::fs::create_dir_all(&fixture.album_dir).expect("published album dir");
+        std::fs::write(fixture.album_dir.join("conversion.log"), b"complete\n")
+            .expect("conversion log");
+        for ordinal in 1..=participant_count {
+            let track_dir = if let Some(disc_number) = disc_numbers[ordinal - 1] {
+                let disc_dir = fixture.album_dir.join(format!("Disc {disc_number}"));
+                std::fs::create_dir_all(&disc_dir).expect("published disc subdirectory");
+                disc_dir
+            } else {
+                fixture.album_dir.clone()
+            };
+            std::fs::write(
+                track_dir.join(format!("{ordinal:02}.flac")),
+                format!("published-{ordinal}\n"),
+            )
+            .expect("published audio");
+        }
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&requests[0])
+            .expect("establish batch workspace");
+        let coord_dir = conversion_log_batch_coordination_album_dir(&requests[0])
+            .expect("coordination directory");
+        let identity = conversion_log_batch_identity(&requests[0], &coord_dir, None)
+            .expect("batch identity");
+        mark_conversion_log_batch_complete(&identity, participant_count, true)
+            .expect("durable batch completion marker");
+
+        let published = PublishedAlbum {
+            album_dir: fixture.album_dir.clone(),
+            entries: vec![PublishedEntry {
+                final_path: fixture.album_dir.join("conversion.log"),
+                role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                bytes: 9,
+            }],
+            manifest_path: None,
+            batch_completion: Some(PublishedBatchCompletion::Successful),
+        };
+        let mut binding = None;
+        let mut post_records = vec![None; participant_count];
+        for ordinal in 1..=participant_count {
+            let mut authority = acquire_album_action_authority_for_publish(
+                &requests[ordinal - 1],
+                &fixture.album_dir,
+                None,
+            )
+            .expect("publication action authority");
+            let transition_published = published_album_bound_to_authority(
+                &published,
+                authority.lock().expect("locked publication authority"),
+            )
+            .expect("descriptor-bound published album");
+            if ordinal == binding_owner {
+                binding = Some(
+                    PublicationCapabilityBinding::capture(
+                        authority.lock().expect("locked publication authority"),
+                        &fixture.album_dir,
+                    )
+                    .expect("capture publication binding")
+                    .expect("action-enabled publication binding"),
+                );
+            }
+            let source = prepared_source_from_dispatch_metadata(
+                &requests[ordinal - 1],
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let post_record = execute_post_actions_stage_with_runner(
+                &requests[ordinal - 1],
+                &source,
+                None,
+                &transition_published,
+                &mut authority,
+                PostActionGate::Ready,
+                true,
+                &reporter,
+                &cancellation,
+                &scripts,
+            )
+            .await
+            .expect("post action stage");
+            assert_eq!(
+                post_record.outcome,
+                StageOutcome::Ok,
+                "POST election/replay stage for participant {ordinal}"
+            );
+            post_records[ordinal - 1] = Some(post_record);
+        }
+        let binding = binding.expect("binding owner participated in POST election");
+        assert_eq!(
+            fixture.post_count(),
+            post_count_before + 1,
+            "batch-level POST runscript must be elected exactly once for this batch"
+        );
+        assert!(fixture.album_dir.is_dir(), "published album must exist");
+        fixture.assert_pre_journal_present(&requests[0]);
+        assert!(
+            conversion_log_batch_is_durably_complete_at(&requests[0], &coord_dir),
+            "durable completion gate must be closed before finalization cleanup"
+        );
+        assert!(
+            conversion_log_batch_action_lifecycle_allows_cleanup_at(&requests[0], &coord_dir),
+            "post-action lifecycle gate must be terminal before cleanup"
+        );
+
+        let mut reports = Vec::new();
+        let mut binding = Some(binding);
+        for (position, ordinal) in finalization_order.iter().copied().enumerate() {
+            let request = &requests[ordinal - 1];
+            let source = prepared_source_from_dispatch_metadata(
+                request,
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let outcome = AlbumOutcome::Complete {
+                tracks: Vec::new(),
+                stages: post_records[ordinal - 1].clone().into_iter().collect(),
+            };
+            let report = if ordinal == binding_owner {
+                finalize_report_with_binding(
+                    request,
+                    &reporter,
+                    Some(source),
+                    None,
+                    None,
+                    Some(published.clone()),
+                    outcome,
+                    binding.take(),
+                )
+                .await
+            } else {
+                finalize_report(
+                    request,
+                    &reporter,
+                    Some(source),
+                    None,
+                    None,
+                    Some(published.clone()),
+                    outcome,
+                )
+                .await
+            };
+            assert_recovery_free_action_reports(&report);
+            if position + 1 < finalization_order.len() {
+                let manifest = read_conversion_log_batch_drain_manifest(&coord_dir, &batch_id)
+                    .expect("drain manifest before terminal participant");
+                let observed = validate_conversion_log_batch_drain_inventory(&coord_dir, &manifest)
+                    .expect("drain inventory before terminal participant");
+                assert_eq!(
+                    observed.len(),
+                    position + 1,
+                    "each recovery-free participant must record exactly one drain acknowledgment"
+                );
+                assert!(
+                    coord_dir.exists(),
+                    "non-final participant must not delete the PRE journal or workspace"
+                );
+            }
+            reports.push(report);
+        }
+
+        let pre_report_count = reports
+            .iter()
+            .flat_map(|report| report.action_reports.iter())
+            .filter(|report| report.phase == Some(super::super::actions::ActionPhase::Pre))
+            .count();
+        let post_report_count = reports
+            .iter()
+            .flat_map(|report| report.action_reports.iter())
+            .filter(|report| report.phase == Some(super::super::actions::ActionPhase::Post))
+            .count();
+        assert_eq!(
+            pre_report_count,
+            participant_count,
+            "every participant must produce a recovery-free durable PRE report"
+        );
+        assert_eq!(
+            post_report_count,
+            participant_count,
+            "every participant must produce a recovery-free durable POST report"
+        );
+        assert!(
+            !coord_dir.exists(),
+            "terminal participant must retire the workspace after drain, durable completion, lifecycle completion, and authority retirement"
+        );
+        fixture.assert_no_authority_or_coordination_residue();
+        reports
+    }
+
+    fn assert_recovery_free_action_reports(report: &PipelineReport) {
+        for action_report in &report.action_reports {
+            assert!(
+                !action_report.recovery_required,
+                "durable action report fabricated recovery: {action_report:?}"
+            );
+            for notice in &action_report.notices {
+                assert!(
+                    !notice.contains("action recovery contradiction")
+                        && !notice.contains("conflicts with an already retained capability"),
+                    "scope-evolution contradiction must not reappear: {notice}"
+                );
+            }
+            for action in &action_report.actions {
+                if let Some(error) = action.error.as_deref() {
+                    assert!(
+                        !error.contains("action recovery contradiction")
+                            && !error.contains("conflicts with an already retained capability"),
+                        "scope-evolution contradiction must not reappear: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn flat_pre_runscript_post_lifecycle_retires_authority_and_zero_residue_then_reruns() {
+        let fixture = PrePostLifecycleE2eFixture::new("flat-pre-post-e2e", 1);
+        run_pre_post_lifecycle_once(
+            &fixture,
+            "flat-pre-post-e2e-first",
+            1,
+            &[None],
+            &[1],
+            1,
+        )
+        .await;
+        assert_eq!(fixture.pre_count(), 1);
+        assert_eq!(fixture.post_count(), 1);
+
+        std::fs::remove_dir_all(&fixture.album_dir).expect("remove first published album");
+        run_pre_post_lifecycle_once(
+            &fixture,
+            "flat-pre-post-e2e-second",
+            1,
+            &[None],
+            &[1],
+            1,
+        )
+        .await;
+        assert_eq!(
+            fixture.pre_count(),
+            2,
+            "fresh conversion after output deletion must run PRE exactly once for the new batch"
+        );
+        assert_eq!(
+            fixture.post_count(),
+            2,
+            "fresh conversion after output deletion must run POST exactly once for the new batch"
+        );
+        fixture.assert_no_authority_or_coordination_residue();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn multidisc_pre_runscript_post_lifecycle_drains_all_participants_in_both_orders() {
+        let fixture = PrePostLifecycleE2eFixture::new("multidisc-pre-post-e2e", 2);
+        run_pre_post_lifecycle_once(
+            &fixture,
+            "multidisc-pre-post-binding-final",
+            2,
+            &[Some(1), Some(2)],
+            &[1, 2],
+            2,
+        )
+        .await;
+        assert_eq!(fixture.pre_count(), 1);
+        assert_eq!(fixture.post_count(), 1);
+        assert!(fixture.album_dir.join("Disc 1").join("01.flac").is_file());
+        assert!(fixture.album_dir.join("Disc 2").join("02.flac").is_file());
+
+        std::fs::remove_dir_all(&fixture.album_dir).expect("remove first published album");
+        run_pre_post_lifecycle_once(
+            &fixture,
+            "multidisc-pre-post-nobinding-final",
+            2,
+            &[Some(1), Some(2)],
+            &[2, 1],
+            2,
+        )
+        .await;
+        assert_eq!(fixture.pre_count(), 2);
+        assert_eq!(fixture.post_count(), 2);
+        assert!(fixture.album_dir.join("Disc 1").join("01.flac").is_file());
+        assert!(fixture.album_dir.join("Disc 2").join("02.flac").is_file());
+        fixture.assert_no_authority_or_coordination_residue();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn concurrent_finalizers_observe_valid_pre_journal_and_evolved_album_scope() {
+        for paused_has_binding in [true, false] {
+            let label = if paused_has_binding {
+                "concurrent-finalize-binding-final"
+            } else {
+                "concurrent-finalize-nobinding-final"
+            };
+            let fixture = PrePostLifecycleE2eFixture::new(label, 2);
+            let batch_id = generated_current_process_test_batch_id(label);
+            let requests = vec![
+                fixture.request(&batch_id, 2, 1, None),
+                fixture.request(&batch_id, 2, 2, None),
+            ];
+            let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+            let cancellation = CancellationToken::new();
+            let scripts = SelfContainedLifecycleScriptRunner;
+            for request in &requests {
+                let record = execute_pre_actions_stage_with_runner(
+                    request,
+                    None,
+                    &reporter,
+                    &cancellation,
+                    &scripts,
+                )
+                .await;
+                assert_eq!(record.outcome, StageOutcome::Ok);
+            }
+            assert_eq!(fixture.pre_count(), 1);
+            std::fs::create_dir_all(&fixture.album_dir).expect("published album dir");
+            std::fs::write(fixture.album_dir.join("conversion.log"), b"complete\n")
+                .expect("conversion log");
+            ensure_conversion_log_batch_workspace_owned_for_request(&requests[0])
+                .expect("establish batch workspace");
+            let coord_dir = conversion_log_batch_coordination_album_dir(&requests[0])
+                .expect("coordination directory");
+            let identity = conversion_log_batch_identity(&requests[0], &coord_dir, None)
+                .expect("batch identity");
+            mark_conversion_log_batch_complete(&identity, 2, true).expect("durable completion");
+
+            let binding_index = if paused_has_binding { 0 } else { 1 };
+            let paused_index = 0;
+            let active_index = 1;
+            let published = PublishedAlbum {
+                album_dir: fixture.album_dir.clone(),
+                entries: vec![PublishedEntry {
+                    final_path: fixture.album_dir.join("conversion.log"),
+                    role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                    bytes: 9,
+                }],
+                manifest_path: None,
+                batch_completion: Some(PublishedBatchCompletion::Successful),
+            };
+            let mut binding = None;
+            let mut post_records = vec![None; requests.len()];
+            for participant_index in 0..requests.len() {
+                let mut authority = acquire_album_action_authority_for_publish(
+                    &requests[participant_index],
+                    &fixture.album_dir,
+                    None,
+                )
+                .expect("publication authority");
+                let transition_published = published_album_bound_to_authority(
+                    &published,
+                    authority.lock().expect("locked publication authority"),
+                )
+                .expect("descriptor-bound published album");
+                if participant_index == binding_index {
+                    binding = Some(
+                        PublicationCapabilityBinding::capture(
+                            authority.lock().expect("locked publication authority"),
+                            &fixture.album_dir,
+                        )
+                        .expect("capture publication binding")
+                        .expect("binding"),
+                    );
+                }
+                let post_source = prepared_source_from_dispatch_metadata(
+                    &requests[participant_index],
+                    SourceKind::SingleFile,
+                    TrackMetadata::default(),
+                );
+                let post_record = execute_post_actions_stage_with_runner(
+                    &requests[participant_index],
+                    &post_source,
+                    None,
+                    &transition_published,
+                    &mut authority,
+                    PostActionGate::Ready,
+                    true,
+                    &reporter,
+                    &cancellation,
+                    &scripts,
+                )
+                .await
+                .expect("post action stage");
+                assert_eq!(
+                    post_record.outcome,
+                    StageOutcome::Ok,
+                    "POST election/replay stage for participant {participant_index}"
+                );
+                post_records[participant_index] = Some(post_record);
+            }
+            let binding = binding.expect("binding participant competed in POST election");
+            assert_eq!(fixture.post_count(), 1);
+            fixture.assert_pre_journal_present(&requests[0]);
+
+            let pause_context = if paused_has_binding {
+                pre_action_context_for_publication_binding(&requests[paused_index], &binding)
+                    .expect("binding-backed PRE durable-report context")
+            } else {
+                pre_action_context(&requests[paused_index])
+                    .expect("fallback PRE durable-report context")
+            };
+            let pause = super::super::actions::install_durable_report_pause_after_journal_load(
+                &requests[paused_index].actions,
+                &pause_context,
+            )
+            .expect("install deterministic durable-report pause");
+
+            let paused_request = requests[paused_index].clone();
+            let paused_source = prepared_source_from_dispatch_metadata(
+                &paused_request,
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let paused_published = published.clone();
+            let paused_post_record = post_records[paused_index].clone();
+            let mut binding = Some(binding);
+            let paused_binding = if paused_has_binding { binding.take() } else { None };
+            let active_binding = binding;
+            let paused_thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("paused finalizer runtime");
+                let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+                runtime.block_on(async move {
+                    let outcome = AlbumOutcome::Complete {
+                        tracks: Vec::new(),
+                        stages: paused_post_record.into_iter().collect(),
+                    };
+                    match paused_binding {
+                        Some(binding) => {
+                            finalize_report_with_binding(
+                                &paused_request,
+                                &reporter,
+                                Some(paused_source),
+                                None,
+                                None,
+                                Some(paused_published),
+                                outcome,
+                                Some(binding),
+                            )
+                            .await
+                        }
+                        None => {
+                            finalize_report(
+                                &paused_request,
+                                &reporter,
+                                Some(paused_source),
+                                None,
+                                None,
+                                Some(paused_published),
+                                outcome,
+                            )
+                            .await
+                        }
+                    }
+                })
+            });
+
+            pause.wait_until_paused();
+            fixture.assert_pre_journal_present(&requests[0]);
+            assert!(
+                coord_dir.exists(),
+                "workspace must remain while one participant is paused inside PRE durable-report collection"
+            );
+
+            let active_request = &requests[active_index];
+            let active_source = prepared_source_from_dispatch_metadata(
+                active_request,
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let active_outcome = AlbumOutcome::Complete {
+                tracks: Vec::new(),
+                stages: post_records[active_index].clone().into_iter().collect(),
+            };
+            let active_report = match active_binding {
+                Some(binding) => {
+                    finalize_report_with_binding(
+                        active_request,
+                        &reporter,
+                        Some(active_source),
+                        None,
+                        None,
+                        Some(published.clone()),
+                        active_outcome,
+                        Some(binding),
+                    )
+                    .await
+                }
+                None => {
+                    finalize_report(
+                        active_request,
+                        &reporter,
+                        Some(active_source),
+                        None,
+                        None,
+                        Some(published.clone()),
+                        active_outcome,
+                    )
+                    .await
+                }
+            };
+            assert_recovery_free_action_reports(&active_report);
+            fixture.assert_pre_journal_present(&requests[0]);
+            let manifest = read_conversion_log_batch_drain_manifest(&coord_dir, &batch_id)
+                .expect("drain manifest while paused participant remains");
+            let observed = validate_conversion_log_batch_drain_inventory(&coord_dir, &manifest)
+                .expect("drain inventory while paused participant remains");
+            assert_eq!(
+                observed.len(),
+                1,
+                "the unpaused participant must drain without retiring the journal needed by the paused participant"
+            );
+            assert!(
+                coord_dir.exists(),
+                "terminal cleanup must not run before the paused participant validates the PRE journal"
+            );
+
+            pause.resume();
+            let paused_report = paused_thread
+                .join()
+                .expect("paused finalizer thread completed");
+            assert_recovery_free_action_reports(&paused_report);
+            assert!(
+                !coord_dir.exists(),
+                "terminal cleanup must run only after both participants complete recovery-free durable reporting and drain"
+            );
+            fixture.assert_no_authority_or_coordination_residue();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminal_retirement_marker_retry_finishes_after_each_partial_authority_unlink_state() {
+        for (case, remove_bootstrap, remove_identity) in [
+            ("after-marker-before-unlink", false, false),
+            ("after-bootstrap-unlink", true, false),
+            ("older-after-identity-unlink", false, true),
+            ("after-both-unlinked", true, true),
+        ] {
+            let fixture = PrePostLifecycleE2eFixture::new(case, 2);
+            let batch_id = generated_current_process_test_batch_id(case);
+            let requests = vec![
+                fixture.request(&batch_id, 2, 1, None),
+                fixture.request(&batch_id, 2, 2, None),
+            ];
+            let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+            let cancellation = CancellationToken::new();
+            let scripts = SelfContainedLifecycleScriptRunner;
+            for request in &requests {
+                let record = execute_pre_actions_stage_with_runner(
+                    request,
+                    None,
+                    &reporter,
+                    &cancellation,
+                    &scripts,
+                )
+                .await;
+                assert_eq!(record.outcome, StageOutcome::Ok, "{case} PRE");
+            }
+            std::fs::create_dir_all(&fixture.album_dir).expect("album dir");
+            std::fs::write(fixture.album_dir.join("conversion.log"), b"complete\n")
+                .expect("conversion log");
+            ensure_conversion_log_batch_workspace_owned_for_request(&requests[0])
+                .expect("workspace");
+            let coord_dir = conversion_log_batch_coordination_album_dir(&requests[0])
+                .expect("coordination directory");
+            let identity = conversion_log_batch_identity(&requests[0], &coord_dir, None)
+                .expect("identity");
+            mark_conversion_log_batch_complete(&identity, 2, true).expect("complete");
+
+            let mut authority = acquire_album_action_authority_for_publish(
+                &requests[0],
+                &fixture.album_dir,
+                None,
+            )
+            .expect("publication authority");
+            let published = PublishedAlbum {
+                album_dir: fixture.album_dir.clone(),
+                entries: vec![PublishedEntry {
+                    final_path: fixture.album_dir.join("conversion.log"),
+                    role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                    bytes: 9,
+                }],
+                manifest_path: None,
+                batch_completion: Some(PublishedBatchCompletion::Successful),
+            };
+            let transition_published = published_album_bound_to_authority(
+                &published,
+                authority.lock().expect("locked publication authority"),
+            )
+            .expect("descriptor-bound published album");
+            let binding = PublicationCapabilityBinding::capture(
+                authority.lock().expect("locked publication authority"),
+                &fixture.album_dir,
+            )
+            .expect("capture binding")
+            .expect("binding");
+            let source = prepared_source_from_dispatch_metadata(
+                &requests[0],
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let post_record = execute_post_actions_stage_with_runner(
+                &requests[0],
+                &source,
+                None,
+                &transition_published,
+                &mut authority,
+                PostActionGate::Ready,
+                true,
+                &reporter,
+                &cancellation,
+                &scripts,
+            )
+            .await
+            .expect("post action stage");
+            assert_eq!(post_record.outcome, StageOutcome::Ok, "{case} POST");
+            let first_report = finalize_report_with_binding(
+                &requests[0],
+                &reporter,
+                Some(source),
+                None,
+                None,
+                Some(published.clone()),
+                AlbumOutcome::Complete {
+                    tracks: Vec::new(),
+                    stages: vec![post_record],
+                },
+                Some(binding),
+            )
+            .await;
+            assert_recovery_free_action_reports(&first_report);
+            assert!(coord_dir.exists(), "{case} first participant is not terminal");
+            mark_conversion_log_batch_materialization_authorities_retired_at(&requests[0], &coord_dir)
+                .expect("durable terminal retirement marker");
+            if remove_bootstrap {
+                fixture.remove_bootstrap_authorities();
+            }
+            if remove_identity {
+                fixture.remove_identity_attestations();
+            }
+            if remove_bootstrap && remove_identity {
+                assert!(fixture.authority_side_files().iter().all(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name == "materialization-authorities-retired.json"
+                                || name.starts_with(".tonepoet-materialization-lock-")
+                        })
+                }));
+            }
+
+            let second_source = prepared_source_from_dispatch_metadata(
+                &requests[1],
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let second_report = finalize_report(
+                &requests[1],
+                &reporter,
+                Some(second_source),
+                None,
+                None,
+                Some(published),
+                AlbumOutcome::Complete {
+                    tracks: Vec::new(),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+            assert_recovery_free_action_reports(&second_report);
+            assert!(
+                !coord_dir.exists(),
+                "{case}: retry from partial terminal retirement must finish workspace cleanup"
+            );
+            fixture.assert_no_authority_or_coordination_residue();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminal_workspace_cleanup_retries_after_each_durable_cleanup_boundary() {
+        for (case, point) in [
+            (
+                "after-cleaning-state",
+                TerminalCleanupInterruptionPoint::AfterCleaningStateCommitted,
+            ),
+            (
+                "after-retirement-record-removal",
+                TerminalCleanupInterruptionPoint::AfterRetirementRecordRemoved,
+            ),
+        ] {
+            let fixture = PrePostLifecycleE2eFixture::new(case, 2);
+            let batch_id = generated_current_process_test_batch_id(case);
+            let requests = vec![
+                fixture.request(&batch_id, 2, 1, None),
+                fixture.request(&batch_id, 2, 2, None),
+            ];
+            let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+            let cancellation = CancellationToken::new();
+            let scripts = SelfContainedLifecycleScriptRunner;
+            for request in &requests {
+                let record = execute_pre_actions_stage_with_runner(
+                    request,
+                    None,
+                    &reporter,
+                    &cancellation,
+                    &scripts,
+                )
+                .await;
+                assert_eq!(record.outcome, StageOutcome::Ok, "{case} PRE");
+            }
+            assert_eq!(fixture.pre_count(), 1, "{case} PRE election");
+
+            std::fs::create_dir_all(&fixture.album_dir).expect("album dir");
+            std::fs::write(fixture.album_dir.join("conversion.log"), b"complete\n")
+                .expect("conversion log");
+            ensure_conversion_log_batch_workspace_owned_for_request(&requests[0])
+                .expect("workspace");
+            let coord_dir = conversion_log_batch_coordination_album_dir(&requests[0])
+                .expect("coordination directory");
+            let identity = conversion_log_batch_identity(&requests[0], &coord_dir, None)
+                .expect("identity");
+            mark_conversion_log_batch_complete(&identity, 2, true).expect("complete");
+
+            let published = PublishedAlbum {
+                album_dir: fixture.album_dir.clone(),
+                entries: vec![PublishedEntry {
+                    final_path: fixture.album_dir.join("conversion.log"),
+                    role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                    bytes: 9,
+                }],
+                manifest_path: None,
+                batch_completion: Some(PublishedBatchCompletion::Successful),
+            };
+            let mut authority = acquire_album_action_authority_for_publish(
+                &requests[0],
+                &fixture.album_dir,
+                None,
+            )
+            .expect("publication authority");
+            let transition_published = published_album_bound_to_authority(
+                &published,
+                authority.lock().expect("locked publication authority"),
+            )
+            .expect("descriptor-bound published album");
+            let binding = PublicationCapabilityBinding::capture(
+                authority.lock().expect("locked publication authority"),
+                &fixture.album_dir,
+            )
+            .expect("capture binding")
+            .expect("binding");
+            let first_source = prepared_source_from_dispatch_metadata(
+                &requests[0],
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let post_record = execute_post_actions_stage_with_runner(
+                &requests[0],
+                &first_source,
+                None,
+                &transition_published,
+                &mut authority,
+                PostActionGate::Ready,
+                true,
+                &reporter,
+                &cancellation,
+                &scripts,
+            )
+            .await
+            .expect("post action stage");
+            assert_eq!(post_record.outcome, StageOutcome::Ok, "{case} POST");
+            assert_eq!(fixture.post_count(), 1, "{case} POST election");
+
+            let first_report = finalize_report_with_binding(
+                &requests[0],
+                &reporter,
+                Some(first_source),
+                None,
+                None,
+                Some(published.clone()),
+                AlbumOutcome::Complete {
+                    tracks: Vec::new(),
+                    stages: vec![post_record],
+                },
+                Some(binding),
+            )
+            .await;
+            assert_recovery_free_action_reports(&first_report);
+            assert!(coord_dir.exists(), "{case} first participant is not terminal");
+
+            let interruption = TerminalCleanupInterruptionGuard::install(point);
+            let second_source = prepared_source_from_dispatch_metadata(
+                &requests[1],
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let interrupted_report = finalize_report(
+                &requests[1],
+                &reporter,
+                Some(second_source),
+                None,
+                None,
+                Some(published.clone()),
+                AlbumOutcome::Complete {
+                    tracks: Vec::new(),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+            assert_recovery_free_action_reports(&interrupted_report);
+            assert!(coord_dir.exists(), "{case} injected cleanup boundary must retain workspace");
+            let state = read_conversion_log_batch_workspace_state(&coord_dir)
+                .expect("read interrupted cleanup state")
+                .expect("interrupted cleanup state");
+            assert_eq!(
+                state.status,
+                CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING,
+                "{case} interruption occurs only after durable cleaning state"
+            );
+            let retirement_record =
+                conversion_log_batch_materialization_authority_retirement_path(&coord_dir);
+            match point {
+                TerminalCleanupInterruptionPoint::AfterCleaningStateCommitted => {
+                    assert!(retirement_record.is_file(), "{case} record remains before its cleanup boundary");
+                }
+                TerminalCleanupInterruptionPoint::AfterRetirementRecordRemoved => {
+                    assert!(!retirement_record.exists(), "{case} record was durably removed");
+                }
+            }
+            assert_eq!(fixture.pre_count(), 1, "{case} cleanup interruption must not rerun PRE");
+            assert_eq!(fixture.post_count(), 1, "{case} cleanup interruption must not rerun POST");
+            drop(interruption);
+
+            let retry_source = prepared_source_from_dispatch_metadata(
+                &requests[1],
+                SourceKind::SingleFile,
+                TrackMetadata::default(),
+            );
+            let retry_report = finalize_report(
+                &requests[1],
+                &reporter,
+                Some(retry_source),
+                None,
+                None,
+                Some(published),
+                AlbumOutcome::Complete {
+                    tracks: Vec::new(),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+            assert_recovery_free_action_reports(&retry_report);
+            assert!(!coord_dir.exists(), "{case} retry must finish terminal workspace deletion");
+            assert_eq!(fixture.pre_count(), 1, "{case} retry must not rerun PRE");
+            assert_eq!(fixture.post_count(), 1, "{case} retry must not rerun POST");
+            fixture.assert_no_authority_or_coordination_residue();
+        }
+    }
+
+    #[test]
+    fn materialization_authority_retirement_lookup_absent_marker_is_not_recovery() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let source_root = temp.path().join("source");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&source_root).expect("source root");
+        let source_one = source_root.join("01.flac");
+        std::fs::write(&source_one, b"one").expect("source one");
+        let batch_id = generated_current_process_test_batch_id("missing-retirement-marker");
+        let batch = AlbumBatchContext::new(
+            batch_id,
+            1,
+            output_root.join("Album"),
+            source_root,
+        )
+        .with_source_paths(vec![source_one.clone()]);
+
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.output_root = output_root;
+        req.container = source_one;
+        req.album_batch = Some(batch);
+        req.actions.pre = vec![super::super::actions::ConversionAction::CreateFolder(
+            super::super::actions::CreateFolderAction {
+                path: PathBuf::from("pre-action-root"),
+                continue_on_error: false,
+            },
+        )];
+        let coord_dir = conversion_log_batch_coordination_album_dir(&req)
+            .expect("coordination directory");
+
+        assert!(
+            !conversion_log_batch_materialization_authorities_retired_at(&req, &coord_dir)
+                .expect("missing retirement record is ordinary incomplete state"),
+            "absence of the terminal retirement record must not require a drain manifest or fabricate recovery"
+        );
+    }
+
+    #[test]
+    fn materialization_authority_retirement_record_is_removed_during_terminal_cleanup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let source_root = temp.path().join("source");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&source_root).expect("source root");
+        let source_one = source_root.join("01.flac");
+        std::fs::write(&source_one, b"one").expect("source one");
+        let batch_id = generated_current_process_test_batch_id("retirement-record-cleanup");
+        let batch = AlbumBatchContext::new(
+            batch_id.clone(),
+            1,
+            output_root.join("Album"),
+            source_root,
+        )
+        .with_source_paths(vec![source_one.clone()]);
+
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.output_root = output_root;
+        req.container = source_one;
+        req.album_batch = Some(batch);
+        req.actions.pre = vec![super::super::actions::ConversionAction::CreateFolder(
+            super::super::actions::CreateFolderAction {
+                path: PathBuf::from("pre-action-root"),
+                continue_on_error: false,
+            },
+        )];
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&req)
+            .expect("establish batch authority");
+        let coord_dir = conversion_log_batch_coordination_album_dir(&req)
+            .expect("coordination directory");
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("complete state");
+        assert!(
+            record_conversion_log_batch_participant_drained(&req)
+                .expect("single participant acknowledgment")
+        );
+        mark_conversion_log_batch_materialization_authorities_retired_at(&req, &coord_dir)
+            .expect("write terminal retirement record");
+        assert!(
+            conversion_log_batch_materialization_authority_retirement_path(&coord_dir)
+                .is_file(),
+            "retirement transaction record exists before cleanup"
+        );
+
+        cleanup_conversion_log_batch_coordination_after_success_best_effort(
+            &req,
+            "materialization-authority retirement record cleanup regression",
+        );
+        assert!(
+            !coord_dir.exists(),
+            "terminal cleanup must recognize and remove the retirement record before final inventory"
+        );
+    }
+
+    #[test]
+    fn cleaning_workspace_without_retirement_record_is_already_retired() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let source_root = temp.path().join("source");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&source_root).expect("source root");
+        let source_one = source_root.join("01.flac");
+        std::fs::write(&source_one, b"one").expect("source one");
+        let batch_id = generated_current_process_test_batch_id("cleaning-no-retirement-record");
+        let batch = AlbumBatchContext::new(
+            batch_id.clone(),
+            1,
+            output_root.join("Album"),
+            source_root,
+        )
+        .with_source_paths(vec![source_one.clone()]);
+
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.output_root = output_root;
+        req.container = source_one;
+        req.album_batch = Some(batch);
+        req.actions.pre = vec![super::super::actions::ConversionAction::CreateFolder(
+            super::super::actions::CreateFolderAction {
+                path: PathBuf::from("pre-action-root"),
+                continue_on_error: false,
+            },
+        )];
+        let coord_dir = conversion_log_batch_coordination_album_dir(&req)
+            .expect("coordination directory");
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_CLEANING,
+        )
+        .expect("cleaning state");
+        assert!(
+            conversion_log_batch_materialization_authorities_retired_at(&req, &coord_dir)
+                .expect("cleaning state implies completed retirement"),
+            "once cleaning is durable, the retirement record may already have been removed"
+        );
+        if let Some(state) = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read retained state")
+        {
+            if let Some(owner) = state.owner.as_ref() {
+                release_current_process_owner_claim(&owner.claim_id);
+            }
+        }
+    }
+
+    #[test]
+    fn materialization_authority_retirement_record_is_durable_and_manifest_bound() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let source_root = temp.path().join("source");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&source_root).expect("source root");
+        let source_one = source_root.join("01.flac");
+        std::fs::write(&source_one, b"one").expect("source one");
+        let batch_id = generated_current_process_test_batch_id("retirement-marker-bound");
+        let batch = AlbumBatchContext::new(
+            batch_id.clone(),
+            1,
+            output_root.join("Album"),
+            source_root,
+        )
+        .with_source_paths(vec![source_one.clone()]);
+
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.output_root = output_root;
+        req.container = source_one;
+        req.album_batch = Some(batch);
+        req.actions.pre = vec![super::super::actions::ConversionAction::CreateFolder(
+            super::super::actions::CreateFolderAction {
+                path: PathBuf::from("pre-action-root"),
+                continue_on_error: false,
+            },
+        )];
+
+        ensure_conversion_log_batch_workspace_owned_for_request(&req)
+            .expect("establish batch authority");
+        let coord_dir = conversion_log_batch_coordination_album_dir(&req)
+            .expect("coordination directory");
+        write_conversion_log_batch_workspace_state(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_COMPLETE,
+        )
+        .expect("complete state");
+        assert!(
+            record_conversion_log_batch_participant_drained(&req)
+                .expect("single participant acknowledgment"),
+            "single expected participant closes the drain manifest"
+        );
+
+        mark_conversion_log_batch_materialization_authorities_retired_at(&req, &coord_dir)
+            .expect("write terminal retirement record");
+        assert!(
+            conversion_log_batch_materialization_authorities_retired_at(&req, &coord_dir)
+                .expect("valid retirement record"),
+            "valid terminal retirement record must survive lookup"
+        );
+
+        let invalid = ConversionLogBatchMaterializationAuthorityRetirement {
+            schema_version: CONVERSION_LOG_BATCH_MATERIALIZATION_AUTHORITY_RETIREMENT_SCHEMA_VERSION,
+            batch_id,
+            pipeline_sha256: super::super::manifest::sha256_hex(b"different-pipeline"),
+        };
+        std::fs::write(
+            conversion_log_batch_materialization_authority_retirement_path(&coord_dir),
+            serde_json::to_vec_pretty(&invalid).expect("serialize invalid retirement record"),
+        )
+        .expect("overwrite invalid retirement record");
+
+        assert!(
+            conversion_log_batch_materialization_authorities_retired_at(&req, &coord_dir)
+                .is_err(),
+            "foreign or malformed terminal retirement records must fail closed"
+        );
+
+        if let Some(state) = read_conversion_log_batch_workspace_state(&coord_dir)
+            .expect("read retained state")
+        {
+            if let Some(owner) = state.owner.as_ref() {
+                release_current_process_owner_claim(&owner.claim_id);
+            }
+        }
     }
 
     #[test]
