@@ -142,6 +142,69 @@ for embedded cue sheets:
 - Regression tests assert the menu/help entries exist (the codebase has
   precedent for asserting rendered menu items).
 
+## Robustness requirements (non-negotiable — a brittle pass fails review)
+
+This is the fourth round on this feature. The implementation must be
+structural, not shaped around the one test tree. Specifically:
+
+1. MODEL, NOT TEXT SPLICING. The concatenated sheet is generated from a
+   parsed, unified in-memory model (parse each member cue → merge →
+   regenerate). Concatenating or regex-editing cue TEXT is forbidden.
+   Required property test: parse(generate(model)) round-trips the model,
+   for every fixture in the suite.
+2. N PARTS, NOT TWO. Everything works for 2..N member cues (test with 3),
+   with differing track counts per part. TRACK numbers are 2-digit in cue
+   syntax: a merged group exceeding 99 tracks must fail closed with a
+   clear status message, not emit an invalid sheet.
+3. HOSTILE-INPUT TOLERANCE. Member cues may differ in: CRLF vs LF, BOM,
+   header field presence/order, REM fields, casing, quoting, per-track
+   PERFORMER presence, INDEX 00 pregaps, and encodings the existing
+   `decode_cue_bytes_for_path` handles. None of these may break merging;
+   divergent album-level values are reconciled per Deliverable 1 and
+   surfaced, never silently dropped, never crashed on.
+4. STABLE ROW↔SOURCE MAPPING. The unified surface's row-to-(cue, image,
+   local-index) mapping must survive editing operations the editor
+   already supports on other surfaces. No positional assumptions that
+   break when the view is re-sorted or a field is edited.
+5. MULTI-FILE SAVE IS ALL-OR-NOTHING IN EFFECT. Writing the sheet to N
+   images can partially fail (permissions, formats). Either stage
+   through the editor's existing save/dirty machinery so a failure
+   surfaces per-file with nothing silently half-applied, or write with
+   explicit per-file error reporting and a consistent retry story. A
+   save that updates one image and silently skips the other is a
+   defect. Re-saving an unchanged view is a byte-stable no-op.
+6. TOTAL PRECEDENCE RULES. Read-path behavior must be defined (and
+   tested) for every combination: no embedded sheets / one member has a
+   stale per-side sheet / all members carry identical synthetic sheets /
+   members carry DIVERGENT synthetic sheets / sheet on some members
+   only / unparseable embedded sheet. Sidecars are ground truth on any
+   disagreement; corrupt embedded data degrades gracefully to the
+   sidecar-derived view with a status note.
+7. CONVERSION HAS NO PART-COUNT OR NAME ASSUMPTIONS. The one-album
+   conversion works for N parts, does not assume side-letter filenames,
+   and if it stages a transient synthetic cue, its FILE references must
+   resolve robustly (the existing resolution machinery, not string
+   paths glued together) and the transient artifact is cleaned up on
+   every exit path.
+8. NO PANICS, NO SILENT FALLBACKS. Production paths use the status-line
+   error conventions; `unwrap`/`expect` on data derived from user files
+   is forbidden. Where the code cannot honor the user model (e.g. >99
+   tracks, unwritable tag format), it says so explicitly and leaves
+   files untouched.
+9. TESTS PROVE THE PROPERTIES, NOT THE HAPPY PATH. Minimum: 3-part
+   fixture; divergent-header fixture; stale-sheet-overwrite fixture;
+   divergent-embedded-sheets fixture; partial-save-failure fixture
+   (injectable through the existing save machinery); generator
+   round-trip property test; single-cue bypass test; two-folder
+   regression test. Fixtures follow the suite's existing patterns
+   (real ffmpeg-encoded images where probing is involved, placeholder
+   bytes where it is not — check which the exercised path needs).
+10. REPORT YOUR SEAMS. The implementation report must enumerate every
+    behavioral decision made where this brief left freedom, every
+    precedence rule as implemented, and every place you knowingly
+    accepted a limitation — so review verifies decisions, not
+    archaeology.
+
 ## Real-tree acceptance (applier runs; user verifies in the TUI)
 
 Tree: `~/livetorrents/Pink Floyd - 1973 - The Dark Side Of The Moon (LP,
