@@ -3161,18 +3161,18 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             frame += count / samples_per_frame;
                         }
                         sectors.push(frame as u32);
-                        let toc_string = match super::musicbrainz::build_mb_toc(&sectors) {
-                            Some(s) => s,
-                            None => {
-                                app.set_status(":tags-mb: TOC too short".to_string());
-                                return;
-                            }
-                        };
+                        if super::musicbrainz::build_mb_toc(&sectors).is_none() {
+                            app.set_status(":tags-mb: TOC too short".to_string());
+                            return;
+                        }
                         let image_paths: Vec<std::path::PathBuf> = (0..info.track_boundaries.len())
                             .map(|_| info.audio_path.clone())
                             .collect();
+                        // Real rip geometry: exact TOC, no stub-drop cascade.
                         spawn_tags_mb_toc_lookup(
-                            app, tx, sectors, toc_string, image_paths,
+                            app, tx,
+                            vec![super::musicbrainz::TocCandidate::exact(sectors)],
+                            image_paths,
                             /* editor_park */ false, /* fallback_seed */ None,
                         );
                         return;
@@ -3200,15 +3200,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     }
                 },
             };
-            let toc_string = match super::musicbrainz::build_mb_toc(&sectors) {
-                Some(s) => s,
-                None => {
-                    app.set_status(":tags-mb: TOC too short".to_string());
-                    return;
-                }
-            };
+            if super::musicbrainz::build_mb_toc(&sectors).is_none() {
+                app.set_status(":tags-mb: TOC too short".to_string());
+                return;
+            }
+            // Real rip geometry: exact TOC, no stub-drop cascade.
             spawn_tags_mb_toc_lookup(
-                app, tx, sectors, toc_string, paths, /* editor_park */ false,
+                app, tx,
+                vec![super::musicbrainz::TocCandidate::exact(sectors)],
+                paths, /* editor_park */ false,
                 /* fallback_seed */ None,
             );
         }
@@ -6204,12 +6204,13 @@ fn dvda_source_to_cd_sectors(
     let disc = crate::tui::dvda::parse_dvda_volume(volume.as_ref())
         .map_err(|e| format!("DVD-Audio parse failed for '{}': {}", path.display(), e))?;
 
-    // Always prefer the stereo group for MusicBrainz TOC lookup.
-    // DVD-Audio multichannel tracks often have different durations than
-    // the CD mastering, causing TOC mismatches. The stereo group's
-    // timing typically matches CD releases.
-    let group_nr = dvda_stereo_group_for_mb_toc(volume.as_ref(), &disc, path)
-        .or(group_nr);
+    // The stereo group's timing typically matches CD releases, so it is the
+    // DEFAULT when the user has not chosen a group — but an explicit
+    // :dvda-group selection takes precedence. (The old stereo-always
+    // override made group switching a no-op for TOC lookups, and MB's fuzzy
+    // matching absorbs multichannel duration drift in practice.)
+    let group_nr = group_nr
+        .or_else(|| dvda_stereo_group_for_mb_toc(volume.as_ref(), &disc, path));
 
     let group = super::dvda_metabase::select_group(&disc, group_nr)
         .map_err(|e| e.to_string())?;
@@ -9638,26 +9639,40 @@ fn dvdv_is_album_level_sidecar_key(key: &str) -> bool {
 pub(super) fn spawn_tags_mb_toc_lookup(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
-    sectors: Vec<u32>,
-    toc_string: String,
+    candidates: Vec<super::musicbrainz::TocCandidate>,
     paths: Vec<std::path::PathBuf>,
     editor_park: bool,
     fallback_seed: Option<SacdMbSeed>,
 ) {
-    let cached = app.db.get_cached_mb_response(&toc_string);
-    let n_cached = if cached.is_some() {
+    // Pre-fetch the cache body for every cascade stage here on the UI
+    // thread; the spawned lookup stays database-free.
+    let cached: Vec<Option<String>> = candidates
+        .iter()
+        .map(|candidate| {
+            super::musicbrainz::build_mb_toc(&candidate.sectors)
+                .and_then(|toc| app.db.get_cached_mb_response(&toc))
+        })
+        .collect();
+    let n_cached = if cached.first().is_some_and(Option::is_some) {
         "cached"
     } else {
         "fetching"
     };
-    let n_tracks = sectors.len().saturating_sub(1);
-    app.set_status(format!(
-        ":tags-mb: {} disc TOC ({} tracks)…",
-        n_cached, n_tracks,
-    ));
+    let n_tracks = candidates
+        .first()
+        .map(|c| c.sectors.len().saturating_sub(1))
+        .unwrap_or(0);
+    let n_stages = candidates.len();
+    app.set_status(if n_stages > 1 {
+        format!(
+            ":tags-mb: {} disc TOC ({} tracks, {} stub-drop stages)…",
+            n_cached, n_tracks, n_stages,
+        )
+    } else {
+        format!(":tags-mb: {} disc TOC ({} tracks)…", n_cached, n_tracks)
+    });
 
     let tx = tx.clone();
-    let toc_for_msg = toc_string;
     let ctx = super::message::TagsMbContext {
         paths,
         editor_park,
@@ -9665,13 +9680,11 @@ pub(super) fn spawn_tags_mb_toc_lookup(
     };
 
     tokio::spawn(async move {
-        let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await;
+        let outcome =
+            super::musicbrainz::lookup_release_by_toc_cascading(&candidates, cached).await;
         let _ = tx
             .send(AppMessage::TagsFromMbComplete {
-                outcome: super::message::MbOutcome::Toc {
-                    outcome,
-                    toc_string: toc_for_msg,
-                },
+                outcome: super::message::MbOutcome::Toc { outcome },
                 ctx,
             })
             .await;
@@ -9747,7 +9760,7 @@ fn try_dispatch_in_editor_tags_mb(
     // the audio files via the same accuraterip helpers the Browse
     // path uses, and disable the fallback (file-level TOCs are
     // sample-exact; fallback rarely helps).
-    let (sectors, fallback_seed) = if let Some(area_kind) = state_owned.active_surface().sacd_area_kind {
+    let (sectors, fallback_seed, synthesized_toc) = if let Some(area_kind) = state_owned.active_surface().sacd_area_kind {
         let durations = {
             let surface = state_owned.active_surface();
             match area_kind {
@@ -9766,7 +9779,7 @@ fn try_dispatch_in_editor_tags_mb(
         };
         let sectors = sacd_durations_to_sectors(&durations);
         let seed = seed_sacd_mb_query(&state_owned);
-        (sectors, seed)
+        (sectors, seed, true)
     } else if super::keybindings::metadata_editor_is_dvda_source(&state_owned) {
         let paths = state_owned.active_surface().paths.clone();
         let Some(first_path) = paths.first().cloned() else {
@@ -9789,7 +9802,7 @@ fn try_dispatch_in_editor_tags_mb(
             }
         };
         let seed = seed_sacd_mb_query(&state_owned);
-        (sectors, seed)
+        (sectors, seed, true)
     } else if super::keybindings::metadata_editor_is_bluray_source(&state_owned) {
         let paths = state_owned.active_surface().paths.clone();
         let Some(first_path) = paths.first().cloned() else {
@@ -9863,7 +9876,7 @@ fn try_dispatch_in_editor_tags_mb(
                 return Some(true);
             }
         };
-        (sectors, seed)
+        (sectors, seed, true)
     } else if super::keybindings::metadata_editor_is_dvdv_source(&state_owned) {
         let paths = state_owned.active_surface().paths.clone();
         let Some(first_path) = paths.first().cloned() else {
@@ -9915,7 +9928,7 @@ fn try_dispatch_in_editor_tags_mb(
                 }
             },
         };
-        (sectors, seed)
+        (sectors, seed, true)
     } else {
         // File editor: state.active_surface().paths is the audio file set. Use the
         // same TOC derivation the Browse path uses — first try
@@ -9952,13 +9965,20 @@ fn try_dispatch_in_editor_tags_mb(
                 }
             },
         };
-        (sectors, None)
+        (sectors, None, false)
     };
 
-    let Some(toc_string) = super::musicbrainz::build_mb_toc(&sectors) else {
+    if super::musicbrainz::build_mb_toc(&sectors).is_none() {
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
         app.set_status(":tags-mb: TOC too short".to_string());
         return Some(true);
+    }
+    // Synthesized TOCs (SACD/DVD-A/DVD-V/Blu-ray durations) get the
+    // stub-drop cascade; real rip geometry stays a single exact candidate.
+    let candidates = if synthesized_toc {
+        super::musicbrainz::toc_candidates_from_sectors(&sectors)
+    } else {
+        vec![super::musicbrainz::TocCandidate::exact(sectors)]
     };
     let paths = state_owned.active_surface().paths.clone();
 
@@ -9970,8 +9990,7 @@ fn try_dispatch_in_editor_tags_mb(
     spawn_tags_mb_toc_lookup(
         app,
         tx,
-        sectors,
-        toc_string,
+        candidates,
         paths,
         /* editor_park */ true,
         fallback_seed,

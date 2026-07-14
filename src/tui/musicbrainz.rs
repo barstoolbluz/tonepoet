@@ -216,6 +216,248 @@ impl MbLookupOutcome {
     }
 }
 
+/// Red Book minimum track length. A track shorter than this cannot exist on
+/// a real CD, so it can never participate in a legitimate CD TOC — which
+/// makes it the principled threshold for identifying spurious stub "tracks"
+/// (menu fragments, 7KB AOB stubs) in TOCs synthesized from DVD-Audio /
+/// DVD-Video / SACD durations.
+pub const CD_MIN_TRACK_FRAMES: u32 = 4 * 75;
+
+/// One candidate TOC in the stub-drop cascade, plus the mapping back to the
+/// source track list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocCandidate {
+    /// `[off1, …, offN, leadout]` absolute CD-frame offsets (off1 = 150).
+    pub sectors: Vec<u32>,
+    /// Source track indices (0-based) that survive in this candidate, in
+    /// order. `kept_indices[k]` is the source track that MB track `k`
+    /// describes when this candidate matches.
+    pub kept_indices: Vec<usize>,
+    /// Short human-readable stage label for status lines.
+    pub label: &'static str,
+}
+
+impl TocCandidate {
+    /// Wrap an exact, trusted TOC (real CD rip offsets) as the sole
+    /// candidate: no tracks dropped, no cascade.
+    pub fn exact(sectors: Vec<u32>) -> Self {
+        let n = sectors.len().saturating_sub(1);
+        TocCandidate {
+            sectors,
+            kept_indices: (0..n).collect(),
+            label: "as-is",
+        }
+    }
+
+    /// Source track indices (0-based) excluded by this candidate.
+    pub fn dropped_indices(&self, total: usize) -> Vec<usize> {
+        (0..total)
+            .filter(|i| !self.kept_indices.contains(i))
+            .collect()
+    }
+}
+
+fn sectors_from_kept_frames(frames: &[u32], kept: &[usize]) -> Vec<u32> {
+    let mut sectors = Vec::with_capacity(kept.len() + 1);
+    let mut cur: u32 = 150;
+    sectors.push(cur);
+    for &i in kept {
+        cur = cur.saturating_add(frames[i]);
+        sectors.push(cur);
+    }
+    sectors
+}
+
+/// Build the cascading stub-drop TOC candidates from per-track CD-frame
+/// counts (the caller performs its own duration→frame rounding so the
+/// "as-is" candidate is byte-identical to the historical single TOC and
+/// existing cache entries keep hitting).
+///
+/// Stage order — try the untouched TOC first, then progressively drop
+/// sub-Red-Book stub tracks (first/last/both edges, then everywhere):
+/// discs mastered with spurious fragment tracks (DVD-A menu stubs, DVD-V
+/// credit chapters) otherwise synthesize a TOC with a track count no real
+/// release has, and the MB fuzzy lookup can never match. Candidates are
+/// deduplicated; callers stop at the first stage that returns releases.
+pub fn toc_candidates_from_frames(frames: &[u32]) -> Vec<TocCandidate> {
+    let n = frames.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let all: Vec<usize> = (0..n).collect();
+    let is_stub = |i: usize| frames[i] < CD_MIN_TRACK_FRAMES;
+
+    let mut stages: Vec<(&'static str, Vec<usize>)> = vec![("as-is", all.clone())];
+    if is_stub(0) {
+        stages.push(("dropped leading stub track", all[1..].to_vec()));
+    }
+    if n > 1 && is_stub(n - 1) {
+        stages.push(("dropped trailing stub track", all[..n - 1].to_vec()));
+    }
+    if n > 2 && is_stub(0) && is_stub(n - 1) {
+        stages.push(("dropped edge stub tracks", all[1..n - 1].to_vec()));
+    }
+    let interior: Vec<usize> = all.iter().copied().filter(|&i| !is_stub(i)).collect();
+    if !interior.is_empty() {
+        stages.push(("dropped all stub tracks", interior));
+    }
+
+    let mut out: Vec<TocCandidate> = Vec::new();
+    for (label, kept) in stages {
+        if kept.is_empty() {
+            continue;
+        }
+        let sectors = sectors_from_kept_frames(frames, &kept);
+        if out.iter().any(|c| c.sectors == sectors) {
+            continue;
+        }
+        out.push(TocCandidate {
+            sectors,
+            kept_indices: kept,
+            label,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn two_against_nature_frames_test_reexport() -> Vec<u32> {
+    let offsets = [
+        150u32, 26702, 50461, 78872, 97596, 116395, 144731, 169281, 194435, 232049,
+    ];
+    let leadout = 232128u32;
+    let mut frames: Vec<u32> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
+    frames.push(leadout - offsets[offsets.len() - 1]);
+    frames
+}
+
+/// Build cascade candidates from an already-synthesized `[offsets…, leadout]`
+/// sector vector (the shape every existing TOC-synthesis helper produces).
+/// The as-is candidate reproduces the input exactly, so cached responses for
+/// historical TOC strings keep hitting.
+pub fn toc_candidates_from_sectors(sectors: &[u32]) -> Vec<TocCandidate> {
+    if sectors.len() < 2 {
+        return Vec::new();
+    }
+    let frames: Vec<u32> = sectors.windows(2).map(|w| w[1].saturating_sub(w[0])).collect();
+    toc_candidates_from_frames(&frames)
+}
+
+/// Align a release matched by a dropped-track candidate back onto the FULL
+/// source track list: MB track `k` lands at source ordinal `kept[k]`, and
+/// dropped source ordinals get neutral placeholder tracks (empty title, no
+/// IDs) that the editor-population presence passes already treat as "MB is
+/// silent on this track". This keeps every downstream consumer positional
+/// without shifting tags onto the wrong files.
+pub fn align_release_tracks_to_source(
+    release: &MbRelease,
+    kept: &[usize],
+    total_source_tracks: usize,
+) -> MbRelease {
+    let mut aligned = release.clone();
+    let mut tracks: Vec<MbTrack> = (0..total_source_tracks)
+        .map(|i| MbTrack {
+            position: (i + 1) as u32,
+            track_id: None,
+            recording_id: None,
+            artist_id: None,
+            title: String::new(),
+            artist: String::new(),
+            isrc: None,
+            length_ms: None,
+        })
+        .collect();
+    for (k, &src) in kept.iter().enumerate() {
+        if let (Some(slot), Some(track)) = (tracks.get_mut(src), release.tracks.get(k)) {
+            let mut track = track.clone();
+            track.position = (src + 1) as u32;
+            *slot = track;
+        }
+    }
+    aligned.tracks = tracks;
+    aligned
+}
+
+/// Outcome of a cascading TOC lookup: releases from the FIRST stage that
+/// matched (already aligned back to the full source track list when that
+/// stage dropped tracks), which stage matched, and the cache writes for
+/// every stage that fired over the network.
+#[derive(Debug)]
+pub struct MbCascadeOutcome {
+    pub releases: Vec<MbRelease>,
+    /// The candidate that produced `releases`; `None` when no stage matched.
+    pub matched: Option<TocCandidate>,
+    /// 0-based source track indices excluded by the matching stage (empty
+    /// for an as-is match).
+    pub dropped_source_indices: Vec<usize>,
+    /// `(toc_string, response_json)` for each stage that hit the network.
+    pub cache_writes: Vec<(String, String)>,
+}
+
+/// Run the stub-drop cascade: try each candidate TOC in order, stopping at
+/// the first stage that returns releases. `cached` must be pre-fetched
+/// per-candidate (same order) so this stays database-free for
+/// `tokio::spawn`. Total source track count is taken from the FIRST
+/// candidate (the as-is stage always covers every source track).
+pub async fn lookup_release_by_toc_cascading(
+    candidates: &[TocCandidate],
+    cached: Vec<Option<String>>,
+) -> Result<MbCascadeOutcome, String> {
+    let total = candidates
+        .first()
+        .map(|c| c.kept_indices.len())
+        .unwrap_or(0);
+    let mut cache_writes = Vec::new();
+    let mut last_error: Option<String> = None;
+    for (i, candidate) in candidates.iter().enumerate() {
+        let cached_body = cached.get(i).cloned().flatten();
+        let outcome = match lookup_release_by_toc(&candidate.sectors, cached_body).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Transport failures abort later stages (rate limiting makes
+                // hammering a failing endpoint pointless) but surface the
+                // error only if NO earlier stage matched.
+                last_error = Some(error);
+                break;
+            }
+        };
+        if let Some(body) = outcome.cache_response {
+            if let Some(toc) = build_mb_toc(&candidate.sectors) {
+                cache_writes.push((toc, body));
+            }
+        }
+        if !outcome.releases.is_empty() {
+            let dropped = candidate.dropped_indices(total);
+            let releases = if dropped.is_empty() {
+                outcome.releases
+            } else {
+                outcome
+                    .releases
+                    .iter()
+                    .map(|r| align_release_tracks_to_source(r, &candidate.kept_indices, total))
+                    .collect()
+            };
+            return Ok(MbCascadeOutcome {
+                releases,
+                matched: Some(candidate.clone()),
+                dropped_source_indices: dropped,
+                cache_writes,
+            });
+        }
+    }
+    if let Some(error) = last_error {
+        if cache_writes.is_empty() {
+            return Err(error);
+        }
+    }
+    Ok(MbCascadeOutcome {
+        releases: Vec::new(),
+        matched: None,
+        dropped_source_indices: Vec::new(),
+        cache_writes,
+    })
+}
+
 /// Look up the best-matching MusicBrainz release for a disc TOC.
 ///
 /// Database-free for use inside `tokio::spawn`: caller owns cache
@@ -1974,6 +2216,118 @@ fn artist_credit_string(value: Option<&serde_json::Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+    // ── stub-drop TOC cascade ──────────────────────────────────────────
+
+    // Real-world fixture lives in two_against_nature_frames_test_reexport():
+    // Two Against Nature DVD-A stereo group — nine CD-accurate tracks plus a
+    // 79-frame (≈1.05 s) spurious stub, reconstructed from the cached failing
+    // TOC.
+
+    #[test]
+    fn cascade_as_is_candidate_matches_historical_toc() {
+        let frames = super::two_against_nature_frames_test_reexport();
+        let candidates = super::toc_candidates_from_frames(&frames);
+        assert_eq!(candidates[0].label, "as-is");
+        assert_eq!(
+            super::build_mb_toc(&candidates[0].sectors).unwrap(),
+            "1+10+232128+150+26702+50461+78872+97596+116395+144731+169281+194435+232049",
+            "as-is candidate must be byte-identical to the historical TOC so cache entries keep hitting"
+        );
+        assert_eq!(candidates[0].kept_indices, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cascade_drops_trailing_stub_and_produces_cd_accurate_nine_track_toc() {
+        let frames = super::two_against_nature_frames_test_reexport();
+        let candidates = super::toc_candidates_from_frames(&frames);
+        let dropped_last = candidates
+            .iter()
+            .find(|c| c.label == "dropped trailing stub track")
+            .expect("trailing 79-frame stub must produce a drop-last stage");
+        assert_eq!(dropped_last.kept_indices, (0..9).collect::<Vec<_>>());
+        assert_eq!(
+            super::build_mb_toc(&dropped_last.sectors).unwrap(),
+            "1+9+232049+150+26702+50461+78872+97596+116395+144731+169281+194435",
+            "drop-last TOC keeps the CD-accurate nine-track geometry"
+        );
+        // drop-all dedupes into the same TOC (the stub is the only sub-4s track).
+        assert_eq!(
+            candidates.len(),
+            2,
+            "one stub at the tail must yield exactly as-is + drop-last after dedupe"
+        );
+        assert_eq!(dropped_last.dropped_indices(10), vec![9]);
+    }
+
+    #[test]
+    fn cascade_clean_disc_yields_single_as_is_candidate() {
+        // No sub-4s tracks: cascade must not invent extra stages/requests.
+        let frames = vec![26552, 23759, 28411, 18724, 18799, 28336, 24550, 25154, 37693];
+        let candidates = super::toc_candidates_from_frames(&frames);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].label, "as-is");
+    }
+
+    #[test]
+    fn cascade_handles_leading_and_interior_stubs() {
+        // stub, real, stub(interior), real, stub(tail)
+        let frames = vec![100, 20000, 200, 21000, 150];
+        let candidates = super::toc_candidates_from_frames(&frames);
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "as-is",
+                "dropped leading stub track",
+                "dropped trailing stub track",
+                "dropped edge stub tracks",
+                "dropped all stub tracks",
+            ]
+        );
+        let all_dropped = candidates.last().unwrap();
+        assert_eq!(all_dropped.kept_indices, vec![1, 3]);
+        assert_eq!(all_dropped.dropped_indices(5), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn align_release_places_mb_tracks_at_kept_ordinals() {
+        let release = super::MbRelease {
+            tracks: vec![
+                super::MbTrack {
+                    position: 1,
+                    track_id: Some("t1".into()),
+                    recording_id: None,
+                    artist_id: None,
+                    title: "Gaslighting Abbie".into(),
+                    artist: "Steely Dan".into(),
+                    isrc: None,
+                    length_ms: Some(354_000),
+                },
+                super::MbTrack {
+                    position: 2,
+                    track_id: Some("t2".into()),
+                    recording_id: None,
+                    artist_id: None,
+                    title: "What a Shame About Me".into(),
+                    artist: "Steely Dan".into(),
+                    isrc: None,
+                    length_ms: Some(317_000),
+                },
+            ],
+            ..Default::default()
+        };
+        // MB tracks describe source ordinals 1 and 3 (0-based); 0 and 2 were
+        // dropped stubs.
+        let aligned = super::align_release_tracks_to_source(&release, &[1, 3], 4);
+        assert_eq!(aligned.tracks.len(), 4);
+        assert_eq!(aligned.tracks[0].title, "");
+        assert_eq!(aligned.tracks[1].title, "Gaslighting Abbie");
+        assert_eq!(aligned.tracks[1].position, 2);
+        assert_eq!(aligned.tracks[2].title, "");
+        assert_eq!(aligned.tracks[3].title, "What a Shame About Me");
+        assert_eq!(aligned.tracks[3].position, 4);
+    }
+
     use super::*;
 
     #[test]

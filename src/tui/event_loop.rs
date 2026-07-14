@@ -4854,11 +4854,8 @@ fn handle_tags_from_mb_complete(
 ) {
     use super::message::MbOutcome;
     match outcome {
-        MbOutcome::Toc {
-            outcome,
-            toc_string,
-        } => {
-            handle_mb_toc_outcome(app, tx, outcome, toc_string, ctx);
+        MbOutcome::Toc { outcome } => {
+            handle_mb_toc_outcome(app, tx, outcome, ctx);
         }
         MbOutcome::Search {
             outcome,
@@ -4872,8 +4869,7 @@ fn handle_tags_from_mb_complete(
 fn handle_mb_toc_outcome(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
-    outcome: Result<super::musicbrainz::MbLookupOutcome, String>,
-    toc_string: String,
+    outcome: Result<super::musicbrainz::MbCascadeOutcome, String>,
     ctx: super::message::TagsMbContext,
 ) {
     let outcome = match outcome {
@@ -4884,11 +4880,28 @@ fn handle_mb_toc_outcome(
         }
     };
 
-    if let Some(json) = outcome.cache_response.as_deref() {
-        if let Err(e) = app.db.store_mb_response(&toc_string, json) {
+    for (toc_string, json) in &outcome.cache_writes {
+        if let Err(e) = app.db.store_mb_response(toc_string, json) {
             log::warn!("MB TOC cache store failed: {}", e);
         }
     }
+
+    // When a stub-drop stage matched, tell the user which source tracks were
+    // excluded (1-based, matching the editor's track numbering). The matched
+    // releases are already aligned back onto the full source track list, so
+    // the excluded rows simply receive no MB proposals.
+    let stub_note = (!outcome.dropped_source_indices.is_empty()).then(|| {
+        let ordinals: Vec<String> = outcome
+            .dropped_source_indices
+            .iter()
+            .map(|i| format!("#{}", i + 1))
+            .collect();
+        format!(
+            "matched after excluding sub-4s stub track{} {}",
+            if ordinals.len() == 1 { "" } else { "s" },
+            ordinals.join(", "),
+        )
+    });
 
     match outcome.releases.len() {
         0 => match ctx.fallback_seed.clone() {
@@ -4903,9 +4916,15 @@ fn handle_mb_toc_outcome(
         },
         1 => {
             open_editor_with_mb_release(app, outcome.releases, 0, ctx.paths);
+            if let Some(note) = stub_note {
+                app.set_status(format!(":tags-mb: {}", note));
+            }
         }
         n => {
             open_mb_select_picker(app, tx, outcome.releases, ctx, n, None);
+            if let Some(note) = stub_note {
+                app.set_status(format!(":tags-mb: {}", note));
+            }
         }
     }
 }
@@ -6151,10 +6170,12 @@ mod musicbrainz_completion_dispatch_tests {
 
     fn lookup_outcome(
         releases: Vec<crate::tui::musicbrainz::MbRelease>,
-    ) -> crate::tui::musicbrainz::MbLookupOutcome {
-        crate::tui::musicbrainz::MbLookupOutcome {
+    ) -> crate::tui::musicbrainz::MbCascadeOutcome {
+        crate::tui::musicbrainz::MbCascadeOutcome {
             releases,
-            cache_response: None,
+            matched: None,
+            dropped_source_indices: Vec::new(),
+            cache_writes: Vec::new(),
         }
     }
 
@@ -6196,7 +6217,6 @@ mod musicbrainz_completion_dispatch_tests {
         let msg = AppMessage::TagsFromMbComplete {
             outcome: crate::tui::message::MbOutcome::Toc {
                 outcome: Err("synthetic lookup failure".to_string()),
-                toc_string: "1+1".to_string(),
             },
             ctx: ctx_for(Vec::new(), false),
         };
@@ -6226,8 +6246,7 @@ mod musicbrainz_completion_dispatch_tests {
                         release("", "Candidate A"),
                         release("", "Candidate B"),
                     ])),
-                    toc_string: "1+2".to_string(),
-                },
+                    },
                 ctx: ctx_for(editor_paths.clone(), true),
             },
             &tx,
@@ -6270,8 +6289,7 @@ mod musicbrainz_completion_dispatch_tests {
             AppMessage::TagsFromMbComplete {
                 outcome: crate::tui::message::MbOutcome::Toc {
                     outcome: Ok(lookup_outcome(vec![release("", "One Match Album")])),
-                    toc_string: "1+2".to_string(),
-                },
+                    },
                 ctx: ctx_for(editor_paths, true),
             },
             &tx,

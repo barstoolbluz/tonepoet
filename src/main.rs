@@ -2102,6 +2102,15 @@ fn classify_tags_mb_paths(paths: &[PathBuf]) -> Result<PathKind, String> {
             if tonepoet::disc::dvdv_utils::is_dvdv_iso(&path) {
                 return Ok(PathKind::DvdVideoSource(path));
             }
+            // DVD-Audio ISOs would otherwise fall through to the SACD parser
+            // and die on a misleading "not a valid SACD ISO (no Master TOC
+            // magic)" error.
+            if tonepoet::disc::dvda_utils::is_dvda_iso(&path) {
+                return Err(format!(
+                    "{} is a DVD-Audio ISO; CLI tags-mb does not support DVD-Audio yet — use the TUI (:tags-mb from the DVD-Audio editor)",
+                    path.display()
+                ));
+            }
             return Ok(PathKind::SacdIso(path));
         }
     } else if paths.iter().any(|p| {
@@ -2248,6 +2257,7 @@ async fn resolve_release(
         return disambiguate(outcome.releases, auto, quiet, "search");
     }
 
+    let synthesized_toc = !matches!(kind, PathKind::Audio(_));
     let sectors: Vec<u32> = match kind {
         PathKind::Audio(paths) => {
             let dir = paths[0]
@@ -2297,20 +2307,52 @@ async fn resolve_release(
             })?
         }
     };
-    let toc_string = musicbrainz::build_mb_toc(&sectors).ok_or_else(|| {
+    if musicbrainz::build_mb_toc(&sectors).is_none() {
         eprintln!("tags-mb: TOC too short");
-        3
-    })?;
-    say!("TOC lookup ({} tracks)...", n_tracks);
-    let cached = db.get_cached_mb_response(&toc_string);
-    let outcome = musicbrainz::lookup_release_by_toc(&sectors, cached)
+        return Err(3);
+    }
+    // Synthesized TOCs (SACD/DVD-A/DVD-V durations) get the stub-drop
+    // cascade; real rip geometry stays a single exact candidate.
+    let candidates = if synthesized_toc {
+        musicbrainz::toc_candidates_from_sectors(&sectors)
+    } else {
+        vec![musicbrainz::TocCandidate::exact(sectors)]
+    };
+    if candidates.len() > 1 {
+        say!(
+            "TOC lookup ({} tracks, {} stub-drop stages)...",
+            n_tracks,
+            candidates.len()
+        );
+    } else {
+        say!("TOC lookup ({} tracks)...", n_tracks);
+    }
+    let cached: Vec<Option<String>> = candidates
+        .iter()
+        .map(|candidate| {
+            musicbrainz::build_mb_toc(&candidate.sectors)
+                .and_then(|toc| db.get_cached_mb_response(&toc))
+        })
+        .collect();
+    let outcome = musicbrainz::lookup_release_by_toc_cascading(&candidates, cached)
         .await
         .map_err(|e| {
             eprintln!("tags-mb: TOC lookup: {}", e);
             4
         })?;
-    if let Some(body) = outcome.cache_response {
-        let _ = db.store_mb_response(&toc_string, &body);
+    for (toc, body) in &outcome.cache_writes {
+        let _ = db.store_mb_response(toc, body);
+    }
+    if !outcome.dropped_source_indices.is_empty() {
+        let ordinals: Vec<String> = outcome
+            .dropped_source_indices
+            .iter()
+            .map(|i| format!("#{}", i + 1))
+            .collect();
+        say!(
+            "matched after excluding sub-4s stub track(s) {}",
+            ordinals.join(", ")
+        );
     }
     disambiguate(outcome.releases, auto, quiet, "TOC")
 }

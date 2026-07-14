@@ -7,12 +7,11 @@
 /// branching is the same shape for both.
 #[derive(Debug)]
 pub enum MbOutcome {
-    /// Result of a `/ws/2/discid/-?toc=…` lookup. `toc_string` is
-    /// the cache key under which the handler persists
-    /// `outcome.cache_response`.
+    /// Result of a cascading `/ws/2/discid/-?toc=…` lookup (stub-drop
+    /// cascade for synthesized TOCs; a single exact candidate for real CD
+    /// rips). Cache writes carry their own TOC-string keys.
     Toc {
-        outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
-        toc_string: String,
+        outcome: Result<crate::tui::musicbrainz::MbCascadeOutcome, String>,
     },
     /// Result of a `/ws/2/release/?query=…` search, spawned by the
     /// handler as a zero-match fallback from `Toc`. Entering this
