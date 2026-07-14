@@ -84,16 +84,30 @@ wvtag/metaflac. Deleting must also drop the synthetic per-track rows that
 were derived from that CUESHEET in the open editor (re-shape from sidecar
 surfaces if present).
 
-## Feature B — hand-edit an embedded CUESHEET
+## Feature B — hand-edit an embedded CUESHEET (SYSTEM editor)
 
-The editor already has a read-only cue view (`MetadataCueView` /
-CuePreview overlay). Upgrade path: an editable variant for the embedded
-CUESHEET text — multi-line editing following the existing CuePreview/
-save conventions, with parse-validation before accepting (reject a sheet
-that fails `parse_cue` or has tracks without INDEX 01; show the error in
-the status line). Saving re-runs the same embed/save path the editor uses
-today (regenerated CUESHEET written back to the tag; sidecar untouched).
-Keyboard and mouse coeval per TUI convention.
+Use the SYSTEM editor, not a new built-in widget. Precedent: sidecar
+`.cue` files are already system-editable today via
+`src/tui/external_editor.rs::open_in_editor` (the `:edit-file` command /
+browse "Edit" action suspends the TUI, launches the user's editor, and
+resumes with `force_redraw`). Embedded CUESHEETs must get the symmetric
+flow:
+
+- From the metadata editor (command, e.g. `:cuesheet-edit`, plus a
+  context affordance where natural): extract the active surface's
+  embedded CUESHEET text to a temp file (respect the scratch/temp
+  conventions), run `open_in_editor`, and on return parse-validate the
+  result (`parse_cue`; reject sheets with no tracks or tracks missing
+  INDEX 01) BEFORE accepting.
+- Accept: write the edited text back through the SAME tag-save machinery
+  the editor uses (lofty; sidecar untouched) and re-shape the open
+  editor's synthetic per-track rows from the new sheet.
+- Reject: keep the buffer (tell the user where the temp file is or
+  re-open on retry), surface the parse error in the status line, and
+  leave the file's tag unchanged.
+- The existing read-only CuePreview (`MetadataCueView`) stays as the
+  quick-inspection surface. Do NOT build a multi-line ratatui editor for
+  this — that is explicitly out of scope for this round.
 
 ## Feature C — album-grouping heuristic ladder for same-folder cue sets
 
