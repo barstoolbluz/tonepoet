@@ -408,18 +408,16 @@ pub async fn lookup_release_by_toc_cascading(
         .map(|c| c.kept_indices.len())
         .unwrap_or(0);
     let mut cache_writes = Vec::new();
-    let mut last_error: Option<String> = None;
     for (i, candidate) in candidates.iter().enumerate() {
         let cached_body = cached.get(i).cloned().flatten();
         let outcome = match lookup_release_by_toc(&candidate.sectors, cached_body).await {
             Ok(outcome) => outcome,
-            Err(error) => {
-                // Transport failures abort later stages (rate limiting makes
-                // hammering a failing endpoint pointless) but surface the
-                // error only if NO earlier stage matched.
-                last_error = Some(error);
-                break;
-            }
+            // A transport failure aborts the cascade (rate limiting makes
+            // hammering a failing endpoint pointless) and MUST surface as an
+            // error: reporting "no match" for a lookup that never completed
+            // would be a lie. Partial cache writes from earlier stages are
+            // dropped — they are only a cache.
+            Err(error) => return Err(error),
         };
         if let Some(body) = outcome.cache_response {
             if let Some(toc) = build_mb_toc(&candidate.sectors) {
@@ -443,11 +441,6 @@ pub async fn lookup_release_by_toc_cascading(
                 dropped_source_indices: dropped,
                 cache_writes,
             });
-        }
-    }
-    if let Some(error) = last_error {
-        if cache_writes.is_empty() {
-            return Err(error);
         }
     }
     Ok(MbCascadeOutcome {
