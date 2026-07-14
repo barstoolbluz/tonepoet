@@ -25,14 +25,18 @@ DFF/SHN are documented input formats; SACD/DVD-A ISOs have full pipelines)
    context-menu arms.
 2. `.iso` maps to `EntryKind::Archive` in `classify_file`. Browse upgrades
    ISO entries LAZILY to SacdIso/DvdAudioIso/DvdVideoIso/BlurayIso via
-   magic-byte probes cached by (path, mtime) — "after settled focus or
-   explicit actions" (see the EntryKind doc comments). Until that probe
+   magic-byte probes cached by path + mtime (+ len for DVD kinds) —
+   "after settled focus or explicit actions" (see the EntryKind doc
+   comments). Until that probe
    lands, a right-click sees the Archive menu.
 3. `src/tui/context_menu.rs` menu arms (fn around line 540):
    - `EntryKind::SacdIso` offers "Edit metadata" and a stream submenu
      (only when the disc probe is cached) but NO general Convert item —
      unlike the DVD/Bluray arm, which has "Convert (default stream)".
-   - cue files are `OtherFile`: no Convert, no Edit metadata.
+   - cue files are `OtherFile`, and that arm ALREADY special-cases cue
+     and shows the Convert submenu (context_menu.rs ~695) — but no Edit
+     metadata item. The user still cannot convert via that submenu in
+     practice; see cause 6.
    - `EntryKind::Archive` (which is what an un-probed ISO is) has a
      Convert submenu and an "Edit metadata" item, but that Edit metadata
      path expands to zero audio and dies with "No audio files selected".
@@ -43,6 +47,15 @@ DFF/SHN are documented input formats; SACD/DVD-A ISOs have full pipelines)
    selections special-case single SACD/DVD-A/DVD-V/Bluray sources, then
    fall through to `expand_audio_paths_for_metadata` → empty →
    "No audio files selected".
+6. `queue_expansion::analyze_cue_for_queue` (~line 690) returns
+   Err("did not resolve to a supported audio file") whenever the cue's
+   FILE reference resolves to a path `is_audio_file_path` (= the same
+   `classify_file`) rejects. An APE/DSF-backed cue therefore fails cue
+   analysis outright — the Convert submenu renders but converting does
+   nothing useful. This is the classify gap surfacing a second way, and
+   it means extending `classify_file` also unlocks cue-driven conversion
+   for those images. WavPack-backed cues (DSOTM) pass this check; their
+   failures come from causes 4 and the pairing gap.
 
 ## Gap A+C — folders of APE/DSF/DFF (+cue) refuse Edit metadata / Convert
 
@@ -117,14 +130,18 @@ Required:
   both sides; :tags-mb reaches the text-fallback (or a per-side match)
   instead of failing outright.
 
-## Gap D — right-click a cue file → Convert
+## Gap D — right-click a cue file → Convert (make it WORK, not just render)
 
-Cue files are `OtherFile` today. Required: a cue file's context menu
-offers the Convert submenu; converting a cue routes through the existing
-single-image CUE decomposition exactly as if the folder had been staged
-(the pipeline's CUE materializer already exists — this is menu gating +
-selection expansion, not new conversion machinery). Multi-select of cue
-files behaves sanely (each pairs with its own image).
+The Convert submenu already renders for cue files (root cause 3); the
+user still reports Convert unusable. Required: trace the full action path
+for a cue selection (ConvertCustom / ConvertLastUsed / preset →
+BrowseConvertExpansionRequest → queue expansion → cue decision) and make
+it work end-to-end for cues backed by EVERY supported image format —
+including the ones cause 6 currently rejects. The pipeline's CUE
+materializer already exists; expect this to be classification +
+expansion, not new conversion machinery. Multi-select of cue files
+behaves sanely (each pairs with its own image). Add a regression test per
+image format (flac/wv/ape at minimum).
 
 ## Gap E — right-click an ISO file → Convert + Edit metadata
 
