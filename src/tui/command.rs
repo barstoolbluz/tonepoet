@@ -657,12 +657,70 @@ fn paths_for_cue_metadata_surfaces(surfaces: &[CueMetadataSurface]) -> Vec<PathB
         .collect()
 }
 
+/// Album title for an MB text search over a MULTI-part cue album. Side-split
+/// rips title each cue per side ("… (Side A)" / "… (Side B)"); searching with
+/// one side's verbatim title biases the query. Use the longest common prefix
+/// of every part's title, trimmed of a dangling side/part designator opener.
+/// Falls back to the first title when the parts share no meaningful prefix.
+fn common_cue_album_title(titles: &[String]) -> Option<String> {
+    let first = titles.first()?.clone();
+    if titles.len() < 2 || titles.iter().any(|t| t.trim().is_empty()) {
+        return Some(first);
+    }
+    let mut prefix: Vec<char> = titles[0].chars().collect();
+    for title in &titles[1..] {
+        let chars: Vec<char> = title.chars().collect();
+        let mut common = 0;
+        while common < prefix.len()
+            && common < chars.len()
+            && prefix[common] == chars[common]
+        {
+            common += 1;
+        }
+        prefix.truncate(common);
+    }
+    let mut candidate: String = prefix.into_iter().collect();
+    loop {
+        let trimmed = candidate.trim_end();
+        if trimmed.len() != candidate.len() {
+            candidate.truncate(trimmed.len());
+            continue;
+        }
+        if let Some(last) = candidate.chars().last() {
+            if matches!(last, '-' | '–' | ':' | ',' | '&' | '/') {
+                candidate.pop();
+                continue;
+            }
+        }
+        let opens = candidate.matches(['(', '[']).count();
+        let closes = candidate.matches([')', ']']).count();
+        if opens > closes {
+            if let Some(cut) = candidate.rfind(['(', '[']) {
+                candidate.truncate(cut);
+                continue;
+            }
+        }
+        break;
+    }
+    // Require the shared prefix to be meaningful; otherwise the parts are
+    // unrelated titles and the first one is the least-bad seed.
+    if candidate.chars().count() >= 4 {
+        Some(candidate)
+    } else {
+        Some(first)
+    }
+}
+
 fn seed_mb_query_from_cue_metadata_surfaces(
     surfaces: &[CueMetadataSurface],
 ) -> Option<SacdMbSeed> {
     let first = surfaces.first()?;
     let artist = first.sheet.performer.clone().unwrap_or_default();
-    let album = first.sheet.title.clone().unwrap_or_default();
+    let titles: Vec<String> = surfaces
+        .iter()
+        .map(|surface| surface.sheet.title.clone().unwrap_or_default())
+        .collect();
+    let album = common_cue_album_title(&titles).unwrap_or_default();
     let catalog = first.sheet.catalog.clone();
     let year = first.sheet.date.clone();
 
@@ -759,7 +817,11 @@ fn seed_mb_query_from_single_image_cues(
 ) -> Option<SacdMbSeed> {
     let first = infos.first()?;
     let artist = first.sheet.performer.clone().unwrap_or_default();
-    let album = first.sheet.title.clone().unwrap_or_default();
+    let titles: Vec<String> = infos
+        .iter()
+        .map(|info| info.sheet.title.clone().unwrap_or_default())
+        .collect();
+    let album = common_cue_album_title(&titles).unwrap_or_default();
     let catalog = first.sheet.catalog.clone();
     let year = first.sheet.date.clone();
 
@@ -14769,6 +14831,35 @@ mod conversion_action_command_parser_tests {
 #[cfg(test)]
 mod split_cue_source_coverage_tests {
     use super::*;
+
+    #[test]
+    fn common_cue_album_title_strips_side_designators() {
+        let titles = vec![
+            "The Dark Side Of The Moon (Side A)".to_string(),
+            "The Dark Side Of The Moon (Side B)".to_string(),
+        ];
+        assert_eq!(
+            super::common_cue_album_title(&titles).as_deref(),
+            Some("The Dark Side Of The Moon")
+        );
+    }
+
+    #[test]
+    fn common_cue_album_title_keeps_single_or_unrelated_titles() {
+        assert_eq!(
+            super::common_cue_album_title(&["Chronicle".to_string()]).as_deref(),
+            Some("Chronicle")
+        );
+        assert_eq!(
+            super::common_cue_album_title(&[
+                "Chronicle".to_string(),
+                "Willy and the Poor Boys".to_string(),
+            ])
+            .as_deref(),
+            Some("Chronicle"),
+            "unrelated part titles fall back to the first title"
+        );
+    }
 
     #[test]
     fn split_cue_info_collection_keeps_ogg_and_tta_cues_before_plain_audio_grouping() {

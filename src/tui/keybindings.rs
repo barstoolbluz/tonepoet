@@ -9183,9 +9183,10 @@ fn metadata_cue_track_labels(surface: &MetadataCueSurface) -> Vec<String> {
         .collect()
 }
 
-fn open_metadata_editor_for_cue_surfaces(
+fn open_metadata_editor_for_cue_surfaces_with_active(
     app: &mut AppState,
     surfaces: Vec<MetadataCueSurface>,
+    active_surface: usize,
 ) {
     if surfaces.is_empty() {
         app.set_status("No CUE/image pairs selected");
@@ -9231,8 +9232,9 @@ fn open_metadata_editor_for_cue_surfaces(
 
     let n_parts = tabs.len();
     let n_tracks: usize = surfaces.iter().map(|surface| surface.sheet.tracks.len()).sum();
+    let active_tab = active_surface.min(tabs.len().saturating_sub(1));
     app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
-        super::app::MetadataEditorState::for_disc_presentations(tabs, 0),
+        super::app::MetadataEditorState::for_disc_presentations(tabs, active_tab),
     ));
     app.set_status(format!(
         "metadata: opened {} CUE part{}, {} tracks",
@@ -12238,9 +12240,28 @@ pub fn open_metadata_editor(app: &mut AppState) {
     // path opens image-level rows and loses each side/disc's CUESHEET track
     // structure. Surface each cue/image pair as its own presentation tab before
     // falling back to generic audio-file expansion.
-    let cue_surfaces = collect_metadata_cue_surfaces(&sel);
+    let mut cue_surfaces = collect_metadata_cue_surfaces(&sel);
+    let mut active_surface = 0;
+    // Metadata editing is album-scoped: invoking it on ONE cue (or one image)
+    // of a folder that holds several cue/image pairs opens ALL of the album's
+    // surfaces, with the clicked side as the active tab. Without this, a
+    // cursor-on-file invocation silently shows one side and the MB seed
+    // carries its "(Side A)"-style title.
+    if cue_surfaces.len() == 1 && sel.len() == 1 && sel[0].is_file() {
+        if let Some(parent) = sel[0].parent() {
+            let album_surfaces = collect_metadata_cue_surfaces(&[parent.to_path_buf()]);
+            if album_surfaces.len() > 1 {
+                let clicked = metadata_cue_surface_key(&cue_surfaces[0].cue_path);
+                active_surface = album_surfaces
+                    .iter()
+                    .position(|surface| metadata_cue_surface_key(&surface.cue_path) == clicked)
+                    .unwrap_or(0);
+                cue_surfaces = album_surfaces;
+            }
+        }
+    }
     if cue_surfaces.len() > 1 {
-        open_metadata_editor_for_cue_surfaces(app, cue_surfaces);
+        open_metadata_editor_for_cue_surfaces_with_active(app, cue_surfaces, active_surface);
         return;
     }
 
@@ -31309,6 +31330,74 @@ mod single_image_metadata_editor_regression_tests {
         assert_eq!(surfaces[1].cue_path, disc2.join("disc2.cue"));
         assert_eq!(surfaces[1].audio_path, disc2.join("disc2.ape"));
         assert_eq!(surfaces[1].sheet.tracks.len(), 2);
+    }
+
+    #[test]
+    fn single_file_metadata_invocation_upgrades_to_album_cue_surfaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        for stem in ["side_a", "side_b"] {
+            // The collector resolves references and classifies extensions but
+            // does not probe, so placeholder image bytes are sufficient here.
+            std::fs::write(album.join(format!("{stem}.wv")), b"img").expect("image");
+            std::fs::write(
+                album.join(format!("{stem}.cue")),
+                format!(
+                    "TITLE \"Album ({stem})\"\nFILE \"{stem}.wv\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"T1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"T2\"\n    INDEX 01 00:30:00\n"
+                ),
+            )
+            .expect("cue");
+        }
+
+        // Selecting ONE cue of the two-part album must surface BOTH parts.
+        let selected = vec![album.join("side_b.cue")];
+        let mut surfaces = collect_metadata_cue_surfaces(&selected);
+        assert_eq!(surfaces.len(), 1);
+        let parent_surfaces =
+            collect_metadata_cue_surfaces(&[album.clone()]);
+        assert_eq!(parent_surfaces.len(), 2);
+        let clicked = metadata_cue_surface_key(&surfaces[0].cue_path);
+        let active = parent_surfaces
+            .iter()
+            .position(|surface| metadata_cue_surface_key(&surface.cue_path) == clicked)
+            .unwrap_or(0);
+        surfaces = parent_surfaces;
+        assert_eq!(active, 1, "clicked side stays the active tab");
+        assert_eq!(surfaces.len(), 2);
+    }
+
+    #[test]
+    #[test]
+    fn metadata_cue_surface_collection_handles_crlf_wv_real_tree_replica() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("Pink Floyd - 1973 - The Dark Side Of The Moon (LP, 24-192, Japanese EOP-80778)");
+        std::fs::create_dir_all(album.join("Covers")).expect("dirs");
+        std::fs::write(album.join("Covers/front.jpg"), b"jpg").expect("cover");
+        for (stem, side) in [("tdsotm_a", "A"), ("tdsotm_b", "B")] {
+            let image = album.join(format!("{stem}.wv"));
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                       "-i", "sine=frequency=440:sample_rate=192000:duration=1",
+                       "-c:a", "wavpack"])
+                .arg(&image)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("ffmpeg fixture");
+            assert!(status.success());
+            let cue = format!(
+                "REM GENRE \"Progressive Rock\"\r\nREM DATE 1973\r\nPERFORMER \"Pink Floyd\"\r\nTITLE \"The Dark Side Of The Moon (Side {side})\"\r\nFILE \"{stem}.wv\" WAVE\r\n  TRACK 01 AUDIO\r\n    TITLE \"T1\"\r\n    INDEX 01 00:00:00\r\n  TRACK 02 AUDIO\r\n    TITLE \"T2\"\r\n    INDEX 01 00:20:00\r\n  TRACK 03 AUDIO\r\n    TITLE \"T3\"\r\n    INDEX 01 00:40:00\r\n"
+            );
+            std::fs::write(album.join(format!("{stem}.cue")), cue).expect("cue fixture");
+        }
+
+        let surfaces = collect_metadata_cue_surfaces(&[album.clone()]);
+        assert_eq!(surfaces.len(), 2, "replica must yield two cue surfaces");
+        assert_eq!(surfaces[0].sheet.tracks.len(), 3);
     }
 
     #[test]
