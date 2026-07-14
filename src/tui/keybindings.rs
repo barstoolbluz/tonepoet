@@ -12,10 +12,6 @@ use super::button_map::TuiButton;
 use super::draw_browse::{
     browse_toolbar_area_for_screen, options_menu_geometry_for_area, OptionsMenuGeometry,
 };
-use super::draw_output_options::{
-    OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW, OUTPUT_OPTIONS_FORCE_ENCODE_ROW,
-    OUTPUT_OPTIONS_WRITE_LOG_ROW,
-};
 use super::message::AppMessage;
 use crate::convert::{ConversionOptions, ConversionStatus};
 
@@ -571,6 +567,17 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
 // ── Convert screen keybindings ───────────────────────────────────────
 
 fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    if app.convert.focus == ConvertFocus::OutputOptions
+        && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+    {
+        let (maximized, area_height) = output_options_render_layout(app);
+        app.convert.output_options.field_focus = app
+            .convert
+            .output_options
+            .field_focus
+            .clamp_for_area(maximized, area_height);
+    }
+
     match (key.code, key.modifiers) {
         // Tab cycles fields within output options, and panes elsewhere. Companion
         // rows are included only in maximized output-options mode.
@@ -578,15 +585,23 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             if app.convert.focus == ConvertFocus::OutputOptions
                 && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
         {
-            let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
-            app.convert.output_options.field_focus = app.convert.output_options.field_focus.next_for(maximized);
+            let (maximized, area_height) = output_options_render_layout(app);
+            app.convert.output_options.field_focus = app
+                .convert
+                .output_options
+                .field_focus
+                .next_for_area(maximized, area_height);
         }
         (KeyCode::BackTab, KeyModifiers::SHIFT)
             if app.convert.focus == ConvertFocus::OutputOptions
                 && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
         {
-            let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
-            app.convert.output_options.field_focus = app.convert.output_options.field_focus.prev_for(maximized);
+            let (maximized, area_height) = output_options_render_layout(app);
+            app.convert.output_options.field_focus = app
+                .convert
+                .output_options
+                .field_focus
+                .prev_for_area(maximized, area_height);
         }
         (KeyCode::Tab, KeyModifiers::NONE) => {
             app.convert.focus = app.convert.focus.next();
@@ -753,15 +768,23 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             if app.convert.focus == ConvertFocus::OutputOptions
                 && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
         {
-            let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
-            app.convert.output_options.field_focus = app.convert.output_options.field_focus.prev_for(maximized);
+            let (maximized, area_height) = output_options_render_layout(app);
+            app.convert.output_options.field_focus = app
+                .convert
+                .output_options
+                .field_focus
+                .prev_for_area(maximized, area_height);
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
                 && !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
         {
-            let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
-            app.convert.output_options.field_focus = app.convert.output_options.field_focus.next_for(maximized);
+            let (maximized, area_height) = output_options_render_layout(app);
+            app.convert.output_options.field_focus = app
+                .convert
+                .output_options
+                .field_focus
+                .next_for_area(maximized, area_height);
         }
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
@@ -918,7 +941,24 @@ fn finish_hidden_inline_edits(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
     let output_visible = app.current_screen == AppScreen::Convert
         && app.convert.focus == ConvertFocus::OutputOptions
         && !app.convert.is_collapsed(ConvertFocus::OutputOptions);
-    if app.convert.output_options.editing.is_some() && !output_visible {
+    if output_visible {
+        let (maximized, area_height) = output_options_render_layout(app);
+        let visible_fields = OutputOptionsField::visible_fields_for_area(maximized, area_height);
+        if let Some(editing) = app.convert.output_options.editing {
+            if !visible_fields.contains(&editing) {
+                // Text-input blur policy is commit-on-blur. A resize can make a
+                // field disappear without an explicit click/focus target, so it
+                // must be treated exactly like a focus change before any key can
+                // be routed to the inline editor.
+                commit_output_options_inline_edit(app);
+            }
+        }
+        app.convert.output_options.field_focus = app
+            .convert
+            .output_options
+            .field_focus
+            .clamp_for_area(maximized, area_height);
+    } else if app.convert.output_options.editing.is_some() {
         commit_output_options_inline_edit(app);
     }
 
@@ -1568,9 +1608,22 @@ fn cycle_browse_metadata_focus(app: &mut AppState, forward: bool) {
     app.set_status("Browse metadata focus — Enter or type to edit, Esc returns to the file list");
 }
 
+fn output_options_render_layout(app: &AppState) -> (bool, u16) {
+    app.button_map.output_options_layout().unwrap_or_else(|| {
+        // Before the first Convert-screen render, preserve the historical full
+        // maximized cycle. After rendering, ButtonRenderMap carries the actual
+        // pane height and keyboard focus will skip rows that were not drawn.
+        (app.convert.is_maximized(ConvertFocus::OutputOptions), u16::MAX)
+    })
+}
+
 fn open_output_options_text_edit(app: &mut AppState) {
-    let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
-    let field = app.convert.output_options.field_focus.clamp_for(maximized);
+    let (maximized, area_height) = output_options_render_layout(app);
+    let field = app
+        .convert
+        .output_options
+        .field_focus
+        .clamp_for_area(maximized, area_height);
     app.convert.output_options.field_focus = field;
 
     match field {
@@ -1590,9 +1643,18 @@ fn open_output_options_text_edit(app: &mut AppState) {
             app.convert.output_options.write_log.select_next();
             app.preset.mark_modified();
         }
+        OutputOptionsField::Actions => open_conversion_actions_wizard(app),
         _ if field.is_text_field() => begin_output_options_inline_edit(app, field, None),
         _ => {}
     }
+}
+
+fn open_conversion_actions_wizard(app: &mut AppState) {
+    let state = super::conversion_actions_ui::ConversionActionsWizardState::new(
+        app.convert.output_options.actions.clone(),
+    );
+    app.active_overlay = ActiveOverlay::ConversionActionsWizard(Box::new(state));
+    app.set_status("Editing conversion actions");
 }
 
 fn output_options_field_value(app: &AppState, field: OutputOptionsField) -> String {
@@ -1612,7 +1674,8 @@ fn output_options_field_value(app: &AppState, field: OutputOptionsField) -> Stri
         OutputOptionsField::MergeMode
         | OutputOptionsField::ForceEncode
         | OutputOptionsField::DiscSubfolders
-        | OutputOptionsField::WriteLog => String::new(),
+        | OutputOptionsField::WriteLog
+        | OutputOptionsField::Actions => String::new(),
     }
 }
 
@@ -1677,7 +1740,8 @@ fn commit_output_options_inline_edit(app: &mut AppState) {
         OutputOptionsField::MergeMode
         | OutputOptionsField::ForceEncode
         | OutputOptionsField::DiscSubfolders
-        | OutputOptionsField::WriteLog => {}
+        | OutputOptionsField::WriteLog
+        | OutputOptionsField::Actions => {}
     }
 }
 
@@ -4352,25 +4416,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             complete_theme_builder_action(app, state, action);
         }
         ActiveOverlay::ConversionActionsWizard(state) => {
-            match super::conversion_actions_ui::handle_wizard_key(*state, key) {
-                super::conversion_actions_ui::WizardKeyResult::Continue(mut state) => {
-                    super::conversion_actions_ui::refresh_wizard_preview_for_app(
-                        &mut state,
-                        app,
-                    );
-                    app.active_overlay = ActiveOverlay::ConversionActionsWizard(Box::new(state));
-                }
-                super::conversion_actions_ui::WizardKeyResult::Commit(pipeline) => {
-                    app.convert.output_options.actions = pipeline;
-                    app.preset.modified = true;
-                    app.active_overlay = ActiveOverlay::None;
-                    app.set_status("Conversion actions saved to Output Options");
-                }
-                super::conversion_actions_ui::WizardKeyResult::Cancel => {
-                    app.active_overlay = ActiveOverlay::None;
-                    app.set_status("Conversion actions unchanged");
-                }
-            }
+            let preview_rect = app.button_map.find_button_rect(&TuiButton::ActionsConfigPreview);
+            let result = super::conversion_actions_ui::handle_wizard_key_with_preview_rect(*state, key, preview_rect);
+            apply_conversion_actions_wizard_result(app, result);
         }
         ActiveOverlay::ActionsRun(mut state) => {
             use super::conversion_actions_ui::ActionsRunStatus;
@@ -7574,6 +7622,443 @@ fn handle_theme_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
     let hit = app.button_map.find_button_at(mouse.column, mouse.row);
     let action = super::theme_builder::handle_theme_builder_mouse(&mut *state, mouse, hit);
     complete_theme_builder_action(app, state, action);
+}
+
+
+fn continue_conversion_actions_wizard(
+    app: &mut AppState,
+    mut state: super::conversion_actions_ui::ConversionActionsWizardState,
+) {
+    let preview_rect = app.button_map.find_button_rect(&TuiButton::ActionsConfigPreview);
+    if state.preview_dirty {
+        super::conversion_actions_ui::refresh_wizard_preview_for_app(&mut state, app);
+    }
+    super::conversion_actions_ui::clamp_wizard_preview_scroll_for_rect(&mut state, preview_rect);
+    app.active_overlay = ActiveOverlay::ConversionActionsWizard(Box::new(state));
+}
+
+fn apply_conversion_actions_wizard_result(
+    app: &mut AppState,
+    result: super::conversion_actions_ui::WizardKeyResult,
+) {
+    match result {
+        super::conversion_actions_ui::WizardKeyResult::Continue(state) => {
+            continue_conversion_actions_wizard(app, state);
+        }
+        super::conversion_actions_ui::WizardKeyResult::ValidateConfigApply(mut state) => {
+            if state.preview_dirty {
+                super::conversion_actions_ui::refresh_wizard_preview_for_app(&mut state, app);
+            }
+            match super::conversion_actions_ui::finalize_action_config_apply_after_preview(state) {
+                super::conversion_actions_ui::WizardKeyResult::Continue(state) => {
+                    continue_conversion_actions_wizard(app, state);
+                }
+                other => apply_conversion_actions_wizard_result(app, other),
+            }
+        }
+        super::conversion_actions_ui::WizardKeyResult::Commit(pipeline) => {
+            app.convert.output_options.actions = pipeline;
+            app.preset.modified = true;
+            app.active_overlay = ActiveOverlay::None;
+            app.set_status("Conversion actions saved to Output Options");
+        }
+        super::conversion_actions_ui::WizardKeyResult::CommitDefault(state) => {
+            commit_conversion_actions_default_with_save(app, state, |config| config.save_with_outcome());
+        }
+        super::conversion_actions_ui::WizardKeyResult::Cancel => {
+            app.active_overlay = ActiveOverlay::None;
+            app.set_status("Conversion actions unchanged");
+        }
+    }
+}
+
+fn commit_conversion_actions_default_with_save<F>(
+    app: &mut AppState,
+    state: super::conversion_actions_ui::ConversionActionsWizardState,
+    save: F,
+)
+where
+    F: FnOnce(&crate::config::TonepoetConfig) -> anyhow::Result<crate::config::ConfigSaveOutcome>,
+{
+    let pipeline = state.draft.clone();
+    let mut next_config = app.config.clone();
+    next_config.conversion.actions = pipeline.clone();
+
+    match save(&next_config) {
+        Ok(outcome) => {
+            app.config = next_config;
+            app.convert.output_options.actions = pipeline;
+            app.preset.modified = true;
+            app.active_overlay = ActiveOverlay::None;
+            if let Some(warning) = outcome.durability_warning() {
+                app.set_status(format!(
+                    "Conversion actions saved; config.toml was replaced but durability is unconfirmed: {warning}"
+                ));
+            } else {
+                app.set_status("Conversion actions saved to Output Options and config.toml default");
+            }
+        }
+        Err(error) => {
+            app.active_overlay = ActiveOverlay::ConversionActionsWizard(Box::new(state));
+            app.set_status(format!(
+                "config.toml default save failed; conversion actions were not changed: {error}"
+            ));
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod conversion_actions_default_commit_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::convert::pipeline::{ActionPipeline, ConversionAction, CreateFolderAction};
+    use std::path::PathBuf;
+
+    fn folder_pipeline(name: &str) -> ActionPipeline {
+        ActionPipeline {
+            pre: Vec::new(),
+            post: vec![ConversionAction::CreateFolder(CreateFolderAction {
+                path: PathBuf::from(name),
+                continue_on_error: false,
+            })],
+        }
+    }
+
+    fn wizard_state_with_pipeline(pipeline: ActionPipeline) -> super::super::conversion_actions_ui::ConversionActionsWizardState {
+        super::super::conversion_actions_ui::ConversionActionsWizardState::new(pipeline)
+    }
+
+    #[test]
+    fn save_as_default_writes_temporary_config_file_before_session_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let state = wizard_state_with_pipeline(folder_pipeline("written-default"));
+
+        commit_conversion_actions_default_with_save(&mut app, state, |config| {
+            config.save_to_path_with_outcome(&config_path)
+        });
+
+        let encoded = std::fs::read_to_string(&config_path).expect("saved config");
+        let decoded: TonepoetConfig = toml::from_str(&encoded).expect("saved config parses");
+        assert_eq!(decoded.conversion.actions.post.len(), 1);
+        assert_eq!(app.convert.output_options.actions.post.len(), 1);
+        assert_eq!(app.config.conversion.actions.post.len(), 1);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+
+    #[test]
+    fn save_as_default_success_is_transactional_after_save() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let state = wizard_state_with_pipeline(folder_pipeline("saved-default"));
+        let mut saved_pipeline_len = None;
+
+        commit_conversion_actions_default_with_save(&mut app, state, |config| {
+            saved_pipeline_len = Some(config.conversion.actions.post.len());
+            Ok(crate::config::ConfigSaveOutcome::Durable)
+        });
+
+        assert_eq!(saved_pipeline_len, Some(1));
+        assert_eq!(app.convert.output_options.actions.post.len(), 1);
+        assert_eq!(app.config.conversion.actions.post.len(), 1);
+        assert!(app.preset.modified);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+
+
+    #[test]
+    fn double_click_dispatch_drives_two_mouse_events_through_wizard_handler() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::ConversionActionsWizard(Box::new(
+            super::super::conversion_actions_ui::ConversionActionsWizardState::new(
+                ActionPipeline::default(),
+            ),
+        ));
+        app.button_map.record_button(
+            TuiButton::ActionsAvailable(0),
+            Rect::new(10, 10, 20, 1),
+        );
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_conversion_actions_wizard_mouse(&mut app, click());
+        handle_conversion_actions_wizard_mouse(&mut app, click());
+
+        let ActiveOverlay::ConversionActionsWizard(state) = &app.active_overlay else {
+            panic!("wizard should remain open after configure-on-add")
+        };
+        assert_eq!(state.draft.post.len(), 1);
+        assert!(matches!(
+            state.dialog,
+            super::super::conversion_actions_ui::ActionsWizardDialog::Configure(_)
+        ));
+    }
+
+    #[test]
+    fn small_maximized_output_options_keyboard_cycle_skips_unrendered_actions_row() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::OutputOptions;
+        app.convert.output_options.field_focus = OutputOptionsField::ExcludeFiles;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::OutputOptions);
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        app.button_map.clear();
+        terminal
+            .draw(|frame| {
+                crate::tui::convert_screen::draw_convert_screen(
+                    frame,
+                    frame.size(),
+                    &mut app,
+                    theme,
+                );
+            })
+            .expect("draw convert screen");
+        assert_eq!(app.button_map.output_options_layout(), Some((true, 13)));
+        assert!(app
+            .button_map
+            .find_button_rect(&TuiButton::ActionsPipelineField)
+            .is_none());
+
+        let (tx, _rx) = mpsc::channel(1);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert_eq!(
+            app.convert.output_options.field_focus,
+            OutputOptionsField::DestPath,
+            "keyboard focus must wrap from the last rendered Output Options field, not visit hidden conversion/actions rows"
+        );
+    }
+
+    #[test]
+    fn hidden_output_options_inline_edit_commits_before_printable_key_after_resize() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::OutputOptions;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::OutputOptions);
+        app.convert.output_options.companion_exclude_files = "before".to_string();
+
+        let mut tall = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40))
+            .expect("tall terminal");
+        app.button_map.clear();
+        tall.draw(|frame| {
+            crate::tui::convert_screen::draw_convert_screen(
+                frame,
+                frame.size(),
+                &mut app,
+                theme,
+            );
+        })
+        .expect("draw tall convert screen");
+        assert!(OutputOptionsField::visible_fields_for_area(true, app.button_map.output_options_layout().unwrap().1)
+            .contains(&OutputOptionsField::ExcludeFiles));
+
+        begin_output_options_inline_edit(&mut app, OutputOptionsField::ExcludeFiles, None);
+        app.convert.output_options.edit_input =
+            super::super::text_input::TextInputState::new("edited".to_string());
+        assert_eq!(app.convert.output_options.editing, Some(OutputOptionsField::ExcludeFiles));
+
+        let mut short = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 28))
+            .expect("short terminal");
+        app.button_map.clear();
+        short.draw(|frame| {
+            crate::tui::convert_screen::draw_convert_screen(
+                frame,
+                frame.size(),
+                &mut app,
+                theme,
+            );
+        })
+        .expect("draw short convert screen");
+        assert_eq!(app.button_map.output_options_layout(), Some((true, 11)));
+        assert!(!OutputOptionsField::visible_fields_for_area(true, 11)
+            .contains(&OutputOptionsField::ExcludeFiles));
+
+        let (tx, _rx) = mpsc::channel(1);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert_eq!(app.convert.output_options.editing, None);
+        assert_eq!(
+            app.convert.output_options.companion_exclude_files,
+            "edited",
+            "the hidden editor must blur-commit before the printable key is routed"
+        );
+        assert_eq!(
+            app.convert.output_options.field_focus,
+            OutputOptionsField::MergeMode,
+            "focus must be clamped to a rendered Output Options field"
+        );
+    }
+
+    #[test]
+    fn rendered_output_options_actions_row_click_opens_wizard() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::OutputOptions;
+        app.convert.output_options.field_focus = OutputOptionsField::Actions;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::OutputOptions);
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        app.button_map.clear();
+        terminal
+            .draw(|frame| {
+                crate::tui::convert_screen::draw_convert_screen(
+                    frame,
+                    frame.size(),
+                    &mut app,
+                    theme,
+                );
+            })
+            .expect("draw convert screen");
+        let actions_rect = app
+            .button_map
+            .find_button_rect(&TuiButton::ActionsPipelineField)
+            .expect("production Convert-screen pass should register Actions row");
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: actions_rect.x,
+                row: actions_rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::ConversionActionsWizard(_)));
+        assert_eq!(app.convert.output_options.field_focus, OutputOptionsField::Actions);
+    }
+
+    #[test]
+    fn save_as_default_failure_preserves_session_config_and_dialog() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.output_options.actions = folder_pipeline("session-before");
+        app.config.conversion.actions = folder_pipeline("config-before");
+        app.preset.modified = false;
+        let state = wizard_state_with_pipeline(folder_pipeline("draft-not-written"));
+
+        commit_conversion_actions_default_with_save(&mut app, state, |_config| {
+            Err(anyhow::anyhow!("disk full"))
+        });
+
+        let ConversionAction::CreateFolder(session_action) = &app.convert.output_options.actions.post[0] else {
+            panic!("session action")
+        };
+        assert_eq!(session_action.path, PathBuf::from("session-before"));
+        let ConversionAction::CreateFolder(config_action) = &app.config.conversion.actions.post[0] else {
+            panic!("config action")
+        };
+        assert_eq!(config_action.path, PathBuf::from("config-before"));
+        assert!(!app.preset.modified, "failed default save must not mark the preset dirty");
+        assert!(
+            matches!(app.active_overlay, ActiveOverlay::ConversionActionsWizard(_)),
+            "failed default save must keep the wizard open"
+        );
+        assert!(
+            app.status_message
+                .as_ref()
+                .map(|(text, _)| text.contains("were not changed"))
+                .unwrap_or(false),
+            "failure status should report transactional refusal"
+        );
+    }
+
+
+    #[test]
+    fn save_as_default_post_rename_sync_warning_commits_with_honest_status() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let state = wizard_state_with_pipeline(folder_pipeline("durability-warning"));
+
+        commit_conversion_actions_default_with_save(&mut app, state, |_config| {
+            Ok(crate::config::ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(
+                "parent sync failed".to_string(),
+            ))
+        });
+
+        assert_eq!(app.convert.output_options.actions.post.len(), 1);
+        assert_eq!(app.config.conversion.actions.post.len(), 1);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(
+            app.status_message
+                .as_ref()
+                .map(|(text, _)| text.contains("durability is unconfirmed"))
+                .unwrap_or(false),
+            "post-rename sync failure must not be reported as an unchanged config"
+        );
+    }
+}
+
+fn handle_conversion_actions_wizard_mouse(app: &mut AppState, mouse: MouseEvent) {
+    let button = app.button_map.find_button_at(mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            let ActiveOverlay::ConversionActionsWizard(state) = overlay else {
+                app.active_overlay = overlay;
+                return;
+            };
+            let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) { -3 } else { 3 };
+            let preview_rect = app.button_map.find_button_rect(&TuiButton::ActionsConfigPreview);
+            let result = super::conversion_actions_ui::handle_wizard_scroll(
+                *state,
+                button,
+                delta,
+                preview_rect,
+            );
+            apply_conversion_actions_wizard_result(app, result);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(button) = button else {
+                app.double_click.clear();
+                return;
+            };
+            let double_click_candidate = matches!(
+                button,
+                TuiButton::ActionsAvailable(_) | TuiButton::ActionsPipelineRow(_, _)
+            );
+            let is_double = double_click_candidate
+                && app.double_click.register_click(
+                    button.clone(),
+                    mouse.column,
+                    mouse.row,
+                    std::time::Duration::from_millis(400),
+                );
+            if !double_click_candidate {
+                app.double_click.clear();
+            }
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            let ActiveOverlay::ConversionActionsWizard(state) = overlay else {
+                app.active_overlay = overlay;
+                return;
+            };
+            let result = super::conversion_actions_ui::handle_wizard_button(*state, button, is_double);
+            apply_conversion_actions_wizard_result(app, result);
+        }
+        _ => {}
+    }
 }
 
 fn handle_file_task_user_action(
@@ -24366,78 +24851,6 @@ fn retry_failed(app: &mut AppState) {
 
 /// Handle mouse events
 
-fn handle_output_options_pill_mouse_by_coordinate(app: &mut AppState, x: u16, y: u16) -> bool {
-    if app.current_screen != AppScreen::Convert
-        || app.convert.is_collapsed(ConvertFocus::OutputOptions)
-        || !app.convert.is_maximized(ConvertFocus::OutputOptions)
-    {
-        return false;
-    }
-
-    // The destination field is always registered for a visible Output Options
-    // pane. Its row is pane_y + 1 and its x coordinate is pane_x + 1, which lets
-    // us reconstruct the pane origin without depending on the optional pill rows
-    // themselves being present in ButtonRenderMap.
-    let Some(dest_rect) = app.button_map.find_button_rect(&TuiButton::DestPathField) else {
-        return false;
-    };
-    let pane_x = dest_rect.x.saturating_sub(1);
-    let pane_y = dest_rect.y.saturating_sub(1);
-    let label_col = pane_x + 17;
-    let Some(row) = y.checked_sub(pane_y) else {
-        return false;
-    };
-
-    match row {
-        OUTPUT_OPTIONS_FORCE_ENCODE_ROW => {
-            let Some(index) = pill_index_at_x(&app.convert.output_options.force_encode, x, label_col) else {
-                return false;
-            };
-            app.convert.focus = ConvertFocus::OutputOptions;
-            app.convert.output_options.field_focus = OutputOptionsField::ForceEncode;
-            app.convert.output_options.force_encode.selected = index;
-            app.preset.mark_modified();
-            true
-        }
-        OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW => {
-            let Some(index) = pill_index_at_x(&app.convert.output_options.disc_subfolders, x, label_col) else {
-                return false;
-            };
-            app.convert.focus = ConvertFocus::OutputOptions;
-            app.convert.output_options.field_focus = OutputOptionsField::DiscSubfolders;
-            app.convert.output_options.disc_subfolders.selected = index;
-            app.preset.mark_modified();
-            true
-        }
-        OUTPUT_OPTIONS_WRITE_LOG_ROW => {
-            let Some(index) = pill_index_at_x(&app.convert.output_options.write_log, x, label_col) else {
-                return false;
-            };
-            app.convert.focus = ConvertFocus::OutputOptions;
-            app.convert.output_options.field_focus = OutputOptionsField::WriteLog;
-            app.convert.output_options.write_log.selected = index;
-            app.preset.mark_modified();
-            true
-        }
-        _ => false,
-    }
-}
-
-fn pill_index_at_x<T>(state: &super::pill::PillState<T>, x: u16, start_x: u16) -> Option<usize> {
-    let mut pill_x = start_x;
-    for (index, option) in state.options.iter().enumerate() {
-        if index > 0 {
-            pill_x = pill_x.saturating_add(2);
-        }
-        let width = option.label.len() as u16 + 2;
-        if x >= pill_x && x < pill_x.saturating_add(width) {
-            return option.enabled.then_some(index);
-        }
-        pill_x = pill_x.saturating_add(width);
-    }
-    None
-}
-
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
     // Metadata editor mouse: intercept all events when the editor is open.
     if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
@@ -24491,6 +24904,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // FormatSettings: dedicated handler for pill clicks inside the overlay.
     if matches!(app.active_overlay, ActiveOverlay::FormatSettings { .. }) {
         handle_format_settings_mouse(app, mouse, tx);
+        return;
+    }
+
+    if matches!(app.active_overlay, ActiveOverlay::ConversionActionsWizard(_)) {
+        handle_conversion_actions_wizard_mouse(app, mouse);
         return;
     }
 
@@ -24906,15 +25324,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
-    // Defensive fallback for below-the-fold Output Options pills. The normal path
-    // uses ButtonRenderMap entries registered during rendering, but these rows
-    // have regressed before because the rendered labels and hit-map rows drifted.
-    // Prefer the actual mouse coordinate for these rows so a visible `disc dirs`
-    // click cannot silently toggle the wrong pill or no-op because of a stale map.
-    if handle_output_options_pill_mouse_by_coordinate(app, x, y) {
-        return;
-    }
-
     // Check button map — skip screen-specific buttons if they belong
     // to a different screen (stale button_map from the previous frame).
     if let Some(button) = clicked_button {
@@ -25041,6 +25450,34 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.convert.focus = ConvertFocus::OutputOptions;
                 begin_output_options_inline_edit(app, OutputOptionsField::ExcludeFiles, None);
             }
+            TuiButton::ActionsPipelineField => {
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::Actions;
+                open_conversion_actions_wizard(app);
+            }
+            // Wizard/config-box buttons are consumed by the
+            // ConversionActionsWizard overlay's mouse handler before this
+            // screen-level dispatch runs; reaching them here means the overlay
+            // already closed and the click is stale. Deliberate no-op.
+            TuiButton::ActionsAvailable(_)
+            | TuiButton::ActionsAvailablePane
+            | TuiButton::ActionsPipelinePane
+            | TuiButton::ActionsPipelineRow(_, _)
+            | TuiButton::ActionsPipelineNudgeUp(_, _)
+            | TuiButton::ActionsPipelineNudgeDown(_, _)
+            | TuiButton::ActionsAddingPhase(_)
+            | TuiButton::ActionsFooterAdd
+            | TuiButton::ActionsFooterConfigure
+            | TuiButton::ActionsFooterSave
+            | TuiButton::ActionsFooterSaveDefault
+            | TuiButton::ActionsFooterDone
+            | TuiButton::ActionsConfigField(_)
+            | TuiButton::ActionsConfigMode(_)
+            | TuiButton::ActionsConfigToken(_)
+            | TuiButton::ActionsConfigApply
+            | TuiButton::ActionsConfigCancel
+            | TuiButton::ActionsConfigPreview
+            | TuiButton::ActionsConfigModal => {}
             TuiButton::SourceBrowseButton => {
                 app.browse.return_target = super::browse::BrowseReturnTarget::ConvertSource;
                 app.current_screen = AppScreen::Browse;

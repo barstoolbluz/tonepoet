@@ -150,7 +150,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             draw_bulk_rename(f, &state, theme);
         }
         ActiveOverlay::ConversionActionsWizard(ref state) => {
-            super::conversion_actions_ui::draw_wizard(f, state, theme);
+            super::conversion_actions_ui::draw_wizard(f, state, &mut app.button_map, theme);
         }
         ActiveOverlay::ActionsRun(ref state) => {
             super::conversion_actions_ui::draw_actions_run(f, state, theme);

@@ -94,6 +94,8 @@ pub enum TuiButton {
     CompanionExtensionsField,
     ExcludeFilesField,
     CompanionFoldersField,
+    /// Output Options Actions row. Click opens the conversion-actions wizard.
+    ActionsPipelineField,
     MetadataField(MetadataFieldKind),
     /// Convert metadata file-list row (absolute source index).
     MetadataFileRow(usize),
@@ -251,6 +253,31 @@ pub enum TuiButton {
     DiscBrowserConvert,
     DiscBrowserClose,
 
+    // Conversion actions wizard overlay.
+    ActionsAvailable(usize),
+    /// Available pane body. Used for blank-space hover/scroll.
+    ActionsAvailablePane,
+    /// Pipeline pane body. Used for blank-space hover/scroll.
+    ActionsPipelinePane,
+    /// Pipeline row. bool=true means pre-conversion, false means post-conversion.
+    ActionsPipelineRow(bool, usize),
+    ActionsPipelineNudgeUp(bool, usize),
+    ActionsPipelineNudgeDown(bool, usize),
+    ActionsAddingPhase(bool),
+    ActionsFooterAdd,
+    ActionsFooterConfigure,
+    ActionsFooterSave,
+    ActionsFooterSaveDefault,
+    ActionsFooterDone,
+    ActionsConfigField(usize),
+    ActionsConfigMode(usize),
+    ActionsConfigToken(usize),
+    ActionsConfigApply,
+    ActionsConfigCancel,
+    ActionsConfigPreview,
+    /// Catch-all surface for Dialog B so modal blank space never falls through.
+    ActionsConfigModal,
+
     // Template builder: open pills on output options pane.
     TemplateBuildFolderButton,
     TemplateBuildFilenameButton,
@@ -349,6 +376,25 @@ impl TuiButton {
             | Self::DiscBrowserExpand(_)
             | Self::DiscBrowserConvert
             | Self::DiscBrowserClose
+            | Self::ActionsAvailable(_)
+            | Self::ActionsAvailablePane
+            | Self::ActionsPipelinePane
+            | Self::ActionsPipelineRow(_, _)
+            | Self::ActionsPipelineNudgeUp(_, _)
+            | Self::ActionsPipelineNudgeDown(_, _)
+            | Self::ActionsAddingPhase(_)
+            | Self::ActionsFooterAdd
+            | Self::ActionsFooterConfigure
+            | Self::ActionsFooterSave
+            | Self::ActionsFooterSaveDefault
+            | Self::ActionsFooterDone
+            | Self::ActionsConfigField(_)
+            | Self::ActionsConfigMode(_)
+            | Self::ActionsConfigToken(_)
+            | Self::ActionsConfigApply
+            | Self::ActionsConfigCancel
+            | Self::ActionsConfigPreview
+            | Self::ActionsConfigModal
             | Self::TemplateBuilderToken(_)
             | Self::TemplateBuilderSavedItem(_)
             | Self::TemplateBuilderApply
@@ -435,6 +481,7 @@ impl TuiButton {
             | Self::CompanionExtensionsField
             | Self::ExcludeFilesField
             | Self::CompanionFoldersField
+            | Self::ActionsPipelineField
             | Self::MetadataField(_)
             | Self::MetadataFileRow(_)
             | Self::SourceBrowseButton
@@ -514,6 +561,42 @@ impl TuiButton {
 pub struct ButtonRenderMap {
     button_bounds: Vec<(TuiButton, Rect)>,
     metadata_file_list_visible_rows: Option<usize>,
+    output_options_layout: Option<(bool, u16)>,
+}
+
+/// Reusable double-click detector for button-map targets.
+///
+/// A double click is the same rendered target, at the same terminal cell, inside
+/// a bounded interval. Keeping this state outside individual widgets prevents
+/// each overlay from inventing subtly different timing and target semantics.
+#[derive(Debug, Clone, Default)]
+pub struct DoubleClickState {
+    last: Option<(TuiButton, u16, u16, std::time::Instant)>,
+}
+
+impl DoubleClickState {
+    pub fn register_click(
+        &mut self,
+        target: TuiButton,
+        x: u16,
+        y: u16,
+        interval: std::time::Duration,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        let is_double = self
+            .last
+            .as_ref()
+            .map(|(prior, px, py, at)| {
+                *prior == target && *px == x && *py == y && now.duration_since(*at) <= interval
+            })
+            .unwrap_or(false);
+        self.last = if is_double { None } else { Some((target, x, y, now)) };
+        is_double
+    }
+
+    pub fn clear(&mut self) {
+        self.last = None;
+    }
 }
 
 impl ButtonRenderMap {
@@ -521,6 +604,7 @@ impl ButtonRenderMap {
         Self {
             button_bounds: Vec::new(),
             metadata_file_list_visible_rows: None,
+            output_options_layout: None,
         }
     }
 
@@ -528,11 +612,31 @@ impl ButtonRenderMap {
     pub fn clear(&mut self) {
         self.button_bounds.clear();
         self.metadata_file_list_visible_rows = None;
+        self.output_options_layout = None;
     }
 
-    /// Record that a button was rendered at the given screen coordinates
+    /// Record that a button was rendered at the given screen coordinates.
     pub fn record_button(&mut self, button: TuiButton, screen_rect: Rect) {
         self.button_bounds.push((button, screen_rect));
+    }
+
+    /// Expose recorded buttons for render helpers/tests without exposing the
+    /// internal vector mutably.
+    pub fn recorded_buttons(&self) -> &[(TuiButton, Rect)] {
+        &self.button_bounds
+    }
+
+
+    /// Record the Output Options pane geometry from the most recent Convert
+    /// screen render. Keyboard focus cycling uses this to avoid selecting rows
+    /// that are not rendered in small maximized panes.
+    pub fn record_output_options_layout(&mut self, maximized: bool, area_height: u16) {
+        self.output_options_layout = Some((maximized, area_height));
+    }
+
+    /// Return the Output Options pane geometry from the most recent render.
+    pub fn output_options_layout(&self) -> Option<(bool, u16)> {
+        self.output_options_layout
     }
 
     /// Record the current metadata file-list viewport size. This is transient
@@ -558,9 +662,12 @@ impl ButtonRenderMap {
     /// Find which button (if any) contains the given screen coordinates.
     /// Returns the LAST recorded button at that position (topmost in draw order).
     pub fn find_button_at(&self, x: u16, y: u16) -> Option<TuiButton> {
-        // Iterate in reverse so overlays/later-drawn elements take priority
         for (button, rect) in self.button_bounds.iter().rev() {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+            if x >= rect.x
+                && x < rect.x.saturating_add(rect.width)
+                && y >= rect.y
+                && y < rect.y.saturating_add(rect.height)
+            {
                 return Some(*button);
             }
         }

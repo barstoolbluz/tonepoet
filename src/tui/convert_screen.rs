@@ -16,8 +16,7 @@ use super::draw_metadata::{draw_metadata_pane, draw_metadata_title_bar};
 use super::draw_output::{draw_format_pane, draw_format_title_bar};
 use super::draw_output_options::{
     draw_output_options_pane, draw_output_options_title_bar,
-    OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW, OUTPUT_OPTIONS_FORCE_ENCODE_ROW,
-    OUTPUT_OPTIONS_WRITE_LOG_ROW,
+    register_output_options_mouse_targets,
 };
 use super::draw_preset_bar::draw_preset_bar;
 use super::draw_source::{draw_source_pane, draw_source_title_bar};
@@ -384,73 +383,24 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
 
 fn register_output_options_buttons(app: &mut AppState, area: Rect) {
     register_title_bar_buttons(&mut app.button_map, area, ConvertFocus::OutputOptions);
+    let maximized = app.convert.is_maximized(ConvertFocus::OutputOptions);
+    app.button_map.record_output_options_layout(maximized, area.height);
     if app.convert.is_collapsed(ConvertFocus::OutputOptions) {
         return;
     }
 
-    let state = &app.convert.output_options;
-    let buttons = &mut app.button_map;
-    let label_col = area.x + 17;
-    register_pill_row(buttons, &state.merge, area.y + 4, label_col, |i| TuiButton::MergePill(i));
-
-    let inner_x = area.x + 1;
-    let inner_w = area.width.saturating_sub(2);
-    buttons.record_button(TuiButton::DestPathField, Rect::new(inner_x, area.y + 1, inner_w, 1));
-    let pill_zone = 6 + 1 + 8 + 1;
-    let text_w = inner_w.saturating_sub(pill_zone);
-    buttons.record_button(
-        TuiButton::FolderTemplateField,
-        Rect::new(inner_x, area.y + 2, text_w, 1),
+    // Output Options concrete controls are registered through the same helper
+    // that owns their rendered row constants. Keep this in the normal
+    // Convert-screen second pass; do not recreate event-time coordinate
+    // fallbacks, hidden render side channels, or pane-generic synthetic child
+    // targets. Register after the title-bar target so concrete controls win
+    // ButtonRenderMap overlap resolution.
+    register_output_options_mouse_targets(
+        &mut app.button_map,
+        area,
+        &app.convert.output_options,
+        maximized,
     );
-    buttons.record_button(
-        TuiButton::FilenameTemplateField,
-        Rect::new(inner_x, area.y + 3, text_w, 1),
-    );
-    let load_x = area.x + area.width.saturating_sub(pill_zone);
-    buttons.record_button(TuiButton::TemplateLoadFolderButton, Rect::new(load_x, area.y + 2, 6, 1));
-    buttons.record_button(TuiButton::TemplateBuildFolderButton, Rect::new(load_x + 7, area.y + 2, 8, 1));
-    buttons.record_button(TuiButton::TemplateLoadFilenameButton, Rect::new(load_x, area.y + 3, 6, 1));
-    buttons.record_button(TuiButton::TemplateBuildFilenameButton, Rect::new(load_x + 7, area.y + 3, 8, 1));
-
-    if app.convert.is_maximized(ConvertFocus::OutputOptions) && area.height >= 11 {
-        buttons.record_button(
-            TuiButton::CompanionExtensionsField,
-            Rect::new(inner_x, area.y + 8, inner_w, 1),
-        );
-        buttons.record_button(
-            TuiButton::CompanionFoldersField,
-            Rect::new(inner_x, area.y + 9, inner_w, 1),
-        );
-        if area.height >= 12 {
-            buttons.record_button(
-                TuiButton::ExcludeFilesField,
-                Rect::new(inner_x, area.y + 10, inner_w, 1),
-            );
-        }
-    }
-    if app.convert.is_maximized(ConvertFocus::OutputOptions) && area.height >= 17 {
-        register_pill_row(
-            buttons,
-            &state.force_encode,
-            area.y + OUTPUT_OPTIONS_FORCE_ENCODE_ROW,
-            label_col,
-            |i| TuiButton::ForceEncodePill(i),
-        );
-        register_pill_row(
-            buttons,
-            &state.disc_subfolders,
-            area.y + OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW,
-            label_col,
-            |i| TuiButton::DiscSubfoldersPill(i),
-        );
-        register_pill_row(
-            buttons,
-            &state.write_log,
-            area.y + OUTPUT_OPTIONS_WRITE_LOG_ROW,
-            label_col,
-            |i| TuiButton::WriteLogPill(i),
-        );
-    }
 }
 
 fn register_metadata_fields(buttons: &mut ButtonRenderMap, area: Rect) {
@@ -597,6 +547,10 @@ fn draw_convert_action_bar(f: &mut Frame, area: Rect, buttons: &mut ButtonRender
 #[cfg(test)]
 mod output_options_button_map_tests {
     use super::*;
+    use super::super::draw_output_options::{
+        OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW, OUTPUT_OPTIONS_FORCE_ENCODE_ROW,
+        OUTPUT_OPTIONS_WRITE_LOG_ROW,
+    };
     use crate::config::TonepoetConfig;
     use crate::tui::app::AppScreen;
     use ratatui::backend::TestBackend;
@@ -644,6 +598,91 @@ mod output_options_button_map_tests {
                 .find_button_at(label_col, pane_y + OUTPUT_OPTIONS_WRITE_LOG_ROW),
             Some(TuiButton::WriteLogPill(0)),
             "write-log pill hit row must match the rendered write log row",
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod output_options_registration_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{AppScreen, OutputOptionsField};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn draw_convert_screen_registers_rendered_output_options_actions_row() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::OutputOptions;
+        app.convert.output_options.field_focus = OutputOptionsField::Actions;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::OutputOptions);
+        app.button_map.clear();
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
+            .expect("draw convert screen");
+
+        assert!(
+            app.button_map
+                .find_button_rect(&TuiButton::ActionsPipelineField)
+                .is_some(),
+            "production draw_convert_screen/register_buttons path must register the rendered Actions row when it is actually rendered"
+        );
+    }
+
+    #[test]
+    fn draw_convert_screen_does_not_register_actions_row_when_maximized_pane_too_short() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::OutputOptions;
+        app.convert.output_options.field_focus = OutputOptionsField::Actions;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::OutputOptions);
+        app.button_map.clear();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
+            .expect("draw convert screen");
+
+        assert_eq!(app.button_map.output_options_layout(), Some((true, 13)));
+        assert!(
+            app.button_map
+                .find_button_rect(&TuiButton::ActionsPipelineField)
+                .is_none(),
+            "a maximized Output Options pane shorter than the Actions row threshold must not register invisible Actions targets"
+        );
+    }
+
+    #[test]
+    fn draw_convert_screen_does_not_register_actions_row_when_output_options_collapsed() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Source;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Source);
+        app.button_map.clear();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
+            .expect("draw convert screen");
+
+        assert!(
+            app.button_map
+                .find_button_rect(&TuiButton::ActionsPipelineField)
+                .is_none(),
+            "collapsed Output Options pane must not receive invisible Actions-row targets"
         );
     }
 }

@@ -3575,10 +3575,9 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::Actions => {
-            let mut state = super::conversion_actions_ui::ConversionActionsWizardState::new(
+            let state = super::conversion_actions_ui::ConversionActionsWizardState::new(
                 app.convert.output_options.actions.clone(),
             );
-            super::conversion_actions_ui::refresh_wizard_preview_for_app(&mut state, app);
             app.active_overlay = super::app::ActiveOverlay::ConversionActionsWizard(Box::new(state));
             app.set_status("Editing conversion actions");
         }

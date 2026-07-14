@@ -9,8 +9,9 @@ use ratatui::{
 };
 
 use super::app::{FormatState, OutputOptionsField, OutputOptionsState};
+use super::button_map::{ButtonRenderMap, TuiButton};
 use super::inline_edit::{inline_cursor_col, render_inline_value};
-use super::pill::render_pill_spans;
+use super::pill::{render_pill_spans, PillState};
 use super::probe::SourceInfo;
 use crate::convert::formats::AudioFormat;
 
@@ -20,6 +21,200 @@ use crate::convert::formats::AudioFormat;
 pub const OUTPUT_OPTIONS_FORCE_ENCODE_ROW: u16 = 13;
 pub const OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW: u16 = 14;
 pub const OUTPUT_OPTIONS_WRITE_LOG_ROW: u16 = 15;
+pub const OUTPUT_OPTIONS_ACTIONS_ROW: u16 = 18;
+
+const OUTPUT_OPTIONS_TEMPLATE_LOAD_WIDTH: u16 = 6;
+const OUTPUT_OPTIONS_TEMPLATE_BUILD_WIDTH: u16 = 8;
+const OUTPUT_OPTIONS_TEMPLATE_GAP: u16 = 1;
+
+/// Register Output Options mouse targets from the same row-offset constants used
+/// by `draw_output_options_pane`. This is intentionally separate from drawing so
+/// the app's standard second pass can populate `ButtonRenderMap` after layout is
+/// known, without event-time coordinate reconstruction.
+pub fn register_output_options_mouse_targets(
+    buttons: &mut ButtonRenderMap,
+    area: Rect,
+    opts: &OutputOptionsState,
+    maximized: bool,
+) {
+    if area.height < 5 || area.width < 30 {
+        return;
+    }
+
+    let content_x = area.x.saturating_add(1);
+    let content_width = area.width.saturating_sub(2);
+    if content_width == 0 {
+        return;
+    }
+    let row_rect = |row: u16| Rect::new(content_x, area.y.saturating_add(row), content_width, 1);
+    let row_visible = |row: u16| row < area.height.saturating_sub(1);
+
+    if row_visible(1) {
+        buttons.record_button(TuiButton::DestPathField, row_rect(1));
+    }
+    if row_visible(2) {
+        buttons.record_button(TuiButton::FolderTemplateField, row_rect(2));
+        register_output_options_template_buttons(buttons, area, 2, true);
+    }
+    if row_visible(3) {
+        buttons.record_button(TuiButton::FilenameTemplateField, row_rect(3));
+        register_output_options_template_buttons(buttons, area, 3, false);
+    }
+    if row_visible(4) {
+        register_output_options_pills(
+            buttons,
+            area,
+            4,
+            "merge      ",
+            &opts.merge,
+            TuiButton::MergePill,
+        );
+    }
+
+    if maximized && area.height >= 11 {
+        if row_visible(8) {
+            buttons.record_button(TuiButton::CompanionExtensionsField, row_rect(8));
+        }
+        if row_visible(9) {
+            buttons.record_button(TuiButton::CompanionFoldersField, row_rect(9));
+        }
+        if area.height >= 12 && row_visible(10) {
+            buttons.record_button(TuiButton::ExcludeFilesField, row_rect(10));
+        }
+    }
+
+    if maximized && area.height >= 17 {
+        register_output_options_pills(
+            buttons,
+            area,
+            OUTPUT_OPTIONS_FORCE_ENCODE_ROW,
+            "force enc ",
+            &opts.force_encode,
+            TuiButton::ForceEncodePill,
+        );
+        register_output_options_pills(
+            buttons,
+            area,
+            OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW,
+            "disc dirs ",
+            &opts.disc_subfolders,
+            TuiButton::DiscSubfoldersPill,
+        );
+        register_output_options_pills(
+            buttons,
+            area,
+            OUTPUT_OPTIONS_WRITE_LOG_ROW,
+            "write log  ",
+            &opts.write_log,
+            TuiButton::WriteLogPill,
+        );
+    }
+
+    if maximized && area.height >= 20 && row_visible(OUTPUT_OPTIONS_ACTIONS_ROW) {
+        buttons.record_button(TuiButton::ActionsPipelineField, row_rect(OUTPUT_OPTIONS_ACTIONS_ROW));
+    }
+}
+
+fn register_output_options_template_buttons(
+    buttons: &mut ButtonRenderMap,
+    area: Rect,
+    row: u16,
+    folder_template: bool,
+) {
+    if row >= area.height.saturating_sub(1) {
+        return;
+    }
+    let right_border_x = area.x.saturating_add(area.width).saturating_sub(1);
+    let build_x = right_border_x.saturating_sub(OUTPUT_OPTIONS_TEMPLATE_BUILD_WIDTH);
+    let load_x = build_x
+        .saturating_sub(OUTPUT_OPTIONS_TEMPLATE_GAP)
+        .saturating_sub(OUTPUT_OPTIONS_TEMPLATE_LOAD_WIDTH);
+    if load_x <= area.x || build_x <= area.x {
+        return;
+    }
+    let y = area.y.saturating_add(row);
+    let (load_button, build_button) = if folder_template {
+        (
+            TuiButton::TemplateLoadFolderButton,
+            TuiButton::TemplateBuildFolderButton,
+        )
+    } else {
+        (
+            TuiButton::TemplateLoadFilenameButton,
+            TuiButton::TemplateBuildFilenameButton,
+        )
+    };
+    // Register after the full-row field target so the visible pills win
+    // overlapping hit tests. This mirrors the rendered right-aligned pill row.
+    buttons.record_button(
+        load_button,
+        Rect::new(load_x, y, OUTPUT_OPTIONS_TEMPLATE_LOAD_WIDTH, 1),
+    );
+    buttons.record_button(
+        build_button,
+        Rect::new(build_x, y, OUTPUT_OPTIONS_TEMPLATE_BUILD_WIDTH, 1),
+    );
+}
+
+fn register_output_options_pills<T>(
+    buttons: &mut ButtonRenderMap,
+    area: Rect,
+    row: u16,
+    label: &str,
+    state: &PillState<T>,
+    button_for: impl Fn(usize) -> TuiButton,
+) {
+    if row >= area.height.saturating_sub(1) {
+        return;
+    }
+    let y = area.y.saturating_add(row);
+    let right = area.x.saturating_add(area.width).saturating_sub(1);
+    let label_width = format!("   {}  ", label).chars().count() as u16;
+    let mut x = area.x.saturating_add(1).saturating_add(label_width);
+    for (index, option) in state.options.iter().enumerate() {
+        if index > 0 {
+            x = x.saturating_add(2);
+        }
+        let width = option.label.chars().count() as u16 + 2;
+        if x >= right {
+            break;
+        }
+        let visible_width = width.min(right.saturating_sub(x));
+        buttons.record_button(button_for(index), Rect::new(x, y, visible_width, 1));
+        x = x.saturating_add(width);
+    }
+}
+
+
+/// Draw the output options pane and register its mouse targets in the standard
+/// render-time `ButtonRenderMap` pass.
+pub fn draw_output_options_pane_with_mouse_targets(
+    f: &mut Frame,
+    area: Rect,
+    opts: &OutputOptionsState,
+    source_info: Option<&SourceInfo>,
+    total_source_size: u64,
+    format: &FormatState,
+    focused: bool,
+    maximized: bool,
+    buttons: &mut ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
+    draw_output_options_pane(
+        f,
+        area,
+        opts,
+        source_info,
+        total_source_size,
+        format,
+        focused,
+        maximized,
+        theme,
+    );
+    register_output_options_mouse_targets(buttons, area, opts, maximized);
+}
+
+
 
 /// Draw the output options pane with cyan border
 pub fn draw_output_options_pane(
@@ -62,6 +257,7 @@ pub fn draw_output_options_pane(
     let is_force_encode_focused = focused && opts.field_focus == OutputOptionsField::ForceEncode;
     let is_disc_subfolders_focused = focused && opts.field_focus == OutputOptionsField::DiscSubfolders;
     let is_write_log_focused = focused && opts.field_focus == OutputOptionsField::WriteLog;
+    let is_actions_focused = focused && opts.field_focus == OutputOptionsField::Actions;
 
     let is_editing = |field| opts.editing == Some(field);
 
@@ -256,6 +452,24 @@ pub fn draw_output_options_pane(
         ));
     }
 
+    if maximized && area.height >= 20 {
+        lines.push(bordered_line(border_color, w, vec![], theme));
+        lines.push(bordered_line(
+            border_color,
+            w,
+            vec![Span::styled("   Actions", output_options_section_header_style(theme))],
+            theme,
+        ));
+        lines.push(actions_row(
+            border_color,
+            w,
+            &output_options_actions_summary(&opts.actions),
+            opts.actions.is_empty(),
+            is_actions_focused,
+            theme,
+        ));
+    }
+
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
     while lines.len() < target_len_before_bottom {
         lines.push(bordered_line(border_color, w, vec![], theme));
@@ -310,6 +524,51 @@ fn field_row<'a>(
         vec![
             Span::styled(label, label_style),
             render_inline_value(value, editing, input, focused, value_w, theme),
+        ],
+        theme,
+    )
+}
+
+pub fn output_options_actions_summary(
+    actions: &crate::convert::pipeline::ActionPipeline,
+) -> String {
+    if actions.is_empty() {
+        return "none".to_string();
+    }
+    let pre = actions.pre.len();
+    let post = actions.post.len();
+    match (pre, post) {
+        (0, post) => format!("{post} post"),
+        (pre, 0) => format!("{pre} pre"),
+        (pre, post) => format!("{pre} pre · {post} post"),
+    }
+}
+
+fn actions_row<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    summary: &str,
+    empty: bool,
+    focused: bool,
+    theme: super::theme::Theme,
+) -> Line<'a> {
+    let label_style = if focused { theme.bright() } else { theme.muted() };
+    let summary_style = if empty {
+        Style::default().fg(theme.text_dim)
+    } else if focused {
+        theme.bright()
+    } else {
+        theme.accent()
+    };
+    bordered_line(
+        border_color,
+        width,
+        vec![
+            Span::styled("   pipeline    ", label_style),
+            Span::styled("▸ ", theme.muted()),
+            Span::styled(summary.to_string(), summary_style),
+            Span::raw("          "),
+            Span::styled("Enter/click edit", theme.muted()),
         ],
         theme,
     )
@@ -569,6 +828,206 @@ mod output_options_companion_render_tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+
+    #[test]
+    fn maximized_actions_row_renders_live_pipeline_summary() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut opts = OutputOptionsState::new();
+        opts.field_focus = OutputOptionsField::Actions;
+        opts.actions.post.push(crate::convert::pipeline::ConversionAction::CreateFolder(
+            crate::convert::pipeline::CreateFolderAction {
+                path: std::path::PathBuf::from("Logs"),
+                continue_on_error: false,
+            },
+        ));
+        let format = FormatState::new();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                draw_output_options_pane(
+                    frame,
+                    Rect::new(0, 0, 80, 20),
+                    &opts,
+                    None,
+                    0,
+                    &format,
+                    true,
+                    true,
+                    theme,
+                )
+            })
+            .expect("draw output options");
+
+        let mut row = String::new();
+        for x in 0..80 {
+            row.push_str(terminal.backend().buffer().get(x, OUTPUT_OPTIONS_ACTIONS_ROW).symbol());
+        }
+        assert!(row.contains("pipeline"), "actions row should render pipeline label: {row}");
+        assert!(row.contains("1 post"), "actions row should summarize post actions: {row}");
+        assert!(row.contains("Enter/click edit"), "actions row should advertise edit affordance: {row}");
+    }
+
+    #[test]
+    fn maximized_actions_row_registers_button_map_target_inside_pane_only() {
+        let opts = OutputOptionsState::new();
+        let mut buttons = ButtonRenderMap::new();
+        register_output_options_mouse_targets(
+            &mut buttons,
+            Rect::new(10, 4, 80, 20),
+            &opts,
+            true,
+        );
+
+        assert_eq!(
+            buttons.find_button_at(11, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
+            Some(TuiButton::ActionsPipelineField)
+        );
+        assert_eq!(
+            buttons.find_button_at(9, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
+            None,
+            "clicks outside the Output Options pane must not open the actions wizard"
+        );
+        assert_eq!(
+            buttons.find_button_at(89, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
+            None,
+            "right border must not be treated as the actions row"
+        );
+        assert_eq!(
+            buttons.find_button_at(90, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
+            None,
+            "outside cells must not be treated as the actions row"
+        );
+    }
+
+    #[test]
+    fn wrapped_output_options_draw_populates_button_map_for_actions_row() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let opts = OutputOptionsState::new();
+        let area = Rect::new(10, 4, 80, 20);
+        let format = FormatState::new();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut buttons = ButtonRenderMap::new();
+
+        terminal
+            .draw(|frame| {
+                draw_output_options_pane_with_mouse_targets(
+                    frame,
+                    area,
+                    &opts,
+                    None,
+                    0,
+                    &format,
+                    true,
+                    true,
+                    &mut buttons,
+                    theme,
+                );
+            })
+            .expect("draw output options");
+
+        assert_eq!(
+            buttons.find_button_at(11, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
+            Some(TuiButton::ActionsPipelineField),
+            "the production Output Options draw path must register the rendered Actions row"
+        );
+        assert_eq!(buttons.find_button_at(9, 4 + OUTPUT_OPTIONS_ACTIONS_ROW), None);
+    }
+
+    #[test]
+    fn output_options_registration_includes_template_pills_with_concrete_targets() {
+        let opts = OutputOptionsState::new();
+        let mut buttons = ButtonRenderMap::new();
+        let area = Rect::new(10, 4, 80, 20);
+
+        register_output_options_mouse_targets(&mut buttons, area, &opts, true);
+
+        let folder_y = area.y + 2;
+        let filename_y = area.y + 3;
+        let build_x = area.x + area.width - 1 - OUTPUT_OPTIONS_TEMPLATE_BUILD_WIDTH;
+        let load_x = build_x - OUTPUT_OPTIONS_TEMPLATE_GAP - OUTPUT_OPTIONS_TEMPLATE_LOAD_WIDTH;
+
+        assert_eq!(
+            buttons.find_button_at(load_x, folder_y),
+            Some(TuiButton::TemplateLoadFolderButton),
+            "folder template load pill must be registered by the shared helper"
+        );
+        assert_eq!(
+            buttons.find_button_at(build_x, folder_y),
+            Some(TuiButton::TemplateBuildFolderButton),
+            "folder template custom pill must be registered by the shared helper"
+        );
+        assert_eq!(
+            buttons.find_button_at(load_x, filename_y),
+            Some(TuiButton::TemplateLoadFilenameButton),
+            "filename template load pill must be registered by the shared helper"
+        );
+        assert_eq!(
+            buttons.find_button_at(build_x, filename_y),
+            Some(TuiButton::TemplateBuildFilenameButton),
+            "filename template custom pill must be registered by the shared helper"
+        );
+    }
+
+    #[test]
+    fn maximized_output_options_pill_targets_use_rendered_option_indices() {
+        let opts = OutputOptionsState::new();
+        let mut buttons = ButtonRenderMap::new();
+        let area = Rect::new(10, 4, 80, 20);
+
+        register_output_options_mouse_targets(&mut buttons, area, &opts, true);
+
+        assert!(
+            buttons
+                .recorded_buttons()
+                .iter()
+                .any(|(button, _)| matches!(button, TuiButton::ForceEncodePill(index) if *index < opts.force_encode.options.len())),
+            "registered force-encode pill targets must use concrete option indices"
+        );
+        assert!(
+            buttons
+                .recorded_buttons()
+                .iter()
+                .all(|(button, _)| !matches!(button, TuiButton::ForceEncodePill(usize::MAX) | TuiButton::DiscSubfoldersPill(usize::MAX) | TuiButton::WriteLogPill(usize::MAX))),
+            "Output Options registration must not create synthetic full-row sentinel pill targets"
+        );
+    }
+
+    #[test]
+    fn non_maximized_output_options_does_not_register_below_fold_targets() {
+        let opts = OutputOptionsState::new();
+        let mut buttons = ButtonRenderMap::new();
+        register_output_options_mouse_targets(
+            &mut buttons,
+            Rect::new(10, 4, 80, 20),
+            &opts,
+            false,
+        );
+
+        assert_eq!(
+            buttons.find_button_at(11, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
+            None,
+            "non-maximized Output Options must not expose invisible Actions-row hitboxes"
+        );
+        assert_eq!(
+            buttons.find_button_at(11, 4 + OUTPUT_OPTIONS_FORCE_ENCODE_ROW),
+            None,
+            "non-maximized Output Options must not expose invisible conversion-pill hitboxes"
+        );
+    }
+
+    #[test]
+    fn actions_summary_renders_none_for_empty_pipeline() {
+        assert_eq!(
+            output_options_actions_summary(&crate::convert::pipeline::ActionPipeline::default()),
+            "none"
+        );
+    }
 
     #[test]
     fn maximized_companion_header_uses_header_style_not_accent_style() {

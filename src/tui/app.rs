@@ -13,7 +13,7 @@ use tonepoet_pipeline::enums::{
     DsdFilterPreset, DsdNoiseShaper, DsdToPcmGainMode, ModulatorOrder,
 };
 use crate::convert::{ConversionConfig, ConversionItem, ConversionManager};
-use crate::tui::button_map::ButtonRenderMap;
+use crate::tui::button_map::{ButtonRenderMap, DoubleClickState};
 use crate::tui::pill::PillState;
 use crate::tui::probe::{SourceInfo, SourceMetadata};
 
@@ -2440,6 +2440,7 @@ pub enum OutputOptionsField {
     ForceEncode,
     DiscSubfolders,
     WriteLog,
+    Actions,
 }
 
 impl OutputOptionsField {
@@ -2449,7 +2450,20 @@ impl OutputOptionsField {
         Self::FilenameTemplate,
         Self::MergeMode,
     ];
-    const MAXIMIZED_FIELDS: [Self; 10] = [
+    const MAXIMIZED_FIELDS: [Self; 11] = [
+        Self::DestPath,
+        Self::FolderTemplate,
+        Self::FilenameTemplate,
+        Self::MergeMode,
+        Self::CompanionExtensions,
+        Self::CompanionFolders,
+        Self::ExcludeFiles,
+        Self::ForceEncode,
+        Self::DiscSubfolders,
+        Self::WriteLog,
+        Self::Actions,
+    ];
+    const MAXIMIZED_FIELDS_WITHOUT_ACTIONS: [Self; 10] = [
         Self::DestPath,
         Self::FolderTemplate,
         Self::FilenameTemplate,
@@ -2461,10 +2475,47 @@ impl OutputOptionsField {
         Self::DiscSubfolders,
         Self::WriteLog,
     ];
+    const MAXIMIZED_FIELDS_WITHOUT_CONVERSION_OR_ACTIONS: [Self; 7] = [
+        Self::DestPath,
+        Self::FolderTemplate,
+        Self::FilenameTemplate,
+        Self::MergeMode,
+        Self::CompanionExtensions,
+        Self::CompanionFolders,
+        Self::ExcludeFiles,
+    ];
+    const MAXIMIZED_FIELDS_WITHOUT_EXCLUDE_CONVERSION_OR_ACTIONS: [Self; 6] = [
+        Self::DestPath,
+        Self::FolderTemplate,
+        Self::FilenameTemplate,
+        Self::MergeMode,
+        Self::CompanionExtensions,
+        Self::CompanionFolders,
+    ];
 
     fn visible_fields(maximized: bool) -> &'static [Self] {
         if maximized {
             &Self::MAXIMIZED_FIELDS
+        } else {
+            &Self::COLLAPSED_FIELDS
+        }
+    }
+
+    /// Fields whose rows are actually rendered for a maximized Output Options
+    /// pane of the given height. Keep these thresholds in sync with
+    /// draw_output_options.rs; the Actions row exists only at height >= 20.
+    pub fn visible_fields_for_area(maximized: bool, area_height: u16) -> &'static [Self] {
+        if !maximized {
+            return &Self::COLLAPSED_FIELDS;
+        }
+        if area_height >= 20 {
+            &Self::MAXIMIZED_FIELDS
+        } else if area_height >= 17 {
+            &Self::MAXIMIZED_FIELDS_WITHOUT_ACTIONS
+        } else if area_height >= 12 {
+            &Self::MAXIMIZED_FIELDS_WITHOUT_CONVERSION_OR_ACTIONS
+        } else if area_height >= 11 {
+            &Self::MAXIMIZED_FIELDS_WITHOUT_EXCLUDE_CONVERSION_OR_ACTIONS
         } else {
             &Self::COLLAPSED_FIELDS
         }
@@ -2490,8 +2541,28 @@ impl OutputOptionsField {
         fields[(idx + fields.len() - 1) % fields.len()]
     }
 
+    pub fn next_for_area(self, maximized: bool, area_height: u16) -> Self {
+        let fields = Self::visible_fields_for_area(maximized, area_height);
+        let idx = fields.iter().position(|field| *field == self).unwrap_or(0);
+        fields[(idx + 1) % fields.len()]
+    }
+
+    pub fn prev_for_area(self, maximized: bool, area_height: u16) -> Self {
+        let fields = Self::visible_fields_for_area(maximized, area_height);
+        let idx = fields.iter().position(|field| *field == self).unwrap_or(0);
+        fields[(idx + fields.len() - 1) % fields.len()]
+    }
+
     pub fn clamp_for(self, maximized: bool) -> Self {
         if Self::visible_fields(maximized).contains(&self) {
+            self
+        } else {
+            Self::MergeMode
+        }
+    }
+
+    pub fn clamp_for_area(self, maximized: bool, area_height: u16) -> Self {
+        if Self::visible_fields_for_area(maximized, area_height).contains(&self) {
             self
         } else {
             Self::MergeMode
@@ -3850,6 +3921,7 @@ mod output_options_companion_projection_tests {
         assert_eq!(DestPath.prev_for(false), MergeMode);
         assert_eq!(CompanionExtensions.clamp_for(false), MergeMode);
         assert_eq!(CompanionFolders.clamp_for(false), MergeMode);
+        assert_eq!(Actions.clamp_for(false), MergeMode);
     }
 
     #[test]
@@ -3862,11 +3934,30 @@ mod output_options_companion_projection_tests {
         assert_eq!(ExcludeFiles.next_for(true), ForceEncode);
         assert_eq!(ForceEncode.next_for(true), DiscSubfolders);
         assert_eq!(DiscSubfolders.next_for(true), WriteLog);
-        assert_eq!(WriteLog.next_for(true), DestPath);
-        assert_eq!(DestPath.prev_for(true), WriteLog);
+        assert_eq!(WriteLog.next_for(true), Actions);
+        assert_eq!(Actions.next_for(true), DestPath);
+        assert_eq!(DestPath.prev_for(true), Actions);
+        assert_eq!(Actions.prev_for(true), WriteLog);
         assert_eq!(WriteLog.prev_for(true), DiscSubfolders);
         assert_eq!(DiscSubfolders.prev_for(true), ForceEncode);
         assert_eq!(CompanionExtensions.clamp_for(true), CompanionExtensions);
+    }
+
+    #[test]
+    fn output_options_field_cycle_matches_rows_rendered_for_small_maximized_panes() {
+        use super::OutputOptionsField::*;
+
+        assert_eq!(ExcludeFiles.next_for_area(true, 13), DestPath);
+        assert_eq!(DestPath.prev_for_area(true, 13), ExcludeFiles);
+        assert_eq!(WriteLog.clamp_for_area(true, 13), MergeMode);
+        assert_eq!(Actions.clamp_for_area(true, 13), MergeMode);
+
+        assert_eq!(WriteLog.next_for_area(true, 17), DestPath);
+        assert_eq!(DestPath.prev_for_area(true, 17), WriteLog);
+        assert_eq!(Actions.clamp_for_area(true, 17), MergeMode);
+
+        assert_eq!(WriteLog.next_for_area(true, 20), Actions);
+        assert_eq!(Actions.next_for_area(true, 20), DestPath);
     }
 }
 
@@ -8320,6 +8411,8 @@ pub struct AppState {
     pub visible_height: usize,
     pub items_snapshot: Vec<ConversionItem>,
     pub button_map: ButtonRenderMap,
+    /// Shared double-click tracking for button-map targets.
+    pub double_click: DoubleClickState,
 
     // Wizard (when active)
     pub wizard: Option<tonepoet_wizard::SimpleWizard>,
@@ -9145,6 +9238,7 @@ impl AppState {
             visible_height: 0,
             items_snapshot: Vec::new(),
             button_map: ButtonRenderMap::new(),
+            double_click: DoubleClickState::default(),
             wizard: None,
             wizard_mouse_areas: None,
             wizard_target: WizardTarget::ConfigureAll,
