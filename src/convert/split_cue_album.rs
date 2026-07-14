@@ -37,13 +37,17 @@ pub fn meaningful_common_cue_album_prefix(titles: &[String]) -> Option<String> {
     if titles.len() < 2 || titles.iter().any(|t| t.trim().is_empty()) {
         return None;
     }
+    // Case-insensitive comparison, preserving the FIRST title's casing:
+    // real rips mix "Of The Moon (Side B)" with "of the Moon (Japan ...)",
+    // and a case-sensitive compare would cut the shared title mid-phrase.
     let mut prefix: Vec<char> = titles[0].chars().collect();
     for title in &titles[1..] {
         let chars: Vec<char> = title.chars().collect();
         let mut common = 0;
         while common < prefix.len()
             && common < chars.len()
-            && prefix[common] == chars[common]
+            && (prefix[common] == chars[common]
+                || prefix[common].to_lowercase().eq(chars[common].to_lowercase()))
         {
             common += 1;
         }
@@ -241,6 +245,22 @@ mod tests {
     fn common_title_drops_dangling_side_word_from_shared_prefix() {
         let titles = vec!["Album Side A".to_string(), "Album Side B".to_string()];
         assert_eq!(common_cue_album_title(&titles).as_deref(), Some("Album"));
+    }
+
+    #[test]
+    fn common_title_prefix_is_case_insensitive_and_keeps_first_casing() {
+        // Real-tree shape: sides cased differently and carrying different
+        // parenthesized suffixes. A case-sensitive compare cuts at "Of"/"of"
+        // and the designator strip then eats "Side", leaving "The Dark".
+        let titles = vec![
+            "The Dark Side of the Moon (Japan Toshiba Harvest-Odeon EOP-80778 LP / 24-192)"
+                .to_string(),
+            "The Dark Side Of The Moon (Side B)".to_string(),
+        ];
+        assert_eq!(
+            common_cue_album_title(&titles).as_deref(),
+            Some("The Dark Side of the Moon")
+        );
     }
 
     #[test]
