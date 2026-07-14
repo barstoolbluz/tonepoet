@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 pub mod classify;
@@ -17,6 +17,7 @@ pub mod cap_fs;
 pub mod cue_parser;
 pub mod formats;
 pub mod queue_expansion;
+pub mod split_cue_album;
 pub mod source_admission;
 pub mod sacd;
 pub mod script_supervisor;
@@ -41,7 +42,9 @@ pub use cue_parser::{parse_cue, parse_cue_file, CueSheet, CueTrack};
 pub use queue_expansion::{
     count_audio_files_bounded, cue_sidecar_override_for_commit_path, expand_paths_to_audio,
     expand_paths_to_audio_with_metadata, expand_paths_to_audio_with_metadata_limited,
-    QueueExpansionLimitedError, QueueExpansionResult,
+    expand_paths_to_audio_with_metadata_using_grouping_decisions,
+    split_cue_album_grouping_key_for_queue, QueueExpansionLimitedError,
+    QueueExpansionResult, QueueSplitCueAlbumGroupingDecisions,
 };
 pub use labels::{detect_pressing_info, LabelInfo};
 pub use metadata::{extract_metadata_from_flac, extract_year_from_flac_files, FlacMetadata};
@@ -93,6 +96,10 @@ pub struct ConversionManager {
     pub config: ConversionConfig,
     paused: bool,
     stop_requested: bool,
+    /// Transient synthetic CUE inputs currently owned by queued conversion
+    /// items. The key is the queue item id; values are removed when the item is
+    /// terminal, removed from the queue, or when the manager drops.
+    synthetic_cue_artifacts: Arc<Mutex<HashMap<String, PathBuf>>>,
     /// Cancellation token for the active conversion run. Triggered by
     /// `stop_all_conversions()` to kill in-flight child processes.
     cancel_token: tokio_util::sync::CancellationToken,
@@ -229,6 +236,8 @@ fn _status_progress_for_update(status: &ConversionStatus, progress_hint: f32) ->
 impl ConversionManager {
     /// Create a new conversion manager
     pub fn new(config: ConversionConfig) -> Self {
+        crate::convert::queue_expansion::scavenge_stale_synthetic_cue_album_artifacts();
+
         let processor = ConversionProcessor::new(ProcessorConfig {
             worker_count: config.worker_count,
             tool_paths: config.tool_paths.clone(),
@@ -243,6 +252,7 @@ impl ConversionManager {
             config,
             paused: false,
             stop_requested: false,
+            synthetic_cue_artifacts: Arc::new(Mutex::new(HashMap::new())),
             cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -267,8 +277,30 @@ impl ConversionManager {
         dir: &Path,
         options: ConversionOptions,
     ) -> ConversionResult<()> {
-        let files = self.scan_directory(dir)?;
-        self.add_files(files, options).await
+        if !dir.is_dir() {
+            return Err(ConversionError::ValidationError(format!(
+                "not a directory: {}",
+                dir.display()
+            )));
+        }
+
+        let expansion = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(&[
+            dir.to_path_buf(),
+        ]);
+        if let Some(message) = expansion.first_error() {
+            return Err(ConversionError::ValidationError(message.to_string()));
+        }
+
+        let synthetic_cue_artifacts = expansion.synthetic_cue_artifacts.clone();
+        if let Err(err) = self.add_files(expansion.paths, options).await {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+            return Err(err);
+        }
+        let claimed = self.register_synthetic_cue_artifacts_for_current_queue(&synthetic_cue_artifacts);
+        for artifact in synthetic_cue_artifacts.difference(&claimed) {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
+        }
+        Ok(())
     }
 
     /// Scan a directory for queueable conversion inputs.
@@ -277,6 +309,7 @@ impl ConversionManager {
     /// canonical conversion-domain queue expansion planner. This avoids a
     /// second CUE/queue implementation inside `convert::mod` and keeps CLI,
     /// TUI, and manager directory scans on one set of semantics.
+    #[allow(dead_code)]
     fn scan_directory(&self, dir: &Path) -> ConversionResult<Vec<PathBuf>> {
         if !dir.is_dir() {
             return Err(ConversionError::ValidationError(format!(
@@ -517,6 +550,70 @@ impl ConversionManager {
         if let Ok(mut queue) = self.queue.try_write() {
             queue.clear();
         }
+        self.cleanup_all_synthetic_cue_artifacts();
+    }
+
+    pub fn register_synthetic_cue_artifact(&self, item_id: &str, path: &Path) {
+        if !crate::convert::queue_expansion::is_synthetic_cue_album_artifact(path) {
+            return;
+        }
+        if let Ok(mut artifacts) = self.synthetic_cue_artifacts.lock() {
+            artifacts.insert(item_id.to_string(), path.to_path_buf());
+        }
+    }
+
+    pub fn register_synthetic_cue_artifacts_for_current_queue(
+        &self,
+        paths: &std::collections::HashSet<PathBuf>,
+    ) -> std::collections::HashSet<PathBuf> {
+        let mut pairs: Vec<(String, PathBuf)> = Vec::new();
+        if let Ok(queue) = self.queue.try_read() {
+            for item in queue.all_items() {
+                for path in paths {
+                    if same_path_for_queue(&item.input_path, path) {
+                        pairs.push((item.id.clone(), path.clone()));
+                    }
+                }
+            }
+        }
+
+        let mut claimed = std::collections::HashSet::new();
+        for (item_id, path) in pairs {
+            self.register_synthetic_cue_artifact(&item_id, &path);
+            claimed.insert(path);
+        }
+        claimed
+    }
+
+    fn cleanup_synthetic_cue_artifact_for_item_id(&self, item_id: &str) {
+        let path = self
+            .synthetic_cue_artifacts
+            .lock()
+            .ok()
+            .and_then(|mut artifacts| artifacts.remove(item_id));
+        if let Some(path) = path {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(&path);
+        }
+    }
+
+    fn cleanup_synthetic_cue_artifacts_for_item_ids<I>(&self, item_ids: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for item_id in item_ids {
+            self.cleanup_synthetic_cue_artifact_for_item_id(&item_id);
+        }
+    }
+
+    pub fn cleanup_all_synthetic_cue_artifacts(&self) {
+        let paths = self
+            .synthetic_cue_artifacts
+            .lock()
+            .map(|mut artifacts| artifacts.drain().map(|(_, path)| path).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for path in paths {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(&path);
+        }
     }
 
     fn record_closed_track_epoch(item: &mut ConversionItem, track_index: u32, epoch: u64) {
@@ -540,6 +637,16 @@ impl ConversionManager {
 
     /// Update item status by ID
     pub fn update_item_status(&self, id: &str, status: ConversionStatus, _progress: f32) -> bool {
+        let terminal = matches!(
+            &status,
+            ConversionStatus::Completed { .. }
+                | ConversionStatus::CompletedWithActionErrors { .. }
+                | ConversionStatus::Partial { .. }
+                | ConversionStatus::Failed { .. }
+                | ConversionStatus::Cancelled
+        );
+        let mut updated = false;
+
         if let Ok(mut queue) = self.queue.try_write() {
             if let Some(item) = queue.find_item_mut(id) {
                 // Clear per-track sub-lines when the item-level phase moves
@@ -586,10 +693,14 @@ impl ConversionManager {
                     }
                     _ => {}
                 }
-                return true;
+                updated = true;
             }
         }
-        false
+
+        if updated && terminal {
+            self.cleanup_synthetic_cue_artifact_for_item_id(id);
+        }
+        updated
     }
 
     /// Update per-track progress for a multi-track source. Track-scoped
@@ -732,16 +843,19 @@ impl ConversionManager {
         self.paused = false;
         self.cancel_token.cancel();
         // Cancel all queued items
+        let mut cancelled_item_ids = Vec::new();
         if let Ok(mut queue) = self.queue.try_write() {
             for item in queue.all_items_mut() {
                 match &item.status {
                     ConversionStatus::Queued | ConversionStatus::Processing { .. } => {
                         item.status = ConversionStatus::Cancelled;
+                        cancelled_item_ids.push(item.id.clone());
                     }
                     _ => {}
                 }
             }
         }
+        self.cleanup_synthetic_cue_artifacts_for_item_ids(cancelled_item_ids);
     }
 
     /// Pause conversions
@@ -818,11 +932,26 @@ impl ConversionManager {
 
     /// Remove selected items from queue
     pub fn remove_selected(&mut self) -> usize {
-        if let Ok(mut queue) = self.queue.try_write() {
+        let selected_item_ids = if let Ok(queue) = self.queue.try_read() {
+            queue
+                .all_items()
+                .into_iter()
+                .filter(|item| item.selected)
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let removed = if let Ok(mut queue) = self.queue.try_write() {
             queue.remove_selected()
         } else {
             0
+        };
+        if removed > 0 {
+            self.cleanup_synthetic_cue_artifacts_for_item_ids(selected_item_ids);
         }
+        removed
     }
 
     /// Get all items as a cloned vector for UI display
@@ -836,14 +965,40 @@ impl ConversionManager {
 
     /// Clear completed items from queue
     pub fn clear_completed(&mut self) {
+        let finished_item_ids = self.finished_item_ids_snapshot();
         if let Ok(mut queue) = self.queue.try_write() {
             queue.clear_completed();
         }
+        self.cleanup_synthetic_cue_artifacts_for_item_ids(finished_item_ids);
     }
 
     pub fn clear_finished(&mut self) {
+        let finished_item_ids = self.finished_item_ids_snapshot();
         if let Ok(mut queue) = self.queue.try_write() {
             queue.clear_finished();
+        }
+        self.cleanup_synthetic_cue_artifacts_for_item_ids(finished_item_ids);
+    }
+
+    fn finished_item_ids_snapshot(&self) -> Vec<String> {
+        if let Ok(queue) = self.queue.try_read() {
+            queue
+                .all_items()
+                .into_iter()
+                .filter(|item| {
+                    matches!(
+                        &item.status,
+                        ConversionStatus::Completed { .. }
+                            | ConversionStatus::CompletedWithActionErrors { .. }
+                            | ConversionStatus::Partial { .. }
+                            | ConversionStatus::Failed { .. }
+                            | ConversionStatus::Cancelled
+                    )
+                })
+                .map(|item| item.id.clone())
+                .collect()
+        } else {
+            Vec::new()
         }
     }
 
@@ -851,6 +1006,7 @@ impl ConversionManager {
         if let Ok(mut queue) = self.queue.try_write() {
             queue.clear();
         }
+        self.cleanup_all_synthetic_cue_artifacts();
     }
 
     /// Get path to persisted conversion queue file
@@ -955,8 +1111,11 @@ impl ConversionManager {
                 .all_items()
                 .iter()
                 .filter(|item| {
+                    if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path) {
+                        return false;
+                    }
                     // Save: NotConfigured, Queued, Paused, Completed, Failed
-                    // Don't save: Processing, Cancelled
+                    // Don't save: Processing, Cancelled, transient synthetic CUE inputs
                     matches!(
                         item.status,
                         ConversionStatus::NotConfigured
@@ -982,6 +1141,12 @@ impl ConversionManager {
         std::fs::rename(&temp_path, &queue_path)?;
 
         Ok(())
+    }
+}
+
+impl Drop for ConversionManager {
+    fn drop(&mut self) {
+        self.cleanup_all_synthetic_cue_artifacts();
     }
 }
 
@@ -1619,6 +1784,33 @@ mod per_track_epoch_tests {
             .expect("item exists");
         assert!(item.active_tracks.is_empty());
         assert_eq!(item.closed_track_epochs.get(&0), Some(&7));
+    }
+
+    #[test]
+    fn terminal_item_status_removes_owned_synthetic_cue_artifact() {
+        let (manager, item_id) = test_manager_with_item();
+        // Mirror the canonical owner-root layout the predicate requires:
+        // <tmp>/tonepoet-synthetic-cue-albums/process-*/artifact-*/album.cue
+        let artifact_dir = std::env::temp_dir()
+            .join("tonepoet-synthetic-cue-albums")
+            .join(format!("process-{}-test", std::process::id()))
+            .join(format!("artifact-test-{item_id}"));
+        let artifact = artifact_dir.join("album.cue");
+        std::fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        std::fs::write(&artifact, b"TITLE \"Temp\"\n").expect("artifact file");
+        assert!(crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&artifact));
+
+        manager.register_synthetic_cue_artifact(&item_id, &artifact);
+        assert!(manager.update_item_status(
+            &item_id,
+            ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            },
+            100.0,
+        ));
+
+        assert!(!artifact_dir.exists(), "terminal queue state must remove the owned synthetic CUE artifact directory");
     }
 
     #[test]

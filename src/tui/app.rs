@@ -2340,7 +2340,7 @@ mod batch_format_extension_tests {
 }
 
 /// State for the source pane.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SourceState {
     pub mode: SourceMode,
     pub advanced_open: bool,
@@ -2361,6 +2361,51 @@ pub struct SourceState {
     /// resulting `ConversionItem`, so downstream detection skips sidecar CUE
     /// discovery while still honoring embedded CUESHEET tags.
     pub cue_artifact_audio: std::collections::HashSet<PathBuf>,
+    /// Synthetic CUE queue inputs staged for a merged split-CUE album while the
+    /// Convert screen is in review. Commit transfers these artifacts to the
+    /// conversion manager; replacing or clearing the source removes them.
+    pub synthetic_cue_artifacts: std::collections::HashSet<PathBuf>,
+}
+
+impl SourceState {
+    pub fn cleanup_synthetic_cue_artifacts(&mut self) {
+        let artifacts = std::mem::take(&mut self.synthetic_cue_artifacts);
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&artifacts);
+    }
+
+    pub fn cleanup_synthetic_cue_artifacts_not_in(&mut self, retained_paths: &[PathBuf]) {
+        let mut removed = std::collections::HashSet::new();
+        self.synthetic_cue_artifacts.retain(|path| {
+            let keep = crate::convert::queue_expansion::path_list_contains_queue_identity(retained_paths, path);
+            if !keep {
+                removed.insert(path.clone());
+            }
+            keep
+        });
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&removed);
+    }
+}
+
+impl Clone for SourceState {
+    fn clone(&self) -> Self {
+        // Synthetic CUE artifacts are owned resources, not copyable metadata.
+        // Cloned app/test snapshots must not acquire duplicate cleanup
+        // responsibility for source-owned temporary files.
+        Self {
+            mode: self.mode.clone(),
+            advanced_open: self.advanced_open,
+            batch_probe_pending: self.batch_probe_pending.clone(),
+            batch_probe_debounce: self.batch_probe_debounce.clone(),
+            cue_artifact_audio: self.cue_artifact_audio.clone(),
+            synthetic_cue_artifacts: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl Drop for SourceState {
+    fn drop(&mut self) {
+        self.cleanup_synthetic_cue_artifacts();
+    }
 }
 
 impl Default for SourceState {
@@ -2371,6 +2416,7 @@ impl Default for SourceState {
             batch_probe_pending: None,
             batch_probe_debounce: None,
             cue_artifact_audio: std::collections::HashSet::new(),
+            synthetic_cue_artifacts: std::collections::HashSet::new(),
         }
     }
 }
@@ -4126,6 +4172,8 @@ impl ConvertState {
     pub fn set_source_mode(&mut self, mode: SourceMode) {
         self.clear_pending_archive_preview();
         self.source.mode.cleanup_archive_preview_staging();
+        let retained_paths = mode.all_paths();
+        self.source.cleanup_synthetic_cue_artifacts_not_in(&retained_paths);
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
         self.refresh_source_constraints_preserving_format_selection();
@@ -4138,6 +4186,8 @@ impl ConvertState {
     pub fn set_source_mode_preserving_format_selection(&mut self, mode: SourceMode) {
         self.clear_pending_archive_preview();
         self.source.mode.cleanup_archive_preview_staging();
+        let retained_paths = mode.all_paths();
+        self.source.cleanup_synthetic_cue_artifacts_not_in(&retained_paths);
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
         self.refresh_source_constraints_preserving_format_selection();
@@ -5922,6 +5972,42 @@ impl MetadataTechnicalDetails {
     }
 }
 
+/// Stable source identity for one row in a unified split-CUE album surface.
+///
+/// The visible metadata grid is deliberately flattened to album track order,
+/// but save, edit, delete, and synthetic-CUE regeneration still need to know
+/// which sidecar/image/local track each row came from. This mapping is stored
+/// on the presentation surface rather than inferred from row position at save
+/// time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueAlbumTrackSource {
+    pub cue_path: std::path::PathBuf,
+    pub audio_path: std::path::PathBuf,
+    pub local_track_index: usize,
+    pub original_track_number: u32,
+    pub file_ref: String,
+    pub index00_frames: Option<u32>,
+    pub index01_frames: Option<u32>,
+    pub isrc: Option<String>,
+}
+
+/// State carried by a unified synthetic split-CUE album surface.
+///
+/// `audio_paths` is the save dimension: the generated CUESHEET is written
+/// identically to every member image through the normal metadata-editor tag
+/// writer. `track_sources` is the row dimension: one entry per visible track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueAlbumSyntheticSheet {
+    pub cue_paths: Vec<std::path::PathBuf>,
+    pub audio_paths: Vec<std::path::PathBuf>,
+    pub track_sources: Vec<CueAlbumTrackSource>,
+    pub album_title: Option<String>,
+    pub album_performer: Option<String>,
+    pub album_date: Option<String>,
+    pub album_genre: Option<String>,
+    pub album_catalog: Option<String>,
+}
+
 /// One presentation surface inside the metadata editor.
 ///
 /// Invariant: this struct owns a presentation's editable rows, labels, dirty
@@ -5976,6 +6062,9 @@ pub struct PresentationTab {
     /// Save-path tombstone for deleting an embedded CUESHEET while leaving any
     /// sidecar-derived synthetic row visible in the editor.
     pub pending_embedded_cuesheet_delete: bool,
+    /// Unified split-CUE album state. Present only for same-folder CUE groups
+    /// that the album-grouping ladder merged into one album surface.
+    pub cue_album_synthetic_sheet: Option<CueAlbumSyntheticSheet>,
 }
 
 impl Default for PresentationTab {
@@ -6004,6 +6093,7 @@ impl Default for PresentationTab {
             embedded_cuesheet_present: false,
             sidecar_cuesheet_shadow_present: false,
             pending_embedded_cuesheet_delete: false,
+            cue_album_synthetic_sheet: None,
         }
     }
 }
@@ -6082,6 +6172,7 @@ impl PresentationTab {
         tab.embedded_cuesheet_present = active.embedded_cuesheet_present;
         tab.sidecar_cuesheet_shadow_present = active.sidecar_cuesheet_shadow_present;
         tab.pending_embedded_cuesheet_delete = active.pending_embedded_cuesheet_delete;
+        tab.cue_album_synthetic_sheet = active.cue_album_synthetic_sheet.clone();
         tab
     }
 }
@@ -7390,7 +7481,9 @@ fn apply_write_results_to_tab(
     }
 
     reduce_saved_slots(tab, &saved_slots);
-    if tab.pending_embedded_cuesheet_delete && saved_slots.contains(&0) {
+    if tab.pending_embedded_cuesheet_delete
+        && pending_embedded_cuesheet_delete_fully_saved(tab, &saved_slots)
+    {
         tab.pending_embedded_cuesheet_delete = false;
         tab.embedded_cuesheet_present = false;
     }
@@ -7430,6 +7523,14 @@ fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
     }
 }
 
+fn pending_embedded_cuesheet_delete_fully_saved(
+    tab: &PresentationTab,
+    saved_slots: &std::collections::BTreeSet<usize>,
+) -> bool {
+    let path_count = tab.paths.len();
+    path_count > 0 && (0..path_count).all(|idx| saved_slots.contains(&idx))
+}
+
 fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections::BTreeSet<usize>) {
     if saved_slots.is_empty() {
         return;
@@ -7446,14 +7547,22 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
 
         if !file_aligned {
             if deleted.contains(&entry_idx) {
-                // A row-level delete for a non-file-aligned entry cannot be
-                // safely reduced from path-keyed write results. Examples
-                // include presentation-scoped or single-image/CUESHEET data
-                // where the entry does not map 1:1 onto `paths`. Keep the
-                // delete marker until a dedicated owner proves and clears the
-                // non-file-aligned write. Clearing it here would silently lose
-                // a pending delete after an unrelated file slot saved.
-                retained_deleted.push(entry_idx);
+                let unified_cue_album_fully_saved = tab.cue_album_synthetic_sheet.is_some()
+                    && path_count > 0
+                    && (0..path_count).all(|idx| saved_slots.contains(&idx));
+                if unified_cue_album_fully_saved {
+                    // Unified CUE-album per-track/album rows are not written
+                    // as independent tag vectors; their delete operation is
+                    // consumed by the regenerated embedded CUESHEET that was
+                    // just written to every member image.  Only then is it safe
+                    // to clear the non-file-aligned tombstone.
+                    remove_entries.push(entry_idx);
+                } else {
+                    // A row-level delete for a non-file-aligned entry cannot be
+                    // safely reduced from partial path-keyed write results. Keep
+                    // the marker so retry state is preserved.
+                    retained_deleted.push(entry_idx);
+                }
             } else if path_count == 1 && saved_slots.contains(&0) {
                 // Non-deleted single-file synthetic/display entries have no
                 // per-slot retry state to preserve. Once the sole file saved,
@@ -12741,6 +12850,53 @@ mod metadata_presentation_tab_tests {
         assert_eq!(state.active_surface().entries[0].per_file_originals[0], "new one");
         assert_eq!(state.active_surface().entries[0].per_file_originals[1], "old two");
         assert!(state.active_surface().dirty, "failed file remains dirty");
+    }
+
+    #[test]
+    fn partial_embedded_cuesheet_delete_keeps_retry_tombstone_until_all_member_images_save() {
+        let mut state = write_state();
+        state.active_surface_mut().pending_embedded_cuesheet_delete = true;
+        state.active_surface_mut().embedded_cuesheet_present = true;
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::failed(state.active_surface().paths[1].clone(), "locked"),
+                ],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.failed, 1);
+        assert!(state.active_surface().pending_embedded_cuesheet_delete);
+        assert!(state.active_surface().embedded_cuesheet_present);
+        assert!(state.active_surface().dirty, "remaining member image still needs CUESHEET deletion");
+
+        // Retry keeps the album-level tombstone and stages deletion through the
+        // same multi-file save path. Only after every member image reports a
+        // successful save may the tombstone be cleared.
+        let (session_id, generation) = state.begin_write();
+        let retry_summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[1].clone()),
+                ],
+            )
+            .expect("retry save result should reduce");
+
+        assert_eq!(retry_summary.saved, 2);
+        assert!(!retry_summary.remaining_dirty);
+        assert!(!state.active_surface().pending_embedded_cuesheet_delete);
+        assert!(!state.active_surface().embedded_cuesheet_present);
+        assert!(!state.active_surface().dirty);
     }
 
     #[test]

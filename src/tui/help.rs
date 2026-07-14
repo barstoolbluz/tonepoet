@@ -92,6 +92,9 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     (":ctdb-repair", "CTDB Reed-Solomon repair (parity)"),
                     (":view", "View text file (read-only)"),
                     (":edit-file", "Edit text file (not .log)"),
+                    (":cue-view", "View embedded or synthetic CUESHEET in metadata editor"),
+                    (":cuesheet-edit", "Edit embedded CUESHEET through the system editor"),
+                    (":cuesheet-delete", "Stage deletion of embedded CUESHEET tags"),
                 ],
             },
             HelpSection {
@@ -288,4 +291,27 @@ pub fn draw_help(f: &mut Frame, screen: AppScreen, scroll: usize, theme: super::
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered_help_pairs(screen: AppScreen) -> Vec<(&'static str, &'static str)> {
+        help_content_for(screen)
+            .into_iter()
+            .flat_map(|section| section.entries.into_iter())
+            .collect()
+    }
+
+    #[test]
+    fn metadata_help_renders_all_cue_sheet_commands() {
+        let entries = rendered_help_pairs(AppScreen::Browse);
+        for command in [":cue-view", ":cuesheet-edit", ":cuesheet-delete"] {
+            assert!(
+                entries.iter().any(|(key, desc)| *key == command && desc.contains("CUE")),
+                "Browse help must render {command} with a CUE description"
+            );
+        }
+    }
 }

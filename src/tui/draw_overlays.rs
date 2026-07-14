@@ -4461,16 +4461,19 @@ fn draw_metadata_editor(
             super::probe::MbRevertPill::UseMb => " [use MB]",
         };
         let pill_w = pill_text.chars().count();
-        // Synthetic-preview rows (CUESHEET) also get a `[view]` pill
-        // before the revert pill, opening a read-only CuePreview
-        // overlay seeded with the value.
-        let view_text = if super::probe::is_synthetic_preview(entry) {
-            " [view]"
+        // Synthetic-preview rows (CUESHEET) surface the full affordance set
+        // inline.  The existing MetadataEntryView button kind owns the whole
+        // `[view] [edit] [delete]` pill span; the mouse handler dispatches to
+        // the concrete action by click offset so no button-map schema change is
+        // required in this partial bundle.
+        let cue_actions_text = metadata_cuesheet_affordance_text(entry);
+        let view_w = if super::probe::is_synthetic_preview(entry) {
+            cue_actions_text.chars().count()
         } else {
-            ""
+            0
         };
-        let view_w = view_text.chars().count();
-        let combined_pill_w = view_w + pill_w;
+        let cue_actions_w = cue_actions_text.chars().count();
+        let combined_pill_w = cue_actions_w + pill_w;
         let val_for_pill = val_max.saturating_sub(combined_pill_w);
         let val_truncated = truncate_to_chars(&value_display, val_for_pill);
 
@@ -4495,9 +4498,9 @@ fn draw_metadata_editor(
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
-            if view_w > 0 {
+            if cue_actions_w > 0 {
                 spans.push(Span::styled(
-                    view_text.to_string(),
+                    cue_actions_text.to_string(),
                     Style::default()
                         .fg(theme.blue)
                         .add_modifier(Modifier::BOLD),
@@ -4523,7 +4526,7 @@ fn draw_metadata_editor(
                     button_map.record_button(
                         super::button_map::TuiButton::MetadataEntryRevert(i),
                         Rect::new(
-                            view_screen_x + view_w as u16,
+                            view_screen_x + cue_actions_w as u16,
                             content_area.y + visible_row,
                             pill_w as u16,
                             1,
@@ -7470,6 +7473,14 @@ fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect, theme
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn metadata_cuesheet_affordance_text(entry: &super::probe::TagEntry) -> &'static str {
+    if super::probe::is_synthetic_preview(entry) {
+        " [view] [edit] [delete]"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::app::{MetadataEditorState, PresentationTab};
@@ -7492,6 +7503,15 @@ mod tests {
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
+    }
+
+    #[test]
+    fn metadata_cuesheet_row_affordance_text_surfaces_all_actions() {
+        let cue = tag("CUESHEET", "FILE \"a.flac\" FLAC", vec!["FILE \"a.flac\" FLAC"]);
+        let title = tag("TITLE", "Track", vec!["Track"]);
+
+        assert_eq!(metadata_cuesheet_affordance_text(&cue), " [view] [edit] [delete]");
+        assert_eq!(metadata_cuesheet_affordance_text(&title), "");
     }
 
     fn presentation_tab(

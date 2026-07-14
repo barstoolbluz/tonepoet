@@ -1819,7 +1819,16 @@ pub fn populate_editor_from_mb_with_per_track_decision(
 
     populate_editor_mb_supplemental_with_per_track_decision(state, release, decision);
 
-    let n = state.active_surface().paths.len();
+    // A unified cue-album surface (one flattened track list spanning N
+    // images) dimensions its per-track entries by ROW, not by file; MB
+    // tracks map positionally onto rows exactly like a plain multi-file
+    // editor with that many files. Its row count also disqualifies the
+    // single-image special-casing below (n > 1).
+    let n = if state.active_surface().cue_album_synthetic_sheet.is_some() {
+        state.active_surface().file_labels.len().max(1)
+    } else {
+        state.active_surface().paths.len()
+    };
 
     fn find_or_create(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
@@ -1981,24 +1990,39 @@ pub fn populate_editor_from_mb_with_per_track_decision(
     } else {
         // Per-file populate: tag-per-file with track position == file
         // index + 1.
+        // Entries on a unified cue-album surface are dimensioned by ROW for
+        // per-track fields but by FILE for album-level fields, so every
+        // write is bounds-guarded: short (file-dimensioned) entries receive
+        // their own slot count and per-track rows receive all N.
+        fn set_slot(
+            state: &mut crate::tui::app::MetadataEditorState,
+            idx: usize,
+            slot: usize,
+            value: String,
+        ) {
+            let values = &mut state.active_surface_mut().entries[idx].per_file_values;
+            if slot < values.len() {
+                values[slot] = value;
+            }
+        }
         for i in 0..n {
             let mt = release.tracks.iter().find(|m| m.position as usize == i + 1);
             if let Some(mt) = mt {
                 if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
-                    state.active_surface_mut().entries[idx].per_file_values[i] = mt.title.clone();
+                    set_slot(state, idx, i, mt.title.clone());
                 }
                 if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
-                    state.active_surface_mut().entries[idx].per_file_values[i] = mt.artist.clone();
+                    set_slot(state, idx, i, mt.artist.clone());
                 }
             }
             if let Some(idx) = album_idx {
-                state.active_surface_mut().entries[idx].per_file_values[i] = release.title.clone();
+                set_slot(state, idx, i, release.title.clone());
             }
-            state.active_surface_mut().entries[tn_idx].per_file_values[i] = (i + 1).to_string();
+            set_slot(state, tn_idx, i, (i + 1).to_string());
             if let (Some(idx), Some(year)) =
                 (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
             {
-                state.active_surface_mut().entries[idx].per_file_values[i] = year.to_string();
+                set_slot(state, idx, i, year.to_string());
             }
         }
     }

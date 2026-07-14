@@ -2671,7 +2671,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     plan: &AlbumPlan,
     req: &PipelineRequest,
     staging: &StagingDir,
-    _runner: &dyn ToolRunner,
+    runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     reporter: Option<&dyn PipelineReporter>,
     tool_paths: &HashMap<String, PathBuf>,
@@ -2742,8 +2742,8 @@ async fn convert_tracks_with_reporter_with_tool_paths(
             staging.root.clone(),
             staging.job_id.clone(),
             convert_root.clone(),
+            runner,
             tool_paths.clone(),
-            None,
             cancel.clone(),
             tool_concurrency_limits.clone(),
             reporter,
@@ -2824,14 +2824,13 @@ async fn convert_one_track_work(
     staging_root: PathBuf,
     staging_job: String,
     convert_root: PathBuf,
+    runner: &dyn ToolRunner,
     tool_paths: HashMap<String, PathBuf>,
-    version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
     cancel: CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     reporter: Option<&dyn PipelineReporter>,
 ) -> Result<ScheduledTrackOutput, String> {
     let staging = StagingDir::borrowed(staging_root, staging_job);
-    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
     let realized = match realize_track_with_tool_limits_and_stats(
@@ -2839,7 +2838,7 @@ async fn convert_one_track_work(
         Some(&track),
         &req,
         &staging,
-        &runner,
+        runner,
         &cancel,
         tool_concurrency_limits.clone(),
         Some(&mut progress_tracker),
@@ -2875,7 +2874,7 @@ async fn convert_one_track_work(
         &realized_input,
         &staged_path,
         &convert_root,
-        &runner,
+        runner,
         &cancel,
         &tool_paths,
         tool_concurrency_limits.clone(),
@@ -2903,7 +2902,7 @@ async fn convert_one_track_work(
                     &track,
                     &realized_input,
                     &req.settings,
-                    &runner,
+                    runner,
                     &cancel,
                     tool_concurrency_limits.as_ref(),
                 )
@@ -2927,7 +2926,7 @@ async fn convert_one_track_work(
                     &staged_path,
                     post_encode_expected_samples,
                     &req.settings.target_format,
-                    &runner,
+                    runner,
                     &cancel,
                     tool_concurrency_limits.as_ref(),
                 )
@@ -20186,6 +20185,7 @@ pub async fn encode_track_for_scheduler_with_tool_limits_and_version_cache(
     reporter: &dyn PipelineReporter,
     cancel: CancellationToken,
 ) -> Result<ScheduledTrackOutput, String> {
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache);
     convert_one_track_work(
         track_index,
         track,
@@ -20194,8 +20194,8 @@ pub async fn encode_track_for_scheduler_with_tool_limits_and_version_cache(
         staging_root,
         staging_job,
         convert_root,
+        &runner,
         tool_paths,
-        version_cache,
         cancel,
         tool_concurrency_limits,
         Some(reporter),

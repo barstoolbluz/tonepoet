@@ -873,7 +873,12 @@ fn validate_track_number_identity(sheet: &CueSheet) -> Result<(), String> {
 fn validate_index_order_per_file(sheet: &CueSheet) -> Result<(), String> {
     let mut previous_by_file: HashMap<String, u32> = HashMap::new();
     for track in &sheet.tracks {
-        let current = track.index01_frames.expect("checked above");
+        let Some(current) = track.index01_frames else {
+            return Err(format!(
+                "CUE requires INDEX 01 for track {}",
+                track.number
+            ));
+        };
         let file_key = track
             .file
             .as_deref()
@@ -1497,14 +1502,20 @@ fn compute_track_boundaries_for_layout(
         })?;
         let start = cue_frames_to_samples(index01 as u64, probe.sample_rate);
 
-        let next_start = ((idx + 1)..sheet.tracks.len())
-            .find(|next_idx| image_keys[*next_idx] == *image_key)
-            .map(|next_idx| {
-                let next_frames = sheet.tracks[next_idx]
-                    .index01_frames
-                    .expect("validated INDEX 01");
-                cue_frames_to_samples(next_frames as u64, probe.sample_rate)
-            });
+        let mut next_start = None;
+        for next_idx in (idx + 1)..sheet.tracks.len() {
+            if image_keys[next_idx] != *image_key {
+                continue;
+            }
+            let next_frames = sheet.tracks[next_idx].index01_frames.ok_or_else(|| {
+                MaterializeError::Parse(format!(
+                    "track {} has no INDEX 01",
+                    sheet.tracks[next_idx].number
+                ))
+            })?;
+            next_start = Some(cue_frames_to_samples(next_frames as u64, probe.sample_rate));
+            break;
+        }
         let end = next_start.unwrap_or(probe.total_samples);
 
         if end <= start {
@@ -3628,6 +3639,77 @@ TRACK XX AUDIO
         assert_eq!(source.tracks[0].sample_rate, Some(44100));
         assert_eq!(source.tracks[0].bit_depth, Some(16));
         assert_eq!(source.tracks[0].expected_samples, Some(3_969_000));
+    }
+
+    #[tokio::test]
+    async fn synthetic_multifile_cue_materializes_as_one_prepared_album_source() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let samples_per_image: u64 = 4_410_000;
+        let probe_a = ffprobe_json_exact(44100, samples_per_image, 16);
+        let probe_b = ffprobe_json_exact(44100, samples_per_image, 16);
+        let cue = r#"PERFORMER "Artist"
+TITLE "Album"
+FILE "side_a.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "A1"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "A2"
+    INDEX 01 00:30:00
+FILE "side_b.flac" WAVE
+  TRACK 03 AUDIO
+    TITLE "B1"
+    INDEX 01 00:00:00
+  TRACK 04 AUDIO
+    TITLE "B2"
+    INDEX 01 00:30:00
+"#;
+
+        let source = materialize_cue_with_audio_files(
+            cue,
+            &[probe_a.as_str(), probe_b.as_str()],
+            &["side_a.flac", "side_b.flac"],
+            &temp,
+        )
+        .await
+        .expect("synthetic multi-FILE CUE materializes");
+
+        assert_eq!(source.kind, SourceKind::CueImage);
+        assert_eq!(source.tracks.len(), 4, "one synthetic CUE must produce one album source with every track");
+        assert_eq!(source.album_metadata.album.as_deref(), Some("Album"));
+        assert_eq!(source.album_metadata.album_artist.as_deref(), Some("Artist"));
+        assert_eq!(source.album_metadata.total_tracks, 4);
+        assert_eq!(
+            source
+                .tracks
+                .iter()
+                .map(|track| track.id.track_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+        );
+        assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("A1"));
+        assert_eq!(source.tracks[3].metadata.title.as_deref(), Some("B2"));
+        assert!(
+            source
+                .tracks
+                .iter()
+                .all(|track| track.metadata.extra.get("album").map(String::as_str) == Some("Album")),
+            "downstream naming/log/companion code must see one reconciled album, not side titles"
+        );
+
+        let album_values: BTreeSet<String> = source
+            .tracks
+            .iter()
+            .filter_map(|track| track.metadata.extra.get("album").cloned())
+            .collect();
+        assert_eq!(album_values.into_iter().collect::<Vec<_>>(), vec!["Album".to_string()]);
+        assert!(
+            source
+                .tracks
+                .iter()
+                .all(|track| !track.metadata.extra.values().any(|value| value.contains("Side A") || value.contains("Side B"))),
+            "the materialized source handed to downstream output planning must not carry side album identity"
+        );
     }
 
     #[tokio::test]

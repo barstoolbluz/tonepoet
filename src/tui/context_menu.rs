@@ -158,6 +158,21 @@ pub enum ContextAction {
     /// MetadataEditor: open a read-only CuePreview seeded with the
     /// cursor row's value (synthetic-preview rows like CUESHEET).
     MetadataCueView,
+    /// MetadataEditor: edit the active embedded/synthetic CUESHEET via the
+    /// configured system editor and stage it through the metadata editor.
+    MetadataCueEdit,
+    /// MetadataEditor: open the destructive-action confirmation for staging
+    /// deletion of the active embedded/synthetic CUESHEET.
+    MetadataCueDelete,
+    /// Browse: open metadata for the selected cue-bearing item and view its
+    /// embedded/synthetic CUESHEET row.
+    BrowseCueView,
+    /// Browse: open metadata for the selected cue-bearing item and edit its
+    /// embedded/synthetic CUESHEET row.
+    BrowseCueEdit,
+    /// Browse: open metadata for the selected cue-bearing item and stage
+    /// embedded/synthetic CUESHEET deletion after confirmation.
+    BrowseCueDelete,
     /// MetadataEditor detail overlay: field-level revert toggle
     /// (operates on per_file_values).
     MetadataDetailToggleRevert,
@@ -448,6 +463,24 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
             "Get tags from CUE",
             ContextAction::ImportCueFromBrowse,
         ));
+        children.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "View embedded CUE sheet".to_string(),
+            action: ContextAction::BrowseCueView,
+            shortcut: Some(":cue-view".to_string()),
+            enabled: true,
+        }));
+        children.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Edit embedded CUE sheet".to_string(),
+            action: ContextAction::BrowseCueEdit,
+            shortcut: Some(":cuesheet-edit".to_string()),
+            enabled: true,
+        }));
+        children.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Delete embedded CUE sheet".to_string(),
+            action: ContextAction::BrowseCueDelete,
+            shortcut: Some(":cuesheet-delete".to_string()),
+            enabled: true,
+        }));
     }
     ContextMenuEntry::Submenu {
         label: "Tagging".to_string(),
@@ -560,6 +593,42 @@ fn path_has_extension(path: &Path, expected: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn directory_contains_cue(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .ok()
+        .map(|entries| {
+            entries.filter_map(|entry| entry.ok()).any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("cue"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn sibling_directory_contains_cue(path: &Path) -> bool {
+    path.parent().map(directory_contains_cue).unwrap_or(false)
+}
+
+fn audio_file_has_embedded_cuesheet(path: &Path) -> bool {
+    super::probe::read_all_tags(path)
+        .map(|entries| {
+            entries.into_iter().any(|entry| {
+                entry.display_key.eq_ignore_ascii_case("CUESHEET")
+                    && (entry.per_file_values.iter().any(|value| !value.trim().is_empty())
+                        || !entry.value.trim().is_empty())
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn audio_file_is_cue_bearing(path: &Path) -> bool {
+    sibling_directory_contains_cue(path) || audio_file_has_embedded_cuesheet(path)
+}
+
 /// Build the context menu for a right-click on a browse entry.
 pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let entry = match app.browse.selected_entry() {
@@ -585,20 +654,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
-            // Check if a CUE file exists in the directory.
-            let has_cue = entry
-                .path
-                .parent()
-                .and_then(|d| std::fs::read_dir(d).ok())
-                .map(|entries| {
-                    entries.filter_map(|e| e.ok()).any(|e| {
-                        e.path()
-                            .extension()
-                            .map(|ext| ext.to_ascii_lowercase() == "cue")
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
+            let has_cue = audio_file_is_cue_bearing(&entry.path);
             items.push(build_tagging_submenu(has_cue));
             items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
@@ -690,18 +746,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open", ContextAction::OpenEntry));
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
-            // Check if a CUE file exists inside the directory.
-            let has_cue = std::fs::read_dir(&entry.path)
-                .ok()
-                .map(|entries| {
-                    entries.filter_map(|e| e.ok()).any(|e| {
-                        e.path()
-                            .extension()
-                            .map(|ext| ext.to_ascii_lowercase() == "cue")
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
+            let has_cue = directory_contains_cue(&entry.path);
             items.push(build_tagging_submenu(has_cue));
             items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
@@ -733,6 +778,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             if is_cue {
                 items.push(build_convert_submenu(app));
                 items.push(item("Edit metadata", ContextAction::EditMetadataFull));
+                items.push(build_tagging_submenu(true));
                 items.push(separator());
             }
             if super::browse::is_viewable_text_file(&entry.path) {
@@ -919,7 +965,10 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         | ContextAction::GenerateCueMbMultiFile
         | ContextAction::GenerateCueMbSingleImage
         | ContextAction::FillCueFromMb
-        | ContextAction::ImportCueFromBrowse => Some("CUE operations"),
+        | ContextAction::ImportCueFromBrowse
+        | ContextAction::BrowseCueView
+        | ContextAction::BrowseCueEdit
+        | ContextAction::BrowseCueDelete => Some("CUE operations"),
         ContextAction::MarkCompareReference | ContextAction::BitCompareWithReference => {
             Some("bit comparison")
         }
@@ -942,6 +991,79 @@ fn archive_context_dispatch_for_action(action: &ContextAction) -> ArchiveContext
 }
 
 // ── Action dispatch ─────────────────────────────────────────────────
+
+fn focus_metadata_editor_on_cuesheet_row(
+    state: &mut Box<super::app::MetadataEditorState>,
+    operation: &str,
+) -> Result<usize, String> {
+    let Some(idx) = state
+        .active_surface()
+        .entries
+        .iter()
+        .position(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+    else {
+        return Err(format!("{operation}: selected item has no embedded CUE sheet"));
+    };
+    state.cursor = idx;
+    Ok(idx)
+}
+
+fn open_browse_metadata_cue_action(
+    app: &mut AppState,
+    action: ContextAction,
+    _tx: &mpsc::Sender<AppMessage>,
+) {
+    super::keybindings::open_metadata_editor(app);
+    let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    let mut state = match overlay {
+        ActiveOverlay::MetadataEditor(state) => state,
+        other => {
+            app.active_overlay = other;
+            app.set_status("CUE sheet action: metadata editor did not open for the selected item");
+            return;
+        }
+    };
+
+    let cue_idx = match focus_metadata_editor_on_cuesheet_row(&mut state, "CUE sheet action") {
+        Ok(idx) => idx,
+        Err(reason) => {
+            app.set_status(reason);
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            return;
+        }
+    };
+
+    match action {
+        ContextAction::BrowseCueView => {
+            let entry = &state.active_surface().entries[cue_idx];
+            let content = entry
+                .per_file_values
+                .first()
+                .cloned()
+                .unwrap_or_else(|| entry.value.clone());
+            let summary = format!(
+                "{} (read-only · {})",
+                entry.display_key,
+                super::probe::cue_summary_string(&content),
+            );
+            app.pending_metadata_editor = Some(state);
+            app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+                super::app::CuePreviewState::new_readonly(content, summary),
+            ));
+        }
+        ContextAction::BrowseCueEdit => {
+            let status = super::keybindings::metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
+            app.set_status(status);
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        ContextAction::BrowseCueDelete => {
+            super::keybindings::open_embedded_cuesheet_delete_confirmation(app, state);
+        }
+        _ => {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+    }
+}
 
 /// Execute a context action. Delegates to existing command/action
 /// functions where possible.
@@ -968,6 +1090,9 @@ pub fn execute_context_action(
         }
     }
     match action {
+        ContextAction::BrowseCueView | ContextAction::BrowseCueEdit | ContextAction::BrowseCueDelete => {
+            open_browse_metadata_cue_action(app, action, tx);
+        }
         // ── Browse: Convert actions ─────────────────────────────────
         ContextAction::ConvertCustom => {
             // Open Convert screen for manual review — no auto-commit.
@@ -1234,10 +1359,8 @@ pub fn execute_context_action(
             }
         }
         ContextAction::MetadataCueView => {
-            // Open a read-only CuePreview seeded with the row's value.
-            // Identical contract to the `[view]` pill click and the
-            // :cue-view colon command — only triggers on synthetic-
-            // preview rows; falls back to a status when not.
+            // Open a read-only CuePreview seeded with the row's full CUE
+            // text. The display value is only a summary.
             if let Some(state) = app.pending_metadata_editor.take() {
                 let cursor = state.cursor;
                 let entry = match state.active_surface().entries.get(cursor) {
@@ -1250,7 +1373,11 @@ pub fn execute_context_action(
                         return;
                     }
                 };
-                let content = entry.value.clone();
+                let content = entry
+                    .per_file_values
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| entry.value.clone());
                 let summary = format!(
                     "{} (read-only · {})",
                     entry.display_key,
@@ -1260,6 +1387,18 @@ pub fn execute_context_action(
                 app.active_overlay = super::app::ActiveOverlay::CuePreview(Box::new(
                     super::app::CuePreviewState::new_readonly(content, summary),
                 ));
+            }
+        }
+        ContextAction::MetadataCueEdit => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let status = super::keybindings::metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
+                app.set_status(status);
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataCueDelete => {
+            if let Some(state) = app.pending_metadata_editor.take() {
+                super::keybindings::open_embedded_cuesheet_delete_confirmation(app, state);
             }
         }
         ContextAction::MetadataDetailToggleRevert => {
@@ -2117,6 +2256,167 @@ mod tests {
             }
         }
         labels
+    }
+
+    fn menu_contains_action(
+        entries: &[ContextMenuEntry],
+        predicate: impl Fn(&ContextAction) -> bool + Copy,
+    ) -> bool {
+        entries.iter().any(|entry| match entry {
+            ContextMenuEntry::Item(item) => predicate(&item.action),
+            ContextMenuEntry::Submenu { children, .. } => menu_contains_action(children, predicate),
+            ContextMenuEntry::Separator => false,
+        })
+    }
+
+    #[test]
+    fn tagging_submenu_cue_entries_dispatch_to_cuesheet_actions() {
+        let ContextMenuEntry::Submenu { children, .. } = build_tagging_submenu(true) else {
+            panic!("tagging menu must be a submenu");
+        };
+
+        assert!(menu_contains_action(&children, |action| matches!(action, ContextAction::BrowseCueView)));
+        assert!(menu_contains_action(&children, |action| matches!(action, ContextAction::BrowseCueEdit)));
+        assert!(menu_contains_action(&children, |action| matches!(action, ContextAction::BrowseCueDelete)));
+        assert!(
+            !children.iter().any(|entry| matches!(
+                entry,
+                ContextMenuEntry::Item(ContextMenuItem {
+                    label,
+                    action: ContextAction::EditMetadataFull,
+                    ..
+                }) if label.contains("CUE sheet")
+            )),
+            "CUE-labelled menu entries must not dispatch to generic Edit metadata"
+        );
+    }
+
+    #[test]
+    fn explicit_cue_file_browse_menu_includes_tagging_cuesheet_actions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue = temp.path().join("side_a.cue");
+        std::fs::write(&cue, b"FILE \"side_a.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n")
+            .expect("cue fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            cue.clone(),
+            "side_a.cue".to_string(),
+            EntryKind::OtherFile,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        let menu = build_browse_entry_menu(&app);
+        let labels = menu_labels_recursive(&menu);
+        assert!(labels.iter().any(|label| label == "Tagging"));
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueView)));
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueEdit)));
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueDelete)));
+    }
+
+    fn fixture_tool_available(tool: &str) -> bool {
+        std::process::Command::new(tool)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    #[test]
+    fn merged_folder_browse_menu_includes_cue_actions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        std::fs::write(album.join("side_a.flac"), b"audio").expect("audio");
+        std::fs::write(album.join("side_b.flac"), b"audio").expect("audio");
+        for stem in ["side_a", "side_b"] {
+            std::fs::write(
+                album.join(format!("{stem}.cue")),
+                format!(
+                    "TITLE \"Album {stem}\"\nFILE \"{stem}.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:30:00\n"
+                ),
+            )
+            .expect("cue");
+        }
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        let menu = build_browse_entry_menu(&app);
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueView)));
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueEdit)));
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueDelete)));
+    }
+
+    #[test]
+    fn embedded_cuesheet_audio_file_browse_menu_includes_cue_actions() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
+            eprintln!("skipping: ffmpeg/metaflac unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("embedded.flac");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=1",
+                "-c:a",
+                "flac",
+            ])
+            .arg(&image)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg fixture");
+        assert!(status.success());
+        let cuesheet = temp.path().join("embedded.cue.txt");
+        std::fs::write(
+            &cuesheet,
+            "TITLE \"Embedded Album\"\nFILE \"embedded.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("write cuesheet");
+        let status = std::process::Command::new("metaflac")
+            .arg(format!("--set-tag-from-file=CUESHEET={}", cuesheet.display()))
+            .arg(&image)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("metaflac fixture");
+        assert!(status.success());
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            image.clone(),
+            "embedded.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        let menu = build_browse_entry_menu(&app);
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueView)));
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueEdit)));
+        assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueDelete)));
     }
 
     #[test]

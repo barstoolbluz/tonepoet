@@ -2,11 +2,33 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
+use once_cell::sync::OnceCell;
 
 use crate::convert::classify::{classify_file, is_audio_file_path, is_cue_sheet_path, EntryKind};
 use crate::convert::source_admission::is_direct_queue_source_path;
 use crate::convert::pipeline::CueSidecarPolicy;
+use crate::convert::split_cue_album::{
+    common_cue_album_title, decide_with_toc_evidence, grouping_key_from_paths,
+    SplitCueAlbumGroupingDecision, SplitCueAlbumGroupingReason,
+};
+
+
+/// Resolved split-CUE album grouping decisions supplied by a higher layer that
+/// already ran the authoritative title/TOC ladder. Keys are order-independent,
+/// canonicalized CUE member sets from `split_cue_album::grouping_key_from_paths`;
+/// values are the exact decision conversion must honor.
+pub type QueueSplitCueAlbumGroupingDecisions =
+    BTreeMap<Vec<PathBuf>, SplitCueAlbumGroupingDecision>;
+
+#[must_use]
+pub fn split_cue_album_grouping_key_for_queue(paths: &[PathBuf]) -> Vec<PathBuf> {
+    grouping_key_from_paths(paths)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueueExpansionResult {
@@ -17,12 +39,26 @@ pub struct QueueExpansionResult {
     /// skip sidecar CUE discovery for these paths while still honoring
     /// embedded CUESHEET tags.
     pub cue_artifact_audio: HashSet<PathBuf>,
+    /// Synthetic CUE files created for merged split-CUE albums. These are
+    /// transient queue inputs and must be owned by the Convert source state
+    /// until commit, then by the conversion manager until the corresponding
+    /// queue item reaches a terminal state or is removed.
+    pub synthetic_cue_artifacts: HashSet<PathBuf>,
+    /// Fatal queue-planning errors. When this is non-empty the queue planner
+    /// has deliberately failed closed: no paths are staged, so callers cannot
+    /// silently fall back to side-specific CUE jobs or raw audio conversion.
+    pub expansion_errors: Vec<String>,
 }
 
 impl QueueExpansionResult {
     #[must_use]
     pub fn into_paths(self) -> Vec<PathBuf> {
         self.paths
+    }
+
+    #[must_use]
+    pub fn first_error(&self) -> Option<&str> {
+        self.expansion_errors.first().map(String::as_str)
     }
 }
 
@@ -101,12 +137,22 @@ pub fn count_audio_files_bounded(paths: &[PathBuf], limit: usize) -> usize {
 }
 
 /// Expands files/directories to queueable paths using the historical
-/// `Vec<PathBuf>` API, applying conversion-queue CUE semantics: a
-/// split-source CUE is the queueable path and its referenced audio (for a
-/// single-image album, the image file itself) is suppressed. Only queue
-/// construction should use this.
+/// `Vec<PathBuf>` API. This adapter cannot transfer ownership of transient
+/// synthetic CUE artifacts, so it cleans and omits them; queue-building callers
+/// that may materialize merged split-CUE albums must use
+/// `expand_paths_to_audio_with_metadata()` and register returned artifacts.
 pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
-    expand_paths_to_audio_with_metadata(paths).into_paths()
+    let mut expansion = expand_paths_to_audio_with_metadata(paths);
+    if !expansion.synthetic_cue_artifacts.is_empty() {
+        // The legacy Vec-only API cannot transfer ownership of transient
+        // synthetic CUE artifacts to a queue manager. Do not leak them or
+        // return paths to caller-unowned temp files; queue-building callers
+        // must use `expand_paths_to_audio_with_metadata()` instead.
+        let artifacts = std::mem::take(&mut expansion.synthetic_cue_artifacts);
+        expansion.paths.retain(|path| !artifacts.contains(path));
+        cleanup_synthetic_cue_artifacts(&artifacts);
+    }
+    expansion.into_paths()
 }
 
 /// Expands files/directories to every audio file they contain, with no CUE
@@ -177,11 +223,26 @@ fn push_audio_file(path: PathBuf, out: &mut Vec<PathBuf>, seen: &mut HashSet<Pat
 /// callers must use this result; non-queue callers should use
 /// `expand_paths_to_audio()` above to preserve the old API contract.
 pub fn expand_paths_to_audio_with_metadata(paths: &[PathBuf]) -> QueueExpansionResult {
+    expand_paths_to_audio_with_metadata_using_grouping_decisions(
+        paths,
+        &QueueSplitCueAlbumGroupingDecisions::new(),
+    )
+}
+
+/// Expands files/directories for conversion using caller-supplied authoritative
+/// split-CUE grouping decisions. TUI conversion must use this when it has a
+/// cached or freshly resolved metadata/GNUDB/MB ladder result so conversion
+/// cannot recompute a weaker title-only approximation and disagree with the
+/// metadata surface.
+pub fn expand_paths_to_audio_with_metadata_using_grouping_decisions(
+    paths: &[PathBuf],
+    grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
+) -> QueueExpansionResult {
     let mut plan = QueueExpansionPlan::default();
     for path in paths {
         collect_queue_candidates(path, &mut plan);
     }
-    plan.into_queue_paths()
+    plan.into_queue_paths_with_grouping_decisions(grouping_decisions)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,11 +283,31 @@ pub fn expand_paths_to_audio_with_metadata_limited<F>(
 where
     F: FnMut() -> bool,
 {
-    expand_paths_to_audio_with_preserved_disc_roots_limited(
+    expand_paths_to_audio_with_metadata_limited_using_grouping_decisions(
+        paths,
+        max_visited,
+        is_cancelled,
+        &QueueSplitCueAlbumGroupingDecisions::new(),
+    )
+}
+
+/// Bounded expansion variant that honors authoritative split-CUE decisions
+/// supplied by a caller that already ran the metadata/GNUDB/MB ladder.
+pub fn expand_paths_to_audio_with_metadata_limited_using_grouping_decisions<F>(
+    paths: &[PathBuf],
+    max_visited: usize,
+    is_cancelled: F,
+    grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
+) -> Result<(QueueExpansionResult, usize), QueueExpansionLimitedError>
+where
+    F: FnMut() -> bool,
+{
+    expand_paths_to_audio_with_preserved_disc_roots_limited_using_grouping_decisions(
         paths,
         &[],
         max_visited,
         is_cancelled,
+        grouping_decisions,
     )
 }
 
@@ -239,7 +320,28 @@ pub fn expand_paths_to_audio_with_preserved_disc_roots_limited<F>(
     paths: &[PathBuf],
     preserved_disc_roots: &[PathBuf],
     max_visited: usize,
+    is_cancelled: F,
+) -> Result<(QueueExpansionResult, usize), QueueExpansionLimitedError>
+where
+    F: FnMut() -> bool,
+{
+    expand_paths_to_audio_with_preserved_disc_roots_limited_using_grouping_decisions(
+        paths,
+        preserved_disc_roots,
+        max_visited,
+        is_cancelled,
+        &QueueSplitCueAlbumGroupingDecisions::new(),
+    )
+}
+
+/// Bounded preserved-root expansion that honors already-resolved split-CUE
+/// grouping decisions from the metadata/GNUDB/MB ladder.
+pub fn expand_paths_to_audio_with_preserved_disc_roots_limited_using_grouping_decisions<F>(
+    paths: &[PathBuf],
+    preserved_disc_roots: &[PathBuf],
+    max_visited: usize,
     mut is_cancelled: F,
+    grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
 ) -> Result<(QueueExpansionResult, usize), QueueExpansionLimitedError>
 where
     F: FnMut() -> bool,
@@ -266,12 +368,32 @@ where
         }
     }
 
-    Ok((plan.into_queue_paths(), state.visited))
+    let queue = plan.into_queue_paths_with_grouping_decisions(grouping_decisions);
+    if let Some(message) = queue.first_error() {
+        return Err(QueueExpansionLimitedError::failed(
+            message.to_string(),
+            state.visited,
+        ));
+    }
+
+    Ok((queue, state.visited))
 }
 
 pub(crate) fn expand_paths_to_audio_with_preserved_disc_roots(
     paths: &[PathBuf],
     preserved_disc_roots: &[PathBuf],
+) -> QueueExpansionResult {
+    expand_paths_to_audio_with_preserved_disc_roots_using_grouping_decisions(
+        paths,
+        preserved_disc_roots,
+        &QueueSplitCueAlbumGroupingDecisions::new(),
+    )
+}
+
+pub(crate) fn expand_paths_to_audio_with_preserved_disc_roots_using_grouping_decisions(
+    paths: &[PathBuf],
+    preserved_disc_roots: &[PathBuf],
+    grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
 ) -> QueueExpansionResult {
     let preserved_disc_root_keys: HashSet<PathBuf> = preserved_disc_roots
         .iter()
@@ -285,7 +407,7 @@ pub(crate) fn expand_paths_to_audio_with_preserved_disc_roots(
             collect_queue_candidates(path, &mut plan);
         }
     }
-    plan.into_queue_paths()
+    plan.into_queue_paths_with_grouping_decisions(grouping_decisions)
 }
 
 /// Directory/file expansion plan for conversion queue inputs.
@@ -352,7 +474,10 @@ impl QueueExpansionPlan {
         });
     }
 
-    fn into_queue_paths(self) -> QueueExpansionResult {
+    fn into_queue_paths_with_grouping_decisions(
+        self,
+        grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
+    ) -> QueueExpansionResult {
         let QueueExpansionPlan {
             disc_roots,
             disc_root_keys,
@@ -370,7 +495,29 @@ impl QueueExpansionPlan {
             push_unique_path_with_keys(&mut result, &mut result_keys, disc_root);
         }
 
+        let (grouped_cue_keys, synthetic_album_errors, mut synthetic_cue_artifacts) =
+            push_synthetic_cue_album_groups_for_queue(
+                &cue_sheets,
+                &disc_root_keys,
+                grouping_decisions,
+                &mut result,
+                &mut result_keys,
+                &mut suppressed_audio_keys,
+            );
+        if !synthetic_album_errors.is_empty() {
+            cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+            return QueueExpansionResult {
+                paths: Vec::new(),
+                cue_artifact_audio: HashSet::new(),
+                synthetic_cue_artifacts: HashSet::new(),
+                expansion_errors: synthetic_album_errors,
+            };
+        }
+
         for cue in cue_sheets {
+            if grouped_cue_keys.contains(&cue.path_key) {
+                continue;
+            }
             if path_key_is_under_any_root(&queue_path_key(&cue.path), &disc_root_keys) {
                 continue;
             }
@@ -430,10 +577,616 @@ impl QueueExpansionPlan {
             push_unique_path_with_keys(&mut result, &mut result_keys, path);
         }
 
+        synthetic_cue_artifacts.retain(|path| {
+            result.iter().any(|queued| queue_path_key(queued) == queue_path_key(path))
+        });
+
         QueueExpansionResult {
             paths: result,
             cue_artifact_audio,
+            synthetic_cue_artifacts,
+            expansion_errors: Vec::new(),
         }
+    }
+}
+
+
+#[derive(Debug, Clone)]
+struct SyntheticCueAlbumPart {
+    cue_path: PathBuf,
+    cue_key: PathBuf,
+    sheet: crate::convert::cue_parser::CueSheet,
+    referenced_audio: Vec<PathBuf>,
+}
+
+fn push_synthetic_cue_album_groups_for_queue(
+    cue_sheets: &[CueQueueCandidate],
+    disc_root_keys: &HashSet<PathBuf>,
+    grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
+    result: &mut Vec<PathBuf>,
+    result_keys: &mut HashSet<PathBuf>,
+    suppressed_audio_keys: &mut HashSet<PathBuf>,
+) -> (HashSet<PathBuf>, Vec<String>, HashSet<PathBuf>) {
+    let mut by_parent: BTreeMap<PathBuf, Vec<CueQueueCandidate>> = BTreeMap::new();
+    for cue in cue_sheets {
+        if cue.explicit || path_key_is_under_any_root(&cue.path_key, disc_root_keys) {
+            continue;
+        }
+        let Some(parent) = cue.path.parent().map(queue_path_key) else {
+            continue;
+        };
+        by_parent.entry(parent).or_default().push(cue.clone());
+    }
+
+    let mut grouped = HashSet::new();
+    let mut fatal_errors = Vec::new();
+    let mut synthetic_cue_artifacts = HashSet::new();
+    for (parent, mut candidates) in by_parent {
+        if candidates.len() < 2 {
+            continue;
+        }
+        candidates.sort_by(|a, b| deterministic_path_sort_key(&a.path).cmp(&deterministic_path_sort_key(&b.path)));
+
+        let mut parts = Vec::new();
+        for cue in &candidates {
+            let sheet = match crate::convert::cue_parser::parse_cue_file(&cue.path) {
+                Ok(sheet) => sheet,
+                Err(err) => {
+                    fatal_errors.push(format!(
+                        "Cannot queue merged CUE album for {}: failed to parse {}: {}. Nothing was staged; fix the CUE or select a single .cue explicitly.",
+                        parent.display(),
+                        cue.path.display(),
+                        err
+                    ));
+                    break;
+                }
+            };
+            let referenced_audio = match cue_queue_decision_for_path(&cue.path) {
+                Ok(CueQueueDecision::SplitSource { referenced_audio }) => referenced_audio,
+                Ok(CueQueueDecision::MetadataArtifact { .. }) => continue,
+                Err(err) => {
+                    fatal_errors.push(format!(
+                        "Cannot queue merged CUE album for {}: failed to analyze {}: {}. Nothing was staged; fix the CUE or select a single .cue explicitly.",
+                        parent.display(),
+                        cue.path.display(),
+                        err
+                    ));
+                    break;
+                }
+            };
+            if referenced_audio.is_empty() || sheet.tracks.is_empty() {
+                continue;
+            }
+            parts.push(SyntheticCueAlbumPart {
+                cue_path: cue.path.clone(),
+                cue_key: cue.path_key.clone(),
+                sheet,
+                referenced_audio,
+            });
+        }
+        if !fatal_errors.is_empty() {
+            continue;
+        }
+        if parts.len() < 2 {
+            continue;
+        }
+        // Two cues referencing the SAME image are alternate track layouts of
+        // one rip, not album parts; merging would duplicate audio in the
+        // synthetic sheet. Such folders keep the legacy per-cue queue path.
+        {
+            let mut seen_images: HashSet<PathBuf> = HashSet::new();
+            let mut overlapping = false;
+            for part in &parts {
+                for audio in &part.referenced_audio {
+                    if !seen_images.insert(queue_path_key(audio)) {
+                        overlapping = true;
+                    }
+                }
+            }
+            if overlapping {
+                continue;
+            }
+        }
+
+        parts.sort_by(|a, b| deterministic_path_sort_key(&a.cue_path).cmp(&deterministic_path_sort_key(&b.cue_path)));
+        let cue_paths: Vec<PathBuf> = parts.iter().map(|part| part.cue_path.clone()).collect();
+        let titles: Vec<String> = parts
+            .iter()
+            .map(|part| part.sheet.title.clone().unwrap_or_default())
+            .collect();
+        let decision_key = grouping_key_from_paths(&cue_paths);
+        let Some(decision) = grouping_decisions
+            .get(&decision_key)
+            .cloned()
+            .or_else(|| decide_with_toc_evidence(&cue_paths, &titles, None, None))
+        else {
+            continue;
+        };
+        if matches!(decision.reason, SplitCueAlbumGroupingReason::PerCueDistinctTocHits) {
+            continue;
+        }
+
+        for group in decision.groups {
+            if group.len() < 2 {
+                continue;
+            }
+            let group_keys: HashSet<PathBuf> = group.into_iter().collect();
+            let mut group_parts: Vec<SyntheticCueAlbumPart> = parts
+                .iter()
+                .filter(|part| group_keys.contains(&part.cue_key))
+                .cloned()
+                .collect();
+            if group_parts.len() < 2 {
+                continue;
+            }
+            group_parts.sort_by(|a, b| deterministic_path_sort_key(&a.cue_path).cmp(&deterministic_path_sort_key(&b.cue_path)));
+            let total_tracks: usize = group_parts.iter().map(|part| part.sheet.tracks.len()).sum();
+            if total_tracks == 0 {
+                fatal_errors.push(format!(
+                    "Cannot queue merged CUE album for {}: the merged CUE group has no tracks. Nothing was staged.",
+                    parent.display()
+                ));
+                continue;
+            }
+            if total_tracks > 99 {
+                fatal_errors.push(format!(
+                    "Cannot queue merged CUE album for {}: the merged CUE group has {} tracks, but CUE syntax supports at most 99. Nothing was staged; split the selection or edit the cues.",
+                    parent.display(),
+                    total_tracks
+                ));
+                continue;
+            }
+            let text = match generate_queue_synthetic_cue_album(&group_parts) {
+                Ok(text) => text,
+                Err(err) => {
+                    fatal_errors.push(format!(
+                        "Cannot queue merged CUE album for {}: failed to generate the synthetic CUE: {}. Nothing was staged.",
+                        parent.display(),
+                        err
+                    ));
+                    continue;
+                }
+            };
+            let path = match write_queue_synthetic_cue_album(&group_parts, &text) {
+                Ok(path) => path,
+                Err(err) => {
+                    fatal_errors.push(format!(
+                        "Cannot queue merged CUE album for {}: failed to stage the synthetic CUE: {}. Nothing was staged.",
+                        parent.display(),
+                        err
+                    ));
+                    continue;
+                }
+            };
+            synthetic_cue_artifacts.insert(path.clone());
+            push_unique_path_with_keys(result, result_keys, path);
+            for part in &group_parts {
+                grouped.insert(part.cue_key.clone());
+                for audio in &part.referenced_audio {
+                    suppressed_audio_keys.insert(queue_path_key(audio));
+                }
+            }
+        }
+    }
+    if !fatal_errors.is_empty() {
+        cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+        synthetic_cue_artifacts.clear();
+    }
+
+    (grouped, fatal_errors, synthetic_cue_artifacts)
+}
+
+fn generate_queue_synthetic_cue_album(parts: &[SyntheticCueAlbumPart]) -> Result<String, String> {
+    let titles: Vec<String> = parts
+        .iter()
+        .map(|part| part.sheet.title.clone().unwrap_or_default())
+        .collect();
+    let title = common_cue_album_title(&titles)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Merged CUE album".to_string());
+    let performer = first_non_empty(parts.iter().filter_map(|part| part.sheet.performer.as_deref()));
+    let date = first_non_empty(parts.iter().filter_map(|part| part.sheet.date.as_deref()));
+    let genre = first_non_empty(parts.iter().filter_map(|part| part.sheet.genre.as_deref()));
+    let catalog = first_non_empty(parts.iter().filter_map(|part| part.sheet.catalog.as_deref()));
+
+    let mut out = String::new();
+    if let Some(catalog) = catalog {
+        out.push_str(&format!("CATALOG {}\n", catalog.trim()));
+    }
+    if let Some(performer) = performer {
+        out.push_str(&format!("PERFORMER \"{}\"\n", quote_cue_value(performer.trim())));
+    }
+    out.push_str(&format!("TITLE \"{}\"\n", quote_cue_value(&title)));
+    if let Some(date) = date {
+        out.push_str(&format!("REM DATE {}\n", quote_cue_value(date.trim())));
+    }
+    if let Some(genre) = genre {
+        out.push_str(&format!("REM GENRE \"{}\"\n", quote_cue_value(genre.trim())));
+    }
+
+    let mut next_track = 1usize;
+    let mut last_audio_key: Option<PathBuf> = None;
+    for part in parts {
+        for track in &part.sheet.tracks {
+            let file_ref = track.file.as_deref().ok_or_else(|| {
+                format!("track {} in {} has no FILE reference", track.number, part.cue_path.display())
+            })?;
+            let parent = part.cue_path.parent().ok_or_else(|| "CUE path has no parent directory".to_string())?;
+            let resolved = match resolve_cue_file_reference_for_queue(parent, file_ref) {
+                CueReferenceResolution::Resolved(path) => path,
+                CueReferenceResolution::Missing => return Err(format!("FILE reference {:?} not found", file_ref)),
+                CueReferenceResolution::Ambiguous(paths) => {
+                    return Err(format!("FILE reference {:?} ambiguous: {}", file_ref, format_candidate_paths_for_log(&paths)))
+                }
+            };
+            let audio_key = queue_path_key(&resolved);
+            if last_audio_key.as_ref() != Some(&audio_key) {
+                out.push_str(&format!(
+                    "FILE \"{}\" {}\n",
+                    quote_cue_value(&resolved.display().to_string()),
+                    cue_file_type_for_queue(&resolved)
+                ));
+                last_audio_key = Some(audio_key);
+            }
+            out.push_str(&format!("  TRACK {:02} AUDIO\n", next_track));
+            if let Some(isrc) = track.isrc.as_deref().filter(|value| !value.trim().is_empty()) {
+                out.push_str(&format!("    ISRC {}\n", isrc.trim()));
+            }
+            if let Some(title) = track.title.as_deref().filter(|value| !value.trim().is_empty()) {
+                out.push_str(&format!("    TITLE \"{}\"\n", quote_cue_value(title.trim())));
+            }
+            // Emit the parse-normal form: parse_cue inherits the album
+            // PERFORMER into performer-less tracks, so byte-stable
+            // round-trips require emitting that inherited value here too.
+            let track_performer = track
+                .performer
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| performer.filter(|value| !value.trim().is_empty()));
+            if let Some(track_performer) = track_performer {
+                out.push_str(&format!("    PERFORMER \"{}\"\n", quote_cue_value(track_performer.trim())));
+            }
+            if let Some(frames) = track.index00_frames {
+                out.push_str(&format!("    INDEX 00 {}\n", cue_timestamp(frames)));
+            }
+            let frames = track.index01_frames.ok_or_else(|| {
+                format!("track {} in {} has no INDEX 01", track.number, part.cue_path.display())
+            })?;
+            out.push_str(&format!("    INDEX 01 {}\n", cue_timestamp(frames)));
+            next_track += 1;
+        }
+    }
+    Ok(out)
+}
+
+const SYNTHETIC_CUE_ALBUM_DIR: &str = "tonepoet-synthetic-cue-albums";
+const SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX: &str = "process-";
+const SYNTHETIC_CUE_ALBUM_PROCESS_LOCK: &str = ".owner.lock";
+const SYNTHETIC_CUE_ALBUM_PROCESS_PID: &str = ".owner.pid";
+const SYNTHETIC_CUE_ALBUM_ARTIFACT_PREFIX: &str = "artifact-";
+const SYNTHETIC_CUE_ALBUM_FILE: &str = "album.cue";
+const SYNTHETIC_CUE_ALBUM_TMP: &str = "album.cue.tmp";
+const SYNTHETIC_CUE_ALBUM_SCAVENGE_AFTER_SECS: u64 = 24 * 60 * 60;
+
+struct SyntheticCueAlbumProcessRoot {
+    path: PathBuf,
+    #[allow(dead_code)]
+    lock_file: std::fs::File,
+}
+
+static SYNTHETIC_CUE_ALBUM_PROCESS_ROOT: OnceCell<SyntheticCueAlbumProcessRoot> = OnceCell::new();
+
+fn synthetic_cue_album_root() -> PathBuf {
+    std::env::temp_dir().join(SYNTHETIC_CUE_ALBUM_DIR)
+}
+
+fn synthetic_cue_album_process_root() -> Result<PathBuf, String> {
+    SYNTHETIC_CUE_ALBUM_PROCESS_ROOT
+        .get_or_try_init(|| {
+            let root = synthetic_cue_album_root();
+            fs::create_dir_all(&root)
+                .map_err(|err| format!("failed to create synthetic CUE root: {err}"))?;
+            sync_directory_best_effort(&root);
+
+            let pid = std::process::id();
+            for attempt in 0..128u32 {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                let process_root = root.join(format!(
+                    "{SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX}{pid}-{nonce:x}-{attempt}"
+                ));
+                match fs::create_dir(&process_root) {
+                    Ok(()) => {
+                        let lock_path = process_root.join(SYNTHETIC_CUE_ALBUM_PROCESS_LOCK);
+                        let lock_file = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create_new(true)
+                            .open(&lock_path)
+                            .map_err(|err| format!("failed to create synthetic CUE owner lock: {err}"))?;
+                        lock_file
+                            .lock_exclusive()
+                            .map_err(|err| format!("failed to lock synthetic CUE owner root: {err}"))?;
+                        let pid_path = process_root.join(SYNTHETIC_CUE_ALBUM_PROCESS_PID);
+                        write_and_sync_file(&pid_path, std::process::id().to_string().as_bytes())
+                            .map_err(|err| format!("failed to write synthetic CUE owner pid: {err}"))?;
+                        sync_directory_best_effort(&process_root);
+                        sync_directory_best_effort(&root);
+                        return Ok(SyntheticCueAlbumProcessRoot {
+                            path: process_root,
+                            lock_file,
+                        });
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => {
+                        return Err(format!("failed to create synthetic CUE owner root: {err}"));
+                    }
+                }
+            }
+            Err("failed to allocate a unique synthetic CUE owner root".to_string())
+        })
+        .map(|root| root.path.clone())
+}
+
+fn write_queue_synthetic_cue_album(parts: &[SyntheticCueAlbumPart], text: &str) -> Result<PathBuf, String> {
+    let process_root = synthetic_cue_album_process_root()?;
+
+    let identity_hash = deterministic_synthetic_cue_album_hash(parts, text);
+    let artifact_dir = create_unique_synthetic_cue_album_dir(&process_root, identity_hash)?;
+    let tmp_path = artifact_dir.join(SYNTHETIC_CUE_ALBUM_TMP);
+    let final_path = artifact_dir.join(SYNTHETIC_CUE_ALBUM_FILE);
+
+    if let Err(err) = write_and_sync_file(&tmp_path, text.as_bytes()) {
+        let _ = fs::remove_dir_all(&artifact_dir);
+        return Err(format!("failed to write synthetic CUE: {err}"));
+    }
+    if let Err(err) = fs::rename(&tmp_path, &final_path) {
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_dir_all(&artifact_dir);
+        return Err(format!("failed to publish synthetic CUE: {err}"));
+    }
+    sync_directory_best_effort(&artifact_dir);
+    sync_directory_best_effort(&process_root);
+    sync_directory_best_effort(&synthetic_cue_album_root());
+
+    Ok(final_path)
+}
+
+fn deterministic_synthetic_cue_album_hash(parts: &[SyntheticCueAlbumPart], text: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for part in parts {
+        fnv1a_update(&mut hash, queue_path_key(&part.cue_path).to_string_lossy().as_bytes());
+        fnv1a_update(&mut hash, &[0]);
+    }
+    fnv1a_update(&mut hash, text.as_bytes());
+    hash
+}
+
+fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn create_unique_synthetic_cue_album_dir(root: &Path, identity_hash: u64) -> Result<PathBuf, String> {
+    let pid = std::process::id();
+    for attempt in 0..128u32 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let dir = root.join(format!(
+            "{SYNTHETIC_CUE_ALBUM_ARTIFACT_PREFIX}{identity_hash:016x}-{pid}-{nonce:x}-{attempt}"
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("failed to create synthetic CUE artifact directory: {err}")),
+        }
+    }
+    Err("failed to allocate a unique synthetic CUE artifact directory".to_string())
+}
+
+fn write_and_sync_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn sync_directory_best_effort(path: &Path) {
+    if let Ok(dir) = std::fs::File::open(path) {
+        let _ = dir.sync_all();
+    }
+}
+
+pub fn is_synthetic_cue_album_artifact(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some(SYNTHETIC_CUE_ALBUM_FILE) {
+        return false;
+    }
+    let Some(artifact_dir) = path.parent() else {
+        return false;
+    };
+    if !artifact_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(SYNTHETIC_CUE_ALBUM_ARTIFACT_PREFIX))
+    {
+        return false;
+    }
+    let Some(process_root) = artifact_dir.parent() else {
+        return false;
+    };
+    process_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX))
+        && process_root
+            .parent()
+            .is_some_and(|root| root == synthetic_cue_album_root())
+}
+
+pub fn cleanup_synthetic_cue_artifact(path: &Path) {
+    if !is_synthetic_cue_album_artifact(path) {
+        return;
+    }
+    if let Some(artifact_dir) = path.parent() {
+        let process_root = artifact_dir.parent().map(Path::to_path_buf);
+        let _ = fs::remove_dir_all(artifact_dir);
+        if let Some(process_root) = process_root {
+            sync_directory_best_effort(&process_root);
+        }
+        sync_directory_best_effort(&synthetic_cue_album_root());
+    }
+}
+
+pub fn cleanup_synthetic_cue_artifacts(paths: &HashSet<PathBuf>) {
+    for path in paths {
+        cleanup_synthetic_cue_artifact(path);
+    }
+}
+
+pub fn scavenge_stale_synthetic_cue_album_artifacts() {
+    scavenge_synthetic_cue_album_artifacts_older_than(Duration::from_secs(SYNTHETIC_CUE_ALBUM_SCAVENGE_AFTER_SECS));
+}
+
+fn scavenge_synthetic_cue_album_artifacts_older_than(max_age: Duration) {
+    let root = synthetic_cue_album_root();
+    let Ok(read_dir) = fs::read_dir(&root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in read_dir.flatten() {
+        let process_root = entry.path();
+        let name_matches = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX));
+        if !name_matches || !process_root.is_dir() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let old_enough = now
+            .duration_since(modified)
+            .map(|age| age >= max_age)
+            .unwrap_or(false);
+        if !old_enough {
+            continue;
+        }
+
+        try_remove_abandoned_synthetic_cue_process_root(&process_root);
+    }
+    sync_directory_best_effort(&root);
+}
+
+fn try_remove_abandoned_synthetic_cue_process_root(process_root: &Path) {
+    if process_root_owner_is_live(process_root) {
+        return;
+    }
+
+    let lock_path = process_root.join(SYNTHETIC_CUE_ALBUM_PROCESS_LOCK);
+    let Ok(lock_file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+        // A malformed root without a lock is not safely attributable to an
+        // abandoned owner. Leave it for explicit cleanup rather than risk
+        // deleting another process's live conversion input.
+        return;
+    };
+
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            // A live owner still holds this process-root lock. Age alone is
+            // not proof of abandonment; do not delete queued/paused work.
+            return;
+        }
+        Err(_) => return,
+    }
+
+    if process_root_owner_is_live(process_root) {
+        let _ = lock_file.unlock();
+        return;
+    }
+
+    // Windows commonly rejects `remove_dir_all` when any file under the tree
+    // is still open. Once the exclusive lock proves there is no live owner,
+    // release and drop the handle before removing the abandoned process root.
+    // New live owners never attach to an existing process root; each process
+    // creates a fresh unique root. A racing scavenger can only race this same
+    // best-effort deletion, which remains harmless and idempotent.
+    let _ = lock_file.unlock();
+    drop(lock_file);
+
+    let _ = fs::remove_dir_all(process_root);
+}
+
+fn process_root_owner_is_live(process_root: &Path) -> bool {
+    let pid_path = process_root.join(SYNTHETIC_CUE_ALBUM_PROCESS_PID);
+    let Ok(text) = fs::read_to_string(pid_path) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return false;
+    };
+    process_id_is_live(pid)
+}
+
+fn process_id_is_live(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn first_non_empty<'a>(values: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    values.map(str::trim).find(|value| !value.is_empty())
+}
+
+fn quote_cue_value(value: &str) -> String {
+    value.replace('"', "'")
+}
+
+fn cue_timestamp(frames: u32) -> String {
+    let minutes = frames / (60 * 75);
+    let seconds = (frames / 75) % 60;
+    let frame = frames % 75;
+    format!("{minutes:02}:{seconds:02}:{frame:02}")
+}
+
+fn cue_file_type_for_queue(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("flac") => "FLAC",
+        Some("wv") => "WAVE",
+        Some("aif") | Some("aiff") => "AIFF",
+        Some("mp3") => "MP3",
+        _ => "WAVE",
     }
 }
 
@@ -979,6 +1732,603 @@ fn same_queue_identity(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn write_queue_split_cue_part(
+        dir: &Path,
+        stem: &str,
+        title: &str,
+        tracks: usize,
+        header: &str,
+        bom: bool,
+        crlf: bool,
+    ) -> (PathBuf, PathBuf) {
+        let audio = dir.join(format!("{stem}.flac"));
+        let cue = dir.join(format!("{stem}.cue"));
+        std::fs::write(&audio, b"not real flac").expect("audio fixture");
+        let mut body = String::new();
+        body.push_str(header);
+        body.push_str(&format!("TITLE \"{title}\"\n"));
+        body.push_str(&format!("FILE \"{stem}.flac\" WAVE\n"));
+        for idx in 0..tracks {
+            let seconds = idx * 31;
+            body.push_str(&format!(
+                "  TRACK {:02} AUDIO\n    TITLE \"{stem} track {}\"\n    INDEX 01 {:02}:{:02}:00\n",
+                idx + 1,
+                idx + 1,
+                seconds / 60,
+                seconds % 60,
+            ));
+        }
+        if crlf {
+            body = body.replace('\n', "\r\n");
+        }
+        let mut bytes = Vec::new();
+        if bom {
+            bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+        }
+        bytes.extend_from_slice(body.as_bytes());
+        std::fs::write(&cue, bytes).expect("cue fixture");
+        (cue, audio)
+    }
+
+    fn generated_cue_track_numbers_are_continuous(sheet: &crate::convert::cue_parser::CueSheet) {
+        for (idx, track) in sheet.tracks.iter().enumerate() {
+            assert_eq!(
+                track.number,
+                (idx + 1) as u32,
+                "generated CUE must renumber tracks continuously in album order",
+            );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct QueueCueFixturePart {
+        stem: &'static str,
+        title: &'static str,
+        tracks: usize,
+        header: &'static str,
+        bom: bool,
+        crlf: bool,
+    }
+
+    fn registered_queue_cue_roundtrip_fixtures() -> Vec<Vec<QueueCueFixturePart>> {
+        vec![
+            vec![
+                QueueCueFixturePart {
+                    stem: "fixture_a",
+                    title: "Registered Album Side A",
+                    tracks: 2,
+                    header: "PERFORMER \"Artist\"\nREM DATE 1973\n",
+                    bom: true,
+                    crlf: true,
+                },
+                QueueCueFixturePart {
+                    stem: "fixture_b",
+                    title: "Registered Album Side B",
+                    tracks: 3,
+                    header: "rem genre \"Rock\"\nREM COMMENT \"mixed REM fields are tolerated\"\n",
+                    bom: false,
+                    crlf: false,
+                },
+                QueueCueFixturePart {
+                    stem: "fixture_c",
+                    title: "Registered Album Side C",
+                    tracks: 2,
+                    header: "CATALOG 1234567890123\n",
+                    bom: false,
+                    crlf: true,
+                },
+            ],
+            vec![
+                QueueCueFixturePart {
+                    stem: "quoted_one",
+                    title: "Quoted Album Side A",
+                    tracks: 2,
+                    header: "PERFORMER \"Artist With \\\"Quote\\\"\"\n",
+                    bom: false,
+                    crlf: false,
+                },
+                QueueCueFixturePart {
+                    stem: "quoted_two",
+                    title: "Quoted Album Side B",
+                    tracks: 2,
+                    header: "REM GENRE \"Progressive Rock\"\n",
+                    bom: true,
+                    crlf: true,
+                },
+            ],
+        ]
+    }
+
+    fn build_queue_roundtrip_parts(
+        dir: &Path,
+        fixture: &[QueueCueFixturePart],
+    ) -> Vec<SyntheticCueAlbumPart> {
+        let mut parts = Vec::new();
+        for part in fixture {
+            let (cue_path, _audio_path) = write_queue_split_cue_part(
+                dir,
+                part.stem,
+                part.title,
+                part.tracks,
+                part.header,
+                part.bom,
+                part.crlf,
+            );
+            let sheet = crate::convert::cue_parser::parse_cue_file(&cue_path)
+                .expect("registered CUE fixture parses");
+            let referenced_audio = match cue_queue_decision_for_path(&cue_path)
+                .expect("registered CUE fixture analyzes")
+            {
+                CueQueueDecision::SplitSource { referenced_audio } => referenced_audio,
+                CueQueueDecision::MetadataArtifact { .. } => {
+                    panic!("registered fixture must be a split-source CUE")
+                }
+            };
+            parts.push(SyntheticCueAlbumPart {
+                cue_key: queue_path_key(&cue_path),
+                cue_path,
+                sheet,
+                referenced_audio,
+            });
+        }
+        parts
+    }
+
+    #[test]
+    fn all_registered_queue_cue_fixtures_parse_generate_parse_round_trip() {
+        let fixtures = registered_queue_cue_roundtrip_fixtures();
+        assert!(
+            fixtures.len() >= 2,
+            "round-trip property suite must cover multiple registered fixture shapes"
+        );
+        for (fixture_idx, fixture) in fixtures.iter().enumerate() {
+            let td = tempfile::tempdir().expect("tempdir");
+            let parts = build_queue_roundtrip_parts(td.path(), fixture);
+            let generated = generate_queue_synthetic_cue_album(&parts)
+                .expect("registered fixture generates a synthetic CUE");
+            let reparsed = crate::convert::cue_parser::parse_cue(&generated);
+            generated_cue_track_numbers_are_continuous(&reparsed);
+            assert_eq!(
+                reparsed.tracks.len(),
+                fixture.iter().map(|part| part.tracks).sum::<usize>(),
+                "fixture {fixture_idx} must preserve total track cardinality"
+            );
+
+            let regenerated_parts = vec![SyntheticCueAlbumPart {
+                cue_key: PathBuf::from(format!("/roundtrip/fixture-{fixture_idx}.cue")),
+                cue_path: td.path().join(format!("roundtrip-{fixture_idx}.cue")),
+                sheet: reparsed,
+                referenced_audio: parts
+                    .iter()
+                    .flat_map(|part| part.referenced_audio.iter().cloned())
+                    .collect(),
+            }];
+            let regenerated = generate_queue_synthetic_cue_album(&regenerated_parts)
+                .expect("registered fixture regenerates from parsed synthetic CUE");
+            assert_eq!(
+                generated, regenerated,
+                "parse(generate(model)) must be byte-stable for registered CUE fixture {fixture_idx}"
+            );
+        }
+    }
+
+    fn registered_project_cue_fixture_files() -> Vec<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = root.join("tests/fixtures/cue_roundtrip/manifest.txt");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|err| panic!("CUE fixture manifest {} must be readable: {err}", manifest.display()));
+        let mut out = Vec::new();
+        for (line_no, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.contains("..") || Path::new(trimmed).is_absolute() {
+                panic!(
+                    "CUE fixture manifest {} line {} must contain a safe relative path, got {trimmed:?}",
+                    manifest.display(),
+                    line_no + 1,
+                );
+            }
+            let path = root.join(trimmed);
+            assert!(
+                path.exists(),
+                "CUE fixture manifest {} line {} references missing fixture {}",
+                manifest.display(),
+                line_no + 1,
+                path.display(),
+            );
+            out.push(path);
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn synthetic_cue_scavenger_never_deletes_live_owner_roots() {
+        let root = synthetic_cue_album_root();
+        std::fs::create_dir_all(&root).expect("synthetic root");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+
+        let live_root = root.join(format!(
+            "{SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX}live-{}-{nonce}",
+            std::process::id(),
+        ));
+        let abandoned_root = root.join(format!(
+            "{SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX}abandoned-{}-{nonce}",
+            std::process::id(),
+        ));
+        for (process_root, pid_text) in [
+            (&live_root, std::process::id().to_string()),
+            (&abandoned_root, "not-a-live-pid".to_string()),
+        ] {
+            std::fs::create_dir_all(process_root).expect("process root");
+            std::fs::write(process_root.join(SYNTHETIC_CUE_ALBUM_PROCESS_LOCK), b"lock")
+                .expect("owner lock");
+            std::fs::write(process_root.join(SYNTHETIC_CUE_ALBUM_PROCESS_PID), pid_text)
+                .expect("owner pid");
+            let artifact_dir = process_root.join(format!("{SYNTHETIC_CUE_ALBUM_ARTIFACT_PREFIX}fixture"));
+            std::fs::create_dir_all(&artifact_dir).expect("artifact dir");
+            std::fs::write(artifact_dir.join(SYNTHETIC_CUE_ALBUM_FILE), b"TITLE \"Album\"\n")
+                .expect("artifact cue");
+        }
+
+        scavenge_synthetic_cue_album_artifacts_older_than(Duration::ZERO);
+
+        assert!(
+            live_root.exists(),
+            "scavenging must not delete an artifact tree whose owner process is live"
+        );
+        assert!(
+            !abandoned_root.exists(),
+            "scavenging should remove old roots only after proving there is no live owner"
+        );
+        let _ = std::fs::remove_dir_all(live_root);
+        sync_directory_best_effort(&root);
+    }
+
+    #[test]
+    fn complete_registered_project_cue_fixture_corpus_participates_in_roundtrip_property() {
+        let cue_files = registered_project_cue_fixture_files();
+        assert!(
+            cue_files.len() >= 3,
+            "project CUE fixture corpus must be explicit, hermetic, and non-vacuous"
+        );
+        let mut materializable = 0usize;
+        for cue_file in &cue_files {
+            let sheet = crate::convert::cue_parser::parse_cue_file(cue_file)
+                .unwrap_or_else(|err| panic!("project CUE fixture {} must parse: {err}", cue_file.display()));
+            assert!(
+                !sheet.tracks.is_empty(),
+                "project CUE fixture {} must contain at least one track",
+                cue_file.display(),
+            );
+            let referenced_audio = match cue_queue_decision_for_path(cue_file)
+                .unwrap_or_else(|err| panic!("project CUE fixture {} must analyze: {err}", cue_file.display()))
+            {
+                CueQueueDecision::SplitSource { referenced_audio } => referenced_audio,
+                CueQueueDecision::MetadataArtifact { .. } => {
+                    panic!(
+                        "project CUE fixture {} must be materializable for the round-trip property",
+                        cue_file.display(),
+                    )
+                }
+            };
+            materializable += 1;
+            let part = SyntheticCueAlbumPart {
+                cue_key: queue_path_key(cue_file),
+                cue_path: cue_file.clone(),
+                sheet,
+                referenced_audio,
+            };
+            let generated = generate_queue_synthetic_cue_album(&[part])
+                .unwrap_or_else(|err| panic!("project CUE fixture {} must generate: {err}", cue_file.display()));
+            let reparsed = crate::convert::cue_parser::parse_cue(&generated);
+            generated_cue_track_numbers_are_continuous(&reparsed);
+            let regenerated_part = SyntheticCueAlbumPart {
+                cue_key: queue_path_key(cue_file),
+                cue_path: cue_file.clone(),
+                sheet: reparsed,
+                referenced_audio: Vec::new(),
+            };
+            let regenerated = generate_queue_synthetic_cue_album(&[regenerated_part])
+                .unwrap_or_else(|err| panic!("project CUE fixture {} must regenerate: {err}", cue_file.display()));
+            assert_eq!(
+                generated,
+                regenerated,
+                "project CUE fixture {} must be byte-stable under parse-generate-parse",
+                cue_file.display(),
+            );
+        }
+        assert_eq!(
+            materializable,
+            cue_files.len(),
+            "every registered project CUE fixture must exercise the full parse-generate-parse property"
+        );
+    }
+
+    #[test]
+    fn folder_expansion_merges_three_parts_with_different_track_counts_and_hostile_headers() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let (cue_a, audio_a) = write_queue_split_cue_part(
+            td.path(),
+            "part_a",
+            "Album Side A",
+            2,
+            "REM GENRE \"Rock\"\nREM DATE 1973\nPERFORMER \"Artist A\"\nREM COMMENT \"kept but not structural\"\n",
+            true,
+            true,
+        );
+        let (cue_b, audio_b) = write_queue_split_cue_part(
+            td.path(),
+            "part_b",
+            "Album Side B",
+            3,
+            "rem genre \"Progressive Rock\"\nPERFORMER \"Artist B\"\n",
+            false,
+            false,
+        );
+        let (cue_c, audio_c) = write_queue_split_cue_part(
+            td.path(),
+            "part_c",
+            "Album Side C",
+            4,
+            "CATALOG 1234567890123\nREM DISCID ABCD1234\n",
+            false,
+            true,
+        );
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+
+        assert_eq!(expanded.expansion_errors, Vec::<String>::new());
+        assert_eq!(expanded.paths.len(), 1, "N-part split CUE albums must queue one synthetic CUE");
+        assert_eq!(expanded.synthetic_cue_artifacts.len(), 1);
+        for path in [&cue_a, &cue_b, &cue_c, &audio_a, &audio_b, &audio_c] {
+            assert!(
+                !path_list_contains(&expanded.paths, path),
+                "merged folder conversion must not also queue member path {}",
+                path.display(),
+            );
+        }
+        let synthetic = std::fs::read_to_string(&expanded.paths[0]).expect("synthetic cue text");
+        let parsed = crate::convert::cue_parser::parse_cue(&synthetic);
+        assert_eq!(parsed.title.as_deref(), Some("Album"));
+        assert_eq!(parsed.tracks.len(), 9, "2+3+4 member tracks must flatten to nine album tracks");
+        generated_cue_track_numbers_are_continuous(&parsed);
+        assert!(synthetic.contains("TRACK 09 AUDIO"));
+        assert!(synthetic.contains(&audio_a.display().to_string()));
+        assert!(synthetic.contains(&audio_b.display().to_string()));
+        assert!(synthetic.contains(&audio_c.display().to_string()));
+        assert!(
+            synthetic.contains("FILE") && synthetic.contains("TRACK 03 AUDIO\n    TITLE \"part_b track 1\"\n    PERFORMER \"Artist B\"\n    INDEX 01 00:00:00"),
+            "INDEX times must remain local to each member image, not accumulated: {synthetic}",
+        );
+        cleanup_synthetic_cue_artifacts(&expanded.synthetic_cue_artifacts);
+    }
+
+    #[test]
+    fn generated_queue_synthetic_cue_parse_generate_parse_round_trips_fixture_matrix() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mut parts = Vec::new();
+        for (stem, title, tracks, header, bom, crlf) in [
+            (
+                "one",
+                "Fixture Side A",
+                2usize,
+                "PERFORMER \"Artist\"\nREM DATE 1973\n",
+                true,
+                true,
+            ),
+            (
+                "two",
+                "Fixture Side B",
+                3usize,
+                "REM GENRE \"Rock\"\nREM COMMENT \"mixed REM fields are tolerated\"\n",
+                false,
+                false,
+            ),
+            (
+                "three",
+                "Fixture Side C",
+                2usize,
+                "CATALOG 1234567890123\n",
+                false,
+                true,
+            ),
+        ] {
+            let (cue_path, _audio_path) = write_queue_split_cue_part(td.path(), stem, title, tracks, header, bom, crlf);
+            let sheet = crate::convert::cue_parser::parse_cue_file(&cue_path).expect("parse member cue");
+            let referenced_audio = match cue_queue_decision_for_path(&cue_path).expect("analyze member cue") {
+                CueQueueDecision::SplitSource { referenced_audio } => referenced_audio,
+                CueQueueDecision::MetadataArtifact { .. } => panic!("fixture must be a split-source CUE"),
+            };
+            parts.push(SyntheticCueAlbumPart {
+                cue_key: queue_path_key(&cue_path),
+                cue_path,
+                sheet,
+                referenced_audio,
+            });
+        }
+
+        let generated = generate_queue_synthetic_cue_album(&parts).expect("generate synthetic cue");
+        let reparsed = crate::convert::cue_parser::parse_cue(&generated);
+        let regenerated_parts = vec![SyntheticCueAlbumPart {
+            cue_key: PathBuf::from("/roundtrip/generated.cue"),
+            cue_path: td.path().join("roundtrip.cue"),
+            sheet: reparsed.clone(),
+            referenced_audio: parts
+                .iter()
+                .flat_map(|part| part.referenced_audio.iter().cloned())
+                .collect(),
+        }];
+        let regenerated = generate_queue_synthetic_cue_album(&regenerated_parts)
+            .expect("regenerate from parsed synthetic cue");
+
+        assert_eq!(reparsed.tracks.len(), 7);
+        generated_cue_track_numbers_are_continuous(&reparsed);
+        assert_eq!(generated, regenerated, "parse(generate(model)) must be byte-stable for the generated model");
+    }
+
+    #[test]
+    fn folder_expansion_merges_same_album_split_cue_parts_into_one_synthetic_cue() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let a = td.path().join("side_a.flac");
+        let b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("side_b.cue");
+        std::fs::write(&a, b"not real flac").unwrap();
+        std::fs::write(&b, b"not real flac").unwrap();
+        std::fs::write(
+            &cue_a,
+            r#"TITLE "Album Side A"
+FILE "side_a.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "A1"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "A2"
+    INDEX 01 03:00:00
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &cue_b,
+            r#"TITLE "Album Side B"
+FILE "side_b.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "B1"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "B2"
+    INDEX 01 02:30:00
+"#,
+        )
+        .unwrap();
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert_eq!(expanded.paths.len(), 1, "folder conversion should queue one synthetic album CUE");
+        assert_eq!(expanded.synthetic_cue_artifacts.len(), 1, "synthetic CUE path must be handed to lifecycle owners");
+        assert!(is_cue_sheet_path(&expanded.paths[0]));
+        assert!(expanded.synthetic_cue_artifacts.contains(&expanded.paths[0]));
+        assert!(!path_list_contains(&expanded.paths, &cue_a));
+        assert!(!path_list_contains(&expanded.paths, &cue_b));
+        assert!(!path_list_contains(&expanded.paths, &a));
+        assert!(!path_list_contains(&expanded.paths, &b));
+        let synthetic = std::fs::read_to_string(&expanded.paths[0]).expect("synthetic cue text");
+        assert!(synthetic.contains("TRACK 04 AUDIO"));
+        assert!(synthetic.contains("TITLE \"Album\""), "synthetic CUE should use the reconciled album title, not a side title: {synthetic}");
+        assert!(!synthetic.contains("TITLE \"Album Side A\""));
+        assert!(!synthetic.contains("TITLE \"Album Side B\""));
+        assert!(synthetic.contains(&a.display().to_string()));
+        assert!(synthetic.contains(&b.display().to_string()));
+        cleanup_synthetic_cue_artifacts(&expanded.synthetic_cue_artifacts);
+        assert!(!expanded.paths[0].exists(), "synthetic artifact cleanup removes its owner directory");
+    }
+
+    #[test]
+    fn folder_expansion_fails_closed_when_merged_cue_group_exceeds_track_limit() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let a = td.path().join("side_a.flac");
+        let b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("side_b.cue");
+        std::fs::write(&a, b"not real flac").unwrap();
+        std::fs::write(&b, b"not real flac").unwrap();
+
+        fn many_track_cue(title: &str, image: &str, first: usize, count: usize) -> String {
+            let mut text = format!("TITLE \"{title}\"\nFILE \"{image}\" WAVE\n");
+            for n in first..first + count {
+                text.push_str(&format!("  TRACK {:02} AUDIO\n    INDEX 01 {:02}:00:00\n", ((n - first) % 99) + 1, n));
+            }
+            text
+        }
+
+        std::fs::write(&cue_a, many_track_cue("Album Side A", "side_a.flac", 0, 50)).unwrap();
+        std::fs::write(&cue_b, many_track_cue("Album Side B", "side_b.flac", 50, 50)).unwrap();
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert!(expanded.paths.is_empty(), "track-limit failure must not fall back to side CUEs or raw images: {:?}", expanded.paths);
+        assert!(expanded.cue_artifact_audio.is_empty());
+        assert!(expanded.expansion_errors.iter().any(|err| err.contains("at most 99")), "expected a user-facing track-limit error, got {:?}", expanded.expansion_errors);
+
+        let err = expand_paths_to_audio_with_metadata_limited(
+            &[td.path().to_path_buf()],
+            1_000,
+            || false,
+        )
+        .expect_err("limited production expansion should surface the fatal planning error");
+        assert!(!err.cancelled);
+        assert!(err.message.contains("at most 99"));
+    }
+
+    #[test]
+    fn folder_expansion_fails_closed_when_merged_cue_group_cannot_be_parsed() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let a = td.path().join("side_a.flac");
+        let b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("side_b.cue");
+        std::fs::write(&a, b"not real flac").unwrap();
+        std::fs::write(&b, b"not real flac").unwrap();
+        std::fs::write(
+            &cue_a,
+            r#"TITLE "Album Side A"
+FILE "side_a.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 01:00:00
+"#,
+        )
+        .unwrap();
+        std::fs::write(&cue_b, [0xff, 0xfe, 0x00]).unwrap();
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert!(expanded.paths.is_empty(), "parse failure must not fall back to side CUEs or raw images: {:?}", expanded.paths);
+        assert!(expanded.expansion_errors.iter().any(|err| err.contains("failed to parse") || err.contains("failed to analyze")), "expected a parse/analyze error, got {:?}", expanded.expansion_errors);
+    }
+
+    #[test]
+    fn explicit_single_cue_selection_bypasses_synthetic_album_grouping() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let a = td.path().join("side_a.flac");
+        let b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("side_b.cue");
+        std::fs::write(&a, b"not real flac").unwrap();
+        std::fs::write(&b, b"not real flac").unwrap();
+        for (cue, image, title) in [(&cue_a, "side_a.flac", "Album Side A"), (&cue_b, "side_b.flac", "Album Side B")] {
+            std::fs::write(
+                cue,
+                format!(
+                    r#"TITLE "{title}"
+FILE "{image}" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 01:00:00
+"#,
+                ),
+            )
+            .unwrap();
+        }
+
+        let expanded = expand_paths_to_audio(&[cue_a.clone()]);
+        assert_eq!(expanded.len(), 1);
+        assert!(path_list_contains(&expanded, &cue_a));
+        assert!(!path_list_contains(&expanded, &cue_b));
+        let queued = crate::convert::cue_parser::parse_cue_file(&expanded[0])
+            .expect("explicit cue remains parseable after bypass");
+        assert_eq!(
+            queued.title.as_deref(),
+            Some("Album Side A"),
+            "explicit single-CUE conversion must preserve the selected side's own album title"
+        );
+    }
+
     #[test]
     fn expand_paths_to_audio_suppresses_child_directory_split_source_cue_by_design() {
         let td = tempfile::tempdir().expect("tempdir");
@@ -1377,7 +2727,7 @@ FILE "10 - Live Version.wav" WAVE
     }
 
     #[test]
-    fn expand_paths_to_audio_queues_side_cues_and_suppresses_side_images() {
+    fn explicit_split_source_cues_queue_side_cues_and_suppress_side_images() {
         let td = tempfile::tempdir().expect("tempdir");
         let side_a_cue = td.path().join("side_a.cue");
         let side_b_cue = td.path().join("side_b.cue");
@@ -1406,7 +2756,7 @@ FILE "10 - Live Version.wav" WAVE
         )
         .unwrap();
 
-        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        let expanded = expand_paths_to_audio(&[side_a_cue.clone(), side_b_cue.clone()]);
         assert!(path_list_contains(&expanded, &side_a_cue));
         assert!(path_list_contains(&expanded, &side_b_cue));
         assert!(!path_list_contains(&expanded, &side_a));
@@ -1930,5 +3280,97 @@ mod direct_queue_source_policy_expansion_tests {
         for name in ["notes.txt", "track.zip", "track.tar.gz", "track.dmg", "track.cab"] {
             assert!(!path_list_contains(&expanded, &td.path().join(name)), "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod authoritative_split_cue_grouping_tests {
+    use super::*;
+
+    fn write_side(dir: &Path, stem: &str, title: &str, tracks: &[u32]) -> PathBuf {
+        let image = dir.join(format!("{stem}.flac"));
+        std::fs::write(&image, b"placeholder audio").expect("audio fixture");
+        let cue = dir.join(format!("{stem}.cue"));
+        let mut text = format!(
+            "TITLE \"{title}\"\nFILE \"{stem}.flac\" WAVE\n"
+        );
+        for (idx, minute) in tracks.iter().enumerate() {
+            text.push_str(&format!(
+                "  TRACK {:02} AUDIO\n    TITLE \"Track {}\"\n    INDEX 01 {:02}:00:00\n",
+                idx + 1,
+                idx + 1,
+                minute
+            ));
+        }
+        std::fs::write(&cue, text).expect("cue fixture");
+        cue
+    }
+
+    #[test]
+    fn conversion_honors_authoritative_split_decision_instead_of_conservative_merge() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let left = write_side(td.path(), "left", "Left", &[0, 3]);
+        let right = write_side(td.path(), "right", "Right", &[0, 4]);
+        let cue_paths = vec![left.clone(), right.clone()];
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(
+            split_cue_album_grouping_key_for_queue(&cue_paths),
+            crate::convert::split_cue_album::split_each_decision(
+                &cue_paths,
+                SplitCueAlbumGroupingReason::PerCueDistinctTocHits,
+            ),
+        );
+
+        let authoritative = expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[td.path().to_path_buf()],
+            &decisions,
+        );
+        assert!(authoritative.expansion_errors.is_empty());
+        assert_eq!(authoritative.paths, cue_paths);
+
+        let fallback = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert_eq!(fallback.paths.len(), 1, "without an authoritative split decision, the conversion planner would conservatively merge this ambiguous folder");
+        assert!(is_synthetic_cue_album_artifact(&fallback.paths[0]));
+        cleanup_synthetic_cue_artifacts(&fallback.synthetic_cue_artifacts);
+    }
+
+    #[test]
+    fn authoritative_split_lookup_is_order_independent_for_native_vs_casefolded_sort() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let upper = write_side(td.path(), "B", "Unrelated Upper", &[0, 3]);
+        let lower = write_side(td.path(), "a", "Unrelated Lower", &[0, 4]);
+
+        // PathBuf's native ordering sorts `B.cue` before `a.cue` on Unix, while
+        // queue expansion's deterministic browse order is case-folded and sorts
+        // `a.cue` before `B.cue`. The grouping decision key must therefore be
+        // a canonical member set, not the caller's traversal order.
+        let metadata_order = vec![upper.clone(), lower.clone()];
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(
+            split_cue_album_grouping_key_for_queue(&metadata_order),
+            crate::convert::split_cue_album::split_each_decision(
+                &metadata_order,
+                SplitCueAlbumGroupingReason::PerCueDistinctTocHits,
+            ),
+        );
+
+        let expanded = expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[td.path().to_path_buf()],
+            &decisions,
+        );
+
+        assert!(expanded.expansion_errors.is_empty());
+        assert_eq!(expanded.paths.len(), 2);
+        assert!(expanded.paths.iter().any(|path| queue_path_key(path) == queue_path_key(&lower)));
+        assert!(expanded.paths.iter().any(|path| queue_path_key(path) == queue_path_key(&upper)));
+        assert!(
+            expanded.synthetic_cue_artifacts.is_empty(),
+            "a cached per-cue split must not miss lookup and fall back to a synthetic merged album"
+        );
+
+        let fallback = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert_eq!(fallback.paths.len(), 1);
+        assert!(is_synthetic_cue_album_artifact(&fallback.paths[0]));
+        cleanup_synthetic_cue_artifacts(&fallback.synthetic_cue_artifacts);
     }
 }

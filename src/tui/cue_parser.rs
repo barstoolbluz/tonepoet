@@ -172,10 +172,10 @@ fn single_image_info_for_cue(cue_path: &Path) -> Option<SingleImageInfo> {
     let n = sheet.tracks.len();
     let mut boundaries = Vec::with_capacity(n);
     for i in 0..n {
-        let start_frames = sheet.tracks[i].index01_frames.unwrap() as u64;
+        let start_frames = sheet.tracks[i].index01_frames? as u64;
         let start_sample = start_frames * samples_per_frame;
         let end_sample = if i + 1 < n {
-            let next_frames = sheet.tracks[i + 1].index01_frames.unwrap() as u64;
+            let next_frames = sheet.tracks[i + 1].index01_frames? as u64;
             next_frames * samples_per_frame
         } else {
             total_samples

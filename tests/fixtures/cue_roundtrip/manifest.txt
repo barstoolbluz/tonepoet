@@ -1,0 +1,3 @@
+tests/fixtures/cue_roundtrip/three_part_a.cue
+tests/fixtures/cue_roundtrip/three_part_b.cue
+tests/fixtures/cue_roundtrip/quoted_catalog.cue

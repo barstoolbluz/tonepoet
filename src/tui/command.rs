@@ -11,7 +11,10 @@ use tokio::task;
 use super::app::*;
 use super::message::AppMessage;
 use crate::convert::formats::AudioFormat;
-use crate::convert::queue_expansion::{queue_path_key, QueueExpansionResult};
+use crate::convert::queue_expansion::{
+    queue_path_key, split_cue_album_grouping_key_for_queue, QueueExpansionResult,
+    QueueSplitCueAlbumGroupingDecisions,
+};
 use crate::convert::simple_wizard::DitherType;
 
 const CD_FRAMES_PER_SECOND: f64 = 75.0;
@@ -233,6 +236,18 @@ fn regular_filesystem_audio_folder_paths_for_convert_blocking_with_cancel(
     )
     .map_err(|err| err.message)?;
 
+    if let Some(err) = queue.first_error() {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&queue.synthetic_cue_artifacts);
+        return Err(err.to_string());
+    }
+    if !queue.synthetic_cue_artifacts.is_empty() {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&queue.synthetic_cue_artifacts);
+        return Err(
+            "Browse folder conversion produced transient synthetic CUE artifacts; use the ownership-bearing queue expansion API"
+                .to_string(),
+        );
+    }
+
     Ok(Some((queue.paths, visited)))
 }
 
@@ -259,14 +274,135 @@ pub(crate) fn browse_selection_contains_regular_audio_folder_for_convert(
         .any(|path| is_regular_filesystem_audio_folder_convert_candidate(app, path))
 }
 
+#[must_use]
+pub(crate) fn resolved_split_cue_album_grouping_decisions_for_conversion(
+    app: &AppState,
+    _paths: &[PathBuf],
+) -> QueueSplitCueAlbumGroupingDecisions {
+    let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+
+    // Reducer-safe snapshot only: carry every already-resolved session
+    // decision. Do not discover folders, parse CUEs, probe media, or construct
+    // TOC evidence here. WavPack/FFmpeg probing can block; conversion-specific
+    // evidence construction is performed inside the blocking expansion worker.
+    for decision in app.split_cue_album_grouping_cache.values() {
+        insert_queue_grouping_decision(&mut decisions, decision.clone());
+    }
+
+    decisions
+}
+
+fn augment_split_cue_album_grouping_decisions_for_conversion_blocking(
+    decisions: &mut QueueSplitCueAlbumGroupingDecisions,
+    paths: &[PathBuf],
+    cancel: &tokio_util::sync::CancellationToken,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
+    let infos = collect_single_image_cue_infos_for_sources(paths, &[]);
+    if cancel.is_cancelled() {
+        return;
+    }
+    let db = crate::db::Database::open().ok();
+    insert_cached_split_cue_grouping_decisions_for_infos_with_cache(
+        &infos,
+        decisions,
+        |toc| db.as_ref().and_then(|db| db.get_cached_mb_response(toc)),
+    );
+}
+
+fn insert_queue_grouping_decision(
+    decisions: &mut QueueSplitCueAlbumGroupingDecisions,
+    decision: SplitCueAlbumGroupingDecision,
+) {
+    let cue_paths: Vec<PathBuf> = decision
+        .groups
+        .iter()
+        .flat_map(|group| group.iter().cloned())
+        .collect();
+    if cue_paths.len() < 2 {
+        return;
+    }
+    decisions.insert(split_cue_album_grouping_key_for_queue(&cue_paths), decision);
+}
+
+#[cfg(test)]
+fn insert_cached_split_cue_grouping_decisions_for_infos(
+    app: &AppState,
+    infos: &[super::cue_parser::SingleImageInfo],
+    decisions: &mut QueueSplitCueAlbumGroupingDecisions,
+) {
+    insert_cached_split_cue_grouping_decisions_for_infos_with_cache(
+        infos,
+        decisions,
+        |toc| app.db.get_cached_mb_response(toc),
+    );
+}
+
+fn insert_cached_split_cue_grouping_decisions_for_infos_with_cache<F>(
+    infos: &[super::cue_parser::SingleImageInfo],
+    decisions: &mut QueueSplitCueAlbumGroupingDecisions,
+    mut cached_mb_response: F,
+) where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut by_parent: std::collections::BTreeMap<PathBuf, Vec<super::cue_parser::SingleImageInfo>> =
+        std::collections::BTreeMap::new();
+    for info in infos {
+        let Some(parent) = info.cue_path.parent() else {
+            continue;
+        };
+        by_parent
+            .entry(cue_info_path_key(parent))
+            .or_default()
+            .push(info.clone());
+    }
+
+    for mut group in by_parent.into_values() {
+        if group.len() < 2 {
+            continue;
+        }
+        group.sort_by(|left, right| left.cue_path.cmp(&right.cue_path));
+        let cue_paths: Vec<PathBuf> = group.iter().map(|info| info.cue_path.clone()).collect();
+        let queue_key = split_cue_album_grouping_key_for_queue(&cue_paths);
+        if decisions.contains_key(&queue_key) {
+            continue;
+        }
+        let decision = split_cue_title_rung_decision(&group).or_else(|| {
+            cached_split_cue_album_grouping_ladder_decision_with_cache(&group, |toc| {
+                cached_mb_response(toc)
+            })
+        });
+        if let Some(decision) = decision {
+            decisions.insert(queue_key, decision);
+        }
+    }
+}
+
 /// Blocking expansion implementation for the Browse Convert worker. It expands
 /// only regular filesystem audio folders; real disc/archive/CUE/single-file
 /// sources remain opaque. The result is deterministic and explicit about empty
 /// folders versus scan failures.
+#[cfg(test)]
 pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking(
     browse_in_archive: bool,
     paths: Vec<PathBuf>,
     cancel: tokio_util::sync::CancellationToken,
+) -> BrowseConvertExpansion {
+    expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions(
+        browse_in_archive,
+        paths,
+        cancel,
+        QueueSplitCueAlbumGroupingDecisions::new(),
+    )
+}
+
+pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions(
+    browse_in_archive: bool,
+    paths: Vec<PathBuf>,
+    cancel: tokio_util::sync::CancellationToken,
+    mut grouping_decisions: QueueSplitCueAlbumGroupingDecisions,
 ) -> BrowseConvertExpansion {
     let selection = normalized_path_snapshot(paths);
     let mut regular_folders = Vec::new();
@@ -291,6 +427,8 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking(
             queue: QueueExpansionResult {
                 paths: selection,
                 cue_artifact_audio: std::collections::HashSet::new(),
+                synthetic_cue_artifacts: std::collections::HashSet::new(),
+                expansion_errors: Vec::new(),
             },
             expanded_folder_count: 0,
             empty_audio_folders: Vec::new(),
@@ -300,11 +438,21 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking(
         };
     }
 
-    match crate::convert::queue_expansion::expand_paths_to_audio_with_preserved_disc_roots_limited(
+    augment_split_cue_album_grouping_decisions_for_conversion_blocking(
+        &mut grouping_decisions,
+        &regular_folders,
+        &cancel,
+    );
+    if cancel.is_cancelled() {
+        return BrowseConvertExpansion::cancelled(0);
+    }
+
+    match crate::convert::queue_expansion::expand_paths_to_audio_with_preserved_disc_roots_limited_using_grouping_decisions(
         &selection,
         &preserved_roots,
         BROWSE_CONVERT_FOLDER_EXPANSION_MAX_VISITED,
         || cancel.is_cancelled(),
+        &grouping_decisions,
     ) {
         Ok((queue, visited)) => {
             let empty_audio_folders = regular_folders
@@ -392,6 +540,10 @@ pub(crate) fn start_browse_convert_folder_expansion(
         status,
     ));
 
+    let grouping_decisions = resolved_split_cue_album_grouping_decisions_for_conversion(
+        app,
+        &request.selection_snapshot,
+    );
     let tx_for_worker = tx.clone();
     let request_for_worker = request.clone();
     tokio::spawn(async move {
@@ -399,10 +551,11 @@ pub(crate) fn start_browse_convert_folder_expansion(
         let browse_in_archive = request_for_worker.browse_in_archive;
         let cancel_for_worker = cancel.clone();
         let worker_result = task::spawn_blocking(move || {
-            expand_regular_filesystem_audio_folders_for_convert_blocking(
+            expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions(
                 browse_in_archive,
                 paths_for_worker,
                 cancel_for_worker,
+                grouping_decisions,
             )
         })
         .await
@@ -662,9 +815,8 @@ fn paths_for_cue_metadata_surfaces(surfaces: &[CueMetadataSurface]) -> Vec<PathB
 /// one side's verbatim title biases the query. Use the longest common prefix
 /// of every part's title, trimmed of a dangling side/part designator opener.
 /// Falls back to the first title when the parts share no meaningful prefix.
-fn common_cue_album_title(titles: &[String]) -> Option<String> {
-    let first = titles.first()?.clone();
-    meaningful_common_cue_album_prefix(titles).or(Some(first))
+pub(crate) fn common_cue_album_title(titles: &[String]) -> Option<String> {
+    crate::convert::split_cue_album::common_cue_album_title(titles)
 }
 
 /// Return the decisive TITLE-rung shared prefix used by the split-CUE album
@@ -673,63 +825,15 @@ fn common_cue_album_title(titles: &[String]) -> Option<String> {
 /// it means the ladder must continue to concat-TOC, per-CUE TOC, and finally
 /// conservative merge.
 pub(crate) fn meaningful_common_cue_album_prefix(titles: &[String]) -> Option<String> {
-    if titles.len() < 2 || titles.iter().any(|t| t.trim().is_empty()) {
-        return None;
-    }
-    let mut prefix: Vec<char> = titles[0].chars().collect();
-    for title in &titles[1..] {
-        let chars: Vec<char> = title.chars().collect();
-        let mut common = 0;
-        while common < prefix.len()
-            && common < chars.len()
-            && prefix[common] == chars[common]
-        {
-            common += 1;
-        }
-        prefix.truncate(common);
-    }
-    let mut candidate: String = prefix.into_iter().collect();
-    loop {
-        let trimmed = candidate.trim_end();
-        if trimmed.len() != candidate.len() {
-            candidate.truncate(trimmed.len());
-            continue;
-        }
-        if let Some(last) = candidate.chars().last() {
-            if matches!(last, '-' | '\u{2013}' | ':' | ',' | '&' | '/') {
-                candidate.pop();
-                continue;
-            }
-        }
-        let opens = candidate.matches(['(', '[']).count();
-        let closes = candidate.matches([')', ']']).count();
-        if opens > closes {
-            if let Some(cut) = candidate.rfind(['(', '[']) {
-                candidate.truncate(cut);
-                continue;
-            }
-        }
-        break;
-    }
-    (candidate.chars().count() >= 4).then_some(candidate)
+    crate::convert::split_cue_album::meaningful_common_cue_album_prefix(titles)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SplitCueAlbumGroupingKey(Vec<PathBuf>);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SplitCueAlbumGroupingReason {
-    TitleSharedPrefix,
-    ConcatTocHit,
-    PerCueDistinctTocHits,
-    AmbiguousMerge,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SplitCueAlbumGroupingDecision {
-    pub groups: Vec<Vec<PathBuf>>,
-    pub reason: SplitCueAlbumGroupingReason,
-}
+pub use crate::convert::split_cue_album::{
+    SplitCueAlbumGroupingDecision, SplitCueAlbumGroupingReason,
+};
 
 #[derive(Debug)]
 pub struct SplitCueAlbumGroupingRequest {
@@ -749,7 +853,7 @@ pub struct SplitCueAlbumGroupingAsyncOutcome {
 pub(crate) fn split_cue_album_grouping_key_from_paths(
     paths: &[PathBuf],
 ) -> SplitCueAlbumGroupingKey {
-    SplitCueAlbumGroupingKey(paths.iter().map(|path| cue_info_path_key(path)).collect())
+    SplitCueAlbumGroupingKey(crate::convert::split_cue_album::grouping_key_from_paths(paths))
 }
 
 pub(crate) fn split_cue_album_grouping_key(
@@ -763,23 +867,16 @@ fn split_cue_album_grouping_decision_merge(
     infos: &[super::cue_parser::SingleImageInfo],
     reason: SplitCueAlbumGroupingReason,
 ) -> SplitCueAlbumGroupingDecision {
-    SplitCueAlbumGroupingDecision {
-        groups: vec![infos.iter().map(|info| cue_info_path_key(&info.cue_path)).collect()],
-        reason,
-    }
+    let cue_paths: Vec<PathBuf> = infos.iter().map(|info| info.cue_path.clone()).collect();
+    crate::convert::split_cue_album::merge_decision(&cue_paths, reason)
 }
 
 fn split_cue_album_grouping_decision_split_each(
     infos: &[super::cue_parser::SingleImageInfo],
     reason: SplitCueAlbumGroupingReason,
 ) -> SplitCueAlbumGroupingDecision {
-    SplitCueAlbumGroupingDecision {
-        groups: infos
-            .iter()
-            .map(|info| vec![cue_info_path_key(&info.cue_path)])
-            .collect(),
-        reason,
-    }
+    let cue_paths: Vec<PathBuf> = infos.iter().map(|info| info.cue_path.clone()).collect();
+    crate::convert::split_cue_album::split_each_decision(&cue_paths, reason)
 }
 
 fn split_cue_infos_for_decision_group(
@@ -1001,19 +1098,6 @@ fn single_image_cue_info_to_cd_sectors(
     super::musicbrainz::build_mb_toc(&sectors).map(|_| sectors)
 }
 
-fn cached_mb_bodies_for_toc_candidates(
-    app: &AppState,
-    candidates: &[super::musicbrainz::TocCandidate],
-) -> Vec<Option<String>> {
-    candidates
-        .iter()
-        .map(|candidate| {
-            super::musicbrainz::build_mb_toc(&candidate.sectors)
-                .and_then(|toc| app.db.get_cached_mb_response(&toc))
-        })
-        .collect()
-}
-
 fn split_cue_album_grouping_probe_inputs(
     app: &AppState,
     infos: &[super::cue_parser::SingleImageInfo],
@@ -1022,16 +1106,37 @@ fn split_cue_album_grouping_probe_inputs(
     Vec<Option<String>>,
     Vec<(Vec<u32>, Option<String>)>,
 ) {
+    split_cue_album_grouping_probe_inputs_with_cache(infos, |toc| {
+        app.db.get_cached_mb_response(toc)
+    })
+}
+
+fn split_cue_album_grouping_probe_inputs_with_cache<F>(
+    infos: &[super::cue_parser::SingleImageInfo],
+    mut cached_mb_response: F,
+) -> (
+    Vec<super::musicbrainz::TocCandidate>,
+    Vec<Option<String>>,
+    Vec<(Vec<u32>, Option<String>)>,
+) where
+    F: FnMut(&str) -> Option<String>,
+{
     let concat_candidates = concat_single_image_cue_infos_to_cd_sectors(infos)
         .map(|sectors| super::musicbrainz::toc_candidates_from_sectors(&sectors))
         .unwrap_or_default();
-    let concat_cached = cached_mb_bodies_for_toc_candidates(app, &concat_candidates);
+    let concat_cached = concat_candidates
+        .iter()
+        .map(|candidate| {
+            super::musicbrainz::build_mb_toc(&candidate.sectors)
+                .and_then(|toc| cached_mb_response(&toc))
+        })
+        .collect();
     let per_cue_cached: Vec<(Vec<u32>, Option<String>)> = infos
         .iter()
         .filter_map(|info| {
             let sectors = single_image_cue_info_to_cd_sectors(info)?;
             let cached = super::musicbrainz::build_mb_toc(&sectors)
-                .and_then(|toc| app.db.get_cached_mb_response(&toc));
+                .and_then(|toc| cached_mb_response(&toc));
             Some((sectors, cached))
         })
         .collect();
@@ -1042,8 +1147,20 @@ fn cached_split_cue_album_grouping_ladder_decision(
     app: &AppState,
     infos: &[super::cue_parser::SingleImageInfo],
 ) -> Option<SplitCueAlbumGroupingDecision> {
+    cached_split_cue_album_grouping_ladder_decision_with_cache(infos, |toc| {
+        app.db.get_cached_mb_response(toc)
+    })
+}
+
+fn cached_split_cue_album_grouping_ladder_decision_with_cache<F>(
+    infos: &[super::cue_parser::SingleImageInfo],
+    cached_mb_response: F,
+) -> Option<SplitCueAlbumGroupingDecision>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let (concat_candidates, concat_cached, per_cue_cached) =
-        split_cue_album_grouping_probe_inputs(app, infos);
+        split_cue_album_grouping_probe_inputs_with_cache(infos, cached_mb_response);
     for (candidate, cached) in concat_candidates.iter().zip(concat_cached.iter()) {
         let body = cached.as_ref()?;
         let releases = super::musicbrainz::parse_mb_response_all(
@@ -5890,8 +6007,14 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
 
     let mut count = 0usize;
     let mut errors = 0usize;
-    let QueueExpansionResult { paths, cue_artifact_audio } = queue;
+    let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
+    if let Some(err) = expansion_errors.first() {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+        app.set_status(err.clone());
+        return;
+    }
     for path in paths {
+        let is_synthetic_cue_artifact = synthetic_cue_artifacts.contains(&path);
         let archive_password = if crate::is_encrypted_archive_ext(&path) {
             app.archive_passwords
                 .get(&path)
@@ -5909,13 +6032,21 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
             &cue_artifact_audio,
         );
         match app.manager.add_file_ready_for_processing_with_cue_sidecar_override(
-            path,
+            path.clone(),
             options.clone(),
             archive_password,
             cue_sidecar_override,
         ) {
-            Ok(_) => count = count.saturating_add(1),
+            Ok(item_id) => {
+                count = count.saturating_add(1);
+                if is_synthetic_cue_artifact {
+                    app.manager.register_synthetic_cue_artifact(&item_id, &path);
+                }
+            }
             Err(err) => {
+                if is_synthetic_cue_artifact {
+                    crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(&path);
+                }
                 errors = errors.saturating_add(1);
                 log::warn!("queue add failed during Browse Convert expansion: {err}");
             }
@@ -5938,9 +6069,15 @@ pub(crate) fn install_browse_convert_source_paths(
     from_folder_expansion: bool,
 ) {
     app.cancel_browse_convert_expansion();
-    let QueueExpansionResult { paths, cue_artifact_audio } = queue;
+    let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
+    if let Some(err) = expansion_errors.first() {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+        app.set_status(err.clone());
+        return;
+    }
     let paths = normalized_path_snapshot(paths);
     if paths.is_empty() {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
         app.set_status("No supported sources selected");
         return;
     }
@@ -5984,6 +6121,10 @@ pub(crate) fn install_browse_convert_source_paths(
     app.convert.set_source_mode(mode);
     app.convert.source.cue_artifact_audio = cue_artifact_audio;
     app.convert.source.cue_artifact_audio.retain(|path| {
+        crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
+    });
+    app.convert.source.synthetic_cue_artifacts = synthetic_cue_artifacts;
+    app.convert.source.synthetic_cue_artifacts.retain(|path| {
         crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
     });
     app.convert.apply_source_defaults();
@@ -6053,9 +6194,15 @@ fn finish_browse_queue_review_after_expansion(
     queue: QueueExpansionResult,
     expanded_folder_count: usize,
 ) -> bool {
-    let QueueExpansionResult { paths, mut cue_artifact_audio } = queue;
+    let QueueExpansionResult { paths, mut cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
+    if let Some(err) = expansion_errors.first() {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+        app.set_status(err.clone());
+        return false;
+    }
     let paths = normalized_path_snapshot(paths);
     if paths.is_empty() {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
         app.set_status("queue: no supported sources in selection");
         return false;
     }
@@ -6082,7 +6229,7 @@ fn finish_browse_queue_review_after_expansion(
     install_browse_convert_source_paths(
         app,
         tx,
-        QueueExpansionResult { paths, cue_artifact_audio },
+        QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors: Vec::new() },
         expanded_folder_count,
         expanded_folder_count > 0,
     );
@@ -6153,6 +6300,13 @@ fn execute_queue_with_post_load(
             }
 
             let selection = app.browse.collect_selection_for_queue();
+            if let Some(err) = selection.first_error() {
+                app.set_status(status_with_stale_selection_notice(
+                    dropped_stale_count,
+                    err.to_string(),
+                ));
+                return;
+            }
             if selection.paths.is_empty() {
                 app.set_status(status_with_stale_selection_notice(
                     dropped_stale_count,
@@ -6471,6 +6625,7 @@ fn execute_commit_with_source_options_transform(
     // metadata lives on the Convert source state, because that state is the
     // ownership boundary between Browse expansion and Commit.
     let cue_artifact_audio = app.convert.source.cue_artifact_audio.clone();
+    let source_synthetic_cue_artifacts = app.convert.source.synthetic_cue_artifacts.clone();
     let outcome = super::convert_actions::commit_batch_with_cue_artifacts(
         app,
         &batch,
@@ -6498,6 +6653,14 @@ fn execute_commit_with_source_options_transform(
         }
         return;
     }
+
+    let claimed_synthetic_cue_artifacts = app
+        .manager
+        .register_synthetic_cue_artifacts_for_current_queue(&source_synthetic_cue_artifacts);
+    for artifact in source_synthetic_cue_artifacts.difference(&claimed_synthetic_cue_artifacts) {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
+    }
+    app.convert.source.synthetic_cue_artifacts.clear();
 
     // Attach or update a PipelineRequest whenever the Convert screen carries
     // source state the generic ConversionItem builder cannot infer, or when a
@@ -6709,6 +6872,7 @@ fn execute_commit_with_source_options_transform(
     // Clear source pane so a subsequent `:queue` arrives fresh. Transfer any
     // archive preview staging to the queued item before dropping the source.
     let _ = app.convert.source.mode.disarm_archive_preview_cleanup();
+    app.convert.source.synthetic_cue_artifacts.clear();
     app.convert.set_source_mode(SourceMode::Empty);
     app.convert.source.cue_artifact_audio.clear();
     app.convert.metadata = MetadataState::default();
@@ -14848,13 +15012,18 @@ mod execute_queue_state_consistency_tests {
             "fresh async completions must not recompute queue semantics through Browse"
         );
         let destructure = finish_body
-            .find("let QueueExpansionResult { paths, mut cue_artifact_audio } = queue;")
+            .find("let QueueExpansionResult { paths, mut cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
+    if let Some(err) = expansion_errors.first() {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+        app.set_status(err.clone());
+        return false;
+    }")
             .expect("CUE metadata should come from the expansion result");
         let retain = finish_body
             .find("cue_artifact_audio.retain")
             .expect("CUE metadata must be trimmed to expanded paths");
         let publish = finish_body
-            .find("QueueExpansionResult { paths, cue_artifact_audio }")
+            .find("QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors: Vec::new() }")
             .expect("CUE metadata should be published with source paths");
 
         assert!(destructure < retain);
@@ -14890,6 +15059,60 @@ mod execute_queue_state_consistency_tests {
         assert!(expansion.expansion_errors.is_empty());
         assert_eq!(expansion.queue.paths, vec![cue]);
         assert!(!expansion.queue.paths.contains(&image));
+    }
+
+    #[test]
+    fn compatibility_folder_adapter_rejects_owned_synthetic_cue_artifacts() {
+        fn synthetic_artifact_dirs() -> std::collections::BTreeSet<std::path::PathBuf> {
+            let root = std::env::temp_dir().join("tonepoet-synthetic-cue-albums");
+            std::fs::read_dir(root)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.flatten())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("artifact-"))
+                })
+                .collect()
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        for (stem, title) in [("side_a", "Album Side A"), ("side_b", "Album Side B")] {
+            std::fs::write(album.join(format!("{stem}.flac")), b"not real flac").expect("audio fixture");
+            std::fs::write(
+                album.join(format!("{stem}.cue")),
+                format!(
+                    r#"TITLE "{title}"
+FILE "{stem}.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "{stem} track 1"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "{stem} track 2"
+    INDEX 01 00:30:00
+"#
+                ),
+            )
+            .expect("cue fixture");
+        }
+
+        let before = synthetic_artifact_dirs();
+        let err = regular_filesystem_audio_folder_paths_for_convert_blocking(false, &album)
+            .expect_err("legacy adapter must not discard ownership of synthetic CUE artifacts");
+        let after = synthetic_artifact_dirs();
+
+        assert!(
+            err.contains("ownership-bearing queue expansion API"),
+            "adapter should direct callers to the lifecycle-owning API: {err}"
+        );
+        assert_eq!(
+            before, after,
+            "adapter must clean any transient synthetic CUE artifacts before returning an error"
+        );
     }
 
     #[test]
@@ -15032,6 +15255,8 @@ mod execute_queue_state_consistency_tests {
                 queue: QueueExpansionResult {
                     paths: vec![track],
                     cue_artifact_audio: std::collections::HashSet::new(),
+                    synthetic_cue_artifacts: std::collections::HashSet::new(),
+                    expansion_errors: Vec::new(),
                 },
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -15109,6 +15334,8 @@ mod execute_queue_state_consistency_tests {
                 queue: QueueExpansionResult {
                     paths: vec![track_a],
                     cue_artifact_audio: std::collections::HashSet::new(),
+                    synthetic_cue_artifacts: std::collections::HashSet::new(),
+                    expansion_errors: Vec::new(),
                 },
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -15892,6 +16119,79 @@ mod split_cue_source_coverage_tests {
         );
     }
 
+    #[test]
+    fn conversion_grouping_snapshot_is_reducer_safe_and_worker_augments_evidence() {
+        let source = include_str!("command.rs");
+        let snapshot_start = source
+            .find("pub(crate) fn resolved_split_cue_album_grouping_decisions_for_conversion(")
+            .expect("snapshot helper should exist");
+        // The worker fn sits BETWEEN the snapshot helper and the insert
+        // helper in this file; the snapshot span must end where the worker
+        // begins or it would (wrongly) contain the worker's discovery calls.
+        let snapshot_end = source[snapshot_start..]
+            .find("fn augment_split_cue_album_grouping_decisions_for_conversion_blocking(")
+            .map(|offset| snapshot_start + offset)
+            .expect("worker helper follows snapshot helper");
+        let snapshot_body = &source[snapshot_start..snapshot_end];
+        assert!(
+            snapshot_body.contains("split_cue_album_grouping_cache.values()"),
+            "the reducer may snapshot already-resolved decisions"
+        );
+        assert!(
+            !snapshot_body.contains("collect_single_image_cue_infos_for_sources"),
+            "the reducer snapshot must not discover/parse/probe CUE groups"
+        );
+        assert!(
+            !snapshot_body.contains("insert_cached_split_cue_grouping_decisions_for_infos"),
+            "cache-evidence construction must not run on the reducer path"
+        );
+
+        let worker_start = source
+            .find("fn augment_split_cue_album_grouping_decisions_for_conversion_blocking(")
+            .expect("blocking augmentation helper should exist");
+        let worker_end = source[worker_start..]
+            .find("fn insert_queue_grouping_decision(")
+            .map(|offset| worker_start + offset)
+            .expect("insert helper follows worker augmentation helper");
+        let worker_body = &source[worker_start..worker_end];
+        assert!(
+            worker_body.contains("collect_single_image_cue_infos_for_sources"),
+            "filesystem discovery and media probing must happen in the blocking worker"
+        );
+        assert!(
+            worker_body.contains("insert_cached_split_cue_grouping_decisions_for_infos_with_cache"),
+            "TOC cache evidence must be constructed after worker-side probing"
+        );
+    }
+
+    #[test]
+    fn cached_split_cue_grouping_decision_is_snapshotted_for_conversion_expansion() {
+        let infos = split_cue_grouping_fixture(&[
+            Some("Chronicle"),
+            Some("Willy And The Poor Boys"),
+        ]);
+        let mut app = crate::tui::app::AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let decision = split_cue_album_grouping_decision_split_each(
+            &infos,
+            SplitCueAlbumGroupingReason::PerCueDistinctTocHits,
+        );
+        app.split_cue_album_grouping_cache
+            .insert(split_cue_album_grouping_key(&infos), decision.clone());
+
+        let snapshot = resolved_split_cue_album_grouping_decisions_for_conversion(
+            &app,
+            &[PathBuf::from("/tmp/album")],
+        );
+        let cue_paths: Vec<PathBuf> = infos.iter().map(|info| info.cue_path.clone()).collect();
+        let queue_key = split_cue_album_grouping_key_for_queue(&cue_paths);
+        assert_eq!(
+            snapshot.get(&queue_key).map(|decision| decision.reason),
+            Some(SplitCueAlbumGroupingReason::PerCueDistinctTocHits),
+            "Browse conversion must carry the same cached decisive split that metadata/GNUDB already resolved"
+        );
+        assert_eq!(snapshot.get(&queue_key), Some(&decision));
+    }
+
 
     fn store_cached_mb_body_for_sectors(
         app: &mut crate::tui::app::AppState,
@@ -15963,6 +16263,44 @@ mod split_cue_source_coverage_tests {
             "per-CUE decisive split must be available to metadata/GNUDB grouping from cached MB bodies, not only after :tags-mb computed it"
         );
     }
+
+    #[test]
+    fn cached_per_cue_distinct_release_ids_drive_metadata_and_conversion_split_identically() {
+        let infos = split_cue_grouping_fixture(&[
+            Some("Chronicle"),
+            Some("Willy And The Poor Boys"),
+        ]);
+        let mut app = crate::tui::app::AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        store_cached_mb_body_for_sectors(&mut app, &concat, r#"{"releases":[]}"#);
+        for (idx, info) in infos.iter().enumerate() {
+            let sectors = single_image_cue_info_to_cd_sectors(info).expect("per cue toc");
+            store_cached_mb_body_for_sectors(
+                &mut app,
+                &sectors,
+                &mb_cached_body(&format!("distinct-release-{}", idx + 1), "Separate", 2),
+            );
+        }
+
+        let metadata_decision = cached_or_title_split_cue_album_grouping_decision(&mut app, &infos)
+            .expect("metadata ladder uses cached per-cue release ids");
+        assert_eq!(
+            metadata_decision.reason,
+            SplitCueAlbumGroupingReason::PerCueDistinctTocHits,
+        );
+
+        let mut conversion_decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        insert_cached_split_cue_grouping_decisions_for_infos(&app, &infos, &mut conversion_decisions);
+        let queue_key = split_cue_album_grouping_key_for_queue(
+            &infos.iter().map(|info| info.cue_path.clone()).collect::<Vec<_>>(),
+        );
+        let conversion_decision = conversion_decisions
+            .get(&queue_key)
+            .expect("conversion snapshot carries equivalent cached TOC evidence");
+        assert_eq!(conversion_decision.reason, metadata_decision.reason);
+        assert_eq!(conversion_decision.groups, metadata_decision.groups);
+    }
+
 
     #[tokio::test]
     async fn split_cue_grouping_unrelated_titles_still_reach_concat_toc_hit() {

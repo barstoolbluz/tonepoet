@@ -4682,12 +4682,16 @@ impl BrowseState {
                     return QueueExpansionResult {
                         paths: vec![entry.path.clone()],
                         cue_artifact_audio: HashSet::new(),
+                        synthetic_cue_artifacts: HashSet::new(),
+                        expansion_errors: Vec::new(),
                     };
                 }
                 EntryKind::OtherFile if is_cue_sheet_path(&entry.path) => {
                     return QueueExpansionResult {
                         paths: vec![entry.path.clone()],
                         cue_artifact_audio: HashSet::new(),
+                        synthetic_cue_artifacts: HashSet::new(),
+                        expansion_errors: Vec::new(),
                     };
                 }
                 EntryKind::Directory => {
@@ -4697,6 +4701,8 @@ impl BrowseState {
                     return QueueExpansionResult {
                         paths: vec![entry.path.clone()],
                         cue_artifact_audio: HashSet::new(),
+                        synthetic_cue_artifacts: HashSet::new(),
+                        expansion_errors: Vec::new(),
                     };
                 }
                 _ => {}
