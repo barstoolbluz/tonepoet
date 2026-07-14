@@ -4340,13 +4340,47 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         AppMessage::TagsFromMbComplete { outcome, ctx } => {
             dispatch_tags_from_mb_complete(app, tx, outcome, ctx);
         }
+        AppMessage::SplitCueAlbumGroupingComplete { request, result } => {
+            super::command::handle_split_cue_album_grouping_complete(
+                app,
+                tx,
+                *request,
+                result,
+            );
+        }
+        AppMessage::GnudbSplitCueAlbumGroupingComplete {
+            infos,
+            active_audio_path,
+            result,
+        } => {
+            super::context_menu::handle_gnudb_split_cue_album_grouping_complete(
+                app,
+                tx,
+                infos,
+                active_audio_path,
+                result,
+            );
+        }
+        AppMessage::MetadataEditorSplitCueAlbumGroupingComplete {
+            infos,
+            active_cue_path,
+            result,
+        } => {
+            super::keybindings::handle_metadata_editor_split_cue_album_grouping_complete(
+                app,
+                tx,
+                infos,
+                active_cue_path,
+                result,
+            );
+        }
         AppMessage::TagsMbApplyReady {
             releases,
             selected,
             paths,
             decision,
         } => {
-            apply_editor_with_mb_release_decision(app, releases, selected, paths, decision);
+            apply_editor_with_mb_release_decision(app, tx, releases, selected, paths, decision);
         }
         AppMessage::MbDetailPrefetchComplete { release_id, result } => {
             // Stamp the in-memory cache if the picker is still open,
@@ -4818,7 +4852,7 @@ fn handle_cue_mb_complete(
 /// `AppMessage::TagsFromMbComplete`, and this function hands the payload to
 /// `handle_tags_from_mb_complete`, whose success path eventually reopens the
 /// editor through the apply-to-all presentation prompt.
-fn dispatch_tags_from_mb_complete(
+pub(super) fn dispatch_tags_from_mb_complete(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     outcome: super::message::MbOutcome,
@@ -4915,7 +4949,7 @@ fn handle_mb_toc_outcome(
             }
         },
         1 => {
-            open_editor_with_mb_release(app, outcome.releases, 0, ctx.paths);
+            open_editor_with_mb_release(app, tx, outcome.releases, 0, ctx.paths);
             if let Some(note) = stub_note {
                 app.set_status(format!(":tags-mb: {}", note));
             }
@@ -4962,7 +4996,7 @@ fn handle_mb_search_outcome(
             ));
         }
         1 => {
-            open_editor_with_mb_release(app, outcome.releases, 0, ctx.paths);
+            open_editor_with_mb_release(app, tx, outcome.releases, 0, ctx.paths);
         }
         n => {
             open_mb_select_picker(app, tx, outcome.releases, ctx, n, Some(query_label));
@@ -5170,6 +5204,33 @@ pub(super) fn take_metadata_editor(
     None
 }
 
+
+fn metadata_editor_paths_match_tags_mb_context(
+    state: &super::app::MetadataEditorState,
+    paths: &[std::path::PathBuf],
+) -> bool {
+    if state.active_surface().paths == paths {
+        return true;
+    }
+    if state.presentation_tabs.len() < 2 {
+        return false;
+    }
+    let mut expanded = Vec::new();
+    for tab in &state.presentation_tabs {
+        let Some(path) = tab.paths.first() else {
+            return false;
+        };
+        if tab.paths.len() != 1 {
+            return false;
+        }
+        let count = tab.file_labels.len().max(1);
+        for _ in 0..count {
+            expanded.push(path.clone());
+        }
+    }
+    expanded == paths
+}
+
 /// Spawn a Phase B-4 prefetch task for an MbSelect candidate. The task
 /// sleeps for the debounce window (150 ms), re-checks the picker's
 /// generation atomic — bailing out if the user has moved cursor — and
@@ -5232,6 +5293,7 @@ pub(super) fn spawn_mb_detail_prefetch(
 /// being whatever the user picked).
 pub(super) fn open_editor_with_mb_release(
     app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
     releases: Vec<super::musicbrainz::MbRelease>,
     selected: usize,
     paths: Vec<std::path::PathBuf>,
@@ -5287,6 +5349,7 @@ pub(super) fn open_editor_with_mb_release(
         );
         apply_editor_with_mb_release_decision(
             app,
+            tx,
             releases,
             selected,
             paths,
@@ -5302,6 +5365,7 @@ pub(super) fn open_editor_with_mb_release(
 
     apply_editor_with_mb_release_decision(
         app,
+        tx,
         releases,
         selected,
         paths,
@@ -5311,6 +5375,7 @@ pub(super) fn open_editor_with_mb_release(
 
 pub(super) fn apply_editor_with_mb_release_decision(
     app: &mut AppState,
+    _tx: &mpsc::Sender<AppMessage>,
     releases: Vec<super::musicbrainz::MbRelease>,
     selected: usize,
     paths: Vec<std::path::PathBuf>,
@@ -5331,50 +5396,89 @@ pub(super) fn apply_editor_with_mb_release_decision(
     //   `active_overlay` because the dispatch deliberately left it
     //   there during the async wait to suppress auto-restore from
     //   the command-input / context-menu wrappers.
-    let mut state = if let Some(s) = take_metadata_editor(app) {
-        s
+    let (mut state, mut split_cue_mb_populated) = if let Some(s) = take_metadata_editor(app) {
+        (s, false)
     } else {
-        super::keybindings::open_metadata_editor(app);
-        let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
-        match prior {
-            ActiveOverlay::MetadataEditor(state) => state,
-            other => {
-                app.active_overlay = other;
+        match super::keybindings::build_metadata_editor_for_cue_surfaces_with_mb_release(
+            app,
+            &paths,
+            release,
+        ) {
+            Ok(Some(state)) => (state, true),
+            Ok(None) => {
+                super::keybindings::open_metadata_editor(app);
+                let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+                match prior {
+                    ActiveOverlay::MetadataEditor(state) => (state, false),
+                    other => {
+                        app.active_overlay = other;
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                app.set_status(format!(":tags-mb: could not open split CUE editor: {}", err));
                 return;
             }
         }
     };
 
-    if state.active_surface().paths != paths {
+    if !metadata_editor_paths_match_tags_mb_context(&state, &paths) {
         app.set_status(":tags-mb: selection changed since lookup; rerun".to_string());
         app.active_overlay = ActiveOverlay::MetadataEditor(state);
         return;
     }
+    if !split_cue_mb_populated
+        && state.cue_surface_tabs
+        && state.presentation_tabs.len() > 1
+        && metadata_editor_paths_match_tags_mb_context(&state, &paths)
+    {
+        split_cue_mb_populated = super::keybindings::populate_split_cue_metadata_editor_from_mb_release(
+            &mut state,
+            release,
+        );
+    }
     // The potentially blocking per-track guard was computed before this
     // reducer ran. Reuse it for status text and population so the event loop
     // never performs media/tag inspection here.
-    let skip_reason = decision.skip_reason.clone();
+    let skip_reason = if split_cue_mb_populated {
+        None
+    } else {
+        decision.skip_reason.clone()
+    };
     // Phase C item 3: surface track-count divergence as a non-fatal
     // warning. MB releases sometimes carry bonus/hidden tracks not
     // present on the SACD area being tagged, or the reverse —
     // populate writes what it can match by position. The helper
     // guards single-image rips (where N>1 MB tracks ride in the
     // CUESHEET tag, not in N files) so they don't false-warn.
-    let track_count_warning = super::musicbrainz::track_count_mismatch_message(&state, release);
+    let track_count_warning = if split_cue_mb_populated {
+        None
+    } else {
+        super::musicbrainz::track_count_mismatch_message(&state, release)
+    };
 
     // Keep the active tab snapshot current before and after MB population. For
     // multi-presentation editors this preserves per-tab state and lets the
     // apply-to-all confirmation copy only the MB-populated values from the
-    // active presentation into matching sibling presentations.
-    super::musicbrainz::populate_editor_from_mb_with_per_track_decision(
-        &mut state,
-        release,
-        &decision,
-    );
-    let dvdv_duration_warning =
-        super::musicbrainz::apply_dvdv_duration_warnings(&mut state, release);
+    // active presentation into matching sibling presentations. Split-CUE MB
+    // apply has already populated every tab by concatenated track position;
+    // applying the whole release to the active tab here would collapse side B
+    // back into side A's shape.
+    if !split_cue_mb_populated {
+        super::musicbrainz::populate_editor_from_mb_with_per_track_decision(
+            &mut state,
+            release,
+            &decision,
+        );
+        state.active_surface_mut().dirty = true;
+    }
+    let dvdv_duration_warning = if split_cue_mb_populated {
+        None
+    } else {
+        super::musicbrainz::apply_dvdv_duration_warnings(&mut state, release)
+    };
     state.phase = super::app::MetadataEditorPhase::Editing;
-    state.active_surface_mut().dirty = true;
 
     let label = if release.title.is_empty() {
         "(untitled)"
@@ -5402,7 +5506,7 @@ pub(super) fn apply_editor_with_mb_release_decision(
         });
     }
 
-    let has_matching_presentations = state.has_multiple_presentations();
+    let has_matching_presentations = !split_cue_mb_populated && state.has_multiple_presentations();
     super::keybindings::reopen_metadata_editor_after_musicbrainz_population(app, state);
     if has_matching_presentations {
         msg.push_str(" [apply to matching presentations?]");
@@ -6344,8 +6448,10 @@ mod musicbrainz_completion_dispatch_tests {
             editor_paths.clone(),
         )));
 
+        let tx = tx();
         open_editor_with_mb_release(
             &mut app,
+            &tx,
             vec![release("", "Candidate A"), release("", "Candidate B")],
             1,
             editor_paths,

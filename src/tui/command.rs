@@ -658,14 +658,23 @@ fn paths_for_cue_metadata_surfaces(surfaces: &[CueMetadataSurface]) -> Vec<PathB
 }
 
 /// Album title for an MB text search over a MULTI-part cue album. Side-split
-/// rips title each cue per side ("… (Side A)" / "… (Side B)"); searching with
+/// rips title each cue per side ("... (Side A)" / "... (Side B)"); searching with
 /// one side's verbatim title biases the query. Use the longest common prefix
 /// of every part's title, trimmed of a dangling side/part designator opener.
 /// Falls back to the first title when the parts share no meaningful prefix.
 fn common_cue_album_title(titles: &[String]) -> Option<String> {
     let first = titles.first()?.clone();
+    meaningful_common_cue_album_prefix(titles).or(Some(first))
+}
+
+/// Return the decisive TITLE-rung shared prefix used by the split-CUE album
+/// grouping ladder. This is deliberately stricter than `common_cue_album_title`:
+/// callers use `Some(_)` as merge evidence. `None` is never split evidence;
+/// it means the ladder must continue to concat-TOC, per-CUE TOC, and finally
+/// conservative merge.
+pub(crate) fn meaningful_common_cue_album_prefix(titles: &[String]) -> Option<String> {
     if titles.len() < 2 || titles.iter().any(|t| t.trim().is_empty()) {
-        return Some(first);
+        return None;
     }
     let mut prefix: Vec<char> = titles[0].chars().collect();
     for title in &titles[1..] {
@@ -687,7 +696,7 @@ fn common_cue_album_title(titles: &[String]) -> Option<String> {
             continue;
         }
         if let Some(last) = candidate.chars().last() {
-            if matches!(last, '-' | '–' | ':' | ',' | '&' | '/') {
+            if matches!(last, '-' | '\u{2013}' | ':' | ',' | '&' | '/') {
                 candidate.pop();
                 continue;
             }
@@ -702,13 +711,124 @@ fn common_cue_album_title(titles: &[String]) -> Option<String> {
         }
         break;
     }
-    // Require the shared prefix to be meaningful; otherwise the parts are
-    // unrelated titles and the first one is the least-bad seed.
-    if candidate.chars().count() >= 4 {
-        Some(candidate)
-    } else {
-        Some(first)
+    (candidate.chars().count() >= 4).then_some(candidate)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SplitCueAlbumGroupingKey(Vec<PathBuf>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitCueAlbumGroupingReason {
+    TitleSharedPrefix,
+    ConcatTocHit,
+    PerCueDistinctTocHits,
+    AmbiguousMerge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitCueAlbumGroupingDecision {
+    pub groups: Vec<Vec<PathBuf>>,
+    pub reason: SplitCueAlbumGroupingReason,
+}
+
+#[derive(Debug)]
+pub struct SplitCueAlbumGroupingRequest {
+    pub key: SplitCueAlbumGroupingKey,
+    pub infos: Vec<super::cue_parser::SingleImageInfo>,
+    pub editor_park: bool,
+    pub active_audio_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct SplitCueAlbumGroupingAsyncOutcome {
+    pub decision: SplitCueAlbumGroupingDecision,
+    pub toc_outcome: Option<super::musicbrainz::MbCascadeOutcome>,
+    pub cache_writes: Vec<(String, String)>,
+}
+
+pub(crate) fn split_cue_album_grouping_key_from_paths(
+    paths: &[PathBuf],
+) -> SplitCueAlbumGroupingKey {
+    SplitCueAlbumGroupingKey(paths.iter().map(|path| cue_info_path_key(path)).collect())
+}
+
+pub(crate) fn split_cue_album_grouping_key(
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> SplitCueAlbumGroupingKey {
+    let cue_paths: Vec<PathBuf> = infos.iter().map(|info| info.cue_path.clone()).collect();
+    split_cue_album_grouping_key_from_paths(&cue_paths)
+}
+
+fn split_cue_album_grouping_decision_merge(
+    infos: &[super::cue_parser::SingleImageInfo],
+    reason: SplitCueAlbumGroupingReason,
+) -> SplitCueAlbumGroupingDecision {
+    SplitCueAlbumGroupingDecision {
+        groups: vec![infos.iter().map(|info| cue_info_path_key(&info.cue_path)).collect()],
+        reason,
     }
+}
+
+fn split_cue_album_grouping_decision_split_each(
+    infos: &[super::cue_parser::SingleImageInfo],
+    reason: SplitCueAlbumGroupingReason,
+) -> SplitCueAlbumGroupingDecision {
+    SplitCueAlbumGroupingDecision {
+        groups: infos
+            .iter()
+            .map(|info| vec![cue_info_path_key(&info.cue_path)])
+            .collect(),
+        reason,
+    }
+}
+
+fn split_cue_infos_for_decision_group(
+    infos: &[super::cue_parser::SingleImageInfo],
+    group: &[PathBuf],
+) -> Vec<super::cue_parser::SingleImageInfo> {
+    let keys: std::collections::BTreeSet<PathBuf> = group.iter().cloned().collect();
+    infos
+        .iter()
+        .filter(|info| keys.contains(&cue_info_path_key(&info.cue_path)))
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn split_cue_decision_groups_as_infos(
+    decision: &SplitCueAlbumGroupingDecision,
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> Vec<Vec<super::cue_parser::SingleImageInfo>> {
+    decision
+        .groups
+        .iter()
+        .map(|group| split_cue_infos_for_decision_group(infos, group))
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+pub(crate) fn same_folder_split_cue_infos(infos: &[super::cue_parser::SingleImageInfo]) -> bool {
+    if infos.len() < 2 {
+        return false;
+    }
+    let Some(first_dir) = infos.first().and_then(|info| info.cue_path.parent()) else {
+        return false;
+    };
+    infos.iter().all(|info| info.cue_path.parent() == Some(first_dir))
+}
+
+fn split_cue_title_rung_decision(
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> Option<SplitCueAlbumGroupingDecision> {
+    let titles: Vec<String> = infos
+        .iter()
+        .map(|info| info.sheet.title.clone().unwrap_or_default())
+        .collect();
+    meaningful_common_cue_album_prefix(&titles).map(|_| {
+        split_cue_album_grouping_decision_merge(
+            infos,
+            SplitCueAlbumGroupingReason::TitleSharedPrefix,
+        )
+    })
 }
 
 fn seed_mb_query_from_cue_metadata_surfaces(
@@ -841,21 +961,357 @@ fn seed_mb_query_from_single_image_cues(
     }
 }
 
-fn dispatch_split_cue_musicbrainz_text_fallback(
+fn concat_single_image_cue_infos_to_cd_sectors(
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> Option<Vec<u32>> {
+    if infos.len() < 2 || infos.iter().any(|info| info.track_boundaries.is_empty()) {
+        return None;
+    }
+    let mut sectors = Vec::new();
+    let mut frame: u64 = CD_TOC_PREGAP_FRAMES as u64;
+    for info in infos {
+        let samples_per_frame = (info.sample_rate / 75).max(1) as u64;
+        for &(_, sample_count) in &info.track_boundaries {
+            sectors.push(frame as u32);
+            frame += sample_count / samples_per_frame;
+        }
+    }
+    sectors.push(frame as u32);
+    if super::musicbrainz::build_mb_toc(&sectors).is_some() {
+        Some(sectors)
+    } else {
+        None
+    }
+}
+
+fn single_image_cue_info_to_cd_sectors(
+    info: &super::cue_parser::SingleImageInfo,
+) -> Option<Vec<u32>> {
+    if info.track_boundaries.is_empty() {
+        return None;
+    }
+    let mut sectors = Vec::with_capacity(info.track_boundaries.len() + 1);
+    let samples_per_frame = (info.sample_rate / 75).max(1) as u64;
+    let mut frame: u64 = CD_TOC_PREGAP_FRAMES as u64;
+    for &(_, sample_count) in &info.track_boundaries {
+        sectors.push(frame as u32);
+        frame += sample_count / samples_per_frame;
+    }
+    sectors.push(frame as u32);
+    super::musicbrainz::build_mb_toc(&sectors).map(|_| sectors)
+}
+
+fn cached_mb_bodies_for_toc_candidates(
+    app: &AppState,
+    candidates: &[super::musicbrainz::TocCandidate],
+) -> Vec<Option<String>> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            super::musicbrainz::build_mb_toc(&candidate.sectors)
+                .and_then(|toc| app.db.get_cached_mb_response(&toc))
+        })
+        .collect()
+}
+
+fn split_cue_album_grouping_probe_inputs(
+    app: &AppState,
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> (
+    Vec<super::musicbrainz::TocCandidate>,
+    Vec<Option<String>>,
+    Vec<(Vec<u32>, Option<String>)>,
+) {
+    let concat_candidates = concat_single_image_cue_infos_to_cd_sectors(infos)
+        .map(|sectors| super::musicbrainz::toc_candidates_from_sectors(&sectors))
+        .unwrap_or_default();
+    let concat_cached = cached_mb_bodies_for_toc_candidates(app, &concat_candidates);
+    let per_cue_cached: Vec<(Vec<u32>, Option<String>)> = infos
+        .iter()
+        .filter_map(|info| {
+            let sectors = single_image_cue_info_to_cd_sectors(info)?;
+            let cached = super::musicbrainz::build_mb_toc(&sectors)
+                .and_then(|toc| app.db.get_cached_mb_response(&toc));
+            Some((sectors, cached))
+        })
+        .collect();
+    (concat_candidates, concat_cached, per_cue_cached)
+}
+
+fn cached_split_cue_album_grouping_ladder_decision(
+    app: &AppState,
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> Option<SplitCueAlbumGroupingDecision> {
+    let (concat_candidates, concat_cached, per_cue_cached) =
+        split_cue_album_grouping_probe_inputs(app, infos);
+    for (candidate, cached) in concat_candidates.iter().zip(concat_cached.iter()) {
+        let body = cached.as_ref()?;
+        let releases = super::musicbrainz::parse_mb_response_all(
+            body,
+            candidate.sectors.len().saturating_sub(1),
+        )
+        .ok()?;
+        if !releases.is_empty() {
+            return Some(split_cue_album_grouping_decision_merge(
+                infos,
+                SplitCueAlbumGroupingReason::ConcatTocHit,
+            ));
+        }
+    }
+
+    if per_cue_cached.len() != infos.len() {
+        return Some(split_cue_album_grouping_decision_merge(
+            infos,
+            SplitCueAlbumGroupingReason::AmbiguousMerge,
+        ));
+    }
+
+    let mut release_ids = Vec::new();
+    for (sectors, cached) in &per_cue_cached {
+        let body = cached.as_ref()?;
+        let releases = super::musicbrainz::parse_mb_response_all(
+            body,
+            sectors.len().saturating_sub(1),
+        )
+        .ok()?;
+        let Some(release) = releases.first() else {
+            return Some(split_cue_album_grouping_decision_merge(
+                infos,
+                SplitCueAlbumGroupingReason::AmbiguousMerge,
+            ));
+        };
+        if release.release_id.trim().is_empty() {
+            return Some(split_cue_album_grouping_decision_merge(
+                infos,
+                SplitCueAlbumGroupingReason::AmbiguousMerge,
+            ));
+        }
+        release_ids.push(release.release_id.clone());
+    }
+
+    let unique: std::collections::BTreeSet<String> = release_ids.iter().cloned().collect();
+    if unique.len() == infos.len() {
+        Some(split_cue_album_grouping_decision_split_each(
+            infos,
+            SplitCueAlbumGroupingReason::PerCueDistinctTocHits,
+        ))
+    } else {
+        Some(split_cue_album_grouping_decision_merge(
+            infos,
+            SplitCueAlbumGroupingReason::AmbiguousMerge,
+        ))
+    }
+}
+
+pub(crate) fn cached_or_title_split_cue_album_grouping_decision(
+    app: &mut AppState,
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> Option<SplitCueAlbumGroupingDecision> {
+    if !same_folder_split_cue_infos(infos) {
+        return None;
+    }
+    let key = split_cue_album_grouping_key(infos);
+    if let Some(decision) = app.split_cue_album_grouping_cache.get(&key).cloned() {
+        return Some(decision);
+    }
+    if let Some(decision) = split_cue_title_rung_decision(infos) {
+        app.split_cue_album_grouping_cache
+            .insert(key, decision.clone());
+        return Some(decision);
+    }
+    if let Some(decision) = cached_split_cue_album_grouping_ladder_decision(app, infos) {
+        app.split_cue_album_grouping_cache
+            .insert(key, decision.clone());
+        return Some(decision);
+    }
+    None
+}
+
+pub(crate) fn store_split_cue_album_grouping_outcome(
+    app: &mut AppState,
+    infos: &[super::cue_parser::SingleImageInfo],
+    outcome: &SplitCueAlbumGroupingAsyncOutcome,
+) {
+    for (toc, body) in &outcome.cache_writes {
+        if let Err(err) = app.db.store_mb_response(toc, body) {
+            log::warn!("MB TOC cache store failed during split-CUE grouping: {err}");
+        }
+    }
+    let key = split_cue_album_grouping_key(infos);
+    app.split_cue_album_grouping_cache
+        .insert(key, outcome.decision.clone());
+}
+
+pub(crate) fn spawn_split_cue_album_grouping_ladder_for_gnudb(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    infos: Vec<super::cue_parser::SingleImageInfo>,
+    active_audio_path: Option<PathBuf>,
+) -> bool {
+    if !same_folder_split_cue_infos(&infos) {
+        return false;
+    }
+    let (concat_candidates, concat_cached, per_cue_cached) =
+        split_cue_album_grouping_probe_inputs(app, &infos);
+    app.set_status(format!(
+        "GNUDB: grouping {} same-folder CUE parts...",
+        infos.len(),
+    ));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = compute_split_cue_album_grouping_ladder(
+            infos.clone(),
+            concat_candidates,
+            concat_cached,
+            per_cue_cached,
+        )
+        .await
+        .map(Box::new);
+        let _ = tx
+            .send(AppMessage::GnudbSplitCueAlbumGroupingComplete {
+                infos,
+                active_audio_path,
+                result,
+            })
+            .await;
+    });
+    true
+}
+
+pub(crate) fn spawn_split_cue_album_grouping_ladder_for_metadata_editor(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    infos: Vec<super::cue_parser::SingleImageInfo>,
+    active_cue_path: Option<PathBuf>,
+) -> bool {
+    if !same_folder_split_cue_infos(&infos) {
+        return false;
+    }
+    let (concat_candidates, concat_cached, per_cue_cached) =
+        split_cue_album_grouping_probe_inputs(app, &infos);
+    app.set_status(format!(
+        "metadata: grouping {} same-folder CUE parts...",
+        infos.len(),
+    ));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = compute_split_cue_album_grouping_ladder(
+            infos.clone(),
+            concat_candidates,
+            concat_cached,
+            per_cue_cached,
+        )
+        .await
+        .map(Box::new);
+        let _ = tx
+            .send(AppMessage::MetadataEditorSplitCueAlbumGroupingComplete {
+                infos,
+                active_cue_path,
+                result,
+            })
+            .await;
+    });
+    true
+}
+
+pub(crate) fn split_cue_active_group<'a>(
+    groups: &'a [Vec<super::cue_parser::SingleImageInfo>],
+    active_audio_path: Option<&Path>,
+) -> Option<&'a [super::cue_parser::SingleImageInfo]> {
+    if let Some(active) = active_audio_path {
+        if let Some(group) = groups.iter().find(|group| {
+            group.iter().any(|info| {
+                info.audio_path == active
+                    || match (info.audio_path.canonicalize(), active.canonicalize()) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => false,
+                    }
+            })
+        }) {
+            return Some(group.as_slice());
+        }
+    }
+    groups.first().map(Vec::as_slice)
+}
+
+fn dispatch_split_cue_musicbrainz_for_decision(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     infos: &[super::cue_parser::SingleImageInfo],
+    decision: &SplitCueAlbumGroupingDecision,
+    editor_park: bool,
+    active_audio_path: Option<&Path>,
+    concat_already_missed: bool,
 ) -> bool {
-    let Some(seed) = seed_mb_query_from_single_image_cues(infos) else {
+    let groups = split_cue_decision_groups_as_infos(decision, infos);
+    if groups.is_empty() {
+        return false;
+    }
+
+    let merged = decision.groups.len() == 1;
+    if merged {
+        let group = groups[0].as_slice();
+        let paths = paths_for_single_image_cue_infos(group);
+        if paths.is_empty() {
+            return false;
+        }
+        let fallback_seed = seed_mb_query_from_single_image_cues(group);
+        if !concat_already_missed {
+            if let Some(sectors) = concat_single_image_cue_infos_to_cd_sectors(group) {
+                let candidates = super::musicbrainz::toc_candidates_from_sectors(&sectors);
+                if !candidates.is_empty() {
+                    spawn_tags_mb_toc_lookup(app, tx, candidates, paths, editor_park, fallback_seed);
+                    return true;
+                }
+            }
+        }
+        let Some(seed) = fallback_seed else {
+            return false;
+        };
+        let ctx = super::message::TagsMbContext {
+            paths,
+            editor_park,
+            fallback_seed: None,
+        };
+        super::event_loop::spawn_tags_mb_text_search(
+            app,
+            tx,
+            seed,
+            ctx,
+            super::event_loop::TextSearchMode::DirectRequest,
+        );
+        return true;
+    }
+
+    let Some(group) = split_cue_active_group(&groups, active_audio_path) else {
         return false;
     };
-    let paths = paths_for_single_image_cue_infos(infos);
+    let paths = paths_for_single_image_cue_infos(group);
     if paths.is_empty() {
         return false;
     }
+    let fallback_seed = seed_mb_query_from_single_image_cues(group);
+    if let Some(info) = group.first() {
+        if group.len() == 1 {
+            if let Some(sectors) = single_image_cue_info_to_cd_sectors(info) {
+                spawn_tags_mb_toc_lookup(
+                    app,
+                    tx,
+                    vec![super::musicbrainz::TocCandidate::exact(sectors)],
+                    paths,
+                    editor_park,
+                    fallback_seed,
+                );
+                return true;
+            }
+        }
+    }
+    let Some(seed) = fallback_seed else {
+        return false;
+    };
     let ctx = super::message::TagsMbContext {
         paths,
-        editor_park: false,
+        editor_park,
         fallback_seed: None,
     };
     super::event_loop::spawn_tags_mb_text_search(
@@ -866,6 +1322,285 @@ fn dispatch_split_cue_musicbrainz_text_fallback(
         super::event_loop::TextSearchMode::DirectRequest,
     );
     true
+}
+
+async fn compute_split_cue_album_grouping_ladder(
+    infos: Vec<super::cue_parser::SingleImageInfo>,
+    concat_candidates: Vec<super::musicbrainz::TocCandidate>,
+    concat_cached: Vec<Option<String>>,
+    per_cue_cached: Vec<(Vec<u32>, Option<String>)>,
+) -> Result<SplitCueAlbumGroupingAsyncOutcome, String> {
+    let mut cache_writes = Vec::new();
+
+    if !concat_candidates.is_empty() {
+        let concat_outcome =
+            super::musicbrainz::lookup_release_by_toc_cascading(&concat_candidates, concat_cached)
+                .await?;
+        if !concat_outcome.releases.is_empty() {
+            return Ok(SplitCueAlbumGroupingAsyncOutcome {
+                decision: split_cue_album_grouping_decision_merge(
+                    &infos,
+                    SplitCueAlbumGroupingReason::ConcatTocHit,
+                ),
+                toc_outcome: Some(concat_outcome),
+                cache_writes,
+            });
+        }
+        cache_writes.extend(concat_outcome.cache_writes);
+    }
+
+    let mut release_ids = Vec::new();
+    for (idx, (sectors, cached)) in per_cue_cached.into_iter().enumerate() {
+        let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await?;
+        if let Some(body) = outcome.cache_response {
+            if let Some(toc) = super::musicbrainz::build_mb_toc(&sectors) {
+                cache_writes.push((toc, body));
+            }
+        }
+        let Some(release) = outcome.releases.first() else {
+            release_ids.clear();
+            break;
+        };
+        let release_id = release.release_id.clone();
+        if release_id.trim().is_empty() {
+            release_ids.clear();
+            break;
+        }
+        release_ids.push((idx, release_id));
+    }
+
+    if release_ids.len() == infos.len() {
+        let unique: std::collections::BTreeSet<String> =
+            release_ids.iter().map(|(_, id)| id.clone()).collect();
+        if unique.len() == infos.len() {
+            return Ok(SplitCueAlbumGroupingAsyncOutcome {
+                decision: split_cue_album_grouping_decision_split_each(
+                    &infos,
+                    SplitCueAlbumGroupingReason::PerCueDistinctTocHits,
+                ),
+                toc_outcome: None,
+                cache_writes,
+            });
+        }
+    }
+
+    Ok(SplitCueAlbumGroupingAsyncOutcome {
+        decision: split_cue_album_grouping_decision_merge(
+            &infos,
+            SplitCueAlbumGroupingReason::AmbiguousMerge,
+        ),
+        toc_outcome: None,
+        cache_writes,
+    })
+}
+
+fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    infos: &[super::cue_parser::SingleImageInfo],
+    editor_park: bool,
+    active_audio_path: Option<PathBuf>,
+) -> bool {
+    let paths = paths_for_single_image_cue_infos(infos);
+    if paths.is_empty() {
+        return false;
+    }
+
+    if !same_folder_split_cue_infos(infos) {
+        let decision = split_cue_album_grouping_decision_merge(
+            infos,
+            SplitCueAlbumGroupingReason::AmbiguousMerge,
+        );
+        return dispatch_split_cue_musicbrainz_for_decision(
+            app,
+            tx,
+            infos,
+            &decision,
+            editor_park,
+            active_audio_path.as_deref(),
+            false,
+        );
+    }
+
+    let key = split_cue_album_grouping_key(infos);
+    if let Some(decision) = cached_or_title_split_cue_album_grouping_decision(app, infos) {
+        return dispatch_split_cue_musicbrainz_for_decision(
+            app,
+            tx,
+            infos,
+            &decision,
+            editor_park,
+            active_audio_path.as_deref(),
+            false,
+        );
+    }
+
+    let (concat_candidates, concat_cached, per_cue_cached) =
+        split_cue_album_grouping_probe_inputs(app, infos);
+
+    let request = SplitCueAlbumGroupingRequest {
+        key,
+        infos: infos.to_vec(),
+        editor_park,
+        active_audio_path,
+    };
+    app.set_status(format!(
+        ":tags-mb: grouping {} same-folder CUE parts...",
+        request.infos.len(),
+    ));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = compute_split_cue_album_grouping_ladder(
+            request.infos.clone(),
+            concat_candidates,
+            concat_cached,
+            per_cue_cached,
+        )
+        .await
+        .map(Box::new);
+        let _ = tx
+            .send(AppMessage::SplitCueAlbumGroupingComplete {
+                request: Box::new(request),
+                result,
+            })
+            .await;
+    });
+    true
+}
+
+/// Test-facing composition of the production grouping pieces: the real call
+/// sites (context_menu GNUDB dispatch, the MB grouping dispatchers, and the
+/// metadata-surface grouping in keybindings) inline this decision->groups->
+/// active-group sequence with flow-specific handling.
+#[cfg(test)]
+pub(crate) fn split_cue_infos_for_cached_or_title_grouping(
+    app: &mut AppState,
+    infos: Vec<super::cue_parser::SingleImageInfo>,
+    active_audio_path: Option<&Path>,
+) -> Vec<super::cue_parser::SingleImageInfo> {
+    if !same_folder_split_cue_infos(&infos) {
+        return infos;
+    }
+    let Some(decision) = cached_or_title_split_cue_album_grouping_decision(app, &infos) else {
+        return infos;
+    };
+    if decision.groups.len() <= 1 {
+        return infos;
+    }
+    let groups = split_cue_decision_groups_as_infos(&decision, &infos);
+    split_cue_active_group(&groups, active_audio_path)
+        .map(|group| group.to_vec())
+        .unwrap_or(infos)
+}
+
+pub(super) fn handle_split_cue_album_grouping_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    request: SplitCueAlbumGroupingRequest,
+    result: Result<Box<SplitCueAlbumGroupingAsyncOutcome>, String>,
+) {
+    let outcome = match result {
+        Ok(outcome) => *outcome,
+        Err(err) => {
+            app.set_status(format!(":tags-mb: split-CUE grouping failed: {err}"));
+            return;
+        }
+    };
+
+    store_split_cue_album_grouping_outcome(app, &request.infos, &outcome);
+
+    if let Some(toc_outcome) = outcome.toc_outcome {
+        let ctx = super::message::TagsMbContext {
+            paths: paths_for_single_image_cue_infos(&request.infos),
+            editor_park: request.editor_park,
+            fallback_seed: seed_mb_query_from_single_image_cues(&request.infos),
+        };
+        super::event_loop::dispatch_tags_from_mb_complete(
+            app,
+            tx,
+            super::message::MbOutcome::Toc {
+                outcome: Ok(toc_outcome),
+            },
+            ctx,
+        );
+        return;
+    }
+
+    if !dispatch_split_cue_musicbrainz_for_decision(
+        app,
+        tx,
+        &request.infos,
+        &outcome.decision,
+        request.editor_park,
+        request.active_audio_path.as_deref(),
+        true,
+    ) {
+        app.set_status(":tags-mb: split-CUE grouping produced no usable MusicBrainz seed".to_string());
+    }
+}
+
+
+fn split_cue_infos_from_metadata_editor(
+    state: &super::app::MetadataEditorState,
+) -> Vec<super::cue_parser::SingleImageInfo> {
+    if state.presentation_tabs.len() < 2 {
+        return Vec::new();
+    }
+    let mut audio_paths = Vec::new();
+    for tab in &state.presentation_tabs {
+        if tab.paths.len() == 1 {
+            audio_paths.push(tab.paths[0].clone());
+        } else {
+            return Vec::new();
+        }
+    }
+    collect_single_image_cue_infos_for_sources(&audio_paths, &audio_paths)
+}
+
+
+fn same_path_for_split_cue(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn split_cue_infos_from_single_editor_source_folder(
+    state: &super::app::MetadataEditorState,
+) -> Option<(Vec<super::cue_parser::SingleImageInfo>, PathBuf)> {
+    // Ordinary file-backed metadata editors store their only editable surface in
+    // `file_surface` and leave `presentation_tabs` empty.  A previous version of
+    // this helper required exactly one presentation tab, so the common path
+    // `Edit metadata` on `side_a.wv` in a same-folder split-CUE album still fell
+    // through to the one-image TOC lookup with no text fallback.  The brief's
+    // rule is source-based, not tab-count-based: when there is no multi-tab
+    // presentation already, rediscover sibling CUE surfaces from the active
+    // source folder before attempting a single-image TOC.
+    if state.presentation_tabs.len() > 1 {
+        return None;
+    }
+    let surface = state.active_surface();
+    if surface.paths.len() != 1
+        || surface.sacd_area_kind.is_some()
+        || surface.dvdv_track_durations.is_some()
+        || surface.bluray_chapter_durations.is_some()
+    {
+        return None;
+    }
+    let active_audio = surface.paths.first()?.clone();
+    let parent = active_audio.parent()?.to_path_buf();
+    let mut infos = collect_single_image_cue_infos_for_sources(&[parent.clone()], &[]);
+    infos.retain(|info| info.cue_path.parent() == Some(parent.as_path()));
+    if infos.len() < 2 {
+        return None;
+    }
+    let contains_active = infos
+        .iter()
+        .any(|info| same_path_for_split_cue(&info.audio_path, &active_audio));
+    contains_active.then_some((infos, active_audio))
 }
 
 /// Full list of command-mode tokens (including aliases) recognised by
@@ -958,6 +1693,9 @@ pub const COMMAND_NAMES: &[&str] = &[
     "cue-fill",
     "cue-enrich",
     "cue-view",
+    "tags-cue-sidecar",
+    "cuesheet-delete",
+    "cuesheet-edit",
     "tags-mb",
     "mb-tags",
     "musicbrainz-tags",
@@ -1290,6 +2028,13 @@ pub enum Command {
     /// both an embedded CUESHEET and a sidecar and the user wants
     /// the sidecar's values to win.
     TagsCueSidecar,
+    /// Metadata editor: stage deletion of the active surface's embedded
+    /// CUESHEET tag and remove synthetic rows derived from it.
+    CueSheetDelete,
+    /// Metadata editor: edit the active surface's embedded CUESHEET in the
+    /// user's system editor, validate it, write it back through lofty, and
+    /// refresh derived per-track rows.
+    CueSheetEdit,
     /// Return from the metadata editor to the MbSelect picker
     /// (cached release list — no MB requery). Confirmation if the
     /// editor is dirty (any edits / proposed-from-MB values not yet
@@ -1450,6 +2195,8 @@ impl std::fmt::Debug for Command {
             Command::MetaUndelete => f.write_str("MetaUndelete"),
             Command::MetaDetail => f.write_str("MetaDetail"),
             Command::TagsCueSidecar => f.write_str("TagsCueSidecar"),
+            Command::CueSheetDelete => f.write_str("CueSheetDelete"),
+            Command::CueSheetEdit => f.write_str("CueSheetEdit"),
             Command::MbBack => f.write_str("MbBack"),
             Command::GnudbBack => f.write_str("GnudbBack"),
             Command::SacdSwitchArea(target) => f.debug_tuple("SacdSwitchArea").field(target).finish(),
@@ -1525,6 +2272,8 @@ pub fn parse_command(input: &str) -> Command {
         "u" | "undelete" => Command::MetaUndelete,
         "D" | "detail" => Command::MetaDetail,
         "tags-cue-sidecar" | "tags-cue" => Command::TagsCueSidecar,
+        "cuesheet-delete" | "cue-delete" => Command::CueSheetDelete,
+        "cuesheet-edit" | "cue-edit" => Command::CueSheetEdit,
         "mb-back" | "tags-mb-back" => Command::MbBack,
         "gnudb-back" | "tags-gnudb-back" => Command::GnudbBack,
         "area" | "sacd-area" => {
@@ -3223,6 +3972,22 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
+        Command::CueSheetDelete => {
+            let Some(state) = app.pending_metadata_editor.take() else {
+                app.set_status(":cuesheet-delete only works in the metadata editor");
+                return;
+            };
+            super::keybindings::open_embedded_cuesheet_delete_confirmation(app, state);
+        }
+        Command::CueSheetEdit => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status(":cuesheet-edit only works in the metadata editor");
+                return;
+            };
+            let msg = super::keybindings::metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
+            app.set_status(msg);
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+        }
         Command::CueView => {
             let Some(state) = app.pending_metadata_editor.take() else {
                 app.set_status(":cue-view only works in the metadata editor");
@@ -3479,12 +4244,24 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 return;
             }
 
-            // Split-side/split-disc single-image CUE albums must not be
-            // collapsed into a fabricated whole-album TOC from the backing
-            // images. MusicBrainz rarely has side-level disc IDs for LP sides,
-            // and a side match cannot be safely applied to all album rows. Use
-            // the intended album-level text fallback seeded from CUE metadata.
+            // Same-folder split-CUE albums get a whole-album synthetic TOC
+            // before text fallback. A concat-TOC hit is stronger evidence than
+            // title search, while misses remain non-decisive and fall through to
+            // the common-title seed.
             if cue_metadata_surfaces.len() > 1 {
+                let active_audio_path = paths
+                    .first()
+                    .cloned()
+                    .or_else(|| cue_infos.first().map(|info| info.audio_path.clone()));
+                if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
+                    app,
+                    tx,
+                    &cue_infos,
+                    /* editor_park */ false,
+                    active_audio_path,
+                ) {
+                    return;
+                }
                 if dispatch_split_cue_musicbrainz_text_fallback_from_surfaces(
                     app,
                     tx,
@@ -3499,7 +4276,17 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 return;
             }
             if cue_infos.len() > 1 {
-                if dispatch_split_cue_musicbrainz_text_fallback(app, tx, &cue_infos) {
+                let active_audio_path = paths
+                    .first()
+                    .cloned()
+                    .or_else(|| cue_infos.first().map(|info| info.audio_path.clone()));
+                if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
+                    app,
+                    tx,
+                    &cue_infos,
+                    /* editor_park */ false,
+                    active_audio_path,
+                ) {
                     return;
                 }
                 app.set_status(
@@ -10204,7 +10991,12 @@ fn try_dispatch_in_editor_tags_mb(
     // result handler can populate it in place (same parking-slot
     // invariant as the TOC path).
     if let Some(seed) = direct_seed {
-        let paths = state_owned.active_surface().paths.clone();
+        let split_infos = split_cue_infos_from_metadata_editor(&state_owned);
+        let paths = if split_infos.len() > 1 {
+            paths_for_single_image_cue_infos(&split_infos)
+        } else {
+            state_owned.active_surface().paths.clone()
+        };
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
         let ctx = super::message::TagsMbContext {
             paths,
@@ -10397,6 +11189,49 @@ fn try_dispatch_in_editor_tags_mb(
             },
         };
         (sectors, seed, true)
+    } else if state_owned.presentation_tabs.len() > 1 {
+        let infos = split_cue_infos_from_metadata_editor(&state_owned);
+        let active_audio_path = state_owned.active_surface().paths.first().cloned();
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
+            app,
+            tx,
+            &infos,
+            /* editor_park */ true,
+            active_audio_path,
+        ) {
+            return Some(true);
+        }
+        app.set_status(
+            ":tags-mb: split CUE editor has no concatenated TOC or album/artist seed".to_string(),
+        );
+        return Some(true);
+    } else if let Some((infos, active_audio_path)) =
+        split_cue_infos_from_single_editor_source_folder(&state_owned)
+    {
+        if state_owned.any_presentation_dirty() {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(
+                ":tags-mb: source folder contains multiple CUE surfaces; save or revert editor changes before running split-CUE MusicBrainz lookup"
+                    .to_string(),
+            );
+            return Some(true);
+        }
+        if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
+            app,
+            tx,
+            &infos,
+            /* editor_park */ false,
+            Some(active_audio_path),
+        ) {
+            return Some(true);
+        }
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        app.set_status(
+            ":tags-mb: split CUE source folder has no concatenated TOC or album/artist seed"
+                .to_string(),
+        );
+        return Some(true);
     } else {
         // File editor: state.active_surface().paths is the audio file set. Use the
         // same TOC derivation the Browse path uses — first try
@@ -14832,6 +15667,72 @@ mod conversion_action_command_parser_tests {
 mod split_cue_source_coverage_tests {
     use super::*;
 
+    fn fixture_tool_available(tool: &str) -> bool {
+        std::process::Command::new(tool)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn file_surface_editor_without_presentation_tabs_discovers_split_cue_source_folder() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        for stem in ["side_a", "side_b"] {
+            let image = album.join(format!("{stem}.flac"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=44100:duration=2",
+                    "-c:a",
+                    "flac",
+                ])
+                .arg(&image)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("ffmpeg fixture");
+            assert!(status.success());
+            std::fs::write(
+                album.join(format!("{stem}.cue")),
+                format!(
+                    "PERFORMER \"Artist\"\nTITLE \"Album ({stem})\"\nFILE \"{stem}.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 00:01:00\n"
+                ),
+            )
+            .expect("cue fixture");
+        }
+        let state = crate::tui::app::MetadataEditorState::for_files(
+            vec![album.join("side_a.flac")],
+            Vec::new(),
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        assert!(
+            state.presentation_tabs.is_empty(),
+            "ordinary file editors are file_surface-backed; they do not create a presentation tab"
+        );
+
+        let (infos, active_audio) = split_cue_infos_from_single_editor_source_folder(&state)
+            .expect("file-surface editor should discover sibling split-CUE surfaces from its source folder");
+        assert_eq!(active_audio, album.join("side_a.flac"));
+        assert_eq!(infos.len(), 2);
+        assert!(infos.iter().any(|info| info.audio_path == album.join("side_b.flac")));
+    }
+
     #[test]
     fn common_cue_album_title_strips_side_designators() {
         let titles = vec![
@@ -14861,6 +15762,359 @@ mod split_cue_source_coverage_tests {
         );
     }
 
+
+
+    fn split_cue_grouping_fixture(titles: &[Option<&str>]) -> Vec<crate::tui::cue_parser::SingleImageInfo> {
+        titles
+            .iter()
+            .enumerate()
+            .map(|(idx, title)| {
+                let stem = format!("part_{}", idx + 1);
+                crate::tui::cue_parser::SingleImageInfo {
+                    audio_path: std::path::PathBuf::from(format!("/tmp/album/{stem}.wv")),
+                    cue_path: std::path::PathBuf::from(format!("/tmp/album/{stem}.cue")),
+                    sheet: crate::tui::cue_parser::CueSheet {
+                        title: title.map(str::to_string),
+                        performer: Some("Artist".to_string()),
+                        date: None,
+                        genre: None,
+                        catalog: None,
+                        tracks: vec![
+                            crate::tui::cue_parser::CueTrack {
+                                number: 1,
+                                title: Some(format!("{stem} track 1")),
+                                performer: None,
+                                file: Some(format!("{stem}.wv")),
+                                index01_frames: Some(0),
+                                index00_frames: None,
+                                isrc: None,
+                            },
+                            crate::tui::cue_parser::CueTrack {
+                                number: 2,
+                                title: Some(format!("{stem} track 2")),
+                                performer: None,
+                                file: Some(format!("{stem}.wv")),
+                                index01_frames: Some(4500),
+                                index00_frames: None,
+                                isrc: None,
+                            },
+                        ],
+                    },
+                    sample_rate: 44_100,
+                    // Vary durations per part: identical boundaries would make
+                    // the per-cue TOC strings collide (one cache entry, one
+                    // "distinct" release), which no real split-side rip does.
+                    total_samples: 44_100 * (120 + idx as u64 * 20),
+                    track_boundaries: vec![
+                        (0, 44_100 * (60 + idx as u64 * 10)),
+                        (44_100 * (60 + idx as u64 * 10), 44_100 * (60 + idx as u64 * 10)),
+                    ],
+                }
+            })
+            .collect()
+    }
+
+    fn mb_cached_body(release_id: &str, title: &str, tracks: usize) -> String {
+        let tracks_json = (1..=tracks)
+            .map(|idx| format!(r#"{{"position":{idx},"title":"Track {idx}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"releases":[{{"id":"{release_id}","title":"{title}","artist-credit":[{{"name":"Artist"}}],"media":[{{"track-count":{tracks},"tracks":[{tracks_json}]}}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn split_cue_grouping_title_rung_merges_shared_prefix() {
+        let infos = split_cue_grouping_fixture(&[
+            Some("The Dark Side Of The Moon (Side A)"),
+            Some("The Dark Side Of The Moon (Side B)"),
+        ]);
+        let decision = split_cue_title_rung_decision(&infos).expect("title rung decision");
+        assert_eq!(decision.reason, SplitCueAlbumGroupingReason::TitleSharedPrefix);
+        assert_eq!(decision.groups.len(), 1);
+        assert_eq!(decision.groups[0].len(), 2);
+    }
+
+    #[test]
+    fn split_cue_grouping_title_rung_defers_unrelated_titles_to_toc_rungs() {
+        let infos = split_cue_grouping_fixture(&[
+            Some("Chronicle"),
+            Some("Willy And The Poor Boys"),
+        ]);
+        assert!(
+            split_cue_title_rung_decision(&infos).is_none(),
+            "unrelated cue titles are not decisive split evidence; the ladder must continue to concat-TOC, per-CUE TOC, then conservative merge"
+        );
+    }
+
+    #[test]
+    fn split_cue_grouping_title_rung_defers_blank_titles_to_cached_toc_rungs() {
+        let infos = split_cue_grouping_fixture(&[None, None]);
+        assert!(
+            split_cue_title_rung_decision(&infos).is_none(),
+            "missing titles are not negative evidence; they must continue to concat/per-CUE TOC rungs"
+        );
+    }
+
+    #[test]
+    fn split_cue_grouping_decision_is_reused_for_same_session_metadata_grouping() {
+        let infos = split_cue_grouping_fixture(&[
+            Some("Chronicle"),
+            Some("Willy And The Poor Boys"),
+        ]);
+        let key = split_cue_album_grouping_key(&infos);
+        let active_audio = infos[1].audio_path.clone();
+        let mut app = crate::tui::app::AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.split_cue_album_grouping_cache.insert(
+            key.clone(),
+            split_cue_album_grouping_decision_split_each(
+                &infos,
+                SplitCueAlbumGroupingReason::PerCueDistinctTocHits,
+            ),
+        );
+
+        let reused_group = split_cue_infos_for_cached_or_title_grouping(
+            &mut app,
+            infos.clone(),
+            Some(active_audio.as_path()),
+        );
+        assert_eq!(
+            reused_group.len(),
+            1,
+            "the session cache, not a fresh title re-evaluation, should drive later same-folder grouping"
+        );
+        assert_eq!(reused_group[0].audio_path, active_audio);
+        assert_eq!(
+            app.split_cue_album_grouping_cache.get(&key).map(|decision| decision.reason),
+            Some(SplitCueAlbumGroupingReason::PerCueDistinctTocHits),
+            "cached TOC-rung decisions must be reused by later editor/dispatch flows"
+        );
+    }
+
+
+    fn store_cached_mb_body_for_sectors(
+        app: &mut crate::tui::app::AppState,
+        sectors: &[u32],
+        body: &str,
+    ) {
+        let toc = crate::tui::musicbrainz::build_mb_toc(sectors).expect("toc string");
+        app.db.store_mb_response(&toc, body).expect("store cached mb body");
+    }
+
+    #[test]
+    fn cached_full_ladder_concat_hit_feeds_later_grouping_without_precomputed_decision() {
+        let infos = split_cue_grouping_fixture(&[
+            Some("Chronicle"),
+            Some("Willy And The Poor Boys"),
+        ]);
+        let mut app = crate::tui::app::AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        store_cached_mb_body_for_sectors(
+            &mut app,
+            &concat,
+            &mb_cached_body("merged-release", "Merged", 4),
+        );
+
+        let decision = cached_or_title_split_cue_album_grouping_decision(&mut app, &infos)
+            .expect("cached concat-TOC rung should decide");
+        assert_eq!(decision.reason, SplitCueAlbumGroupingReason::ConcatTocHit);
+        assert_eq!(decision.groups.len(), 1);
+        assert_eq!(
+            app.split_cue_album_grouping_cache
+                .get(&split_cue_album_grouping_key(&infos))
+                .map(|decision| decision.reason),
+            Some(SplitCueAlbumGroupingReason::ConcatTocHit),
+            "metadata-editor and GNUDB call sites must not require another flow to precompute the session decision"
+        );
+    }
+
+    #[test]
+    fn cached_full_ladder_per_cue_distinct_hits_feed_active_group_filtering() {
+        let infos = split_cue_grouping_fixture(&[
+            Some("Chronicle"),
+            Some("Willy And The Poor Boys"),
+        ]);
+        let mut app = crate::tui::app::AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        store_cached_mb_body_for_sectors(&mut app, &concat, r#"{"releases":[]}"#);
+        for (idx, info) in infos.iter().enumerate() {
+            let sectors = single_image_cue_info_to_cd_sectors(info).expect("per cue toc");
+            store_cached_mb_body_for_sectors(
+                &mut app,
+                &sectors,
+                &mb_cached_body(&format!("release-{}", idx + 1), "Separate", 2),
+            );
+        }
+        let active_audio = infos[1].audio_path.clone();
+
+        let active_group = split_cue_infos_for_cached_or_title_grouping(
+            &mut app,
+            infos.clone(),
+            Some(active_audio.as_path()),
+        );
+        assert_eq!(active_group.len(), 1);
+        assert_eq!(active_group[0].audio_path, active_audio);
+        assert_eq!(
+            app.split_cue_album_grouping_cache
+                .get(&split_cue_album_grouping_key(&infos))
+                .map(|decision| decision.reason),
+            Some(SplitCueAlbumGroupingReason::PerCueDistinctTocHits),
+            "per-CUE decisive split must be available to metadata/GNUDB grouping from cached MB bodies, not only after :tags-mb computed it"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_cue_grouping_unrelated_titles_still_reach_concat_toc_hit() {
+        let infos = split_cue_grouping_fixture(&[
+            Some("Chronicle"),
+            Some("Willy And The Poor Boys"),
+        ]);
+        assert!(
+            split_cue_title_rung_decision(&infos).is_none(),
+            "the title rung must not split unrelated same-folder cues before the TOC rungs run"
+        );
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        let candidates = crate::tui::musicbrainz::toc_candidates_from_sectors(&concat);
+        let cached = candidates
+            .iter()
+            .map(|_| Some(mb_cached_body("merged-release", "Merged", 4)))
+            .collect();
+        let outcome = compute_split_cue_album_grouping_ladder(infos, candidates, cached, Vec::new())
+            .await
+            .expect("grouping ladder");
+        assert_eq!(outcome.decision.reason, SplitCueAlbumGroupingReason::ConcatTocHit);
+        assert_eq!(outcome.decision.groups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn split_cue_grouping_concat_toc_hit_is_decisive_merge() {
+        let infos = split_cue_grouping_fixture(&[None, None]);
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        let candidates = crate::tui::musicbrainz::toc_candidates_from_sectors(&concat);
+        let cached = candidates.iter().map(|_| Some(mb_cached_body("merged-release", "Merged", 4))).collect();
+        let per_cue = Vec::new();
+
+        let outcome = compute_split_cue_album_grouping_ladder(infos, candidates, cached, per_cue)
+            .await
+            .expect("grouping ladder");
+        assert_eq!(outcome.decision.reason, SplitCueAlbumGroupingReason::ConcatTocHit);
+        assert_eq!(outcome.decision.groups.len(), 1);
+        assert!(outcome.toc_outcome.expect("toc outcome").releases.len() == 1);
+        assert!(
+            outcome.cache_writes.is_empty(),
+            "cached concat responses must not produce network-derived cache writes in regression tests"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_cue_grouping_concat_toc_hit_wins_before_contradictory_per_cue_hits() {
+        let infos = split_cue_grouping_fixture(&[None, None]);
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        let candidates = crate::tui::musicbrainz::toc_candidates_from_sectors(&concat);
+        let cached = candidates.iter().map(|_| Some(mb_cached_body("merged-release", "Merged", 4))).collect();
+        let per_cue = infos
+            .iter()
+            .enumerate()
+            .map(|(idx, info)| {
+                (
+                    single_image_cue_info_to_cd_sectors(info).expect("per cue toc"),
+                    Some(mb_cached_body(&format!("separate-release-{idx}"), "Separate", 2)),
+                )
+            })
+            .collect();
+
+        let outcome = compute_split_cue_album_grouping_ladder(infos, candidates, cached, per_cue)
+            .await
+            .expect("grouping ladder");
+        assert_eq!(
+            outcome.decision.reason,
+            SplitCueAlbumGroupingReason::ConcatTocHit,
+            "the decisive-positive concat rung must short-circuit later per-CUE split evidence"
+        );
+        assert_eq!(outcome.decision.groups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn split_cue_grouping_per_cue_distinct_hits_are_decisive_split() {
+        let infos = split_cue_grouping_fixture(&[None, None]);
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        let candidates = crate::tui::musicbrainz::toc_candidates_from_sectors(&concat);
+        let cached = candidates.iter().map(|_| Some(r#"{"releases":[]}"#.to_string())).collect();
+        let per_cue = infos
+            .iter()
+            .enumerate()
+            .map(|(idx, info)| {
+                (
+                    single_image_cue_info_to_cd_sectors(info).expect("per cue toc"),
+                    Some(mb_cached_body(&format!("release-{idx}"), "Part", 2)),
+                )
+            })
+            .collect();
+
+        let outcome = compute_split_cue_album_grouping_ladder(infos, candidates, cached, per_cue)
+            .await
+            .expect("grouping ladder");
+        assert_eq!(outcome.decision.reason, SplitCueAlbumGroupingReason::PerCueDistinctTocHits);
+        assert_eq!(outcome.decision.groups.len(), 2);
+        assert!(outcome.toc_outcome.is_none());
+        assert!(
+            outcome.cache_writes.is_empty(),
+            "per-CUE decisive separation test must be driven entirely by cached/mocked MB bodies"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_cue_grouping_per_cue_same_release_hits_are_not_separation_evidence() {
+        let infos = split_cue_grouping_fixture(&[None, None]);
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        let candidates = crate::tui::musicbrainz::toc_candidates_from_sectors(&concat);
+        let cached = candidates.iter().map(|_| Some(r#"{"releases":[]}"#.to_string())).collect();
+        let per_cue = infos
+            .iter()
+            .map(|info| {
+                (
+                    single_image_cue_info_to_cd_sectors(info).expect("per cue toc"),
+                    Some(mb_cached_body("same-release", "Same", 2)),
+                )
+            })
+            .collect();
+
+        let outcome = compute_split_cue_album_grouping_ladder(infos, candidates, cached, per_cue)
+            .await
+            .expect("grouping ladder");
+        assert_eq!(
+            outcome.decision.reason,
+            SplitCueAlbumGroupingReason::AmbiguousMerge,
+            "per-CUE hits only prove separateness when every part resolves to a different release"
+        );
+        assert_eq!(outcome.decision.groups.len(), 1);
+        assert!(outcome.toc_outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn split_cue_grouping_misses_conservatively_merge() {
+        let infos = split_cue_grouping_fixture(&[None, None]);
+        let concat = concat_single_image_cue_infos_to_cd_sectors(&infos).expect("concat toc");
+        let candidates = crate::tui::musicbrainz::toc_candidates_from_sectors(&concat);
+        let cached = candidates.iter().map(|_| Some(r#"{"releases":[]}"#.to_string())).collect();
+        let per_cue = infos
+            .iter()
+            .map(|info| {
+                (
+                    single_image_cue_info_to_cd_sectors(info).expect("per cue toc"),
+                    Some(r#"{"releases":[]}"#.to_string()),
+                )
+            })
+            .collect();
+
+        let outcome = compute_split_cue_album_grouping_ladder(infos, candidates, cached, per_cue)
+            .await
+            .expect("grouping ladder");
+        assert_eq!(outcome.decision.reason, SplitCueAlbumGroupingReason::AmbiguousMerge);
+        assert_eq!(outcome.decision.groups.len(), 1);
+        assert!(outcome.toc_outcome.is_none());
+    }
     #[test]
     fn split_cue_info_collection_keeps_ogg_and_tta_cues_before_plain_audio_grouping() {
         let temp = tempfile::tempdir().expect("tempdir");

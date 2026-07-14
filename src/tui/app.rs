@@ -5964,6 +5964,18 @@ pub struct PresentationTab {
     pub bluray_angle_number: Option<u8>,
     /// Blu-ray-only: per-chapter durations (seconds) for MusicBrainz TOC synthesis.
     pub bluray_chapter_durations: Option<Vec<f64>>,
+    /// True when the active CUESHEET row represents an embedded tag that existed
+    /// in the edited audio file, not a sidecar-derived synthetic row. This keeps
+    /// embedded-CUESHEET commands from treating sidecar structure as an embedded
+    /// tag.
+    pub embedded_cuesheet_present: bool,
+    /// True when the visible CUESHEET row is a read-only sidecar shadow used to
+    /// shape a split-CUE presentation. It must not be treated as an embedded tag
+    /// creation/update by the ordinary lofty save diff.
+    pub sidecar_cuesheet_shadow_present: bool,
+    /// Save-path tombstone for deleting an embedded CUESHEET while leaving any
+    /// sidecar-derived synthetic row visible in the editor.
+    pub pending_embedded_cuesheet_delete: bool,
 }
 
 impl Default for PresentationTab {
@@ -5989,6 +6001,9 @@ impl Default for PresentationTab {
             bluray_audio_stream_index: None,
             bluray_angle_number: None,
             bluray_chapter_durations: None,
+            embedded_cuesheet_present: false,
+            sidecar_cuesheet_shadow_present: false,
+            pending_embedded_cuesheet_delete: false,
         }
     }
 }
@@ -6064,6 +6079,9 @@ impl PresentationTab {
         tab.bluray_audio_stream_index = active.bluray_audio_stream_index;
         tab.bluray_angle_number = active.bluray_angle_number;
         tab.bluray_chapter_durations = active.bluray_chapter_durations.clone();
+        tab.embedded_cuesheet_present = active.embedded_cuesheet_present;
+        tab.sidecar_cuesheet_shadow_present = active.sidecar_cuesheet_shadow_present;
+        tab.pending_embedded_cuesheet_delete = active.pending_embedded_cuesheet_delete;
         tab
     }
 }
@@ -6276,6 +6294,14 @@ impl std::ops::DerefMut for MetadataEditorState {
 /// - read-only tab scroll values are clamped before storage.
 #[derive(Debug, Clone)]
 pub struct MetadataEditorState {
+    /// True when the presentation tabs are single-image CUE surfaces (one
+    /// tab per cue/image pair of an album). Split-cue MB population slices
+    /// the release tracklist ACROSS tabs, which is only correct for cue
+    /// surfaces — disc editors (SACD areas, DVD-A groups) repeat the same
+    /// tracks per tab and must keep the apply-to-matching-presentations
+    /// flow instead.
+    pub cue_surface_tabs: bool,
+
     /// Archive-edit ownership context when the editor is working against
     /// extracted archive staging instead of ordinary source files.
     pub archive_edit_context: Option<ArchiveMetadataEditContext>,
@@ -6320,6 +6346,7 @@ fn read_only_max_scroll(total_lines: usize, visible_rows: usize) -> usize {
 impl MetadataEditorState {
     pub fn from_model(model: MetadataEditorModel) -> Self {
         Self {
+            cue_surface_tabs: false,
             archive_edit_context: None,
             archive_staging_dirty: false,
             close_after_successful_save: true,
@@ -7214,6 +7241,7 @@ impl MetadataEditorState {
 
 fn mark_presentation_tab_saved(tab: &mut PresentationTab) {
     tab.dirty = false;
+    tab.pending_embedded_cuesheet_delete = false;
     for entry in &mut tab.entries {
         mark_tag_entry_saved(entry);
     }
@@ -7265,6 +7293,7 @@ fn apply_write_results_to_tab(
                             .saturating_add(1);
                     }
                 }
+                mark_sidecar_cue_writeback_saved(tab);
             }
             MetadataEditorWriteOutcome::SidecarCueFailed { cue_path, reason } => {
                 summary.sidecar_cue_failed = summary.sidecar_cue_failed.saturating_add(1);
@@ -7361,6 +7390,10 @@ fn apply_write_results_to_tab(
     }
 
     reduce_saved_slots(tab, &saved_slots);
+    if tab.pending_embedded_cuesheet_delete && saved_slots.contains(&0) {
+        tab.pending_embedded_cuesheet_delete = false;
+        tab.embedded_cuesheet_present = false;
+    }
     tab.dirty = presentation_tab_has_changes(tab);
     summary.remaining_dirty = tab.dirty;
     Some(summary)
@@ -7380,6 +7413,21 @@ fn attach_write_issue(tab: &mut PresentationTab, idx: usize, issue: MetadataIssu
         _ => {}
     }
     file.issues.push(issue);
+}
+
+fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
+    let path_count = tab.paths.len();
+    for entry in &mut tab.entries {
+        let is_cuesheet_shadow = tab.sidecar_cuesheet_shadow_present
+            && entry.display_key.eq_ignore_ascii_case("CUESHEET");
+        let is_sidecar_track_row = (entry.display_key.eq_ignore_ascii_case("TITLE")
+            || entry.display_key.eq_ignore_ascii_case("ARTIST")
+            || entry.display_key.eq_ignore_ascii_case("ISRC"))
+            && entry.per_file_values.len() != path_count;
+        if is_cuesheet_shadow || is_sidecar_track_row {
+            mark_tag_entry_saved(entry);
+        }
+    }
 }
 
 fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections::BTreeSet<usize>) {
@@ -7458,7 +7506,7 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
 }
 
 fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
-    if !tab.deleted.is_empty() {
+    if tab.pending_embedded_cuesheet_delete || !tab.deleted.is_empty() {
         return true;
     }
 
@@ -8152,6 +8200,12 @@ pub enum ConfirmAction {
     /// explicit confirmation. The editor itself is parked in
     /// `AppState::pending_metadata_editor` so cancellation restores it.
     DiscardMetadataEditorChanges,
+    /// Stage deletion of the active embedded CUESHEET after an explicit
+    /// destructive-action confirmation. The editor itself is parked in
+    /// `AppState::pending_metadata_editor`; confirmation only stages the
+    /// tombstone, and persistence still flows through the metadata-editor save
+    /// path.
+    DeleteEmbeddedCueSheet { path: PathBuf },
     RemoveSelected,
     ClearCompleted,
     ClearFinished,
@@ -8273,6 +8327,11 @@ pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [Confirmati
         ConfirmationFooterHint { label: "N keep", key: "n" },
         ConfirmationFooterHint { label: "Esc keep", key: "esc" },
     ];
+    const DELETE_EMBEDDED_CUESHEET: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y delete", key: "y" },
+        ConfirmationFooterHint { label: "N cancel", key: "n" },
+        ConfirmationFooterHint { label: "Esc cancel", key: "esc" },
+    ];
 
     match action {
         ConfirmAction::ArchiveStartupRecovery { .. } => ARCHIVE_STARTUP_RECOVERY,
@@ -8280,6 +8339,7 @@ pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [Confirmati
         ConfirmAction::ArchiveExternalConflict { .. }
         | ConfirmAction::ArchiveRepackageFailure { .. } => ARCHIVE_RETRY_OR_DISCARD,
         ConfirmAction::ArchiveDiscardStaging { .. } => ARCHIVE_DISCARD_STAGING,
+        ConfirmAction::DeleteEmbeddedCueSheet { .. } => DELETE_EMBEDDED_CUESHEET,
         _ => DEFAULT,
     }
 }
@@ -8645,6 +8705,16 @@ pub struct AppState {
 
     /// Approximate retained heap footprint for archive listings.
     archive_listing_cache_bytes: usize,
+
+    /// Session-scoped same-folder split-CUE album grouping decisions. The
+    /// grouping ladder may spend MusicBrainz TOC probes to decide whether cue
+    /// surfaces form one album or several; retaining the decision here reuses
+    /// that answer across Browse dispatch, in-editor `:tags-mb`, and subsequent
+    /// metadata-editor opens in the same run.
+    pub(crate) split_cue_album_grouping_cache: std::collections::HashMap<
+        crate::tui::command::SplitCueAlbumGroupingKey,
+        crate::tui::command::SplitCueAlbumGroupingDecision,
+    >,
 
     /// Last directory visited by the Artwork-tab file picker.
     ///
@@ -9314,6 +9384,7 @@ impl AppState {
             archive_listing_cache: std::collections::HashMap::new(),
             archive_listing_cache_lru: std::collections::VecDeque::new(),
             archive_listing_cache_bytes: 0,
+            split_cue_album_grouping_cache: std::collections::HashMap::new(),
             last_artwork_picker_dir: None,
             image_picker: new_terminal_image_picker(),
             image_picker_generation: 0,

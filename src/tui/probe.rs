@@ -6532,6 +6532,32 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
     progress: Option<MetadataWriteProgressCallback>,
     cancel: Option<MetadataWriteCancelFlag>,
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+    apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
+        paths,
+        entries_snap,
+        deleted,
+        save_block_reasons,
+        progress,
+        cancel,
+        &[],
+    )
+}
+
+/// Apply audio tag changes with additional file-indexed tombstones that do not
+/// have to correspond to a currently visible editor row. This is used for
+/// embedded-CUESHEET deletion after the UI has reshaped itself from a sidecar
+/// synthetic row: the save still deletes the on-disk tag through the normal
+/// async/progress/cancellation path, but the visible CUESHEET row is no longer
+/// treated as the tag to delete.
+pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
+    paths: &[std::path::PathBuf],
+    entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
+    deleted: &[usize],
+    save_block_reasons: &[Option<String>],
+    progress: Option<MetadataWriteProgressCallback>,
+    cancel: Option<MetadataWriteCancelFlag>,
+    forced_deletes: &[(usize, lofty::tag::ItemKey)],
+) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
     #[derive(Debug)]
     struct PlannedWrite {
         original_index: usize,
@@ -6557,6 +6583,12 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
                 changes.push((key.clone(), Some(vals[file_idx].clone())));
             }
         }
+        for (target_idx, key) in forced_deletes {
+            if *target_idx == file_idx {
+                changes.push((key.clone(), None));
+            }
+        }
+
         if changes.is_empty() {
             continue;
         }

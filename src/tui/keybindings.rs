@@ -3664,7 +3664,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             ) {
                 return;
             }
-            open_metadata_editor(app);
+            open_metadata_editor_with_tx(app, tx);
         }
 
         // Type-ahead navigation: bare letter/number keys jump to the
@@ -5042,7 +5042,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     }
                     (KeyCode::Char('a'), _) => {
                         // Accept ALL pages.
-                        super::keybindings::open_metadata_editor(app);
+                        super::keybindings::open_metadata_editor_with_tx(app, tx);
                         if let ActiveOverlay::MetadataEditor(ref mut editor_state) =
                             app.active_overlay
                         {
@@ -5114,7 +5114,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     if idx < state.releases.len() {
                         let releases = std::mem::take(&mut state.releases);
                         let paths = std::mem::take(&mut state.paths);
-                        super::event_loop::open_editor_with_mb_release(app, releases, idx, paths);
+                        super::event_loop::open_editor_with_mb_release(app, tx, releases, idx, paths);
                     }
                 }
                 KeyCode::Up => {
@@ -6007,6 +6007,69 @@ pub(super) fn metadata_editor_open_detail(state: &mut super::app::MetadataEditor
     }
 }
 
+
+fn metadata_editor_forced_delete_items(
+    state: &super::app::MetadataEditorState,
+) -> Vec<(usize, lofty::tag::ItemKey)> {
+    if state.active_surface().pending_embedded_cuesheet_delete {
+        vec![(0, lofty::tag::ItemKey::Unknown("CUESHEET".to_string()))]
+    } else {
+        Vec::new()
+    }
+}
+
+fn metadata_editor_entries_snapshot_for_save(
+    state: &super::app::MetadataEditorState,
+) -> Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> {
+    let surface = state.active_surface();
+    let suppress_sidecar_shadow_cuesheet =
+        surface.sidecar_cuesheet_shadow_present && !surface.embedded_cuesheet_present;
+
+    surface
+        .entries
+        .iter()
+        .map(|entry| {
+            let originals = entry.per_file_originals.clone();
+            let values = if suppress_sidecar_shadow_cuesheet
+                && entry.display_key.eq_ignore_ascii_case("CUESHEET")
+            {
+                // A sidecar shadow is the editable structural anchor for the
+                // sidecar CUE, not an embedded-tag create/update request. Keep
+                // the ordinary lofty diff blind to the regenerated shadow; the
+                // dedicated sidecar write-back plan persists it instead.
+                originals.clone()
+            } else {
+                entry.per_file_values.clone()
+            };
+            (entry.item_key.clone(), values, originals)
+        })
+        .collect()
+}
+
+fn metadata_editor_audio_tag_changes_required_for_sidecar_writeback(
+    state: &super::app::MetadataEditorState,
+) -> bool {
+    let surface = state.active_surface();
+    let path_count = surface.paths.len();
+    if path_count != 1 {
+        return true;
+    }
+    if !metadata_editor_forced_delete_items(state).is_empty() {
+        return true;
+    }
+
+    let deleted: std::collections::BTreeSet<usize> = surface.deleted.iter().copied().collect();
+    metadata_editor_entries_snapshot_for_save(state)
+        .into_iter()
+        .enumerate()
+        .any(|(entry_idx, (_key, values, originals))| {
+            if values.len() != path_count || originals.len() != path_count {
+                return false;
+            }
+            deleted.contains(&entry_idx) || values.iter().zip(originals.iter()).any(|(v, o)| v != o)
+        })
+}
+
 /// Save tags to disk. Runs Phase 4's CUESHEET regen (β album re-derive
 /// + per-track-edit overrides) before snapshotting; refuses save on a
 /// dirty per-track entry without a CUESHEET anchor. Skips per-track
@@ -6210,17 +6273,8 @@ pub(super) fn metadata_editor_save(
             if blocked_count == 1 { "" } else { "s" }
         ));
     }
-    let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> = state.active_surface()
-        .entries
-        .iter()
-        .map(|e| {
-            (
-                e.item_key.clone(),
-                e.per_file_values.clone(),
-                e.per_file_originals.clone(),
-            )
-        })
-        .collect();
+    let entries_snap = metadata_editor_entries_snapshot_for_save(state);
+    let forced_deletes = metadata_editor_forced_delete_items(state);
 
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -6245,13 +6299,14 @@ pub(super) fn metadata_editor_save(
                     )));
                 },
             );
-            let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_and_progress(
+            let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
                 &paths,
                 &entries_snap,
                 &deleted,
                 &save_block_reasons,
                 Some(progress),
                 Some(cancel.clone()),
+                &forced_deletes,
             );
             if let Some(plan) = cue_sidecar_writeback {
                 if let Some(sidecar_result) =
@@ -6289,6 +6344,7 @@ struct CueSidecarWritebackPlan {
     audio_path: std::path::PathBuf,
     cue_path: std::path::PathBuf,
     replacement_cuesheet: String,
+    require_successful_image_save: bool,
 }
 
 fn cue_sidecar_writeback_plan_for_state(
@@ -6310,10 +6366,13 @@ fn cue_sidecar_writeback_plan_for_state(
     if replacement_cuesheet.trim().is_empty() {
         return None;
     }
+    let require_successful_image_save =
+        metadata_editor_audio_tag_changes_required_for_sidecar_writeback(state);
     Some(CueSidecarWritebackPlan {
         audio_path,
         cue_path,
         replacement_cuesheet,
+        require_successful_image_save,
     })
 }
 
@@ -6329,7 +6388,7 @@ fn cue_sidecar_writeback_result_after_successful_image_save(
                     | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
             )
     });
-    if !image_saved {
+    if plan.require_successful_image_save && !image_saved {
         return None;
     }
 
@@ -8782,6 +8841,10 @@ pub fn regenerate_cuesheet_for_save(
     state: &mut super::app::MetadataEditorState,
 ) -> Result<bool, String> {
     let n_paths = state.active_surface().paths.len();
+    if n_paths != 1 { return Ok(false); }
+    if state.active_surface().pending_embedded_cuesheet_delete {
+        return Ok(false);
+    }
 
     // Helpers indexed-by-display-key.
     let entry_idx = |key: &str| -> Option<usize> {
@@ -8844,6 +8907,13 @@ pub fn regenerate_cuesheet_for_save(
             return Ok(false);
         }
     };
+
+    // Sidecar-only split-CUE tabs use the visible CUESHEET shadow as the
+    // structural template for sidecar write-back. They must never create an
+    // embedded tag incidentally, but per-track MB edits still need a durable
+    // home. The save snapshot suppresses the CUESHEET diff from the lofty tag
+    // writer, and the sidecar write-back plan persists the regenerated text to
+    // the associated .cue file.
 
     // Refuse when the user marked CUESHEET deleted but also has
     // per-track edits — the regen output would land in an entry that
@@ -9127,38 +9197,110 @@ fn collect_metadata_cue_surfaces(paths: &[std::path::PathBuf]) -> Vec<MetadataCu
     out
 }
 
+fn metadata_cue_surfaces_same_folder(surfaces: &[MetadataCueSurface]) -> bool {
+    if surfaces.len() < 2 {
+        return false;
+    }
+    let Some(first_dir) = surfaces.first().and_then(|surface| surface.cue_path.parent()) else {
+        return false;
+    };
+    surfaces
+        .iter()
+        .all(|surface| surface.cue_path.parent() == Some(first_dir))
+}
+
+fn metadata_cue_surfaces_to_single_image_infos(
+    surfaces: &[MetadataCueSurface],
+) -> Option<Vec<super::cue_parser::SingleImageInfo>> {
+    let mut infos = Vec::with_capacity(surfaces.len());
+    for surface in surfaces {
+        infos.push(super::cue_parser::detect_single_image_cue(&surface.cue_path)?);
+    }
+    infos.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    Some(infos)
+}
+
+fn apply_cached_or_ladder_split_cue_grouping_to_metadata_surfaces(
+    app: &mut AppState,
+    surfaces: &mut Vec<MetadataCueSurface>,
+    active_surface: &mut usize,
+) -> bool {
+    if surfaces.len() <= 1 || !metadata_cue_surfaces_same_folder(surfaces) {
+        return true;
+    }
+
+    let Some(infos) = metadata_cue_surfaces_to_single_image_infos(surfaces) else {
+        return true;
+    };
+    let Some(decision) =
+        crate::tui::command::cached_or_title_split_cue_album_grouping_decision(app, &infos)
+    else {
+        return false;
+    };
+    if decision.groups.len() <= 1 {
+        return true;
+    }
+
+    let active_key = surfaces
+        .get(*active_surface)
+        .map(|surface| metadata_cue_surface_key(&surface.cue_path));
+    let Some(group) = active_key
+        .as_ref()
+        .and_then(|active| decision.groups.iter().find(|group| group.contains(active)))
+        .or_else(|| decision.groups.first())
+    else {
+        return true;
+    };
+    let group_keys: std::collections::BTreeSet<std::path::PathBuf> =
+        group.iter().cloned().collect();
+    let mut filtered: Vec<MetadataCueSurface> = surfaces
+        .iter()
+        .filter(|surface| group_keys.contains(&metadata_cue_surface_key(&surface.cue_path)))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        return true;
+    }
+    filtered.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    let new_active = active_key
+        .and_then(|active| {
+            filtered
+                .iter()
+                .position(|surface| metadata_cue_surface_key(&surface.cue_path) == active)
+        })
+        .unwrap_or(0);
+    *surfaces = filtered;
+    *active_surface = new_active;
+    true
+}
+
 fn upsert_cuesheet_text_for_metadata_surface(
     entries: &mut Vec<super::probe::TagEntry>,
     cue_text: &str,
-) {
+) -> bool {
     use lofty::tag::ItemKey;
 
-    if let Some(idx) = entries
+    if entries
         .iter()
-        .position(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+        .any(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
     {
-        let entry = &mut entries[idx];
-        if entry.per_file_values.is_empty() {
-            entry.per_file_values.push(cue_text.to_string());
-        } else {
-            entry.per_file_values[0] = cue_text.to_string();
-        }
-        entry.value = super::probe::cue_summary_string(cue_text);
-        return;
+        return false;
     }
 
+    let summary = super::probe::cue_summary_string(cue_text);
     entries.push(super::probe::TagEntry {
         display_key: "CUESHEET".to_string(),
         item_key: ItemKey::Unknown("CUESHEET".to_string()),
-        value: super::probe::cue_summary_string(cue_text),
-        original: String::new(),
+        value: summary.clone(),
+        original: summary,
         is_binary: true,
         is_mixed: false,
         per_file_values: vec![cue_text.to_string()],
-        per_file_originals: vec![String::new()],
+        per_file_originals: vec![cue_text.to_string()],
         mb_proposed_value: None,
         mb_proposed_per_file: None,
     });
+    true
 }
 
 fn metadata_cue_surface_label(surface: &MetadataCueSurface, ordinal: usize) -> String {
@@ -9183,34 +9325,40 @@ fn metadata_cue_track_labels(surface: &MetadataCueSurface) -> Vec<String> {
         .collect()
 }
 
-fn open_metadata_editor_for_cue_surfaces_with_active(
+fn build_metadata_editor_for_cue_surfaces(
     app: &mut AppState,
-    surfaces: Vec<MetadataCueSurface>,
+    surfaces: &[MetadataCueSurface],
     active_surface: usize,
-) {
+) -> Result<(Box<super::app::MetadataEditorState>, usize), String> {
     if surfaces.is_empty() {
-        app.set_status("No CUE/image pairs selected");
-        return;
+        return Err("No CUE/image pairs selected".to_string());
     }
 
     let mut tabs = Vec::new();
     for (idx, surface) in surfaces.iter().enumerate() {
         let paths = vec![surface.audio_path.clone()];
-        let merged = match super::probe::read_all_tags_merged_with_metadata(&paths) {
-            Ok(read) => read,
-            Err(err) => {
-                app.set_status(format!(
-                    "Failed to read tags for {}: {}",
-                    surface.audio_path.display(),
-                    err,
-                ));
-                return;
-            }
-        };
+        let merged = super::probe::read_all_tags_merged_with_metadata(&paths).map_err(|err| {
+            format!(
+                "Failed to read tags for {}: {}",
+                surface.audio_path.display(),
+                err,
+            )
+        })?;
 
         let mut entries = merged.entries;
-        upsert_cuesheet_text_for_metadata_surface(&mut entries, &surface.cue_text);
-        apply_embedded_cuesheet_per_track(&mut entries);
+        let embedded_cuesheet_present = metadata_entries_contain_embedded_cuesheet(&entries);
+        // For split-CUE album-shaping, the sidecar surface is authoritative for
+        // presentation rows. Do not overwrite an embedded CUESHEET row with the
+        // sidecar text: doing so makes an ordinary save persist the sidecar as an
+        // embedded tag. Existing embedded tags remain visible as embedded tags;
+        // sidecar text is used only to shape synthetic per-track rows.
+        let sidecar_cuesheet_shadow_present =
+            upsert_cuesheet_text_for_metadata_surface(&mut entries, &surface.cue_text);
+        apply_cuesheet_text_per_track(&mut entries, &surface.cue_text);
+        normalize_cuesheet_shaped_per_track_rows_as_originals(
+            &mut entries,
+            surface.sheet.tracks.len(),
+        );
 
         let technical_details = metadata_technical_details_for_paths_with_analysis(
             &paths,
@@ -9220,28 +9368,216 @@ fn open_metadata_editor_for_cue_surfaces_with_active(
             &app.preemph_results,
         );
         let file_labels = metadata_cue_track_labels(surface);
-        tabs.push(super::app::PresentationTab::new(
+        let mut tab = super::app::PresentationTab::new(
             crate::disc::model::PresentationId::DvdAudioGroup((idx + 1) as u8),
             metadata_cue_surface_label(surface, idx),
             paths,
             entries,
             file_labels,
             technical_details,
-        ));
+        );
+        tab.embedded_cuesheet_present = embedded_cuesheet_present;
+        tab.sidecar_cuesheet_shadow_present = sidecar_cuesheet_shadow_present;
+        tabs.push(tab);
     }
 
-    let n_parts = tabs.len();
     let n_tracks: usize = surfaces.iter().map(|surface| surface.sheet.tracks.len()).sum();
     let active_tab = active_surface.min(tabs.len().saturating_sub(1));
-    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
-        super::app::MetadataEditorState::for_disc_presentations(tabs, active_tab),
+    let mut state = Box::new(super::app::MetadataEditorState::for_disc_presentations(
+        tabs, active_tab,
     ));
-    app.set_status(format!(
-        "metadata: opened {} CUE part{}, {} tracks",
-        n_parts,
-        if n_parts == 1 { "" } else { "s" },
-        n_tracks,
-    ));
+    // Mark the tabs as cue surfaces so MB population knows it may slice the
+    // release tracklist ACROSS tabs; disc editors (SACD areas / DVD-A groups)
+    // repeat the same tracks per tab and keep the apply-to-matching flow.
+    state.cue_surface_tabs = true;
+    Ok((state, n_tracks))
+}
+
+pub(super) fn populate_split_cue_metadata_editor_from_mb_release(
+    state: &mut super::app::MetadataEditorState,
+    release: &super::musicbrainz::MbRelease,
+) -> bool {
+    if state.presentation_tabs.len() <= 1 {
+        return false;
+    }
+
+    let original_tab = state.active_tab;
+    let mut offset = 0usize;
+    let mut populated = false;
+    for tab_idx in 0..state.presentation_tabs.len() {
+        state.active_tab = tab_idx;
+        let local_track_count = state.active_surface().file_labels.len().max(1);
+
+        let mut local_release = release.clone();
+        local_release.tracks = release
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                let pos = track.position as usize;
+                if pos > offset && pos <= offset + local_track_count {
+                    let mut local_track = track.clone();
+                    local_track.position = (pos - offset) as u32;
+                    Some(local_track)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Be tolerant of incomplete or zeroed MB position fields from cached or
+        // fixture data: the selected release is already ordered, so slice by
+        // release order when position-based mapping produced nothing.
+        if local_release.tracks.is_empty() && release.tracks.len() >= offset + local_track_count {
+            local_release.tracks = release.tracks[offset..offset + local_track_count]
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(idx, mut track)| {
+                    track.position = (idx + 1) as u32;
+                    track
+                })
+                .collect();
+        }
+
+        let decision = super::musicbrainz::PerTrackDecision {
+            per_track_populate: local_release.tracks.len() > 1,
+            skip_reason: None,
+        };
+        super::musicbrainz::populate_editor_from_mb_with_per_track_decision(
+            state,
+            &local_release,
+            &decision,
+        );
+        state.active_surface_mut().dirty = true;
+        populated = true;
+        offset += local_track_count;
+    }
+    state.active_tab = original_tab.min(state.presentation_tabs.len().saturating_sub(1));
+    state.phase = super::app::MetadataEditorPhase::Editing;
+    populated
+}
+
+pub(super) fn build_metadata_editor_for_cue_surfaces_with_mb_release(
+    app: &mut AppState,
+    paths: &[std::path::PathBuf],
+    release: &super::musicbrainz::MbRelease,
+) -> Result<Option<Box<super::app::MetadataEditorState>>, String> {
+    let mut surfaces = collect_metadata_cue_surfaces(paths);
+    let mut active_surface = 0usize;
+    if surfaces.len() > 1 {
+        apply_cached_or_ladder_split_cue_grouping_to_metadata_surfaces(
+            app,
+            &mut surfaces,
+            &mut active_surface,
+        );
+    }
+    if surfaces.len() <= 1 {
+        return Ok(None);
+    }
+
+    let (mut state, _n_tracks) = build_metadata_editor_for_cue_surfaces(app, &surfaces, active_surface)?;
+    populate_split_cue_metadata_editor_from_mb_release(&mut state, release);
+    Ok(Some(state))
+}
+
+fn open_metadata_editor_for_cue_surfaces_with_active(
+    app: &mut AppState,
+    surfaces: Vec<MetadataCueSurface>,
+    active_surface: usize,
+) {
+    let n_parts = surfaces.len();
+    match build_metadata_editor_for_cue_surfaces(app, &surfaces, active_surface) {
+        Ok((state, n_tracks)) => {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            app.set_status(format!(
+                "metadata: opened {} CUE part{}, {} tracks",
+                n_parts,
+                if n_parts == 1 { "" } else { "s" },
+                n_tracks,
+            ));
+        }
+        Err(err) => app.set_status(err),
+    }
+}
+
+fn metadata_cue_surfaces_for_grouping_decision(
+    infos: &[super::cue_parser::SingleImageInfo],
+    decision: &crate::tui::command::SplitCueAlbumGroupingDecision,
+    active_cue_path: Option<&std::path::Path>,
+) -> (Vec<MetadataCueSurface>, usize) {
+    let active_key = active_cue_path.map(metadata_cue_surface_key);
+    let selected_group = if decision.groups.len() > 1 {
+        active_key
+            .as_ref()
+            .and_then(|active| decision.groups.iter().find(|group| group.contains(active)))
+            .or_else(|| decision.groups.first())
+    } else {
+        decision.groups.first()
+    };
+    let selected_keys: std::collections::BTreeSet<std::path::PathBuf> = selected_group
+        .map(|group| group.iter().cloned().collect())
+        .unwrap_or_else(|| {
+            infos.iter()
+                .map(|info| metadata_cue_surface_key(&info.cue_path))
+                .collect()
+        });
+
+    let mut surfaces: Vec<MetadataCueSurface> = infos
+        .iter()
+        .filter(|info| selected_keys.contains(&metadata_cue_surface_key(&info.cue_path)))
+        .filter_map(|info| resolve_metadata_cue_surface(&info.cue_path))
+        .collect();
+    surfaces.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    let active_surface = active_key
+        .and_then(|active| {
+            surfaces
+                .iter()
+                .position(|surface| metadata_cue_surface_key(&surface.cue_path) == active)
+        })
+        .unwrap_or(0);
+    (surfaces, active_surface)
+}
+
+pub(super) fn handle_metadata_editor_split_cue_album_grouping_complete(
+    app: &mut AppState,
+    _tx: &mpsc::Sender<AppMessage>,
+    infos: Vec<super::cue_parser::SingleImageInfo>,
+    active_cue_path: Option<std::path::PathBuf>,
+    result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
+) {
+    let outcome = match result {
+        Ok(outcome) => *outcome,
+        Err(err) => {
+            app.set_status(format!("metadata: split-CUE grouping failed: {err}"));
+            let decision = crate::tui::command::SplitCueAlbumGroupingDecision {
+                groups: vec![infos
+                    .iter()
+                    .map(|info| metadata_cue_surface_key(&info.cue_path))
+                    .collect()],
+                reason: crate::tui::command::SplitCueAlbumGroupingReason::AmbiguousMerge,
+            };
+            let (surfaces, active_surface) = metadata_cue_surfaces_for_grouping_decision(
+                &infos,
+                &decision,
+                active_cue_path.as_deref(),
+            );
+            if !surfaces.is_empty() {
+                open_metadata_editor_for_cue_surfaces_with_active(app, surfaces, active_surface);
+            }
+            return;
+        }
+    };
+    crate::tui::command::store_split_cue_album_grouping_outcome(app, &infos, &outcome);
+    let (surfaces, active_surface) = metadata_cue_surfaces_for_grouping_decision(
+        &infos,
+        &outcome.decision,
+        active_cue_path.as_deref(),
+    );
+    if surfaces.is_empty() {
+        app.set_status("metadata: split-CUE grouping produced no usable CUE surfaces");
+        return;
+    }
+    open_metadata_editor_for_cue_surfaces_with_active(app, surfaces, active_surface);
 }
 
 
@@ -9325,8 +9661,6 @@ pub fn inject_sidecar_cuesheet_if_present(
 /// - the CUESHEET parses to fewer than two tracks
 /// - all per-track values for a given field are empty (no data to show)
 pub fn apply_embedded_cuesheet_per_track(entries: &mut Vec<super::probe::TagEntry>) {
-    use lofty::tag::ItemKey;
-
     let cue_text = match entries
         .iter()
         .find(|e| e.display_key.eq_ignore_ascii_case("CUESHEET"))
@@ -9336,8 +9670,13 @@ pub fn apply_embedded_cuesheet_per_track(entries: &mut Vec<super::probe::TagEntr
         Some(s) => s.clone(),
         None => return,
     };
+    apply_cuesheet_text_per_track(entries, &cue_text);
+}
 
-    let parsed = super::cue_parser::parse_cue(&cue_text);
+fn apply_cuesheet_text_per_track(entries: &mut Vec<super::probe::TagEntry>, cue_text: &str) {
+    use lofty::tag::ItemKey;
+
+    let parsed = super::cue_parser::parse_cue(cue_text);
     if parsed.tracks.len() < 2 {
         return;
     }
@@ -9361,6 +9700,579 @@ pub fn apply_embedded_cuesheet_per_track(entries: &mut Vec<super::probe::TagEntr
     grow_or_create_per_track(entries, "TITLE", ItemKey::TrackTitle, titles);
     grow_or_create_per_track(entries, "ARTIST", ItemKey::TrackArtist, artists);
     grow_or_create_per_track(entries, "ISRC", ItemKey::Isrc, isrcs);
+}
+
+
+fn normalize_cuesheet_shaped_per_track_rows_as_originals(
+    entries: &mut [super::probe::TagEntry],
+    track_count: usize,
+) {
+    for entry in entries.iter_mut() {
+        let derived_key = entry.display_key.eq_ignore_ascii_case("TITLE")
+            || entry.display_key.eq_ignore_ascii_case("ARTIST")
+            || entry.display_key.eq_ignore_ascii_case("ISRC");
+        if derived_key && entry.per_file_values.len() == track_count {
+            entry.per_file_originals = entry.per_file_values.clone();
+            entry.original = entry.value.clone();
+            entry.mb_proposed_value = None;
+            entry.mb_proposed_per_file = None;
+        }
+    }
+}
+
+
+
+fn metadata_entries_contain_embedded_cuesheet(entries: &[super::probe::TagEntry]) -> bool {
+    entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+        .and_then(|entry| entry.per_file_originals.first().or_else(|| entry.per_file_values.first()))
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn metadata_cuesheet_entry_index(entries: &[super::probe::TagEntry]) -> Option<usize> {
+    entries
+        .iter()
+        .position(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+}
+
+fn parsed_cuesheet_track_count_from_entry(entry: &super::probe::TagEntry) -> usize {
+    entry
+        .per_file_values
+        .first()
+        .map(|text| super::cue_parser::parse_cue(text).tracks.len())
+        .unwrap_or(0)
+}
+
+fn cue_line_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    if line.len() < keyword.len() {
+        return None;
+    }
+    let head = line.get(..keyword.len())?;
+    let rest = line.get(keyword.len()..)?;
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    if rest.is_empty() || rest.chars().next().map_or(false, char::is_whitespace) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
+}
+
+fn quoted_value_is_well_formed(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    if chars.next() != Some('"') {
+        return false;
+    }
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            return true;
+        }
+    }
+    false
+}
+
+fn cue_file_line_is_well_formed(rest: &str) -> bool {
+    if rest.starts_with('"') {
+        let Some(close_rel) = rest[1..].find('"') else {
+            return false;
+        };
+        let after = rest[close_rel + 2..].trim();
+        return !after.is_empty();
+    }
+    let mut parts = rest.split_whitespace();
+    parts.next().is_some() && parts.next().is_some()
+}
+
+fn cue_track_line_is_well_formed(rest: &str) -> bool {
+    let mut parts = rest.split_whitespace();
+    let Some(number) = parts.next() else { return false; };
+    if number.parse::<u32>().is_err() {
+        return false;
+    }
+    parts.next().is_some()
+}
+
+fn cue_index_line_is_well_formed(rest: &str) -> bool {
+    let mut parts = rest.split_whitespace();
+    let Some(index) = parts.next() else { return false; };
+    if index.len() != 2 || !index.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let Some(timestamp) = parts.next() else { return false; };
+    super::cue_parser::parse_cue_timestamp(timestamp).is_some()
+}
+
+fn validate_embedded_cuesheet_text(text: &str) -> Result<super::cue_parser::CueSheet, String> {
+    if text.trim().is_empty() {
+        return Err("edited CUESHEET is empty".to_string());
+    }
+
+    let mut saw_file = false;
+    let mut in_audio_track = false;
+    let mut active_audio_track: Option<(usize, u32, bool)> = None;
+
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let trimmed = if line_idx == 0 {
+            raw_line.trim_start_matches('\u{FEFF}').trim()
+        } else {
+            raw_line.trim()
+        };
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            continue;
+        }
+
+        if let Some(rest) = cue_line_keyword(trimmed, "FILE") {
+            if !cue_file_line_is_well_formed(rest) {
+                return Err(format!("edited CUESHEET has malformed FILE line at line {line_no}"));
+            }
+            saw_file = true;
+            continue;
+        }
+
+        if let Some(rest) = cue_line_keyword(trimmed, "TRACK") {
+            if let Some((prev_line, prev_number, false)) = active_audio_track.take() {
+                return Err(format!(
+                    "edited CUESHEET track {prev_number:02} from line {prev_line} has no INDEX 01"
+                ));
+            }
+            if !cue_track_line_is_well_formed(rest) {
+                return Err(format!("edited CUESHEET has malformed TRACK line at line {line_no}"));
+            }
+            let mut parts = rest.split_whitespace();
+            let number = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let mode = parts.next().unwrap_or_default();
+            in_audio_track = mode.eq_ignore_ascii_case("AUDIO");
+            if in_audio_track {
+                active_audio_track = Some((line_no, number, false));
+            }
+            continue;
+        }
+
+        if let Some(rest) = cue_line_keyword(trimmed, "INDEX") {
+            if !cue_index_line_is_well_formed(rest) {
+                return Err(format!("edited CUESHEET has malformed INDEX line at line {line_no}"));
+            }
+            if in_audio_track && rest.split_whitespace().next() == Some("01") {
+                if let Some((_, _, has_index01)) = active_audio_track.as_mut() {
+                    *has_index01 = true;
+                }
+            }
+            continue;
+        }
+
+        for keyword in ["TITLE", "PERFORMER"] {
+            if let Some(rest) = cue_line_keyword(trimmed, keyword) {
+                if !quoted_value_is_well_formed(rest) {
+                    return Err(format!(
+                        "edited CUESHEET has malformed {keyword} line at line {line_no}"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some((prev_line, prev_number, false)) = active_audio_track.take() {
+        return Err(format!(
+            "edited CUESHEET track {prev_number:02} from line {prev_line} has no INDEX 01"
+        ));
+    }
+
+    let sheet = super::cue_parser::parse_cue(text);
+    if sheet.tracks.is_empty() {
+        return Err("edited CUESHEET has no TRACK entries".to_string());
+    }
+    if !saw_file || sheet.tracks.iter().any(|track| track.file.is_none()) {
+        return Err("edited CUESHEET has one or more tracks without a FILE reference".to_string());
+    }
+    if !sheet.tracks.iter().all(|track| track.index01_frames.is_some()) {
+        return Err("edited CUESHEET has one or more tracks without INDEX 01".to_string());
+    }
+    Ok(sheet)
+}
+
+fn remove_metadata_entry_at(surface: &mut super::app::PresentationTab, idx: usize) {
+    if idx >= surface.entries.len() {
+        return;
+    }
+    surface.entries.remove(idx);
+    surface.deleted = surface
+        .deleted
+        .iter()
+        .filter_map(|deleted| {
+            if *deleted == idx {
+                None
+            } else if *deleted > idx {
+                Some(*deleted - 1)
+            } else {
+                Some(*deleted)
+            }
+        })
+        .collect();
+}
+
+fn remove_cuesheet_derived_per_track_rows(
+    surface: &mut super::app::PresentationTab,
+    track_count: usize,
+) -> usize {
+    if track_count < 2 || surface.paths.len() != 1 {
+        return 0;
+    }
+    let mut remove: Vec<usize> = surface
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            let key = entry.display_key.as_str();
+            let derived_key = key.eq_ignore_ascii_case("TITLE")
+                || key.eq_ignore_ascii_case("ARTIST")
+                || key.eq_ignore_ascii_case("ISRC");
+            if derived_key && entry.per_file_values.len() == track_count {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    remove.sort_unstable();
+    remove.dedup();
+    let removed = remove.len();
+    for idx in remove.into_iter().rev() {
+        remove_metadata_entry_at(surface, idx);
+    }
+    removed
+}
+
+fn sidecar_cuesheet_for_audio(
+    audio_path: &std::path::Path,
+) -> Result<Option<(std::path::PathBuf, String, super::cue_parser::CueSheet)>, String> {
+    let Some(cue_path) = super::cue_parser::find_sidecar_cue_for_audio_image(audio_path) else {
+        return Ok(None);
+    };
+    let raw = std::fs::read(&cue_path)
+        .map_err(|err| format!("failed to read sidecar CUE {}: {}", cue_path.display(), err))?;
+    let text = super::cue_parser::decode_cue_bytes_for_path(&raw, &cue_path)
+        .map_err(|err| format!("failed to decode sidecar CUE {}: {}", cue_path.display(), err))?;
+    let sheet = validate_embedded_cuesheet_text(&text)
+        .map_err(|err| format!("sidecar CUE {} is not usable for reshaping: {}", cue_path.display(), err))?;
+    Ok(Some((cue_path, text, sheet)))
+}
+
+fn replace_cuesheet_row_with_sidecar_text(
+    surface: &mut super::app::PresentationTab,
+    cue_idx: Option<usize>,
+    sidecar_text: &str,
+) {
+    let summary = super::probe::cue_summary_string(sidecar_text);
+    match cue_idx {
+        Some(idx) if idx < surface.entries.len() => {
+            let entry = &mut surface.entries[idx];
+            entry.per_file_values = vec![sidecar_text.to_string()];
+            entry.per_file_originals = vec![sidecar_text.to_string()];
+            entry.value = summary.clone();
+            entry.original = summary;
+            entry.is_binary = true;
+            entry.is_mixed = false;
+            entry.mb_proposed_value = None;
+            entry.mb_proposed_per_file = None;
+            surface.deleted.retain(|deleted| *deleted != idx);
+            surface.sidecar_cuesheet_shadow_present = true;
+        }
+        _ => {
+            surface.entries.push(super::probe::TagEntry {
+                display_key: "CUESHEET".to_string(),
+                item_key: lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                value: summary.clone(),
+                original: summary,
+                is_binary: true,
+                is_mixed: false,
+                per_file_values: vec![sidecar_text.to_string()],
+                per_file_originals: vec![sidecar_text.to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            });
+            surface.sidecar_cuesheet_shadow_present = true;
+        }
+    }
+}
+
+fn embedded_cuesheet_command_target(
+    state: &super::app::MetadataEditorState,
+    command: &str,
+) -> Result<(std::path::PathBuf, usize), String> {
+    let surface = state.active_surface();
+    if surface.paths.len() != 1 {
+        return Err(format!(":{command}: active surface is not a single-image CUESHEET carrier"));
+    }
+    if !surface.embedded_cuesheet_present || surface.pending_embedded_cuesheet_delete {
+        return Err(format!(":{command}: active surface has no embedded CUESHEET tag"));
+    }
+    let audio_path = surface
+        .paths
+        .first()
+        .cloned()
+        .ok_or_else(|| format!(":{command}: active surface has no audio path"))?;
+    let cue_idx = metadata_cuesheet_entry_index(&surface.entries)
+        .ok_or_else(|| format!(":{command}: embedded CUESHEET row is not present in the editor"))?;
+    let original_embedded_text_present = surface.entries[cue_idx]
+        .per_file_originals
+        .first()
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false);
+    if !original_embedded_text_present {
+        return Err(format!(":{command}: active CUESHEET row is sidecar-derived, not an embedded tag"));
+    }
+    Ok((audio_path, cue_idx))
+}
+
+fn embedded_cuesheet_edit_temp_path(audio_path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let parent = audio_path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory for edit buffer", audio_path.display()))?;
+    let stem = audio_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("embedded-cuesheet")
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .collect::<String>();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(parent.join(format!(
+        ".{stem}.tonepoet-embedded-cuesheet-{pid}-{nanos}.cue"
+    )))
+}
+
+fn write_cuesheet_edit_buffer(path: &std::path::Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| format!("failed to create edit buffer {}: {}", path.display(), err))?;
+    file.write_all(text.as_bytes())
+        .map_err(|err| format!("failed to write edit buffer {}: {}", path.display(), err))?;
+    file.sync_all()
+        .map_err(|err| format!("failed to sync edit buffer {}: {}", path.display(), err))
+}
+
+fn embedded_cuesheet_delete_confirmation_message(
+    audio_path: &std::path::Path,
+    surface_label: &str,
+) -> String {
+    let surface = if surface_label.trim().is_empty() {
+        audio_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| audio_path.display().to_string())
+    } else {
+        surface_label.to_string()
+    };
+    format!(
+        "Delete the embedded CUESHEET tag from {} ({})?\n\nThis only stages deletion in the metadata editor. Save (:w) to write the tag change. Sidecar .cue files are not deleted or modified. [Y/Enter = delete, N/Esc = cancel]",
+        audio_path.display(),
+        surface,
+    )
+}
+
+/// Open the existing confirmation overlay for `:cuesheet-delete`. The command
+/// is destructive enough to require a deliberate second action, but confirming
+/// still only stages an editor tombstone; it does not write tags.
+pub(super) fn open_embedded_cuesheet_delete_confirmation(
+    app: &mut AppState,
+    state: Box<super::app::MetadataEditorState>,
+) {
+    if state.read_only {
+        app.set_status(":cuesheet-delete: metadata editor is read-only".to_string());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        return;
+    }
+    let (audio_path, _cue_idx) = match embedded_cuesheet_command_target(&state, "cuesheet-delete") {
+        Ok(target) => target,
+        Err(reason) => {
+            app.set_status(reason);
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            return;
+        }
+    };
+    let message = embedded_cuesheet_delete_confirmation_message(
+        &audio_path,
+        &state.active_surface().label,
+    );
+    app.pending_metadata_editor = Some(state);
+    app.active_overlay = ActiveOverlay::Confirmation {
+        message,
+        action: ConfirmAction::DeleteEmbeddedCueSheet { path: audio_path },
+    };
+    app.set_status(
+        ":cuesheet-delete: confirm embedded CUESHEET deletion; N/Esc cancels without staging"
+            .to_string(),
+    );
+}
+
+/// Stage deletion of the active surface's embedded CUESHEET through the normal
+/// metadata-editor save path. When a sidecar CUE exists, the visible editor is
+/// immediately reshaped from that sidecar; the save still deletes only the
+/// embedded tag via a file-indexed tombstone.
+pub(super) fn metadata_editor_delete_embedded_cuesheet(
+    state: &mut super::app::MetadataEditorState,
+) -> String {
+    if state.read_only {
+        return ":cuesheet-delete: metadata editor is read-only".to_string();
+    }
+    let (audio_path, cue_idx) = match embedded_cuesheet_command_target(state, "cuesheet-delete") {
+        Ok(target) => target,
+        Err(reason) => return reason,
+    };
+    let old_track_count = parsed_cuesheet_track_count_from_entry(&state.active_surface().entries[cue_idx]);
+    let sidecar = match sidecar_cuesheet_for_audio(&audio_path) {
+        Ok(sidecar) => sidecar,
+        Err(reason) => return format!(":cuesheet-delete: {reason}"),
+    };
+
+    let len_after;
+    let removed;
+    let reshaped_from_sidecar;
+    {
+        let surface = state.active_surface_mut();
+        surface.pending_embedded_cuesheet_delete = true;
+        surface.embedded_cuesheet_present = false;
+        surface.deleted.retain(|deleted| *deleted != cue_idx);
+        removed = remove_cuesheet_derived_per_track_rows(surface, old_track_count);
+        if let Some((_cue_path, sidecar_text, _sheet)) = sidecar {
+            let current_cue_idx = metadata_cuesheet_entry_index(&surface.entries);
+            replace_cuesheet_row_with_sidecar_text(surface, current_cue_idx, &sidecar_text);
+            apply_embedded_cuesheet_per_track(&mut surface.entries);
+            let track_count = super::cue_parser::parse_cue(&sidecar_text).tracks.len();
+            normalize_cuesheet_shaped_per_track_rows_as_originals(&mut surface.entries, track_count);
+            reshaped_from_sidecar = true;
+        } else {
+            if let Some(idx) = metadata_cuesheet_entry_index(&surface.entries) {
+                remove_metadata_entry_at(surface, idx);
+            }
+            surface.sidecar_cuesheet_shadow_present = false;
+            reshaped_from_sidecar = false;
+        }
+        surface.dirty = true;
+        len_after = surface.entries.len();
+    }
+    if state.cursor >= len_after {
+        state.cursor = len_after.saturating_sub(1);
+    }
+    if reshaped_from_sidecar {
+        return format!(
+            ":cuesheet-delete: staged embedded CUESHEET deletion and reshaped from sidecar; save (:w) to write tags{}",
+            if removed > 0 {
+                format!(" (removed {removed} stale derived row{})", if removed == 1 { "" } else { "s" })
+            } else {
+                String::new()
+            },
+        );
+    }
+    ":cuesheet-delete: staged embedded CUESHEET deletion; save (:w) to write tags".to_string()
+}
+
+fn metadata_editor_stage_embedded_cuesheet_edit(
+    state: &mut super::app::MetadataEditorState,
+    edited: &str,
+) -> Result<(), String> {
+    let (_audio_path, cue_idx) = embedded_cuesheet_command_target(state, "cuesheet-edit")?;
+    validate_embedded_cuesheet_text(edited)?;
+    let old_track_count = parsed_cuesheet_track_count_from_entry(&state.active_surface().entries[cue_idx]);
+    {
+        let surface = state.active_surface_mut();
+        remove_cuesheet_derived_per_track_rows(surface, old_track_count);
+        let Some(updated_cue_idx) = metadata_cuesheet_entry_index(&surface.entries) else {
+            return Err("embedded CUESHEET row disappeared before staging".to_string());
+        };
+        let entry = &mut surface.entries[updated_cue_idx];
+        entry.per_file_values = vec![edited.to_string()];
+        entry.value = super::probe::cue_summary_string(edited);
+        entry.mb_proposed_value = None;
+        entry.mb_proposed_per_file = None;
+        surface.pending_embedded_cuesheet_delete = false;
+        surface.embedded_cuesheet_present = true;
+        surface.sidecar_cuesheet_shadow_present = false;
+        apply_embedded_cuesheet_per_track(&mut surface.entries);
+        surface.dirty = true;
+    }
+    Ok(())
+}
+
+/// Edit the active surface's embedded CUESHEET in the user's system editor,
+/// validate it, then stage it through the metadata-editor save path. Sidecar
+/// `.cue` files are intentionally untouched.
+pub(super) fn metadata_editor_edit_embedded_cuesheet_with_system_editor(
+    state: &mut super::app::MetadataEditorState,
+) -> String {
+    if state.read_only {
+        return ":cuesheet-edit: metadata editor is read-only".to_string();
+    }
+    let (audio_path, cue_idx) = match embedded_cuesheet_command_target(state, "cuesheet-edit") {
+        Ok(target) => target,
+        Err(reason) => return reason,
+    };
+    let current_text = state.active_surface().entries[cue_idx]
+        .per_file_values
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    if current_text.trim().is_empty() {
+        return ":cuesheet-edit: active embedded CUESHEET is empty".to_string();
+    }
+
+    let tmp = match embedded_cuesheet_edit_temp_path(&audio_path) {
+        Ok(path) => path,
+        Err(err) => return format!(":cuesheet-edit: {err}"),
+    };
+    if let Err(err) = write_cuesheet_edit_buffer(&tmp, &current_text) {
+        return format!(":cuesheet-edit: {err}");
+    }
+
+    match super::external_editor::open_in_editor(&tmp) {
+        Ok(true) => {}
+        Ok(false) => {
+            return format!(":cuesheet-edit: editor exited unsuccessfully; buffer kept at {}", tmp.display());
+        }
+        Err(err) => {
+            return format!(":cuesheet-edit: {}; buffer kept at {}", err, tmp.display());
+        }
+    }
+
+    let edited = match std::fs::read_to_string(&tmp) {
+        Ok(text) => text,
+        Err(err) => {
+            return format!(":cuesheet-edit: failed to read edited buffer {}: {}", tmp.display(), err);
+        }
+    };
+    if let Err(err) = validate_embedded_cuesheet_text(&edited) {
+        return format!(":cuesheet-edit: {}; buffer kept at {}", err, tmp.display());
+    }
+    if edited == current_text {
+        let _ = std::fs::remove_file(&tmp);
+        return ":cuesheet-edit: embedded CUESHEET unchanged".to_string();
+    }
+
+    if let Err(err) = metadata_editor_stage_embedded_cuesheet_edit(state, &edited) {
+        return format!(":cuesheet-edit: {}; buffer kept at {}", err, tmp.display());
+    }
+    let _ = std::fs::remove_file(&tmp);
+    ":cuesheet-edit: staged embedded CUESHEET update; save (:w) to write tags".to_string()
 }
 
 /// Replace `entries[key].per_file_values` (and originals) with `values`,
@@ -12102,6 +13014,14 @@ fn editor_metadata_value(
 }
 
 pub fn open_metadata_editor(app: &mut AppState) {
+    open_metadata_editor_impl(app, None);
+}
+
+pub fn open_metadata_editor_with_tx(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    open_metadata_editor_impl(app, Some(tx));
+}
+
+fn open_metadata_editor_impl(app: &mut AppState, tx: Option<&mpsc::Sender<AppMessage>>) {
     // Collect paths — expand directories recursively to find nested
     // audio files (e.g., disc 01/disc 02 folders).
     let sel = super::command::collect_selection_for_file_ops(app);
@@ -12261,6 +13181,31 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     }
     if cue_surfaces.len() > 1 {
+        let grouping_resolved = apply_cached_or_ladder_split_cue_grouping_to_metadata_surfaces(
+            app,
+            &mut cue_surfaces,
+            &mut active_surface,
+        );
+        if !grouping_resolved {
+            if let (Some(tx), Some(infos)) = (
+                tx,
+                metadata_cue_surfaces_to_single_image_infos(&cue_surfaces),
+            ) {
+                let active_cue_path = cue_surfaces
+                    .get(active_surface)
+                    .map(|surface| surface.cue_path.clone());
+                if crate::tui::command::spawn_split_cue_album_grouping_ladder_for_metadata_editor(
+                    app,
+                    tx,
+                    infos,
+                    active_cue_path,
+                ) {
+                    return;
+                }
+            }
+        }
+    }
+    if cue_surfaces.len() > 1 {
         open_metadata_editor_for_cue_surfaces_with_active(app, cue_surfaces, active_surface);
         return;
     }
@@ -12317,6 +13262,8 @@ pub fn open_metadata_editor(app: &mut AppState) {
     // ISRC entries to per-track dim from whichever CUESHEET source
     // is present. Save-time regen (Phase 4) writes user edits back to
     // the embedded CUESHEET tag.
+    let embedded_cuesheet_present = paths.len() == 1
+        && metadata_entries_contain_embedded_cuesheet(&entries);
     if paths.len() == 1 {
         inject_sidecar_cuesheet_if_present(&mut entries, &paths[0]);
         apply_embedded_cuesheet_per_track(&mut entries);
@@ -12405,7 +13352,11 @@ pub fn open_metadata_editor(app: &mut AppState) {
         file_labels,
         technical_details,
     );
-    state.active_surface_mut().dirty = did_auto_populate;
+    {
+        let surface = state.active_surface_mut();
+        surface.dirty = did_auto_populate;
+        surface.embedded_cuesheet_present = embedded_cuesheet_present;
+    }
     app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
 }
 
@@ -17632,7 +18583,7 @@ fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Send
                     if idx < state.releases.len() {
                         let releases = std::mem::take(&mut state.releases);
                         let paths = std::mem::take(&mut state.paths);
-                        super::event_loop::open_editor_with_mb_release(app, releases, idx, paths);
+                        super::event_loop::open_editor_with_mb_release(app, tx, releases, idx, paths);
                     }
                     return;
                 }
@@ -17657,7 +18608,7 @@ fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Send
                             let releases = std::mem::take(&mut state.releases);
                             let paths = std::mem::take(&mut state.paths);
                             super::event_loop::open_editor_with_mb_release(
-                                app, releases, idx, paths,
+                                app, tx, releases, idx, paths,
                             );
                             return;
                         }
@@ -20038,6 +20989,8 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
     let mut source_metadata = merged.metadata;
     let mut source_metadata_errors = merged.metadata_errors;
 
+    let embedded_cuesheet_present = paths.len() == 1
+        && metadata_entries_contain_embedded_cuesheet(&entries);
     if paths.len() == 1 {
         inject_sidecar_cuesheet_if_present(&mut entries, &paths[0]);
         apply_embedded_cuesheet_per_track(&mut entries);
@@ -20073,6 +21026,7 @@ fn open_convert_cursor_metadata_editor(app: &mut AppState) {
         file_labels,
         technical_details,
     );
+    state.active_surface_mut().embedded_cuesheet_present = embedded_cuesheet_present;
     if let Some(context) = archive_preview_context {
         state.archive_edit_context = Some(context);
     }
@@ -24416,6 +25370,9 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
             app.quit_after_browse_archive_metadata_resolution = false;
             app.set_status("metadata editor: discard cancelled".to_string());
         }
+        Some(ConfirmAction::DeleteEmbeddedCueSheet { .. }) => {
+            app.set_status(":cuesheet-delete: cancelled; embedded CUESHEET unchanged".to_string());
+        }
         Some(ConfirmAction::ArchiveExternalConflict { context }) => {
             app.should_quit = false;
             app.quit_after_browse_archive_repackage = false;
@@ -24830,6 +25787,31 @@ fn execute_confirm_action(
                 }
             }
         }
+        ConfirmAction::DeleteEmbeddedCueSheet { path } => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status(":cuesheet-delete: editor state unavailable; deletion not staged".to_string());
+                return;
+            };
+            match embedded_cuesheet_command_target(&state, "cuesheet-delete") {
+                Ok((current_path, _)) if current_path.as_path() == path.as_path() => {
+                    let msg = metadata_editor_delete_embedded_cuesheet(&mut state);
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    app.set_status(msg);
+                }
+                Ok((current_path, _)) => {
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    app.set_status(format!(
+                        ":cuesheet-delete: active target changed from {} to {}; deletion not staged",
+                        path.display(),
+                        current_path.display(),
+                    ));
+                }
+                Err(reason) => {
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    app.set_status(format!("{reason}; deletion not staged"));
+                }
+            }
+        }
         ConfirmAction::ArchiveExternalConflict { context } => {
             let context = context.clone();
             super::event_loop::start_browse_archive_repackage_overwrite(app, context, tx);
@@ -24868,7 +25850,7 @@ fn execute_confirm_action(
             app.bulk_guard_frozen_paths = Some(paths);
             match command {
                 BulkGuardCommand::OpenMetadataEditor => {
-                    open_metadata_editor(app);
+                    open_metadata_editor_with_tx(app, tx);
                 }
                 BulkGuardCommand::Analyze { force } => {
                     super::command::execute_command(app, super::command::Command::Analyze { force }, tx);
@@ -26437,7 +27419,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 ) {
                     return;
                 }
-                open_metadata_editor(app);
+                open_metadata_editor_with_tx(app, tx);
             }
             TuiButton::BrowseInfoAudioStreams => {
                 clear_browse_info_focus(app);
@@ -28400,6 +29382,156 @@ mod phase4_tests {
         assert_eq!(plan.cue_path.as_path(), expected.as_path());
     }
 
+
+    #[test]
+    fn sidecar_shadow_per_track_edits_regenerate_sidecar_without_embedding() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let audio = td.path().join("album.flac");
+        std::fs::write(&audio, b"").expect("create edited audio image");
+        let cue_path = write_sidecar(td.path(), "album.cue", CUE_TEMPLATE);
+
+        let mut state = MetadataEditorState::for_files(
+            vec![audio.clone()],
+            vec![
+                entry(
+                    "CUESHEET",
+                    ItemKey::Unknown("CUESHEET".into()),
+                    &[CUE_TEMPLATE],
+                    &[CUE_TEMPLATE],
+                ),
+                entry(
+                    "TITLE",
+                    ItemKey::TrackTitle,
+                    &["Track 1", "Sidecar Persisted", "Track 3"],
+                    &["Track 1", "Track 2", "Track 3"],
+                ),
+            ],
+            vec!["album.flac".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().sidecar_cuesheet_shadow_present = true;
+        state.active_surface_mut().embedded_cuesheet_present = false;
+        state.active_surface_mut().dirty = true;
+
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("sidecar shadow should regenerate"));
+        let cue_entry_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET shadow");
+        let cue_entry = &state.active_surface().entries[cue_entry_idx];
+        assert!(cue_entry.per_file_values[0].contains("TITLE \"Sidecar Persisted\""));
+        assert_ne!(
+            cue_entry.per_file_values,
+            cue_entry.per_file_originals,
+            "the editor must retain a sidecar write-back diff before save reduction"
+        );
+
+        let entries_snap = metadata_editor_entries_snapshot_for_save(&state);
+        let (_key, snapshot_values, snapshot_originals) = &entries_snap[cue_entry_idx];
+        assert_eq!(
+            snapshot_values, snapshot_originals,
+            "ordinary lofty save snapshot must not materialize a sidecar shadow as an embedded CUESHEET tag"
+        );
+
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("sidecar shadow regen should produce a sidecar write-back plan");
+        assert_eq!(plan.cue_path.as_path(), cue_path.as_path());
+        assert!(
+            !plan.require_successful_image_save,
+            "pure per-track sidecar edits must not require an unrelated image-tag write"
+        );
+
+        let (session_id, generation) = state.begin_write();
+        let sidecar_result = cue_sidecar_writeback_result_after_successful_image_save(plan, &[])
+            .expect("sidecar-only edits should write even when no audio tag write was needed");
+        assert!(matches!(
+            &sidecar_result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved { unchanged: false, .. }
+        ));
+        let summary = state
+            .apply_write_results(session_id, generation, vec![sidecar_result])
+            .expect("sidecar-only save completion should reduce editor state");
+        assert_eq!(summary.saved, 0);
+        assert_eq!(summary.sidecar_cue_saved, 1);
+        assert!(summary.all_saved(), "unexpected summary: {:?}", summary);
+        assert!(!state.active_surface().dirty);
+        let cue_entry = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET shadow after reduction");
+        assert_eq!(cue_entry.per_file_values, cue_entry.per_file_originals);
+        let title_entry = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("TITLE row after reduction");
+        assert_eq!(title_entry.per_file_values, title_entry.per_file_originals);
+
+        let sidecar_text = std::fs::read_to_string(&cue_path).expect("read updated sidecar");
+        assert!(sidecar_text.contains("TITLE \"Sidecar Persisted\""));
+    }
+
+    #[test]
+    fn sidecar_shadow_album_tag_edits_gate_sidecar_writeback_on_image_save() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let audio = td.path().join("album.flac");
+        std::fs::write(&audio, b"").expect("create edited audio image");
+        let cue_path = write_sidecar(td.path(), "album.cue", CUE_TEMPLATE);
+
+        let mut state = MetadataEditorState::for_files(
+            vec![audio.clone()],
+            vec![
+                entry(
+                    "CUESHEET",
+                    ItemKey::Unknown("CUESHEET".into()),
+                    &[CUE_TEMPLATE],
+                    &[CUE_TEMPLATE],
+                ),
+                entry("ALBUM", ItemKey::AlbumTitle, &["New Album"], &["Old Album"]),
+                entry(
+                    "TITLE",
+                    ItemKey::TrackTitle,
+                    &["Track 1", "Edited Track 2", "Track 3"],
+                    &["Track 1", "Track 2", "Track 3"],
+                ),
+            ],
+            vec!["album.flac".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().sidecar_cuesheet_shadow_present = true;
+        state.active_surface_mut().embedded_cuesheet_present = false;
+        state.active_surface_mut().dirty = true;
+
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("sidecar shadow should regenerate"));
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("sidecar shadow regen should produce a sidecar write-back plan");
+        assert!(
+            plan.require_successful_image_save,
+            "sidecar write-back that also depends on dirty image tags must be gated on the image save"
+        );
+        assert!(
+            cue_sidecar_writeback_result_after_successful_image_save(plan.clone(), &[]).is_none(),
+            "without a successful image save, sidecar write-back must not create a cross-surface partial update"
+        );
+        let image_result = crate::tui::app::MetadataEditorWriteResult::saved(audio.clone());
+        let sidecar_result = cue_sidecar_writeback_result_after_successful_image_save(
+            plan,
+            &[image_result],
+        )
+        .expect("successful image save should release the sidecar write-back");
+        assert!(matches!(
+            &sidecar_result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved { .. }
+        ));
+        let sidecar_text = std::fs::read_to_string(&cue_path).expect("read updated sidecar");
+        assert!(sidecar_text.contains("TITLE \"New Album\""));
+        assert!(sidecar_text.contains("TITLE \"Edited Track 2\""));
+    }
 
     #[test]
     fn cue_sidecar_writeback_summary_reports_utf8_fallback() {
@@ -31300,6 +32432,598 @@ mod single_image_metadata_editor_regression_tests {
             .unwrap_or(false)
     }
 
+
+    fn fixture_cue(stem: &str, album_title: &str, side_prefix: &str, n_tracks: usize) -> String {
+        let mut cue = format!(
+            "PERFORMER \"Pink Floyd\"\nTITLE \"{album_title}\"\nFILE \"{stem}.flac\" WAVE\n"
+        );
+        for track in 1..=n_tracks {
+            // Cue timestamps are MM:SS:FF with SS < 60; split total seconds
+            // properly or tracks past #2 produce invalid "00:60:00"-style
+            // stamps that the embedded-cuesheet validator rightly rejects.
+            let total_seconds = (track - 1) * 30;
+            let minutes = total_seconds / 60;
+            let seconds = total_seconds % 60;
+            cue.push_str(&format!(
+                "  TRACK {track:02} AUDIO\n    TITLE \"{side_prefix} Track {track}\"\n    INDEX 01 {minutes:02}:{seconds:02}:00\n"
+            ));
+        }
+        cue
+    }
+
+    fn cuesheet_tag_entry(value: &str, original: &str) -> crate::tui::probe::TagEntry {
+        crate::tui::probe::TagEntry {
+            display_key: "CUESHEET".to_string(),
+            item_key: lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+            value: crate::tui::probe::cue_summary_string(value),
+            original: crate::tui::probe::cue_summary_string(original),
+            is_binary: true,
+            is_mixed: false,
+            per_file_values: vec![value.to_string()],
+            per_file_originals: vec![original.to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    fn title_tag_entry(values: Vec<&str>) -> crate::tui::probe::TagEntry {
+        crate::tui::probe::TagEntry {
+            display_key: "TITLE".to_string(),
+            item_key: lofty::tag::ItemKey::TrackTitle,
+            value: if values.len() > 1 { "<multiple values>".to_string() } else { values.first().copied().unwrap_or_default().to_string() },
+            original: values.first().copied().unwrap_or_default().to_string(),
+            is_binary: false,
+            is_mixed: values.len() > 1,
+            per_file_values: values.iter().map(|v| v.to_string()).collect(),
+            per_file_originals: values.iter().map(|v| v.to_string()).collect(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    #[test]
+    fn embedded_cuesheet_commands_reject_sidecar_synthetic_cuesheet_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        std::fs::write(&image, b"placeholder").expect("image");
+        let synthetic = fixture_cue("side_a", "Album", "Side A", 2);
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image],
+            vec![cuesheet_tag_entry(&synthetic, "")],
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = false;
+
+        let delete_status = metadata_editor_delete_embedded_cuesheet(&mut state);
+        assert!(delete_status.contains("no embedded CUESHEET"), "unexpected status: {delete_status}");
+        assert!(!state.active_surface().pending_embedded_cuesheet_delete);
+
+        let edit_status = metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
+        assert!(edit_status.contains("no embedded CUESHEET"), "unexpected status: {edit_status}");
+        assert!(!state.active_surface().dirty, "synthetic rows must not be staged for embedded-tag writes");
+    }
+
+    #[test]
+    fn embedded_cuesheet_delete_stages_tag_tombstone_and_reshapes_from_sidecar() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        std::fs::write(&image, b"placeholder").expect("image");
+        let stale_embedded = fixture_cue("side_a", "Album", "Stale", 2);
+        let sidecar = fixture_cue("side_a", "Album", "Sidecar", 3);
+        std::fs::write(temp.path().join("side_a.cue"), &sidecar).expect("sidecar");
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image],
+            vec![
+                cuesheet_tag_entry(&stale_embedded, &stale_embedded),
+                title_tag_entry(vec!["Stale Track 1", "Stale Track 2"]),
+            ],
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+
+        let status = metadata_editor_delete_embedded_cuesheet(&mut state);
+        assert!(status.contains("reshaped from sidecar"), "unexpected status: {status}");
+        let surface = state.active_surface();
+        assert!(surface.pending_embedded_cuesheet_delete, "save path must retain an embedded-tag tombstone");
+        assert!(!surface.embedded_cuesheet_present, "visible sidecar row must not masquerade as embedded");
+        let cue = surface.entries.iter().find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET")).expect("sidecar CUESHEET row");
+        assert_eq!(cue.per_file_values.first().map(String::as_str), Some(sidecar.as_str()));
+        let title = surface.entries.iter().find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE")).expect("reshaped TITLE row");
+        assert_eq!(title.per_file_values.len(), 3, "sidecar track count should reshape derived rows");
+        assert!(title.per_file_values.iter().any(|title| title.contains("Sidecar Track 3")));
+    }
+
+    #[test]
+    fn embedded_cuesheet_delete_first_invocation_opens_confirmation_without_staging() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        std::fs::write(&image, b"placeholder").expect("image");
+        let stale_embedded = fixture_cue("side_a", "Album", "Embedded", 2);
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            vec![cuesheet_tag_entry(&stale_embedded, &stale_embedded)],
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        open_embedded_cuesheet_delete_confirmation(&mut app, Box::new(state));
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { message, action } => {
+                assert!(
+                    message.contains("Delete the embedded CUESHEET tag"),
+                    "unexpected confirmation message: {message}"
+                );
+                assert!(
+                    message.contains(&image.display().to_string()),
+                    "confirmation should identify the active file: {message}"
+                );
+                assert!(matches!(action, ConfirmAction::DeleteEmbeddedCueSheet { path } if path == &image));
+            }
+            other => panic!("expected delete confirmation, got {other:?}"),
+        }
+
+        let parked = app.pending_metadata_editor.as_ref().expect("parked editor");
+        assert!(!parked.active_surface().pending_embedded_cuesheet_delete);
+        assert!(!parked.active_surface().dirty, "confirmation prompt must not stage writes");
+    }
+
+    #[test]
+    fn embedded_cuesheet_delete_decline_restores_editor_without_staging_or_touching_sidecar() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        std::fs::write(&image, b"placeholder").expect("image");
+        let stale_embedded = fixture_cue("side_a", "Album", "Embedded", 2);
+        let sidecar = fixture_cue("side_a", "Album", "Sidecar", 3);
+        let sidecar_path = temp.path().join("side_a.cue");
+        std::fs::write(&sidecar_path, &sidecar).expect("sidecar");
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            vec![cuesheet_tag_entry(&stale_embedded, &stale_embedded)],
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        open_embedded_cuesheet_delete_confirmation(&mut app, Box::new(state));
+        let action = match &app.active_overlay {
+            ActiveOverlay::Confirmation { action, .. } => action.clone(),
+            other => panic!("expected delete confirmation, got {other:?}"),
+        };
+
+        cancel_confirm_action(&mut app, Some(&action));
+
+        let state = match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => panic!("expected restored metadata editor, got {other:?}"),
+        };
+        let surface = state.active_surface();
+        assert!(surface.embedded_cuesheet_present);
+        assert!(!surface.pending_embedded_cuesheet_delete);
+        assert!(!surface.dirty, "decline must not create pending writes");
+        let cue = surface
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("embedded CUESHEET row");
+        assert_eq!(cue.per_file_values.first().map(String::as_str), Some(stale_embedded.as_str()));
+        assert_eq!(std::fs::read_to_string(&sidecar_path).expect("sidecar after cancel"), sidecar);
+    }
+
+    #[test]
+    fn embedded_cuesheet_delete_confirm_stages_tombstone_and_preserves_sidecar_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        std::fs::write(&image, b"placeholder").expect("image");
+        let stale_embedded = fixture_cue("side_a", "Album", "Embedded", 2);
+        let sidecar = fixture_cue("side_a", "Album", "Sidecar", 3);
+        let sidecar_path = temp.path().join("side_a.cue");
+        std::fs::write(&sidecar_path, &sidecar).expect("sidecar");
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            vec![
+                cuesheet_tag_entry(&stale_embedded, &stale_embedded),
+                title_tag_entry(vec!["Embedded Track 1", "Embedded Track 2"]),
+            ],
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        open_embedded_cuesheet_delete_confirmation(&mut app, Box::new(state));
+        let action = match &app.active_overlay {
+            ActiveOverlay::Confirmation { action, .. } => action.clone(),
+            other => panic!("expected delete confirmation, got {other:?}"),
+        };
+        let (tx, _rx) = mpsc::channel(8);
+        app.active_overlay = ActiveOverlay::None;
+
+        execute_confirm_action(&mut app, &action, &tx);
+
+        let state = match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => panic!("expected restored metadata editor, got {other:?}"),
+        };
+        let surface = state.active_surface();
+        assert!(surface.pending_embedded_cuesheet_delete);
+        assert!(!surface.embedded_cuesheet_present);
+        assert!(surface.sidecar_cuesheet_shadow_present);
+        assert!(surface.dirty, "confirmed deletion must stage a save-path tombstone");
+        let cue = surface
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("sidecar CUESHEET row after reshape");
+        assert_eq!(cue.per_file_values.first().map(String::as_str), Some(sidecar.as_str()));
+        let title = surface
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("reshaped title row");
+        assert_eq!(title.per_file_values.len(), 3);
+        assert!(title.per_file_values.iter().any(|value| value.contains("Sidecar Track 3")));
+        assert_eq!(std::fs::read_to_string(&sidecar_path).expect("sidecar after confirm"), sidecar);
+    }
+
+    #[test]
+    fn embedded_cuesheet_validation_rejects_malformed_or_trackless_buffers() {
+        let malformed_title = "TITLE Album\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        assert!(validate_embedded_cuesheet_text(malformed_title).is_err());
+
+        let missing_index = "TITLE \"Album\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n";
+        assert!(validate_embedded_cuesheet_text(missing_index).is_err());
+
+        let no_tracks = "TITLE \"Album\"\nFILE \"album.flac\" WAVE\n";
+        assert!(validate_embedded_cuesheet_text(no_tracks).is_err());
+    }
+
+    fn create_flac_fixture(path: &std::path::Path) -> bool {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=1",
+                "-c:a",
+                "flac",
+            ])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
+    fn read_cuesheet_tag(path: &std::path::Path) -> Option<String> {
+        crate::tui::probe::read_all_tags_merged(&[path.to_path_buf()])
+            .ok()?
+            .into_iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .and_then(|entry| entry.per_file_values.first().map(|text| text.trim().to_string()))
+    }
+
+    #[test]
+    fn embedded_cuesheet_delete_decline_does_not_remove_real_tag_or_sidecar() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        assert!(create_flac_fixture(&image), "flac fixture");
+        let original = fixture_cue("side_a", "Album", "Embedded", 2);
+        let sidecar = fixture_cue("side_a", "Album", "Sidecar", 3);
+        let sidecar_path = temp.path().join("side_a.cue");
+        std::fs::write(&sidecar_path, &sidecar).expect("sidecar");
+        crate::tui::probe::write_all_tags(
+            &image,
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(original.clone()))],
+        )
+        .expect("write embedded CUESHEET");
+        assert_eq!(read_cuesheet_tag(&image).as_deref(), Some(original.trim()));
+
+        let entries = crate::tui::probe::read_all_tags_merged(&[image.clone()])
+            .expect("read tags for editor");
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            entries,
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        open_embedded_cuesheet_delete_confirmation(&mut app, Box::new(state));
+        let action = match &app.active_overlay {
+            ActiveOverlay::Confirmation { action, .. } => action.clone(),
+            other => panic!("expected delete confirmation, got {other:?}"),
+        };
+        cancel_confirm_action(&mut app, Some(&action));
+
+        assert_eq!(read_cuesheet_tag(&image).as_deref(), Some(original.trim()));
+        assert_eq!(std::fs::read_to_string(&sidecar_path).expect("sidecar after cancel"), sidecar);
+        let state = match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => panic!("expected restored metadata editor, got {other:?}"),
+        };
+        assert!(metadata_editor_forced_delete_items(state).is_empty());
+    }
+
+    #[test]
+    fn embedded_cuesheet_delete_stages_save_path_tombstone_and_deletes_real_tag_via_helper() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        assert!(create_flac_fixture(&image), "flac fixture");
+        let original = fixture_cue("side_a", "Album", "Embedded", 2);
+        crate::tui::probe::write_all_tags(
+            &image,
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(original.clone()))],
+        )
+        .expect("write embedded CUESHEET");
+        assert_eq!(read_cuesheet_tag(&image).as_deref(), Some(original.trim()));
+
+        let entries = crate::tui::probe::read_all_tags_merged(&[image.clone()])
+            .expect("read tags for editor");
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            entries,
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+
+        let status = metadata_editor_delete_embedded_cuesheet(&mut state);
+        assert!(status.contains("staged embedded CUESHEET deletion"), "unexpected status: {status}");
+        assert!(state.active_surface().pending_embedded_cuesheet_delete);
+        assert!(state.active_surface().dirty);
+        assert_eq!(
+            metadata_editor_forced_delete_items(&state),
+            vec![(0, lofty::tag::ItemKey::Unknown("CUESHEET".to_string()))],
+            "the async save snapshot must carry an explicit embedded-tag tombstone"
+        );
+
+        crate::tui::probe::write_all_tags(
+            &image,
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), None)],
+        )
+        .expect("delete embedded CUESHEET through tag helper");
+        assert!(read_cuesheet_tag(&image).is_none(), "CUESHEET tag should be gone on disk");
+    }
+
+    #[test]
+    fn embedded_cuesheet_edit_stages_real_embedded_tag_diff_and_writes_via_helper() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        assert!(create_flac_fixture(&image), "flac fixture");
+        let original = fixture_cue("side_a", "Album", "Original", 2);
+        let edited = fixture_cue("side_a", "Album", "Edited", 3);
+        crate::tui::probe::write_all_tags(
+            &image,
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(original.clone()))],
+        )
+        .expect("write original embedded CUESHEET");
+
+        let entries = crate::tui::probe::read_all_tags_merged(&[image.clone()])
+            .expect("read tags for editor");
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            entries,
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+
+        metadata_editor_stage_embedded_cuesheet_edit(&mut state, &edited)
+            .expect("stage edited embedded CUESHEET");
+        let cue_entry = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET row after edit");
+        assert_eq!(cue_entry.per_file_values.first().map(String::as_str), Some(edited.as_str()));
+        assert_eq!(cue_entry.per_file_originals.first().map(String::as_str), Some(original.trim()));
+        assert!(state.active_surface().dirty, "edit must be staged, not directly written");
+        let title = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("derived TITLE row after edit");
+        assert_eq!(title.per_file_values.len(), 3, "edited CUESHEET reshapes derived rows");
+        assert!(title.per_file_values.iter().any(|value| value.contains("Edited Track 3")));
+
+        crate::tui::probe::write_all_tags(
+            &image,
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(edited.clone()))],
+        )
+        .expect("write edited embedded CUESHEET through tag helper");
+        assert_eq!(read_cuesheet_tag(&image).as_deref(), Some(edited.trim()));
+    }
+
+    #[test]
+    fn mb_apply_ignores_stale_embedded_subset_cuesheet_and_opens_two_tabs_ten_rows() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dsotm");
+        std::fs::create_dir_all(&album).expect("album dir");
+
+        for stem in ["tdsotm_a", "tdsotm_b"] {
+            let image = album.join(format!("{stem}.flac"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=44100:duration=1",
+                    "-c:a",
+                    "flac",
+                ])
+                .arg(&image)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("ffmpeg fixture");
+            assert!(status.success());
+        }
+
+        let side_a_cue = fixture_cue("tdsotm_a", "The Dark Side Of The Moon (Side A)", "A", 5);
+        let side_b_cue = fixture_cue("tdsotm_b", "The Dark Side Of The Moon (Side B)", "B", 5);
+        let stale_embedded_side_a = fixture_cue("tdsotm_a", "Stale Embedded Side A", "A", 5);
+        std::fs::write(album.join("tdsotm_a.cue"), &side_a_cue).expect("side a cue");
+        std::fs::write(album.join("tdsotm_b.cue"), &side_b_cue).expect("side b cue");
+
+        // Reproduce the real failure shape: only side A has an embedded CUESHEET,
+        // and it describes a strict subset of the same-folder sidecar album.
+        crate::tui::probe::write_all_tags(
+            &album.join("tdsotm_a.flac"),
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(stale_embedded_side_a.clone()))],
+        )
+        .expect("write stale embedded CUESHEET through tag helper");
+        assert_eq!(
+            read_cuesheet_tag(&album.join("tdsotm_a.flac")).as_deref(),
+            Some(stale_embedded_side_a.trim()),
+            "Bug 1 fixture must carry a real on-disk embedded CUESHEET written by the tag-save helper"
+        );
+        assert!(
+            read_cuesheet_tag(&album.join("tdsotm_b.flac")).is_none(),
+            "Bug 1 fixture must leave side B without an embedded CUESHEET"
+        );
+
+        let release = crate::tui::musicbrainz::MbRelease {
+            release_id: "mb-dsotm".to_string(),
+            title: "The Dark Side Of The Moon".to_string(),
+            artist: "Pink Floyd".to_string(),
+            disc_count: 1,
+            tracks: (1..=10)
+                .map(|position| crate::tui::musicbrainz::MbTrack {
+                    position,
+                    title: format!("MB Track {position}"),
+                    artist: "Pink Floyd".to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = build_metadata_editor_for_cue_surfaces_with_mb_release(
+            &mut app,
+            &[album.clone()],
+            &release,
+        )
+        .expect("builder should not fail")
+        .expect("multi-CUE MB apply editor");
+
+        assert_eq!(state.presentation_tabs.len(), 2, "stale embedded subset must not collapse side B");
+        let row_count: usize = state.presentation_tabs.iter().map(|tab| tab.file_labels.len()).sum();
+        assert_eq!(row_count, 10, "MB apply should expose all sidecar tracks across tabs");
+        assert_eq!(state.presentation_tabs[0].file_labels.len(), 5);
+        assert_eq!(state.presentation_tabs[1].file_labels.len(), 5);
+        let side_a_cue_row = state.presentation_tabs[0]
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("side A embedded CUESHEET row");
+        assert_eq!(
+            side_a_cue_row.per_file_values.first().map(String::as_str),
+            Some(stale_embedded_side_a.trim()),
+            "sidecar shaping must not overwrite the embedded CUESHEET value"
+        );
+        assert_eq!(
+            side_a_cue_row.per_file_originals.first().map(String::as_str),
+            Some(stale_embedded_side_a.trim()),
+            "ordinary save must not see a sidecar-vs-embedded CUESHEET diff"
+        );
+        let side_b_cue_row = state.presentation_tabs[1]
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("side B sidecar CUESHEET shadow row");
+        assert_eq!(
+            side_b_cue_row.per_file_values,
+            side_b_cue_row.per_file_originals,
+            "sidecar-only CUESHEET rows must be display/shaping shadows, not pending embedded-tag creates"
+        );
+        assert!(state.presentation_tabs[1].sidecar_cuesheet_shadow_present);
+        assert!(!state.presentation_tabs[1].embedded_cuesheet_present);
+        let side_b_title = state.presentation_tabs[1]
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("side B TITLE row");
+        assert_eq!(side_b_title.per_file_values.len(), 5);
+        assert_eq!(side_b_title.per_file_values.first().map(String::as_str), Some("MB Track 6"));
+
+        state.active_tab = 1;
+        assert!(
+            regenerate_cuesheet_for_save(&mut state).expect("side-B sidecar shadow should regenerate"),
+            "MB-applied side-B per-track proposals must have a durable sidecar save path"
+        );
+        let side_b_cue_entry = state.active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("side B regenerated CUESHEET shadow");
+        assert!(side_b_cue_entry.per_file_values[0].contains("TITLE \"MB Track 6\""));
+        let entries_snap = metadata_editor_entries_snapshot_for_save(&state);
+        let cue_idx = state.active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("side B CUESHEET index");
+        assert_eq!(
+            entries_snap[cue_idx].1, entries_snap[cue_idx].2,
+            "side-B sidecar CUESHEET diff must be suppressed from embedded-tag writes"
+        );
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("side-B sidecar shadow should produce a write-back plan");
+        assert!(
+            plan.require_successful_image_save,
+            "MB album-level tag proposals should gate sidecar write-back on image-tag save"
+        );
+        let (session_id, generation) = state.begin_write();
+        let image_result = crate::tui::app::MetadataEditorWriteResult::saved(album.join("tdsotm_b.flac"));
+        let sidecar_result = cue_sidecar_writeback_result_after_successful_image_save(
+            plan,
+            &[image_result.clone()],
+        )
+        .expect("successful side-B image save should persist sidecar CUE edits");
+        let summary = state
+            .apply_write_results(session_id, generation, vec![image_result, sidecar_result])
+            .expect("side-B save reduction");
+        assert!(summary.all_saved(), "unexpected side-B save summary: {:?}", summary);
+        let side_b_sidecar_text = std::fs::read_to_string(album.join("tdsotm_b.cue"))
+            .expect("read updated side-B sidecar");
+        assert!(side_b_sidecar_text.contains("TITLE \"MB Track 6\""));
+        assert!(
+            read_cuesheet_tag(&album.join("tdsotm_b.flac")).is_none(),
+            "saving side-B MB edits must not materialize a sidecar shadow as an embedded tag"
+        );
+    }
+
     #[test]
     fn metadata_cue_surface_collection_recurses_and_pairs_each_cue_to_its_image() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -31367,7 +33091,6 @@ mod single_image_metadata_editor_regression_tests {
         assert_eq!(surfaces.len(), 2);
     }
 
-    #[test]
     #[test]
     fn metadata_cue_surface_collection_handles_crlf_wv_real_tree_replica() {
         if !fixture_tool_available("ffmpeg") {

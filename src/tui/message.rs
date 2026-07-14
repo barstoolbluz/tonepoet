@@ -538,6 +538,31 @@ pub enum AppMessage {
         outcome: MbOutcome,
         ctx: TagsMbContext,
     },
+    /// Completion of the same-folder split-CUE album grouping ladder. The
+    /// reducer caches the grouping decision, persists any TOC cache bodies
+    /// produced by the probes, then continues the original MusicBrainz tagging
+    /// dispatch according to the resolved merge/split outcome.
+    SplitCueAlbumGroupingComplete {
+        request: Box<crate::tui::command::SplitCueAlbumGroupingRequest>,
+        result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
+    },
+    /// Completion of the same grouping ladder for GNUDB dispatch. GNUDB uses
+    /// the resolved album grouping to decide which same-folder CUE surfaces
+    /// belong to the active tagging operation before issuing per-CUE GNUDB
+    /// lookups.
+    GnudbSplitCueAlbumGroupingComplete {
+        infos: Vec<crate::tui::cue_parser::SingleImageInfo>,
+        active_audio_path: Option<std::path::PathBuf>,
+        result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
+    },
+    /// Completion of the same grouping ladder before opening a split-CUE
+    /// metadata editor. This keeps metadata-editor grouping on the same
+    /// title/concat-TOC/per-CUE/ambiguous-merge policy used by MB dispatch.
+    MetadataEditorSplitCueAlbumGroupingComplete {
+        infos: Vec<crate::tui::cue_parser::SingleImageInfo>,
+        active_cue_path: Option<std::path::PathBuf>,
+        result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
+    },
     /// Result of the blocking single-image MusicBrainz guard checks used
     /// before applying a selected release to the metadata editor. The guard
     /// may read tags and probe sample counts, so it must complete on a

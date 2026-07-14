@@ -1094,7 +1094,7 @@ pub fn execute_context_action(
             ) {
                 return;
             }
-            super::keybindings::open_metadata_editor(app);
+            super::keybindings::open_metadata_editor_with_tx(app, tx);
         }
         ContextAction::DeletePermanently => {
             // Browse-archive deletion is handled above by
@@ -1295,7 +1295,7 @@ pub fn execute_context_action(
                 if idx < state.releases.len() {
                     let releases = std::mem::take(&mut state.releases);
                     let paths = std::mem::take(&mut state.paths);
-                    super::event_loop::open_editor_with_mb_release(app, releases, idx, paths);
+                    super::event_loop::open_editor_with_mb_release(app, tx, releases, idx, paths);
                 } else {
                     // Out-of-range — restore the picker.
                     app.active_overlay = super::app::ActiveOverlay::MbSelect(state);
@@ -1575,6 +1575,55 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 
+fn launch_gnudb_for_split_cue_grouping_decision(
+    infos: Vec<super::cue_parser::SingleImageInfo>,
+    decision: &super::command::SplitCueAlbumGroupingDecision,
+    active_audio_path: Option<&std::path::Path>,
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let groups = super::command::split_cue_decision_groups_as_infos(decision, &infos);
+    let selected = if decision.groups.len() > 1 {
+        super::command::split_cue_active_group(&groups, active_audio_path)
+            .map(|group| group.to_vec())
+            .unwrap_or_else(|| infos.clone())
+    } else {
+        groups.into_iter().next().unwrap_or(infos)
+    };
+
+    if selected.len() > 1 {
+        launch_multi_single_image_gnudb(selected, app, tx);
+    } else if let Some(info) = selected.into_iter().next() {
+        launch_single_image_gnudb(info, app, tx);
+    } else {
+        app.set_status("GNUDB: no usable CUE/image pairs for lookup");
+    }
+}
+
+pub(super) fn handle_gnudb_split_cue_album_grouping_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    infos: Vec<super::cue_parser::SingleImageInfo>,
+    active_audio_path: Option<std::path::PathBuf>,
+    result: Result<Box<super::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
+) {
+    let outcome = match result {
+        Ok(outcome) => *outcome,
+        Err(err) => {
+            app.set_status(format!("GNUDB: split-CUE grouping failed: {err}"));
+            return;
+        }
+    };
+    super::command::store_split_cue_album_grouping_outcome(app, &infos, &outcome);
+    launch_gnudb_for_split_cue_grouping_decision(
+        infos,
+        &outcome.decision,
+        active_audio_path.as_deref(),
+        app,
+        tx,
+    );
+}
+
 /// Execute a GNUDB lookup for the current Browse selection, with the same
 /// bulk-operation guard as command-mode tagging flows.
 pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
@@ -1610,9 +1659,38 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         &paths,
         &audio_paths,
     );
+    let active_audio_path = audio_paths
+        .first()
+        .cloned()
+        .or_else(|| cue_infos.first().map(|info| info.audio_path.clone()));
     if cue_infos.len() > 1 {
-        launch_multi_single_image_gnudb(cue_infos, app, tx);
-        return;
+        if super::command::same_folder_split_cue_infos(&cue_infos) {
+            if let Some(decision) =
+                super::command::cached_or_title_split_cue_album_grouping_decision(app, &cue_infos)
+            {
+                launch_gnudb_for_split_cue_grouping_decision(
+                    cue_infos,
+                    &decision,
+                    active_audio_path.as_deref(),
+                    app,
+                    tx,
+                );
+                return;
+            }
+            // The ladder consumes the infos only when it actually spawns;
+            // clone so the not-spawned fallthrough below keeps its data.
+            if super::command::spawn_split_cue_album_grouping_ladder_for_gnudb(
+                app,
+                tx,
+                cue_infos.clone(),
+                active_audio_path,
+            ) {
+                return;
+            }
+        } else {
+            launch_multi_single_image_gnudb(cue_infos, app, tx);
+            return;
+        }
     }
     if let Some(info) = cue_infos.into_iter().next() {
         launch_single_image_gnudb(info, app, tx);
@@ -1706,7 +1784,7 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
 /// contributes its own disc ID from its own track boundaries, and successful
 /// reads are merged into the existing multi-disc review surface. No synthetic
 /// joined TOC is fabricated.
-fn launch_multi_single_image_gnudb(
+pub(super) fn launch_multi_single_image_gnudb(
     infos: Vec<super::cue_parser::SingleImageInfo>,
     app: &mut AppState,
     tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
@@ -1762,7 +1840,7 @@ fn launch_multi_single_image_gnudb(
     });
 }
 
-fn launch_single_image_gnudb(
+pub(super) fn launch_single_image_gnudb(
     info: super::cue_parser::SingleImageInfo,
     app: &mut AppState,
     tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,

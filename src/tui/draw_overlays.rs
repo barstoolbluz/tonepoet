@@ -552,7 +552,8 @@ fn confirmation_footer_hint_bg(
     match hint.key {
         "y" => match action {
             super::app::ConfirmAction::ArchiveDiscardStartupRecovery { .. }
-            | super::app::ConfirmAction::ArchiveDiscardStaging { .. } => theme.destructive,
+            | super::app::ConfirmAction::ArchiveDiscardStaging { .. }
+            | super::app::ConfirmAction::DeleteEmbeddedCueSheet { .. } => theme.destructive,
             _ => theme.green,
         },
         "d" => theme.destructive,
