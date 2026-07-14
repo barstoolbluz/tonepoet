@@ -190,6 +190,8 @@ src/convert/queue_expansion.rs, src/convert/mod.rs;
 src/tui/context_menu.rs, src/tui/browse.rs, src/tui/keybindings.rs,
 src/tui/command.rs, src/tui/event_loop.rs, src/tui/app.rs,
 src/tui/message.rs, src/tui/probe.rs, src/tui/cue_parser.rs,
+src/convert/cue_parser.rs (the queue-side parser analyze_cue_for_queue
+uses — TWO distinct cue parsers exist),
 src/tui/gnudb.rs, src/tui/accuraterip.rs, src/tui/musicbrainz.rs,
 src/tui/cue_generate.rs, src/tui/sacd.rs, src/tui/dvda/ (directory),
 src/tui/dvda_metabase.rs, src/tui/disc_browser_actions.rs, src/tui/mod.rs;
