@@ -1650,6 +1650,14 @@ fn open_output_options_text_edit(app: &mut AppState) {
 }
 
 fn open_conversion_actions_wizard(app: &mut AppState) {
+    // Defense-in-depth for the feature gate: every UI entry point (pane row
+    // hitbox, Enter on the Actions field, :actions) funnels through here, so
+    // gate the choke point too — stale focus state or a future caller cannot
+    // bypass it.
+    if !app.conversion_actions_ui_enabled() {
+        app.set_status(super::command::CONVERSION_ACTIONS_GATED_STATUS);
+        return;
+    }
     let state = super::conversion_actions_ui::ConversionActionsWizardState::new(
         app.convert.output_options.actions.clone(),
     );

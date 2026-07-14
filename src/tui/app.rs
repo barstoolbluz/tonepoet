@@ -2514,7 +2514,7 @@ impl OutputOptionsField {
         }
         if area_height >= 20 && show_actions {
             &Self::MAXIMIZED_FIELDS
-        } else if area_height >= 20 || area_height >= 17 {
+        } else if area_height >= 17 {
             &Self::MAXIMIZED_FIELDS_WITHOUT_ACTIONS
         } else if area_height >= 12 {
             &Self::MAXIMIZED_FIELDS_WITHOUT_CONVERSION_OR_ACTIONS
