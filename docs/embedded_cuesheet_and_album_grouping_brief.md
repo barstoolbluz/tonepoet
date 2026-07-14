@@ -168,7 +168,7 @@ src/tui/event_loop.rs, src/tui/musicbrainz.rs, src/tui/cue_parser.rs,
 src/tui/gnudb.rs, src/tui/accuraterip.rs, src/tui/app.rs,
 src/tui/message.rs, src/tui/probe.rs, src/tui/context_menu.rs,
 src/tui/draw_overlays.rs, src/tui/inline_edit.rs, src/tui/browse.rs,
-src/tui/mod.rs; src/convert/classify.rs, src/convert/formats.rs,
+src/tui/external_editor.rs, src/tui/mod.rs; src/convert/classify.rs, src/convert/formats.rs,
 src/convert/queue_expansion.rs, src/convert/source_admission.rs,
 src/convert/cue_parser.rs, src/convert/mod.rs. Reference-only:
 src/convert/pipeline/mod.rs.
