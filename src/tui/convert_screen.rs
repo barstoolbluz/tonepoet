@@ -109,7 +109,10 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
             app.convert.source.mode.total_source_size(),
             &app.convert.format,
             output_focused,
-            app.convert.is_maximized(ConvertFocus::OutputOptions), theme);
+            app.convert.is_maximized(ConvertFocus::OutputOptions),
+            app.conversion_actions_ui_enabled(),
+            theme,
+        );
     }
 
     draw_convert_action_bar(f, chunks[9], &mut app.button_map, theme);
@@ -395,11 +398,13 @@ fn register_output_options_buttons(app: &mut AppState, area: Rect) {
     // fallbacks, hidden render side channels, or pane-generic synthetic child
     // targets. Register after the title-bar target so concrete controls win
     // ButtonRenderMap overlap resolution.
+    let show_actions = app.conversion_actions_ui_enabled();
     register_output_options_mouse_targets(
         &mut app.button_map,
         area,
         &app.convert.output_options,
         maximized,
+        show_actions,
     );
 }
 
@@ -612,10 +617,45 @@ mod output_options_registration_tests {
     use ratatui::Terminal;
 
     #[test]
+    fn gated_convert_screen_hides_actions_row_and_hitbox() {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        // Default config: the conversion-actions feature gate is OFF.
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        assert!(!app.conversion_actions_ui_enabled());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::OutputOptions;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::OutputOptions);
+        app.button_map.clear();
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
+            .expect("draw convert screen");
+
+        assert!(
+            app.button_map
+                .find_button_rect(&super::TuiButton::ActionsPipelineField)
+                .is_none(),
+            "gated-off Actions row must not register a hitbox"
+        );
+        let buffer_text: String = (0..40)
+            .map(|y| (0..100).map(|x| terminal.backend().buffer().get(x, y).symbol().to_string()).collect::<String>())
+            .collect();
+        assert!(
+            !buffer_text.contains("   Actions"),
+            "gated-off Actions section must not render"
+        );
+    }
+
+    #[test]
     fn draw_convert_screen_registers_rendered_output_options_actions_row() {
         let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
             .expect("default theme");
-        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut config = TonepoetConfig::default();
+        config.ui.show_conversion_actions = true;
+        let mut app = AppState::new_for_test(config);
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::OutputOptions;
         app.convert.output_options.field_focus = OutputOptionsField::Actions;

@@ -36,6 +36,7 @@ pub fn register_output_options_mouse_targets(
     area: Rect,
     opts: &OutputOptionsState,
     maximized: bool,
+    show_actions: bool,
 ) {
     if area.height < 5 || area.width < 30 {
         return;
@@ -110,7 +111,7 @@ pub fn register_output_options_mouse_targets(
         );
     }
 
-    if maximized && area.height >= 20 && row_visible(OUTPUT_OPTIONS_ACTIONS_ROW) {
+    if show_actions && maximized && area.height >= 20 && row_visible(OUTPUT_OPTIONS_ACTIONS_ROW) {
         buttons.record_button(TuiButton::ActionsPipelineField, row_rect(OUTPUT_OPTIONS_ACTIONS_ROW));
     }
 }
@@ -197,6 +198,7 @@ pub fn draw_output_options_pane_with_mouse_targets(
     format: &FormatState,
     focused: bool,
     maximized: bool,
+    show_actions: bool,
     buttons: &mut ButtonRenderMap,
     theme: super::theme::Theme,
 ) {
@@ -209,9 +211,10 @@ pub fn draw_output_options_pane_with_mouse_targets(
         format,
         focused,
         maximized,
+        show_actions,
         theme,
     );
-    register_output_options_mouse_targets(buttons, area, opts, maximized);
+    register_output_options_mouse_targets(buttons, area, opts, maximized, show_actions);
 }
 
 
@@ -226,6 +229,7 @@ pub fn draw_output_options_pane(
     format: &FormatState,
     focused: bool,
     maximized: bool,
+    show_actions: bool,
     theme: super::theme::Theme,
 ) {
     if area.height < 5 || area.width < 30 {
@@ -452,7 +456,7 @@ pub fn draw_output_options_pane(
         ));
     }
 
-    if maximized && area.height >= 20 {
+    if show_actions && maximized && area.height >= 20 {
         lines.push(bordered_line(border_color, w, vec![], theme));
         lines.push(bordered_line(
             border_color,
@@ -857,6 +861,7 @@ mod output_options_companion_render_tests {
                     &format,
                     true,
                     true,
+                    true,
                     theme,
                 )
             })
@@ -879,6 +884,7 @@ mod output_options_companion_render_tests {
             &mut buttons,
             Rect::new(10, 4, 80, 20),
             &opts,
+            true,
             true,
         );
 
@@ -925,6 +931,7 @@ mod output_options_companion_render_tests {
                     &format,
                     true,
                     true,
+                    true,
                     &mut buttons,
                     theme,
                 );
@@ -945,7 +952,7 @@ mod output_options_companion_render_tests {
         let mut buttons = ButtonRenderMap::new();
         let area = Rect::new(10, 4, 80, 20);
 
-        register_output_options_mouse_targets(&mut buttons, area, &opts, true);
+        register_output_options_mouse_targets(&mut buttons, area, &opts, true, true);
 
         let folder_y = area.y + 2;
         let filename_y = area.y + 3;
@@ -980,7 +987,7 @@ mod output_options_companion_render_tests {
         let mut buttons = ButtonRenderMap::new();
         let area = Rect::new(10, 4, 80, 20);
 
-        register_output_options_mouse_targets(&mut buttons, area, &opts, true);
+        register_output_options_mouse_targets(&mut buttons, area, &opts, true, true);
 
         assert!(
             buttons
@@ -1007,6 +1014,7 @@ mod output_options_companion_render_tests {
             Rect::new(10, 4, 80, 20),
             &opts,
             false,
+            true,
         );
 
         assert_eq!(
@@ -1047,6 +1055,7 @@ mod output_options_companion_render_tests {
                     None,
                     0,
                     &format,
+                    true,
                     true,
                     true,
                     theme,

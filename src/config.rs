@@ -259,6 +259,12 @@ pub struct UiConfig {
     /// false (default) = auto-clear; true = persist until manually cleared.
     #[serde(default)]
     pub compare_keep_reference: bool,
+    /// Feature gate for the conversion-actions UI (Output Options row,
+    /// :actions / :actions-run / :actions-identity-import). Default OFF while
+    /// the feature hardens; config-defined pipelines still apply to
+    /// conversions exactly as they do for the CLI.
+    #[serde(default)]
+    pub show_conversion_actions: bool,
     /// Runtime-selectable TUI theme slug. Unknown values fall back to Tokyo Night.
     #[serde(default = "crate::tui::theme::default_theme_name")]
     pub theme: String,
@@ -276,6 +282,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             default_screen: default_initial_screen(),
+            show_conversion_actions: false,
             convert_default_action: default_convert_action(),
             compare_keep_reference: false,
             theme: crate::tui::theme::default_theme_name(),
@@ -819,6 +826,9 @@ append_lineage_to_comment = false
 default_screen = "browse"
 convert_default_action = "start"
 compare_keep_reference = false
+# Feature gate for the conversion-actions UI (Output Options row + :actions
+# commands) while the feature hardens. Config-defined pipelines still apply.
+show_conversion_actions = false
 "#,
         )
         .expect("config parses without theme");
@@ -846,6 +856,9 @@ append_lineage_to_comment = false
 default_screen = "browse"
 convert_default_action = "start"
 compare_keep_reference = false
+# Feature gate for the conversion-actions UI (Output Options row + :actions
+# commands) while the feature hardens. Config-defined pipelines still apply.
+show_conversion_actions = false
 "#,
         )
         .expect("config parses without performance");

@@ -575,7 +575,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             .convert
             .output_options
             .field_focus
-            .clamp_for_area(maximized, area_height);
+            .clamp_for_area(maximized, area_height, app.conversion_actions_ui_enabled());
     }
 
     match (key.code, key.modifiers) {
@@ -590,7 +590,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 .convert
                 .output_options
                 .field_focus
-                .next_for_area(maximized, area_height);
+                .next_for_area(maximized, area_height, app.conversion_actions_ui_enabled());
         }
         (KeyCode::BackTab, KeyModifiers::SHIFT)
             if app.convert.focus == ConvertFocus::OutputOptions
@@ -601,7 +601,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 .convert
                 .output_options
                 .field_focus
-                .prev_for_area(maximized, area_height);
+                .prev_for_area(maximized, area_height, app.conversion_actions_ui_enabled());
         }
         (KeyCode::Tab, KeyModifiers::NONE) => {
             app.convert.focus = app.convert.focus.next();
@@ -773,7 +773,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 .convert
                 .output_options
                 .field_focus
-                .prev_for_area(maximized, area_height);
+                .prev_for_area(maximized, area_height, app.conversion_actions_ui_enabled());
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
@@ -784,7 +784,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 .convert
                 .output_options
                 .field_focus
-                .next_for_area(maximized, area_height);
+                .next_for_area(maximized, area_height, app.conversion_actions_ui_enabled());
         }
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::OutputOptions
@@ -943,7 +943,7 @@ fn finish_hidden_inline_edits(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
         && !app.convert.is_collapsed(ConvertFocus::OutputOptions);
     if output_visible {
         let (maximized, area_height) = output_options_render_layout(app);
-        let visible_fields = OutputOptionsField::visible_fields_for_area(maximized, area_height);
+        let visible_fields = OutputOptionsField::visible_fields_for_area(maximized, area_height, app.conversion_actions_ui_enabled());
         if let Some(editing) = app.convert.output_options.editing {
             if !visible_fields.contains(&editing) {
                 // Text-input blur policy is commit-on-blur. A resize can make a
@@ -957,7 +957,7 @@ fn finish_hidden_inline_edits(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
             .convert
             .output_options
             .field_focus
-            .clamp_for_area(maximized, area_height);
+            .clamp_for_area(maximized, area_height, app.conversion_actions_ui_enabled());
     } else if app.convert.output_options.editing.is_some() {
         commit_output_options_inline_edit(app);
     }
@@ -1623,7 +1623,7 @@ fn open_output_options_text_edit(app: &mut AppState) {
         .convert
         .output_options
         .field_focus
-        .clamp_for_area(maximized, area_height);
+        .clamp_for_area(maximized, area_height, app.conversion_actions_ui_enabled());
     app.convert.output_options.field_focus = field;
 
     match field {
@@ -7864,7 +7864,7 @@ mod conversion_actions_default_commit_tests {
             );
         })
         .expect("draw tall convert screen");
-        assert!(OutputOptionsField::visible_fields_for_area(true, app.button_map.output_options_layout().unwrap().1)
+        assert!(OutputOptionsField::visible_fields_for_area(true, app.button_map.output_options_layout().unwrap().1, true)
             .contains(&OutputOptionsField::ExcludeFiles));
 
         begin_output_options_inline_edit(&mut app, OutputOptionsField::ExcludeFiles, None);
@@ -7885,7 +7885,7 @@ mod conversion_actions_default_commit_tests {
         })
         .expect("draw short convert screen");
         assert_eq!(app.button_map.output_options_layout(), Some((true, 11)));
-        assert!(!OutputOptionsField::visible_fields_for_area(true, 11)
+        assert!(!OutputOptionsField::visible_fields_for_area(true, 11, true)
             .contains(&OutputOptionsField::ExcludeFiles));
 
         let (tx, _rx) = mpsc::channel(1);
@@ -7912,7 +7912,9 @@ mod conversion_actions_default_commit_tests {
     fn rendered_output_options_actions_row_click_opens_wizard() {
         let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
             .expect("default theme");
-        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut config = TonepoetConfig::default();
+        config.ui.show_conversion_actions = true;
+        let mut app = AppState::new_for_test(config);
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::OutputOptions;
         app.convert.output_options.field_focus = OutputOptionsField::Actions;

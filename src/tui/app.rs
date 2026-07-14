@@ -2504,13 +2504,17 @@ impl OutputOptionsField {
     /// Fields whose rows are actually rendered for a maximized Output Options
     /// pane of the given height. Keep these thresholds in sync with
     /// draw_output_options.rs; the Actions row exists only at height >= 20.
-    pub fn visible_fields_for_area(maximized: bool, area_height: u16) -> &'static [Self] {
+    pub fn visible_fields_for_area(
+        maximized: bool,
+        area_height: u16,
+        show_actions: bool,
+    ) -> &'static [Self] {
         if !maximized {
             return &Self::COLLAPSED_FIELDS;
         }
-        if area_height >= 20 {
+        if area_height >= 20 && show_actions {
             &Self::MAXIMIZED_FIELDS
-        } else if area_height >= 17 {
+        } else if area_height >= 20 || area_height >= 17 {
             &Self::MAXIMIZED_FIELDS_WITHOUT_ACTIONS
         } else if area_height >= 12 {
             &Self::MAXIMIZED_FIELDS_WITHOUT_CONVERSION_OR_ACTIONS
@@ -2541,14 +2545,14 @@ impl OutputOptionsField {
         fields[(idx + fields.len() - 1) % fields.len()]
     }
 
-    pub fn next_for_area(self, maximized: bool, area_height: u16) -> Self {
-        let fields = Self::visible_fields_for_area(maximized, area_height);
+    pub fn next_for_area(self, maximized: bool, area_height: u16, show_actions: bool) -> Self {
+        let fields = Self::visible_fields_for_area(maximized, area_height, show_actions);
         let idx = fields.iter().position(|field| *field == self).unwrap_or(0);
         fields[(idx + 1) % fields.len()]
     }
 
-    pub fn prev_for_area(self, maximized: bool, area_height: u16) -> Self {
-        let fields = Self::visible_fields_for_area(maximized, area_height);
+    pub fn prev_for_area(self, maximized: bool, area_height: u16, show_actions: bool) -> Self {
+        let fields = Self::visible_fields_for_area(maximized, area_height, show_actions);
         let idx = fields.iter().position(|field| *field == self).unwrap_or(0);
         fields[(idx + fields.len() - 1) % fields.len()]
     }
@@ -2561,8 +2565,8 @@ impl OutputOptionsField {
         }
     }
 
-    pub fn clamp_for_area(self, maximized: bool, area_height: u16) -> Self {
-        if Self::visible_fields_for_area(maximized, area_height).contains(&self) {
+    pub fn clamp_for_area(self, maximized: bool, area_height: u16, show_actions: bool) -> Self {
+        if Self::visible_fields_for_area(maximized, area_height, show_actions).contains(&self) {
             self
         } else {
             Self::MergeMode
@@ -3947,17 +3951,23 @@ mod output_options_companion_projection_tests {
     fn output_options_field_cycle_matches_rows_rendered_for_small_maximized_panes() {
         use super::OutputOptionsField::*;
 
-        assert_eq!(ExcludeFiles.next_for_area(true, 13), DestPath);
-        assert_eq!(DestPath.prev_for_area(true, 13), ExcludeFiles);
-        assert_eq!(WriteLog.clamp_for_area(true, 13), MergeMode);
-        assert_eq!(Actions.clamp_for_area(true, 13), MergeMode);
+        assert_eq!(ExcludeFiles.next_for_area(true, 13, true), DestPath);
+        assert_eq!(DestPath.prev_for_area(true, 13, true), ExcludeFiles);
+        assert_eq!(WriteLog.clamp_for_area(true, 13, true), MergeMode);
+        assert_eq!(Actions.clamp_for_area(true, 13, true), MergeMode);
 
-        assert_eq!(WriteLog.next_for_area(true, 17), DestPath);
-        assert_eq!(DestPath.prev_for_area(true, 17), WriteLog);
-        assert_eq!(Actions.clamp_for_area(true, 17), MergeMode);
+        assert_eq!(WriteLog.next_for_area(true, 17, true), DestPath);
+        assert_eq!(DestPath.prev_for_area(true, 17, true), WriteLog);
+        assert_eq!(Actions.clamp_for_area(true, 17, true), MergeMode);
 
-        assert_eq!(WriteLog.next_for_area(true, 20), Actions);
-        assert_eq!(Actions.next_for_area(true, 20), DestPath);
+        assert_eq!(WriteLog.next_for_area(true, 20, true), Actions);
+        assert_eq!(Actions.next_for_area(true, 20, true), DestPath);
+
+        // Feature gate OFF: the Actions row never joins the cycle, even at
+        // full height, and stale Actions focus clamps away.
+        assert_eq!(WriteLog.next_for_area(true, 20, false), DestPath);
+        assert_eq!(Actions.clamp_for_area(true, 20, false), MergeMode);
+        assert_eq!(DestPath.prev_for_area(true, 20, false), WriteLog);
     }
 }
 
@@ -9759,6 +9769,12 @@ impl AppState {
                 .collect();
             let _ = self.db.sync_queue(&items);
         }
+    }
+
+    /// Feature gate for the conversion-actions UI surfaces (Output Options
+    /// row, :actions family). Config-defined pipelines still run.
+    pub fn conversion_actions_ui_enabled(&self) -> bool {
+        self.config.ui.show_conversion_actions
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {

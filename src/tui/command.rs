@@ -1620,6 +1620,11 @@ fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
     }
 }
 
+/// Status shown when a conversion-actions command is used while the feature
+/// gate (`[ui] show_conversion_actions`) is off.
+pub(super) const CONVERSION_ACTIONS_GATED_STATUS: &str =
+    "conversion actions are gated off — set show_conversion_actions = true under [ui] in config.toml";
+
 pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMessage>) {
     match cmd {
         Command::Quit => {
@@ -3575,6 +3580,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::Actions => {
+            if !app.conversion_actions_ui_enabled() {
+                app.set_status(CONVERSION_ACTIONS_GATED_STATUS);
+                return;
+            }
             let state = super::conversion_actions_ui::ConversionActionsWizardState::new(
                 app.convert.output_options.actions.clone(),
             );
@@ -3582,6 +3591,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.set_status("Editing conversion actions");
         }
         Command::ActionsRun(path) => {
+            if !app.conversion_actions_ui_enabled() {
+                app.set_status(CONVERSION_ACTIONS_GATED_STATUS);
+                return;
+            }
             let state = super::conversion_actions_ui::start_actions_run_preparation(
                 app.browse.current_dir.clone(),
                 app.convert.output_options.actions.clone(),
@@ -3592,6 +3605,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.set_status("Preparing exact action preview… Esc cancels");
         }
         Command::ActionsIdentityImport(path) => {
+            if !app.conversion_actions_ui_enabled() {
+                app.set_status(CONVERSION_ACTIONS_GATED_STATUS);
+                return;
+            }
             if app.current_screen != AppScreen::Browse {
                 app.set_status(":actions-identity-import only works on the browse screen");
             } else {
