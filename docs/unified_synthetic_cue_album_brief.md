@@ -1,7 +1,7 @@
 # Brief: unified synthetic cue album — one view, one embedded sheet, one output
 
 Date: 2026-07-14. For a fresh reasoning-model session. Baseline: branch
-`working` at 59f45b1 (unpushed local; the bundle IS the baseline), suite
+`working` at 59f45b1 (pushed), suite
 3253/0, zero cold-build warnings. The sandbox cannot compile — favor
 mechanically verifiable changes; the applier compiles, runs the suite, and
 validates on the real tree.
