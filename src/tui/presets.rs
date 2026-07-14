@@ -581,6 +581,9 @@ fn format_key(format: AudioFormat) -> &'static str {
         AudioFormat::Dts => "dts",
         AudioFormat::Ac3 => "ac3",
         AudioFormat::Ape => "ape",
+        AudioFormat::Shorten => "shn",
+        AudioFormat::Ogg => "ogg",
+        AudioFormat::Tta => "tta",
         AudioFormat::Lpcm => "lpcm",
     }
 }
@@ -604,6 +607,9 @@ fn parse_format(s: &str) -> Option<AudioFormat> {
         "dts" => Some(AudioFormat::Dts),
         "ac3" | "ac-3" => Some(AudioFormat::Ac3),
         "ape" => Some(AudioFormat::Ape),
+        "shn" => Some(AudioFormat::Shorten),
+        "ogg" => Some(AudioFormat::Ogg),
+        "tta" => Some(AudioFormat::Tta),
         "lpcm" | "pcm" => Some(AudioFormat::Lpcm),
         _ => None,
     }

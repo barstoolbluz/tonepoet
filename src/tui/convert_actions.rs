@@ -202,7 +202,13 @@ pub fn try_pills_to_options(
             compression_level: 0,
         },
         // Input-only / decode-only formats: fall back to FLAC defaults
-        AudioFormat::Dts | AudioFormat::Ac3 | AudioFormat::Ape | AudioFormat::Lpcm => {
+        AudioFormat::Dts
+        | AudioFormat::Ac3
+        | AudioFormat::Ape
+        | AudioFormat::Shorten
+        | AudioFormat::Ogg
+        | AudioFormat::Tta
+        | AudioFormat::Lpcm => {
             QualitySettings::Flac { compression_level: 8 }
         }
     };
@@ -475,7 +481,12 @@ fn map_audio_format(format: AudioFormat, container_ext: Option<&str>) -> pipelin
         (AudioFormat::Dff, _) => pipeline_enums::AudioFormat::Dff,
         (AudioFormat::Dts, _) => pipeline_enums::AudioFormat::Dts,
         (AudioFormat::Ac3, _) => pipeline_enums::AudioFormat::Ac3,
-        (AudioFormat::Ape, _) => pipeline_enums::AudioFormat::Flac, // Ape is decode-only; target FLAC
+        // Decode-only source formats are never output targets; default to FLAC
+        // like the pre-existing Ape arm.
+        (AudioFormat::Ape, _)
+        | (AudioFormat::Shorten, _)
+        | (AudioFormat::Ogg, _)
+        | (AudioFormat::Tta, _) => pipeline_enums::AudioFormat::Flac,
         (AudioFormat::Lpcm, Some("aiff")) => pipeline_enums::AudioFormat::Aiff,
         (AudioFormat::Lpcm, _) => pipeline_enums::AudioFormat::Wav,
     }

@@ -690,27 +690,32 @@ pub fn build_multi_disc_review_state_from_cue(
     }
 }
 
-/// Find a .cue file in a directory. Returns the first one found
-/// (sorted alphabetically for determinism).
-pub fn find_cue_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
-    let mut cues: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
+/// Find all .cue files in a directory in deterministic order.
+pub fn find_cues_in_dir(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut cues: Vec<PathBuf> = entries
         .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            if p.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("cue"))
+        .filter_map(|entry| {
+            let path = entry.path();
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("cue"))
                 .unwrap_or(false)
-            {
-                Some(p)
-            } else {
-                None
-            }
+                .then_some(path)
         })
         .collect();
     cues.sort();
-    cues.into_iter().next()
+    cues
+}
+
+/// Find a .cue file in a directory. Compatibility wrapper for legacy
+/// single-CUE call sites; new browse/metadata flows should use
+/// `find_cues_in_dir` so multi-part albums do not collapse to side A.
+pub fn find_cue_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    find_cues_in_dir(dir).into_iter().next()
 }
 
 /// Collect track durations for audio files. Checks the asynchronous browse

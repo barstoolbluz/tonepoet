@@ -44,6 +44,26 @@ pub enum EntryKind {
     OtherFile,
 }
 
+impl EntryKind {
+    /// True for fully classified disc-image or disc-directory source kinds.
+    ///
+    /// Plain `.iso` files initially enter Browse as `Archive` until the cheap
+    /// disc-image probe promotes them. Callers that deliberately probe an ISO
+    /// for an explicit user action should run the effective-kind helper at that
+    /// action boundary, then use this predicate on the resulting kind.
+    pub fn is_disc_source(&self) -> bool {
+        matches!(
+            self,
+            Self::SacdIso
+                | Self::DvdAudioIso
+                | Self::DvdAudioDir
+                | Self::DvdVideoIso
+                | Self::DvdVideoDir
+                | Self::BlurayIso
+                | Self::BlurayDir
+        )
+    }
+}
 
 /// Return true when `path` names a CUE sheet.
 pub fn is_cue_sheet_path(path: &Path) -> bool {
@@ -71,11 +91,20 @@ pub fn classify_file(path: &Path) -> EntryKind {
 
     match ext.as_deref() {
         Some("flac") => EntryKind::AudioFile(AudioFormat::Flac),
-        Some("wav") | Some("wave") => EntryKind::AudioFile(AudioFormat::Wav),
+        Some("wav") | Some("wave") | Some("w64") | Some("rf64") => {
+            EntryKind::AudioFile(AudioFormat::Wav)
+        }
         Some("aiff") | Some("aif") | Some("aifc") => EntryKind::AudioFile(AudioFormat::Aiff),
         Some("wv") => EntryKind::AudioFile(AudioFormat::WavPack),
+        Some("ape") => EntryKind::AudioFile(AudioFormat::Ape),
+        Some("dsf") => EntryKind::AudioFile(AudioFormat::Dsf),
+        Some("dff") => EntryKind::AudioFile(AudioFormat::Dff),
+        Some("shn") => EntryKind::AudioFile(AudioFormat::Shorten),
+        Some("ogg") | Some("oga") => EntryKind::AudioFile(AudioFormat::Ogg),
+        Some("tta") => EntryKind::AudioFile(AudioFormat::Tta),
         Some("mp3") => EntryKind::AudioFile(AudioFormat::Mp3),
         Some("m4a") | Some("mp4") | Some("aac") => EntryKind::AudioFile(AudioFormat::Aac),
+        Some("alac") => EntryKind::AudioFile(AudioFormat::Alac),
         Some("opus") => EntryKind::AudioFile(AudioFormat::Opus),
         Some("7z") | Some("zip") | Some("rar") | Some("tar") | Some("iso") | Some("cab")
         | Some("dmg") | Some("tgz") | Some("tbz2") | Some("txz") => EntryKind::Archive,
@@ -112,10 +141,20 @@ mod tests {
     fn classify_file_maps_supported_audio_extensions_case_insensitively() {
         assert_eq!(classify_file(Path::new("track.FLAC")), EntryKind::AudioFile(AudioFormat::Flac));
         assert_eq!(classify_file(Path::new("track.wave")), EntryKind::AudioFile(AudioFormat::Wav));
+        assert_eq!(classify_file(Path::new("track.W64")), EntryKind::AudioFile(AudioFormat::Wav));
+        assert_eq!(classify_file(Path::new("track.rf64")), EntryKind::AudioFile(AudioFormat::Wav));
         assert_eq!(classify_file(Path::new("track.AIFC")), EntryKind::AudioFile(AudioFormat::Aiff));
         assert_eq!(classify_file(Path::new("track.wv")), EntryKind::AudioFile(AudioFormat::WavPack));
+        assert_eq!(classify_file(Path::new("track.APE")), EntryKind::AudioFile(AudioFormat::Ape));
+        assert_eq!(classify_file(Path::new("track.dsf")), EntryKind::AudioFile(AudioFormat::Dsf));
+        assert_eq!(classify_file(Path::new("track.DFF")), EntryKind::AudioFile(AudioFormat::Dff));
+        assert_eq!(classify_file(Path::new("track.SHN")), EntryKind::AudioFile(AudioFormat::Shorten));
+        assert_eq!(classify_file(Path::new("track.ogg")), EntryKind::AudioFile(AudioFormat::Ogg));
+        assert_eq!(classify_file(Path::new("track.OGA")), EntryKind::AudioFile(AudioFormat::Ogg));
+        assert_eq!(classify_file(Path::new("track.TTA")), EntryKind::AudioFile(AudioFormat::Tta));
         assert_eq!(classify_file(Path::new("track.MP3")), EntryKind::AudioFile(AudioFormat::Mp3));
         assert_eq!(classify_file(Path::new("track.m4a")), EntryKind::AudioFile(AudioFormat::Aac));
+        assert_eq!(classify_file(Path::new("track.ALAC")), EntryKind::AudioFile(AudioFormat::Alac));
         assert_eq!(classify_file(Path::new("track.OPUS")), EntryKind::AudioFile(AudioFormat::Opus));
     }
 

@@ -172,7 +172,7 @@ impl BoundedScoreSearchResults {
 }
 
 use crate::convert::formats::AudioFormat;
-pub use crate::convert::classify::{EntryKind, is_tar_compound_pub};
+pub use crate::convert::classify::EntryKind;
 pub(super) use crate::convert::classify::{classify_file, is_cue_sheet_path};
 pub use crate::convert::queue_expansion::{
     count_audio_files_bounded, expand_paths_to_audio, expand_paths_to_audio_with_metadata,
@@ -1408,6 +1408,9 @@ impl FormatFilter {
             Self::Only(AudioFormat::Dts),
             Self::Only(AudioFormat::Ac3),
             Self::Only(AudioFormat::Ape),
+            Self::Only(AudioFormat::Shorten),
+            Self::Only(AudioFormat::Ogg),
+            Self::Only(AudioFormat::Tta),
             Self::Only(AudioFormat::Lpcm),
         ]
     }
@@ -1464,6 +1467,9 @@ impl FormatFilter {
             "dts" => Some(Self::Only(AudioFormat::Dts)),
             "ac3" => Some(Self::Only(AudioFormat::Ac3)),
             "ape" => Some(Self::Only(AudioFormat::Ape)),
+            "shn" | "shorten" => Some(Self::Only(AudioFormat::Shorten)),
+            "ogg" | "oga" | "vorbis" => Some(Self::Only(AudioFormat::Ogg)),
+            "tta" | "trueaudio" => Some(Self::Only(AudioFormat::Tta)),
             "lpcm" => Some(Self::Only(AudioFormat::Lpcm)),
             _ => None,
         }
@@ -1869,16 +1875,7 @@ impl BrowseEntry {
     }
 
     pub fn is_disc_source(&self) -> bool {
-        matches!(
-            self.kind,
-            EntryKind::SacdIso
-                | EntryKind::DvdAudioIso
-                | EntryKind::DvdAudioDir
-                | EntryKind::DvdVideoIso
-                | EntryKind::DvdVideoDir
-                | EntryKind::BlurayIso
-                | EntryKind::BlurayDir
-        )
+        self.kind.is_disc_source()
     }
 
     /// Probe-pipeline gate: entries this returns `true` for produce
@@ -9214,15 +9211,18 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
         EntryKind::AudioFile(AudioFormat::Dts) => 20,
         EntryKind::AudioFile(AudioFormat::Ac3) => 21,
         EntryKind::AudioFile(AudioFormat::Ape) => 22,
-        EntryKind::AudioFile(AudioFormat::Lpcm) => 23,
+        EntryKind::AudioFile(AudioFormat::Shorten) => 23,
+        EntryKind::AudioFile(AudioFormat::Ogg) => 24,
+        EntryKind::AudioFile(AudioFormat::Tta) => 25,
+        EntryKind::AudioFile(AudioFormat::Lpcm) => 26,
         EntryKind::SacdIso
         | EntryKind::DvdAudioIso
         | EntryKind::DvdAudioDir
         | EntryKind::DvdVideoIso
         | EntryKind::DvdVideoDir
         | EntryKind::BlurayIso
-        | EntryKind::BlurayDir => 25,
-        EntryKind::Archive => 25,
+        | EntryKind::BlurayDir => 27,
+        EntryKind::Archive => 27,
         EntryKind::OtherFile => 30,
     }
 }

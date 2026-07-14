@@ -4,6 +4,7 @@
 //! Reference: <http://www.accuraterip.com/driveoffsets.htm>
 //! Algorithm details: <https://hydrogenaud.io/index.php?topic=36162.0>
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 // ── Data structures ─────────────────────────────────────────────────
@@ -406,20 +407,13 @@ pub fn find_toc_offsets(dir: &Path) -> Option<Vec<u32>> {
         log::info!("AccurateRip: could not read directory {}", dir.display());
     }
 
-    // Look for .cue files with INDEX 01 timestamps.
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if ext == "cue" {
-                if let Some(offsets) = parse_cue_index_offsets(&path) {
-                    return Some(offsets);
-                }
-            }
+    // Look for .cue files with INDEX 01 timestamps. Try every CUE
+    // deterministically so folders containing side/disc CUEs do not silently
+    // collapse to whichever file the filesystem yields first. Each CUE remains
+    // an independent TOC candidate; we do not fabricate a joined album TOC.
+    for path in find_cue_files(dir) {
+        if let Some(offsets) = parse_cue_index_offsets(&path) {
+            return Some(offsets);
         }
     }
 
@@ -525,9 +519,31 @@ pub fn find_eac_log(dir: &Path) -> Option<std::path::PathBuf> {
     find_first_with_ext(dir, "log")
 }
 
-/// Find the first `.cue` file in a directory.
+/// Find all `.cue` files in a directory in deterministic order.
+pub fn find_cue_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut cues: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("cue"))
+                .unwrap_or(false)
+                .then_some(path)
+        })
+        .collect();
+    cues.sort();
+    cues
+}
+
+/// Find the first `.cue` file in a directory. Compatibility wrapper for
+/// single-CUE call sites; new Browse flows should use `find_cue_files`.
 pub fn find_cue_file(dir: &Path) -> Option<std::path::PathBuf> {
-    find_first_with_ext(dir, "cue")
+    find_cue_files(dir).into_iter().next()
 }
 
 fn find_first_with_ext(dir: &Path, ext: &str) -> Option<std::path::PathBuf> {
@@ -696,29 +712,110 @@ fn extract_cue_filename(line: &str) -> Option<String> {
 // parse_cue_timestamp is in cue_parser.rs
 use super::cue_parser::parse_cue_timestamp;
 
-/// Resolve a CUE FILE reference to an actual file path.
+/// Detailed result for resolving a CUE `FILE` reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CueFileReferenceResolution {
+    /// The reference resolved to exactly one source file.
+    Resolved(PathBuf),
+    /// No source file matched either the literal reference or the supported
+    /// same-stem fallback.
+    Missing,
+    /// More than one supported source file matched a fallback lookup. The
+    /// caller must not guess which one the CUE intended.
+    Ambiguous(Vec<PathBuf>),
+}
+
+/// Resolve a CUE FILE reference to an actual file path with ambiguity
+/// reporting.
 ///
 /// CUE sheets often reference a filename with an extension that doesn't
 /// match the actual file (e.g., `album.wav` when the file is `album.flac`).
-/// Tries the original reference first, then common lossless extensions.
-pub fn resolve_cue_file_reference(dir: &Path, filename: &str) -> Option<PathBuf> {
+/// The literal reference remains authoritative when it exists. Otherwise, the
+/// fallback scans supported audio siblings by exact name and then same stem. A
+/// fallback is accepted only when it is unique; multiple same-stem candidates
+/// are reported as ambiguous rather than chosen lexicographically.
+pub fn resolve_cue_file_reference_detailed(
+    dir: &Path,
+    filename: &str,
+) -> CueFileReferenceResolution {
     let original = dir.join(filename);
-    if original.exists() {
-        return Some(original);
+    if original.is_file() {
+        return CueFileReferenceResolution::Resolved(original);
     }
 
-    // Try alternative lossless extensions.
-    let stem = Path::new(filename).file_stem()?.to_str()?;
-    for ext in &[
-        "flac", "wav", "wave", "ape", "wv", "aiff", "aif", "m4a", "alac",
-    ] {
-        let alt = dir.join(format!("{}.{}", stem, ext));
-        if alt.exists() {
-            return Some(alt);
+    let raw = Path::new(filename);
+    let fallback_dir = raw
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| dir.join(parent))
+        .unwrap_or_else(|| dir.to_path_buf());
+
+    if let Some(wanted_name) = raw.file_name().and_then(|value| value.to_str()) {
+        match unique_cue_reference_candidate(&fallback_dir, |path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case(wanted_name))
+                .unwrap_or(false)
+        }) {
+            CueFileReferenceResolution::Missing => {}
+            other => return other,
         }
     }
 
-    None
+    if let Some(wanted_stem) = raw.file_stem().and_then(|value| value.to_str()) {
+        return unique_cue_reference_candidate(&fallback_dir, |path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case(wanted_stem))
+                .unwrap_or(false)
+        });
+    }
+
+    CueFileReferenceResolution::Missing
+}
+
+/// Resolve a CUE FILE reference to an actual file path.
+///
+/// This compatibility wrapper intentionally returns `None` for ambiguous
+/// fallback matches. Treating ambiguity as absence is safer than silently
+/// pairing a CUE with the first sorted same-stem sibling. Callers that need a
+/// user-facing diagnostic should use `resolve_cue_file_reference_detailed`.
+pub fn resolve_cue_file_reference(dir: &Path, filename: &str) -> Option<PathBuf> {
+    match resolve_cue_file_reference_detailed(dir, filename) {
+        CueFileReferenceResolution::Resolved(path) => Some(path),
+        CueFileReferenceResolution::Missing | CueFileReferenceResolution::Ambiguous(_) => None,
+    }
+}
+
+fn unique_cue_reference_candidate(
+    dir: &Path,
+    matches_reference: impl Fn(&Path) -> bool,
+) -> CueFileReferenceResolution {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return CueFileReferenceResolution::Missing;
+    };
+
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && crate::convert::classify::is_audio_file_path(path)
+                && matches_reference(path)
+        })
+        .collect();
+
+    candidates.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    });
+
+    match candidates.len() {
+        0 => CueFileReferenceResolution::Missing,
+        1 => CueFileReferenceResolution::Resolved(candidates.remove(0)),
+        _ => CueFileReferenceResolution::Ambiguous(candidates),
+    }
 }
 
 // ── Database URL construction ───────────────────────────────────────
@@ -2586,5 +2683,65 @@ Track  3
         let pregaps = parse_eac_log_pregaps(f.path()).expect("parse");
         assert_eq!(pregaps.len(), 3);
         assert_eq!(pregaps[2], Some(81));
+    }
+}
+
+#[cfg(test)]
+mod cue_reference_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn cue_reference_same_stem_fallback_requires_unique_audio_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        std::fs::write(dir.join("album.flac"), b"flac").expect("flac fixture");
+        std::fs::write(dir.join("album.ape"), b"ape").expect("ape fixture");
+
+        match resolve_cue_file_reference_detailed(dir, "album.wav") {
+            CueFileReferenceResolution::Ambiguous(paths) => {
+                let names: Vec<String> = paths
+                    .iter()
+                    .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+                    .collect();
+                assert_eq!(names, vec!["album.ape".to_string(), "album.flac".to_string()]);
+            }
+            other => panic!("expected ambiguous same-stem fallback, got {other:?}"),
+        }
+
+        assert_eq!(
+            resolve_cue_file_reference(dir, "album.wav"),
+            None,
+            "compatibility wrapper must not silently choose among ambiguous candidates"
+        );
+    }
+
+    #[test]
+    fn cue_reference_exact_file_beats_ambiguous_same_stem_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        let exact = dir.join("album.wav");
+        std::fs::write(&exact, b"wav").expect("wav fixture");
+        std::fs::write(dir.join("album.flac"), b"flac").expect("flac fixture");
+        std::fs::write(dir.join("album.ape"), b"ape").expect("ape fixture");
+
+        assert_eq!(
+            resolve_cue_file_reference_detailed(dir, "album.wav"),
+            CueFileReferenceResolution::Resolved(exact.clone())
+        );
+        assert_eq!(resolve_cue_file_reference(dir, "album.wav"), Some(exact));
+    }
+
+    #[test]
+    fn cue_reference_unique_same_stem_fallback_still_resolves() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        let image = dir.join("album.tta");
+        std::fs::write(&image, b"tta").expect("tta fixture");
+
+        assert_eq!(
+            resolve_cue_file_reference_detailed(dir, "album.wav"),
+            CueFileReferenceResolution::Resolved(image.clone())
+        );
+        assert_eq!(resolve_cue_file_reference(dir, "album.wav"), Some(image));
     }
 }

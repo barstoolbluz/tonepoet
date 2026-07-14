@@ -25,11 +25,6 @@ use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 use crate::tui::cue_parser::{decode_cue_bytes_for_path, parse_cue, CueSheet};
 
-const AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "wav", "wave", "aiff", "aif", "aifc", "wv", "mp3", "m4a", "mp4", "aac", "opus", "ogg",
-    "ape", "w64", "rf64",
-];
-
 #[derive(Debug, Clone)]
 struct CueInput {
     sheet: CueSheet,
@@ -1103,7 +1098,11 @@ async fn probe_audio_image(
         secret_args: vec![],
         cwd: None,
         env: vec![],
-        timeout: Duration::from_secs(30),
+        // `-count_frames` decodes the ENTIRE image to count samples, so this
+        // probe scales with image length and codec decode speed. 30s (the
+        // header-read probes' budget) is fine for FLAC/WAV images but a full
+        // Monkey's Audio (APE) CD image legitimately takes minutes.
+        timeout: Duration::from_secs(600),
     };
 
     let output = match runner.run(cmd, cancel).await {
@@ -2619,10 +2618,10 @@ fn unquote(value: &str) -> &str {
 }
 
 fn has_audio_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .map(|value| AUDIO_EXTENSIONS.contains(&value.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    // Source-admission gate: CUE image resolution must follow the same
+    // classifier as Browse and queue expansion. Do not maintain an
+    // independent extension table here.
+    crate::convert::classify::is_audio_file_path(path)
 }
 
 fn has_extension(path: &Path, ext: &str) -> bool {

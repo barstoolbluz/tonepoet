@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::convert::classify::{classify_file, is_audio_file_path, is_cue_sheet_path, EntryKind};
+use crate::convert::source_admission::is_direct_queue_source_path;
 use crate::convert::pipeline::CueSidecarPolicy;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -324,7 +325,7 @@ impl QueueExpansionPlan {
     fn add_file(&mut self, path: PathBuf, explicit: bool) {
         if is_cue_sheet_path(&path) {
             self.add_cue_sheet(path, explicit);
-        } else if is_queueable_file(&path) {
+        } else if is_direct_queue_source_path(&path) {
             push_unique_path_with_keys(
                 &mut self.queueable_non_cue,
                 &mut self.queueable_non_cue_keys,
@@ -957,39 +958,6 @@ fn is_same_directory_key_for_queue(left_key: &Path, right_file: &Path) -> bool {
 
 
 
-/// A file is queueable for conversion if it's an audio file, a CUE sheet,
-/// a supported archive (7z), or a supported disc ISO. Generic ISOs, zips,
-/// rars, etc. that the pipeline can't handle are excluded to avoid noisy queue errors.
-fn is_queueable_file(path: &Path) -> bool {
-    if is_cue_sheet_path(path) {
-        return true;
-    }
-
-    let kind = classify_file(path);
-    match kind {
-        EntryKind::AudioFile(_) => true,
-        EntryKind::Archive => {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase());
-            match ext.as_deref() {
-                // 7z archives are always queueable (pipeline supports them).
-                Some("7z") => true,
-                // ISOs are only queueable if they're supported disc images.
-                Some("iso") => crate::convert::sacd::is_sacd_iso(path)
-                    || crate::disc::dvda_utils::is_dvda_iso(path)
-                    || crate::disc::dvdv_utils::is_dvdv_iso(path)
-                    || crate::disc::bluray_utils::is_bluray_iso(path),
-                // Other archive formats (zip, rar, tar, etc.) are not
-                // supported by the conversion pipeline.
-                _ => false,
-            }
-        }
-        _ => false,
-    }
-}
-
 /// Map queue-expansion CUE-artifact metadata onto the sidecar policy for one
 /// queued path. Shared by CLI and TUI queue construction so both front ends
 /// apply identical CUE semantics.
@@ -1445,6 +1413,39 @@ FILE "10 - Live Version.wav" WAVE
         assert!(!path_list_contains(&expanded, &side_b));
     }
 
+
+    #[test]
+    fn split_source_cue_supported_decode_only_images_queue_via_cue() {
+        for (ext, cue_type) in [
+            ("ape", "WAVE"),
+            ("dsf", "WAVE"),
+            ("dff", "WAVE"),
+            ("shn", "WAVE"),
+            ("ogg", "WAVE"),
+            ("tta", "WAVE"),
+        ] {
+            let td = tempfile::tempdir().expect("tempdir");
+            let cue = td.path().join(format!("album-{ext}.cue"));
+            let image = td.path().join(format!("album-{ext}.{ext}"));
+            std::fs::write(&image, b"not real audio").unwrap();
+            std::fs::write(
+                &cue,
+                format!(
+                    "FILE \"{}\" {cue_type}\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                    image.file_name().unwrap().to_string_lossy()
+                ),
+            )
+            .unwrap();
+
+            let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+            assert!(path_list_contains(&expanded, &cue), "{ext}");
+            assert!(!path_list_contains(&expanded, &image), "{ext}");
+
+            let metadata_view = expand_paths_to_all_audio(&[td.path().to_path_buf()]);
+            assert!(path_list_contains(&metadata_view, &image), "{ext}");
+        }
+    }
+
     #[test]
     fn expand_paths_to_audio_suppresses_unparseable_cue_and_keeps_audio() {
         let td = tempfile::tempdir().expect("tempdir");
@@ -1864,3 +1865,70 @@ mod all_audio_expansion_tests {
     }
 }
 
+
+#[cfg(test)]
+mod ogg_tta_cue_queue_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_and_folder_cue_conversion_paths_accept_ogg_and_tta_images() {
+        for ext in ["ogg", "tta"] {
+            let td = tempfile::tempdir().expect("tempdir");
+            let cue = td.path().join(format!("album.{ext}.cue"));
+            let image = td.path().join(format!("album.{ext}"));
+            std::fs::write(&image, b"placeholder audio").expect("audio fixture");
+            std::fs::write(
+                &cue,
+                format!(
+                    "FILE \"{}\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                    image.file_name().unwrap().to_string_lossy()
+                ),
+            )
+            .expect("cue fixture");
+
+            let explicit = expand_paths_to_audio_with_metadata(&[cue.clone()]);
+            assert_eq!(explicit.paths, vec![cue.clone()], "explicit .cue conversion must queue the CUE for {ext}");
+            assert!(explicit.cue_artifact_audio.is_empty(), "explicit split-source CUE must not be tagged as metadata artifact for {ext}");
+
+            let folder = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+            assert_eq!(folder.paths, vec![cue.clone()], "folder conversion must stage the CUE, not the image, for {ext}");
+            assert!(folder.cue_artifact_audio.is_empty(), "split-source CUE must not request EmbeddedOnly sidecar policy for {ext}");
+
+            let metadata = expand_paths_to_all_audio(&[td.path().to_path_buf()]);
+            assert_eq!(metadata, vec![image.clone()], "metadata surfaces must still see the backing image for {ext}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_queue_source_policy_expansion_tests {
+    use super::*;
+
+    #[test]
+    fn folder_queue_expansion_uses_shared_direct_source_policy_not_local_audio_list() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let admitted = [
+            "track.ape",
+            "track.dsf",
+            "track.dff",
+            "track.shn",
+            "track.ogg",
+            "track.tta",
+            "track.7z",
+        ];
+        for name in admitted {
+            std::fs::write(td.path().join(name), b"fixture").expect("fixture");
+        }
+        for name in ["notes.txt", "track.zip", "track.tar.gz", "track.dmg", "track.cab"] {
+            std::fs::write(td.path().join(name), b"fixture").expect("fixture");
+        }
+
+        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
+        for name in admitted {
+            assert!(path_list_contains(&expanded, &td.path().join(name)), "{name}");
+        }
+        for name in ["notes.txt", "track.zip", "track.tar.gz", "track.dmg", "track.cab"] {
+            assert!(!path_list_contains(&expanded, &td.path().join(name)), "{name}");
+        }
+    }
+}

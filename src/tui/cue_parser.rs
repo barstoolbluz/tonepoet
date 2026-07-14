@@ -114,8 +114,33 @@ fn absolutize_lossy(path: &Path) -> PathBuf {
 }
 
 pub fn detect_single_image(dir: &Path) -> Option<SingleImageInfo> {
-    let cue_path = crate::tui::gnudb::find_cue_in_dir(dir)?;
-    let sheet = parse_cue_file(&cue_path).ok()?;
+    let mut infos = detect_single_image_cues(dir);
+    if infos.len() == 1 {
+        infos.pop()
+    } else {
+        None
+    }
+}
+
+/// Detect every materializable single-image CUE in `dir`, preserving
+/// deterministic CUE-file order. This is the multi-cue album path used for
+/// split-side/split-disc folders; each CUE is paired to the FILE reference it
+/// actually declares rather than by directory sort order.
+pub fn detect_single_image_cues(dir: &Path) -> Vec<SingleImageInfo> {
+    crate::tui::gnudb::find_cues_in_dir(dir)
+        .into_iter()
+        .filter_map(|cue_path| single_image_info_for_cue(&cue_path))
+        .collect()
+}
+
+/// Detect a materializable single-image CUE from an explicit `.cue` path.
+pub fn detect_single_image_cue(cue_path: &Path) -> Option<SingleImageInfo> {
+    single_image_info_for_cue(cue_path)
+}
+
+fn single_image_info_for_cue(cue_path: &Path) -> Option<SingleImageInfo> {
+    let dir = cue_path.parent()?;
+    let sheet = parse_cue_file(cue_path).ok()?;
 
     // Must have multiple tracks with INDEX 01 timestamps.
     if sheet.tracks.len() < 2 {
@@ -163,7 +188,7 @@ pub fn detect_single_image(dir: &Path) -> Option<SingleImageInfo> {
 
     Some(SingleImageInfo {
         audio_path,
-        cue_path,
+        cue_path: cue_path.to_path_buf(),
         sheet,
         sample_rate,
         total_samples,

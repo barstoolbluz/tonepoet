@@ -9012,6 +9012,237 @@ fn metadata_editor_sidecar_for_audio(audio_path: &std::path::Path) -> Option<std
     }
 }
 
+#[derive(Debug, Clone)]
+struct MetadataCueSurface {
+    cue_path: std::path::PathBuf,
+    audio_path: std::path::PathBuf,
+    cue_text: String,
+    sheet: super::cue_parser::CueSheet,
+}
+
+fn metadata_cue_surface_key(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn resolve_metadata_cue_surface(cue_path: &std::path::Path) -> Option<MetadataCueSurface> {
+    if !crate::convert::classify::is_cue_sheet_path(cue_path) {
+        return None;
+    }
+
+    let raw = std::fs::read(cue_path).ok()?;
+    let cue_text = super::cue_parser::decode_cue_bytes_for_path(&raw, cue_path).ok()?;
+    let sheet = super::cue_parser::parse_cue(&cue_text);
+    if sheet.tracks.len() < 2 {
+        return None;
+    }
+
+    let first_file = sheet.tracks.first().and_then(|track| track.file.as_deref())?;
+    if sheet
+        .tracks
+        .iter()
+        .any(|track| track.file.as_deref() != Some(first_file))
+    {
+        return None;
+    }
+
+    let dir = cue_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let audio_path = super::accuraterip::resolve_cue_file_reference(dir, first_file)?;
+    if !matches!(
+        crate::convert::classify::classify_file(&audio_path),
+        crate::convert::classify::EntryKind::AudioFile(_)
+    ) {
+        return None;
+    }
+
+    Some(MetadataCueSurface {
+        cue_path: cue_path.to_path_buf(),
+        audio_path,
+        cue_text,
+        sheet,
+    })
+}
+
+fn collect_metadata_cue_surfaces_from_path(
+    path: &std::path::Path,
+    out: &mut Vec<MetadataCueSurface>,
+    seen: &mut std::collections::BTreeSet<std::path::PathBuf>,
+) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+
+    if meta.file_type().is_symlink() {
+        return;
+    }
+
+    if meta.is_dir() {
+        let Ok(read_dir) = std::fs::read_dir(path) else {
+            return;
+        };
+        let mut children: Vec<std::path::PathBuf> = read_dir
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        children.sort();
+        for child in children {
+            collect_metadata_cue_surfaces_from_path(&child, out, seen);
+        }
+        return;
+    }
+
+    if !meta.is_file() {
+        return;
+    }
+
+    let cue_path = if crate::convert::classify::is_cue_sheet_path(path) {
+        Some(path.to_path_buf())
+    } else if matches!(
+        crate::convert::classify::classify_file(path),
+        crate::convert::classify::EntryKind::AudioFile(_)
+    ) {
+        metadata_editor_sidecar_for_audio(path)
+    } else {
+        None
+    };
+
+    let Some(cue_path) = cue_path else {
+        return;
+    };
+    let key = metadata_cue_surface_key(&cue_path);
+    if !seen.insert(key) {
+        return;
+    }
+    if let Some(surface) = resolve_metadata_cue_surface(&cue_path) {
+        out.push(surface);
+    }
+}
+
+fn collect_metadata_cue_surfaces(paths: &[std::path::PathBuf]) -> Vec<MetadataCueSurface> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for path in paths {
+        collect_metadata_cue_surfaces_from_path(path, &mut out, &mut seen);
+    }
+    out.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    out
+}
+
+fn upsert_cuesheet_text_for_metadata_surface(
+    entries: &mut Vec<super::probe::TagEntry>,
+    cue_text: &str,
+) {
+    use lofty::tag::ItemKey;
+
+    if let Some(idx) = entries
+        .iter()
+        .position(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+    {
+        let entry = &mut entries[idx];
+        if entry.per_file_values.is_empty() {
+            entry.per_file_values.push(cue_text.to_string());
+        } else {
+            entry.per_file_values[0] = cue_text.to_string();
+        }
+        entry.value = super::probe::cue_summary_string(cue_text);
+        return;
+    }
+
+    entries.push(super::probe::TagEntry {
+        display_key: "CUESHEET".to_string(),
+        item_key: ItemKey::Unknown("CUESHEET".to_string()),
+        value: super::probe::cue_summary_string(cue_text),
+        original: String::new(),
+        is_binary: true,
+        is_mixed: false,
+        per_file_values: vec![cue_text.to_string()],
+        per_file_originals: vec![String::new()],
+        mb_proposed_value: None,
+        mb_proposed_per_file: None,
+    });
+}
+
+fn metadata_cue_surface_label(surface: &MetadataCueSurface, ordinal: usize) -> String {
+    let cue_label = surface
+        .cue_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| format!("CUE {}", ordinal + 1));
+    match surface.sheet.title.as_deref().filter(|title| !title.trim().is_empty()) {
+        Some(title) if title != cue_label => format!("{} — {}", cue_label, title),
+        _ => cue_label,
+    }
+}
+
+fn metadata_cue_track_labels(surface: &MetadataCueSurface) -> Vec<String> {
+    surface
+        .sheet
+        .tracks
+        .iter()
+        .map(|track| format!("{:>02}", track.number))
+        .collect()
+}
+
+fn open_metadata_editor_for_cue_surfaces(
+    app: &mut AppState,
+    surfaces: Vec<MetadataCueSurface>,
+) {
+    if surfaces.is_empty() {
+        app.set_status("No CUE/image pairs selected");
+        return;
+    }
+
+    let mut tabs = Vec::new();
+    for (idx, surface) in surfaces.iter().enumerate() {
+        let paths = vec![surface.audio_path.clone()];
+        let merged = match super::probe::read_all_tags_merged_with_metadata(&paths) {
+            Ok(read) => read,
+            Err(err) => {
+                app.set_status(format!(
+                    "Failed to read tags for {}: {}",
+                    surface.audio_path.display(),
+                    err,
+                ));
+                return;
+            }
+        };
+
+        let mut entries = merged.entries;
+        upsert_cuesheet_text_for_metadata_surface(&mut entries, &surface.cue_text);
+        apply_embedded_cuesheet_per_track(&mut entries);
+
+        let technical_details = metadata_technical_details_for_paths_with_analysis(
+            &paths,
+            &merged.metadata,
+            &merged.metadata_errors,
+            Some(&app.db),
+            &app.preemph_results,
+        );
+        let file_labels = metadata_cue_track_labels(surface);
+        tabs.push(super::app::PresentationTab::new(
+            crate::disc::model::PresentationId::DvdAudioGroup((idx + 1) as u8),
+            metadata_cue_surface_label(surface, idx),
+            paths,
+            entries,
+            file_labels,
+            technical_details,
+        ));
+    }
+
+    let n_parts = tabs.len();
+    let n_tracks: usize = surfaces.iter().map(|surface| surface.sheet.tracks.len()).sum();
+    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
+        super::app::MetadataEditorState::for_disc_presentations(tabs, 0),
+    ));
+    app.set_status(format!(
+        "metadata: opened {} CUE part{}, {} tracks",
+        n_parts,
+        if n_parts == 1 { "" } else { "s" },
+        n_tracks,
+    ));
+}
+
+
 
 /// When the editor opens on a single audio file with no embedded
 /// CUESHEET tag but a sidecar `.cue` file alongside, parse the sidecar
@@ -9905,6 +10136,9 @@ async fn metadata_editor_analyze_details_target(
 fn metadata_editor_details_preemphasis_candidate(
     file: &crate::tui::app::MetadataFileDetails,
 ) -> bool {
+    // Semantic subset, not supported-source admission: pre-emphasis analysis
+    // is meaningful for PCM/lossless-style material and must exclude known
+    // lossy/DSD families even though some are valid conversion inputs.
     let path = &file.file_facts.path;
     !metadata_editor_details_path_is_disc_structure(path)
         && !metadata_editor_details_path_has_extension(path, &["dsf", "dff"])
@@ -9916,6 +10150,9 @@ fn metadata_editor_details_preemphasis_candidate(
 }
 
 fn metadata_editor_details_hdcd_candidate(file: &crate::tui::app::MetadataFileDetails) -> bool {
+    // Semantic subset, not supported-source admission: HDCD detection is only
+    // useful for confirmed 16-bit PCM/lossless candidates. Keep this list
+    // intentionally narrower than the direct conversion-queue source policy.
     let path = &file.file_facts.path;
     if metadata_editor_details_path_is_disc_structure(path)
         || metadata_editor_details_path_has_extension(path, &["dsf", "dff"])
@@ -11914,7 +12151,15 @@ pub fn open_metadata_editor(app: &mut AppState) {
         return;
     }
 
+    let selected_path_is_iso = sel.len() == 1
+        && sel[0]
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("iso"))
+            .unwrap_or(false);
+
     if sel.len() == 1
+        && !selected_path_is_iso
         && !app.browse.is_in_archive()
         && matches!(crate::convert::classify::classify_file(&sel[0]), crate::convert::classify::EntryKind::Archive)
     {
@@ -11980,11 +12225,47 @@ pub fn open_metadata_editor(app: &mut AppState) {
         }
     }
 
+    if sel.len() == 1
+        && !app.browse.is_in_archive()
+        && matches!(crate::convert::classify::classify_file(&sel[0]), crate::convert::classify::EntryKind::Archive)
+    {
+        open_browse_archive_metadata_editor(app, sel[0].clone());
+        return;
+    }
+
+    // Multi-part single-image CUE albums must stay CUE-shaped. If we first
+    // collapse the selection to image files, the ordinary multi-file metadata
+    // path opens image-level rows and loses each side/disc's CUESHEET track
+    // structure. Surface each cue/image pair as its own presentation tab before
+    // falling back to generic audio-file expansion.
+    let cue_surfaces = collect_metadata_cue_surfaces(&sel);
+    if cue_surfaces.len() > 1 {
+        open_metadata_editor_for_cue_surfaces(app, cue_surfaces);
+        return;
+    }
+
     // Metadata semantics, via the shared helper: every audio file including
     // single-image CUE carriers that queue expansion suppresses. This call
     // site has been silently reverted to queue semantics twice by bundle
     // applications; the behavioral test below pins it.
-    let mut paths: Vec<std::path::PathBuf> = super::command::expand_audio_paths_for_metadata(&sel);
+    let cue_selection_count = sel
+        .iter()
+        .filter(|path| crate::convert::classify::is_cue_sheet_path(path))
+        .count();
+    let mut paths: Vec<std::path::PathBuf> = if cue_selection_count > 0 && cue_selection_count == sel.len() {
+        let resolved: Vec<_> = sel
+            .iter()
+            .filter_map(|cue| super::cue_parser::detect_single_image_cue(cue))
+            .map(|info| info.audio_path)
+            .collect();
+        if resolved.len() == sel.len() {
+            resolved
+        } else {
+            super::command::expand_audio_paths_for_metadata(&sel)
+        }
+    } else {
+        super::command::expand_audio_paths_for_metadata(&sel)
+    };
 
     if paths.is_empty() {
         app.set_status("No audio files selected");
@@ -24752,6 +25033,48 @@ fn conversion_options_from_current_convert_output(app: &AppState) -> ConversionO
     options
 }
 
+fn manual_file_input_admits_path(path: &std::path::Path) -> bool {
+    crate::convert::source_admission::is_direct_queue_source_path(path)
+}
+
+#[cfg(test)]
+mod manual_file_input_source_admission_tests {
+    use super::manual_file_input_admits_path;
+    use std::path::Path;
+
+    #[test]
+    fn manual_directory_walk_uses_queue_source_policy() {
+        for name in [
+            "disc.ape",
+            "side.wv",
+            "side.ogg",
+            "side.tta",
+            "side.w64",
+            "side.rf64",
+            "disc.cue",
+            "album.7z",
+        ] {
+            assert!(manual_file_input_admits_path(Path::new(name)), "{name}");
+        }
+
+        for name in [
+            "booklet.txt",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.tar.gz",
+            "album.dmg",
+            "album.cab",
+            // A generic ISO is an archive-looking file, but it is not a
+            // conversion source until the disc-image probes identify it as
+            // SACD/DVD-A/DVD-V/Blu-ray.
+            "disc.iso",
+        ] {
+            assert!(!manual_file_input_admits_path(Path::new(name)), "{name}");
+        }
+    }
+}
+
 fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
     if !path.exists() {
         app.set_status(format!("Path not found: {}", path.display()));
@@ -24770,37 +25093,10 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
         {
             let file_path = entry.path();
             if file_path.is_file() {
-                // Check compound tar extensions first, then single extensions.
-                let is_compound_tar = super::browse::is_tar_compound_pub(file_path);
-                let is_known = is_compound_tar
-                    || file_path
-                        .extension()
-                        .map(|ext| {
-                            let e = ext.to_string_lossy().to_lowercase();
-                            matches!(
-                                e.as_str(),
-                                "7z" | "zip"
-                                    | "rar"
-                                    | "tar"
-                                    | "iso"
-                                    | "cab"
-                                    | "tgz"
-                                    | "tbz2"
-                                    | "txz"
-                                    | "flac"
-                                    | "wav"
-                                    | "aiff"
-                                    | "aif"
-                                    | "wv"
-                                    | "mp3"
-                                    | "m4a"
-                                    | "aac"
-                                    | "opus"
-                                    | "ogg"
-                            )
-                        })
-                        .unwrap_or(false);
-                if is_known {
+                // Manual directory input is a source-admission path, not a
+                // semantic subset. Route through the shared queue-admission
+                // policy so typed paths and queue expansion do not drift.
+                if manual_file_input_admits_path(file_path) {
                     match app
                         .manager
                         .add_file_blocking(file_path.to_path_buf(), options.clone())
@@ -30983,6 +31279,103 @@ mod single_image_metadata_editor_regression_tests {
             .unwrap_or(false)
     }
 
+    #[test]
+    fn metadata_cue_surface_collection_recurses_and_pairs_each_cue_to_its_image() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        let disc1 = album.join("Disc 1");
+        let disc2 = album.join("Disc 2");
+        std::fs::create_dir_all(&disc1).expect("disc1");
+        std::fs::create_dir_all(&disc2).expect("disc2");
+        std::fs::write(disc1.join("disc1.ape"), b"ape placeholder").expect("ape1");
+        std::fs::write(disc2.join("disc2.ape"), b"ape placeholder").expect("ape2");
+        std::fs::write(
+            disc1.join("disc1.cue"),
+            "TITLE \"Disc One\"\nFILE \"disc1.ape\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 00:30:00\n",
+        )
+        .expect("cue1");
+        std::fs::write(
+            disc2.join("disc2.cue"),
+            "TITLE \"Disc Two\"\nFILE \"disc2.ape\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Three\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Four\"\n    INDEX 01 00:30:00\n",
+        )
+        .expect("cue2");
+
+        let surfaces = collect_metadata_cue_surfaces(&[album.clone()]);
+
+        assert_eq!(surfaces.len(), 2);
+        assert_eq!(surfaces[0].cue_path, disc1.join("disc1.cue"));
+        assert_eq!(surfaces[0].audio_path, disc1.join("disc1.ape"));
+        assert_eq!(surfaces[0].sheet.tracks.len(), 2);
+        assert_eq!(surfaces[1].cue_path, disc2.join("disc2.cue"));
+        assert_eq!(surfaces[1].audio_path, disc2.join("disc2.ape"));
+        assert_eq!(surfaces[1].sheet.tracks.len(), 2);
+    }
+
+    #[test]
+    fn open_metadata_editor_targets_all_tracks_for_multi_cue_folder() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        for stem in ["side_a", "side_b"] {
+            let image = album.join(format!("{stem}.flac"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=44100:duration=1",
+                    "-c:a",
+                    "flac",
+                ])
+                .arg(&image)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("ffmpeg fixture");
+            assert!(status.success());
+            std::fs::write(
+                album.join(format!("{stem}.cue")),
+                format!(
+                    "TITLE \"Album\"\nFILE \"{stem}.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"{stem} Track 1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"{stem} Track 2\"\n    INDEX 01 00:30:00\n"
+                ),
+            )
+            .expect("cue fixture");
+        }
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![super::super::browse::BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            crate::convert::classify::EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        open_metadata_editor(&mut app);
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("metadata editor should open for multi-CUE folder");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        for tab in &state.presentation_tabs {
+            let title = tab
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+                .expect("TITLE row");
+            assert_eq!(title.per_file_values.len(), 2, "each CUE tab exposes its tracks");
+        }
+    }
+
     /// Regression pin: Edit Metadata on a single-image CUE directory must
     /// open the editor on the image file, never report "No audio files
     /// selected". This call path has been silently reverted to queue-
@@ -31040,5 +31433,39 @@ mod single_image_metadata_editor_regression_tests {
             matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)),
             "metadata editor should open on the image file"
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_cue_source_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_cue_surface_collection_accepts_ogg_and_tta_backing_images() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("multi-cue-album");
+        std::fs::create_dir_all(&album).expect("album dir");
+
+        for (stem, ext) in [("side_a", "ogg"), ("side_b", "tta")] {
+            std::fs::write(album.join(format!("{stem}.{ext}")), b"placeholder audio")
+                .expect("audio fixture");
+            std::fs::write(
+                album.join(format!("{stem}.cue")),
+                format!(
+                    "TITLE \"Album\"\nFILE \"{stem}.{ext}\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("cue fixture");
+        }
+
+        let surfaces = collect_metadata_cue_surfaces(&[album.clone()]);
+
+        assert_eq!(surfaces.len(), 2, "metadata editor must retain both CUE surfaces");
+        assert_eq!(surfaces[0].cue_path, album.join("side_a.cue"));
+        assert_eq!(surfaces[0].audio_path, album.join("side_a.ogg"));
+        assert_eq!(surfaces[0].sheet.tracks.len(), 2);
+        assert_eq!(surfaces[1].cue_path, album.join("side_b.cue"));
+        assert_eq!(surfaces[1].audio_path, album.join("side_b.tta"));
+        assert_eq!(surfaces[1].sheet.tracks.len(), 2);
     }
 }

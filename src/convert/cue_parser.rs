@@ -405,16 +405,21 @@ fn cue_decode_has_audio_extension(path: &Path) -> bool {
                     | "wave"
                     | "aiff"
                     | "aif"
+                    | "aifc"
+                    | "w64"
+                    | "rf64"
                     | "ape"
                     | "wv"
                     | "tta"
                     | "mp3"
                     | "m4a"
+                    | "mp4"
                     | "aac"
                     | "ogg"
                     | "opus"
                     | "dsf"
                     | "dff"
+                    | "shn"
             )
         })
         .unwrap_or(false)

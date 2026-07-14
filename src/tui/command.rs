@@ -550,6 +550,262 @@ fn current_audio_paths(app: &AppState, include_convert: bool) -> Vec<PathBuf> {
 }
 
 
+
+fn cue_info_path_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn collect_cue_paths_from_source(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    seen: &mut std::collections::BTreeSet<PathBuf>,
+) {
+    if crate::convert::classify::is_cue_sheet_path(path) {
+        let key = cue_info_path_key(path);
+        if seen.insert(key) {
+            out.push(path.to_path_buf());
+        }
+        return;
+    }
+
+    if path.is_dir() {
+        for cue in super::gnudb::find_cues_in_dir(path) {
+            let key = cue_info_path_key(&cue);
+            if seen.insert(key) {
+                out.push(cue);
+            }
+        }
+    }
+}
+
+/// Find the single-image CUE surfaces associated with a Browse selection or
+/// its expanded audio paths. This deliberately pairs through the CUE FILE
+/// reference, then filters against the expanded audio set when present, so a
+/// split-side folder such as `side_a.cue`/`side_a.wv` +
+/// `side_b.cue`/`side_b.wv` stays side-aware instead of becoming two ordinary
+/// audio image files.
+
+#[derive(Debug, Clone)]
+struct CueMetadataSurface {
+    audio_path: PathBuf,
+    sheet: super::cue_parser::CueSheet,
+}
+
+fn resolve_cue_metadata_surface(cue_path: &Path) -> Option<CueMetadataSurface> {
+    let sheet = super::cue_parser::parse_cue_file(cue_path).ok()?;
+    if sheet.tracks.len() < 2 {
+        return None;
+    }
+    let first_file = sheet.tracks.first().and_then(|track| track.file.as_deref())?;
+    if sheet
+        .tracks
+        .iter()
+        .any(|track| track.file.as_deref() != Some(first_file))
+    {
+        return None;
+    }
+    let dir = cue_path.parent().unwrap_or_else(|| Path::new("."));
+    let audio_path = super::accuraterip::resolve_cue_file_reference(dir, first_file)?;
+    if !matches!(
+        crate::convert::classify::classify_file(&audio_path),
+        crate::convert::classify::EntryKind::AudioFile(_)
+    ) {
+        return None;
+    }
+    Some(CueMetadataSurface { audio_path, sheet })
+}
+
+fn collect_cue_metadata_surfaces_for_sources(
+    sources: &[PathBuf],
+    audio_paths: &[PathBuf],
+) -> Vec<CueMetadataSurface> {
+    let audio_keys: std::collections::BTreeSet<PathBuf> = audio_paths
+        .iter()
+        .map(|path| cue_info_path_key(path))
+        .collect();
+
+    let mut cue_paths = Vec::new();
+    let mut seen_cues = std::collections::BTreeSet::new();
+    for source in sources {
+        collect_cue_paths_from_source(source, &mut cue_paths, &mut seen_cues);
+    }
+    for audio in audio_paths {
+        if let Some(parent) = audio.parent() {
+            collect_cue_paths_from_source(parent, &mut cue_paths, &mut seen_cues);
+        }
+    }
+
+    let mut surfaces = Vec::new();
+    for cue_path in cue_paths {
+        let Some(surface) = resolve_cue_metadata_surface(&cue_path) else {
+            continue;
+        };
+        if !audio_keys.is_empty() && !audio_keys.contains(&cue_info_path_key(&surface.audio_path)) {
+            continue;
+        }
+        surfaces.push(surface);
+    }
+    surfaces
+}
+
+fn paths_for_cue_metadata_surfaces(surfaces: &[CueMetadataSurface]) -> Vec<PathBuf> {
+    surfaces
+        .iter()
+        .flat_map(|surface| {
+            (0..surface.sheet.tracks.len()).map(move |_| surface.audio_path.clone())
+        })
+        .collect()
+}
+
+fn seed_mb_query_from_cue_metadata_surfaces(
+    surfaces: &[CueMetadataSurface],
+) -> Option<SacdMbSeed> {
+    let first = surfaces.first()?;
+    let artist = first.sheet.performer.clone().unwrap_or_default();
+    let album = first.sheet.title.clone().unwrap_or_default();
+    let catalog = first.sheet.catalog.clone();
+    let year = first.sheet.date.clone();
+
+    if artist.trim().is_empty()
+        && album.trim().is_empty()
+        && catalog.as_deref().unwrap_or_default().trim().is_empty()
+        && year.as_deref().unwrap_or_default().trim().is_empty()
+    {
+        None
+    } else {
+        Some(SacdMbSeed {
+            artist,
+            album,
+            catalog,
+            year,
+        })
+    }
+}
+
+fn dispatch_split_cue_musicbrainz_text_fallback_from_surfaces(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    surfaces: &[CueMetadataSurface],
+) -> bool {
+    let Some(seed) = seed_mb_query_from_cue_metadata_surfaces(surfaces) else {
+        return false;
+    };
+    let paths = paths_for_cue_metadata_surfaces(surfaces);
+    if paths.is_empty() {
+        return false;
+    }
+    let ctx = super::message::TagsMbContext {
+        paths,
+        editor_park: false,
+        fallback_seed: None,
+    };
+    super::event_loop::spawn_tags_mb_text_search(
+        app,
+        tx,
+        seed,
+        ctx,
+        super::event_loop::TextSearchMode::DirectRequest,
+    );
+    true
+}
+
+pub(crate) fn collect_single_image_cue_infos_for_sources(
+    sources: &[PathBuf],
+    audio_paths: &[PathBuf],
+) -> Vec<super::cue_parser::SingleImageInfo> {
+    let audio_keys: std::collections::BTreeSet<PathBuf> = audio_paths
+        .iter()
+        .map(|path| cue_info_path_key(path))
+        .collect();
+
+    let mut cue_paths = Vec::new();
+    let mut seen_cues = std::collections::BTreeSet::new();
+    for source in sources {
+        collect_cue_paths_from_source(source, &mut cue_paths, &mut seen_cues);
+    }
+    for audio in audio_paths {
+        if let Some(parent) = audio.parent() {
+            collect_cue_paths_from_source(parent, &mut cue_paths, &mut seen_cues);
+        }
+    }
+
+    let mut infos = Vec::new();
+    for cue_path in cue_paths {
+        let Some(info) = super::cue_parser::detect_single_image_cue(&cue_path) else {
+            continue;
+        };
+        if !audio_keys.is_empty() && !audio_keys.contains(&cue_info_path_key(&info.audio_path)) {
+            continue;
+        }
+        infos.push(info);
+    }
+    infos.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    infos
+}
+
+pub(crate) fn paths_for_single_image_cue_infos(
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> Vec<PathBuf> {
+    infos
+        .iter()
+        .flat_map(|info| {
+            (0..info.sheet.tracks.len()).map(move |_| info.audio_path.clone())
+        })
+        .collect()
+}
+
+fn seed_mb_query_from_single_image_cues(
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> Option<SacdMbSeed> {
+    let first = infos.first()?;
+    let artist = first.sheet.performer.clone().unwrap_or_default();
+    let album = first.sheet.title.clone().unwrap_or_default();
+    let catalog = first.sheet.catalog.clone();
+    let year = first.sheet.date.clone();
+
+    if artist.trim().is_empty()
+        && album.trim().is_empty()
+        && catalog.as_deref().unwrap_or_default().trim().is_empty()
+        && year.as_deref().unwrap_or_default().trim().is_empty()
+    {
+        None
+    } else {
+        Some(SacdMbSeed {
+            artist,
+            album,
+            catalog,
+            year,
+        })
+    }
+}
+
+fn dispatch_split_cue_musicbrainz_text_fallback(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    infos: &[super::cue_parser::SingleImageInfo],
+) -> bool {
+    let Some(seed) = seed_mb_query_from_single_image_cues(infos) else {
+        return false;
+    };
+    let paths = paths_for_single_image_cue_infos(infos);
+    if paths.is_empty() {
+        return false;
+    }
+    let ctx = super::message::TagsMbContext {
+        paths,
+        editor_park: false,
+        fallback_seed: None,
+    };
+    super::event_loop::spawn_tags_mb_text_search(
+        app,
+        tx,
+        seed,
+        ctx,
+        super::event_loop::TextSearchMode::DirectRequest,
+    );
+    true
+}
+
 /// Full list of command-mode tokens (including aliases) recognised by
 /// `parse_command`. Used by the tab-completion machinery.
 ///
@@ -3110,7 +3366,21 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
 
             let mut paths: Vec<std::path::PathBuf> = current_audio_paths(app, false);
-            if paths.is_empty() {
+            let browse_selection_for_cues = if app.current_screen == AppScreen::Browse {
+                collect_selection_for_file_ops(app)
+            } else {
+                Vec::new()
+            };
+            let cue_infos = collect_single_image_cue_infos_for_sources(
+                &browse_selection_for_cues,
+                &paths,
+            );
+            let cue_metadata_surfaces = collect_cue_metadata_surfaces_for_sources(
+                &browse_selection_for_cues,
+                &paths,
+            );
+
+            if paths.is_empty() && cue_infos.is_empty() && cue_metadata_surfaces.is_empty() {
                 // SACD ISOs are handled by the auto-open block at the
                 // top of this arm (C-2d); anything reaching here is
                 // genuinely a "no audio files" case (empty selection,
@@ -3121,10 +3391,19 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             super::probe::sort_paths_by_track(&mut paths);
 
             // Explicit args from the user override the TOC primary
-            // path: fire a direct text search instead.
+            // path: fire a direct text search instead. Explicit CUE-file
+            // selections may not expand to ordinary audio paths, so use the
+            // CUE-derived per-track image path vector when needed.
             if let Some(seed) = direct_seed {
+                let ctx_paths = if paths.is_empty() && !cue_metadata_surfaces.is_empty() {
+                    paths_for_cue_metadata_surfaces(&cue_metadata_surfaces)
+                } else if paths.is_empty() && !cue_infos.is_empty() {
+                    paths_for_single_image_cue_infos(&cue_infos)
+                } else {
+                    paths
+                };
                 let ctx = super::message::TagsMbContext {
-                    paths,
+                    paths: ctx_paths,
                     editor_park: false,
                     fallback_seed: None,
                 };
@@ -3135,6 +3414,41 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     ctx,
                     super::event_loop::TextSearchMode::DirectRequest,
                 );
+                return;
+            }
+
+            // Split-side/split-disc single-image CUE albums must not be
+            // collapsed into a fabricated whole-album TOC from the backing
+            // images. MusicBrainz rarely has side-level disc IDs for LP sides,
+            // and a side match cannot be safely applied to all album rows. Use
+            // the intended album-level text fallback seeded from CUE metadata.
+            if cue_metadata_surfaces.len() > 1 {
+                if dispatch_split_cue_musicbrainz_text_fallback_from_surfaces(
+                    app,
+                    tx,
+                    &cue_metadata_surfaces,
+                ) {
+                    return;
+                }
+                app.set_status(
+                    ":tags-mb: split CUE album has no album/artist metadata for text fallback"
+                        .to_string(),
+                );
+                return;
+            }
+            if cue_infos.len() > 1 {
+                if dispatch_split_cue_musicbrainz_text_fallback(app, tx, &cue_infos) {
+                    return;
+                }
+                app.set_status(
+                    ":tags-mb: split CUE album has no album/artist metadata for text fallback"
+                        .to_string(),
+                );
+                return;
+            }
+
+            if paths.is_empty() {
+                app.set_status(":tags-mb: no audio files in selection");
                 return;
             }
 
@@ -3733,40 +4047,109 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
 
             let groups = super::gnudb::group_by_disc(&paths);
 
+            let cue_audio_paths =
+                |cue_path: &std::path::Path, sheet: &super::cue_parser::CueSheet| {
+                let dir = cue_path.parent().unwrap_or(std::path::Path::new("."));
+                let mut resolved = Vec::new();
+                for filename in sheet.tracks.iter().filter_map(|track| track.file.as_deref()) {
+                    if let Some(path) =
+                        super::accuraterip::resolve_cue_file_reference(dir, filename)
+                    {
+                        if !resolved.iter().any(|existing| existing == &path) {
+                            resolved.push(path);
+                        }
+                    }
+                }
+                resolved
+            };
+
             if groups.len() <= 1 {
-                // Single disc.
+                // Single directory: handle one CUE as the traditional path,
+                // or N CUE/image pairs as ordered album parts/sides.
                 let (_, group_paths) = groups.into_iter().next().unwrap();
                 let dir = group_paths[0].parent().unwrap_or(std::path::Path::new("."));
-                let cue_path = match super::gnudb::find_cue_in_dir(dir) {
-                    Some(p) => p,
-                    None => {
-                        app.set_status("No CUE file found in directory");
+                let cue_paths = super::gnudb::find_cues_in_dir(dir);
+                if cue_paths.is_empty() {
+                    app.set_status("No CUE file found in directory");
+                    return;
+                }
+
+                if cue_paths.len() == 1 {
+                    let cue_path = cue_paths[0].clone();
+                    let sheet = match super::cue_parser::parse_cue_file(&cue_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            app.set_status(format!("CUE parse error: {}", e));
+                            return;
+                        }
+                    };
+                    let n_tracks = sheet.tracks.len();
+                    let cue_paths = cue_audio_paths(&cue_path, &sheet);
+                    let review_paths = if cue_paths.is_empty() {
+                        group_paths
+                    } else {
+                        cue_paths
+                    };
+                    let review = super::gnudb::build_review_state_from_cue(&sheet, review_paths);
+                    app.set_status(format!(
+                        "CUE import: {} tracks from {}",
+                        n_tracks,
+                        cue_path.file_name().unwrap_or_default().to_string_lossy(),
+                    ));
+                    app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
+                } else {
+                    let mut entries = Vec::new();
+                    for cue_path in cue_paths {
+                        if let Ok(sheet) = super::cue_parser::parse_cue_file(&cue_path) {
+                            let label = cue_path
+                                .file_stem()
+                                .map(|stem| stem.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "cue".to_string());
+                            let resolved_paths = cue_audio_paths(&cue_path, &sheet);
+                            if !resolved_paths.is_empty() {
+                                entries.push((label, sheet, resolved_paths));
+                            }
+                        }
+                    }
+                    if entries.is_empty() {
+                        app.set_status("No usable CUE/image pairs found in directory");
                         return;
                     }
-                };
-                let sheet = match super::cue_parser::parse_cue_file(&cue_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        app.set_status(format!("CUE parse error: {}", e));
-                        return;
-                    }
-                };
-                let n_tracks = sheet.tracks.len();
-                let review = super::gnudb::build_review_state_from_cue(&sheet, group_paths);
-                app.set_status(format!(
-                    "CUE import: {} tracks from {}",
-                    n_tracks,
-                    cue_path.file_name().unwrap_or_default().to_string_lossy(),
-                ));
-                app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
+                    let n_parts = entries.len();
+                    let n_tracks: usize = entries.iter().map(|(_, s, _)| s.tracks.len()).sum();
+                    let review = super::gnudb::build_multi_disc_review_state_from_cue(&entries);
+                    app.set_status(format!(
+                        "CUE import: {} part{}, {} tracks",
+                        n_parts,
+                        if n_parts == 1 { "" } else { "s" },
+                        n_tracks,
+                    ));
+                    app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
+                }
             } else {
-                // Multi-disc: find CUE in each subdirectory.
+                // Multi-disc: find every CUE in each subdirectory, preserving
+                // the CUE-to-image association instead of choosing one file by
+                // sort order.
                 let mut entries = Vec::new();
                 for (label, group_paths) in groups {
                     let dir = group_paths[0].parent().unwrap_or(std::path::Path::new("."));
-                    if let Some(cue_path) = super::gnudb::find_cue_in_dir(dir) {
+                    let cue_paths = super::gnudb::find_cues_in_dir(dir);
+                    for cue_path in cue_paths {
                         if let Ok(sheet) = super::cue_parser::parse_cue_file(&cue_path) {
-                            entries.push((label, sheet, group_paths));
+                            let mut entry_label = label.clone();
+                            if let Some(stem) = cue_path.file_stem() {
+                                entry_label = format!("{} {}", entry_label, stem.to_string_lossy());
+                            }
+                            let resolved_paths = cue_audio_paths(&cue_path, &sheet);
+                            entries.push((
+                                entry_label,
+                                sheet,
+                                if resolved_paths.is_empty() {
+                                    group_paths.clone()
+                                } else {
+                                    resolved_paths
+                                },
+                            ));
                         }
                     }
                 }
@@ -4551,9 +4934,15 @@ fn execute_filter(app: &mut AppState, arg: Option<&str>, tx: &mpsc::Sender<AppMe
         "wav" => FormatFilter::Only(AudioFormat::Wav),
         "wavpack" | "wv" => FormatFilter::Only(AudioFormat::WavPack),
         "aiff" => FormatFilter::Only(AudioFormat::Aiff),
+        "dsf" => FormatFilter::Only(AudioFormat::Dsf),
+        "dff" => FormatFilter::Only(AudioFormat::Dff),
+        "ape" => FormatFilter::Only(AudioFormat::Ape),
+        "shn" | "shorten" => FormatFilter::Only(AudioFormat::Shorten),
+        "ogg" | "oga" | "vorbis" => FormatFilter::Only(AudioFormat::Ogg),
+        "tta" | "trueaudio" => FormatFilter::Only(AudioFormat::Tta),
         other => {
             app.set_status(format!(
-                "Unknown filter: {}. Try: off, audio, flac, opus, aac, mp3, alac, wav, wavpack, aiff",
+                "Unknown filter: {}. Try: off, audio, flac, opus, aac, mp3, alac, wav, wavpack, aiff, dsf, dff, ape, shn, ogg, tta",
                 other
             ));
             return;
@@ -14374,5 +14763,60 @@ mod conversion_action_command_parser_tests {
             parse_command("actions-identity-import reviewed identity.json"),
             Command::ActionsIdentityImport(Some(path)) if path == "reviewed identity.json"
         ));
+    }
+}
+
+#[cfg(test)]
+mod split_cue_source_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn split_cue_info_collection_keeps_ogg_and_tta_cues_before_plain_audio_grouping() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("split-side-album");
+        std::fs::create_dir_all(&album).expect("album dir");
+
+        // SingleImageInfo detection probes the image for sample counts, so
+        // the fixtures must be REAL decodable audio; the dev/test shell
+        // provides ffmpeg, which encodes both Vorbis and TTA. The second
+        // track's INDEX must fall inside the 2-second image.
+        for (stem, ext, title) in [
+            ("side_a", "ogg", "Side A"),
+            ("side_b", "tta", "Side B"),
+        ] {
+            let audio = album.join(format!("{stem}.{ext}"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                    "-ar", "44100",
+                ])
+                .arg(&audio)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("spawn ffmpeg for audio fixture");
+            assert!(status.success(), "ffmpeg fixture encode failed for {ext}");
+            std::fs::write(
+                album.join(format!("{stem}.cue")),
+                format!(
+                    "PERFORMER \"Artist\"\nTITLE \"Album\"\nFILE \"{stem}.{ext}\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"{title} One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"{title} Two\"\n    INDEX 01 00:01:00\n"
+                ),
+            )
+            .expect("cue fixture");
+        }
+
+        let audio_paths = crate::convert::queue_expansion::expand_paths_to_all_audio(&[album.clone()]);
+        assert_eq!(audio_paths.len(), 2, "OGG and TTA must both be audio sources");
+
+        let cue_infos = collect_single_image_cue_infos_for_sources(&[album.clone()], &audio_paths);
+
+        assert_eq!(cue_infos.len(), 2, "split-side Browse tagging must stay CUE-shaped");
+        assert_eq!(cue_infos[0].cue_path, album.join("side_a.cue"));
+        assert_eq!(cue_infos[0].audio_path, album.join("side_a.ogg"));
+        assert_eq!(cue_infos[0].sheet.tracks.len(), 2);
+        assert_eq!(cue_infos[1].cue_path, album.join("side_b.cue"));
+        assert_eq!(cue_infos[1].audio_path, album.join("side_b.tta"));
+        assert_eq!(cue_infos[1].sheet.tracks.len(), 2);
     }
 }

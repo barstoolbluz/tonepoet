@@ -47,6 +47,13 @@ pub enum AudioFormat {
     Ac3,
     /// Monkey's Audio (decode-only — not encodable by ffmpeg or SoX)
     Ape,
+    /// Shorten lossless audio (decode-only — not encodable by ffmpeg or SoX)
+    Shorten,
+    /// Ogg container input, usually Vorbis for legacy rips. Decode-only in
+    /// this model; Opus output remains represented by `AudioFormat::Opus`.
+    Ogg,
+    /// True Audio lossless compression (decode-only source coverage).
+    Tta,
     /// Linear PCM (raw headerless, or via WAV/AIFF container)
     Lpcm,
 }
@@ -68,6 +75,9 @@ impl AudioFormat {
             Self::Dts => "dts",
             Self::Ac3 => "ac3",
             Self::Ape => "ape",
+            Self::Shorten => "shn",
+            Self::Ogg => "ogg",
+            Self::Tta => "tta",
             Self::Lpcm => "pcm",
         }
     }
@@ -88,6 +98,9 @@ impl AudioFormat {
             Self::Dts => "DTS",
             Self::Ac3 => "AC3",
             Self::Ape => "APE",
+            Self::Shorten => "SHN",
+            Self::Ogg => "OGG",
+            Self::Tta => "TTA",
             Self::Lpcm => "LPCM",
         }
     }
@@ -96,12 +109,32 @@ impl AudioFormat {
     pub fn is_lossless(&self) -> bool {
         matches!(
             self,
-            Self::Flac | Self::Wav | Self::Aiff | Self::WavPack | Self::Alac | Self::Dsf | Self::Dff | Self::Ape | Self::Lpcm
+            Self::Flac
+                | Self::Wav
+                | Self::Aiff
+                | Self::WavPack
+                | Self::Alac
+                | Self::Dsf
+                | Self::Dff
+                | Self::Ape
+                | Self::Shorten
+                | Self::Tta
+                | Self::Lpcm
         )
     }
 
-    /// Get all supported output formats
+    /// Formats that may appear as conversion targets.
+    ///
+    /// This is deliberately narrower than source/input recognition. APE,
+    /// Shorten, OGG, and TTA are accepted as input sources and CUE backing
+    /// images, but they are not exposed as output codecs or treated as
+    /// encodable targets.
     pub fn all() -> Vec<Self> {
+        Self::output_encodable()
+    }
+
+    /// Formats accepted as input audio sources by extension/probe routing.
+    pub fn input_decodable() -> Vec<Self> {
         vec![
             Self::Flac,
             Self::Wav,
@@ -116,13 +149,77 @@ impl AudioFormat {
             Self::Dts,
             Self::Ac3,
             Self::Ape,
+            Self::Shorten,
+            Self::Ogg,
+            Self::Tta,
             Self::Lpcm,
         ]
     }
 
+    /// Formats the pipeline models as output-encodable targets.
+    pub fn output_encodable() -> Vec<Self> {
+        vec![
+            Self::Flac,
+            Self::Wav,
+            Self::Aiff,
+            Self::WavPack,
+            Self::Mp3,
+            Self::Aac,
+            Self::Opus,
+            Self::Alac,
+            Self::Dsf,
+            Self::Dff,
+            Self::Dts,
+            Self::Ac3,
+            Self::Lpcm,
+        ]
+    }
+
+    pub fn is_input_decodable(&self) -> bool {
+        matches!(
+            self,
+            Self::Flac
+                | Self::Wav
+                | Self::Aiff
+                | Self::WavPack
+                | Self::Mp3
+                | Self::Aac
+                | Self::Opus
+                | Self::Alac
+                | Self::Dsf
+                | Self::Dff
+                | Self::Dts
+                | Self::Ac3
+                | Self::Ape
+                | Self::Shorten
+                | Self::Ogg
+                | Self::Tta
+                | Self::Lpcm
+        )
+    }
+
+    pub fn is_output_encodable(&self) -> bool {
+        matches!(
+            self,
+            Self::Flac
+                | Self::Wav
+                | Self::Aiff
+                | Self::WavPack
+                | Self::Mp3
+                | Self::Aac
+                | Self::Opus
+                | Self::Alac
+                | Self::Dsf
+                | Self::Dff
+                | Self::Dts
+                | Self::Ac3
+                | Self::Lpcm
+        )
+    }
+
     /// Additional output formats shown below-the-fold when the format pane is maximized.
     pub fn advanced_output() -> Vec<Self> {
-        vec![Self::Dts, Self::Ac3, Self::Ape, Self::Lpcm]
+        vec![Self::Dts, Self::Ac3, Self::Lpcm]
     }
 
     /// Formats shown as pills in the main TUI convert screen
@@ -219,6 +316,15 @@ impl AudioFormat {
             Self::Ape => &[
                 ContainerOption { extension: "ape", display_name: "APE", ffmpeg_flags: &[], enabled: false },
             ],
+            Self::Shorten => &[
+                ContainerOption { extension: "shn", display_name: "SHN", ffmpeg_flags: &[], enabled: false },
+            ],
+            Self::Ogg => &[
+                ContainerOption { extension: "ogg", display_name: "OGG", ffmpeg_flags: &[], enabled: false },
+            ],
+            Self::Tta => &[
+                ContainerOption { extension: "tta", display_name: "TTA", ffmpeg_flags: &[], enabled: false },
+            ],
             Self::Lpcm => &[
                 ContainerOption { extension: "wav", display_name: "WAV", ffmpeg_flags: &[], enabled: true },
                 ContainerOption { extension: "aiff", display_name: "AIFF", ffmpeg_flags: &[], enabled: true },
@@ -227,7 +333,24 @@ impl AudioFormat {
         }
     }
 
-    /// Default container for this codec (index 0 of available_containers).
+    /// Enabled output containers for this codec. Decode-only source formats
+    /// intentionally return an empty list even though `available_containers()`
+    /// keeps a disabled legacy sentinel for safe rendering of stale presets.
+    pub fn enabled_output_containers(&self) -> Vec<&'static ContainerOption> {
+        if !self.is_output_encodable() {
+            return Vec::new();
+        }
+        self.available_containers()
+            .iter()
+            .filter(|container| container.enabled)
+            .collect()
+    }
+
+    /// Default container for this output codec (index 0 of available_containers).
+    ///
+    /// Decode-only source formats keep a disabled sentinel container so legacy
+    /// config or preset state can still render and be clamped away without
+    /// panicking. They are never returned by output-format list APIs.
     pub fn default_container(&self) -> &'static ContainerOption {
         &self.available_containers()[0]
     }
@@ -798,30 +921,24 @@ impl FormatDetector {
         };
 
         match extension.as_str() {
-            // Archives — all handled by 7zz/7z extraction pipeline.
-            "7z" | "zip" | "rar" | "tar" | "iso" | "cab" | "dmg" | "tgz" | "tbz2" | "txz" => {
-                Ok(FileFormat::Archive)
-            }
             // Control files that route to the CUE materializer. These are
             // deliberately distinct from Archive: treating `.cue` as an
             // archive lets it pass the detector but sends the wrong signal to
             // downstream code and hides probe/routing mistakes.
             "cue" => Ok(FileFormat::CueSheet),
-            // Audio formats.
-            "flac" => Ok(FileFormat::Audio(AudioFormat::Flac)),
-            "wav" | "wave" => Ok(FileFormat::Audio(AudioFormat::Wav)),
-            "aiff" | "aif" | "aifc" => Ok(FileFormat::Audio(AudioFormat::Aiff)),
-            "wv" => Ok(FileFormat::Audio(AudioFormat::WavPack)),
-            "mp3" => Ok(FileFormat::Audio(AudioFormat::Mp3)),
+            // M4A/MP4 need codec probing to distinguish AAC from ALAC; the
+            // extension-only classifier deliberately stays conservative there.
             "m4a" | "mp4" => Ok(FileFormat::Audio(Self::detect_m4a_codec(path))),
-            "aac" => Ok(FileFormat::Audio(AudioFormat::Aac)),
-            "opus" => Ok(FileFormat::Audio(AudioFormat::Opus)),
-            "dsf" => Ok(FileFormat::Audio(AudioFormat::Dsf)),
-            "dff" => Ok(FileFormat::Audio(AudioFormat::Dff)),
-            _ => Err(super::ConversionError::UnsupportedFormat(format!(
-                "Unsupported format: .{}",
-                extension
-            ))),
+            _ => match crate::convert::classify::classify_file(path) {
+                crate::convert::classify::EntryKind::Archive => Ok(FileFormat::Archive),
+                crate::convert::classify::EntryKind::AudioFile(format) => {
+                    Ok(FileFormat::Audio(format))
+                }
+                _ => Err(super::ConversionError::UnsupportedFormat(format!(
+                    "Unsupported format: .{}",
+                    extension
+                ))),
+            },
         }
     }
 
@@ -910,7 +1027,9 @@ impl AudioFormat {
             },
             AudioFormat::Dts => QualitySettings::Flac { compression_level: 0 },
             AudioFormat::Ac3 => QualitySettings::Flac { compression_level: 0 },
-            AudioFormat::Ape => QualitySettings::Flac { compression_level: 0 },
+            AudioFormat::Ape | AudioFormat::Shorten | AudioFormat::Ogg | AudioFormat::Tta => {
+                QualitySettings::Flac { compression_level: 0 }
+            },
             AudioFormat::Lpcm => QualitySettings::Wav { bit_depth: 16, sample_rate: 44100 },
         }
     }
@@ -1109,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_accepts_standalone_dsf_and_dff_as_audio() {
+    fn detect_accepts_standalone_dsd_and_decode_only_formats_as_audio() {
         assert_eq!(
             FormatDetector::detect(Path::new("album.dsf")).expect("DSF is supported"),
             FileFormat::Audio(AudioFormat::Dsf)
@@ -1118,10 +1237,38 @@ mod tests {
             FormatDetector::detect(Path::new("album.dff")).expect("DFF is supported"),
             FileFormat::Audio(AudioFormat::Dff)
         );
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.w64")).expect("W64 is supported"),
+            FileFormat::Audio(AudioFormat::Wav)
+        );
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.rf64")).expect("RF64 is supported"),
+            FileFormat::Audio(AudioFormat::Wav)
+        );
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.alac")).expect("ALAC extension is supported"),
+            FileFormat::Audio(AudioFormat::Alac)
+        );
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.ape")).expect("APE is supported"),
+            FileFormat::Audio(AudioFormat::Ape)
+        );
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.shn")).expect("Shorten is supported"),
+            FileFormat::Audio(AudioFormat::Shorten)
+        );
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.ogg")).expect("OGG is supported"),
+            FileFormat::Audio(AudioFormat::Ogg)
+        );
+        assert_eq!(
+            FormatDetector::detect(Path::new("album.tta")).expect("TTA is supported"),
+            FileFormat::Audio(AudioFormat::Tta)
+        );
     }
 
     #[test]
-    fn detect_audio_accepts_standalone_dsf_and_dff() {
+    fn detect_audio_accepts_standalone_dsd_and_decode_only_formats() {
         assert_eq!(
             FormatDetector::detect_audio(Path::new("track.DSF")).expect("uppercase DSF is supported"),
             AudioFormat::Dsf
@@ -1130,6 +1277,65 @@ mod tests {
             FormatDetector::detect_audio(Path::new("track.DFF")).expect("uppercase DFF is supported"),
             AudioFormat::Dff
         );
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.W64")).expect("uppercase W64 is supported"),
+            AudioFormat::Wav
+        );
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.RF64")).expect("uppercase RF64 is supported"),
+            AudioFormat::Wav
+        );
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.ALAC")).expect("uppercase ALAC is supported"),
+            AudioFormat::Alac
+        );
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.APE")).expect("uppercase APE is supported"),
+            AudioFormat::Ape
+        );
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.SHN")).expect("uppercase SHN is supported"),
+            AudioFormat::Shorten
+        );
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.OGG")).expect("uppercase OGG is supported"),
+            AudioFormat::Ogg
+        );
+        assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.TTA")).expect("uppercase TTA is supported"),
+            AudioFormat::Tta
+        );
+    }
+
+    #[test]
+    fn decode_only_source_formats_are_not_output_choices() {
+        for format in [AudioFormat::Ape, AudioFormat::Shorten, AudioFormat::Ogg, AudioFormat::Tta] {
+            assert!(
+                AudioFormat::input_decodable().contains(&format),
+                "decode-only format must remain accepted as an input source"
+            );
+            assert!(format.is_input_decodable());
+            assert!(
+                !AudioFormat::all().contains(&format),
+                "AudioFormat::all is output-facing and must not expose decode-only targets"
+            );
+            assert!(!AudioFormat::output_encodable().contains(&format));
+            assert!(!AudioFormat::advanced_output().contains(&format));
+            assert!(!AudioFormat::common_output().contains(&format));
+            assert!(!format.is_output_encodable());
+            assert!(format.enabled_output_containers().is_empty());
+        }
+    }
+
+    #[test]
+    fn output_formats_have_at_least_one_enabled_container() {
+        for format in AudioFormat::output_encodable() {
+            assert!(
+                !format.enabled_output_containers().is_empty(),
+                "output format {} must have an enabled output container",
+                format.name()
+            );
+        }
     }
 
     #[test]

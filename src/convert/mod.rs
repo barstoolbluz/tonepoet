@@ -17,6 +17,7 @@ pub mod cap_fs;
 pub mod cue_parser;
 pub mod formats;
 pub mod queue_expansion;
+pub mod source_admission;
 pub mod sacd;
 pub mod script_supervisor;
 pub mod labels;
@@ -35,6 +36,7 @@ pub use formats::{
     QualitySettings, WavPackMode,
 };
 pub use classify::{classify_file, EntryKind};
+pub use source_admission::is_direct_queue_source_path;
 pub use cue_parser::{parse_cue, parse_cue_file, CueSheet, CueTrack};
 pub use queue_expansion::{
     count_audio_files_bounded, cue_sidecar_override_for_commit_path, expand_paths_to_audio,

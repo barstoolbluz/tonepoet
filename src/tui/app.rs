@@ -2254,8 +2254,8 @@ fn compute_format_histogram(paths: &[PathBuf]) -> Vec<(AudioFormat, usize)> {
 /// Mappings pick the closest existing `AudioFormat` variant; some are
 /// best-effort (e.g. `.ogg` is typically Vorbis but could also be Opus
 /// or FLAC — we map to Opus as the most common modern case). Extensions
-/// without a reasonable represented histogram bucket (ape/wma/shn/tta/amr,
-/// and other unsupported or decode-only formats) return `None` and fall
+/// without a reasonable represented histogram bucket (wma/tta/amr,
+/// and other unsupported formats) return `None` and fall
 /// through to "(no recognised audio extensions)" if the whole batch is
 /// unrecognised.
 fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
@@ -2275,14 +2275,20 @@ fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
         "m4a" | "aac" | "mp4" | "m4b" | "m4r" => Some(AudioFormat::Aac),
         // ALAC — typically carried in m4a but sometimes standalone
         "alac" | "caf" => Some(AudioFormat::Alac),
-        // Opus (.opus is unambiguous; .oga is Ogg Opus; .ogg is
-        // ambiguous but maps here as best-effort)
-        "opus" | "oga" | "ogg" => Some(AudioFormat::Opus),
+        // Opus (.opus is unambiguous). Generic Ogg containers are modeled
+        // separately as input-decodable source coverage so Browse, metadata,
+        // and queue paths agree on admissibility without exposing Ogg as an
+        // output codec.
+        "opus" => Some(AudioFormat::Opus),
+        "ogg" | "oga" => Some(AudioFormat::Ogg),
         // DSD family. Keep this cheap extension path aligned with
         // FormatDetector so batch histograms do not silently drop DSD-only
         // selections.
         "dsf" => Some(AudioFormat::Dsf),
         "dff" => Some(AudioFormat::Dff),
+        "ape" => Some(AudioFormat::Ape),
+        "shn" => Some(AudioFormat::Shorten),
+        "tta" => Some(AudioFormat::Tta),
         _ => None,
     }
 }
@@ -2294,7 +2300,7 @@ mod batch_format_extension_tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn cheap_extension_detector_recognizes_dsf_and_dff() {
+    fn cheap_extension_detector_recognizes_dsf_dff_ogg_and_tta() {
         assert_eq!(
             detect_format_from_extension(Path::new("Album.DSF")),
             Some(AudioFormat::Dsf)
@@ -2302,6 +2308,14 @@ mod batch_format_extension_tests {
         assert_eq!(
             detect_format_from_extension(Path::new("Album.DFF")),
             Some(AudioFormat::Dff)
+        );
+        assert_eq!(
+            detect_format_from_extension(Path::new("Album.OGG")),
+            Some(AudioFormat::Ogg)
+        );
+        assert_eq!(
+            detect_format_from_extension(Path::new("Album.TTA")),
+            Some(AudioFormat::Tta)
         );
     }
 
@@ -2311,6 +2325,8 @@ mod batch_format_extension_tests {
             PathBuf::from("a.dsf"),
             PathBuf::from("b.dff"),
             PathBuf::from("c.dff"),
+            PathBuf::from("d.ogg"),
+            PathBuf::from("e.tta"),
             PathBuf::from("cover.jpg"),
         ];
 
@@ -2318,6 +2334,8 @@ mod batch_format_extension_tests {
 
         assert!(histogram.contains(&(AudioFormat::Dsf, 1)));
         assert!(histogram.contains(&(AudioFormat::Dff, 2)));
+        assert!(histogram.contains(&(AudioFormat::Ogg, 1)));
+        assert!(histogram.contains(&(AudioFormat::Tta, 1)));
     }
 }
 
@@ -3455,7 +3473,7 @@ impl FormatState {
                     }
                 }
             }
-            AudioFormat::Mp3 => {
+            AudioFormat::Mp3 | AudioFormat::Ogg => {
                 self.bit_depth.set_all_enabled(false);
                 self.dither.set_all_enabled(false);
                 for opt in &mut self.sample_rate.options {
@@ -3491,8 +3509,8 @@ impl FormatState {
                     }
                 }
             }
-            // Ape is lossless but not encodable; same constraints as FLAC
-            AudioFormat::Ape => {
+            // Ape/Shorten/TTA are lossless but not encodable; same constraints as FLAC.
+            AudioFormat::Ape | AudioFormat::Shorten | AudioFormat::Tta => {
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
                 for opt in &mut self.sample_rate.options {

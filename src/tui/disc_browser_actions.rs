@@ -54,21 +54,45 @@ fn require_selected_presentation_stream_conversion(
 /// the overlay as soon as a current `DiscContents` result is cached, so users
 /// do not have to click "Browse Audio Streams..." twice.
 pub fn open_selected_disc_browser(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let Some((path, is_disc_source)) = app
-        .browse
-        .selected_entry()
-        .map(|entry| (entry.path.clone(), entry.is_disc_source()))
-    else {
-        app.set_status("No browse entry selected");
+    let Some(path) = selected_entry_effective_disc_path(app) else {
+        if app.browse.selected_entry().is_none() {
+            app.set_status("No browse entry selected");
+        } else {
+            app.set_status("Selected entry is not a browsable disc source");
+        }
         return;
     };
 
-    if !is_disc_source {
-        app.set_status("Selected entry is not a browsable disc source");
-        return;
+    open_disc_browser_for_path(app, path, tx);
+}
+
+/// Return the selected Browse path when it is a disc source, applying the same
+/// explicit-action ISO promotion used by the context menu. This keeps menu
+/// exposure and action dispatch coherent during the lazy-classification window:
+/// a right-click on an unprobed SACD/DVD/BD `.iso` promotes the selected row
+/// before dispatch, so subsequent handlers do not reject the action as a stale
+/// `Archive`.
+fn selected_entry_effective_disc_path(app: &mut AppState) -> Option<PathBuf> {
+    let index = app.browse.selected_index;
+    let (path, current_kind) = app
+        .browse
+        .entries
+        .get(index)
+        .map(|entry| (entry.path.clone(), entry.kind.clone()))?;
+
+    let effective_kind =
+        super::context_menu::effective_browse_context_entry_kind(&current_kind, &path);
+    if !effective_kind.is_disc_source() {
+        return None;
     }
 
-    open_disc_browser_for_path(app, path, tx);
+    if effective_kind != current_kind {
+        if let Some(entry) = app.browse.entries.get_mut(index) {
+            entry.kind = effective_kind;
+        }
+    }
+
+    Some(path)
 }
 
 /// Open the Audio Streams overlay for a specific disc path, or start probing it.
@@ -187,22 +211,19 @@ pub fn handle_disc_context_action(
 ) -> bool {
     match action {
         crate::tui::context_menu::ContextAction::ConvertDiscDefault => {
-            let Some(path) = app.browse.selected_entry().map(|entry| entry.path.clone()) else {
-                app.set_status("No browse entry selected");
+            let Some(path) = selected_entry_effective_disc_path(app) else {
+                if app.browse.selected_entry().is_none() {
+                    app.set_status("No browse entry selected");
+                } else {
+                    app.set_status("Selected entry is not a browsable disc source");
+                }
                 return true;
             };
             convert_default_disc_stream(app, &path, tx);
             true
         }
         crate::tui::context_menu::ContextAction::ConvertCustom => {
-            let Some((path, is_disc_source)) = app
-                .browse
-                .selected_entry()
-                .map(|entry| (entry.path.clone(), entry.is_disc_source()))
-            else {
-                return false;
-            };
-            if is_disc_source {
+            if let Some(path) = selected_entry_effective_disc_path(app) {
                 convert_default_disc_stream(app, &path, tx);
                 true
             } else {
@@ -255,14 +276,7 @@ pub fn handle_disc_browser_button_click(
 ) -> bool {
     match button {
         TuiButton::BrowseInfoAnalyze => {
-            let Some((path, is_disc_source)) = app
-                .browse
-                .selected_entry()
-                .map(|entry| (entry.path.clone(), entry.is_disc_source()))
-            else {
-                return false;
-            };
-            if is_disc_source {
+            if let Some(path) = selected_entry_effective_disc_path(app) {
                 force_disc_reprobe(app, path, tx);
                 true
             } else {
@@ -600,5 +614,65 @@ pub fn selected_presentation_id(mode: &SourceMode) -> Option<&PresentationId> {
             ..
         } => Some(id),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::convert::classify::EntryKind;
+    use crate::tui::browse::BrowseEntry;
+    use std::fs::File;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
+
+    fn write_synthetic_sacd_iso(path: &Path) {
+        let mut file = File::create(path).expect("create synthetic SACD ISO");
+        let offset = 510_u64 * 2048;
+        file.set_len(offset + 8).expect("size synthetic SACD ISO");
+        file.seek(SeekFrom::Start(offset)).expect("seek SACD TOC");
+        file.write_all(b"SACDMTOC").expect("write SACD magic");
+    }
+
+    fn app_with_selected_archive_iso(path: PathBuf) -> AppState {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![BrowseEntry::new(
+            path,
+            "disc.iso".to_string(),
+            EntryKind::Archive,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app
+    }
+
+    #[test]
+    fn explicit_disc_action_promotes_unprobed_sacd_iso_selection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let iso = temp.path().join("disc.iso");
+        write_synthetic_sacd_iso(&iso);
+        let mut app = app_with_selected_archive_iso(iso.clone());
+
+        let selected = selected_entry_effective_disc_path(&mut app).expect("disc path");
+
+        assert_eq!(selected, iso);
+        assert!(
+            matches!(app.browse.entries[0].kind, EntryKind::SacdIso),
+            "dispatch must promote the selected row instead of leaving a stale Archive kind"
+        );
+    }
+
+    #[test]
+    fn explicit_disc_action_rejects_generic_iso_without_promoting_archive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let iso = temp.path().join("data.iso");
+        std::fs::write(&iso, b"not a disc image").expect("write generic iso");
+        let mut app = app_with_selected_archive_iso(iso);
+
+        assert!(selected_entry_effective_disc_path(&mut app).is_none());
+        assert!(matches!(app.browse.entries[0].kind, EntryKind::Archive));
     }
 }

@@ -2,7 +2,7 @@
 //! with context-sensitive actions. Per-screen `build_*_menu` functions
 //! produce filtered item lists; `execute_context_action` dispatches.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use super::app::*;
@@ -532,6 +532,34 @@ fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     }
 }
 
+pub(crate) fn effective_browse_context_entry_kind(kind: &EntryKind, path: &Path) -> EntryKind {
+    if !matches!(kind, EntryKind::Archive) || !path_has_extension(path, "iso") {
+        return kind.clone();
+    }
+
+    // Browse intentionally classifies ISO images lazily during normal render
+    // passes. A context menu is an explicit action: spend the small bounded
+    // probe cost here so a disc image never presents generic archive actions.
+    if super::sacd::is_sacd_iso(path) {
+        EntryKind::SacdIso
+    } else if crate::disc::dvda_utils::is_dvda_iso(path) {
+        EntryKind::DvdAudioIso
+    } else if crate::disc::dvdv_utils::is_dvdv_iso(path) {
+        EntryKind::DvdVideoIso
+    } else if crate::disc::bluray_utils::is_bluray_iso(path) {
+        EntryKind::BlurayIso
+    } else {
+        EntryKind::Archive
+    }
+}
+
+fn path_has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
+}
+
 /// Build the context menu for a right-click on a browse entry.
 pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let entry = match app.browse.selected_entry() {
@@ -544,8 +572,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     }
 
     let mut items = Vec::new();
+    let effective_kind = effective_browse_context_entry_kind(&entry.kind, &entry.path);
 
-    match &entry.kind {
+    match &effective_kind {
         EntryKind::AudioFile(_) => {
             items.push(build_convert_submenu(app));
             items.push(separator());
@@ -597,6 +626,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             ));
         }
         EntryKind::SacdIso => {
+            items.push(item("Convert (default stream)", ContextAction::ConvertDiscDefault));
             items.push(item("Browse Audio Streams...", ContextAction::BrowseDiscStreams));
             if let Some(contents) = app
                 .browse
@@ -702,6 +732,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 .unwrap_or(false);
             if is_cue {
                 items.push(build_convert_submenu(app));
+                items.push(item("Edit metadata", ContextAction::EditMetadataFull));
                 items.push(separator());
             }
             if super::browse::is_viewable_text_file(&entry.path) {
@@ -1570,30 +1601,27 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             .collect();
     super::probe::sort_paths_by_track(&mut audio_paths);
 
-    // Check for single-image CUE layout (one audio file + CUE sheet).
-    if audio_paths.len() <= 1 {
-        let dir = if audio_paths.is_empty() {
-            let sel_dir = super::command::collect_selection_for_file_ops(app);
-            sel_dir.first().and_then(|p| {
-                if p.is_dir() {
-                    Some(p.clone())
-                } else {
-                    p.parent().map(|d| d.to_path_buf())
-                }
-            })
-        } else {
-            audio_paths[0].parent().map(|d| d.to_path_buf())
-        };
-        if let Some(ref dir) = dir {
-            if let Some(info) = super::cue_parser::detect_single_image(dir) {
-                launch_single_image_gnudb(info, app, tx);
-                return;
-            }
-        }
-        if audio_paths.is_empty() {
-            app.set_status("No audio files for GNUDB lookup");
-            return;
-        }
+    // CUE-aware path before ordinary audio grouping. A split-side folder
+    // expands to multiple image files, but GNUDB should still query each
+    // CUE/image surface using the CUE track boundaries rather than treating the
+    // images as two ordinary tracks. Explicit .cue selections are covered too,
+    // even though they do not expand to audio paths.
+    let cue_infos = super::command::collect_single_image_cue_infos_for_sources(
+        &paths,
+        &audio_paths,
+    );
+    if cue_infos.len() > 1 {
+        launch_multi_single_image_gnudb(cue_infos, app, tx);
+        return;
+    }
+    if let Some(info) = cue_infos.into_iter().next() {
+        launch_single_image_gnudb(info, app, tx);
+        return;
+    }
+
+    if audio_paths.is_empty() {
+        app.set_status("No audio files for GNUDB lookup");
+        return;
     }
 
     let disc_groups = super::gnudb::group_by_disc(&audio_paths);
@@ -1672,6 +1700,68 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
 }
 
 /// Launch a GNUDB query for a single-image CUE album.
+
+/// Launch GNUDB queries for an ordered set of single-image CUE parts. This is
+/// the split-side/split-disc analogue of `launch_single_image_gnudb`: each CUE
+/// contributes its own disc ID from its own track boundaries, and successful
+/// reads are merged into the existing multi-disc review surface. No synthetic
+/// joined TOC is fabricated.
+fn launch_multi_single_image_gnudb(
+    infos: Vec<super::cue_parser::SingleImageInfo>,
+    app: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
+) {
+    let mut queries = Vec::new();
+    for info in infos {
+        let durations: Vec<f64> = info
+            .track_boundaries
+            .iter()
+            .map(|&(_, count)| count as f64 / info.sample_rate as f64)
+            .collect();
+        if durations.is_empty() {
+            continue;
+        }
+        let disc_id = super::gnudb::compute_disc_id(&durations);
+        let label = info
+            .cue_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "CUE".to_string());
+        let paths_for_editor: Vec<std::path::PathBuf> = (0..info.sheet.tracks.len())
+            .map(|_| info.audio_path.clone())
+            .collect();
+        queries.push((label, disc_id, paths_for_editor));
+    }
+
+    if queries.is_empty() {
+        app.set_status("GNUDB: no usable CUE/image pairs for lookup");
+        return;
+    }
+
+    app.set_status(format!(
+        "Querying gnudb.org ({} CUE parts)...",
+        queries.len(),
+    ));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut all_entries = Vec::new();
+        for (label, disc_id, paths_for_editor) in queries {
+            if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
+                if let Some(m) = matches.first() {
+                    if let Ok(entry) = super::gnudb::read_gnudb(&m.category, &m.disc_id).await {
+                        all_entries.push((label, entry, paths_for_editor));
+                    }
+                }
+            }
+        }
+        let _ = tx
+            .send(super::message::AppMessage::GnudbMultiDiscComplete {
+                entries: all_entries,
+            })
+            .await;
+    });
+}
+
 fn launch_single_image_gnudb(
     info: super::cue_parser::SingleImageInfo,
     app: &mut AppState,

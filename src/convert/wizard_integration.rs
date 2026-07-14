@@ -146,7 +146,13 @@ pub fn extract_wizard_settings(
 
         // Input-only / decode-only formats — not selectable as wizard output,
         // but the match must be exhaustive. Fall back to FLAC quality defaults.
-        AudioFormat::Dts | AudioFormat::Ac3 | AudioFormat::Ape | AudioFormat::Lpcm => {
+        AudioFormat::Dts
+        | AudioFormat::Ac3
+        | AudioFormat::Ape
+        | AudioFormat::Shorten
+        | AudioFormat::Ogg
+        | AudioFormat::Tta
+        | AudioFormat::Lpcm => {
             QualitySettings::Flac { compression_level: 8 }
         }
     };
@@ -537,7 +543,13 @@ pub fn preset_to_conversion_options(
         },
         // Input-only / decode-only formats — not selectable as output,
         // but the match must be exhaustive. Fall back to FLAC quality defaults.
-        AudioFormat::Dts | AudioFormat::Ac3 | AudioFormat::Ape | AudioFormat::Lpcm => {
+        AudioFormat::Dts
+        | AudioFormat::Ac3
+        | AudioFormat::Ape
+        | AudioFormat::Shorten
+        | AudioFormat::Ogg
+        | AudioFormat::Tta
+        | AudioFormat::Lpcm => {
             QualitySettings::Flac { compression_level: 8 }
         }
     };
