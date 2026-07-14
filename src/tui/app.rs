@@ -7546,10 +7546,10 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
             && entry.per_file_originals.len() == path_count;
 
         if !file_aligned {
+            let unified_cue_album_fully_saved = tab.cue_album_synthetic_sheet.is_some()
+                && path_count > 0
+                && (0..path_count).all(|idx| saved_slots.contains(&idx));
             if deleted.contains(&entry_idx) {
-                let unified_cue_album_fully_saved = tab.cue_album_synthetic_sheet.is_some()
-                    && path_count > 0
-                    && (0..path_count).all(|idx| saved_slots.contains(&idx));
                 if unified_cue_album_fully_saved {
                     // Unified CUE-album per-track/album rows are not written
                     // as independent tag vectors; their delete operation is
@@ -7567,6 +7567,14 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
                 // Non-deleted single-file synthetic/display entries have no
                 // per-slot retry state to preserve. Once the sole file saved,
                 // advance their originals with the rest of the surface.
+                mark_tag_entry_saved(entry);
+            } else if unified_cue_album_fully_saved {
+                // Unified CUE-album per-track rows (row-dimensioned, not
+                // path-keyed) persist through the regenerated embedded
+                // CUESHEET that was just written to every member image.
+                // Once every image saved, the row edits are durable; leaving
+                // originals stale here would keep the surface dirty forever
+                // and the editor could never close after a successful save.
                 mark_tag_entry_saved(entry);
             }
             continue;
@@ -12850,6 +12858,103 @@ mod metadata_presentation_tab_tests {
         assert_eq!(state.active_surface().entries[0].per_file_originals[0], "new one");
         assert_eq!(state.active_surface().entries[0].per_file_originals[1], "old two");
         assert!(state.active_surface().dirty, "failed file remains dirty");
+    }
+
+    #[test]
+    fn unified_cue_album_row_entries_clear_dirty_after_all_member_images_save() {
+        let mut state = write_state();
+        // Unified surface: 2 member images, but per-track rows dimensioned by
+        // track count (4), persisted via the regenerated embedded CUESHEET.
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: Vec::new(),
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state
+            .active_surface_mut()
+            .entries
+            .push(tag("TITLE", "<multiple values>", vec!["T1", "T2", "T3", "T4"]));
+        let row_idx = state.active_surface().entries.len() - 1;
+        state.active_surface_mut().entries[row_idx].per_file_values[2] = "Edited".to_string();
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[1].clone()),
+                ],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.saved, 2);
+        assert_eq!(
+            state.active_surface().entries[row_idx].per_file_originals[2],
+            "Edited",
+            "row-dimensioned entries advance originals once every member image saved"
+        );
+        assert!(
+            !state.active_surface().dirty,
+            "unified surface must not stay dirty after a fully successful save (editor could never close)"
+        );
+        assert!(!summary.remaining_dirty);
+    }
+
+    #[test]
+    fn unified_cue_album_row_entries_stay_dirty_after_partial_save() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: Vec::new(),
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state
+            .active_surface_mut()
+            .entries
+            .push(tag("TITLE", "<multiple values>", vec!["T1", "T2", "T3", "T4"]));
+        let row_idx = state.active_surface().entries.len() - 1;
+        state.active_surface_mut().entries[row_idx].per_file_values[2] = "Edited".to_string();
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::failed(state.active_surface().paths[1].clone(), "disk full"),
+                ],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            state.active_surface().entries[row_idx].per_file_originals[2],
+            "T3",
+            "row edits must stay pending until every member image carries the regenerated sheet"
+        );
+        assert!(state.active_surface().dirty, "partial save keeps the surface dirty for retry");
     }
 
     #[test]
