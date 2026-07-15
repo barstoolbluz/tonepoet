@@ -6147,14 +6147,17 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
     let mut errors = 0usize;
     let mut first_error: Option<String> = None;
     let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
-    if let Some(err) = expansion_errors.first() {
+    let expansion_warning = if let Some(err) = expansion_errors.first() {
         if paths.is_empty() {
             crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
             app.set_status(err.clone());
             return;
         }
-        app.set_status(format!("{}; continuing with queueable sources", err));
-    }
+        log::warn!("queue expansion warning: {err}");
+        Some(err.clone())
+    } else {
+        None
+    };
     for path in paths {
         let is_synthetic_cue_artifact = synthetic_cue_artifacts.contains(&path);
         let archive_password = if crate::is_encrypted_archive_ext(&path) {
@@ -6211,13 +6214,19 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
         }
     }
 
-    if errors == 0 {
-        app.set_status(format!("Queued {} files", count));
+    let mut status = if errors == 0 {
+        format!("Queued {} files", count)
     } else if let Some(message) = first_error {
-        app.set_status(format!("Queued {} files; {} failed; {}", count, errors, message));
+        format!("Queued {} files; {} failed; {}", count, errors, message)
     } else {
-        app.set_status(format!("Queued {} files; {} failed", count, errors));
+        format!("Queued {} files; {} failed", count, errors)
+    };
+    if let Some(warning) = expansion_warning {
+        // A separate set_status is overwritten by this one in the same
+        // reducer pass; fold the expansion warning into the visible status.
+        status = format!("{status} — note: {warning}");
     }
+    app.set_status(status);
     app.save_queue();
 }
 
@@ -7087,10 +7096,17 @@ fn execute_commit_with_source_options_transform(
         // :Commit — start processing if not already active, land on Queue.
         if !app.processing_active {
             super::convert_actions::start_processing(app, tx);
-            app.set_status(format!(
+            let mut status = format!(
                 "Processing {} file(s) → {}",
                 outcome.enqueued, format_name
-            ));
+            );
+            if outcome.errors > 0 {
+                status.push_str(&format!("; {} error(s)", outcome.errors));
+                if let Some(err) = &outcome.last_error {
+                    status.push_str(&format!("; last error: {err}"));
+                }
+            }
+            app.set_status(status);
         } else {
             app.set_status(format!("{} (processing active)", success_status));
         }
@@ -12051,9 +12067,16 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(d) = depth {
-                app.convert.format.bit_depth.select_value(&d);
-                app.preset.mark_modified();
-                app.set_status(format!("depth = {}", value));
+                if app.convert.format.bit_depth.select_value(&d) {
+                    app.preset.mark_modified();
+                    app.set_status(format!("depth = {}", value));
+                } else {
+                    app.set_status(format!(
+                        "depth {} is not available for {}",
+                        value,
+                        app.convert.format.format.selected_label()
+                    ));
+                }
             } else {
                 app.set_status(format!(
                     "Unknown depth: {}. Try: 16, 24, 32, 32f, 64f",

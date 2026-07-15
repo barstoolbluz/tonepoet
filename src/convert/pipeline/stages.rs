@@ -1546,13 +1546,34 @@ struct PostEncodeValidation {
 fn expected_post_encode_depth_for_track(
     track: &PreparedTrack,
     settings: &tonepoet_pipeline::PipelineSettings,
-) -> Option<tonepoet_pipeline::PcmBitDepth> {
+) -> Option<PostEncodeDepthExpectation> {
     match settings.target_bit_depth {
-        tonepoet_pipeline::BitDepthTarget::Pcm(depth) => Some(depth),
+        tonepoet_pipeline::BitDepthTarget::Pcm(depth) => Some(PostEncodeDepthExpectation {
+            depth,
+            // Explicit user request: the sample-format CLASS (int vs float)
+            // must match exactly.
+            class_strict: true,
+        }),
         tonepoet_pipeline::BitDepthTarget::Source => {
-            pcm_bit_depth_from_source_bits(track.bit_depth.or(track.source_audio.bit_depth))
+            pcm_bit_depth_from_source_bits(track.bit_depth.or(track.source_audio.bit_depth)).map(
+                |depth| PostEncodeDepthExpectation {
+                    depth,
+                    // Probes store float sources as plain 32-bit with no float
+                    // marker, so "same as source" can only assert the WIDTH:
+                    // a float-preserving passthrough measuring Float32 against
+                    // a source-resolved Int32 is correct output, while a real
+                    // 32 -> 24 downgrade still fails.
+                    class_strict: false,
+                },
+            )
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PostEncodeDepthExpectation {
+    depth: tonepoet_pipeline::PcmBitDepth,
+    class_strict: bool,
 }
 
 fn pcm_bit_depth_from_source_bits(bits: Option<u32>) -> Option<tonepoet_pipeline::PcmBitDepth> {
@@ -1605,7 +1626,7 @@ async fn validate_encoded_output(
 async fn validate_encoded_output_with_tool_limits(
     out_path: &Path,
     expected_samples: Option<PostEncodeSampleExpectation>,
-    expected_depth: Option<tonepoet_pipeline::PcmBitDepth>,
+    expected_depth: Option<PostEncodeDepthExpectation>,
     target_format: &tonepoet_pipeline::AudioFormat,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
@@ -1684,17 +1705,32 @@ async fn validate_encoded_output_with_tool_limits(
         measured_pcm_depth(&probe)
     };
 
-    if let Some(expected_depth) = expected_depth {
-        let measured = measured_depth.ok_or_else(|| {
-            ConvertError::TrackValidation(format!(
+    if let Some(expectation) = expected_depth {
+        let Some(measured) = measured_depth else {
+            if matches!(target_format, tonepoet_pipeline::AudioFormat::WavPack) {
+                // The wvunpack oracle was unavailable (see
+                // probe_wavpack_depth_with_tool_limits); measurement is
+                // best-effort there, and the ffprobe fallback cannot
+                // distinguish 24-bit WavPack from its decoded s32p form.
+                return Ok(PostEncodeValidation {
+                    samples: actual,
+                    measured_depth: None,
+                });
+            }
+            return Err(ConvertError::TrackValidation(format!(
                 "post-encode depth validation failed for {}: no usable sample format/depth (codec={:?}, sample_fmt={:?})",
                 out_path.display(), probe.codec_name, probe.sample_fmt
-            ))
-        })?;
-        if measured != expected_depth {
+            )));
+        };
+        let matches = if expectation.class_strict {
+            measured == expectation.depth
+        } else {
+            measured.bits() == expectation.depth.bits()
+        };
+        if !matches {
             return Err(ConvertError::TrackValidation(format!(
                 "post-encode depth mismatch for {}: requested {:?}, measured {:?} (codec={:?}, sample_fmt={:?}, bits_per_raw_sample={:?})",
-                out_path.display(), expected_depth, measured, probe.codec_name, probe.sample_fmt, probe.bits_per_raw_sample
+                out_path.display(), expectation.depth, measured, probe.codec_name, probe.sample_fmt, probe.bits_per_raw_sample
             )));
         }
     }
@@ -1810,6 +1846,18 @@ async fn probe_wavpack_depth_with_tool_limits(
         Err(ToolRunnerError::Cancelled { .. }) => {
             return Err(ConvertError::Realize("cancelled".to_string()));
         }
+        Err(ToolRunnerError::Spawn { .. }) => {
+            // wvunpack is the only oracle that distinguishes 24-bit WavPack
+            // from its decoded s32p representation. On machines without it,
+            // depth measurement is best-effort: skip the assertion (the log
+            // then falls back to the planned depth) rather than failing every
+            // WavPack conversion after a successful encode.
+            log::warn!(
+                "wvunpack unavailable; skipping post-encode WavPack depth verification for {}",
+                out_path.display()
+            );
+            return Ok(None);
+        }
         Err(err) => {
             return Err(ConvertError::TrackValidation(format!(
                 "post-encode WavPack depth validation failed for {}: wvunpack probe failed: {err}",
@@ -1843,7 +1891,9 @@ fn parse_wvunpack_source_depth(text: &str) -> Option<tonepoet_pipeline::PcmBitDe
             continue;
         }
         let lower = trimmed.to_ascii_lowercase();
-        let bit_pos = lower.find("-bit")?;
+        let Some(bit_pos) = lower.find("-bit") else {
+            continue;
+        };
         let prefix = lower[..bit_pos].trim_end();
         let digits = prefix
             .chars()
@@ -14225,11 +14275,23 @@ fn conversion_summary(
         None
     } else {
         resolved_target_bit_depth(track, req.settings.target_bit_depth)
+            .or_else(|| match req.settings.target_bit_depth {
+                // Log-local fallback only: the summary may consult the
+                // source descriptor for Source targets without leaking that
+                // fallback into naming templates.
+                BitDepthTarget::Source => track.source_audio.bit_depth,
+                BitDepthTarget::Pcm(_) => None,
+            })
     };
     let target_depth = verified_output_bit_depth
         .map(tonepoet_pipeline::PcmBitDepth::bits)
         .or(planned_target_depth);
+    let planned_float_target = match req.settings.target_bit_depth {
+        BitDepthTarget::Pcm(depth) if depth.is_float() => Some(depth),
+        _ => None,
+    };
     let target_stream = verified_output_bit_depth
+        .or(planned_float_target)
         .map(|depth| measured_target_stream_description(depth, target_rate))
         .unwrap_or_else(|| target_stream_description(track, target_depth, target_rate, &req.settings));
     let mut summary = format!(
@@ -14378,8 +14440,11 @@ fn resolved_target_rate_hz(
 }
 
 fn resolved_target_bit_depth(track: &PreparedTrack, target: BitDepthTarget) -> Option<u32> {
+    // Shared by naming templates and the publish path — keep the strict
+    // track-probed depth here. The conversion-log summary applies its own
+    // source_audio fallback locally (log-only concern).
     match target {
-        BitDepthTarget::Source => track.bit_depth.or(track.source_audio.bit_depth),
+        BitDepthTarget::Source => track.bit_depth,
         BitDepthTarget::Pcm(depth) => Some(depth.bits()),
     }
 }
@@ -45050,21 +45115,20 @@ mod validate_encoded_output_tests {
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
 
         track.bit_depth = Some(24);
-        assert_eq!(
-            expected_post_encode_depth_for_track(&track, &settings),
-            Some(tonepoet_pipeline::PcmBitDepth::Int24)
-        );
+        let expectation = expected_post_encode_depth_for_track(&track, &settings).expect("depth");
+        assert_eq!(expectation.depth, tonepoet_pipeline::PcmBitDepth::Int24);
+        assert!(!expectation.class_strict, "Source targets assert width only");
 
         track.bit_depth = Some(320);
         assert_eq!(
-            expected_post_encode_depth_for_track(&track, &settings),
+            expected_post_encode_depth_for_track(&track, &settings).map(|e| e.depth),
             Some(tonepoet_pipeline::PcmBitDepth::Float32)
         );
 
         track.bit_depth = None;
         track.source_audio.bit_depth = Some(24);
         assert_eq!(
-            expected_post_encode_depth_for_track(&track, &settings),
+            expected_post_encode_depth_for_track(&track, &settings).map(|e| e.depth),
             Some(tonepoet_pipeline::PcmBitDepth::Int24)
         );
     }
@@ -45086,7 +45150,10 @@ mod validate_encoded_output_tests {
         let validation = validate_encoded_output_with_tool_limits(
             &out,
             Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(192_000))),
-            Some(tonepoet_pipeline::PcmBitDepth::Int32),
+            Some(PostEncodeDepthExpectation {
+                depth: tonepoet_pipeline::PcmBitDepth::Int32,
+                class_strict: true,
+            }),
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,
             &cancel,
@@ -45116,7 +45183,10 @@ mod validate_encoded_output_tests {
         let validation = validate_encoded_output_with_tool_limits(
             &out,
             Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(192_000))),
-            Some(tonepoet_pipeline::PcmBitDepth::Float32),
+            Some(PostEncodeDepthExpectation {
+                depth: tonepoet_pipeline::PcmBitDepth::Float32,
+                class_strict: true,
+            }),
             &tonepoet_pipeline::AudioFormat::Aiff,
             &runner,
             &cancel,
@@ -45148,7 +45218,10 @@ mod validate_encoded_output_tests {
         let validation = validate_encoded_output_with_tool_limits(
             &out,
             Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
-            Some(tonepoet_pipeline::PcmBitDepth::Int24),
+            Some(PostEncodeDepthExpectation {
+                depth: tonepoet_pipeline::PcmBitDepth::Int24,
+                class_strict: true,
+            }),
             &tonepoet_pipeline::AudioFormat::WavPack,
             &runner,
             &cancel,
@@ -45181,7 +45254,10 @@ mod validate_encoded_output_tests {
         let validation = validate_encoded_output_with_tool_limits(
             &out,
             Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
-            Some(tonepoet_pipeline::PcmBitDepth::Int24),
+            Some(PostEncodeDepthExpectation {
+                depth: tonepoet_pipeline::PcmBitDepth::Int24,
+                class_strict: true,
+            }),
             &tonepoet_pipeline::AudioFormat::WavPack,
             &runner,
             &cancel,
@@ -45243,7 +45319,10 @@ mod validate_encoded_output_tests {
         let result = validate_encoded_output_with_tool_limits(
             &out,
             Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(192_000))),
-            Some(tonepoet_pipeline::PcmBitDepth::Int32),
+            Some(PostEncodeDepthExpectation {
+                depth: tonepoet_pipeline::PcmBitDepth::Int32,
+                class_strict: true,
+            }),
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,
             &cancel,

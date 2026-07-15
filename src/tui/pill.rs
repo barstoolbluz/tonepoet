@@ -73,12 +73,17 @@ impl<T: Clone + PartialEq> PillState<T> {
     }
 
     /// Select by value
-    pub fn select_value(&mut self, value: &T) {
+    /// Select the option carrying `value`. Returns whether the selection was
+    /// applied — disabled or unknown options are refused, and callers that
+    /// echo the change to the user must not report success for a refusal.
+    pub fn select_value(&mut self, value: &T) -> bool {
         if let Some(idx) = self.options.iter().position(|o| &o.value == value) {
             if self.options[idx].enabled {
                 self.selected = idx;
+                return true;
             }
         }
+        false
     }
 
     /// Set enabled state for a specific value

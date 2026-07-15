@@ -762,6 +762,18 @@ impl ConversionManager {
             for artifact in &cleaned_after_completed_skip {
                 caller_owned.remove(artifact);
             }
+            // Skip-transferred artifacts were registered to LIVE existing
+            // queue items that are NOT rolled back; returning them to caller
+            // ownership would double-own them and a later source replacement
+            // would delete a live queue input.
+            for artifact in &transferred {
+                let released_to_caller = transferred_by_item
+                    .iter()
+                    .any(|(_, path)| path == artifact);
+                if !released_to_caller {
+                    caller_owned.remove(artifact);
+                }
+            }
             outcome.enqueued = 0;
             outcome.last_error = Some(reason);
 
@@ -816,6 +828,18 @@ impl ConversionManager {
             let mut caller_owned = source_synthetic_cue_artifacts.clone();
             for artifact in &cleaned_after_completed_skip {
                 caller_owned.remove(artifact);
+            }
+            // Skip-transferred artifacts were registered to LIVE existing
+            // queue items that are NOT rolled back; returning them to caller
+            // ownership would double-own them and a later source replacement
+            // would delete a live queue input.
+            for artifact in &transferred {
+                let released_to_caller = transferred_by_item
+                    .iter()
+                    .any(|(_, path)| path == artifact);
+                if !released_to_caller {
+                    caller_owned.remove(artifact);
+                }
             }
             outcome.enqueued = 0;
             outcome.last_error = Some(format!(

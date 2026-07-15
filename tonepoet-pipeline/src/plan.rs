@@ -1174,9 +1174,21 @@ fn plan_from_dsd(
         }
     };
     let target_depth = resolve_target_bit_depth(request);
+    reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
 
+    // Combos sox silently substitutes (FLAC 32-bit -> 24; AIFF float -> int)
+    // must NOT take the direct sox DsdToPcm-to-final branch: route them
+    // through the WAV intermediate so the final EncodePcm step carries the
+    // per-tool eligibility and ffmpeg encoder flags (D1/D4).
+    let sox_silently_substitutes = matches!(
+        (&request.settings.target_format, target_depth),
+        (AudioFormat::Flac, PcmBitDepth::Int32)
+            | (AudioFormat::Aiff, PcmBitDepth::Float32 | PcmBitDepth::Float64)
+            | (AudioFormat::WavPack, PcmBitDepth::Float32 | PcmBitDepth::Float64)
+    );
     if request.settings.target_format.is_pcm_lossless()
         && request.settings.target_format.sox_encodable()
+        && !sox_silently_substitutes
     {
         push_step(
             steps,
@@ -1229,6 +1241,7 @@ fn plan_from_pcm(
 ) -> Result<()> {
     let processing_rate = rate_change_for_pcm(request);
     let target_depth = resolve_target_bit_depth(request);
+    reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
     let depth_change = match request.settings.target_bit_depth {
         BitDepthTarget::Source => false,
         BitDepthTarget::Pcm(depth) => request.source.bit_depth != Some(depth),
@@ -1480,6 +1493,29 @@ fn push_step(
     steps.push(PlanStep::new(index, operation, input, output, description));
 }
 
+/// Reject resolved depths that no available encoder honors — the explicit
+/// settings validation only sees `BitDepthTarget::Pcm(...)`; a
+/// `BitDepthTarget::Source` over a 32-bit source resolves AFTER validation
+/// and must not become a silent encoder downgrade (the ALAC 32->24 door).
+fn reject_unsupported_resolved_depth(
+    format: &AudioFormat,
+    depth: PcmBitDepth,
+) -> Result<()> {
+    match (format, depth) {
+        (AudioFormat::Alac, PcmBitDepth::Int32) => Err(PlanningError::invalid_settings(
+            "target_bit_depth",
+            "ALAC 32-bit is not supported by available encoders; choose 24-bit or WavPack/WAV (source resolves to 32-bit)",
+        )),
+        (AudioFormat::WavPack, PcmBitDepth::Float32 | PcmBitDepth::Float64) => {
+            Err(PlanningError::invalid_settings(
+                "target_bit_depth",
+                "WavPack float output is not supported by the conversion carrier; choose 32-bit integer or WAV",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn resolve_target_bit_depth(request: &PlanRequest) -> PcmBitDepth {
     match request.settings.target_bit_depth {
         BitDepthTarget::Source => request
@@ -1511,6 +1547,30 @@ fn resolve_target_dsd_rate(request: &PlanRequest) -> Result<DsdRate> {
             "target_sample_rate",
             "DSD targets cannot use a PCM rate",
         )),
+    }
+}
+
+#[cfg(test)]
+mod resolved_depth_rejection_tests {
+    use super::*;
+    use crate::enums::{AudioFormat, PcmBitDepth};
+
+    #[test]
+    fn alac_int32_resolved_from_source_is_rejected_at_plan_time() {
+        // The settings validator only sees BitDepthTarget::Pcm; a Source
+        // target over a 32-bit source resolves AFTER validation and must be
+        // rejected here instead of silently downgrading at the encoder.
+        let err = reject_unsupported_resolved_depth(&AudioFormat::Alac, PcmBitDepth::Int32)
+            .expect_err("resolved ALAC Int32 must fail closed");
+        assert!(err.to_string().contains("ALAC 32-bit"), "{err}");
+    }
+
+    #[test]
+    fn honored_resolved_depths_pass() {
+        reject_unsupported_resolved_depth(&AudioFormat::Alac, PcmBitDepth::Int24).expect("alac 24");
+        reject_unsupported_resolved_depth(&AudioFormat::Flac, PcmBitDepth::Int32).expect("flac 32");
+        reject_unsupported_resolved_depth(&AudioFormat::WavPack, PcmBitDepth::Int32).expect("wv 32");
+        reject_unsupported_resolved_depth(&AudioFormat::Aiff, PcmBitDepth::Float32).expect("aiff f32");
     }
 }
 

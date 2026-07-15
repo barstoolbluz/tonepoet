@@ -3677,9 +3677,18 @@ fn step_dsd_to_pcm_gain_db(value: &mut f32, delta: f32) {
 
 fn clamp_pill<T: Clone + PartialEq>(pill: &mut PillState<T>) {
     if !pill.options[pill.selected].enabled {
+        // Prefer the nearest enabled option BELOW the disabled selection
+        // (quality-ordered pills like bit depth degrade gracefully: FLAC+32
+        // switching to ALAC lands on 24, not wrapped-around 16), then scan
+        // upward.
+        for idx in (0..pill.selected).rev() {
+            if pill.options[idx].enabled {
+                pill.selected = idx;
+                return;
+            }
+        }
         let len = pill.options.len();
-        for i in 1..len {
-            let idx = (pill.selected + i) % len;
+        for idx in (pill.selected + 1)..len {
             if pill.options[idx].enabled {
                 pill.selected = idx;
                 return;

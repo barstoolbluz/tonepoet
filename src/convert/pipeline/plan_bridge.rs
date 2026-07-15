@@ -110,14 +110,21 @@ pub fn plan_request_for_track(
     // ReplayGain remains orchestrator-owned because album mode requires all
     // completed tracks.
     settings.replay_gain.mode = None;
-    if matches!(settings.target_bit_depth, BitDepthTarget::Source) {
+    if matches!(settings.target_bit_depth, BitDepthTarget::Source)
+        && !settings.target_format.is_dsd()
+    {
+        // "Same as source" means the PROBED source depth. `source.bit_depth`
+        // is carrier-first (always Int32 for CUE segments) and must not leak
+        // here: an unknown-depth image (e.g. a lossy CUE image) would resolve
+        // to Int32, hard-failing ALAC and emitting decoder-hostile 32-bit
+        // FLAC. Unknown resolves to the format's conservative default.
         let resolved_source_depth = track
             .bit_depth
             .and_then(pcm_bit_depth_from_u32)
-            .or(source.bit_depth);
-        if let Some(depth) = resolved_source_depth {
-            settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-        }
+            .unwrap_or_else(|| {
+                tonepoet_pipeline::default_pcm_depth_for_format(&settings.target_format)
+            });
+        settings.target_bit_depth = BitDepthTarget::Pcm(resolved_source_depth);
     }
     settings
         .validate()
@@ -534,6 +541,11 @@ pub fn source_info_for_realized_track(
     let bit_depth = if is_dsd {
         None
     } else {
+        // Carrier-first is deliberate for PLANNING: the realized input is the
+        // s32 staging WAV, and depth-conversion arguments are decided against
+        // it (a 16-bit target from an s32 carrier still needs explicit depth
+        // args). BitDepthTarget::Source resolution must NOT read this value —
+        // it resolves from the true probed track depth below.
         cue_pcm_segment_carrier_bit_depth(track)
             .or(track.bit_depth)
             .and_then(pcm_bit_depth_from_u32)

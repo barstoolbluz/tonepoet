@@ -915,6 +915,43 @@ pub fn default_pcm_depth_for_format(format: &AudioFormat) -> PcmBitDepth {
 
 
 #[cfg(test)]
+mod depth_honesty_validation_tests {
+    use super::*;
+    use crate::enums::{AudioFormat, BitDepthTarget, PcmBitDepth};
+
+    #[test]
+    fn alac_int32_is_rejected_with_actionable_message() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Alac;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        let err = settings.validate().expect_err("ALAC 32-bit must fail closed");
+        assert!(err.to_string().contains("ALAC 32-bit"), "{err}");
+    }
+
+    #[test]
+    fn wavpack_float_targets_are_rejected() {
+        for depth in [PcmBitDepth::Float32, PcmBitDepth::Float64] {
+            let mut settings = PipelineSettings::default();
+            settings.target_format = AudioFormat::WavPack;
+            settings.target_bit_depth = BitDepthTarget::Pcm(depth);
+            settings.validate().expect_err("WavPack float must fail closed");
+        }
+    }
+
+    #[test]
+    fn flac_int32_and_aiff_float_remain_valid_settings() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.validate().expect("FLAC 32-bit is honored, not rejected");
+
+        settings.target_format = AudioFormat::Aiff;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        settings.validate().expect("AIFF float is honored, not rejected");
+    }
+}
+
+#[cfg(test)]
 mod ssrc_rate_dependent_dither_validation_tests {
     use super::*;
 
