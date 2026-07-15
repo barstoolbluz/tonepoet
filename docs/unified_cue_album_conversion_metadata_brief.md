@@ -24,9 +24,10 @@ worker-only reducer rule, lofty-only tag writes, complete-file delivery
 with IMPLEMENTATION_REPORT.md. ONE CHANGE to the frozen-pipeline rule:
 src/convert/pipeline/materializer_cue.rs and (minimally, only for the
 extra-metadata passthrough) src/convert/pipeline/types.rs are IN SCOPE
-for G2. src/convert/pipeline/stages.rs remains frozen — G2 must work
-through data (AlbumMetadata) consumed by existing stages code, not by
-editing stages.rs.
+for G2, and EXACTLY ONE function in src/convert/pipeline/stages.rs is
+unfrozen for G2's real-tag emission: `authoritative_metadata_tags`
+(stages.rs:3801; plus `is_internal_metadata_extra_key` at 3790 if a new
+key must stay internal). Nothing else in stages.rs may change.
 
 ## Real-tree evidence (user's conversion output)
 
@@ -48,7 +49,7 @@ CATALOGNUMBER, no RELEASECOUNTRY, no MB IDs, no ORIGINALYEAR.
 ## sidecars, ignoring the members' saved embedded sheet
 
 src/convert/queue_expansion.rs: `generate_queue_synthetic_cue_album`
-(FILE emission ~825) builds the synthetic album.cue for a merged group
+(843; FILE emission ~890) builds the synthetic album.cue for a merged group
 from the SIDECAR cues: merged title via the common-prefix helper,
 tracks/titles from sidecar TRACK blocks. The editor's durable album
 truth — the identical embedded concatenated CUESHEET on every member
@@ -59,14 +60,26 @@ album identity even though the user saved the right one.
 Required: extend the hardening round's F1 authority rule to PLANNING.
 When every member image of a merged group carries an embedded CUESHEET,
 the texts are IDENTICAL, and the text parses to a multi-FILE sheet
-whose FILE set matches the group's member images (same resolution the
-editor uses — reuse/share the F1 helper from keybindings rather than
-reimplementing; hoist it into src/convert/split_cue_album.rs or another
-convert-layer home so both editor and planner call ONE implementation),
-then the synthetic album.cue artifact CONTENT is that embedded text
-with each FILE reference rewritten to the member image's absolute path
-(the same absolute-path emission and `"`-fail-closed policy the
-generator already applies). Sidecar regeneration remains the fallback
+whose FILE set matches the group's member images, then the synthetic
+album.cue artifact CONTENT is that embedded text with each FILE
+reference rewritten to the member image's absolute path (the same
+absolute-path emission and `"`-fail-closed policy the generator already
+applies).
+
+IMPLEMENTATION NOTE (audited): the editor's F1 helper
+`cue_album_authoritative_embedded_cuesheet` (src/tui/keybindings.rs:9776)
+is NOT directly hoistable — it validates against the TUI's
+CueAlbumSyntheticSheet via `validate_unified_cue_album_edit_identity`
+and uses the TUI cue parser. Implement the planner-side authority check
+in src/convert/split_cue_album.rs (or queue_expansion.rs) on
+`crate::convert::cue_parser` types, mirroring the SAME rules: every
+member's embedded text present, trimmed texts identical, parses to a
+multi-FILE sheet, FILE references resolve to exactly the group's member
+images (same resolution the planner already uses for sidecar FILE
+refs), plausible track structure. Add a consistency test asserting the
+planner-side check and the editor-side helper accept/reject the same
+fixture set (identical / differing / stale-subset), so the two layers
+cannot drift. Sidecar regeneration remains the fallback
 for: any member missing the sheet, texts differing, parse failure,
 FILE-set mismatch. Track selection/explicit single-cue bypass behavior
 unchanged.
@@ -115,14 +128,31 @@ Required:
   order (consistent with the existing field merges at 2155); a
   conflict (differing non-empty values) logs and keeps the first.
 - Flow the merged extras into `AlbumMetadata.extra` in
-  `cue_album_metadata` under the key names the naming/labels/tag
-  layers already understand — inspect how `extra` keys become output
-  tags and template tokens (labels enrichment fills gaps only;
-  tag-sourced values take priority) and use the existing key
-  conventions (e.g. `catalog`) rather than inventing new ones. Sheet
-  CATALOG wins over tag CATALOGNUMBER when both exist (the sheet is
-  the editor's regenerated truth); tags fill what the sheet cannot
-  express.
+  `cue_album_metadata` using the existing lowercase key convention
+  (`catalog` is the precedent). Sheet CATALOG wins over tag
+  CATALOGNUMBER when both exist (the sheet is the editor's regenerated
+  truth); tags fill what the sheet cannot express.
+- AUDITED MECHANISM you must extend: `authoritative_metadata_tags`
+  (stages.rs:3801) emits `extra` keys as PREFIXED tags via
+  `cue_extra_tag_key("ALBUM", key)` — i.e. TONEPOET_ALBUM_<KEY>; only
+  `catalog` has a real-tag special case (line ~3889 emits CATALOG).
+  Without extending it, RELEASECOUNTRY etc. would surface as
+  TONEPOET_ALBUM_RELEASECOUNTRY, which fails the user-visible goal.
+  Add real-tag mappings in that one function for the whitelisted keys:
+  catalognumber → CATALOGNUMBER, releasecountry → RELEASECOUNTRY,
+  originalyear/originaldate → ORIGINALYEAR/ORIGINALDATE,
+  musicbrainz_albumid → MUSICBRAINZ_ALBUMID, musicbrainz_albumartistid
+  → MUSICBRAINZ_ALBUMARTISTID, musicbrainz_releasegroupid →
+  MUSICBRAINZ_RELEASEGROUPID (ALBUMARTIST flows via the existing
+  album_artist field — do not duplicate). Keys outside the whitelist
+  keep today's prefixed behavior. Mirror the existing `catalog`
+  special-case shape; suppress the generic prefixed emission for keys
+  you map (no double tags).
+- GOOD NEWS you must NOT re-implement: `%ALBUM%`/`%TITLE_EXTRA%`
+  resolve from the album string via `album_and_title_extra_for_template`
+  (stages.rs:30928) / `extract_title_extra` (31489) — with G1 fixed the
+  sheet TITLE carries the parenthetical pressing info and naming works
+  untouched. Do not modify naming/token code.
 - Precedence for the classic fields stays sheet-first (with G1 the
   sheet now carries the editor's values); image tags remain the
   fallback exactly as today.
@@ -134,7 +164,12 @@ Tests (materializer_cue unit tests, mirror the existing
 cue_album_metadata/merge tests): image tags with the whitelisted keys →
 extras present in AlbumMetadata.extra with sheet-CATALOG precedence;
 conflicting member values → first non-empty + no panic; per-track keys
-(ISRC, MUSICBRAINZ_TRACKID) never copied. Plus one boundary-test
+(ISRC, MUSICBRAINZ_TRACKID) never copied. Also unit-test the real-tag
+emission: `authoritative_metadata_tags` with an album whose extras
+carry the whitelisted keys emits CATALOGNUMBER/RELEASECOUNTRY/
+ORIGINALYEAR/MB album-ID tags as REAL tag keys (and does NOT also emit
+the TONEPOET_ALBUM_-prefixed duplicates for them), while an
+unrecognized extra key keeps the prefixed form. Plus one boundary-test
 extension in tests/unified_synthetic_cue_output_boundary.rs: write an
 ALBUM + CATALOGNUMBER tag onto the member images (lofty), convert, and
 assert the published album dir name / conversion output reflect the
@@ -155,18 +190,18 @@ un-normalized display names: `Year` alongside `DATE`, `Album Artist`
 alongside `ALBUMARTIST`.
 
 Required, in the unified builder (src/tui/keybindings.rs,
-build_metadata_editor_for_cue_surfaces ~9863 and its upsert helpers):
+build_metadata_editor_for_cue_surfaces at 10146 and its upsert helpers):
 - Normalize display keys before upserting so loaded file tags and
   builder-created rows collapse into ONE row per logical key (Year →
   DATE, Album Artist → ALBUMARTIST — find the existing normalization
   the plain editor uses in probe.rs read_all_tags_merged and reuse it;
   do not write a second mapping table).
-- After assembly, order entries by the SAME canonical order the plain
-  multi-file editor produces (locate the existing ordering — the plain
-  editor's shape in the user's correct-order screenshot comes from the
-  probe.rs merge path; reuse that ordering fn or extract it) with the
-  unified extras (ISRC, CUE MERGE NOTES, CUESHEET, + Add field) in
-  their existing relative positions at the tail.
+- After assembly, order entries with the SAME machinery the plain
+  multi-file editor uses — `STANDARD_KEY_ORDER` +
+  `sort_entries_by_standard_order` (src/tui/probe.rs:5662 / 5738,
+  pub(super)) — with the unified extras (ISRC is already in
+  STANDARD_KEY_ORDER; CUE MERGE NOTES and CUESHEET at the tail) in
+  their existing relative positions. Do not write a second order table.
 - Cursor/detail focus indices and the CUESHEET-row helpers must keep
   working after reordering (they resolve by display_key, verify).
 
@@ -182,11 +217,14 @@ DSOTM tree (current saved state: identical embedded sheets with full
 album title + CATALOG on both images; file tags carry the full album
 set):
 - Convert folder → output folder named `Pink Floyd - The Dark Side of
-  the Moon (Japan Toshiba Harvest-Odeon EOP-80778 LP / 24-192) (1973)
-  [FLAC] {...}`-shaped per the user's template (full ALBUM, TITLE_EXTRA
-  populated by label enrichment), and mediainfo on track 01 shows the
-  full Album string, CATALOGNUMBER, RELEASECOUNTRY, ORIGINALYEAR, MB
-  album IDs.
+  the Moon (1973) [FLAC] {Japan Toshiba Harvest-Odeon EOP-80778 LP
+  24-192}`-shaped per the user's template — `extract_title_extra`
+  deliberately splits the album's parenthetical into %TITLE_EXTRA%, so
+  %ALBUM% renders the base title and the pressing info lands in the
+  braces (this is the user's originally requested shape). mediainfo on
+  track 01 shows the full Album string (tags keep the parenthetical),
+  CATALOGNUMBER, RELEASECOUNTRY, ORIGINALYEAR, and MB album IDs as
+  real tag keys.
 - Edit metadata → field order matches the plain editor's canonical
   order; single DATE row, single ALBUMARTIST row.
 - Suite green; zero cold warnings; boundary tests (incl. the new G2
@@ -196,7 +234,10 @@ set):
 
 Complete files at baseline d28f081. Modify: src/convert/queue_expansion.rs,
 src/convert/split_cue_album.rs, src/convert/pipeline/materializer_cue.rs,
-src/convert/pipeline/types.rs (only if needed), src/tui/keybindings.rs,
+src/convert/pipeline/types.rs (only if needed),
+src/convert/pipeline/stages.rs (ONLY authoritative_metadata_tags /
+is_internal_metadata_extra_key per the G2 unfreeze — deliver the whole
+file as usual but change nothing else in it), src/tui/keybindings.rs,
 src/tui/probe.rs, tests/unified_synthetic_cue_output_boundary.rs.
 Reference-only: src/convert/pipeline/mod.rs, src/convert/mod.rs,
 src/convert/cue_parser.rs, src/tui/cue_parser.rs, src/tui/command.rs,
