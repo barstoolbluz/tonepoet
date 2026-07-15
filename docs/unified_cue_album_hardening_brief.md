@@ -1,4 +1,4 @@
-# Brief: unified synthetic cue album — hardening round (13 audited findings)
+# Brief: unified synthetic cue album — hardening round (15 audited findings)
 
 Date: 2026-07-14. For a fresh reasoning-model session. Baseline: branch
 `working` at 36ff51a (a7251a2 unified model + f1a0780 title casing +
@@ -6,7 +6,9 @@ Date: 2026-07-14. For a fresh reasoning-model session. Baseline: branch
 sandbox CANNOT compile or run tests — the applier compiles, runs the
 suite, and validates on the real tree. Every finding below was
 adversarially audited and mechanically verified in the code at this
-baseline; line numbers refer to it.
+baseline; line numbers refer to it. Findings F1/F2 additionally have
+LIVE evidence from the user's real tree (see them), and F14/F15 are
+user-reported during real-tree verification with root causes verified.
 
 The unified-model core is sound (verified clean: grouping ladder
 order-independence, scavenger live-owner safety on Unix+Windows,
@@ -81,7 +83,11 @@ sheet only to the embedded CUESHEET tags of every member image
 returns None for multi-path, keybindings.rs:6352). So: edit track
 titles → save (embedded sheets updated) → close → reopen → editor shows
 pre-edit titles flagged dirty → any save reverts the user's saved work.
-User-verified on the real DSOTM tree.
+User-verified on the real DSOTM tree. LIVE EVIDENCE: the user's
+19:45 save (from a reopened editor) rewrote both wv images' embedded
+sheets from the sidecar-derived model; only luck (sidecar titles were
+already correct) prevented visible title loss, and their album-title
+edit did not survive into the sheet.
 
 Required authority rule: when EVERY member image carries an embedded
 CUESHEET, the texts are IDENTICAL, and that text parses to a multi-FILE
@@ -119,7 +125,14 @@ created absent get FILE dimension, then MB track 1's recording ID is
 written as image A's whole-file tag and track 2's as image B's — and
 because those entries ARE file-aligned, the save path persists the
 wrong values. MB tracks 3..10 are dropped. Pre-existing row-dim ISRC
-entries get only rows 0..1 populated.
+entries get only rows 0..1 populated. LIVE EVIDENCE (user's real tree,
+wvtag -l tdsotm_a.wv after their MB apply + save): whole-file APEv2
+tags now include MUSICBRAINZ_TRACKID/MUSICBRAINZ_RELEASETRACKID/ISRC
+GBAYE0300334/TRACKNUMBER 1 — MB track 1's identity persisted onto the
+side-A image, plus release-level Year 1992/RELEASECOUNTRY GB/
+CatalogNumber from the matched release. The fix must also leave the
+applier a documented cleanup path for already-polluted files (which
+managed keys a re-save should clear).
 
 Fix: give the supplemental pass the same dimension rule as the main
 populate (row count when `cue_album_synthetic_sheet.is_some()`), the
@@ -394,6 +407,70 @@ existing tabbed-branch tests use); regression: a unified state must
 NOT reach the plain-file TOC arm. Use the DSOTM-shaped fixture; no
 network (cache-body injection as in existing MB tests).
 
+## F14 — :cuesheet-edit corrupts the terminal on editor close (user-reported)
+
+The system-editor suspend/resume helper `open_in_editor`
+(src/tui/external_editor.rs:12) clears the whole terminal on resume and
+relies on the CALLER to set `app.force_redraw = true` so ratatui
+repaints fully — the `:edit-file` path does (src/tui/command.rs:5780),
+but the embedded-cuesheet edit call site (src/tui/keybindings.rs:11288,
+inside the `:cuesheet-edit` dispatch) never does, on ANY of its return
+paths. Result (user-observed): after the editor closes the screen is
+black except stray diff-painted words ("COMPOSER", "CUESHEET"). The
+edit itself is also perceived as not working — the strict unified
+identity validation (`validate_unified_cue_album_edit_identity`,
+keybindings.rs:11031) rejects structural changes with only a status
+line the user cannot see on the corrupted screen.
+
+Fix: (a) every return path of the embedded-edit flow (accept, reject,
+unchanged, error) must set `app.force_redraw = true` — restructure so
+the flow has access to `app` (it currently returns a status String;
+the caller must own the redraw), and add a sentinel-style source-scan
+test asserting every `open_in_editor(` call site in src/tui/ is
+followed by a force_redraw assignment in the same function; (b) make
+the reject status self-explanatory (what was rejected and why, and
+that the buffer was kept — the buffer path moves out of the album
+folder per F9).
+
+Tests: source-scan sentinel (pattern of command.rs ~16100) over
+keybindings.rs + command.rs for the call-site/redraw pairing; unit
+test for the reject path returning a message containing the reason and
+buffer path.
+
+## F15 — per-track metadata keys without a CUE slot are silently unpersistable (user-reported)
+
+Generalization of F3, user-observed with COMPOSER: on a unified
+surface, any per-track (row-dimensioned) entry whose key has no
+CUE-syntax representation (COMPOSER, arbitrary tags; today only
+TITLE/PERFORMER/ISRC/TRACKNUMBER map into TRACK blocks and
+ALBUM/DATE/GENRE/CATALOGNUMBER into the header) is skipped by BOTH
+persistence paths: the tag writer skips row-dim entries
+(src/tui/probe.rs:6577) and the sheet generator only emits its known
+keys (cue_album_generate_synthetic_cuesheet, keybindings.rs:9559+).
+The editor accepts the edit, save reports success, the value is gone.
+36ff51a's dirty-clear then marks the row saved.
+
+Required behavior — never silent loss; pick per key class:
+- Whitelist per-track keys with a defined CUE mapping as REM track
+  lines (e.g. `REM COMPOSER "…"` inside the TRACK block — parser
+  round-trip must be extended and byte-stability preserved; only do
+  this for keys you can round-trip: parse_cue must read them back into
+  the model, else the next rebuild loses them again).
+- Every other per-track key on a unified surface must be rejected AT
+  EDIT TIME with a status ("cannot persist per-track KEY on a
+  multi-image album") — the row renders read-only or the edit is
+  refused; it must not reach save.
+- Album-dim entries (file-aligned) keep writing to member-image tags
+  as today.
+
+Tests: (1) sheet generator round-trip with a whitelisted REM key —
+byte-stable parse∘generate; (2) editor-level: editing a
+non-whitelisted per-track key on the unified fixture is refused with a
+status and the entry stays clean; (3) regression: save over a surface
+with a non-whitelisted per-track row does NOT mark it saved (interacts
+with the app.rs:7566 branch — the guard from F5 extends here: only
+rows the sheet actually persisted may be marked saved).
+
 ## Minor/latent (fix if cheap, else note in report)
 
 - src/tui/command.rs:6126-6129: bare `retain` drops artifact ownership
@@ -434,6 +511,14 @@ Moon (LP, 24-192, Japanese EOP-80778)`), which now carries IDENTICAL
 saved concatenated sheets on both wv images from the user's session:
 - Reopen Edit metadata → unified surface shows the SAVED (MB) titles,
   dirty == false (F1).
+- Edit a track title + a COMPOSER row → save → wvtag shows the new
+  title in both embedded sheets; COMPOSER either persisted as a REM
+  line or was refused at edit time — never silently dropped (F15).
+- :cuesheet-edit → make a benign title change in $EDITOR → exit → TUI
+  fully repaints, change staged; make a structural change → reject
+  message readable, TUI intact (F14).
+- Applier cleanup: re-save clears the polluted whole-file MB track
+  tags from tdsotm_a.wv (F2 cleanup path).
 - :tags-mb inside the editor reaches concat-TOC or text fallback,
   never a bare no-match (F13).
 - Fail one conversion → retry succeeds (F6).
