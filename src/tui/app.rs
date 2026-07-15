@@ -2373,6 +2373,22 @@ impl SourceState {
         crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&artifacts);
     }
 
+    /// Relinquish source-side cleanup ownership without deleting the files.
+    ///
+    /// This is intentionally narrow: it is used only when queue admission has
+    /// already succeeded and a later ownership-inspection step fails. At that
+    /// point returning artifacts to `SourceState` would create duplicate
+    /// ownership: ordinary source replacement/drop cleanup could delete files
+    /// that queued conversion items now reference. Dropping source ownership is
+    /// therefore safer than deleting or retaining ambiguous ownership locally;
+    /// any true orphan is left for the manager/scavenger rather than risking a
+    /// live queue input.
+    pub fn release_synthetic_cue_artifacts_without_cleanup(
+        &mut self,
+    ) -> std::collections::HashSet<PathBuf> {
+        std::mem::take(&mut self.synthetic_cue_artifacts)
+    }
+
     pub fn cleanup_synthetic_cue_artifacts_not_in(&mut self, retained_paths: &[PathBuf]) {
         let mut removed = std::collections::HashSet::new();
         self.synthetic_cue_artifacts.retain(|path| {
@@ -2418,6 +2434,35 @@ impl Default for SourceState {
             cue_artifact_audio: std::collections::HashSet::new(),
             synthetic_cue_artifacts: std::collections::HashSet::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod source_state_synthetic_artifact_ownership_tests {
+    use super::SourceState;
+    use std::fs;
+
+    #[test]
+    fn release_synthetic_artifacts_without_cleanup_disarms_source_drop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact = temp.path().join("album.cue");
+        fs::write(&artifact, b"FILE \"a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n")
+            .expect("write synthetic cue");
+
+        let released = {
+            let mut source = SourceState::default();
+            source.synthetic_cue_artifacts.insert(artifact.clone());
+            let released = source.release_synthetic_cue_artifacts_without_cleanup();
+            assert!(released.contains(&artifact));
+            assert!(source.synthetic_cue_artifacts.is_empty());
+            released
+        };
+
+        assert!(released.contains(&artifact));
+        assert!(
+            artifact.exists(),
+            "released artifacts must survive SourceState drop/replacement cleanup"
+        );
     }
 }
 
@@ -6065,6 +6110,11 @@ pub struct PresentationTab {
     /// Unified split-CUE album state. Present only for same-folder CUE groups
     /// that the album-grouping ladder merged into one album surface.
     pub cue_album_synthetic_sheet: Option<CueAlbumSyntheticSheet>,
+    /// File-indexed managed whole-file track-scoped tags observed on load that
+    /// must be deleted during the next successful unified-album save. This is a
+    /// migration/cleanup plan for F2-era polluted files, not an unconditional
+    /// per-save tombstone list.
+    pub cue_album_forced_cleanup: Vec<(usize, lofty::tag::ItemKey)>,
 }
 
 impl Default for PresentationTab {
@@ -6094,6 +6144,7 @@ impl Default for PresentationTab {
             sidecar_cuesheet_shadow_present: false,
             pending_embedded_cuesheet_delete: false,
             cue_album_synthetic_sheet: None,
+            cue_album_forced_cleanup: Vec::new(),
         }
     }
 }
@@ -7531,6 +7582,13 @@ fn pending_embedded_cuesheet_delete_fully_saved(
     path_count > 0 && (0..path_count).all(|idx| saved_slots.contains(&idx))
 }
 
+fn unified_cue_album_per_track_key_is_persistable_for_dirty_clear(display_key: &str) -> bool {
+    matches!(
+        display_key.to_ascii_uppercase().as_str(),
+        "TITLE" | "ARTIST" | "ISRC"
+    )
+}
+
 fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections::BTreeSet<usize>) {
     if saved_slots.is_empty() {
         return;
@@ -7547,20 +7605,25 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
 
         if !file_aligned {
             let unified_cue_album_fully_saved = tab.cue_album_synthetic_sheet.is_some()
+                && !tab.pending_embedded_cuesheet_delete
                 && path_count > 0
                 && (0..path_count).all(|idx| saved_slots.contains(&idx));
+            let unified_row_persistable = unified_cue_album_per_track_key_is_persistable_for_dirty_clear(
+                &entry.display_key,
+            );
             if deleted.contains(&entry_idx) {
-                if unified_cue_album_fully_saved {
-                    // Unified CUE-album per-track/album rows are not written
-                    // as independent tag vectors; their delete operation is
+                if unified_cue_album_fully_saved && unified_row_persistable {
+                    // Unified CUE-album per-track rows are not written as
+                    // independent tag vectors; their delete operation is
                     // consumed by the regenerated embedded CUESHEET that was
-                    // just written to every member image.  Only then is it safe
-                    // to clear the non-file-aligned tombstone.
+                    // just written to every member image.  Only rows with a
+                    // defined generator mapping may clear their tombstone here.
                     remove_entries.push(entry_idx);
                 } else {
                     // A row-level delete for a non-file-aligned entry cannot be
-                    // safely reduced from partial path-keyed write results. Keep
-                    // the marker so retry state is preserved.
+                    // safely reduced from partial path-keyed write results, and
+                    // unsupported unified rows must not be reported saved. Keep
+                    // the marker so retry/error state is preserved.
                     retained_deleted.push(entry_idx);
                 }
             } else if path_count == 1 && saved_slots.contains(&0) {
@@ -7568,13 +7631,12 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
                 // per-slot retry state to preserve. Once the sole file saved,
                 // advance their originals with the rest of the surface.
                 mark_tag_entry_saved(entry);
-            } else if unified_cue_album_fully_saved {
-                // Unified CUE-album per-track rows (row-dimensioned, not
-                // path-keyed) persist through the regenerated embedded
-                // CUESHEET that was just written to every member image.
-                // Once every image saved, the row edits are durable; leaving
-                // originals stale here would keep the surface dirty forever
-                // and the editor could never close after a successful save.
+            } else if unified_cue_album_fully_saved && unified_row_persistable {
+                // Unified CUE-album per-track rows with a defined CUE mapping
+                // persist through the regenerated embedded CUESHEET that was
+                // just written to every member image. Unknown row-dimensioned
+                // keys must stay dirty; otherwise edits would appear saved
+                // while being skipped by both the tag writer and CUE generator.
                 mark_tag_entry_saved(entry);
             }
             continue;
@@ -7619,6 +7681,17 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
         if idx < tab.entries.len() {
             tab.entries.remove(idx);
         }
+    }
+
+    if tab.cue_album_synthetic_sheet.is_some() && !tab.cue_album_forced_cleanup.is_empty() {
+        // Whole-file track-scoped pollution is recorded per member image. A
+        // successful write result for a member image consumes only that image's
+        // cleanup entries; skipped or failed slots must keep their cleanup work
+        // for retry. This keeps cleanup-only saves idempotent when pollution is
+        // present on a subset of member images, and avoids rewriting already
+        // cleaned files after a partial save.
+        tab.cue_album_forced_cleanup
+            .retain(|(idx, _key)| !saved_slots.contains(idx));
     }
 }
 
@@ -7756,6 +7829,10 @@ pub struct MbSelectState {
     /// Audio file paths the lookup was computed for (used to populate
     /// the metadata editor after the user accepts).
     pub paths: Vec<std::path::PathBuf>,
+    /// Metadata-editor session that initiated this picker, when the picker
+    /// came from an in-editor asynchronous MusicBrainz lookup.  Accepting a
+    /// release must still match this session before mutating the parked editor.
+    pub editor_session: Option<crate::tui::message::MetadataEditorSessionGuard>,
     /// Last left-click on a row, used for double-click-to-accept
     /// detection. Skipped from Clone-derived semantics by being
     /// reset on each click cycle.
@@ -7780,11 +7857,20 @@ impl MbSelectState {
         releases: Vec<crate::tui::musicbrainz::MbRelease>,
         paths: Vec<std::path::PathBuf>,
     ) -> Self {
+        Self::new_with_editor_session(releases, paths, None)
+    }
+
+    pub fn new_with_editor_session(
+        releases: Vec<crate::tui::musicbrainz::MbRelease>,
+        paths: Vec<std::path::PathBuf>,
+        editor_session: Option<crate::tui::message::MetadataEditorSessionGuard>,
+    ) -> Self {
         Self {
             releases,
             selected: 0,
             scroll: 0,
             paths,
+            editor_session,
             last_click: None,
             prefetch: std::collections::BTreeMap::new(),
             generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -12955,6 +13041,194 @@ mod metadata_presentation_tab_tests {
             "row edits must stay pending until every member image carries the regenerated sheet"
         );
         assert!(state.active_surface().dirty, "partial save keeps the surface dirty for retry");
+    }
+
+
+    #[test]
+    fn unified_cue_album_tracknumber_edits_do_not_clear_as_saved() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: Vec::new(),
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state.active_surface_mut().entries.push(tag(
+            "TRACKNUMBER",
+            "<multiple values>",
+            vec!["01", "02", "03", "04"],
+        ));
+        let row_idx = state.active_surface().entries.len() - 1;
+        state.active_surface_mut().entries[row_idx].per_file_values[2] = "99".to_string();
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[1].clone()),
+                ],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.saved, 2);
+        assert_eq!(
+            state.active_surface().entries[row_idx].per_file_originals[2],
+            "03",
+            "TRACKNUMBER is positional in regenerated CUE sheets and must not be reported saved"
+        );
+        assert!(summary.remaining_dirty);
+        assert!(state.active_surface().dirty);
+    }
+
+    #[test]
+    fn unified_cue_album_unsupported_deleted_row_is_not_removed_after_full_save() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: Vec::new(),
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state.active_surface_mut().entries.push(tag(
+            "COMPOSER",
+            "<multiple values>",
+            vec!["A", "B", "C", "D"],
+        ));
+        let row_idx = state.active_surface().entries.len() - 1;
+        state.active_surface_mut().deleted.push(row_idx);
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[1].clone()),
+                ],
+            )
+            .expect("matching save result should reduce");
+
+        assert_eq!(summary.saved, 2);
+        assert!(
+            state
+                .active_surface()
+                .entries
+                .iter()
+                .any(|entry| entry.display_key == "COMPOSER"),
+            "unsupported per-track deletion must not disappear as if the CUE writer persisted it"
+        );
+        assert!(state.active_surface().deleted.contains(&row_idx));
+        assert!(summary.remaining_dirty);
+        assert!(state.active_surface().dirty);
+    }
+
+    #[test]
+    fn unified_forced_cleanup_consumes_successful_saved_slots_individually() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: Vec::new(),
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state.active_surface_mut().cue_album_forced_cleanup = vec![
+            (0, lofty::tag::ItemKey::Isrc),
+            (0, lofty::tag::ItemKey::TrackNumber),
+        ];
+        state.active_surface_mut().dirty = false;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone())],
+            )
+            .expect("matching cleanup-only save result should reduce");
+
+        assert_eq!(summary.saved, 1);
+        assert!(
+            state.active_surface().cue_album_forced_cleanup.is_empty(),
+            "cleanup entries for a successfully written member image must be consumed even when other member images had no cleanup work"
+        );
+        assert!(
+            !state.active_surface().dirty,
+            "cleanup-only save for a single polluted member should not leave repeated work"
+        );
+    }
+
+    #[test]
+    fn unified_forced_cleanup_retains_only_failed_slots_after_partial_save() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: Vec::new(),
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state.active_surface_mut().cue_album_forced_cleanup = vec![
+            (0, lofty::tag::ItemKey::Isrc),
+            (1, lofty::tag::ItemKey::Isrc),
+            (1, lofty::tag::ItemKey::TrackNumber),
+        ];
+        state.active_surface_mut().dirty = false;
+        let (session_id, generation) = state.begin_write();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::failed(state.active_surface().paths[1].clone(), "locked"),
+                ],
+            )
+            .expect("matching partial cleanup save result should reduce");
+
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            state.active_surface().cue_album_forced_cleanup,
+            vec![
+                (1, lofty::tag::ItemKey::Isrc),
+                (1, lofty::tag::ItemKey::TrackNumber),
+            ],
+            "successful cleanup slots must be retired while failed slots stay pending for retry"
+        );
     }
 
     #[test]

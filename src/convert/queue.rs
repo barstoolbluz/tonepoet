@@ -658,8 +658,14 @@ impl ConversionQueue {
         self.items.len() + (if self.current.is_some() { 1 } else { 0 })
     }
 
-    /// Clear completed items only
-    pub fn clear_completed(&mut self) {
+    /// Clear completed-success items only and return the IDs actually removed.
+    ///
+    /// Artifact cleanup must be driven by this returned set, not by a
+    /// pre-removal snapshot of broader terminal states. Failed, partial, and
+    /// cancelled items are intentionally retryable and must keep any owned
+    /// synthetic CUE artifacts until they are explicitly removed or cleared by
+    /// a terminal-state operation that actually consumes them.
+    pub fn clear_completed(&mut self) -> Vec<String> {
         let is_completed = |item: &ConversionItem| {
             matches!(
                 item.status,
@@ -667,8 +673,7 @@ impl ConversionQueue {
                     | ConversionStatus::CompletedWithActionErrors { .. }
             )
         };
-        self.items.retain(|item| !is_completed(item));
-        self.completed.retain(|item| !is_completed(item));
+        self.remove_matching_items(is_completed)
     }
 
     /// Clear all terminal items (Completed, Failed, Partial, Cancelled)
@@ -694,7 +699,7 @@ impl ConversionQueue {
         }
     }
 
-    pub fn clear_finished(&mut self) {
+    pub fn clear_finished(&mut self) -> Vec<String> {
         let is_terminal = |item: &ConversionItem| {
             matches!(
                 item.status,
@@ -705,15 +710,65 @@ impl ConversionQueue {
                     | ConversionStatus::Cancelled
             )
         };
-        self.items.retain(|item| !is_terminal(item));
-        self.completed.retain(|item| !is_terminal(item));
+        self.remove_matching_items(is_terminal)
     }
 
-    /// Clear all items from the queue
-    pub fn clear(&mut self) {
+    /// Clear all items from the queue and return the IDs actually removed.
+    pub fn clear(&mut self) -> Vec<String> {
+        let mut removed = Vec::with_capacity(self.total_items());
+        removed.extend(self.items.iter().map(|item| item.id.clone()));
+        if let Some(current) = self.current.take() {
+            removed.push(current.id);
+        }
+        removed.extend(self.completed.iter().map(|item| item.id.clone()));
         self.items.clear();
-        self.current = None;
         self.completed.clear();
+        removed
+    }
+
+    pub fn remove_item_by_id(&mut self, item_id: &str) -> bool {
+        !self.remove_matching_items(|item| item.id.as_str() == item_id).is_empty()
+    }
+
+    pub(crate) fn remove_matching_item_ids<F>(&mut self, should_remove: F) -> Vec<String>
+    where
+        F: FnMut(&ConversionItem) -> bool,
+    {
+        self.remove_matching_items(should_remove)
+    }
+
+    fn remove_matching_items<F>(&mut self, mut should_remove: F) -> Vec<String>
+    where
+        F: FnMut(&ConversionItem) -> bool,
+    {
+        let mut removed = Vec::new();
+        self.items.retain(|item| {
+            if should_remove(item) {
+                removed.push(item.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if self
+            .current
+            .as_ref()
+            .map(|item| should_remove(item))
+            .unwrap_or(false)
+        {
+            if let Some(item) = self.current.take() {
+                removed.push(item.id);
+            }
+        }
+        self.completed.retain(|item| {
+            if should_remove(item) {
+                removed.push(item.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Find a specific item by ID for updating
@@ -780,27 +835,41 @@ impl ConversionQueue {
     /// Retry failed items
     pub fn retry_failed(&mut self) {
         let mut to_retry = Vec::new();
+        let mut retained_completed = Vec::with_capacity(self.completed.len());
 
-        for item in &mut self.completed {
+        for mut item in self.completed.drain(..) {
             if item.selected && item.can_retry() {
-                let mut new_item = item.clone();
-                new_item.status = ConversionStatus::Queued;
-                new_item.started_at = None;
-                new_item.completed_at = None;
-                to_retry.push(new_item);
+                item.status = ConversionStatus::Queued;
+                item.started_at = None;
+                item.completed_at = None;
+                item.output_path = None;
+                item.selected = false;
+                to_retry.push(item);
+            } else {
+                retained_completed.push(item);
             }
         }
 
+        self.completed = retained_completed;
         for item in to_retry {
             self.items.push_back(item);
         }
     }
 
-    /// Remove selected items from the queue
+    /// Remove selected items from the queue.
+    ///
+    /// Selection spans the active queue, the current item, and the completed
+    /// collection as rendered by the TUI.  Removing from all three locations is
+    /// important for owned temporary inputs such as synthetic album CUE files:
+    /// the manager snapshots selected ids across `all_items()` before calling
+    /// this method and only cleans lifecycle artifacts for ids that were
+    /// actually removed here.
+    pub fn remove_selected_item_ids(&mut self) -> Vec<String> {
+        self.remove_matching_items(|item| item.selected)
+    }
+
     pub fn remove_selected(&mut self) -> usize {
-        let initial_count = self.items.len();
-        self.items.retain(|item| !item.selected);
-        initial_count - self.items.len()
+        self.remove_selected_item_ids().len()
     }
 }
 
@@ -947,4 +1016,74 @@ mod cue_sidecar_override_queue_tests {
         let decoded: ConversionItem = serde_json::from_value(value).expect("deserialize legacy item");
         assert_eq!(decoded.cue_sidecar_override, None);
     }
+
+
+    #[test]
+    fn retry_failed_supersedes_completed_history_entry() {
+        let mut queue = ConversionQueue::new();
+
+        let mut failed = ConversionItem::default();
+        failed.id = "synthetic-album".to_string();
+        failed.input_path = PathBuf::from("/tmp/tonepoet-synthetic-cue-albums/process-x/artifact-y/album.cue");
+        failed.selected = true;
+        failed.status = ConversionStatus::Failed {
+            error: "failed once".to_string(),
+            log_path: None,
+        };
+        failed.completed_at = Some(chrono::Utc::now());
+        queue.completed.push(failed);
+
+        queue.retry_failed();
+
+        assert!(
+            queue.completed.is_empty(),
+            "retry must move the failed record out of completed history so it cannot remain retryable with the same item id"
+        );
+        assert_eq!(queue.items.len(), 1);
+        let retry = queue.items.front().expect("retry item");
+        assert_eq!(retry.id, "synthetic-album");
+        assert_eq!(retry.status, ConversionStatus::Queued);
+        assert!(retry.completed_at.is_none());
+        assert!(
+            !retry.selected,
+            "a retried item should not inherit the history-row selection that triggered retry"
+        );
+    }
+
+    #[test]
+    fn remove_selected_removes_completed_and_finished_current_items() {
+        let mut queue = ConversionQueue::new();
+
+        let mut queued = ConversionItem::default();
+        queued.id = "queued".to_string();
+        queued.input_path = PathBuf::from("/tmp/queued.flac");
+        queued.selected = true;
+        queue.items.push_back(queued);
+
+        let mut current = ConversionItem::default();
+        current.id = "current".to_string();
+        current.input_path = PathBuf::from("/tmp/current.flac");
+        current.selected = true;
+        current.status = ConversionStatus::Failed {
+            error: "failed".to_string(),
+            log_path: None,
+        };
+        queue.current = Some(current);
+
+        let mut completed = ConversionItem::default();
+        completed.id = "completed".to_string();
+        completed.input_path = PathBuf::from("/tmp/completed.flac");
+        completed.selected = true;
+        completed.status = ConversionStatus::Failed {
+            error: "failed".to_string(),
+            log_path: None,
+        };
+        queue.completed.push(completed);
+
+        assert_eq!(queue.remove_selected(), 3);
+        assert!(queue.items.is_empty());
+        assert!(queue.current.is_none());
+        assert!(queue.completed.is_empty());
+    }
+
 }

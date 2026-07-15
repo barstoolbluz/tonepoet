@@ -5114,7 +5114,10 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     if idx < state.releases.len() {
                         let releases = std::mem::take(&mut state.releases);
                         let paths = std::mem::take(&mut state.paths);
-                        super::event_loop::open_editor_with_mb_release(app, tx, releases, idx, paths);
+                        let editor_session = state.editor_session;
+                        super::event_loop::open_editor_with_mb_release_guarded(
+                            app, tx, releases, idx, paths, editor_session,
+                        );
                     }
                 }
                 KeyCode::Up => {
@@ -5955,10 +5958,151 @@ pub(super) fn metadata_editor_open_add(state: &mut super::app::MetadataEditorSta
     })
 }
 
+fn unified_cue_album_per_track_key_is_persistable(display_key: &str) -> bool {
+    matches!(
+        display_key.to_ascii_uppercase().as_str(),
+        "TITLE" | "ARTIST" | "ISRC"
+    )
+}
+
+pub(super) fn metadata_editor_unpersistable_per_track_reason(
+    state: &super::app::MetadataEditorState,
+    entry_idx: usize,
+) -> Option<String> {
+    let surface = state.active_surface();
+    if surface.cue_album_synthetic_sheet.is_none() {
+        return None;
+    }
+    let entry = surface.entries.get(entry_idx)?;
+    let track_dim = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| sheet.track_sources.len())
+        .unwrap_or(0);
+    if entry.display_key.eq_ignore_ascii_case("TRACKNUMBER")
+        && track_dim > 0
+        && entry.per_file_values.len() == track_dim
+    {
+        return Some(
+            "metadata editor: cannot edit per-track TRACKNUMBER on a multi-image CUE album; CUE TRACK numbers are positional and continuous"
+                .to_string(),
+        );
+    }
+    if entry.per_file_values.len() == surface.paths.len() {
+        return None;
+    }
+    if unified_cue_album_per_track_key_is_persistable(&entry.display_key) {
+        return None;
+    }
+    if entry.display_key.eq_ignore_ascii_case("TRACKNUMBER") {
+        return Some(
+            "metadata editor: cannot edit per-track TRACKNUMBER on a multi-image CUE album; CUE TRACK numbers are positional and continuous"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "metadata editor: cannot persist per-track {} on a multi-image CUE album",
+        entry.display_key
+    ))
+}
+
+/// Begin editing the cursor row through the same persistence-policy gate used
+/// by keyboard, mouse, and context-menu entry points. Returning `Some(status)`
+/// means the caller should leave the editor visible and show that status;
+/// returning `None` means the edit/detail transition was either started or the
+/// cursor was not editable.
+pub(super) fn metadata_editor_begin_cursor_value_edit(
+    state: &mut super::app::MetadataEditorState,
+    select_existing_value: bool,
+) -> Option<String> {
+    let cursor = state.cursor;
+    if cursor >= state.active_surface().entries.len() {
+        return None;
+    }
+    if state.active_surface().deleted.contains(&cursor) {
+        return Some("metadata editor: restore field before editing".to_string());
+    }
+    if state.read_only {
+        return Some("read-only editor (SACD ISO)".to_string());
+    }
+    if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, cursor) {
+        return Some(reason);
+    }
+
+    let Some(entry) = state.active_surface().entries.get(cursor) else {
+        return None;
+    };
+    if entry.is_binary {
+        return Some("metadata editor: cannot edit binary field".to_string());
+    }
+
+    let is_mixed = entry.is_mixed;
+    let value_count = entry.per_file_values.len();
+    let value = entry.value.clone();
+    if is_mixed && value_count > 1 {
+        return metadata_editor_begin_detail_edit_for_entry(state, cursor, false);
+    }
+
+    let (writable, blocked) = metadata_editor_entry_slot_counts(state, cursor);
+    if writable == 0 && blocked > 0 {
+        let reason = metadata_editor_entry_edit_block_reason(state, cursor)
+            .unwrap_or_else(|| "no writable file slots".to_string());
+        return Some(format!("metadata editor: cannot edit blocked field — {reason}"));
+    }
+    if blocked > 0 {
+        if let Some(status) = metadata_editor_begin_detail_edit_for_entry(state, cursor, true) {
+            return Some(status);
+        }
+        return Some(format!(
+            "metadata editor: editing per-file values; {} writable file{} can change, {} blocked slot{} remain visible and locked",
+            writable,
+            if writable == 1 { "" } else { "s" },
+            blocked,
+            if blocked == 1 { "" } else { "s" }
+        ));
+    }
+
+    state.edit_input = Some(if select_existing_value {
+        super::text_input::TextInputState::new_selected(value)
+    } else {
+        super::text_input::TextInputState::new(value)
+    });
+    state.phase = super::app::MetadataEditorPhase::InlineEdit;
+    None
+}
+
 /// Mark the cursor row for deletion (renders strikethrough until save).
+pub(super) fn metadata_editor_delete_cursor_requires_embedded_cuesheet_confirmation(
+    state: &super::app::MetadataEditorState,
+) -> bool {
+    let surface = state.active_surface();
+    if state.cursor >= surface.entries.len() || surface.deleted.contains(&state.cursor) {
+        return false;
+    }
+    if !surface.entries[state.cursor].display_key.eq_ignore_ascii_case("CUESHEET") {
+        return false;
+    }
+    embedded_cuesheet_command_target(state, "cuesheet-delete").is_ok()
+}
+
 pub(super) fn metadata_editor_delete_cursor(state: &mut super::app::MetadataEditorState) -> Option<String> {
     if state.cursor >= state.active_surface().entries.len() || state.active_surface().deleted.contains(&state.cursor) {
         return None;
+    }
+
+    let entry_key = state.active_surface().entries[state.cursor].display_key.clone();
+    if entry_key.eq_ignore_ascii_case("CUESHEET") {
+        return match embedded_cuesheet_command_target(state, "cuesheet-delete") {
+            Ok(_) => Some(
+                "metadata editor: embedded CUESHEET deletion requires confirmation"
+                    .to_string(),
+            ),
+            Err(reason) => Some(reason),
+        };
+    }
+
+    if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, state.cursor) {
+        return Some(reason);
     }
 
     let (writable, blocked) = metadata_editor_entry_slot_counts(state, state.cursor);
@@ -5992,32 +6136,39 @@ pub(super) fn metadata_editor_undelete_cursor(state: &mut super::app::MetadataEd
 /// Force-open the per-file detail overlay on the cursor entry. Gated
 /// on per_file_values.len() > 1 (so per-track entries on single-image
 /// rips qualify even when paths.len() == 1).
-pub(super) fn metadata_editor_open_detail(state: &mut super::app::MetadataEditorState) {
-    if state.cursor < state.active_surface().entries.len()
-        && state.active_surface().entries[state.cursor].per_file_values.len() > 1
-        && !state.active_surface().entries[state.cursor].is_binary
-        && !state.active_surface().deleted.contains(&state.cursor)
-    {
-        state.detail_field_idx = state.cursor;
-        state.detail_cursor = 0;
-        state.detail_scroll = 0;
-        state.detail_edit = None;
-        state.last_click = None;
-        state.phase = super::app::MetadataEditorPhase::DetailEdit;
+pub(super) fn metadata_editor_open_detail(state: &mut super::app::MetadataEditorState) -> Option<String> {
+    if state.cursor >= state.active_surface().entries.len() {
+        return None;
     }
+    if state.active_surface().deleted.contains(&state.cursor) {
+        return Some("metadata editor: restore field before opening detail editor".to_string());
+    }
+    metadata_editor_begin_detail_edit_for_entry(state, state.cursor, false)
 }
 
 
 fn metadata_editor_forced_delete_items(
     state: &super::app::MetadataEditorState,
 ) -> Vec<(usize, lofty::tag::ItemKey)> {
+    let mut forced = Vec::new();
     if state.active_surface().pending_embedded_cuesheet_delete {
-        (0..state.active_surface().paths.len())
-            .map(|idx| (idx, lofty::tag::ItemKey::Unknown("CUESHEET".to_string())))
-            .collect()
-    } else {
-        Vec::new()
+        forced.extend(
+            (0..state.active_surface().paths.len())
+                .map(|idx| (idx, lofty::tag::ItemKey::Unknown("CUESHEET".to_string()))),
+        );
     }
+    if state.active_surface().cue_album_synthetic_sheet.is_some() {
+        forced.extend(state.active_surface().cue_album_forced_cleanup.iter().cloned());
+    }
+    forced
+}
+
+
+fn metadata_editor_has_audio_save_work(
+    state: &super::app::MetadataEditorState,
+    forced_deletes: &[(usize, lofty::tag::ItemKey)],
+) -> bool {
+    state.any_presentation_dirty() || !forced_deletes.is_empty()
 }
 
 fn metadata_editor_entries_snapshot_for_save(
@@ -6094,7 +6245,8 @@ pub(super) fn metadata_editor_save(
         }
         return;
     }
-    if !state.any_presentation_dirty() {
+    let forced_deletes_for_save = metadata_editor_forced_delete_items(state);
+    if !metadata_editor_has_audio_save_work(state, &forced_deletes_for_save) {
         app.set_status("No changes to save");
         return;
     }
@@ -6276,7 +6428,7 @@ pub(super) fn metadata_editor_save(
         ));
     }
     let entries_snap = metadata_editor_entries_snapshot_for_save(state);
-    let forced_deletes = metadata_editor_forced_delete_items(state);
+    let forced_deletes = forced_deletes_for_save;
 
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -8429,37 +8581,8 @@ fn handle_metadata_editor_key(
                 }
                 KeyCode::Enter => {
                     if state.cursor < state.active_surface().entries.len() {
-                        let entry = &state.active_surface().entries[state.cursor];
-                        if !entry.is_binary && !state.active_surface().deleted.contains(&state.cursor) {
-                            if entry.is_mixed && entry.per_file_values.len() > 1 {
-                                metadata_editor_begin_detail_edit_for_entry(state, state.cursor, false);
-                            } else if state.read_only {
-                                app.set_status("read-only editor (SACD ISO)");
-                            } else {
-                                let (writable, blocked) = metadata_editor_entry_slot_counts(state, state.cursor);
-                                if writable == 0 && blocked > 0 {
-                                    let reason = metadata_editor_entry_edit_block_reason(state, state.cursor)
-                                        .unwrap_or_else(|| "no writable file slots".to_string());
-                                    app.set_status(format!(
-                                        "metadata editor: cannot edit blocked field — {}",
-                                        reason
-                                    ));
-                                } else if blocked > 0 {
-                                    app.set_status(format!(
-                                        "metadata editor: editing per-file values; {} writable file{} can change, {} blocked slot{} remain visible and locked",
-                                        writable,
-                                        if writable == 1 { "" } else { "s" },
-                                        blocked,
-                                        if blocked == 1 { "" } else { "s" }
-                                    ));
-                                    metadata_editor_begin_detail_edit_for_entry(state, state.cursor, true);
-                                } else {
-                                    state.edit_input = Some(super::text_input::TextInputState::new_selected(
-                                        entry.value.clone(),
-                                    ));
-                                    state.phase = MetadataEditorPhase::InlineEdit;
-                                }
-                            }
+                        if let Some(status) = metadata_editor_begin_cursor_value_edit(state, true) {
+                            app.set_status(status);
                         }
                     } else if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
@@ -8485,6 +8608,9 @@ fn handle_metadata_editor_key(
                 KeyCode::Delete => {
                     if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
+                    } else if metadata_editor_delete_cursor_requires_embedded_cuesheet_confirmation(state) {
+                        open_embedded_cuesheet_delete_confirmation(app, state.clone());
+                        return;
                     } else if let Some(status) = metadata_editor_delete_cursor(state) {
                         app.set_status(status);
                     }
@@ -8721,7 +8847,9 @@ fn handle_metadata_editor_key(
                                 blocked,
                                 if blocked == 1 { "" } else { "s" }
                             ));
-                            metadata_editor_begin_detail_edit_for_entry(state, state.cursor, true);
+                            if let Some(status) = metadata_editor_begin_detail_edit_for_entry(state, state.cursor, true) {
+                                app.set_status(status);
+                            }
                         } else {
                             state.edit_input = Some(super::text_input::TextInputState::empty());
                             state.phase = MetadataEditorPhase::InlineEdit;
@@ -8759,8 +8887,8 @@ fn handle_metadata_editor_key(
                         let new_val = input.text.clone();
                         let detail_cursor = state.detail_cursor;
                         if field_idx < state.active_surface().entries.len() && detail_cursor < n_files {
-                            if let Some(reason) = metadata_editor_slot_edit_block_reason(state, detail_cursor) {
-                                app.set_status(format!("metadata editor: slot is not editable — {}", reason));
+                            if let Some(reason) = metadata_editor_detail_value_edit_refusal(state, field_idx, detail_cursor) {
+                                app.set_status(reason);
                             } else {
                                 state.active_surface_mut().entries[field_idx].per_file_values[detail_cursor] = new_val;
                                 metadata_editor_recompute_entry_display(&mut state.active_surface_mut().entries[field_idx]);
@@ -8795,8 +8923,8 @@ fn handle_metadata_editor_key(
                 KeyCode::Enter => {
                     if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
-                    } else if let Some(reason) = metadata_editor_slot_edit_block_reason(state, state.detail_cursor) {
-                        app.set_status(format!("metadata editor: slot is not editable — {}", reason));
+                    } else if let Some(reason) = metadata_editor_detail_value_edit_refusal(state, field_idx, state.detail_cursor) {
+                        app.set_status(reason);
                     } else if field_idx < state.active_surface().entries.len() && state.detail_cursor < n_files {
                         let val =
                             state.active_surface().entries[field_idx].per_file_values[state.detail_cursor].clone();
@@ -8833,13 +8961,30 @@ fn handle_metadata_editor_key(
 fn regenerate_unified_cue_album_cuesheet_for_save(
     state: &mut super::app::MetadataEditorState,
 ) -> Result<bool, String> {
+    let n_paths = state.active_surface().paths.len();
+    let per_track_dirty = |surface: &super::app::PresentationTab| -> Vec<String> {
+        surface
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.per_file_values.len() != n_paths)
+            .filter(|(_, entry)| entry.per_file_values != entry.per_file_originals)
+            .map(|(_, entry)| entry.display_key.clone())
+            .collect()
+    };
     if state.active_surface().pending_embedded_cuesheet_delete {
+        let dirty_keys = per_track_dirty(state.active_surface());
+        if !dirty_keys.is_empty() {
+            return Err(format!(
+                "save aborted: CUESHEET is being deleted, so per-track edits ({}) have no persistence target",
+                dirty_keys.join(", ")
+            ));
+        }
         return Ok(false);
     }
     let Some(sheet) = state.active_surface().cue_album_synthetic_sheet.clone() else {
         return Ok(false);
     };
-    let n_paths = state.active_surface().paths.len();
     if n_paths == 0 || sheet.audio_paths.len() != n_paths {
         return Err("save aborted: unified CUE album path mapping is inconsistent".to_string());
     }
@@ -8852,6 +8997,40 @@ fn regenerate_unified_cue_album_cuesheet_for_save(
 
     let cue_idx = cue_album_entry_index(&state.active_surface().entries, "CUESHEET")
         .ok_or_else(|| "save aborted: unified CUE album has no CUESHEET row".to_string())?;
+    let dirty_keys = per_track_dirty(state.active_surface());
+    if state.active_surface().deleted.contains(&cue_idx) && !dirty_keys.is_empty() {
+        return Err(format!(
+            "save aborted: CUESHEET is deleted, so per-track edits ({}) have no persistence target",
+            dirty_keys.join(", ")
+        ));
+    }
+    if let Some((entry_idx, key)) = state
+        .active_surface()
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.per_file_values.len() != n_paths
+                || (entry.display_key.eq_ignore_ascii_case("TRACKNUMBER")
+                    && entry.per_file_values.len() == sheet.track_sources.len())
+        })
+        .filter(|(entry_idx, entry)| {
+            entry.per_file_values != entry.per_file_originals
+                || state.active_surface().deleted.contains(entry_idx)
+        })
+        .find(|(_, entry)| !unified_cue_album_per_track_key_is_persistable(&entry.display_key))
+    {
+        if state.active_surface().deleted.contains(&entry_idx) {
+            return Err(format!(
+                "save aborted: cannot persist deletion of per-track {} on a multi-image CUE album",
+                key.display_key
+            ));
+        }
+        return Err(format!(
+            "save aborted: cannot persist per-track {} on a multi-image CUE album",
+            key.display_key
+        ));
+    }
     let new_cue = cue_album_generate_synthetic_cuesheet(&sheet, &state.active_surface().entries, &state.active_surface().deleted)?;
     let old_values = state.active_surface().entries[cue_idx].per_file_values.clone();
     let new_values = vec![new_cue.clone(); n_paths];
@@ -9123,14 +9302,7 @@ fn metadata_editor_sidecar_for_audio(audio_path: &std::path::Path) -> Option<std
     let cue_count = std::fs::read_dir(parent)
         .ok()?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("cue"))
-                .unwrap_or(false)
-        })
+        .filter(|entry| super::cue_parser::is_user_visible_cue_path(&entry.path()))
         .count();
     if cue_count == 1 {
         super::cue_parser::find_sidecar_cue(audio_path)
@@ -9222,6 +9394,9 @@ fn collect_metadata_cue_surfaces_from_path(
     }
 
     let cue_path = if crate::convert::classify::is_cue_sheet_path(path) {
+        if !super::cue_parser::is_user_visible_cue_path(path) {
+            return;
+        }
         Some(path.to_path_buf())
     } else if matches!(
         crate::convert::classify::classify_file(path),
@@ -9513,8 +9688,51 @@ fn cue_album_first_non_empty_with_divergence(
     (first, divergent)
 }
 
-fn cue_album_remove_replaced_keys(entries: &mut Vec<super::probe::TagEntry>) -> Vec<String> {
+fn cue_album_managed_whole_file_cleanup_key(display_key: &str) -> Option<lofty::tag::ItemKey> {
+    match display_key.to_ascii_uppercase().as_str() {
+        "TRACKNUMBER" => Some(lofty::tag::ItemKey::TrackNumber),
+        "ISRC" => Some(lofty::tag::ItemKey::Isrc),
+        "MUSICBRAINZ_TRACKID" => Some(lofty::tag::ItemKey::MusicBrainzRecordingId),
+        "MUSICBRAINZ_RELEASETRACKID" => Some(lofty::tag::ItemKey::MusicBrainzTrackId),
+        "MUSICBRAINZ_ARTISTID" => Some(lofty::tag::ItemKey::MusicBrainzArtistId),
+        _ => None,
+    }
+}
+
+fn cue_album_entry_has_value_at(entry: &super::probe::TagEntry, idx: usize) -> bool {
+    entry
+        .per_file_originals
+        .get(idx)
+        .or_else(|| entry.per_file_values.get(idx))
+        .or_else(|| (idx == 0).then_some(&entry.original))
+        .or_else(|| (idx == 0).then_some(&entry.value))
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn cue_album_removed_key_cleanup_items(
+    entry: &super::probe::TagEntry,
+    n_paths: usize,
+) -> Vec<(usize, lofty::tag::ItemKey)> {
+    let Some(key) = cue_album_managed_whole_file_cleanup_key(&entry.display_key) else {
+        return Vec::new();
+    };
+    if n_paths == 0 {
+        return Vec::new();
+    }
+
+    (0..n_paths)
+        .filter(|&idx| cue_album_entry_has_value_at(entry, idx))
+        .map(|idx| (idx, key.clone()))
+        .collect()
+}
+
+fn cue_album_remove_replaced_keys(
+    entries: &mut Vec<super::probe::TagEntry>,
+    n_paths: usize,
+) -> (Vec<String>, Vec<(usize, lofty::tag::ItemKey)>) {
     let mut cuesheet_originals = Vec::new();
+    let mut forced_cleanup = Vec::new();
     let replaced = [
         "CUESHEET",
         "TRACKNUMBER",
@@ -9526,6 +9744,9 @@ fn cue_album_remove_replaced_keys(entries: &mut Vec<super::probe::TagEntry>) -> 
         "DATE",
         "GENRE",
         "CATALOGNUMBER",
+        "MUSICBRAINZ_TRACKID",
+        "MUSICBRAINZ_RELEASETRACKID",
+        "MUSICBRAINZ_ARTISTID",
     ];
     let mut retained = Vec::with_capacity(entries.len());
     for entry in entries.drain(..) {
@@ -9541,12 +9762,74 @@ fn cue_album_remove_replaced_keys(entries: &mut Vec<super::probe::TagEntry>) -> 
             .iter()
             .any(|key| entry.display_key.eq_ignore_ascii_case(key))
         {
+            forced_cleanup.extend(cue_album_removed_key_cleanup_items(&entry, n_paths));
             continue;
         }
         retained.push(entry);
     }
     *entries = retained;
-    cuesheet_originals
+    forced_cleanup.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1))));
+    forced_cleanup.dedup();
+    (cuesheet_originals, forced_cleanup)
+}
+
+fn cue_album_authoritative_embedded_cuesheet(
+    sheet: &super::app::CueAlbumSyntheticSheet,
+    cuesheet_originals: &[String],
+    n_paths: usize,
+) -> Option<(super::cue_parser::CueSheet, String)> {
+    if n_paths == 0 || cuesheet_originals.len() != n_paths {
+        return None;
+    }
+    let first = cuesheet_originals.first()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    if cuesheet_originals
+        .iter()
+        .any(|text| text.trim() != first)
+    {
+        return None;
+    }
+    let text = cuesheet_originals.first()?.clone();
+    let parsed = super::cue_parser::parse_cue(&text);
+    if validate_unified_cue_album_edit_identity(sheet, &parsed).is_err() {
+        return None;
+    }
+    Some((parsed, text))
+}
+
+fn cue_album_project_authoritative_parsed_sheet(
+    sheet: &mut super::app::CueAlbumSyntheticSheet,
+    parsed: &super::cue_parser::CueSheet,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    sheet.album_title = parsed.title.clone();
+    sheet.album_performer = parsed.performer.clone();
+    sheet.album_date = parsed.date.clone();
+    sheet.album_genre = parsed.genre.clone();
+    sheet.album_catalog = parsed.catalog.clone();
+
+    let mut track_numbers = Vec::with_capacity(parsed.tracks.len());
+    let mut track_titles = Vec::with_capacity(parsed.tracks.len());
+    let mut track_artists = Vec::with_capacity(parsed.tracks.len());
+    let mut isrcs = Vec::with_capacity(parsed.tracks.len());
+    for (idx, (source, track)) in sheet
+        .track_sources
+        .iter_mut()
+        .zip(parsed.tracks.iter())
+        .enumerate()
+    {
+        source.original_track_number = track.number;
+        source.file_ref = track.file.clone().unwrap_or_else(|| source.file_ref.clone());
+        source.index00_frames = track.index00_frames;
+        source.index01_frames = track.index01_frames;
+        source.isrc = track.isrc.clone();
+        track_numbers.push(format!("{:02}", idx + 1));
+        track_titles.push(track.title.clone().unwrap_or_default());
+        track_artists.push(track.performer.clone().unwrap_or_default());
+        isrcs.push(track.isrc.clone().unwrap_or_default());
+    }
+    (track_numbers, track_titles, track_artists, isrcs)
 }
 
 fn cue_album_member_sheets_need_repair(cuesheet_originals: &[String], synthetic_cue: &str) -> bool {
@@ -9913,16 +10196,31 @@ fn build_metadata_editor_for_cue_surfaces(
         return Ok((state, surface.sheet.tracks.len()));
     }
 
-    let (sheet, track_numbers, track_titles, track_artists, isrcs, merge_warnings) =
+    let (mut sheet, mut track_numbers, mut track_titles, mut track_artists, mut isrcs, merge_warnings) =
         build_unified_cue_album_sheet(&sorted)?;
     let paths = sheet.audio_paths.clone();
     let merged = super::probe::read_all_tags_merged_with_metadata(&paths)
         .map_err(|err| format!("Failed to read tags for unified CUE album: {err}"))?;
     let mut entries = merged.entries;
-    let mut cuesheet_originals = cue_album_remove_replaced_keys(&mut entries);
+    let (mut cuesheet_originals, forced_cleanup) = cue_album_remove_replaced_keys(&mut entries, paths.len());
     cuesheet_originals.resize(paths.len(), String::new());
 
     let n_paths = paths.len();
+    let embedded_authority = cue_album_authoritative_embedded_cuesheet(
+        &sheet,
+        &cuesheet_originals,
+        n_paths,
+    );
+    let authoritative_embedded_text = if let Some((parsed, text)) = embedded_authority {
+        let projected = cue_album_project_authoritative_parsed_sheet(&mut sheet, &parsed);
+        track_numbers = projected.0;
+        track_titles = projected.1;
+        track_artists = projected.2;
+        isrcs = projected.3;
+        Some(text)
+    } else {
+        None
+    };
     cue_album_upsert_album_entry(
         &mut entries,
         "ALBUM",
@@ -9986,8 +10284,14 @@ fn build_metadata_editor_for_cue_surfaces(
         entries.push(warning_entry);
     }
 
-    let synthetic_cue = cue_album_generate_synthetic_cuesheet(&sheet, &entries, &[])?;
-    let embedded_disagrees = cue_album_member_sheets_need_repair(&cuesheet_originals, &synthetic_cue);
+    let generated_cue = cue_album_generate_synthetic_cuesheet(&sheet, &entries, &[])?;
+    let (synthetic_cue, embedded_disagrees) = if let Some(text) = authoritative_embedded_text {
+        cuesheet_originals = vec![text.clone(); n_paths];
+        (text, false)
+    } else {
+        let repair = cue_album_member_sheets_need_repair(&cuesheet_originals, &generated_cue);
+        (generated_cue, repair)
+    };
 
     let technical_details = metadata_technical_details_for_paths_with_analysis(
         &paths,
@@ -10012,6 +10316,7 @@ fn build_metadata_editor_for_cue_surfaces(
     tab.embedded_cuesheet_present = true;
     tab.sidecar_cuesheet_shadow_present = false;
     tab.cue_album_synthetic_sheet = Some(sheet);
+    tab.cue_album_forced_cleanup = forced_cleanup;
     cue_album_update_cuesheet_entry(&mut tab, synthetic_cue, Some(cuesheet_originals));
     tab.dirty = embedded_disagrees;
 
@@ -10606,6 +10911,32 @@ fn remove_cuesheet_derived_per_track_rows(
     removed
 }
 
+fn remove_unified_cuesheet_derived_per_track_rows(
+    surface: &mut super::app::PresentationTab,
+) -> usize {
+    let path_count = surface.paths.len();
+    let mut remove: Vec<usize> = surface
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            if entry.per_file_values.len() != path_count {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    remove.sort_unstable();
+    remove.dedup();
+    let removed = remove.len();
+    for idx in remove.into_iter().rev() {
+        remove_metadata_entry_at(surface, idx);
+    }
+    removed
+}
+
+
 fn sidecar_cuesheet_for_audio(
     audio_path: &std::path::Path,
 ) -> Result<Option<(std::path::PathBuf, String, super::cue_parser::CueSheet)>, String> {
@@ -10700,9 +11031,6 @@ fn embedded_cuesheet_command_target(
 }
 
 fn embedded_cuesheet_edit_temp_path(audio_path: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let parent = audio_path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory for edit buffer", audio_path.display()))?;
     let stem = audio_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -10711,12 +11039,17 @@ fn embedded_cuesheet_edit_temp_path(audio_path: &std::path::Path) -> Result<std:
         .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
         .collect::<String>();
     let pid = std::process::id();
+    let root = std::env::temp_dir()
+        .join("tonepoet-embedded-cuesheet-edits")
+        .join(format!("process-{pid}"));
+    std::fs::create_dir_all(&root)
+        .map_err(|err| format!("failed to create edit-buffer directory {}: {}", root.display(), err))?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Ok(parent.join(format!(
-        ".{stem}.tonepoet-embedded-cuesheet-{pid}-{nanos}.cue"
+    Ok(root.join(format!(
+        "{stem}.tonepoet-embedded-cuesheet-{pid}-{nanos}.cue"
     )))
 }
 
@@ -10840,15 +11173,18 @@ pub(super) fn metadata_editor_delete_embedded_cuesheet(
     if state.active_surface().cue_album_synthetic_sheet.is_some() {
         let member_count = state.active_surface().paths.len();
         let len_after;
+        let removed;
         {
             let surface = state.active_surface_mut();
             surface.pending_embedded_cuesheet_delete = true;
             surface.embedded_cuesheet_present = false;
             surface.sidecar_cuesheet_shadow_present = false;
+            surface.cue_album_synthetic_sheet = None;
             surface.deleted.retain(|deleted| *deleted != cue_idx);
             if let Some(idx) = metadata_cuesheet_entry_index(&surface.entries) {
                 remove_metadata_entry_at(surface, idx);
             }
+            removed = remove_unified_cuesheet_derived_per_track_rows(surface);
             surface.dirty = true;
             len_after = surface.entries.len();
         }
@@ -10856,8 +11192,9 @@ pub(super) fn metadata_editor_delete_embedded_cuesheet(
             state.cursor = len_after.saturating_sub(1);
         }
         return format!(
-            ":cuesheet-delete: staged embedded CUESHEET deletion from {member_count} member image{}; save (:w) to write tags",
-            if member_count == 1 { "" } else { "s" }
+            ":cuesheet-delete: staged embedded CUESHEET deletion from {member_count} member image{} and removed {removed} synthetic row{}; save (:w) to write tags",
+            if member_count == 1 { "" } else { "s" },
+            if removed == 1 { "" } else { "s" }
         );
     }
 
@@ -14257,7 +14594,7 @@ fn open_metadata_editor_impl(app: &mut AppState, tx: Option<&mpsc::Sender<AppMes
     // applications; the behavioral test below pins it.
     let cue_selection_count = sel
         .iter()
-        .filter(|path| crate::convert::classify::is_cue_sheet_path(path))
+        .filter(|path| super::cue_parser::is_user_visible_cue_path(path))
         .count();
     let mut paths: Vec<std::path::PathBuf> = if cue_selection_count > 0 && cue_selection_count == sel.len() {
         let resolved: Vec<_> = sel
@@ -18092,7 +18429,7 @@ pub(super) fn build_metadata_row_context_menu(
             shortcut: None,
             enabled: true,
         }));
-    } else {
+    } else if !is_synthetic {
         entries.push(ContextMenuEntry::Item(ContextMenuItem {
             label: "Delete entry".to_string(),
             action: ContextAction::MetadataDeleteEntry,
@@ -19637,7 +19974,10 @@ fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Send
                     if idx < state.releases.len() {
                         let releases = std::mem::take(&mut state.releases);
                         let paths = std::mem::take(&mut state.paths);
-                        super::event_loop::open_editor_with_mb_release(app, tx, releases, idx, paths);
+                        let editor_session = state.editor_session;
+                        super::event_loop::open_editor_with_mb_release_guarded(
+                            app, tx, releases, idx, paths, editor_session,
+                        );
                     }
                     return;
                 }
@@ -19661,8 +20001,9 @@ fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Send
                         if is_double {
                             let releases = std::mem::take(&mut state.releases);
                             let paths = std::mem::take(&mut state.paths);
-                            super::event_loop::open_editor_with_mb_release(
-                                app, tx, releases, idx, paths,
+                            let editor_session = state.editor_session;
+                            super::event_loop::open_editor_with_mb_release_guarded(
+                                app, tx, releases, idx, paths, editor_session,
                             );
                             return;
                         }
@@ -20096,6 +20437,7 @@ fn handle_metadata_editor_mouse(
                                     }
                                     MetadataCuePillAction::Edit => {
                                         let status = metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
+                                        app.force_redraw = true;
                                         app.set_status(status);
                                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                     }
@@ -20130,8 +20472,8 @@ fn handle_metadata_editor_mouse(
                             let new_val = input.text.clone();
                             let detail_cursor = state.detail_cursor;
                             if field_idx < state.active_surface().entries.len() && detail_cursor < n_files {
-                                if let Some(reason) = metadata_editor_slot_edit_block_reason(&state, detail_cursor) {
-                                    app.set_status(format!("metadata editor: slot is not editable — {}", reason));
+                                if let Some(reason) = metadata_editor_detail_value_edit_refusal(&state, field_idx, detail_cursor) {
+                                    app.set_status(reason);
                                 } else {
                                     state.active_surface_mut().entries[field_idx].per_file_values[detail_cursor] = new_val;
                                     metadata_editor_recompute_entry_display(&mut state.active_surface_mut().entries[field_idx]);
@@ -20152,8 +20494,8 @@ fn handle_metadata_editor_mouse(
                                 .unwrap_or(false);
 
                             if is_double && field_idx < state.active_surface().entries.len() && !state.read_only {
-                                if let Some(reason) = metadata_editor_slot_edit_block_reason(&state, file_idx) {
-                                    app.set_status(format!("metadata editor: slot is not editable — {}", reason));
+                                if let Some(reason) = metadata_editor_detail_value_edit_refusal(&state, field_idx, file_idx) {
+                                    app.set_status(reason);
                                     state.detail_cursor = file_idx;
                                     state.last_click = None;
                                 } else {
@@ -20355,36 +20697,8 @@ fn handle_metadata_editor_mouse(
                 if is_double && row < state.active_surface().entries.len() {
                     // Double-click: open detail for mixed fields, inline edit otherwise.
                     state.cursor = row;
-                    let entry = &state.active_surface().entries[row];
-                    if !entry.is_binary && !state.active_surface().deleted.contains(&row) {
-                        // Mirrors the keyboard-Enter gate: use the entry's
-                        // own dimension so per-track CUESHEET rows on a
-                        // single-image rip can open detail.
-                        if entry.is_mixed && entry.per_file_values.len() > 1 {
-                            metadata_editor_begin_detail_edit_for_entry(&mut state, row, false);
-                        } else if state.read_only {
-                            app.set_status("read-only editor (SACD ISO)");
-                        } else {
-                            let (writable, blocked) = metadata_editor_entry_slot_counts(&state, row);
-                            if writable == 0 && blocked > 0 {
-                                let reason = metadata_editor_entry_edit_block_reason(&state, row)
-                                    .unwrap_or_else(|| "no writable file slots".to_string());
-                                app.set_status(format!("metadata editor: cannot edit blocked field — {}", reason));
-                            } else if blocked > 0 {
-                                app.set_status(format!(
-                                    "metadata editor: editing per-file values; {} writable file{} can change, {} blocked slot{} remain visible and locked",
-                                    writable,
-                                    if writable == 1 { "" } else { "s" },
-                                    blocked,
-                                    if blocked == 1 { "" } else { "s" }
-                                ));
-                                metadata_editor_begin_detail_edit_for_entry(&mut state, row, true);
-                            } else {
-                                state.edit_input =
-                                    Some(super::text_input::TextInputState::new_selected(entry.value.clone()));
-                                state.phase = MetadataEditorPhase::InlineEdit;
-                            }
-                        }
+                    if let Some(status) = metadata_editor_begin_cursor_value_edit(&mut state, true) {
+                        app.set_status(status);
                     }
                     state.last_click = None;
                 } else if is_double && row == state.active_surface().entries.len() {
@@ -20830,7 +21144,23 @@ fn metadata_editor_begin_detail_edit_for_entry(
     state: &mut super::app::MetadataEditorState,
     entry_idx: usize,
     edit_first_writable_slot: bool,
-) {
+) -> Option<String> {
+    if entry_idx >= state.active_surface().entries.len() {
+        return None;
+    }
+    if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, entry_idx) {
+        return Some(reason);
+    }
+    let Some(entry) = state.active_surface().entries.get(entry_idx) else {
+        return None;
+    };
+    if entry.is_binary {
+        return Some("metadata editor: cannot edit binary field".to_string());
+    }
+    if entry.per_file_values.len() <= 1 {
+        return None;
+    }
+
     state.detail_field_idx = entry_idx;
     state.detail_cursor = 0;
     state.detail_scroll = 0;
@@ -20855,6 +21185,7 @@ fn metadata_editor_begin_detail_edit_for_entry(
         }
     }
     state.phase = super::app::MetadataEditorPhase::DetailEdit;
+    None
 }
 
 fn metadata_editor_entry_slot_counts(
@@ -20878,6 +21209,9 @@ fn metadata_editor_apply_inline_value_to_writable_slots(
     entry_idx: usize,
     new_value: String,
 ) -> usize {
+    if metadata_editor_unpersistable_per_track_reason(state, entry_idx).is_some() {
+        return 0;
+    }
     let Some(entry) = state.active_surface().entries.get(entry_idx) else {
         return 0;
     };
@@ -20933,6 +21267,18 @@ fn metadata_editor_slot_edit_block_reason(
         .write_eligibility
         .block_reason()
         .map(|reason| format!("save blocked: {}", reason))
+}
+
+fn metadata_editor_detail_value_edit_refusal(
+    state: &super::app::MetadataEditorState,
+    entry_idx: usize,
+    slot_index: usize,
+) -> Option<String> {
+    if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, entry_idx) {
+        return Some(reason);
+    }
+    metadata_editor_slot_edit_block_reason(state, slot_index)
+        .map(|reason| format!("metadata editor: slot is not editable — {}", reason))
 }
 
 fn metadata_editor_entry_edit_block_reason(
@@ -22121,14 +22467,19 @@ fn focus_metadata_editor_on_track(
 
     let preferred_keys = ["TITLE", "ARTIST", "PERFORMER", "TRACKNUMBER", "ISRC"];
     let preferred = preferred_keys.iter().find_map(|key| {
-        state.active_surface().entries.iter().position(|entry| {
-            entry.display_key.eq_ignore_ascii_case(key)
+        state.active_surface().entries.iter().enumerate().find_map(|(idx, entry)| {
+            (entry.display_key.eq_ignore_ascii_case(key)
                 && !entry.is_binary
                 && entry.per_file_values.len() > track_index
+                && metadata_editor_unpersistable_per_track_reason(state, idx).is_none())
+                .then_some(idx)
         })
     });
-    let fallback = state.active_surface().entries.iter().position(|entry| {
-        !entry.is_binary && entry.per_file_values.len() > track_index
+    let fallback = state.active_surface().entries.iter().enumerate().find_map(|(idx, entry)| {
+        (!entry.is_binary
+            && entry.per_file_values.len() > track_index
+            && metadata_editor_unpersistable_per_track_reason(state, idx).is_none())
+            .then_some(idx)
     });
     let Some(field_idx) = preferred.or(fallback) else {
         state.cursor = state.cursor.min(state.active_surface().entries.len().saturating_sub(1));
@@ -22141,13 +22492,10 @@ fn focus_metadata_editor_on_track(
 
     let values_len = state.active_surface().entries[field_idx].per_file_values.len();
     if values_len > 1 {
-        state.detail_field_idx = field_idx;
-        state.detail_cursor = track_index.min(values_len - 1);
-        state.detail_scroll = 0;
-        state.detail_edit = None;
-        state.last_click = None;
-        state.phase = super::app::MetadataEditorPhase::DetailEdit;
-        ensure_detail_visible(state);
+        if metadata_editor_begin_detail_edit_for_entry(state, field_idx, false).is_none() {
+            state.detail_cursor = track_index.min(values_len - 1);
+            ensure_detail_visible(state);
+        }
     }
 }
 
@@ -28995,6 +29343,89 @@ mod phase4_tests {
     }
 
 
+    /// Build a minimal unified CUE-album state with two member images and four track rows.
+    fn unified_cue_album_state(entries: Vec<TagEntry>) -> MetadataEditorState {
+        let one = std::path::PathBuf::from("/tmp/one.flac");
+        let two = std::path::PathBuf::from("/tmp/two.flac");
+        let mut state = MetadataEditorState::for_files(
+            vec![one.clone(), two.clone()],
+            entries,
+            vec!["one".to_string(), "two".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(
+            crate::tui::app::CueAlbumSyntheticSheet {
+                cue_paths: Vec::new(),
+                audio_paths: vec![one.clone(), two.clone()],
+                track_sources: vec![
+                    crate::tui::app::CueAlbumTrackSource {
+                        cue_path: std::path::PathBuf::from("/tmp/side_a.cue"),
+                        audio_path: one.clone(),
+                        local_track_index: 0,
+                        original_track_number: 1,
+                        file_ref: "one.flac".to_string(),
+                        index00_frames: None,
+                        index01_frames: Some(0),
+                        isrc: None,
+                    },
+                    crate::tui::app::CueAlbumTrackSource {
+                        cue_path: std::path::PathBuf::from("/tmp/side_a.cue"),
+                        audio_path: one,
+                        local_track_index: 1,
+                        original_track_number: 2,
+                        file_ref: "one.flac".to_string(),
+                        index00_frames: None,
+                        index01_frames: Some(75),
+                        isrc: None,
+                    },
+                    crate::tui::app::CueAlbumTrackSource {
+                        cue_path: std::path::PathBuf::from("/tmp/side_b.cue"),
+                        audio_path: two.clone(),
+                        local_track_index: 0,
+                        original_track_number: 1,
+                        file_ref: "two.flac".to_string(),
+                        index00_frames: None,
+                        index01_frames: Some(0),
+                        isrc: None,
+                    },
+                    crate::tui::app::CueAlbumTrackSource {
+                        cue_path: std::path::PathBuf::from("/tmp/side_b.cue"),
+                        audio_path: two,
+                        local_track_index: 1,
+                        original_track_number: 2,
+                        file_ref: "two.flac".to_string(),
+                        index00_frames: None,
+                        index01_frames: Some(75),
+                        isrc: None,
+                    },
+                ],
+                album_title: None,
+                album_performer: None,
+                album_date: None,
+                album_genre: None,
+                album_catalog: None,
+            },
+        );
+        state.active_surface_mut().dirty = true;
+        state
+    }
+
+    #[test]
+    fn metadata_editor_delete_cursor_refuses_unpersistable_unified_tracknumber() {
+        let mut state = unified_cue_album_state(vec![entry(
+            "TRACKNUMBER",
+            ItemKey::TrackNumber,
+            &["01", "02", "03", "04"],
+            &["01", "02", "03", "04"],
+        )]);
+
+        let status = metadata_editor_delete_cursor(&mut state).expect("delete should be refused");
+
+        assert!(status.contains("TRACKNUMBER"), "unexpected status: {status}");
+        assert!(state.active_surface().deleted.is_empty());
+    }
+
+
     fn dvda_multitab_state(tabs: Vec<super::super::app::PresentationTab>) -> MetadataEditorState {
         MetadataEditorState::for_disc_presentations(tabs, 0)
     }
@@ -33699,6 +34130,97 @@ mod single_image_metadata_editor_regression_tests {
             .collect()
     }
 
+    #[test]
+    fn clean_unified_surface_has_no_repeated_forced_cleanup_work() {
+        let mut state = unified_cue_album_edit_state();
+        state.active_surface_mut().dirty = false;
+        state.active_surface_mut().cue_album_forced_cleanup.clear();
+
+        let forced = metadata_editor_forced_delete_items(&state);
+        assert!(
+            forced.is_empty(),
+            "clean authoritative unified surfaces must not rewrite member-image tags on every :w"
+        );
+        assert!(
+            !metadata_editor_has_audio_save_work(&state, &forced),
+            "clean unified surfaces with no observed pollution should return No changes to save"
+        );
+    }
+
+    #[test]
+    fn unified_cleanup_forced_deletes_only_observed_managed_track_scoped_whole_file_pollution() {
+        let mut state = unified_cue_album_edit_state();
+        state.active_surface_mut().dirty = false;
+        state.active_surface_mut().cue_album_forced_cleanup = vec![
+            (0, lofty::tag::ItemKey::MusicBrainzRecordingId),
+            (0, lofty::tag::ItemKey::MusicBrainzTrackId),
+            (0, lofty::tag::ItemKey::MusicBrainzArtistId),
+            (0, lofty::tag::ItemKey::Isrc),
+            (0, lofty::tag::ItemKey::TrackNumber),
+            (1, lofty::tag::ItemKey::MusicBrainzRecordingId),
+        ];
+
+        let forced = metadata_editor_forced_delete_items(&state);
+        assert_eq!(
+            forced,
+            vec![
+                (0, lofty::tag::ItemKey::MusicBrainzRecordingId),
+                (0, lofty::tag::ItemKey::MusicBrainzTrackId),
+                (0, lofty::tag::ItemKey::MusicBrainzArtistId),
+                (0, lofty::tag::ItemKey::Isrc),
+                (0, lofty::tag::ItemKey::TrackNumber),
+                (1, lofty::tag::ItemKey::MusicBrainzRecordingId),
+            ],
+            "forced cleanup must be a loaded-state migration plan, not an unconditional per-save tombstone set"
+        );
+        assert!(
+            metadata_editor_has_audio_save_work(&state, &forced),
+            "an otherwise clean unified surface with observed pollution must still run a cleanup-only save"
+        );
+    }
+
+    #[test]
+    fn unified_cleanup_plan_is_derived_from_replaced_loaded_whole_file_tags() {
+        let mut entries = vec![
+            crate::tui::probe::TagEntry {
+                display_key: "ISRC".to_string(),
+                item_key: lofty::tag::ItemKey::Isrc,
+                value: "<multiple values>".to_string(),
+                original: "".to_string(),
+                is_binary: false,
+                is_mixed: true,
+                per_file_values: vec!["GBAYE0300334".to_string(), "".to_string()],
+                per_file_originals: vec!["GBAYE0300334".to_string(), "".to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            },
+            crate::tui::probe::TagEntry {
+                display_key: "TRACKNUMBER".to_string(),
+                item_key: lofty::tag::ItemKey::TrackNumber,
+                value: "1".to_string(),
+                original: "1".to_string(),
+                is_binary: false,
+                is_mixed: false,
+                per_file_values: vec!["1".to_string(), "2".to_string()],
+                per_file_originals: vec!["1".to_string(), "2".to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            },
+            title_tag_entry(vec!["ordinary title", "ordinary title"]),
+        ];
+
+        let (_cuesheet_originals, forced) = cue_album_remove_replaced_keys(&mut entries, 2);
+        assert!(
+            entries.is_empty(),
+            "unified builder still replaces managed rows with CUE-derived dimensions"
+        );
+        assert!(forced.contains(&(0, lofty::tag::ItemKey::Isrc)));
+        assert!(!forced.contains(&(1, lofty::tag::ItemKey::Isrc)));
+        assert!(forced.contains(&(0, lofty::tag::ItemKey::TrackNumber)));
+        assert!(forced.contains(&(1, lofty::tag::ItemKey::TrackNumber)));
+    }
+
+
     fn write_metadata_surface_part(
         dir: &std::path::Path,
         stem: &str,
@@ -34309,6 +34831,25 @@ mod single_image_metadata_editor_regression_tests {
     }
 
     #[test]
+    fn embedded_cuesheet_edit_buffer_is_outside_album_folder_under_temp_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("album").join("side_a.flac");
+        std::fs::create_dir_all(audio.parent().unwrap()).expect("album dir");
+        let buffer = embedded_cuesheet_edit_temp_path(&audio).expect("edit buffer path");
+
+        assert!(
+            buffer.starts_with(std::env::temp_dir().join("tonepoet-embedded-cuesheet-edits")),
+            "rejected edit buffers must live under the process temp edit root, not the album folder: {}",
+            buffer.display()
+        );
+        assert!(
+            !buffer.starts_with(audio.parent().unwrap()),
+            "embedded-CUESHEET edit buffers kept on reject must not poison sidecar discovery in the album folder"
+        );
+        assert_eq!(buffer.extension().and_then(|ext| ext.to_str()), Some("cue"));
+    }
+
+    #[test]
     fn embedded_cuesheet_commands_reject_sidecar_synthetic_cuesheet_rows() {
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("side_a.flac");
@@ -34360,6 +34901,412 @@ mod single_image_metadata_editor_regression_tests {
         let title = surface.entries.iter().find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE")).expect("reshaped TITLE row");
         assert_eq!(title.per_file_values.len(), 3, "sidecar track count should reshape derived rows");
         assert!(title.per_file_values.iter().any(|title| title.contains("Sidecar Track 3")));
+    }
+
+    #[test]
+    fn metadata_editor_delete_key_on_embedded_cuesheet_routes_to_confirmation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        std::fs::write(&image, b"placeholder").expect("image");
+        let embedded = fixture_cue("side_a", "Album", "Embedded", 2);
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            vec![cuesheet_tag_entry(&embedded, &embedded)],
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+        state.cursor = 0;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { message, action } => {
+                assert!(
+                    message.contains("Delete the embedded CUESHEET tag"),
+                    "unexpected confirmation message: {message}"
+                );
+                assert!(matches!(action, ConfirmAction::DeleteEmbeddedCueSheet { path } if path == &image));
+            }
+            other => panic!("expected delete confirmation, got {other:?}"),
+        }
+        let parked = app.pending_metadata_editor.as_ref().expect("parked editor");
+        assert!(parked.active_surface().deleted.is_empty());
+        assert!(!parked.active_surface().pending_embedded_cuesheet_delete);
+    }
+
+    #[test]
+    fn meta_delete_command_on_embedded_cuesheet_routes_to_confirmation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        std::fs::write(&image, b"placeholder").expect("image");
+        let embedded = fixture_cue("side_a", "Album", "Embedded", 2);
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            vec![cuesheet_tag_entry(&embedded, &embedded)],
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+        state.cursor = 0;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        crate::tui::command::execute_command(
+            &mut app,
+            crate::tui::command::Command::MetaDelete,
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { message, action } => {
+                assert!(
+                    message.contains("Delete the embedded CUESHEET tag"),
+                    "unexpected confirmation message: {message}"
+                );
+                assert!(matches!(action, ConfirmAction::DeleteEmbeddedCueSheet { path } if path == &image));
+            }
+            other => panic!("expected delete confirmation, got {other:?}"),
+        }
+        let parked = app.pending_metadata_editor.as_ref().expect("parked editor");
+        assert!(parked.active_surface().deleted.is_empty());
+        assert!(!parked.active_surface().pending_embedded_cuesheet_delete);
+    }
+
+
+    #[test]
+    fn metadata_context_menu_generic_delete_on_cuesheet_routes_to_confirmation() {
+        let mut state = unified_cue_album_edit_state();
+        let cue_idx = metadata_cuesheet_entry_index(&state.active_surface().entries)
+            .expect("CUESHEET row");
+        state.cursor = cue_idx;
+        let image = state.active_surface().paths[0].clone();
+
+        let entries = build_metadata_row_context_menu(&state, cue_idx);
+        let has_generic_delete = entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if item.label == "Delete entry"
+                    && matches!(item.action, crate::tui::context_menu::ContextAction::MetadataDeleteEntry)
+        ));
+        assert!(!has_generic_delete, "CUESHEET row menu must not expose unconfirmed generic deletion");
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        crate::tui::context_menu::execute_context_action(
+            &mut app,
+            crate::tui::context_menu::ContextAction::MetadataDeleteEntry,
+            &tx,
+            false,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation { message, action } => {
+                assert!(
+                    message.contains("Delete the embedded CUESHEET tag"),
+                    "unexpected confirmation message: {message}"
+                );
+                assert!(matches!(action, ConfirmAction::DeleteEmbeddedCueSheet { path } if path == &image));
+            }
+            other => panic!("expected delete confirmation, got {other:?}"),
+        }
+        let parked = app.pending_metadata_editor.as_ref().expect("parked editor");
+        assert!(parked.active_surface().deleted.is_empty());
+        assert!(!parked.active_surface().pending_embedded_cuesheet_delete);
+    }
+
+    #[test]
+    fn metadata_context_menu_edit_refuses_unpersistable_unified_per_track_key() {
+        let mut state = unified_cue_album_edit_state();
+        let n_tracks = state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("unified sheet")
+            .track_sources
+            .len();
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+            display_key: "COMPOSER".to_string(),
+            item_key: lofty::tag::ItemKey::Composer,
+            value: "<multiple values>".to_string(),
+            original: "Composer 1".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+        state.cursor = state.active_surface().entries.len() - 1;
+        state.active_surface_mut().dirty = false;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        crate::tui::context_menu::execute_context_action(
+            &mut app,
+            crate::tui::context_menu::ContextAction::MetadataEditValue,
+            &tx,
+            false,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("cannot persist per-track COMPOSER"), "unexpected status: {status}");
+        let state = match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => panic!("expected restored metadata editor, got {other:?}"),
+        };
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::Editing);
+        assert!(state.edit_input.is_none());
+        assert!(!state.active_surface().dirty);
+    }
+
+    #[test]
+    fn metadata_context_menu_delete_refuses_unpersistable_unified_per_track_key() {
+        let mut state = unified_cue_album_edit_state();
+        let n_tracks = state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("unified sheet")
+            .track_sources
+            .len();
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+            display_key: "COMPOSER".to_string(),
+            item_key: lofty::tag::ItemKey::Composer,
+            value: "<multiple values>".to_string(),
+            original: "Composer 1".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+        state.cursor = state.active_surface().entries.len() - 1;
+        state.active_surface_mut().dirty = false;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        crate::tui::context_menu::execute_context_action(
+            &mut app,
+            crate::tui::context_menu::ContextAction::MetadataDeleteEntry,
+            &tx,
+            false,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("cannot persist per-track COMPOSER"), "unexpected status: {status}");
+        let state = match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => panic!("expected restored metadata editor, got {other:?}"),
+        };
+        assert!(state.active_surface().deleted.is_empty());
+        assert!(!state.active_surface().dirty);
+    }
+
+    fn append_unpersistable_unified_composer_row(state: &mut crate::tui::app::MetadataEditorState) -> usize {
+        let n_tracks = state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("unified sheet")
+            .track_sources
+            .len();
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+            display_key: "COMPOSER".to_string(),
+            item_key: lofty::tag::ItemKey::Composer,
+            value: "<multiple values>".to_string(),
+            original: "Composer 1".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+        state.active_surface().entries.len() - 1
+    }
+
+    #[test]
+    fn metadata_keyboard_edit_refuses_unpersistable_unified_per_track_key() {
+        let mut state = unified_cue_album_edit_state();
+        let composer_idx = append_unpersistable_unified_composer_row(&mut state);
+        state.cursor = composer_idx;
+
+        let status = metadata_editor_begin_cursor_value_edit(&mut state, true)
+            .expect("unpersistable edit should be refused before opening inline editor");
+        assert!(status.contains("cannot persist per-track COMPOSER"), "unexpected status: {status}");
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::Editing);
+        assert!(state.edit_input.is_none());
+    }
+
+    #[test]
+    fn metadata_mouse_double_click_edit_refuses_unpersistable_unified_per_track_key() {
+        let mut state = unified_cue_album_edit_state();
+        let composer_idx = append_unpersistable_unified_composer_row(&mut state);
+        state.scroll = composer_idx;
+        state.cursor = 0;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        let (terminal_width, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(Rect::new(
+            0,
+            0,
+            terminal_width,
+            terminal_height,
+        ));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: layout.inner.x.saturating_add(1),
+            row: layout.content_area.y,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        handle_metadata_editor_mouse(&mut app, click, &tx);
+        handle_metadata_editor_mouse(&mut app, click, &tx);
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("cannot persist per-track COMPOSER"), "unexpected status: {status}");
+        let state = match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => panic!("expected restored metadata editor, got {other:?}"),
+        };
+        assert_eq!(state.cursor, composer_idx);
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::Editing);
+        assert!(state.edit_input.is_none());
+        assert!(!state.active_surface().dirty);
+    }
+
+
+    #[test]
+    fn metadata_detail_command_refuses_unpersistable_unified_per_track_key() {
+        let mut state = unified_cue_album_edit_state();
+        let composer_idx = append_unpersistable_unified_composer_row(&mut state);
+        state.cursor = composer_idx;
+        state.active_surface_mut().dirty = false;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        crate::tui::command::execute_command(
+            &mut app,
+            crate::tui::command::Command::MetaDetail,
+            &tx,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("cannot persist per-track COMPOSER"), "unexpected status: {status}");
+        let state = match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => panic!("expected restored metadata editor, got {other:?}"),
+        };
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::Editing);
+        assert!(state.detail_edit.is_none());
+        assert!(!state.active_surface().dirty);
+    }
+
+    #[test]
+    fn metadata_detail_overlay_enter_and_commit_refuse_unpersistable_unified_per_track_key() {
+        let mut state = Box::new(unified_cue_album_edit_state());
+        let composer_idx = append_unpersistable_unified_composer_row(&mut state);
+        for entry in &mut state.active_surface_mut().entries {
+            entry.per_file_originals = entry.per_file_values.clone();
+            entry.original = entry.value.clone();
+        }
+        let original = state.active_surface().entries[composer_idx].per_file_values[0].clone();
+        state.cursor = composer_idx;
+        state.detail_field_idx = composer_idx;
+        state.detail_cursor = 0;
+        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        state.active_surface_mut().dirty = false;
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("cannot persist per-track COMPOSER"), "unexpected status: {status}");
+        assert!(state.detail_edit.is_none());
+        assert_eq!(state.active_surface().entries[composer_idx].per_file_values[0], original);
+        assert!(!state.active_surface().dirty);
+
+        state.detail_edit = Some(crate::tui::text_input::TextInputState::new("Changed composer".to_string()));
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("cannot persist per-track COMPOSER"), "unexpected status: {status}");
+        assert!(state.detail_edit.is_none());
+        assert_eq!(state.active_surface().entries[composer_idx].per_file_values[0], original);
+        assert!(!state.active_surface().dirty);
+    }
+
+    #[test]
+    fn focus_metadata_editor_on_track_skips_unpersistable_unified_rows() {
+        let mut state = unified_cue_album_edit_state();
+        append_unpersistable_unified_composer_row(&mut state);
+        let composer = state.active_surface_mut().entries.pop().expect("composer row");
+        state.active_surface_mut().entries = vec![composer];
+        state.cursor = 0;
+        state.phase = crate::tui::app::MetadataEditorPhase::Editing;
+
+        focus_metadata_editor_on_track(&mut state, 0);
+
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::Editing);
+        assert_eq!(state.cursor, 0);
+        assert!(state.detail_edit.is_none());
     }
 
     #[test]
@@ -34536,6 +35483,323 @@ mod single_image_metadata_editor_regression_tests {
             .into_iter()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
             .and_then(|entry| entry.per_file_values.first().map(|text| text.trim().to_string()))
+    }
+
+    fn fixture_cue_without_album_headers(stem: &str, side_prefix: &str, n_tracks: usize) -> String {
+        let mut cue = format!("FILE \"{stem}.flac\" WAVE\n");
+        for track in 1..=n_tracks {
+            let total_seconds = (track - 1) * 30;
+            let minutes = total_seconds / 60;
+            let seconds = total_seconds % 60;
+            cue.push_str(&format!(
+                "  TRACK {track:02} AUDIO\n    TITLE \"{side_prefix} Track {track}\"\n    INDEX 01 {minutes:02}:{seconds:02}:00\n"
+            ));
+        }
+        cue
+    }
+
+    fn create_dsotm_sidecar_fixture(
+        album: &std::path::Path,
+        include_album_headers: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        std::fs::create_dir_all(album).expect("album dir");
+        let side_a = album.join("tdsotm_a.flac");
+        let side_b = album.join("tdsotm_b.flac");
+        assert!(create_flac_fixture(&side_a), "side A flac fixture");
+        assert!(create_flac_fixture(&side_b), "side B flac fixture");
+        let side_a_cue = if include_album_headers {
+            fixture_cue("tdsotm_a", "The Dark Side Of The Moon (Side A)", "A", 5)
+        } else {
+            fixture_cue_without_album_headers("tdsotm_a", "A", 5)
+        };
+        let side_b_cue = if include_album_headers {
+            fixture_cue("tdsotm_b", "The Dark Side Of The Moon (Side B)", "B", 5)
+        } else {
+            fixture_cue_without_album_headers("tdsotm_b", "B", 5)
+        };
+        std::fs::write(album.join("tdsotm_a.cue"), side_a_cue).expect("side A cue");
+        std::fs::write(album.join("tdsotm_b.cue"), side_b_cue).expect("side B cue");
+        (side_a, side_b)
+    }
+
+    fn build_dsotm_unified_editor(
+        album: &std::path::Path,
+    ) -> Box<crate::tui::app::MetadataEditorState> {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut surfaces = collect_metadata_cue_surfaces(&[album.to_path_buf()]);
+        let mut active_surface = 0usize;
+        apply_cached_or_ladder_split_cue_grouping_to_metadata_surfaces(
+            &mut app,
+            &mut surfaces,
+            &mut active_surface,
+        );
+        let (state, n_tracks) = build_metadata_editor_for_cue_surfaces(
+            &mut app,
+            &surfaces,
+            active_surface,
+        )
+        .expect("production unified CUE editor builder");
+        assert_eq!(n_tracks, 10, "DSOTM-shaped fixture must expose ten rows");
+        assert!(state.active_surface().cue_album_synthetic_sheet.is_some());
+        state
+    }
+
+    fn mb_release_10_tracks() -> crate::tui::musicbrainz::MbRelease {
+        crate::tui::musicbrainz::MbRelease {
+            release_id: "mb-dsotm".to_string(),
+            release_group_id: Some("rg-dsotm".to_string()),
+            title: "The Dark Side Of The Moon".to_string(),
+            artist: "Pink Floyd".to_string(),
+            artist_id: Some("artist-pink-floyd".to_string()),
+            year: Some("1973".to_string()),
+            original_date: Some("1973-03-01".to_string()),
+            country: Some("GB".to_string()),
+            catalog: Some("SHVL 804".to_string()),
+            barcode: Some("0000000000000".to_string()),
+            disc_count: 1,
+            tracks: (1..=10)
+                .map(|position| crate::tui::musicbrainz::MbTrack {
+                    position,
+                    track_id: Some(format!("release-track-{position:02}")),
+                    recording_id: Some(format!("recording-{position:02}")),
+                    artist_id: Some(format!("track-artist-{position:02}")),
+                    title: format!("MB Track {position}"),
+                    artist: "Pink Floyd".to_string(),
+                    isrc: Some(format!("GBAYE03003{position:02}")),
+                    length_ms: Some(30_000),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn unified_reopen_after_regenerated_embedded_save_uses_saved_sheet_authoritatively() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dsotm");
+        let (side_a, side_b) = create_dsotm_sidecar_fixture(&album, true);
+
+        let mut state = build_dsotm_unified_editor(&album);
+        let title_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("TITLE row");
+        state.active_surface_mut().entries[title_idx].per_file_values[2] =
+            "Saved Embedded Authority Title".to_string();
+        state.active_surface_mut().dirty = true;
+
+        assert!(
+            regenerate_cuesheet_for_save(&mut state).expect("regenerate edited unified CUE"),
+            "edited track title must regenerate the embedded synthetic sheet"
+        );
+        let saved_sheet = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET row")
+            .per_file_values[0]
+            .clone();
+        assert!(saved_sheet.contains("Saved Embedded Authority Title"));
+
+        for image in [&side_a, &side_b] {
+            crate::tui::probe::write_all_tags(
+                image,
+                &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(saved_sheet.clone()))],
+            )
+            .expect("write regenerated embedded CUESHEET through tag helper");
+            assert_eq!(read_cuesheet_tag(image).as_deref(), Some(saved_sheet.trim()));
+        }
+
+        let reopened = build_dsotm_unified_editor(&album);
+        let reopened_surface = reopened.active_surface();
+        assert!(
+            !reopened_surface.dirty,
+            "identical embedded multi-FILE sheets matching all member images must open clean"
+        );
+        let reopened_titles = reopened_surface
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("reopened TITLE row");
+        assert_eq!(
+            reopened_titles.per_file_values[2],
+            "Saved Embedded Authority Title",
+            "reopen must display the saved embedded sheet, not stale sidecar titles"
+        );
+        let cue_row = reopened_surface
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("reopened CUESHEET row");
+        assert_eq!(cue_row.per_file_originals.len(), 2);
+        assert!(
+            cue_row
+                .per_file_originals
+                .iter()
+                .all(|original| original.trim() == saved_sheet.trim()),
+            "reopened CUESHEET originals must be the authoritative embedded sheet"
+        );
+    }
+
+    #[test]
+    fn unified_reopen_differing_member_embedded_sheets_falls_back_to_sidecar_repair() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dsotm");
+        let (side_a, side_b) = create_dsotm_sidecar_fixture(&album, true);
+
+        let mut state = build_dsotm_unified_editor(&album);
+        // The builder stages the regenerated synthetic sheet on open, so
+        // regen may be a legitimate no-op (Ok(false)); only Err is fatal.
+        regenerate_cuesheet_for_save(&mut state).expect("initial unified CUE regen");
+        let saved_sheet = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET row")
+            .per_file_values[0]
+            .clone();
+        let divergent_sheet = saved_sheet.replace("A Track 1", "Divergent Embedded Track");
+        assert_ne!(saved_sheet, divergent_sheet);
+
+        crate::tui::probe::write_all_tags(
+            &side_a,
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(saved_sheet))],
+        )
+        .expect("write side A embedded sheet");
+        crate::tui::probe::write_all_tags(
+            &side_b,
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(divergent_sheet))],
+        )
+        .expect("write side B divergent embedded sheet");
+
+        let reopened = build_dsotm_unified_editor(&album);
+        let surface = reopened.active_surface();
+        assert!(surface.dirty, "differing member embedded sheets must open as repair state");
+        let titles = surface
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("TITLE row");
+        assert_eq!(
+            titles.per_file_values[0],
+            "A Track 1",
+            "sidecar truth must remain visible when embedded member sheets disagree"
+        );
+    }
+
+    #[test]
+    fn unified_mb_supplemental_populates_ten_isrc_rows_without_file_level_track_mbids() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dsotm");
+        create_dsotm_sidecar_fixture(&album, true);
+        let release = mb_release_10_tracks();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let state = build_metadata_editor_for_cue_surfaces_with_mb_release(
+            &mut app,
+            &[album.clone()],
+            &release,
+        )
+        .expect("builder should not fail")
+        .expect("unified MB editor");
+        let surface = state.active_surface();
+
+        let isrc = surface
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("ISRC"))
+            .expect("ISRC row");
+        assert_eq!(isrc.per_file_values.len(), 10, "ISRC must be row-dimensioned");
+        assert_eq!(isrc.per_file_values[0], "GBAYE0300301");
+        assert_eq!(isrc.per_file_values[9], "GBAYE0300310");
+
+        for forbidden in ["MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ_ARTISTID"] {
+            let entry = surface
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case(forbidden));
+            assert!(
+                entry.is_none(),
+                "unified member images must not receive file-aligned per-track {forbidden} tags"
+            );
+            if let Some(entry) = entry {
+                assert_ne!(
+                    entry.per_file_values.get(0).map(String::as_str),
+                    Some("recording-01"),
+                    "track 1's recording id must never be written to member-image slot zero"
+                );
+            }
+        }
+        assert!(
+            surface.entries.iter().all(|entry| {
+                !entry.display_key.eq_ignore_ascii_case("MUSICBRAINZ_TRACKID")
+                    || entry.per_file_values.get(0).map(String::as_str) != Some("recording-01")
+            }),
+            "no unified production-built row may preserve track 1's recording id as a member-image value"
+        );
+    }
+
+    #[test]
+    fn unified_mb_apply_missing_album_headers_creates_file_dim_album_fields_and_regenerated_header() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dsotm-no-headers");
+        create_dsotm_sidecar_fixture(&album, false);
+        let mut release = mb_release_10_tracks();
+        release.title = "MB Supplied Album".to_string();
+        release.year = Some("1973".to_string());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = build_metadata_editor_for_cue_surfaces_with_mb_release(
+            &mut app,
+            &[album.clone()],
+            &release,
+        )
+        .expect("builder should not fail")
+        .expect("unified MB editor");
+        let paths_len = state.active_surface().paths.len();
+
+        for key in ["ALBUM", "DATE"] {
+            let entry = state
+                .active_surface()
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case(key))
+                .unwrap_or_else(|| panic!("missing {key} row"));
+            assert_eq!(
+                entry.per_file_values.len(),
+                paths_len,
+                "{key} must be member-file dimensioned on unified surfaces"
+            );
+        }
+
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("regenerate unified CUE"));
+        let cue = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .expect("CUESHEET row")
+            .per_file_values[0]
+            .clone();
+        assert!(cue.contains("TITLE \"MB Supplied Album\""), "regenerated sheet must contain MB album title");
+        assert!(cue.contains("REM DATE 1973"), "regenerated sheet must contain MB date");
     }
 
     #[test]

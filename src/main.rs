@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{broadcast, RwLock};
+use std::sync::{Mutex, OnceLock};
+use tokio::sync::broadcast;
 
 use tonepoet::config::TonepoetConfig;
 use tonepoet::convert::pipeline::DvdaDownmixPolicy;
@@ -10,7 +10,7 @@ use tonepoet::convert::{
         AacProfile, AudioFormat, ConversionOptions, FileFormat, FormatDetector, Mp3BitrateMode,
         QualitySettings,
     },
-    ConversionItem, ConversionProcessor, ConversionQueue, ConversionStatus, ProcessorConfig,
+    ConversionConfig, ConversionItem, ConversionManager, ConversionProcessor, ConversionQueue, ConversionStatus, ProcessorConfig,
     ProgressUpdate,
 };
 
@@ -842,6 +842,11 @@ async fn run_convert(
         scratch_memory_limit_percent: config.conversion.scratch_memory_limit_percent,
     };
 
+    let mut manager_config = ConversionConfig::default();
+    manager_config.default_format = output_format.clone();
+    manager_config.default_options = options.clone();
+    manager_config.worker_count = worker_count;
+    let manager = ConversionManager::new(manager_config);
     let mut processor = ConversionProcessor::new(processor_config);
 
     // Set up progress channel
@@ -849,7 +854,7 @@ async fn run_convert(
     processor.set_progress_channel(progress_tx);
 
     // Build queue
-    let queue = Arc::new(RwLock::new(ConversionQueue::new()));
+    let queue = manager.queue.clone();
 
     // Add files to queue through the same expansion heuristics the TUI uses:
     // directories expand to their queueable contents with CUE suppression
@@ -862,6 +867,16 @@ async fn run_convert(
     {
         let mut q = queue.write().await;
         let planned = plan_cli_convert_queue(&paths);
+        if !planned.errors.is_empty() {
+            for err in &planned.errors {
+                eprintln!("Error: {err}");
+            }
+            tonepoet::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+                &planned.synthetic_cue_artifacts,
+            );
+            anyhow::bail!(planned.errors.join("; "));
+        }
+        let planned_synthetic_cue_artifacts = planned.synthetic_cue_artifacts.clone();
         for warning in &planned.warnings {
             eprintln!("Warning: {warning}");
         }
@@ -910,6 +925,9 @@ async fn run_convert(
 
         let total = q.all_items().len();
         if total == 0 {
+            tonepoet::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+                &planned_synthetic_cue_artifacts,
+            );
             anyhow::bail!("No supported files found in the provided paths");
         }
         println!(
@@ -917,6 +935,22 @@ async fn run_convert(
             total,
             output_format.name()
         );
+
+        // Release the write guard before registering artifacts through the
+        // manager's queue-snapshot path.  Synthetic album CUE files must be
+        // owned by queue item ids, not by a free-standing CLI cleanup set, so
+        // panic/unwind and future early returns still run through
+        // ConversionManager's drop/removal lifecycle.
+        drop(q);
+        let claimed = manager
+            .register_synthetic_cue_artifacts_for_current_queue_await(&planned_synthetic_cue_artifacts)
+            .await
+            .map_err(|error| anyhow::anyhow!(
+                "synthetic CUE artifact ownership registration failed: {error}"
+            ))?;
+        for artifact in planned_synthetic_cue_artifacts.difference(&claimed) {
+            tonepoet::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
+        }
     }
 
     // Spawn progress display task
@@ -984,7 +1018,9 @@ async fn run_convert(
         .await;
 
     // Drop the processor (and its progress_tx sender) so the progress display
-    // task's recv() loop terminates instead of blocking forever.
+    // task's recv() loop terminates instead of blocking forever.  The manager
+    // remains alive through summary printing and then drops, cleaning any
+    // registered synthetic CUE artifacts that were not explicitly removed.
     drop(processor);
 
     // Wait for progress display to finish
@@ -1020,6 +1056,8 @@ struct PlannedCliQueue {
         Option<tonepoet::convert::pipeline::CueSidecarPolicy>,
     )>,
     warnings: Vec<String>,
+    errors: Vec<String>,
+    synthetic_cue_artifacts: std::collections::HashSet<PathBuf>,
 }
 
 /// Expand CLI convert arguments through the same queue-expansion heuristics
@@ -1043,6 +1081,14 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
 
     let expansion =
         tonepoet::convert::queue_expansion::expand_paths_to_audio_with_metadata(&expansion_inputs);
+    let mut errors = Vec::new();
+    if !expansion.expansion_errors.is_empty() {
+        if expansion.paths.is_empty() {
+            errors.extend(expansion.expansion_errors.iter().cloned());
+        } else {
+            warnings.extend(expansion.expansion_errors.iter().cloned());
+        }
+    }
 
     // Explicit file arguments the expansion filtered out (unsupported formats)
     // still deserve the historical warning.
@@ -1067,7 +1113,12 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
         }
     }
 
-    PlannedCliQueue { items, warnings }
+    PlannedCliQueue {
+        items,
+        warnings,
+        errors,
+        synthetic_cue_artifacts: expansion.synthetic_cue_artifacts,
+    }
 }
 
 fn add_item_to_queue(
@@ -3081,6 +3132,58 @@ mod cli_convert_queue_planning_tests {
             .collect()
     }
 
+
+    fn write_mergeable_split_cue_album_fixture(root: &std::path::Path) {
+        touch(&root.join("side_a.flac"));
+        touch(&root.join("side_b.flac"));
+        std::fs::write(
+            root.join("side_a.cue"),
+            r#"TITLE "Album Side A"
+FILE "side_a.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "A1"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "A2"
+    INDEX 01 03:00:00
+"#,
+        )
+        .expect("side A cue");
+        std::fs::write(
+            root.join("side_b.cue"),
+            r#"TITLE "Album Side B"
+FILE "side_b.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "B1"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "B2"
+    INDEX 01 03:00:00
+"#,
+        )
+        .expect("side B cue");
+    }
+
+    fn write_overlong_split_cue_album_fixture(root: &std::path::Path) {
+        touch(&root.join("side_a.flac"));
+        touch(&root.join("side_b.flac"));
+        fn many_track_cue(title: &str, image: &str, first: usize, count: usize) -> String {
+            let mut text = format!("TITLE \"{title}\"\nFILE \"{image}\" WAVE\n");
+            for n in first..first + count {
+                text.push_str(&format!(
+                    "  TRACK {:02} AUDIO\n    INDEX 01 {:02}:00:00\n",
+                    ((n - first) % 99) + 1,
+                    n
+                ));
+            }
+            text
+        }
+        std::fs::write(root.join("side_a.cue"), many_track_cue("Album Side A", "side_a.flac", 0, 50))
+            .expect("side A cue");
+        std::fs::write(root.join("side_b.cue"), many_track_cue("Album Side B", "side_b.flac", 50, 50))
+            .expect("side B cue");
+    }
+
     /// The Dreams box-set shape: split per-track FLACs plus an uppercase .CUE
     /// describing an image that is not present. The CUE must be suppressed —
     /// it previously queued and failed every folder conversion containing one.
@@ -3198,4 +3301,114 @@ mod cli_convert_queue_planning_tests {
         assert!(planned.warnings.iter().any(|w| w.contains("does not exist")));
         assert!(planned.warnings.iter().any(|w| w.contains("unsupported file format")));
     }
+
+    #[test]
+    fn cli_planner_surfaces_fatal_merged_cue_errors_instead_of_silent_empty_queue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_overlong_split_cue_album_fixture(temp.path());
+
+        let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
+
+        assert!(planned.items.is_empty(), "fatal merged-CUE planning errors must not queue fallback items");
+        assert!(planned.synthetic_cue_artifacts.is_empty());
+        assert!(
+            planned.errors.iter().any(|err| err.contains("at most 99")),
+            "planner must return the fatal expansion error to the CLI, got {:?}",
+            planned.errors
+        );
+    }
+
+
+    #[test]
+    fn cli_planner_keeps_partial_queue_when_one_synthetic_group_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bad = temp.path().join("bad-disc");
+        let good = temp.path().join("good-disc");
+        std::fs::create_dir_all(&bad).expect("bad dir");
+        std::fs::create_dir_all(&good).expect("good dir");
+        write_overlong_split_cue_album_fixture(&bad);
+        write_mergeable_split_cue_album_fixture(&good);
+        let standalone = temp.path().join("01 - One.flac");
+        touch(&standalone);
+
+        let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
+        let names = planned_names(&planned);
+
+        assert!(
+            planned.errors.is_empty(),
+            "partial expansion errors must be warnings when queueable work remains: {:?}",
+            planned.errors
+        );
+        assert!(
+            planned.warnings.iter().any(|warning| warning.contains("at most 99")),
+            "failed group must be surfaced as a warning, got {:?}",
+            planned.warnings
+        );
+        assert_eq!(planned.synthetic_cue_artifacts.len(), 1);
+        assert!(
+            names.iter().any(|name| name == "album.cue"),
+            "valid merged group should survive partial expansion, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "01 - One.flac"),
+            "unrelated ordinary audio should survive partial expansion, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "side_a.cue" || name == "side_b.cue"),
+            "fail-closed group side CUEs must not be queued as fallback: {names:?}"
+        );
+        tonepoet::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+            &planned.synthetic_cue_artifacts,
+        );
+    }
+
+    #[test]
+    fn cli_synthetic_artifacts_are_manager_owned_and_drop_cleaned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_mergeable_split_cue_album_fixture(temp.path());
+
+        let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
+        assert_eq!(planned.items.len(), 1);
+        assert_eq!(planned.synthetic_cue_artifacts.len(), 1);
+        let artifact = planned.synthetic_cue_artifacts.iter().next().unwrap().clone();
+        assert!(artifact.exists(), "planner-created synthetic CUE must exist before ownership transfer");
+
+        let manager = ConversionManager::new(ConversionConfig::default());
+        {
+            let mut q = manager.queue.try_write().expect("queue write");
+            for (path, format, cue_sidecar_override) in planned.items.clone() {
+                add_item_to_queue(
+                    &mut q,
+                    path,
+                    format,
+                    cue_sidecar_override,
+                    &ConversionOptions::default(),
+                    &None,
+                    &TonepoetConfig::default(),
+                );
+            }
+            for item in q.all_items_mut() {
+                item.status = ConversionStatus::Queued;
+            }
+        }
+
+        let claimed = match manager
+            .register_synthetic_cue_artifacts_for_current_queue_nonblocking(&planned.synthetic_cue_artifacts)
+        {
+            tonepoet::convert::SyntheticCueArtifactRegistration::Registered { claimed } => claimed,
+            tonepoet::convert::SyntheticCueArtifactRegistration::Deferred { .. } => {
+                panic!("uncontended CLI ownership registration should not defer")
+            }
+            tonepoet::convert::SyntheticCueArtifactRegistration::Failed { error, .. } => {
+                panic!("uncontended CLI ownership registration should not fail: {error}")
+            }
+        };
+        assert!(claimed.contains(&artifact), "artifact must be registered against a queue item id");
+        drop(manager);
+        assert!(
+            !artifact.exists(),
+            "ConversionManager Drop must clean registered CLI synthetic CUE artifacts without manual free-standing cleanup"
+        );
+    }
+
 }

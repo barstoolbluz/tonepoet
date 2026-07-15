@@ -57,6 +57,12 @@ pub enum AudioProbeContext {
 /// `fallback_seed` is captured at dispatch time (NOT re-read at
 /// handler time) so a search reflects what the user saw when they
 /// triggered `:tags-mb`, even if they edit values during the wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataEditorSessionGuard {
+    pub session_id: u64,
+    pub save_generation: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TagsMbContext {
     pub paths: Vec<std::path::PathBuf>,
@@ -67,6 +73,12 @@ pub struct TagsMbContext {
     /// editor on single-match / pick.
     pub editor_park: bool,
     pub fallback_seed: Option<crate::tui::command::SacdMbSeed>,
+    /// Identity of the metadata-editor surface that initiated an in-editor
+    /// lookup.  Async completions must match this before parking, populating,
+    /// or otherwise mutating an editor; path equality alone is insufficient
+    /// because users may close and reopen the same album while work is in
+    /// flight.
+    pub editor_session: Option<MetadataEditorSessionGuard>,
 }
 
 /// Messages sent to the TUI event loop via mpsc channel
@@ -563,6 +575,13 @@ pub enum AppMessage {
         active_cue_path: Option<std::path::PathBuf>,
         result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
     },
+    /// Completion of in-editor split-CUE discovery for `:tags-mb`. The reducer
+    /// only snapshots paths and parks the editor; filesystem discovery and CUE
+    /// parsing complete on a blocking worker before this message is reduced.
+    InEditorSplitCueMusicBrainzInfoComplete {
+        request: Box<crate::tui::command::InEditorSplitCueMusicBrainzInfoRequest>,
+        result: Result<Vec<crate::tui::cue_parser::SingleImageInfo>, String>,
+    },
     /// Result of the blocking single-image MusicBrainz guard checks used
     /// before applying a selected release to the metadata editor. The guard
     /// may read tags and probe sample counts, so it must complete on a
@@ -571,6 +590,7 @@ pub enum AppMessage {
         releases: Vec<crate::tui::musicbrainz::MbRelease>,
         selected: usize,
         paths: Vec<std::path::PathBuf>,
+        editor_session: Option<MetadataEditorSessionGuard>,
         decision: crate::tui::musicbrainz::PerTrackDecision,
     },
     /// Result of an MbSelect prefetch: the detail fetch

@@ -1157,14 +1157,20 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
 ) {
     use lofty::tag::ItemKey;
 
-    let n = state.active_surface().paths.len();
+    let file_dim = state.active_surface().paths.len().max(1);
+    let unified = state.active_surface().cue_album_synthetic_sheet.is_some();
+    let row_dim = if unified {
+        state.active_surface().file_labels.len().max(1)
+    } else {
+        file_dim
+    };
     // Single-image rip: one file representing a multi-track release.
-    let single_image = n == 1 && release.tracks.len() > 1;
-    // Per-track populate eligibility: same guards used to gate the
-    // populate-time CUESHEET embed pre-Phase-5. When false on a
-    // single_image rip we fall back to album-only writes for the
-    // legacy MB-only IDs that have no per-track home.
-    let per_track_populate = single_image && decision.per_track_populate;
+    let single_image = !unified && file_dim == 1 && release.tracks.len() > 1;
+    // Unified cue-album surfaces are already a positional per-track model, so
+    // supplemental fields with CUE homes (ISRC) must address rows rather than
+    // member-image file slots. Non-unified single-image rips keep the existing
+    // gated per-track behavior.
+    let per_track_populate = unified || (single_image && decision.per_track_populate);
 
     fn find_or_create(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
@@ -1176,6 +1182,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             .iter()
             .position(|e| e.display_key.eq_ignore_ascii_case(key))
         {
+            crate::tui::probe::ensure_dim_replicate(&mut entries[i], dim);
             return i;
         }
         entries.push(crate::tui::probe::TagEntry {
@@ -1193,48 +1200,55 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
         entries.len() - 1
     }
 
-    // Per-track presence pre-pass: only create the entry when at least
-    // one track in the release has data for that field. Tracks with no
-    // data leave their per-track value as the empty string (matching
-    // the pre-existing "MB silent on this track" behavior).
-    //
-    // ISRC is the one per-track ID that has a home on a single-image
-    // rip — the embedded CUESHEET stores per-track ISRC. It populates
-    // per-track only when `per_track_populate`; on a single_image rip
-    // with failed guards (multi-disc / sidecar / unverifiable identity)
-    // it's skipped entirely (no per-track CUESHEET to land in, and
-    // album-level ISRC has no meaning).
-    //
-    // The other per-track MB IDs (MUSICBRAINZ_RECORDINGID /
-    // RELEASETRACKID / ARTISTID) have no CUESHEET field and a file's
-    // tag system holds only one of each, so they stay album-only and
-    // are gated on `!single_image`.
+    fn set_slot(
+        state: &mut crate::tui::app::MetadataEditorState,
+        idx: usize,
+        slot: usize,
+        value: String,
+    ) {
+        let values = &mut state.active_surface_mut().entries[idx].per_file_values;
+        if slot < values.len() {
+            values[slot] = value;
+        }
+    }
+
+    // ISRC is per-track on unified cue-album surfaces and on eligible
+    // single-image CUESHEET surfaces. On plain multi-file editors it remains
+    // file-aligned. Recording/release-track/artist MBIDs are per-track concepts;
+    // a unified member image is not a track, so never synthesize file-aligned
+    // whole-file tags for those keys on unified surfaces.
     let any_isrc = (per_track_populate || !single_image)
         && release
             .tracks
             .iter()
             .any(|t| t.isrc.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_recording = !single_image
+    let any_recording = !unified
+        && !single_image
         && release
             .tracks
             .iter()
             .any(|t| t.recording_id.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_track = !single_image
+    let any_track = !unified
+        && !single_image
         && release
             .tracks
             .iter()
             .any(|t| t.track_id.as_deref().is_some_and(|s| !s.is_empty()));
-    let any_track_artist = !single_image
+    let any_track_artist = !unified
+        && !single_image
         && release
             .tracks
             .iter()
             .any(|t| t.artist_id.as_deref().is_some_and(|s| !s.is_empty()));
 
-    // ISRC dim: per-track when `per_track_populate`, per-file otherwise.
-    let isrc_dim = if per_track_populate {
-        release.tracks.len()
+    let isrc_dim = if unified {
+        row_dim
+    } else if per_track_populate {
+        // Non-unified single-image rip: rows are MB track positions, not
+        // member files; dimension by the release's track count.
+        release.tracks.len().max(1)
     } else {
-        n
+        file_dim
     };
     let isrc_idx = if any_isrc {
         Some(find_or_create(
@@ -1246,22 +1260,12 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     } else {
         None
     };
-    // Pre-existing ISRC entry on a per-track-eligible single-image rip
-    // (Phase 2 may have surfaced per-track ISRCs from the embedded
-    // CUESHEET): grow / shrink to MB's track count, replicating the
-    // first existing slot into padded positions so revert keeps the
-    // pre-populate state.
-    if per_track_populate {
-        if let Some(idx) = isrc_idx {
-            crate::tui::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[idx], isrc_dim);
-        }
-    }
     let recording_idx = if any_recording {
         Some(find_or_create(
             &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_TRACKID",
             ItemKey::MusicBrainzRecordingId,
-            n,
+            file_dim,
         ))
     } else {
         None
@@ -1271,7 +1275,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_RELEASETRACKID",
             ItemKey::MusicBrainzTrackId,
-            n,
+            file_dim,
         ))
     } else {
         None
@@ -1281,13 +1285,15 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_ARTISTID",
             ItemKey::MusicBrainzArtistId,
-            n,
+            file_dim,
         ))
     } else {
         None
     };
 
-    // Album-level — gate each entry on MB actually having a value.
+    // Album-level fields are file-aligned on unified surfaces: each member
+    // image receives the same album-scope value, and the synthetic CUE header
+    // generator consumes the file-dimensioned entry.
     let catalog_value = release
         .catalog
         .as_deref()
@@ -1299,7 +1305,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "CATALOGNUMBER",
             ItemKey::CatalogNumber,
-            n,
+            file_dim,
         ))
     } else {
         None
@@ -1309,7 +1315,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_ALBUMID",
             ItemKey::MusicBrainzReleaseId,
-            n,
+            file_dim,
         ))
     } else {
         None
@@ -1319,7 +1325,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_ALBUMARTISTID",
             ItemKey::MusicBrainzReleaseArtistId,
-            n,
+            file_dim,
         ))
     } else {
         None
@@ -1333,7 +1339,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_RELEASEGROUPID",
             ItemKey::MusicBrainzReleaseGroupId,
-            n,
+            file_dim,
         ))
     } else {
         None
@@ -1347,7 +1353,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "ORIGINALDATE",
             ItemKey::OriginalReleaseDate,
-            n,
+            file_dim,
         ))
     } else {
         None
@@ -1357,68 +1363,61 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "RELEASECOUNTRY",
             ItemKey::Unknown("RELEASECOUNTRY".to_string()),
-            n,
+            file_dim,
         ))
     } else {
         None
     };
 
-    // Per-track ISRC writes for per_track_populate: the CUESHEET-
-    // friendly dim != paths.len() case, so the per-file loop below
-    // can't address tracks 1..N. Done as a dedicated pass over MB
-    // tracks.
     if per_track_populate {
         if let Some(idx) = isrc_idx {
             for mt in release.tracks.iter() {
                 let i = (mt.position as usize).saturating_sub(1);
-                if i >= state.active_surface().entries[idx].per_file_values.len() {
-                    continue;
-                }
                 if let Some(s) = mt.isrc.as_deref().filter(|s| !s.is_empty()) {
-                    state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+                    set_slot(state, idx, i, s.to_string());
                 }
             }
         }
     }
 
-    for i in 0..n {
+    for i in 0..file_dim {
         if let Some(mt) = release.tracks.iter().find(|m| m.position as usize == i + 1) {
             if !per_track_populate {
                 if let (Some(idx), Some(s)) =
                     (isrc_idx, mt.isrc.as_deref().filter(|s| !s.is_empty()))
                 {
-                    state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+                    set_slot(state, idx, i, s.to_string());
                 }
             }
             if let (Some(idx), Some(s)) = (
                 recording_idx,
                 mt.recording_id.as_deref().filter(|s| !s.is_empty()),
             ) {
-                state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+                set_slot(state, idx, i, s.to_string());
             }
             if let (Some(idx), Some(s)) =
                 (track_idx, mt.track_id.as_deref().filter(|s| !s.is_empty()))
             {
-                state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+                set_slot(state, idx, i, s.to_string());
             }
             if let (Some(idx), Some(s)) = (
                 artist_idx,
                 mt.artist_id.as_deref().filter(|s| !s.is_empty()),
             ) {
-                state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+                set_slot(state, idx, i, s.to_string());
             }
         }
         if let (Some(idx), Some(s)) = (catalog_idx, catalog_value.as_deref()) {
-            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+            set_slot(state, idx, i, s.to_string());
         }
         if let Some(idx) = album_id_idx {
-            state.active_surface_mut().entries[idx].per_file_values[i] = release.release_id.clone();
+            set_slot(state, idx, i, release.release_id.clone());
         }
         if let (Some(idx), Some(s)) = (
             album_artist_id_idx,
             release.artist_id.as_deref().filter(|s| !s.is_empty()),
         ) {
-            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+            set_slot(state, idx, i, s.to_string());
         }
         if let (Some(idx), Some(s)) = (
             release_group_idx,
@@ -1427,19 +1426,19 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
                 .as_deref()
                 .filter(|s| !s.is_empty()),
         ) {
-            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+            set_slot(state, idx, i, s.to_string());
         }
         if let (Some(idx), Some(s)) = (
             original_date_idx,
             release.original_date.as_deref().filter(|s| !s.is_empty()),
         ) {
-            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+            set_slot(state, idx, i, s.to_string());
         }
         if let (Some(idx), Some(s)) = (
             country_idx,
             release.country.as_deref().filter(|s| !s.is_empty()),
         ) {
-            state.active_surface_mut().entries[idx].per_file_values[i] = s.to_string();
+            set_slot(state, idx, i, s.to_string());
         }
     }
 
@@ -1458,7 +1457,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     .iter()
     .filter_map(|x| *x)
     {
-        recompute_and_stamp_mb_proposed(&mut state.active_surface_mut().entries[idx], n);
+        recompute_and_stamp_mb_proposed(&mut state.active_surface_mut().entries[idx], file_dim);
     }
 
     crate::tui::probe::sort_entries_standard_first_existing_only(&mut state.active_surface_mut().entries);
@@ -1819,16 +1818,19 @@ pub fn populate_editor_from_mb_with_per_track_decision(
 
     populate_editor_mb_supplemental_with_per_track_decision(state, release, decision);
 
+    let unified = state.active_surface().cue_album_synthetic_sheet.is_some();
+    let file_dim = state.active_surface().paths.len().max(1);
     // A unified cue-album surface (one flattened track list spanning N
-    // images) dimensions its per-track entries by ROW, not by file; MB
-    // tracks map positionally onto rows exactly like a plain multi-file
-    // editor with that many files. Its row count also disqualifies the
-    // single-image special-casing below (n > 1).
-    let n = if state.active_surface().cue_album_synthetic_sheet.is_some() {
+    // images) dimensions per-track entries by ROW, but album-scoped entries
+    // remain member-file aligned so the tag writer and regenerated CUE header
+    // both have a durable home for ALBUM/DATE/etc.
+    let row_dim = if unified {
         state.active_surface().file_labels.len().max(1)
     } else {
-        state.active_surface().paths.len()
+        file_dim
     };
+    let n = row_dim;
+    let album_dim = if unified { file_dim } else { n };
 
     fn find_or_create(
         entries: &mut Vec<crate::tui::probe::TagEntry>,
@@ -1840,6 +1842,7 @@ pub fn populate_editor_from_mb_with_per_track_decision(
             .iter()
             .position(|e| e.display_key.eq_ignore_ascii_case(key))
         {
+            crate::tui::probe::ensure_dim_replicate(&mut entries[i], dim);
             return i;
         }
         entries.push(crate::tui::probe::TagEntry {
@@ -1861,7 +1864,7 @@ pub fn populate_editor_from_mb_with_per_track_decision(
     // Per-track populate fires only when guards pass (handled by
     // is_per_track_eligible — multi-disc / sidecar .cue / unverifiable
     // identity all fall back to album-level).
-    let single_image = n == 1 && release.tracks.len() > 1;
+    let single_image = !unified && file_dim == 1 && release.tracks.len() > 1;
     let per_track_populate = single_image && decision.per_track_populate;
     if single_image && !per_track_populate {
         if let Some(reason) = decision.skip_reason.as_deref() {
@@ -1904,16 +1907,21 @@ pub fn populate_editor_from_mb_with_per_track_decision(
             &mut state.active_surface_mut().entries,
             "ALBUM",
             ItemKey::AlbumTitle,
-            n,
+            album_dim,
         ))
     } else {
         None
     };
     // TRACKNUMBER is always 1-based-by-file-position, computed locally —
-    // doesn't depend on MB content. Always create.
-    let tn_idx = find_or_create(&mut state.active_surface_mut().entries, "TRACKNUMBER", ItemKey::TrackNumber, n);
+    // doesn't depend on MB content. Create except on unified cue-album
+    // surfaces: there TRACK numbers are positional in the regenerated
+    // sheet, the row is not a persistable per-track key, and dirtying it
+    // would make every save abort with the F15 refusal.
+    let tn_idx = (!unified).then(|| {
+        find_or_create(&mut state.active_surface_mut().entries, "TRACKNUMBER", ItemKey::TrackNumber, n)
+    });
     let date_idx = if release.year.as_deref().is_some_and(|s| !s.is_empty()) {
-        Some(find_or_create(&mut state.active_surface_mut().entries, "DATE", ItemKey::Year, n))
+        Some(find_or_create(&mut state.active_surface_mut().entries, "DATE", ItemKey::Year, album_dim))
     } else {
         None
     };
@@ -1955,7 +1963,9 @@ pub fn populate_editor_from_mb_with_per_track_decision(
         if let Some(idx) = album_idx {
             state.active_surface_mut().entries[idx].per_file_values[0] = release.title.clone();
         }
-        state.active_surface_mut().entries[tn_idx].per_file_values[0] = "1".to_string();
+        if let Some(idx) = tn_idx {
+            state.active_surface_mut().entries[idx].per_file_values[0] = "1".to_string();
+        }
         if let (Some(idx), Some(year)) =
             (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
         {
@@ -1981,7 +1991,9 @@ pub fn populate_editor_from_mb_with_per_track_decision(
         if let Some(idx) = album_idx {
             state.active_surface_mut().entries[idx].per_file_values[0] = release.title.clone();
         }
-        state.active_surface_mut().entries[tn_idx].per_file_values[0] = "1".to_string();
+        if let Some(idx) = tn_idx {
+            state.active_surface_mut().entries[idx].per_file_values[0] = "1".to_string();
+        }
         if let (Some(idx), Some(year)) =
             (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
         {
@@ -2018,7 +2030,9 @@ pub fn populate_editor_from_mb_with_per_track_decision(
             if let Some(idx) = album_idx {
                 set_slot(state, idx, i, release.title.clone());
             }
-            set_slot(state, tn_idx, i, (i + 1).to_string());
+            if let Some(idx) = tn_idx {
+                set_slot(state, idx, i, (i + 1).to_string());
+            }
             if let (Some(idx), Some(year)) =
                 (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
             {
@@ -2027,7 +2041,7 @@ pub fn populate_editor_from_mb_with_per_track_decision(
         }
     }
 
-    for idx in [title_idx, artist_idx, album_idx, Some(tn_idx), date_idx]
+    for idx in [title_idx, artist_idx, album_idx, tn_idx, date_idx]
         .iter()
         .filter_map(|x| *x)
     {

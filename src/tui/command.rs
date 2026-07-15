@@ -149,6 +149,13 @@ pub struct BrowseConvertExpansion {
     pub cancelled: bool,
 }
 
+
+fn cleanup_discarded_browse_convert_expansion(expansion: &BrowseConvertExpansion) {
+    crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+        &expansion.queue.synthetic_cue_artifacts,
+    );
+}
+
 impl BrowseConvertExpansion {
     fn cancelled(visited: usize) -> Self {
         Self {
@@ -237,8 +244,11 @@ fn regular_filesystem_audio_folder_paths_for_convert_blocking_with_cancel(
     .map_err(|err| err.message)?;
 
     if let Some(err) = queue.first_error() {
-        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&queue.synthetic_cue_artifacts);
-        return Err(err.to_string());
+        if queue.paths.is_empty() {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&queue.synthetic_cue_artifacts);
+            return Err(err.to_string());
+        }
+        log::warn!("folder conversion expansion warning: {err}");
     }
     if !queue.synthetic_cue_artifacts.is_empty() {
         crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&queue.synthetic_cue_artifacts);
@@ -605,14 +615,17 @@ pub(crate) fn handle_browse_convert_expansion_complete(
     expansion: BrowseConvertExpansion,
 ) {
     if !app.browse_convert_expansion_pending_for(generation, &request) {
+        cleanup_discarded_browse_convert_expansion(&expansion);
         log::debug!("discarded stale Browse Convert expansion generation {generation}");
         return;
     }
     if generation != app.probe_generation {
+        cleanup_discarded_browse_convert_expansion(&expansion);
         log::debug!("discarded superseded Browse Convert expansion generation {generation}");
         return;
     }
     if !browse_convert_expansion_selection_still_current(app, &request) {
+        cleanup_discarded_browse_convert_expansion(&expansion);
         let _ = app.complete_browse_convert_expansion(generation, &request);
         log::debug!("discarded Browse Convert expansion after selection/screen changed");
         return;
@@ -627,11 +640,17 @@ pub(crate) fn handle_browse_convert_expansion_complete(
         return;
     }
     if let Some(err) = expansion.expansion_errors.first() {
+        if expansion.queue.paths.is_empty() {
+            app.set_status(status_with_stale_selection_notice(
+                request.dropped_stale_selection_count,
+                err.clone(),
+            ));
+            return;
+        }
         app.set_status(status_with_stale_selection_notice(
             request.dropped_stale_selection_count,
-            err.clone(),
+            format!("{}; continuing with queueable sources", err),
         ));
-        return;
     }
     if expansion.queue.paths.is_empty() {
         let status = if let Some(folder) = expansion.empty_audio_folders.first() {
@@ -714,6 +733,9 @@ fn collect_cue_paths_from_source(
     seen: &mut std::collections::BTreeSet<PathBuf>,
 ) {
     if crate::convert::classify::is_cue_sheet_path(path) {
+        if !super::cue_parser::is_user_visible_cue_path(path) {
+            return;
+        }
         let key = cue_info_path_key(path);
         if seen.insert(key) {
             out.push(path.to_path_buf());
@@ -723,6 +745,9 @@ fn collect_cue_paths_from_source(
 
     if path.is_dir() {
         for cue in super::gnudb::find_cues_in_dir(path) {
+            if !super::cue_parser::is_user_visible_cue_path(&cue) {
+                continue;
+            }
             let key = cue_info_path_key(&cue);
             if seen.insert(key) {
                 out.push(cue);
@@ -841,6 +866,7 @@ pub struct SplitCueAlbumGroupingRequest {
     pub infos: Vec<super::cue_parser::SingleImageInfo>,
     pub editor_park: bool,
     pub active_audio_path: Option<PathBuf>,
+    pub editor_session: Option<super::message::MetadataEditorSessionGuard>,
 }
 
 #[derive(Debug)]
@@ -848,6 +874,22 @@ pub struct SplitCueAlbumGroupingAsyncOutcome {
     pub decision: SplitCueAlbumGroupingDecision,
     pub toc_outcome: Option<super::musicbrainz::MbCascadeOutcome>,
     pub cache_writes: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InEditorSplitCueMusicBrainzSource {
+    UnifiedAlbum,
+    PresentationTabs,
+    SingleSourceFolder,
+}
+
+#[derive(Debug)]
+pub struct InEditorSplitCueMusicBrainzInfoRequest {
+    pub source: InEditorSplitCueMusicBrainzSource,
+    pub sources: Vec<PathBuf>,
+    pub audio_paths: Vec<PathBuf>,
+    pub active_audio_path: Option<PathBuf>,
+    pub editor_session: super::message::MetadataEditorSessionGuard,
 }
 
 pub(crate) fn split_cue_album_grouping_key_from_paths(
@@ -973,6 +1015,7 @@ fn dispatch_split_cue_musicbrainz_text_fallback_from_surfaces(
         paths,
         editor_park: false,
         fallback_seed: None,
+        editor_session: None,
     };
     super::event_loop::spawn_tags_mb_text_search(
         app,
@@ -1359,6 +1402,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
     editor_park: bool,
     active_audio_path: Option<&Path>,
     concat_already_missed: bool,
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
 ) -> bool {
     let groups = split_cue_decision_groups_as_infos(decision, infos);
     if groups.is_empty() {
@@ -1377,7 +1421,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
             if let Some(sectors) = concat_single_image_cue_infos_to_cd_sectors(group) {
                 let candidates = super::musicbrainz::toc_candidates_from_sectors(&sectors);
                 if !candidates.is_empty() {
-                    spawn_tags_mb_toc_lookup(app, tx, candidates, paths, editor_park, fallback_seed);
+                    spawn_tags_mb_toc_lookup(app, tx, candidates, paths, editor_park, fallback_seed, editor_session);
                     return true;
                 }
             }
@@ -1389,6 +1433,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
             paths,
             editor_park,
             fallback_seed: None,
+            editor_session,
         };
         super::event_loop::spawn_tags_mb_text_search(
             app,
@@ -1418,6 +1463,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
                     paths,
                     editor_park,
                     fallback_seed,
+                    editor_session,
                 );
                 return true;
             }
@@ -1430,6 +1476,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
         paths,
         editor_park,
         fallback_seed: None,
+        editor_session,
     };
     super::event_loop::spawn_tags_mb_text_search(
         app,
@@ -1517,6 +1564,7 @@ fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
     infos: &[super::cue_parser::SingleImageInfo],
     editor_park: bool,
     active_audio_path: Option<PathBuf>,
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
 ) -> bool {
     let paths = paths_for_single_image_cue_infos(infos);
     if paths.is_empty() {
@@ -1536,6 +1584,7 @@ fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
             editor_park,
             active_audio_path.as_deref(),
             false,
+            editor_session,
         );
     }
 
@@ -1549,6 +1598,7 @@ fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
             editor_park,
             active_audio_path.as_deref(),
             false,
+            editor_session,
         );
     }
 
@@ -1560,6 +1610,7 @@ fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
         infos: infos.to_vec(),
         editor_park,
         active_audio_path,
+        editor_session,
     };
     app.set_status(format!(
         ":tags-mb: grouping {} same-folder CUE parts...",
@@ -1631,6 +1682,7 @@ pub(super) fn handle_split_cue_album_grouping_complete(
             paths: paths_for_single_image_cue_infos(&request.infos),
             editor_park: request.editor_park,
             fallback_seed: seed_mb_query_from_single_image_cues(&request.infos),
+            editor_session: request.editor_session,
         };
         super::event_loop::dispatch_tags_from_mb_complete(
             app,
@@ -1651,27 +1703,95 @@ pub(super) fn handle_split_cue_album_grouping_complete(
         request.editor_park,
         request.active_audio_path.as_deref(),
         true,
+        request.editor_session,
     ) {
         app.set_status(":tags-mb: split-CUE grouping produced no usable MusicBrainz seed".to_string());
     }
 }
 
 
-fn split_cue_infos_from_metadata_editor(
+fn metadata_editor_session_guard(
     state: &super::app::MetadataEditorState,
-) -> Vec<super::cue_parser::SingleImageInfo> {
+) -> super::message::MetadataEditorSessionGuard {
+    let details = &state.active_surface().technical_details;
+    super::message::MetadataEditorSessionGuard {
+        session_id: details.session_id,
+        save_generation: details.save_generation,
+    }
+}
+
+fn metadata_editor_matches_session_guard(
+    state: &super::app::MetadataEditorState,
+    guard: super::message::MetadataEditorSessionGuard,
+) -> bool {
+    let details = &state.active_surface().technical_details;
+    details.session_id == guard.session_id && details.save_generation == guard.save_generation
+}
+
+
+fn metadata_editor_tags_mb_context_paths(
+    state: &super::app::MetadataEditorState,
+) -> Vec<PathBuf> {
+    if let Some(sheet) = state.active_surface().cue_album_synthetic_sheet.as_ref() {
+        return sheet
+            .track_sources
+            .iter()
+            .map(|source| source.audio_path.clone())
+            .collect();
+    }
+    if state.presentation_tabs.len() > 1 {
+        let mut paths = Vec::new();
+        for tab in &state.presentation_tabs {
+            let Some(path) = tab.paths.first() else {
+                return state.active_surface().paths.clone();
+            };
+            let count = tab.file_labels.len().max(1);
+            paths.extend(std::iter::repeat(path.clone()).take(count));
+        }
+        return paths;
+    }
+    state.active_surface().paths.clone()
+}
+
+fn in_editor_split_cue_mb_request_from_metadata_tabs(
+    state: &super::app::MetadataEditorState,
+) -> Option<InEditorSplitCueMusicBrainzInfoRequest> {
     if state.presentation_tabs.len() < 2 {
-        return Vec::new();
+        return None;
     }
     let mut audio_paths = Vec::new();
     for tab in &state.presentation_tabs {
         if tab.paths.len() == 1 {
             audio_paths.push(tab.paths[0].clone());
         } else {
-            return Vec::new();
+            return None;
         }
     }
-    collect_single_image_cue_infos_for_sources(&audio_paths, &audio_paths)
+    Some(InEditorSplitCueMusicBrainzInfoRequest {
+        source: InEditorSplitCueMusicBrainzSource::PresentationTabs,
+        sources: audio_paths.clone(),
+        audio_paths,
+        active_audio_path: state.active_surface().paths.first().cloned(),
+        editor_session: metadata_editor_session_guard(state),
+    })
+}
+
+fn in_editor_split_cue_mb_request_from_unified_album(
+    state: &super::app::MetadataEditorState,
+) -> Option<InEditorSplitCueMusicBrainzInfoRequest> {
+    let sheet = state.active_surface().cue_album_synthetic_sheet.as_ref()?;
+    Some(InEditorSplitCueMusicBrainzInfoRequest {
+        source: InEditorSplitCueMusicBrainzSource::UnifiedAlbum,
+        sources: sheet.audio_paths.clone(),
+        audio_paths: sheet.audio_paths.clone(),
+        active_audio_path: state
+            .active_surface()
+            .paths
+            .first()
+            .cloned()
+            .or_else(|| sheet.audio_paths.first().cloned()),
+        editor_session: metadata_editor_session_guard(state),
+    })
 }
 
 
@@ -1685,17 +1805,13 @@ fn same_path_for_split_cue(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn split_cue_infos_from_single_editor_source_folder(
+fn in_editor_split_cue_mb_request_from_single_editor_source_folder(
     state: &super::app::MetadataEditorState,
-) -> Option<(Vec<super::cue_parser::SingleImageInfo>, PathBuf)> {
+) -> Option<InEditorSplitCueMusicBrainzInfoRequest> {
     // Ordinary file-backed metadata editors store their only editable surface in
-    // `file_surface` and leave `presentation_tabs` empty.  A previous version of
-    // this helper required exactly one presentation tab, so the common path
-    // `Edit metadata` on `side_a.wv` in a same-folder split-CUE album still fell
-    // through to the one-image TOC lookup with no text fallback.  The brief's
-    // rule is source-based, not tab-count-based: when there is no multi-tab
-    // presentation already, rediscover sibling CUE surfaces from the active
-    // source folder before attempting a single-image TOC.
+    // `file_surface` and leave `presentation_tabs` empty.  The reducer may only
+    // capture the active audio path and parent directory here; CUE discovery and
+    // parsing happen later in the blocking worker.
     if state.presentation_tabs.len() > 1 {
         return None;
     }
@@ -1709,15 +1825,13 @@ fn split_cue_infos_from_single_editor_source_folder(
     }
     let active_audio = surface.paths.first()?.clone();
     let parent = active_audio.parent()?.to_path_buf();
-    let mut infos = collect_single_image_cue_infos_for_sources(&[parent.clone()], &[]);
-    infos.retain(|info| info.cue_path.parent() == Some(parent.as_path()));
-    if infos.len() < 2 {
-        return None;
-    }
-    let contains_active = infos
-        .iter()
-        .any(|info| same_path_for_split_cue(&info.audio_path, &active_audio));
-    contains_active.then_some((infos, active_audio))
+    Some(InEditorSplitCueMusicBrainzInfoRequest {
+        source: InEditorSplitCueMusicBrainzSource::SingleSourceFolder,
+        sources: vec![parent],
+        audio_paths: Vec::new(),
+        active_audio_path: Some(active_audio),
+        editor_session: metadata_editor_session_guard(state),
+    })
 }
 
 /// Full list of command-mode tokens (including aliases) recognised by
@@ -3894,9 +4008,33 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             });
         }
         Command::MetaDelete => {
-            with_editor_state(app, |state| {
-                super::keybindings::metadata_editor_delete_cursor(state)
-            });
+            let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
+                parked
+            } else if matches!(
+                app.active_overlay,
+                super::app::ActiveOverlay::MetadataEditor(_)
+            ) {
+                let prev = std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
+                if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
+                    s
+                } else {
+                    unreachable!()
+                }
+            } else {
+                app.set_status("metadata-editor command requires the editor to be active");
+                return;
+            };
+
+            if super::keybindings::metadata_editor_delete_cursor_requires_embedded_cuesheet_confirmation(&state) {
+                super::keybindings::open_embedded_cuesheet_delete_confirmation(app, state);
+            } else {
+                if let Some(status) = super::keybindings::metadata_editor_delete_cursor(&mut state) {
+                    app.set_status(status);
+                }
+                if matches!(app.active_overlay, super::app::ActiveOverlay::None) {
+                    app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                }
+            }
         }
         Command::MetaUndelete => {
             with_editor_state(app, |state| {
@@ -3905,10 +4043,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             });
         }
         Command::MetaDetail => {
-            with_editor_state(app, |state| {
-                super::keybindings::metadata_editor_open_detail(state);
-                None
-            });
+            with_editor_state(app, |state| super::keybindings::metadata_editor_open_detail(state));
         }
         Command::MbBack => {
             // Editor state may be in pending (colon command from
@@ -4102,6 +4237,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 return;
             };
             let msg = super::keybindings::metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
+            app.force_redraw = true;
             app.set_status(msg);
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
@@ -4350,6 +4486,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     paths: ctx_paths,
                     editor_park: false,
                     fallback_seed: None,
+                    editor_session: None,
                 };
                 super::event_loop::spawn_tags_mb_text_search(
                     app,
@@ -4376,6 +4513,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &cue_infos,
                     /* editor_park */ false,
                     active_audio_path,
+                    None,
                 ) {
                     return;
                 }
@@ -4403,6 +4541,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &cue_infos,
                     /* editor_park */ false,
                     active_audio_path,
+                    None,
                 ) {
                     return;
                 }
@@ -4459,6 +4598,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             vec![super::musicbrainz::TocCandidate::exact(sectors)],
                             image_paths,
                             /* editor_park */ false, /* fallback_seed */ None,
+                            /* editor_session */ None,
                         );
                         return;
                     }
@@ -4495,6 +4635,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 vec![super::musicbrainz::TocCandidate::exact(sectors)],
                 paths, /* editor_park */ false,
                 /* fallback_seed */ None,
+                /* editor_session */ None,
             );
         }
         Command::CueFill => {
@@ -5779,7 +5920,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 Ok(_) => {
                     app.force_redraw = true;
                 }
-                Err(e) => app.set_status(format!("Edit error: {}", e)),
+                Err(e) => {
+                    app.force_redraw = true;
+                    app.set_status(format!("Edit error: {}", e));
+                }
             }
         }
         Command::ContextMenu => {
@@ -6007,11 +6151,15 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
 
     let mut count = 0usize;
     let mut errors = 0usize;
+    let mut first_error: Option<String> = None;
     let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
     if let Some(err) = expansion_errors.first() {
-        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
-        app.set_status(err.clone());
-        return;
+        if paths.is_empty() {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+            app.set_status(err.clone());
+            return;
+        }
+        app.set_status(format!("{}; continuing with queueable sources", err));
     }
     for path in paths {
         let is_synthetic_cue_artifact = synthetic_cue_artifacts.contains(&path);
@@ -6037,24 +6185,42 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
             archive_password,
             cue_sidecar_override,
         ) {
-            Ok(item_id) => {
+            Ok(_item_id) => {
+                // Synthetic album-CUE artifacts are transactionally registered
+                // by the manager's ready-admission helper while the queue write
+                // lock is still held. Re-registering here would split lifecycle
+                // ownership from queue admission and can mask registry failures.
                 count = count.saturating_add(1);
-                if is_synthetic_cue_artifact {
-                    app.manager.register_synthetic_cue_artifact(&item_id, &path);
-                }
+            }
+            Err(crate::convert::ConversionError::SyntheticCueArtifactOwnershipFailed {
+                artifact,
+                reason,
+            }) => {
+                errors = errors.saturating_add(1);
+                let message = format!(
+                    "queue add failed: synthetic CUE artifact ownership registration failed; artifact preserved at {}: {}",
+                    artifact.display(),
+                    reason
+                );
+                first_error.get_or_insert_with(|| message.clone());
+                log::error!("{message}");
             }
             Err(err) => {
                 if is_synthetic_cue_artifact {
                     crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(&path);
                 }
                 errors = errors.saturating_add(1);
-                log::warn!("queue add failed during Browse Convert expansion: {err}");
+                let message = format!("queue add failed during Browse Convert expansion: {err}");
+                first_error.get_or_insert_with(|| message.clone());
+                log::warn!("{message}");
             }
         }
     }
 
     if errors == 0 {
         app.set_status(format!("Queued {} files", count));
+    } else if let Some(message) = first_error {
+        app.set_status(format!("Queued {} files; {} failed; {}", count, errors, message));
     } else {
         app.set_status(format!("Queued {} files; {} failed", count, errors));
     }
@@ -6071,9 +6237,12 @@ pub(crate) fn install_browse_convert_source_paths(
     app.cancel_browse_convert_expansion();
     let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
     if let Some(err) = expansion_errors.first() {
-        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
-        app.set_status(err.clone());
-        return;
+        if paths.is_empty() {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+            app.set_status(err.clone());
+            return;
+        }
+        app.set_status(format!("{}; continuing with queueable sources", err));
     }
     let paths = normalized_path_snapshot(paths);
     if paths.is_empty() {
@@ -6124,9 +6293,13 @@ pub(crate) fn install_browse_convert_source_paths(
         crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
     });
     app.convert.source.synthetic_cue_artifacts = synthetic_cue_artifacts;
+    let retained_synthetic_cue_artifacts = app.convert.source.synthetic_cue_artifacts.clone();
     app.convert.source.synthetic_cue_artifacts.retain(|path| {
         crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
     });
+    for artifact in retained_synthetic_cue_artifacts.difference(&app.convert.source.synthetic_cue_artifacts) {
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
+    }
     app.convert.apply_source_defaults();
     let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
     app.recent.record_use_with_db(&first, &app.db);
@@ -6196,9 +6369,12 @@ fn finish_browse_queue_review_after_expansion(
 ) -> bool {
     let QueueExpansionResult { paths, mut cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
     if let Some(err) = expansion_errors.first() {
-        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
-        app.set_status(err.clone());
-        return false;
+        if paths.is_empty() {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+            app.set_status(err.clone());
+            return false;
+        }
+        app.set_status(format!("{}; continuing with queueable sources", err));
     }
     let paths = normalized_path_snapshot(paths);
     if paths.is_empty() {
@@ -6621,20 +6797,199 @@ fn execute_commit_with_source_options_transform(
         .map(|value| value.to_string());
     let format_name = options.output_format.name();
 
-    // Enqueue the whole batch via the shared helper. CUE sidecar override
-    // metadata lives on the Convert source state, because that state is the
-    // ownership boundary between Browse expansion and Commit.
+    // Build the exact post-admission PipelineRequest projection before queue
+    // admission. The manager applies this closure while holding the same queue
+    // write guard that inserts each item, so :commit never has to reacquire a
+    // blocking queue lock from the async TUI event loop.
+    use crate::convert::pipeline::*;
+    let mut source_options_transform = source_options_transform;
+    let mut has_deselected_tracks = false;
+    let mut selected_track_numbers = std::collections::BTreeSet::new();
+
+    if let SourceMode::MultiTrack {
+        tracks,
+        selected,
+        ..
+    } = &app.convert.source.mode
+    {
+        has_deselected_tracks = selected.iter().any(|s| !s);
+        selected_track_numbers = tracks
+            .iter()
+            .zip(selected.iter())
+            .filter(|(_, &sel)| sel)
+            .map(|(t, _)| t.number)
+            .collect();
+    }
+
+    let mut commit_source = SourceOptions {
+        archive_password: None,
+        sacd_area: None,
+        dvda_group: None,
+        dvda_group_selection: DvdaGroupSelection::Default,
+        dvda_assume_decrypted: false,
+        dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+        cue_sidecar: CueSidecarPolicy::PreferSidecar,
+        track_selection: TrackSelection::All,
+        dvdv_vts: None,
+        dvdv_title: None,
+        dvdv_audio_stream: None,
+        dvdv_angle: None,
+        bluray_playlist: None,
+        bluray_audio_pid: None,
+        bluray_audio_stream: None,
+        bluray_angle: None,
+    };
+
+    if matches!(&app.convert.source.mode, SourceMode::MultiTrack { .. }) {
+        apply_multitrack_convert_state_to_source_options(
+            &app.convert.source.mode,
+            &mut commit_source,
+            if has_deselected_tracks {
+                Some(&selected_track_numbers)
+            } else {
+                None
+            },
+        );
+    }
+
+    if let Some(transform) = source_options_transform.take() {
+        commit_source = transform(commit_source);
+    }
+
+    let rg_enabled = options.calculate_replaygain;
+    let companion_policy = companion_copy_policy_from_conversion_options(&options);
+    let pipeline_settings = options.pipeline_settings.clone().unwrap_or_else(|| {
+        crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
+    });
+    let canonical_naming_template = options.effective_naming_template("%NN% - %TITLE%");
+
+    // Enqueue the whole batch via the manager transaction API. CUE sidecar
+    // override metadata lives on the Convert source state, because that state
+    // is the ownership boundary between Browse expansion and Commit. The
+    // transaction result is authoritative: it names exact queue item ids
+    // admitted, exact synthetic artifacts transferred to manager ownership,
+    // exact artifacts that remain caller-owned, skipped inputs, and rollback
+    // state. The TUI must not reconstruct ownership with a post-commit path
+    // scan.
     let cue_artifact_audio = app.convert.source.cue_artifact_audio.clone();
     let source_synthetic_cue_artifacts = app.convert.source.synthetic_cue_artifacts.clone();
-    let outcome = super::convert_actions::commit_batch_with_cue_artifacts(
-        app,
+    let transaction = app.manager.commit_batch_with_cue_artifacts(
         &batch,
         &cue_artifact_audio,
+        &source_synthetic_cue_artifacts,
         &options,
-    );
+        |item| {
+            if item.input_path == batch[0] {
+                item.pre_extracted_staging = archive_preview_staging.clone();
+                item.archive_metadata_overrides = archive_metadata_overrides.clone();
+            }
 
-    // Nothing enqueued → don't clear state or navigate; user sees error.
+            let mut item_source = commit_source.clone();
+            if let Some(ref pw) = item.archive_password {
+                item_source.archive_password = Some(SecretString::new(pw.clone()));
+            }
+            apply_queue_item_cue_sidecar_override_to_source_options(item, &mut item_source);
+
+            if let Some(existing_req) = item.pipeline_request.as_mut() {
+                // `commit_batch_with_cue_artifacts()` may already have attached
+                // a full PipelineRequest from an earlier admission path. Replace
+                // the source and request metadata inside the admission
+                // transaction so transform/state projection cannot be skipped.
+                existing_req.container = item.input_path.clone();
+                existing_req.item_id = item.id.clone();
+                existing_req.job_id = format!("job-{}", item.id);
+                existing_req.source = item_source;
+                existing_req.pre_extracted_staging = item.pre_extracted_staging.clone();
+                existing_req.archive_metadata_overrides = item.archive_metadata_overrides.clone();
+                existing_req.naming.template = canonical_naming_template.clone();
+                existing_req.naming.folder_template = options.folder_template.clone();
+                existing_req.settings = pipeline_settings.clone();
+                existing_req.merge = options.merge_to_single;
+                existing_req.companion = companion_policy.clone();
+                existing_req.actions = options.actions.clone();
+            } else {
+                let output_root = options.output_dir.clone()
+                    .map(|p| crate::convert::pipeline::unified_request::expand_tilde(&p))
+                    .unwrap_or_else(|| {
+                        item.input_path
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .to_path_buf()
+                    });
+                item.pipeline_request = Some(PipelineRequest {
+                    actions: options.actions.clone(),
+                    worker_count: None,
+                    scratch_staging: None,
+                    job_id: format!("job-{}", item.id),
+                    item_id: item.id.clone(),
+                    container: item.input_path.clone(),
+                    source: item_source,
+                    settings: pipeline_settings.clone(),
+                    merge: options.merge_to_single,
+                    output_root: output_root.clone(),
+                    naming: NamingPolicy {
+                        template: canonical_naming_template.clone(),
+                        folder_template: options.folder_template.clone(),
+                        per_album_subdir: true,
+                        collision_policy: NamingCollisionPolicy::Fail,
+                    },
+                    publish: PublishPolicy {
+                        overwrite: OverwritePolicy::FailIfExists,
+                        same_filesystem_required: false,
+                        write_manifest: false,
+                    },
+                    log: LogPolicy {
+                        root: output_root.join(".tonepoet-logs"),
+                        write_for_blocked: true,
+                        write_json_log: false,
+                        write_conversion_log: options.write_log_file,
+                    },
+                    stages: StagePolicy {
+                        metadata: if options.preserve_metadata {
+                            StageRequirement::Enabled
+                        } else {
+                            StageRequirement::Disabled
+                        },
+                        replaygain: if rg_enabled {
+                            StageRequirement::Enabled
+                        } else {
+                            StageRequirement::Disabled
+                        },
+                        features: StageRequirement::Enabled,
+                        generate_cue: false,
+                    },
+                    failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+                    pre_extracted_staging: item.pre_extracted_staging.clone(),
+                    archive_metadata_overrides: item.archive_metadata_overrides.clone(),
+                    metadata_overrides: Default::default(),
+                    batch_resolved_identity: None,
+                    container_extension: options.container_extension.clone(),
+                    container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
+                    album_batch: None,
+                    album_batch_track: None,
+                    expected_album_track_count: None,
+                    suppress_incremental_conversion_log_append: false,
+                    companion: companion_policy.clone(),
+                });
+            }
+        },
+    );
+    let outcome = transaction.outcome.clone();
+    app.convert.source.synthetic_cue_artifacts = transaction.artifacts_remaining_caller_owned.clone();
+
+    // Nothing enqueued → don't clear state or navigate; user sees error. The
+    // transaction has either made no queue mutation or has already rolled back
+    // exact newly admitted ids before returning.
     if outcome.enqueued == 0 {
+        if let Some(rollback) = &transaction.rollback {
+            if !rollback.completed {
+                app.set_status(format!(
+                    "commit failed: rollback incomplete for {} item(s)",
+                    rollback.failed_item_ids.len()
+                ));
+                return;
+            }
+        }
         if outcome.skipped > 0 && outcome.errors == 0 {
             app.set_status(format!(
                 "commit: all {} file(s) already queued",
@@ -6654,201 +7009,16 @@ fn execute_commit_with_source_options_transform(
         return;
     }
 
-    let claimed_synthetic_cue_artifacts = app
-        .manager
-        .register_synthetic_cue_artifacts_for_current_queue(&source_synthetic_cue_artifacts);
-    for artifact in source_synthetic_cue_artifacts.difference(&claimed_synthetic_cue_artifacts) {
-        crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
-    }
-    app.convert.source.synthetic_cue_artifacts.clear();
-
-    // Attach or update a PipelineRequest whenever the Convert screen carries
-    // source state the generic ConversionItem builder cannot infer, or when a
-    // caller supplied a SourceOptions transform. Build the normal SourceOptions
-    // once, apply the transform once, then reuse the transformed result for
-    // both newly-created and already-prebuilt requests.
-    let mut source_options_transform = source_options_transform;
-    let has_source_options_transform = source_options_transform.is_some();
-    let mut has_deselected_tracks = false;
-    let mut has_disc_stream_selection = false;
-    let has_archive_preview_staging = archive_preview_staging.is_some();
-    let has_archive_metadata_overrides = !archive_metadata_overrides.is_empty();
-    let mut selected_track_numbers = std::collections::BTreeSet::new();
-
-    if let SourceMode::MultiTrack {
-        tracks,
-        selected,
-        selected_presentation_id,
-        ..
-    } = &app.convert.source.mode
-    {
-        has_deselected_tracks = selected.iter().any(|s| !s);
-        has_disc_stream_selection = selected_presentation_id.is_some();
-        selected_track_numbers = tracks
-            .iter()
-            .zip(selected.iter())
-            .filter(|(_, &sel)| sel)
-            .map(|(t, _)| t.number)
-            .collect();
-    }
-
-    if has_deselected_tracks
-        || has_disc_stream_selection
-        || has_source_options_transform
-        || has_archive_preview_staging
-        || has_archive_metadata_overrides
-    {
-        use crate::convert::pipeline::*;
-
-        let mut source = SourceOptions {
-            archive_password: None,
-            sacd_area: None,
-            dvda_group: None,
-            dvda_group_selection: DvdaGroupSelection::Default,
-            dvda_assume_decrypted: false,
-            dvda_downmix_policy: DvdaDownmixPolicy::Auto,
-            cue_sidecar: CueSidecarPolicy::PreferSidecar,
-            track_selection: TrackSelection::All,
-            dvdv_vts: None,
-            dvdv_title: None,
-            dvdv_audio_stream: None,
-            dvdv_angle: None,
-            bluray_playlist: None,
-            bluray_audio_pid: None,
-            bluray_audio_stream: None,
-            bluray_angle: None,
-        };
-
-        if matches!(&app.convert.source.mode, SourceMode::MultiTrack { .. }) {
-            apply_multitrack_convert_state_to_source_options(
-                &app.convert.source.mode,
-                &mut source,
-                if has_deselected_tracks {
-                    Some(&selected_track_numbers)
-                } else {
-                    None
-                },
-            );
-        }
-
-        if let Some(transform) = source_options_transform.take() {
-            source = transform(source);
-        }
-
-        let rg_enabled = options.calculate_replaygain;
-        let companion_policy = companion_copy_policy_from_conversion_options(&options);
-        let pipeline_settings = options.pipeline_settings.clone().unwrap_or_else(|| {
-            crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
-        });
-        let canonical_naming_template = options.effective_naming_template("%NN% - %TITLE%");
-
-        if let Ok(mut q) = app.manager.queue.try_write() {
-            for item in q.all_items_mut() {
-                if !batch.contains(&item.input_path) {
-                    continue;
-                }
-
-                if item.input_path == batch[0] {
-                    item.pre_extracted_staging = archive_preview_staging.clone();
-                    item.archive_metadata_overrides = archive_metadata_overrides.clone();
-                }
-
-                let mut item_source = source.clone();
-                if let Some(ref pw) = item.archive_password {
-                    item_source.archive_password = Some(SecretString::new(pw.clone()));
-                }
-                apply_queue_item_cue_sidecar_override_to_source_options(item, &mut item_source);
-
-                if let Some(existing_req) = item.pipeline_request.as_mut() {
-                    // `commit_batch()` may already have attached a full
-                    // PipelineRequest from the ordinary format/output pill
-                    // state. Build the normal SourceOptions, apply the final
-                    // transform, and replace the prebuilt request's source so
-                    // the transform cannot be skipped on this path.
-                    existing_req.container = item.input_path.clone();
-                    existing_req.item_id = item.id.clone();
-                    existing_req.job_id = format!("job-{}", item.id);
-                    existing_req.source = item_source;
-                    existing_req.pre_extracted_staging = item.pre_extracted_staging.clone();
-                    existing_req.archive_metadata_overrides =
-                        item.archive_metadata_overrides.clone();
-                    existing_req.naming.template = canonical_naming_template.clone();
-                    existing_req.naming.folder_template = options.folder_template.clone();
-                    existing_req.settings = pipeline_settings.clone();
-                    existing_req.merge = options.merge_to_single;
-                    existing_req.companion = companion_policy.clone();
-                    existing_req.actions = options.actions.clone();
-                } else {
-                    let output_root = options.output_dir.clone()
-                        .map(|p| crate::convert::pipeline::unified_request::expand_tilde(&p))
-                        .unwrap_or_else(|| {
-                            item.input_path
-                                .parent()
-                                .unwrap_or(std::path::Path::new("."))
-                                .to_path_buf()
-                        });
-                    item.pipeline_request = Some(PipelineRequest {
-                        actions: options.actions.clone(),
-                        worker_count: None,
-                        scratch_staging: None,
-                        job_id: format!("job-{}", item.id),
-                        item_id: item.id.clone(),
-                        container: item.input_path.clone(),
-                        source: item_source,
-                        settings: pipeline_settings.clone(),
-                        merge: options.merge_to_single,
-                        output_root: output_root.clone(),
-                        naming: NamingPolicy {
-                            template: canonical_naming_template.clone(),
-                            folder_template: options.folder_template.clone(),
-                            per_album_subdir: true,
-                            collision_policy: NamingCollisionPolicy::Fail,
-                        },
-                        publish: PublishPolicy {
-                            overwrite: OverwritePolicy::FailIfExists,
-                            same_filesystem_required: false,
-                            write_manifest: false,
-                        },
-                        log: LogPolicy {
-                            root: output_root.join(".tonepoet-logs"),
-                            write_for_blocked: true,
-                            write_json_log: false,
-                            write_conversion_log: options.write_log_file,
-                        },
-                        stages: StagePolicy {
-                            metadata: if options.preserve_metadata {
-                                StageRequirement::Enabled
-                            } else {
-                                StageRequirement::Disabled
-                            },
-                            replaygain: if rg_enabled {
-                                StageRequirement::Enabled
-                            } else {
-                                StageRequirement::Disabled
-                            },
-                            features: StageRequirement::Enabled,
-                            generate_cue: false,
-                        },
-                        failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
-                        pre_extracted_staging: item.pre_extracted_staging.clone(),
-                        archive_metadata_overrides: item.archive_metadata_overrides.clone(),
-                        metadata_overrides: Default::default(),
-                        batch_resolved_identity: None,
-                        container_extension: options.container_extension.clone(),
-                        container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
-                        album_batch: None,
-                        album_batch_track: None,
-                        expected_album_track_count: None,
-                        suppress_incremental_conversion_log_append: false,
-                        companion: companion_policy.clone(),
-                    });
-                }
-            }
-        }
-    }
+    // Retain only caller-owned artifacts that the transaction explicitly says
+    // remain with SourceState. Artifacts transferred to manager ownership are
+    // removed from source ownership without cleanup; there is no ownerless or
+    // duplicate-ownership intermediate state. All PipelineRequest projection was
+    // already applied inside the manager admission transaction while the queue
+    // write guard was held, so the async TUI never reacquires a blocking queue lock here.
+    let synthetic_artifact_lifecycle_warning: Option<String> = None;
 
     // Build the success status message.
-    let success_status = if batch.len() == 1 {
+    let mut success_status = if batch.len() == 1 {
         let filename = batch[0]
             .file_name()
             .unwrap_or_default()
@@ -6868,11 +7038,15 @@ fn execute_commit_with_source_options_transform(
         }
         parts.join(", ")
     };
+    if let Some(warning) = synthetic_artifact_lifecycle_warning {
+        success_status.push_str("; ");
+        success_status.push_str(&warning);
+    }
 
     // Clear source pane so a subsequent `:queue` arrives fresh. Transfer any
     // archive preview staging to the queued item before dropping the source.
     let _ = app.convert.source.mode.disarm_archive_preview_cleanup();
-    app.convert.source.synthetic_cue_artifacts.clear();
+    app.convert.source.cleanup_synthetic_cue_artifacts();
     app.convert.set_source_mode(SourceMode::Empty);
     app.convert.source.cue_artifact_audio.clear();
     app.convert.metadata = MetadataState::default();
@@ -11062,6 +11236,7 @@ pub(super) fn spawn_tags_mb_toc_lookup(
     paths: Vec<std::path::PathBuf>,
     editor_park: bool,
     fallback_seed: Option<SacdMbSeed>,
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
 ) {
     // Pre-fetch the cache body for every cascade stage here on the UI
     // thread; the spawned lookup stays database-free.
@@ -11096,6 +11271,7 @@ pub(super) fn spawn_tags_mb_toc_lookup(
         paths,
         editor_park,
         fallback_seed,
+        editor_session,
     };
 
     tokio::spawn(async move {
@@ -11108,6 +11284,216 @@ pub(super) fn spawn_tags_mb_toc_lookup(
             })
             .await;
     });
+}
+
+fn dispatch_regular_file_editor_tags_mb_toc(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    state_owned: Box<super::app::MetadataEditorState>,
+) -> bool {
+    use super::app::ActiveOverlay;
+
+    // File editor: state.active_surface().paths is the audio file set. Use the
+    // same TOC derivation the Browse path uses — first try AccurateRip-style
+    // offsets in the parent dir, fall back to per-file sample counts.
+    let editor_session = metadata_editor_session_guard(&state_owned);
+    let paths = state_owned.active_surface().paths.clone();
+    let Some(first_path) = paths.first().cloned() else {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        app.set_status(":tags-mb: editor has no paths".to_string());
+        return true;
+    };
+    let dir = first_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let sectors = match super::accuraterip::find_toc_offsets(&dir) {
+        Some(s) => s,
+        None => match super::accuraterip::collect_sample_counts(&paths) {
+            Ok((sample_counts, sample_rate)) => {
+                let samples_per_frame = (sample_rate / 75) as u64;
+                let mut sectors = Vec::with_capacity(sample_counts.len() + 1);
+                let mut frame: u64 = 150;
+                for &count in &sample_counts {
+                    sectors.push(frame as u32);
+                    frame += count / samples_per_frame;
+                }
+                sectors.push(frame as u32);
+                sectors
+            }
+            Err(e) => {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+                app.set_status(format!(":tags-mb: {}", e));
+                return true;
+            }
+        },
+    };
+
+    if super::musicbrainz::build_mb_toc(&sectors).is_none() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        app.set_status(":tags-mb: TOC too short".to_string());
+        return true;
+    }
+
+    app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+    spawn_tags_mb_toc_lookup(
+        app,
+        tx,
+        vec![super::musicbrainz::TocCandidate::exact(sectors)],
+        paths,
+        /* editor_park */ true,
+        None,
+        Some(editor_session),
+    );
+    true
+}
+
+fn spawn_in_editor_split_cue_musicbrainz_info_collection(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    request: InEditorSplitCueMusicBrainzInfoRequest,
+) {
+    let label = match request.source {
+        InEditorSplitCueMusicBrainzSource::UnifiedAlbum => "unified CUE album",
+        InEditorSplitCueMusicBrainzSource::PresentationTabs => "split CUE editor",
+        InEditorSplitCueMusicBrainzSource::SingleSourceFolder => "source folder",
+    };
+    app.set_status(format!(":tags-mb: discovering {label} CUE parts…"));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let sources = request.sources.clone();
+        let audio_paths = request.audio_paths.clone();
+        let result = task::spawn_blocking(move || {
+            collect_single_image_cue_infos_for_sources(&sources, &audio_paths)
+        })
+        .await
+        .map_err(|err| format!("split-CUE discovery task failed: {err}"));
+        let _ = tx
+            .send(AppMessage::InEditorSplitCueMusicBrainzInfoComplete {
+                request: Box::new(request),
+                result,
+            })
+            .await;
+    });
+}
+
+pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    request: InEditorSplitCueMusicBrainzInfoRequest,
+    result: Result<Vec<super::cue_parser::SingleImageInfo>, String>,
+) {
+    use super::app::ActiveOverlay;
+
+    let Some(state_owned) = super::event_loop::take_metadata_editor(app) else {
+        app.set_status(":tags-mb: editor closed during split-CUE discovery; rerun".to_string());
+        return;
+    };
+    if !metadata_editor_matches_session_guard(&state_owned, request.editor_session) {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        app.set_status(
+            ":tags-mb: metadata editor changed during split-CUE discovery; rerun"
+                .to_string(),
+        );
+        return;
+    }
+
+    let infos = match result {
+        Ok(infos) => infos,
+        Err(err) => {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(format!(":tags-mb: {err}"));
+            return;
+        }
+    };
+
+    match request.source {
+        InEditorSplitCueMusicBrainzSource::UnifiedAlbum => {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
+                app,
+                tx,
+                &infos,
+                /* editor_park */ true,
+                request.active_audio_path,
+                Some(request.editor_session),
+            ) {
+                return;
+            }
+            app.set_status(
+                ":tags-mb: unified CUE album has no concatenated TOC or album/artist seed"
+                    .to_string(),
+            );
+        }
+        InEditorSplitCueMusicBrainzSource::PresentationTabs => {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
+                app,
+                tx,
+                &infos,
+                /* editor_park */ true,
+                request.active_audio_path,
+                Some(request.editor_session),
+            ) {
+                return;
+            }
+            app.set_status(
+                ":tags-mb: split CUE editor has no concatenated TOC or album/artist seed"
+                    .to_string(),
+            );
+        }
+        InEditorSplitCueMusicBrainzSource::SingleSourceFolder => {
+            let Some(active_audio_path) = request.active_audio_path else {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+                app.set_status(":tags-mb: editor has no active audio path".to_string());
+                return;
+            };
+            let same_folder_infos: Vec<_> = infos
+                .into_iter()
+                .filter(|info| {
+                    info.cue_path.parent()
+                        == request.sources.first().map(PathBuf::as_path)
+                })
+                .collect();
+            let contains_active = same_folder_infos.iter().any(|info| {
+                same_path_for_split_cue(&info.audio_path, &active_audio_path)
+            });
+            if same_folder_infos.len() < 2 || !contains_active {
+                dispatch_regular_file_editor_tags_mb_toc(app, tx, state_owned);
+                return;
+            }
+            if state_owned.any_presentation_dirty() {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+                app.set_status(
+                    ":tags-mb: source folder contains multiple CUE surfaces; save or revert editor changes before running split-CUE MusicBrainz lookup"
+                        .to_string(),
+                );
+                return;
+            }
+            // The source-folder branch is an intentional editor-to-target
+            // transition: the initiating editor may contain only the active
+            // audio file, while the MusicBrainz target is the expanded
+            // split-CUE album path vector. Keep the initiating editor alive
+            // and parked behind any picker so the async completion can prove
+            // the same editor session is still current, but do not require
+            // its file-dimension paths to equal the target paths later.
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
+                app,
+                tx,
+                &same_folder_infos,
+                /* editor_park */ true,
+                Some(active_audio_path),
+                Some(request.editor_session),
+            ) {
+                return;
+            }
+            app.set_status(
+                ":tags-mb: split CUE source folder has no concatenated TOC or album/artist seed"
+                    .to_string(),
+            );
+        }
+    }
 }
 
 /// Dispatch `:tags-mb` when a metadata editor is open. Handles both
@@ -11150,22 +11536,20 @@ fn try_dispatch_in_editor_tags_mb(
             return None;
         };
 
+    let editor_session = metadata_editor_session_guard(&state_owned);
+
     // Direct-args path: skip TOC, fire a text search using the
     // user-supplied seed. Editor goes into `active_overlay` so the
     // result handler can populate it in place (same parking-slot
     // invariant as the TOC path).
     if let Some(seed) = direct_seed {
-        let split_infos = split_cue_infos_from_metadata_editor(&state_owned);
-        let paths = if split_infos.len() > 1 {
-            paths_for_single_image_cue_infos(&split_infos)
-        } else {
-            state_owned.active_surface().paths.clone()
-        };
+        let paths = metadata_editor_tags_mb_context_paths(&state_owned);
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
         let ctx = super::message::TagsMbContext {
             paths,
             editor_park: true,
             fallback_seed: None,
+            editor_session: Some(editor_session),
         };
         super::event_loop::spawn_tags_mb_text_search(
             app,
@@ -11256,6 +11640,7 @@ fn try_dispatch_in_editor_tags_mb(
                             paths: ctx_paths,
                             editor_park: true,
                             fallback_seed: None,
+                            editor_session: Some(editor_session),
                         };
                         super::event_loop::spawn_tags_mb_text_search(
                             app,
@@ -11284,6 +11669,7 @@ fn try_dispatch_in_editor_tags_mb(
                         paths: ctx_paths,
                         editor_park: true,
                         fallback_seed: None,
+                        editor_session: Some(editor_session),
                     };
                     super::event_loop::spawn_tags_mb_text_search(
                         app,
@@ -11326,6 +11712,7 @@ fn try_dispatch_in_editor_tags_mb(
                             paths: ctx_paths,
                             editor_park: true,
                             fallback_seed: None,
+                            editor_session: Some(editor_session),
                         };
                         super::event_loop::spawn_tags_mb_text_search(
                             app,
@@ -11353,86 +11740,22 @@ fn try_dispatch_in_editor_tags_mb(
             },
         };
         (sectors, seed, true)
-    } else if state_owned.presentation_tabs.len() > 1 {
-        let infos = split_cue_infos_from_metadata_editor(&state_owned);
-        let active_audio_path = state_owned.active_surface().paths.first().cloned();
+    } else if let Some(request) = in_editor_split_cue_mb_request_from_unified_album(&state_owned) {
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
-        if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
-            app,
-            tx,
-            &infos,
-            /* editor_park */ true,
-            active_audio_path,
-        ) {
-            return Some(true);
-        }
-        app.set_status(
-            ":tags-mb: split CUE editor has no concatenated TOC or album/artist seed".to_string(),
-        );
+        spawn_in_editor_split_cue_musicbrainz_info_collection(app, tx, request);
         return Some(true);
-    } else if let Some((infos, active_audio_path)) =
-        split_cue_infos_from_single_editor_source_folder(&state_owned)
-    {
-        if state_owned.any_presentation_dirty() {
-            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
-            app.set_status(
-                ":tags-mb: source folder contains multiple CUE surfaces; save or revert editor changes before running split-CUE MusicBrainz lookup"
-                    .to_string(),
-            );
-            return Some(true);
-        }
-        if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
-            app,
-            tx,
-            &infos,
-            /* editor_park */ false,
-            Some(active_audio_path),
-        ) {
-            return Some(true);
-        }
+    } else if let Some(request) = in_editor_split_cue_mb_request_from_metadata_tabs(&state_owned) {
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
-        app.set_status(
-            ":tags-mb: split CUE source folder has no concatenated TOC or album/artist seed"
-                .to_string(),
-        );
+        spawn_in_editor_split_cue_musicbrainz_info_collection(app, tx, request);
+        return Some(true);
+    } else if let Some(request) =
+        in_editor_split_cue_mb_request_from_single_editor_source_folder(&state_owned)
+    {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        spawn_in_editor_split_cue_musicbrainz_info_collection(app, tx, request);
         return Some(true);
     } else {
-        // File editor: state.active_surface().paths is the audio file set. Use the
-        // same TOC derivation the Browse path uses — first try
-        // AccurateRip-style offsets in the parent dir, fall back to
-        // per-file sample counts.
-        let paths = state_owned.active_surface().paths.clone();
-        let Some(first_path) = paths.first().cloned() else {
-            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
-            app.set_status(":tags-mb: editor has no paths".to_string());
-            return Some(true);
-        };
-        let dir = first_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-        let sectors = match super::accuraterip::find_toc_offsets(&dir) {
-            Some(s) => s,
-            None => match super::accuraterip::collect_sample_counts(&paths) {
-                Ok((sample_counts, sample_rate)) => {
-                    let samples_per_frame = (sample_rate / 75) as u64;
-                    let mut sectors = Vec::with_capacity(sample_counts.len() + 1);
-                    let mut frame: u64 = 150;
-                    for &count in &sample_counts {
-                        sectors.push(frame as u32);
-                        frame += count / samples_per_frame;
-                    }
-                    sectors.push(frame as u32);
-                    sectors
-                }
-                Err(e) => {
-                    app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
-                    app.set_status(format!(":tags-mb: {}", e));
-                    return Some(true);
-                }
-            },
-        };
-        (sectors, None, false)
+        return Some(dispatch_regular_file_editor_tags_mb_toc(app, tx, state_owned));
     };
 
     if super::musicbrainz::build_mb_toc(&sectors).is_none() {
@@ -11461,6 +11784,7 @@ fn try_dispatch_in_editor_tags_mb(
         paths,
         /* editor_park */ true,
         fallback_seed,
+        Some(editor_session),
     );
 
     Some(true)
@@ -14976,6 +15300,92 @@ mod execute_queue_state_consistency_tests {
     }
 
     #[test]
+    fn browse_queue_commit_preserves_synthetic_artifact_on_ownership_failure() {
+        let source = include_str!("command.rs");
+        let start = source
+            .find("fn queue_browse_convert_paths_for_processing(")
+            .expect("Browse queue commit helper should exist");
+        let end = source[start..]
+            .find("pub(crate) fn install_browse_convert_source_paths")
+            .map(|offset| start + offset)
+            .expect("queue helper should precede source installation helper");
+        let body = &source[start..end];
+
+        assert!(
+            body.contains("ConversionError::SyntheticCueArtifactOwnershipFailed"),
+            "Browse queue commit must distinguish registry failure from ordinary admission failure"
+        );
+        assert!(
+            !body.contains("register_synthetic_cue_artifact(&item_id"),
+            "Browse queue commit must not repeat registration after manager ready-admission already registered ownership"
+        );
+        let failure_arm = body
+            .split("ConversionError::SyntheticCueArtifactOwnershipFailed")
+            .nth(1)
+            .expect("ownership failure arm should be present")
+            .split("Err(err) =>")
+            .next()
+            .expect("ownership failure arm should precede ordinary error arm");
+        assert!(
+            failure_arm.contains("artifact preserved"),
+            "ownership failure status/log must tell the user the artifact was preserved"
+        );
+        assert!(
+            !failure_arm.contains("cleanup_synthetic_cue_artifact"),
+            "ownership failure must not clean caller-owned synthetic artifacts"
+        );
+    }
+
+
+
+    #[test]
+    fn convert_commit_uses_transaction_result_without_post_commit_path_inspection() {
+        let source = include_str!("command.rs");
+        let start = source
+            .find("fn execute_commit_with_source_options_transform(")
+            .expect("commit helper should exist");
+        let end = source[start..]
+            .find("fn execute_go(")
+            .map(|offset| start + offset)
+            .expect("commit helper should precede go helper");
+        let body = &source[start..end];
+
+        assert!(
+            body.contains("let transaction = app.manager.commit_batch_with_cue_artifacts("),
+            "Convert commit must use the manager transaction result"
+        );
+        assert!(
+            body.contains("|item| {") && body.contains("item.pipeline_request = Some(PipelineRequest"),
+            "Convert commit must configure admitted items inside the manager transaction closure"
+        );
+        assert!(
+            !body.contains("blocking_write()"),
+            "Convert commit must not call Tokio blocking lock methods from the async TUI event loop"
+        );
+        assert!(
+            body.contains("artifacts_remaining_caller_owned"),
+            "Convert commit must consume exact caller-owned artifact state from the transaction"
+        );
+        assert!(
+            !body.contains("synthetic_cue_artifact_paths_owned_by_manager"),
+            "Convert commit must not reconstruct synthetic ownership with a post-commit path inspection"
+        );
+        assert!(
+            !body.contains("register_synthetic_cue_artifacts_for_current_queue_nonblocking"),
+            "Convert commit must not run a second path-based registration pass"
+        );
+        assert!(
+            !body.contains("pre_commit_item_ids_for_batch"),
+            "Convert commit must not rely on pre-commit path snapshots for rollback"
+        );
+        assert!(
+            !body.contains("item_ids_for_paths(&batch)"),
+            "Convert commit rollback must not infer admitted ids from paths"
+        );
+    }
+
+
+    #[test]
     fn browse_queue_completion_carries_expansion_cue_metadata_after_freshness_checks() {
         let source = include_str!("command.rs");
         let handler_start = source
@@ -15014,9 +15424,12 @@ mod execute_queue_state_consistency_tests {
         let destructure = finish_body
             .find("let QueueExpansionResult { paths, mut cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
     if let Some(err) = expansion_errors.first() {
-        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
-        app.set_status(err.clone());
-        return false;
+        if paths.is_empty() {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+            app.set_status(err.clone());
+            return false;
+        }
+        app.set_status(format!(\"{}; continuing with queueable sources\", err));
     }")
             .expect("CUE metadata should come from the expansion result");
         let retain = finish_body
@@ -15324,6 +15737,44 @@ FILE "{stem}.flac" WAVE
         };
         let (generation, _cancel) = app.begin_browse_convert_expansion(request.clone());
 
+        let merge_album = temp.path().join("merge-album");
+        std::fs::create_dir_all(&merge_album).expect("merge album dir");
+        std::fs::write(merge_album.join("side_a.flac"), b"fixture").expect("side A audio");
+        std::fs::write(merge_album.join("side_b.flac"), b"fixture").expect("side B audio");
+        std::fs::write(
+            merge_album.join("side_a.cue"),
+            r#"TITLE "Album Side A"
+FILE "side_a.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 00:30:00
+"#,
+        )
+        .expect("side A cue");
+        std::fs::write(
+            merge_album.join("side_b.cue"),
+            r#"TITLE "Album Side B"
+FILE "side_b.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 00:30:00
+"#,
+        )
+        .expect("side B cue");
+        let stale_expansion = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(&[
+            merge_album.clone(),
+        ]);
+        assert_eq!(stale_expansion.synthetic_cue_artifacts.len(), 1);
+        let stale_artifact = stale_expansion
+            .synthetic_cue_artifacts
+            .iter()
+            .next()
+            .expect("synthetic artifact")
+            .clone();
+        assert!(stale_artifact.exists());
+
         app.browse.selected_index = 1;
         handle_browse_convert_expansion_complete(
             &mut app,
@@ -15331,12 +15782,7 @@ FILE "{stem}.flac" WAVE
             generation,
             request,
             BrowseConvertExpansion {
-                queue: QueueExpansionResult {
-                    paths: vec![track_a],
-                    cue_artifact_audio: std::collections::HashSet::new(),
-                    synthetic_cue_artifacts: std::collections::HashSet::new(),
-                    expansion_errors: Vec::new(),
-                },
+                queue: stale_expansion,
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
                 expansion_errors: Vec::new(),
@@ -15345,6 +15791,7 @@ FILE "{stem}.flac" WAVE
             },
         );
 
+        assert!(!stale_artifact.exists(), "discarded stale expansion must clean unowned synthetic artifacts");
         assert!(app.pending_browse_convert_expansion.is_none());
         assert_eq!(app.current_screen, AppScreen::Browse);
         assert!(matches!(app.convert.source.mode, SourceMode::Empty));
@@ -15953,9 +16400,12 @@ mod split_cue_source_coverage_tests {
             "ordinary file editors are file_surface-backed; they do not create a presentation tab"
         );
 
-        let (infos, active_audio) = split_cue_infos_from_single_editor_source_folder(&state)
-            .expect("file-surface editor should discover sibling split-CUE surfaces from its source folder");
-        assert_eq!(active_audio, album.join("side_a.flac"));
+        let request = in_editor_split_cue_mb_request_from_single_editor_source_folder(&state)
+            .expect("file-surface editor should snapshot its source folder for async split-CUE discovery");
+        assert_eq!(request.active_audio_path.as_deref(), Some(album.join("side_a.flac").as_path()));
+        assert_eq!(request.sources, vec![album.clone()]);
+        assert!(request.audio_paths.is_empty());
+        let infos = collect_single_image_cue_infos_for_sources(&request.sources, &request.audio_paths);
         assert_eq!(infos.len(), 2);
         assert!(infos.iter().any(|info| info.audio_path == album.join("side_b.flac")));
     }
@@ -16501,5 +16951,196 @@ mod split_cue_source_coverage_tests {
         assert_eq!(cue_infos[1].cue_path, album.join("side_b.cue"));
         assert_eq!(cue_infos[1].audio_path, album.join("side_b.tta"));
         assert_eq!(cue_infos[1].sheet.tracks.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod in_editor_tags_mb_reducer_safety_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{ActiveOverlay, AppState, MetadataEditorState, MetadataTechnicalDetails};
+    use tokio::sync::mpsc;
+
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(4);
+        tx
+    }
+
+    fn editor_for_path(path: std::path::PathBuf) -> Box<MetadataEditorState> {
+        Box::new(MetadataEditorState::for_files(
+            vec![path],
+            Vec::new(),
+            vec!["track.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        ))
+    }
+
+    fn session_guard_for(
+        state: &MetadataEditorState,
+    ) -> super::super::message::MetadataEditorSessionGuard {
+        let details = &state.active_surface().technical_details;
+        super::super::message::MetadataEditorSessionGuard {
+            session_id: details.session_id,
+            save_generation: details.save_generation,
+        }
+    }
+
+    #[test]
+    fn stale_split_cue_discovery_completion_after_reopen_is_ignored() {
+        let path = std::path::PathBuf::from("/tmp/reopened-album/track.flac");
+        let old_editor = editor_for_path(path.clone());
+        let old_guard = session_guard_for(&old_editor);
+        let reopened_editor = editor_for_path(path.clone());
+        let reopened_guard = session_guard_for(&reopened_editor);
+        assert_ne!(old_guard.session_id, reopened_guard.session_id);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(reopened_editor);
+        let request = InEditorSplitCueMusicBrainzInfoRequest {
+            source: InEditorSplitCueMusicBrainzSource::UnifiedAlbum,
+            sources: vec![path.clone()],
+            audio_paths: vec![path.clone()],
+            active_audio_path: Some(path),
+            editor_session: old_guard,
+        };
+
+        handle_in_editor_split_cue_musicbrainz_info_complete(
+            &mut app,
+            &tx(),
+            request,
+            Ok(Vec::new()),
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => assert_eq!(
+                session_guard_for(state).session_id,
+                reopened_guard.session_id,
+                "stale discovery completion must preserve the current reopened editor"
+            ),
+            other => panic!("expected reopened editor to remain active, got {:?}", other),
+        }
+        assert!(app.pending_metadata_editor.is_none());
+        let status = app.status_message.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status
+                .unwrap_or_default()
+                .contains("metadata editor changed during split-CUE discovery"),
+            "stale completion should report the session change, got {:?}",
+            status
+        );
+    }
+
+    #[test]
+    fn in_editor_tags_mb_split_cue_discovery_and_dispatch_are_session_guarded() {
+        let source = include_str!("command.rs");
+        let request_start = source
+            .find("pub struct InEditorSplitCueMusicBrainzInfoRequest")
+            .expect("in-editor split-CUE MB request should exist");
+        let request_end = source[request_start..]
+            .find("pub(crate) fn split_cue_album_grouping_key_from_paths")
+            .map(|offset| request_start + offset)
+            .expect("request struct should precede grouping helpers");
+        let request_body = &source[request_start..request_end];
+        assert!(
+            request_body.contains("editor_session: super::message::MetadataEditorSessionGuard"),
+            "split-CUE discovery requests must carry the originating editor session"
+        );
+
+        let completion_start = source
+            .find("pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(")
+            .expect("split-CUE MB info completion handler should exist");
+        let completion_end = source[completion_start..]
+            .find("/// Dispatch `:tags-mb` when a metadata editor is open")
+            .map(|offset| completion_start + offset)
+            .expect("completion handler should precede :tags-mb dispatcher");
+        let completion_body = &source[completion_start..completion_end];
+        assert!(
+            completion_body.contains("metadata_editor_matches_session_guard(&state_owned, request.editor_session)"),
+            "stale split-CUE discovery completions must be rejected before mutating an editor"
+        );
+        assert!(
+            completion_body.contains("Some(request.editor_session)"),
+            "accepted split-CUE discovery must propagate the session guard into TOC/text dispatch"
+        );
+    }
+
+    #[test]
+    fn in_editor_tags_mb_split_cue_discovery_is_worker_only() {
+        let source = include_str!("command.rs");
+        let dispatch_start = source
+            .find("fn try_dispatch_in_editor_tags_mb(")
+            .expect("in-editor :tags-mb dispatcher should exist");
+        let dispatch_end = source[dispatch_start..]
+            .find("/// Public entry point for metadata editing from context_menu.rs.")
+            .map(|offset| dispatch_start + offset)
+            .expect("metadata entry point should follow the dispatcher");
+        let dispatch_body = &source[dispatch_start..dispatch_end];
+
+        assert!(
+            dispatch_body.contains("in_editor_split_cue_mb_request_from_unified_album"),
+            "unified-album :tags-mb must route through the async split-CUE discovery request"
+        );
+        assert!(
+            dispatch_body.contains("in_editor_split_cue_mb_request_from_metadata_tabs"),
+            "legacy tabbed split-CUE :tags-mb must route through the async split-CUE discovery request"
+        );
+        assert!(
+            dispatch_body.contains("in_editor_split_cue_mb_request_from_single_editor_source_folder"),
+            "single-editor source-folder :tags-mb must route through the async split-CUE discovery request"
+        );
+        assert!(
+            !dispatch_body.contains("collect_single_image_cue_infos_for_sources("),
+            "the in-editor :tags-mb reducer path must not discover or parse CUE files"
+        );
+
+        let worker_start = source
+            .find("fn spawn_in_editor_split_cue_musicbrainz_info_collection(")
+            .expect("blocking split-CUE discovery spawn helper should exist");
+        let worker_end = source[worker_start..]
+            .find("pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(")
+            .map(|offset| worker_start + offset)
+            .expect("completion handler should follow the spawn helper");
+        let worker_body = &source[worker_start..worker_end];
+        assert!(
+            worker_body.contains("task::spawn_blocking"),
+            "split-CUE discovery must run on a blocking worker"
+        );
+        assert!(
+            worker_body.contains("collect_single_image_cue_infos_for_sources(&sources, &audio_paths)"),
+            "the blocking worker should own the CUE discovery/parsing call"
+        );
+    }
+}
+
+#[cfg(test)]
+mod convert_commit_synthetic_artifact_lifecycle_tests {
+    #[test]
+    fn convert_commit_transaction_replaces_ownership_inspection_uncertainty_path() {
+        let source = include_str!("command.rs");
+        let commit_start = source
+            .find("fn execute_commit_with_source_options_transform(")
+            .expect("convert commit function should exist");
+        let commit_end = source[commit_start..]
+            .find("/// Execute a `:go` / `:start` command")
+            .map(|offset| commit_start + offset)
+            .expect("start command should follow convert commit");
+        let commit_body = &source[commit_start..commit_end];
+
+        assert!(
+            commit_body.contains("commit_batch_with_cue_artifacts"),
+            "commit must receive an authoritative queue/artifact transaction"
+        );
+        assert!(
+            !commit_body.contains("quarantine_synthetic_cue_artifacts_without_cleanup"),
+            "commit must not use ambiguous post-admission quarantine as normal control flow"
+        );
+        assert!(
+            !commit_body.contains("release_synthetic_cue_artifacts_without_cleanup"),
+            "commit must not detach artifacts into ownerless limbo after admission"
+        );
+        assert!(
+            !commit_body.contains("synthetic_cue_artifact_paths_owned_by_manager"),
+            "commit must not inspect manager ownership by path after queue side effects"
+        );
     }
 }

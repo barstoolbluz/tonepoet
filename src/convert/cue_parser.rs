@@ -1800,6 +1800,11 @@ pub fn find_sidecar_cue(audio_path: &Path) -> Option<PathBuf> {
             p.extension()
                 .map(|ext| ext.to_ascii_lowercase() == "cue")
                 .unwrap_or(false)
+                && !p
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.starts_with('.'))
+                    .unwrap_or(false)
         })
         .collect();
     cues.sort();

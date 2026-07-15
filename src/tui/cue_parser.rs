@@ -9,6 +9,26 @@ pub use crate::convert::cue_parser::*;
 
 use std::path::{Path, PathBuf};
 
+/// Returns true for a CUE file that should participate in sidecar and
+/// split-CUE surface discovery. Dot-prefixed `.cue` files are treated as
+/// editor scratch buffers, not user sidecars, so a rejected embedded-CUESHEET
+/// edit cannot poison the next folder open or make sidecar detection ambiguous.
+pub fn is_user_visible_cue_path(path: &Path) -> bool {
+    let is_cue = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("cue"))
+        .unwrap_or(false);
+    if !is_cue {
+        return false;
+    }
+    !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with('.'))
+        .unwrap_or(false)
+}
+
 
 // ── Single-image detection ──────────────────────────────────────────
 
@@ -52,12 +72,7 @@ pub fn find_sidecar_cue_for_audio_image(audio_path: &Path) -> Option<PathBuf> {
     let mut cues: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("cue"))
-                .unwrap_or(false)
-        })
+        .filter(|path| is_user_visible_cue_path(path))
         .collect();
     cues.sort();
 
@@ -129,12 +144,16 @@ pub fn detect_single_image(dir: &Path) -> Option<SingleImageInfo> {
 pub fn detect_single_image_cues(dir: &Path) -> Vec<SingleImageInfo> {
     crate::tui::gnudb::find_cues_in_dir(dir)
         .into_iter()
+        .filter(|cue_path| is_user_visible_cue_path(cue_path))
         .filter_map(|cue_path| single_image_info_for_cue(&cue_path))
         .collect()
 }
 
 /// Detect a materializable single-image CUE from an explicit `.cue` path.
 pub fn detect_single_image_cue(cue_path: &Path) -> Option<SingleImageInfo> {
+    if !is_user_visible_cue_path(cue_path) {
+        return None;
+    }
     single_image_info_for_cue(cue_path)
 }
 
@@ -282,4 +301,25 @@ pub fn can_ffmpeg_read(path: &Path) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_prefixed_cue_files_do_not_make_sidecar_detection_ambiguous() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("album.flac");
+        std::fs::write(&audio, b"fixture").expect("audio fixture");
+        let visible = temp.path().join("album.cue");
+        let hidden = temp.path().join(".album.tonepoet-embedded-cuesheet-rejected.cue");
+        let cue_text = "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n";
+        std::fs::write(&visible, cue_text).expect("visible cue");
+        std::fs::write(&hidden, cue_text).expect("hidden cue");
+
+        assert!(is_user_visible_cue_path(&visible));
+        assert!(!is_user_visible_cue_path(&hidden));
+        assert_eq!(find_sidecar_cue_for_audio_image(&audio).as_deref(), Some(visible.as_path()));
+    }
 }

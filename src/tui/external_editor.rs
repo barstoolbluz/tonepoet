@@ -3,36 +3,40 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Open a file in the user's preferred editor.
-///
-/// Suspends the terminal (raw mode off, cursor visible), runs the editor,
-/// then restores the terminal for the TUI. Returns `Ok(true)` if the
-/// editor exited successfully, `Ok(false)` if it exited with an error
-/// (e.g., user killed it), or `Err` if no editor could be found.
-pub fn open_in_editor(path: &Path) -> Result<bool, String> {
-    let editor_str = detect_editor()?;
-    let (program, args) = split_command(&editor_str);
+struct TuiRestoreGuard {
+    restore: bool,
+}
 
-    // Suspend TUI: restore normal terminal mode so the editor can run.
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste,
-        crossterm::cursor::Show,
-        crossterm::terminal::LeaveAlternateScreen,
-    );
+impl TuiRestoreGuard {
+    fn suspend() -> Self {
+        // Suspend TUI: restore normal terminal mode so the editor can run.
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+            crossterm::cursor::Show,
+            crossterm::terminal::LeaveAlternateScreen,
+        );
+        Self { restore: true }
+    }
 
-    // Run the editor, blocking until it exits. DELIBERATE stdin inheritance:
-    // the user's $EDITOR needs the terminal. This is the documented exemption
-    // from the subprocess stdin-nulling convention (see the sentinel test
-    // tests/subprocess_stdin_convention.rs).
-    let status = Command::new(program)
-        .args(&args)
-        .arg(path)
-        .status()
-        .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
+    fn restore_now(&mut self) {
+        if !self.restore {
+            return;
+        }
+        self.restore = false;
+        restore_tui_terminal();
+    }
+}
 
+impl Drop for TuiRestoreGuard {
+    fn drop(&mut self) {
+        self.restore_now();
+    }
+}
+
+fn restore_tui_terminal() {
     // Restore TUI: re-enter raw mode and alternate screen.
     let _ = crossterm::execute!(
         std::io::stdout(),
@@ -50,7 +54,33 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
         std::io::stdout(),
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
     );
+}
 
+/// Open a file in the user's preferred editor.
+///
+/// Suspends the terminal (raw mode off, cursor visible), runs the editor,
+/// then restores the terminal for the TUI. Returns `Ok(true)` if the
+/// editor exited successfully, `Ok(false)` if it exited with an error
+/// (e.g., user killed it), or `Err` if no editor could be found.
+pub fn open_in_editor(path: &Path) -> Result<bool, String> {
+    let editor_str = detect_editor()?;
+    let (program, args) = split_command(&editor_str);
+
+    let mut terminal_restore = TuiRestoreGuard::suspend();
+
+    // Run the editor, blocking until it exits. The terminal restore guard
+    // above intentionally survives this fallible spawn so early returns
+    // cannot leave the TUI suspended. Documented exemption from the
+    // subprocess stdin-nulling convention (see the sentinel test
+    // tests/subprocess_stdin_convention.rs): the user's $EDITOR needs the
+    // terminal — DELIBERATE stdin inheritance.
+    let status = Command::new(program)
+        .args(&args)
+        .arg(path)
+        .status()
+        .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
+
+    terminal_restore.restore_now();
     Ok(status.success())
 }
 
@@ -76,19 +106,12 @@ pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
         _ => Some("-R"),                         // best guess (vim-compatible)
     };
 
-    // Suspend TUI.
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste,
-        crossterm::cursor::Show,
-        crossterm::terminal::LeaveAlternateScreen,
-    );
+    let mut terminal_restore = TuiRestoreGuard::suspend();
 
     // Build and run command. DELIBERATE stdin inheritance, same exemption as
     // the read-write editor spawn above: the user's $EDITOR needs the terminal
-    // (see tests/subprocess_stdin_convention.rs).
+    // (see tests/subprocess_stdin_convention.rs). The restore guard protects
+    // the TUI on fallible spawn as well as normal editor exit.
     let mut cmd = Command::new(program);
     cmd.args(&args);
     if let Some(flag) = readonly_flag {
@@ -99,20 +122,7 @@ pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
         .status()
         .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
 
-    // Restore TUI.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste,
-        crossterm::cursor::Hide,
-    );
-    let _ = crossterm::terminal::enable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-    );
-
+    terminal_restore.restore_now();
     Ok(status.success())
 }
 
@@ -181,4 +191,67 @@ fn which(cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn editor_spawn_error_path_is_guarded_by_terminal_restore_drop() {
+        let source = include_str!("external_editor.rs");
+        let editor_fn = source
+            .split("pub fn open_in_editor")
+            .nth(1)
+            .expect("open_in_editor function")
+            .split("pub fn open_in_viewer")
+            .next()
+            .expect("open_in_editor body");
+        assert!(editor_fn.contains("TuiRestoreGuard::suspend()"));
+        assert!(editor_fn.contains(".map_err(|e| format!(\"failed to run {}: {}\", editor_str, e))?"));
+        assert!(editor_fn.contains("terminal_restore.restore_now();"));
+
+        let viewer_fn = source
+            .split("pub fn open_in_viewer")
+            .nth(1)
+            .expect("open_in_viewer function")
+            .split("/// Split a command string")
+            .next()
+            .expect("open_in_viewer body");
+        assert!(viewer_fn.contains("TuiRestoreGuard::suspend()"));
+        assert!(viewer_fn.contains(".map_err(|e| format!(\"failed to run {}: {}\", editor_str, e))?"));
+        assert!(viewer_fn.contains("terminal_restore.restore_now();"));
+    }
+
+    #[test]
+    fn tui_open_in_editor_callers_force_full_redraw_after_every_return_path() {
+        let command = include_str!("command.rs");
+        let edit_file_arm = command
+            .split("Command::EditFile(path) => {")
+            .nth(1)
+            .expect("edit-file command arm")
+            .split("Command::ContextMenu => {")
+            .next()
+            .expect("edit-file arm body");
+        assert!(edit_file_arm.contains("open_in_editor(&target)"));
+        assert!(
+            edit_file_arm.contains("Ok(_) => {
+                    app.force_redraw = true;")
+                && edit_file_arm.contains("Err(e) => {
+                    app.force_redraw = true;"),
+            ":edit-file must force a full redraw after both successful and failed system-editor returns"
+        );
+
+        let keybindings = include_str!("keybindings.rs");
+        let embedded_call_site = keybindings
+            .split("MetadataCuePillAction::Edit => {")
+            .nth(1)
+            .expect("embedded CUESHEET edit action")
+            .split("MetadataCuePillAction::Delete => {")
+            .next()
+            .expect("embedded CUESHEET edit action body");
+        assert!(embedded_call_site.contains("metadata_editor_edit_embedded_cuesheet_with_system_editor"));
+        assert!(
+            embedded_call_site.contains("app.force_redraw = true;"),
+            ":cuesheet-edit must force a full redraw after the external editor returns with accept, reject, unchanged, or error"
+        );
+    }
 }

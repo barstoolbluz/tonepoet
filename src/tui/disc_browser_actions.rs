@@ -66,12 +66,13 @@ pub fn open_selected_disc_browser(app: &mut AppState, tx: &mpsc::Sender<AppMessa
     open_disc_browser_for_path(app, path, tx);
 }
 
-/// Return the selected Browse path when it is a disc source, applying the same
-/// explicit-action ISO promotion used by the context menu. This keeps menu
-/// exposure and action dispatch coherent during the lazy-classification window:
-/// a right-click on an unprobed SACD/DVD/BD `.iso` promotes the selected row
-/// before dispatch, so subsequent handlers do not reject the action as a stale
-/// `Archive`.
+/// Return the selected Browse path when it is a disc source, or when an
+/// explicit disc action targets a not-yet-classified `.iso` (e.g. one the
+/// scanner filed as `Archive` in the lazy-classification window). The
+/// extension check is pure string work — no ISO header probe runs on the
+/// reducer (that read can stall on slow mounts). The async disc probe the
+/// dispatch kicks off resolves the concrete kind, reclassifies the row on
+/// completion, and reports a clean error for non-disc ISOs.
 fn selected_entry_effective_disc_path(app: &mut AppState) -> Option<PathBuf> {
     let index = app.browse.selected_index;
     let (path, current_kind) = app
@@ -80,19 +81,18 @@ fn selected_entry_effective_disc_path(app: &mut AppState) -> Option<PathBuf> {
         .get(index)
         .map(|entry| (entry.path.clone(), entry.kind.clone()))?;
 
-    let effective_kind =
-        super::context_menu::effective_browse_context_entry_kind(&current_kind, &path);
-    if !effective_kind.is_disc_source() {
-        return None;
+    if current_kind.is_disc_source() {
+        return Some(path);
     }
-
-    if effective_kind != current_kind {
-        if let Some(entry) = app.browse.entries.get_mut(index) {
-            entry.kind = effective_kind;
-        }
+    let is_iso = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("iso"))
+        .unwrap_or(false);
+    if matches!(current_kind, crate::tui::browse::EntryKind::Archive) && is_iso {
+        return Some(path);
     }
-
-    Some(path)
+    None
 }
 
 /// Open the Audio Streams overlay for a specific disc path, or start probing it.
@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_disc_action_promotes_unprobed_sacd_iso_selection() {
+    fn explicit_disc_action_accepts_unprobed_archive_iso_without_reducer_probe() {
         let temp = tempfile::tempdir().expect("tempdir");
         let iso = temp.path().join("disc.iso");
         write_synthetic_sacd_iso(&iso);
@@ -659,18 +659,17 @@ mod tests {
         let selected = selected_entry_effective_disc_path(&mut app).expect("disc path");
 
         assert_eq!(selected, iso);
-        assert!(
-            matches!(app.browse.entries[0].kind, EntryKind::SacdIso),
-            "dispatch must promote the selected row instead of leaving a stale Archive kind"
-        );
+        // No ISO header probe runs on the reducer: the row keeps its lazy
+        // Archive kind until the async disc probe reclassifies it.
+        assert!(matches!(app.browse.entries[0].kind, EntryKind::Archive));
     }
 
     #[test]
-    fn explicit_disc_action_rejects_generic_iso_without_promoting_archive() {
+    fn explicit_disc_action_rejects_non_iso_archive_selection() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let iso = temp.path().join("data.iso");
-        std::fs::write(&iso, b"not a disc image").expect("write generic iso");
-        let mut app = app_with_selected_archive_iso(iso);
+        let archive = temp.path().join("data.7z");
+        std::fs::write(&archive, b"not a disc image").expect("write generic archive");
+        let mut app = app_with_selected_archive_iso(archive);
 
         assert!(selected_entry_effective_disc_path(&mut app).is_none());
         assert!(matches!(app.browse.entries[0].kind, EntryKind::Archive));

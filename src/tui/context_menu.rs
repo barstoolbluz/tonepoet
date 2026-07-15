@@ -565,68 +565,28 @@ fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
     }
 }
 
-pub(crate) fn effective_browse_context_entry_kind(kind: &EntryKind, path: &Path) -> EntryKind {
-    if !matches!(kind, EntryKind::Archive) || !path_has_extension(path, "iso") {
-        return kind.clone();
-    }
-
-    // Browse intentionally classifies ISO images lazily during normal render
-    // passes. A context menu is an explicit action: spend the small bounded
-    // probe cost here so a disc image never presents generic archive actions.
-    if super::sacd::is_sacd_iso(path) {
-        EntryKind::SacdIso
-    } else if crate::disc::dvda_utils::is_dvda_iso(path) {
-        EntryKind::DvdAudioIso
-    } else if crate::disc::dvdv_utils::is_dvdv_iso(path) {
-        EntryKind::DvdVideoIso
-    } else if crate::disc::bluray_utils::is_bluray_iso(path) {
-        EntryKind::BlurayIso
-    } else {
-        EntryKind::Archive
-    }
+pub(crate) fn effective_browse_context_entry_kind(kind: &EntryKind, _path: &Path) -> EntryKind {
+    // Context-menu construction runs on the reducer. Do not perform ISO header
+    // probes here; those are filesystem reads and can stall on slow mounts.
+    // Browse classification/dispatch paths remain responsible for resolving
+    // concrete disc-image kind before disc-specific operations run.
+    kind.clone()
 }
 
-fn path_has_extension(path: &Path, expected: &str) -> bool {
+fn audio_file_extension_supports_embedded_cuesheet(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case(expected))
-        .unwrap_or(false)
-}
-
-fn directory_contains_cue(path: &Path) -> bool {
-    std::fs::read_dir(path)
-        .ok()
-        .map(|entries| {
-            entries.filter_map(|entry| entry.ok()).any(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.eq_ignore_ascii_case("cue"))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn sibling_directory_contains_cue(path: &Path) -> bool {
-    path.parent().map(directory_contains_cue).unwrap_or(false)
-}
-
-fn audio_file_has_embedded_cuesheet(path: &Path) -> bool {
-    super::probe::read_all_tags(path)
-        .map(|entries| {
-            entries.into_iter().any(|entry| {
-                entry.display_key.eq_ignore_ascii_case("CUESHEET")
-                    && (entry.per_file_values.iter().any(|value| !value.trim().is_empty())
-                        || !entry.value.trim().is_empty())
-            })
-        })
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "flac" | "wv" | "ape" | "ogg" | "opus"))
         .unwrap_or(false)
 }
 
 fn audio_file_is_cue_bearing(path: &Path) -> bool {
-    sibling_directory_contains_cue(path) || audio_file_has_embedded_cuesheet(path)
+    // Menu construction runs on the reducer. Do not read tags or scan sibling
+    // directories here: either can block on slow or disconnected mounts. Enable
+    // embedded-CUESHEET actions for plausible carriers by extension only and let
+    // the dispatch path, which already reports precise errors, resolve actual
+    // sidecar/embedded presence on its worker-safe path.
+    audio_file_extension_supports_embedded_cuesheet(path)
 }
 
 /// Build the context menu for a right-click on a browse entry.
@@ -746,8 +706,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open", ContextAction::OpenEntry));
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
-            let has_cue = directory_contains_cue(&entry.path);
-            items.push(build_tagging_submenu(has_cue));
+            // Directory menu construction must not synchronously scan the
+            // directory for CUE files. Show CUE-capable actions for directories
+            // and let dispatch perform worker-safe presence resolution.
+            items.push(build_tagging_submenu(true));
             items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
             items.push(item("Select", ContextAction::Select));
@@ -1053,6 +1015,7 @@ fn open_browse_metadata_cue_action(
         }
         ContextAction::BrowseCueEdit => {
             let status = super::keybindings::metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
+            app.force_redraw = true;
             app.set_status(status);
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
         }
@@ -1322,25 +1285,22 @@ pub fn execute_context_action(
         }
         ContextAction::MetadataEditValue => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
-                let cursor = state.cursor;
-                if let Some(entry) = state.active_surface().entries.get(cursor) {
-                    if !entry.is_binary {
-                        state.edit_input =
-                            Some(super::text_input::TextInputState::new(entry.value.clone()));
-                        state.phase = super::app::MetadataEditorPhase::InlineEdit;
-                    }
+                if let Some(status) = super::keybindings::metadata_editor_begin_cursor_value_edit(&mut state, false) {
+                    app.set_status(status);
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
         }
         ContextAction::MetadataDeleteEntry => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
-                let cursor = state.cursor;
-                if cursor < state.active_surface().entries.len() && !state.active_surface().deleted.contains(&cursor) {
-                    state.active_surface_mut().deleted.push(cursor);
-                    state.active_surface_mut().dirty = true;
+                if super::keybindings::metadata_editor_delete_cursor_requires_embedded_cuesheet_confirmation(&state) {
+                    super::keybindings::open_embedded_cuesheet_delete_confirmation(app, state);
+                } else {
+                    if let Some(status) = super::keybindings::metadata_editor_delete_cursor(&mut state) {
+                        app.set_status(status);
+                    }
+                    app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                 }
-                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
         }
         ContextAction::MetadataRestoreEntry => {
@@ -1392,6 +1352,7 @@ pub fn execute_context_action(
         ContextAction::MetadataCueEdit => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let status = super::keybindings::metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
+                app.force_redraw = true;
                 app.set_status(status);
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
@@ -1434,7 +1395,10 @@ pub fn execute_context_action(
                 if idx < state.releases.len() {
                     let releases = std::mem::take(&mut state.releases);
                     let paths = std::mem::take(&mut state.paths);
-                    super::event_loop::open_editor_with_mb_release(app, tx, releases, idx, paths);
+                    let editor_session = state.editor_session;
+                    super::event_loop::open_editor_with_mb_release_guarded(
+                        app, tx, releases, idx, paths, editor_session,
+                    );
                 } else {
                     // Out-of-range — restore the picker.
                     app.active_overlay = super::app::ActiveOverlay::MbSelect(state);
@@ -2071,6 +2035,30 @@ mod tests {
             } => (generation, request, expansion),
             other => panic!("expected BrowseConvertExpansionComplete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn browse_context_menu_build_does_not_scan_for_cue_presence_on_reducer() {
+        let source = include_str!("context_menu.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        assert!(
+            !production.contains("std::fs::read_dir") && !production.contains("fs::read_dir"),
+            "browse context-menu construction must not synchronously scan directories for CUE presence"
+        );
+        assert!(
+            !production.contains("read_all_tags") && !production.contains("recover_before_read"),
+            "browse context-menu construction must not synchronously read or recover tags"
+        );
+        assert!(
+            !production.contains("is_sacd_iso")
+                && !production.contains("is_dvda_iso")
+                && !production.contains("is_dvdv_iso")
+                && !production.contains("is_bluray_iso"),
+            "browse context-menu construction must not synchronously probe disc-image headers"
+        );
     }
 
     #[tokio::test]

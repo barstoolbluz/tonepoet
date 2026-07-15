@@ -495,24 +495,19 @@ impl QueueExpansionPlan {
             push_unique_path_with_keys(&mut result, &mut result_keys, disc_root);
         }
 
-        let (grouped_cue_keys, synthetic_album_errors, mut synthetic_cue_artifacts) =
+        let (grouped_cue_keys, synthetic_album_errors, synthetic_album_warnings, mut synthetic_cue_artifacts) =
             push_synthetic_cue_album_groups_for_queue(
                 &cue_sheets,
+                &queueable_non_cue,
                 &disc_root_keys,
                 grouping_decisions,
                 &mut result,
                 &mut result_keys,
                 &mut suppressed_audio_keys,
             );
-        if !synthetic_album_errors.is_empty() {
-            cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
-            return QueueExpansionResult {
-                paths: Vec::new(),
-                cue_artifact_audio: HashSet::new(),
-                synthetic_cue_artifacts: HashSet::new(),
-                expansion_errors: synthetic_album_errors,
-            };
-        }
+
+        let mut expansion_errors = synthetic_album_errors;
+        expansion_errors.extend(synthetic_album_warnings);
 
         for cue in cue_sheets {
             if grouped_cue_keys.contains(&cue.path_key) {
@@ -585,7 +580,7 @@ impl QueueExpansionPlan {
             paths: result,
             cue_artifact_audio,
             synthetic_cue_artifacts,
-            expansion_errors: Vec::new(),
+            expansion_errors,
         }
     }
 }
@@ -601,12 +596,13 @@ struct SyntheticCueAlbumPart {
 
 fn push_synthetic_cue_album_groups_for_queue(
     cue_sheets: &[CueQueueCandidate],
+    queueable_non_cue: &[PathBuf],
     disc_root_keys: &HashSet<PathBuf>,
     grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
     result: &mut Vec<PathBuf>,
     result_keys: &mut HashSet<PathBuf>,
     suppressed_audio_keys: &mut HashSet<PathBuf>,
-) -> (HashSet<PathBuf>, Vec<String>, HashSet<PathBuf>) {
+) -> (HashSet<PathBuf>, Vec<String>, Vec<String>, HashSet<PathBuf>) {
     let mut by_parent: BTreeMap<PathBuf, Vec<CueQueueCandidate>> = BTreeMap::new();
     for cue in cue_sheets {
         if cue.explicit || path_key_is_under_any_root(&cue.path_key, disc_root_keys) {
@@ -620,6 +616,7 @@ fn push_synthetic_cue_album_groups_for_queue(
 
     let mut grouped = HashSet::new();
     let mut fatal_errors = Vec::new();
+    let mut nonfatal_errors = Vec::new();
     let mut synthetic_cue_artifacts = HashSet::new();
     for (parent, mut candidates) in by_parent {
         if candidates.len() < 2 {
@@ -628,16 +625,18 @@ fn push_synthetic_cue_album_groups_for_queue(
         candidates.sort_by(|a, b| deterministic_path_sort_key(&a.path).cmp(&deterministic_path_sort_key(&b.path)));
 
         let mut parts = Vec::new();
+        let mut parent_failed_closed = false;
         for cue in &candidates {
             let sheet = match crate::convert::cue_parser::parse_cue_file(&cue.path) {
                 Ok(sheet) => sheet,
                 Err(err) => {
                     fatal_errors.push(format!(
-                        "Cannot queue merged CUE album for {}: failed to parse {}: {}. Nothing was staged; fix the CUE or select a single .cue explicitly.",
+                        "Cannot queue merged CUE album for {}: failed to parse {}: {}. Nothing was staged for this group; fix the CUE or select a single .cue explicitly.",
                         parent.display(),
                         cue.path.display(),
                         err
                     ));
+                    parent_failed_closed = true;
                     break;
                 }
             };
@@ -646,11 +645,12 @@ fn push_synthetic_cue_album_groups_for_queue(
                 Ok(CueQueueDecision::MetadataArtifact { .. }) => continue,
                 Err(err) => {
                     fatal_errors.push(format!(
-                        "Cannot queue merged CUE album for {}: failed to analyze {}: {}. Nothing was staged; fix the CUE or select a single .cue explicitly.",
+                        "Cannot queue merged CUE album for {}: failed to analyze {}: {}. Nothing was staged for this group; fix the CUE or select a single .cue explicitly.",
                         parent.display(),
                         cue.path.display(),
                         err
                     ));
+                    parent_failed_closed = true;
                     break;
                 }
             };
@@ -664,7 +664,11 @@ fn push_synthetic_cue_album_groups_for_queue(
                 referenced_audio,
             });
         }
-        if !fatal_errors.is_empty() {
+        if parent_failed_closed {
+            for cue in &candidates {
+                grouped.insert(cue.path_key.clone());
+            }
+            suppress_parent_audio_for_failed_synthetic_group(&parent, queueable_non_cue, suppressed_audio_keys);
             continue;
         }
         if parts.len() < 2 {
@@ -723,16 +727,26 @@ fn push_synthetic_cue_album_groups_for_queue(
             let total_tracks: usize = group_parts.iter().map(|part| part.sheet.tracks.len()).sum();
             if total_tracks == 0 {
                 fatal_errors.push(format!(
-                    "Cannot queue merged CUE album for {}: the merged CUE group has no tracks. Nothing was staged.",
+                    "Cannot queue merged CUE album for {}: the merged CUE group has no tracks. Nothing was staged for this group.",
                     parent.display()
                 ));
+                block_failed_synthetic_group(&group_parts, &mut grouped, suppressed_audio_keys);
                 continue;
             }
             if total_tracks > 99 {
                 fatal_errors.push(format!(
-                    "Cannot queue merged CUE album for {}: the merged CUE group has {} tracks, but CUE syntax supports at most 99. Nothing was staged; split the selection or edit the cues.",
+                    "Cannot queue merged CUE album for {}: the merged CUE group has {} tracks, but CUE syntax supports at most 99. Nothing was staged for this group; split the selection or edit the cues.",
                     parent.display(),
                     total_tracks
+                ));
+                block_failed_synthetic_group(&group_parts, &mut grouped, suppressed_audio_keys);
+                continue;
+            }
+            if let Some(path_with_quote) = first_resolved_member_audio_path_with_quote(&group_parts) {
+                nonfatal_errors.push(format!(
+                    "Cannot merge CUE album for {}: member image path contains a double quote that CUE FILE syntax cannot round-trip exactly: {}. Falling back to per-CUE queue items.",
+                    parent.display(),
+                    path_with_quote.display()
                 ));
                 continue;
             }
@@ -740,10 +754,11 @@ fn push_synthetic_cue_album_groups_for_queue(
                 Ok(text) => text,
                 Err(err) => {
                     fatal_errors.push(format!(
-                        "Cannot queue merged CUE album for {}: failed to generate the synthetic CUE: {}. Nothing was staged.",
+                        "Cannot queue merged CUE album for {}: failed to generate the synthetic CUE: {}. Nothing was staged for this group.",
                         parent.display(),
                         err
                     ));
+                    block_failed_synthetic_group(&group_parts, &mut grouped, suppressed_audio_keys);
                     continue;
                 }
             };
@@ -751,10 +766,11 @@ fn push_synthetic_cue_album_groups_for_queue(
                 Ok(path) => path,
                 Err(err) => {
                     fatal_errors.push(format!(
-                        "Cannot queue merged CUE album for {}: failed to stage the synthetic CUE: {}. Nothing was staged.",
+                        "Cannot queue merged CUE album for {}: failed to stage the synthetic CUE: {}. Nothing was staged for this group.",
                         parent.display(),
                         err
                     ));
+                    block_failed_synthetic_group(&group_parts, &mut grouped, suppressed_audio_keys);
                     continue;
                 }
             };
@@ -768,12 +784,60 @@ fn push_synthetic_cue_album_groups_for_queue(
             }
         }
     }
-    if !fatal_errors.is_empty() {
-        cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
-        synthetic_cue_artifacts.clear();
-    }
 
-    (grouped, fatal_errors, synthetic_cue_artifacts)
+    (grouped, fatal_errors, nonfatal_errors, synthetic_cue_artifacts)
+}
+
+fn block_failed_synthetic_group(
+    group_parts: &[SyntheticCueAlbumPart],
+    grouped: &mut HashSet<PathBuf>,
+    suppressed_audio_keys: &mut HashSet<PathBuf>,
+) {
+    for part in group_parts {
+        grouped.insert(part.cue_key.clone());
+        for audio in &part.referenced_audio {
+            suppressed_audio_keys.insert(queue_path_key(audio));
+        }
+    }
+}
+
+fn suppress_parent_audio_for_failed_synthetic_group(
+    parent_key: &Path,
+    queueable_non_cue: &[PathBuf],
+    suppressed_audio_keys: &mut HashSet<PathBuf>,
+) {
+    for path in queueable_non_cue {
+        if !is_audio_file_path(path) {
+            continue;
+        }
+        let Some(parent) = path.parent().map(queue_path_key) else {
+            continue;
+        };
+        if parent == parent_key {
+            suppressed_audio_keys.insert(queue_path_key(path));
+        }
+    }
+}
+
+fn first_resolved_member_audio_path_with_quote(parts: &[SyntheticCueAlbumPart]) -> Option<PathBuf> {
+    for part in parts {
+        for track in &part.sheet.tracks {
+            let Some(file_ref) = track.file.as_deref() else {
+                continue;
+            };
+            let Some(parent) = part.cue_path.parent() else {
+                continue;
+            };
+            let resolved = match resolve_cue_file_reference_for_queue(parent, file_ref) {
+                CueReferenceResolution::Resolved(path) => path,
+                CueReferenceResolution::Missing | CueReferenceResolution::Ambiguous(_) => continue,
+            };
+            if resolved.display().to_string().contains('"') {
+                return Some(resolved);
+            }
+        }
+    }
+    None
 }
 
 fn generate_queue_synthetic_cue_album(parts: &[SyntheticCueAlbumPart]) -> Result<String, String> {
@@ -2264,6 +2328,151 @@ FILE "side_b.flac" WAVE
         assert!(err.message.contains("at most 99"));
     }
 
+
+    #[test]
+    fn folder_expansion_preserves_unrelated_work_when_one_synthetic_group_fails_closed() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let bad = td.path().join("bad-disc");
+        let good = td.path().join("good-disc");
+        std::fs::create_dir_all(&bad).expect("bad dir");
+        std::fs::create_dir_all(&good).expect("good dir");
+        let standalone = td.path().join("standalone.flac");
+        std::fs::write(&standalone, b"not real flac").unwrap();
+
+        let bad_a = bad.join("side_a.flac");
+        let bad_b = bad.join("side_b.flac");
+        std::fs::write(&bad_a, b"not real flac").unwrap();
+        std::fs::write(&bad_b, b"not real flac").unwrap();
+        fn many_track_cue(title: &str, image: &str, first: usize, count: usize) -> String {
+            let mut text = format!("TITLE \"{title}\"\nFILE \"{image}\" WAVE\n");
+            for n in first..first + count {
+                text.push_str(&format!("  TRACK {:02} AUDIO\n    INDEX 01 {:02}:00:00\n", ((n - first) % 99) + 1, n));
+            }
+            text
+        }
+        std::fs::write(bad.join("side_a.cue"), many_track_cue("Bad Side A", "side_a.flac", 0, 50)).unwrap();
+        std::fs::write(bad.join("side_b.cue"), many_track_cue("Bad Side B", "side_b.flac", 50, 50)).unwrap();
+
+        let (good_cue_a, good_audio_a) = write_queue_split_cue_part(
+            &good,
+            "side_a",
+            "Good Side A",
+            2,
+            "",
+            false,
+            false,
+        );
+        let (good_cue_b, good_audio_b) = write_queue_split_cue_part(
+            &good,
+            "side_b",
+            "Good Side B",
+            2,
+            "",
+            false,
+            false,
+        );
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+
+        assert!(
+            expanded.expansion_errors.iter().any(|err| err.contains("at most 99")),
+            "failed synthetic group must be reported as a planner warning/error, got {:?}",
+            expanded.expansion_errors
+        );
+        assert_eq!(
+            expanded.synthetic_cue_artifacts.len(),
+            1,
+            "the unrelated valid split-CUE group must still produce its synthetic album artifact"
+        );
+        let synthetic = expanded.synthetic_cue_artifacts.iter().next().unwrap().clone();
+        assert!(path_list_contains(&expanded.paths, &synthetic));
+        assert!(path_list_contains(&expanded.paths, &standalone));
+        for blocked in [bad.join("side_a.cue"), bad.join("side_b.cue"), bad_a, bad_b] {
+            assert!(
+                !path_list_contains(&expanded.paths, &blocked),
+                "fail-closed group member must not leak into the partial queue: {}",
+                blocked.display()
+            );
+        }
+        for merged_member in [good_cue_a, good_cue_b, good_audio_a, good_audio_b] {
+            assert!(
+                !path_list_contains(&expanded.paths, &merged_member),
+                "successfully merged group must not also queue member path {}",
+                merged_member.display()
+            );
+        }
+        cleanup_synthetic_cue_artifacts(&expanded.synthetic_cue_artifacts);
+    }
+
+
+    #[test]
+    fn folder_expansion_preserves_unrelated_per_cue_fallback_when_one_synthetic_group_fails_closed() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let bad = td.path().join("bad-disc");
+        let fallback_parent = td.path().join("12\" Mixes");
+        std::fs::create_dir_all(&bad).expect("bad dir");
+        if let Err(err) = std::fs::create_dir(&fallback_parent) {
+            eprintln!("skipping quoted-path fixture: {err}");
+            return;
+        }
+
+        let bad_a = bad.join("side_a.flac");
+        let bad_b = bad.join("side_b.flac");
+        std::fs::write(&bad_a, b"not real flac").unwrap();
+        std::fs::write(&bad_b, b"not real flac").unwrap();
+        fn many_track_cue(title: &str, image: &str, first: usize, count: usize) -> String {
+            let mut text = format!("TITLE \"{title}\"\nFILE \"{image}\" WAVE\n");
+            for n in first..first + count {
+                text.push_str(&format!("  TRACK {:02} AUDIO\n    INDEX 01 {:02}:00:00\n", ((n - first) % 99) + 1, n));
+            }
+            text
+        }
+        std::fs::write(bad.join("side_a.cue"), many_track_cue("Bad Side A", "side_a.flac", 0, 50)).unwrap();
+        std::fs::write(bad.join("side_b.cue"), many_track_cue("Bad Side B", "side_b.flac", 50, 50)).unwrap();
+
+        let fallback_a = fallback_parent.join("side_a.flac");
+        let fallback_b = fallback_parent.join("side_b.flac");
+        let fallback_cue_a = fallback_parent.join("side_a.cue");
+        let fallback_cue_b = fallback_parent.join("side_b.cue");
+        std::fs::write(&fallback_a, b"not real flac").unwrap();
+        std::fs::write(&fallback_b, b"not real flac").unwrap();
+        for (cue, image, title) in [
+            (&fallback_cue_a, "side_a.flac", "Fallback Side A"),
+            (&fallback_cue_b, "side_b.flac", "Fallback Side B"),
+        ] {
+            std::fs::write(
+                cue,
+                format!(
+                    r#"TITLE "{title}"
+FILE "{image}" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 01:00:00
+"#,
+                ),
+            )
+            .unwrap();
+        }
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+
+        assert!(expanded.synthetic_cue_artifacts.is_empty());
+        assert!(expanded.expansion_errors.iter().any(|err| err.contains("at most 99")));
+        assert!(expanded.expansion_errors.iter().any(|err| err.contains("double quote")));
+        assert!(path_list_contains(&expanded.paths, &fallback_cue_a));
+        assert!(path_list_contains(&expanded.paths, &fallback_cue_b));
+        assert!(!path_list_contains(&expanded.paths, &fallback_a));
+        assert!(!path_list_contains(&expanded.paths, &fallback_b));
+        for blocked in [bad.join("side_a.cue"), bad.join("side_b.cue"), bad_a, bad_b] {
+            assert!(
+                !path_list_contains(&expanded.paths, &blocked),
+                "failed group member must not leak into the partial queue: {}",
+                blocked.display()
+            );
+        }
+    }
+
     #[test]
     fn folder_expansion_fails_closed_when_merged_cue_group_cannot_be_parsed() {
         let td = tempfile::tempdir().expect("tempdir");
@@ -2289,6 +2498,53 @@ FILE "side_a.flac" WAVE
         let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
         assert!(expanded.paths.is_empty(), "parse failure must not fall back to side CUEs or raw images: {:?}", expanded.paths);
         assert!(expanded.expansion_errors.iter().any(|err| err.contains("failed to parse") || err.contains("failed to analyze")), "expected a parse/analyze error, got {:?}", expanded.expansion_errors);
+    }
+
+
+    #[test]
+    fn folder_expansion_declines_synthetic_merge_when_member_image_absolute_path_contains_quote() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let quoted = td.path().join("12\" Mixes");
+        if let Err(err) = std::fs::create_dir(&quoted) {
+            eprintln!("skipping quoted-path fixture: {err}");
+            return;
+        }
+        let a = quoted.join("side_a.flac");
+        let b = quoted.join("side_b.flac");
+        let cue_a = quoted.join("side_a.cue");
+        let cue_b = quoted.join("side_b.cue");
+        std::fs::write(&a, b"not real flac").unwrap();
+        std::fs::write(&b, b"not real flac").unwrap();
+        for (cue, image, title) in [(&cue_a, "side_a.flac", "Album Side A"), (&cue_b, "side_b.flac", "Album Side B")] {
+            std::fs::write(
+                cue,
+                format!(
+                    r#"TITLE "{title}"
+FILE "{image}" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 01:00:00
+"#,
+                ),
+            )
+            .unwrap();
+        }
+
+        let expanded = expand_paths_to_audio_with_metadata(&[quoted.clone()]);
+        assert!(
+            expanded.synthetic_cue_artifacts.is_empty(),
+            "quoted absolute member paths cannot be represented safely in a generated FILE line"
+        );
+        assert!(
+            expanded.expansion_errors.iter().any(|err| err.contains("double quote") && err.contains("Falling back to per-CUE")),
+            "expected quoted-path fallback warning, got {:?}",
+            expanded.expansion_errors
+        );
+        assert!(path_list_contains(&expanded.paths, &cue_a), "side A CUE should survive fallback");
+        assert!(path_list_contains(&expanded.paths, &cue_b), "side B CUE should survive fallback");
+        assert!(!path_list_contains(&expanded.paths, &a), "member image should stay suppressed by its side CUE");
+        assert!(!path_list_contains(&expanded.paths, &b), "member image should stay suppressed by its side CUE");
     }
 
     #[test]

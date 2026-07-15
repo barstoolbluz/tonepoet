@@ -18,6 +18,7 @@ use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tonepoet::convert::pipeline::*;
+use tonepoet::convert::queue_expansion::{cleanup_synthetic_cue_artifacts, expand_paths_to_audio_with_metadata};
 
 fn unique_root(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -38,6 +39,22 @@ fn boundary_tools_available() -> bool {
     ["ffmpeg", "ffprobe", "sox"]
         .iter()
         .all(|tool| executable_on_path(tool))
+}
+
+fn require_or_skip_boundary_tools(test_name: &str) -> bool {
+    if boundary_tools_available() {
+        return true;
+    }
+    let required = std::env::var_os("TONEPOET_REQUIRE_TOOLS")
+        .map(|value| value != "0" && !value.is_empty())
+        .unwrap_or(false);
+    if required {
+        panic!(
+            "{test_name}: ffmpeg, ffprobe, and sox are required because TONEPOET_REQUIRE_TOOLS=1"
+        );
+    }
+    eprintln!("skipping {test_name}; ffmpeg, ffprobe, and sox are required");
+    false
 }
 
 /// Encode a real FLAC image containing `duration_secs` of sine audio so the
@@ -158,6 +175,37 @@ fn visible_dirs(root: &Path) -> Vec<String> {
     dirs
 }
 
+fn assert_album_dir_contains_exact_audio_files_and_no_subdirs(album_dir: &Path, expected: usize) {
+    let entries: Vec<_> = fs::read_dir(album_dir)
+        .unwrap_or_else(|err| panic!("read album directory {}: {err}", album_dir.display()))
+        .map(|entry| entry.expect("album directory entry").path())
+        .collect();
+    let subdirs: Vec<_> = entries.iter().filter(|path| path.is_dir()).collect();
+    assert!(
+        subdirs.is_empty(),
+        "published album directory must not contain subdirectories: {:?}",
+        subdirs
+    );
+    let audio_exts = ["flac", "wav", "wv", "ape", "mp3", "m4a", "ogg", "opus", "aif", "aiff"];
+    let audio_files: Vec<_> = entries
+        .iter()
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| audio_exts.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+                    .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        audio_files.len(),
+        expected,
+        "published album directory must contain exactly {expected} audio files: {:?}",
+        audio_files
+    );
+}
+
 fn count_files_matching(root: &Path, predicate: impl Fn(&Path) -> bool) -> usize {
     let mut count = 0;
     let mut stack = vec![root.to_path_buf()];
@@ -206,9 +254,8 @@ fn published_audio_entries(published: &PublishedAlbum) -> Vec<&PublishedEntry> {
 }
 
 #[tokio::test]
-async fn merged_synthetic_cue_publishes_one_album_boundary() {
-    if !boundary_tools_available() {
-        eprintln!("skipping unified synthetic-CUE output boundary test; ffmpeg, ffprobe, and sox are required");
+async fn folder_expansion_generated_synthetic_cue_publishes_one_album_boundary() {
+    if !require_or_skip_boundary_tools("folder_expansion_generated_synthetic_cue_publishes_one_album_boundary") {
         return;
     }
 
@@ -221,8 +268,8 @@ async fn merged_synthetic_cue_publishes_one_album_boundary() {
     create_sine_flac(&source_dir.join("side_b.flac"), 4.0);
     fs::write(source_dir.join("rip.log"), b"companion log").expect("companion");
 
-    let synthetic = r#"PERFORMER "Artist"
-TITLE "The Album"
+    let side_a = r#"PERFORMER "Artist"
+TITLE "The Album Side A"
 FILE "side_a.flac" WAVE
   TRACK 01 AUDIO
     TITLE "A1"
@@ -230,18 +277,44 @@ FILE "side_a.flac" WAVE
   TRACK 02 AUDIO
     TITLE "A2"
     INDEX 01 00:02:00
+"#;
+    let side_b = r#"PERFORMER "Artist"
+TITLE "The Album Side B"
 FILE "side_b.flac" WAVE
-  TRACK 03 AUDIO
+  TRACK 01 AUDIO
     TITLE "B1"
     INDEX 01 00:00:00
-  TRACK 04 AUDIO
+  TRACK 02 AUDIO
     TITLE "B2"
     INDEX 01 00:02:00
 "#;
-    let cue_path = source_dir.join("synthetic-merged.cue");
-    fs::write(&cue_path, synthetic).expect("synthetic cue");
+    fs::write(source_dir.join("side_a.cue"), side_a).expect("side A cue");
+    fs::write(source_dir.join("side_b.cue"), side_b).expect("side B cue");
 
-    let req = base_request(cue_path, output_root.clone(), log_root.clone());
+    let expansion = expand_paths_to_audio_with_metadata(&[source_dir.clone()]);
+    assert_eq!(expansion.expansion_errors, Vec::<String>::new());
+    assert_eq!(
+        expansion.paths.len(),
+        1,
+        "folder expansion must produce exactly one planner-generated synthetic CUE"
+    );
+    assert_eq!(expansion.synthetic_cue_artifacts.len(), 1);
+    let cue_path = expansion.paths[0].clone();
+    assert!(
+        expansion.synthetic_cue_artifacts.contains(&cue_path),
+        "planner-generated synthetic CUE must be reported as an owned artifact"
+    );
+    assert!(cue_path.exists(), "planner-generated synthetic CUE must exist before pipeline run");
+    fs::write(
+        cue_path
+            .parent()
+            .expect("planner-generated synthetic CUE has an owner directory")
+            .join("rip.log"),
+        b"companion log",
+    )
+    .expect("synthetic companion log");
+
+    let req = base_request(cue_path.clone(), output_root.clone(), log_root.clone());
     let runner = RealToolRunner::new(HashMap::new());
     let reporter = RecordingReporter::new();
     let cancel = CancellationToken::new();
@@ -254,6 +327,7 @@ FILE "side_b.flac" WAVE
     assert_eq!(published.album_dir, output_root.join("The Album"));
     assert!(!output_root.join("The Album Side A").exists());
     assert!(!output_root.join("The Album Side B").exists());
+    assert_album_dir_contains_exact_audio_files_and_no_subdirs(&published.album_dir, 4);
 
     let audio_entries = published_audio_entries(published);
     assert_eq!(audio_entries.len(), 4, "one merged album publishes four audio tracks");
@@ -286,13 +360,13 @@ FILE "side_b.flac" WAVE
         .count();
     assert_eq!(terminal_events, 1, "one album-level terminal flow");
 
+    cleanup_synthetic_cue_artifacts(&expansion.synthetic_cue_artifacts);
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn explicit_single_cue_bypass_keeps_side_album_identity() {
-    if !boundary_tools_available() {
-        eprintln!("skipping explicit single-CUE bypass boundary test; ffmpeg, ffprobe, and sox are required");
+    if !require_or_skip_boundary_tools("explicit_single_cue_bypass_keeps_side_album_identity") {
         return;
     }
 
@@ -329,6 +403,7 @@ FILE "side_a.flac" WAVE
     assert_eq!(visible_dirs(&output_root), vec!["The Album Side A".to_string()]);
     assert_eq!(published.album_dir, output_root.join("The Album Side A"));
     assert!(!output_root.join("The Album").exists());
+    assert_album_dir_contains_exact_audio_files_and_no_subdirs(&published.album_dir, 2);
     assert_eq!(published_audio_entries(published).len(), 2);
     assert_eq!(published_entries_named(published, "conversion.log"), 1);
 

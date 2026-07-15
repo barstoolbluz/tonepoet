@@ -4374,13 +4374,24 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 result,
             );
         }
+        AppMessage::InEditorSplitCueMusicBrainzInfoComplete { request, result } => {
+            super::command::handle_in_editor_split_cue_musicbrainz_info_complete(
+                app,
+                tx,
+                *request,
+                result,
+            );
+        }
         AppMessage::TagsMbApplyReady {
             releases,
             selected,
             paths,
+            editor_session,
             decision,
         } => {
-            apply_editor_with_mb_release_decision(app, tx, releases, selected, paths, decision);
+            apply_editor_with_mb_release_decision_guarded(
+                app, tx, releases, selected, paths, editor_session, decision,
+            );
         }
         AppMessage::MbDetailPrefetchComplete { release_id, result } => {
             // Stamp the in-memory cache if the picker is still open,
@@ -4949,7 +4960,14 @@ fn handle_mb_toc_outcome(
             }
         },
         1 => {
-            open_editor_with_mb_release(app, tx, outcome.releases, 0, ctx.paths);
+            open_editor_with_mb_release_guarded(
+                app,
+                tx,
+                outcome.releases,
+                0,
+                ctx.paths,
+                ctx.editor_session,
+            );
             if let Some(note) = stub_note {
                 app.set_status(format!(":tags-mb: {}", note));
             }
@@ -4996,7 +5014,14 @@ fn handle_mb_search_outcome(
             ));
         }
         1 => {
-            open_editor_with_mb_release(app, tx, outcome.releases, 0, ctx.paths);
+            open_editor_with_mb_release_guarded(
+                app,
+                tx,
+                outcome.releases,
+                0,
+                ctx.paths,
+                ctx.editor_session,
+            );
         }
         n => {
             open_mb_select_picker(app, tx, outcome.releases, ctx, n, Some(query_label));
@@ -5136,6 +5161,13 @@ fn open_mb_select_picker(
             app.set_status(format!(":tags-mb: editor closed during lookup; {}", detail));
             return;
         };
+        if !metadata_editor_matches_tags_mb_context(&state_owned, &ctx.paths, ctx.editor_session) {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            app.set_status(
+                ":tags-mb: metadata editor changed since lookup; rerun".to_string(),
+            );
+            return;
+        }
         app.pending_metadata_editor = Some(state_owned);
     }
     let status = match query_label {
@@ -5149,7 +5181,11 @@ fn open_mb_select_picker(
         ),
     };
     app.set_status(status);
-    let state = super::app::MbSelectState::new(releases, ctx.paths);
+    let state = super::app::MbSelectState::new_with_editor_session(
+        releases,
+        ctx.paths,
+        ctx.editor_session,
+    );
     if let Some(top) = state.releases.first() {
         let cached_body = app
             .db
@@ -5212,6 +5248,31 @@ fn metadata_editor_paths_match_tags_mb_context(
     if state.active_surface().paths == paths {
         return true;
     }
+
+    // Unified synthetic split-CUE album lookups intentionally carry one audio
+    // path per CUE track, because split-CUE MusicBrainz matching and apply are
+    // positional by track.  The editor surface itself is file-dimensioned
+    // (`[side_a, side_b]`), so comparing only `active_surface().paths` rejects
+    // valid completions for two-image / N-track albums as stale.  Match the
+    // completion against the row-dimension source vector that initiated the
+    // lookup instead.
+    if let Some(sheet) = state.active_surface().cue_album_synthetic_sheet.as_ref() {
+        let track_paths: Vec<std::path::PathBuf> = sheet
+            .track_sources
+            .iter()
+            .map(|source| source.audio_path.clone())
+            .collect();
+        if !track_paths.is_empty() && track_paths == paths {
+            return true;
+        }
+
+        // Defensive compatibility: a caller that still carries the unified
+        // file-dimension vector should also match the same session.
+        if sheet.audio_paths == paths {
+            return true;
+        }
+    }
+
     if state.presentation_tabs.len() < 2 {
         return false;
     }
@@ -5229,6 +5290,47 @@ fn metadata_editor_paths_match_tags_mb_context(
         }
     }
     expanded == paths
+}
+
+
+fn metadata_editor_matches_session_guard(
+    state: &super::app::MetadataEditorState,
+    guard: super::message::MetadataEditorSessionGuard,
+) -> bool {
+    let details = &state.active_surface().technical_details;
+    details.session_id == guard.session_id && details.save_generation == guard.save_generation
+}
+
+fn metadata_editor_matches_tags_mb_context(
+    state: &super::app::MetadataEditorState,
+    paths: &[std::path::PathBuf],
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
+) -> bool {
+    if let Some(guard) = editor_session {
+        return metadata_editor_matches_session_guard(state, guard);
+    }
+    metadata_editor_paths_match_tags_mb_context(state, paths)
+}
+
+fn metadata_editor_can_transition_to_split_cue_target(
+    state: &super::app::MetadataEditorState,
+    paths: &[std::path::PathBuf],
+) -> bool {
+    // Legacy single-source-folder `:tags-mb` starts from an ordinary
+    // one-audio-file metadata editor, discovers sibling side CUEs on a
+    // blocking worker, and then intentionally transitions to the expanded
+    // split-CUE target.  The source editor session is the stale-work guard;
+    // the target path vector is allowed to differ from the source surface.
+    if paths.is_empty() || paths.len() <= 1 {
+        return false;
+    }
+    let surface = state.active_surface();
+    state.presentation_tabs.is_empty()
+        && surface.cue_album_synthetic_sheet.is_none()
+        && surface.sacd_area_kind.is_none()
+        && surface.dvdv_track_durations.is_none()
+        && surface.bluray_chapter_durations.is_none()
+        && surface.paths.len() == 1
 }
 
 /// Spawn a Phase B-4 prefetch task for an MbSelect candidate. The task
@@ -5291,12 +5393,24 @@ pub(super) fn spawn_mb_detail_prefetch(
 /// Used by both single-match `:tags-mb` (releases.len() == 1) and
 /// the post-MbSelect commit path (releases.len() >= 1, with selected
 /// being whatever the user picked).
+#[cfg(test)]
 pub(super) fn open_editor_with_mb_release(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     releases: Vec<super::musicbrainz::MbRelease>,
     selected: usize,
     paths: Vec<std::path::PathBuf>,
+) {
+    open_editor_with_mb_release_guarded(app, tx, releases, selected, paths, None)
+}
+
+pub(super) fn open_editor_with_mb_release_guarded(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    releases: Vec<super::musicbrainz::MbRelease>,
+    selected: usize,
+    paths: Vec<std::path::PathBuf>,
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
 ) {
     let Some(release) = releases.get(selected) else {
         app.set_status(":tags-mb: invalid release index".to_string());
@@ -5334,6 +5448,7 @@ pub(super) fn open_editor_with_mb_release(
                         releases,
                         selected,
                         paths,
+                        editor_session,
                         decision,
                     })
                     .await;
@@ -5347,12 +5462,13 @@ pub(super) fn open_editor_with_mb_release(
         app.set_status(
             ":tags-mb: async verifier unavailable; applying album-level tags only".to_string(),
         );
-        apply_editor_with_mb_release_decision(
+        apply_editor_with_mb_release_decision_guarded(
             app,
             tx,
             releases,
             selected,
             paths,
+            editor_session,
             super::musicbrainz::PerTrackDecision {
                 per_track_populate: false,
                 skip_reason: Some(
@@ -5363,22 +5479,24 @@ pub(super) fn open_editor_with_mb_release(
         return;
     }
 
-    apply_editor_with_mb_release_decision(
+    apply_editor_with_mb_release_decision_guarded(
         app,
         tx,
         releases,
         selected,
         paths,
+        editor_session,
         super::musicbrainz::PerTrackDecision::default(),
     );
 }
 
-pub(super) fn apply_editor_with_mb_release_decision(
+pub(super) fn apply_editor_with_mb_release_decision_guarded(
     app: &mut AppState,
     _tx: &mpsc::Sender<AppMessage>,
     releases: Vec<super::musicbrainz::MbRelease>,
     selected: usize,
     paths: Vec<std::path::PathBuf>,
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
     decision: super::musicbrainz::PerTrackDecision,
 ) {
     let Some(release) = releases.get(selected) else {
@@ -5396,20 +5514,77 @@ pub(super) fn apply_editor_with_mb_release_decision(
     //   `active_overlay` because the dispatch deliberately left it
     //   there during the async wait to suppress auto-restore from
     //   the command-input / context-menu wrappers.
-    let (mut state, mut split_cue_mb_populated) = if let Some(s) = take_metadata_editor(app) {
-        (s, false)
+    let (mut state, mut split_cue_mb_populated, source_session_validated) = if let Some(s) = take_metadata_editor(app) {
+        if let Some(guard) = editor_session {
+            if !metadata_editor_matches_session_guard(&s, guard) {
+                app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                app.set_status(
+                    ":tags-mb: metadata editor changed since lookup; rerun".to_string(),
+                );
+                return;
+            }
+            if metadata_editor_paths_match_tags_mb_context(&s, &paths) {
+                (s, false, true)
+            } else if metadata_editor_can_transition_to_split_cue_target(&s, &paths) {
+                match super::keybindings::build_metadata_editor_for_cue_surfaces_with_mb_release(
+                    app,
+                    &paths,
+                    release,
+                ) {
+                    Ok(Some(state)) => (state, true, true),
+                    Ok(None) => {
+                        app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                        app.set_status(
+                            ":tags-mb: could not open split CUE target editor; rerun from Browse"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                        app.set_status(format!(
+                            ":tags-mb: could not open split CUE editor: {}",
+                            err
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                app.set_status(
+                    ":tags-mb: metadata editor target changed since lookup; rerun"
+                        .to_string(),
+                );
+                return;
+            }
+        } else {
+            if !metadata_editor_paths_match_tags_mb_context(&s, &paths) {
+                app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                app.set_status(
+                    ":tags-mb: metadata editor changed since lookup; rerun".to_string(),
+                );
+                return;
+            }
+            (s, false, false)
+        }
     } else {
+        if editor_session.is_some() {
+            app.set_status(
+                ":tags-mb: editor closed during lookup; rerun".to_string(),
+            );
+            return;
+        }
         match super::keybindings::build_metadata_editor_for_cue_surfaces_with_mb_release(
             app,
             &paths,
             release,
         ) {
-            Ok(Some(state)) => (state, true),
+            Ok(Some(state)) => (state, true, false),
             Ok(None) => {
                 super::keybindings::open_metadata_editor(app);
                 let prior = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
                 match prior {
-                    ActiveOverlay::MetadataEditor(state) => (state, false),
+                    ActiveOverlay::MetadataEditor(state) => (state, false, false),
                     other => {
                         app.active_overlay = other;
                         return;
@@ -5423,8 +5598,8 @@ pub(super) fn apply_editor_with_mb_release_decision(
         }
     };
 
-    if !metadata_editor_paths_match_tags_mb_context(&state, &paths) {
-        app.set_status(":tags-mb: selection changed since lookup; rerun".to_string());
+    if !source_session_validated && !metadata_editor_matches_tags_mb_context(&state, &paths, editor_session) {
+        app.set_status(":tags-mb: metadata editor changed since lookup; rerun".to_string());
         app.active_overlay = ActiveOverlay::MetadataEditor(state);
         return;
     }
@@ -6264,6 +6439,129 @@ mod musicbrainz_completion_dispatch_tests {
     }
 
 
+    fn fixture_tool_available(tool: &str) -> bool {
+        std::process::Command::new(tool)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn fixture_cue(stem: &str, album_title: &str, side_prefix: &str, n_tracks: usize) -> String {
+        let mut cue = format!(
+            "PERFORMER \"Pink Floyd\"\nTITLE \"{album_title}\"\nFILE \"{stem}.flac\" WAVE\n"
+        );
+        for track in 1..=n_tracks {
+            let total_seconds = (track - 1) * 30;
+            let minutes = total_seconds / 60;
+            let seconds = total_seconds % 60;
+            cue.push_str(&format!(
+                "  TRACK {track:02} AUDIO\n    TITLE \"{side_prefix} Track {track}\"\n    INDEX 01 {minutes:02}:{seconds:02}:00\n"
+            ));
+        }
+        cue
+    }
+
+    fn dsotm_release() -> crate::tui::musicbrainz::MbRelease {
+        crate::tui::musicbrainz::MbRelease {
+            release_id: "mb-dsotm".to_string(),
+            title: "The Dark Side Of The Moon".to_string(),
+            artist: "Pink Floyd".to_string(),
+            disc_count: 1,
+            tracks: (1..=10)
+                .map(|position| crate::tui::musicbrainz::MbTrack {
+                    position,
+                    title: format!("MB Track {position}"),
+                    artist: "Pink Floyd".to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn dsotm_unified_editor_with_track_sources(
+    ) -> Option<(tempfile::TempDir, Box<MetadataEditorState>, Vec<std::path::PathBuf>)> {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping unified MusicBrainz completion regression: ffmpeg unavailable");
+            return None;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dsotm");
+        std::fs::create_dir_all(&album).expect("album dir");
+        for stem in ["tdsotm_a", "tdsotm_b"] {
+            let image = album.join(format!("{stem}.flac"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=44100:duration=1",
+                    "-c:a",
+                    "flac",
+                ])
+                .arg(&image)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("ffmpeg fixture");
+            assert!(status.success(), "ffmpeg fixture failed for {}", image.display());
+        }
+        std::fs::write(
+            album.join("tdsotm_a.cue"),
+            fixture_cue("tdsotm_a", "The Dark Side Of The Moon (Side A)", "A", 5),
+        )
+        .expect("side a cue");
+        std::fs::write(
+            album.join("tdsotm_b.cue"),
+            fixture_cue("tdsotm_b", "The Dark Side Of The Moon (Side B)", "B", 5),
+        )
+        .expect("side b cue");
+
+        let mut builder_app = AppState::new_for_test(TonepoetConfig::default());
+        let state = super::super::keybindings::build_metadata_editor_for_cue_surfaces_with_mb_release(
+            &mut builder_app,
+            &[album],
+            &dsotm_release(),
+        )
+        .expect("production unified CUE builder should not fail")
+        .expect("DSOTM fixture should produce a unified CUE surface");
+        assert!(
+            state.presentation_tabs.is_empty(),
+            "unified fixture must use the production single-surface model"
+        );
+        let sheet = state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("production builder must attach a unified synthetic sheet");
+        assert_eq!(sheet.track_sources.len(), 10);
+        let track_paths: Vec<_> = sheet
+            .track_sources
+            .iter()
+            .map(|source| source.audio_path.clone())
+            .collect();
+        Some((temp, state, track_paths))
+    }
+
+
+
+    fn single_source_file_editor() -> Box<MetadataEditorState> {
+        Box::new(MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/split-cue-side-a.flac")],
+            vec![tag("TITLE", "Side A", 1)],
+            vec!["Side A".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        ))
+    }
+
     fn release(id: &str, title: &str) -> crate::tui::musicbrainz::MbRelease {
         crate::tui::musicbrainz::MbRelease {
             release_id: id.to_string(),
@@ -6297,6 +6595,30 @@ mod musicbrainz_completion_dispatch_tests {
             paths,
             editor_park,
             fallback_seed: None,
+            editor_session: None,
+        }
+    }
+
+    fn session_guard_for(
+        state: &MetadataEditorState,
+    ) -> crate::tui::message::MetadataEditorSessionGuard {
+        let details = &state.active_surface().technical_details;
+        crate::tui::message::MetadataEditorSessionGuard {
+            session_id: details.session_id,
+            save_generation: details.save_generation,
+        }
+    }
+
+    fn ctx_for_session(
+        paths: Vec<std::path::PathBuf>,
+        editor_park: bool,
+        editor_session: crate::tui::message::MetadataEditorSessionGuard,
+    ) -> crate::tui::message::TagsMbContext {
+        crate::tui::message::TagsMbContext {
+            paths,
+            editor_park,
+            fallback_seed: None,
+            editor_session: Some(editor_session),
         }
     }
 
@@ -6435,6 +6757,189 @@ mod musicbrainz_completion_dispatch_tests {
         assert_eq!(state.presentation_tabs.len(), 2);
         assert_eq!(state.active_tab, 0);
         assert!(app.pending_metadata_editor.is_some());
+    }
+
+    #[tokio::test]
+    async fn unified_track_dimension_paths_match_live_editor_completion_picker() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let tx = tx();
+        let Some((_fixture, editor, track_paths)) = dsotm_unified_editor_with_track_sources() else {
+            return;
+        };
+        let guard = session_guard_for(&editor);
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+
+        handle_message(
+            &mut app,
+            AppMessage::TagsFromMbComplete {
+                outcome: crate::tui::message::MbOutcome::Toc {
+                    outcome: Ok(lookup_outcome(vec![
+                        release("candidate-a", "Candidate A"),
+                        release("candidate-b", "Candidate B"),
+                    ])),
+                },
+                ctx: ctx_for_session(track_paths.clone(), true, guard),
+            },
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MbSelect(state) => {
+                assert_eq!(state.releases.len(), 2);
+                assert_eq!(state.paths, track_paths);
+                assert_eq!(state.editor_session, Some(guard));
+            }
+            other => panic!(
+                "valid unified track-dimension completion should open picker, got {:?}",
+                other
+            ),
+        }
+        assert!(
+            app.pending_metadata_editor.is_some(),
+            "live unified editor should be parked while the picker is open"
+        );
+    }
+
+    #[test]
+    fn unified_track_dimension_paths_match_live_editor_direct_apply() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let tx = tx();
+        let Some((_fixture, editor, track_paths)) = dsotm_unified_editor_with_track_sources() else {
+            return;
+        };
+        let guard = session_guard_for(&editor);
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+
+        apply_editor_with_mb_release_decision_guarded(
+            &mut app,
+            &tx,
+            vec![release("candidate-a", "Candidate A")],
+            0,
+            track_paths,
+            Some(guard),
+            crate::tui::musicbrainz::PerTrackDecision::default(),
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert_eq!(session_guard_for(state).session_id, guard.session_id);
+            }
+            other => panic!(
+                "valid unified track-dimension direct apply should keep editor active, got {:?}",
+                other
+            ),
+        }
+        let status = app.status_message.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status.unwrap_or_default().contains(":tags-mb: applied"),
+            "valid unified direct apply must not be rejected as stale, got {:?}",
+            status
+        );
+    }
+
+    #[tokio::test]
+    async fn single_source_folder_projection_parks_source_editor_with_target_paths() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let tx = tx();
+        let editor = single_source_file_editor();
+        let guard = session_guard_for(&editor);
+        let source_paths = editor.active_surface().paths.clone();
+        let target_paths = vec![
+            source_paths[0].clone(),
+            source_paths[0].clone(),
+            std::path::PathBuf::from("/tmp/split-cue-side-b.flac"),
+            std::path::PathBuf::from("/tmp/split-cue-side-b.flac"),
+        ];
+        assert!(
+            !metadata_editor_paths_match_tags_mb_context(&editor, &target_paths),
+            "the legacy source editor must not be required to have the expanded target paths"
+        );
+        assert!(
+            metadata_editor_can_transition_to_split_cue_target(&editor, &target_paths),
+            "one-file source editors should be eligible for the split-CUE target transition"
+        );
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+
+        handle_message(
+            &mut app,
+            AppMessage::TagsFromMbComplete {
+                outcome: crate::tui::message::MbOutcome::Toc {
+                    outcome: Ok(lookup_outcome(vec![
+                        release("candidate-a", "Candidate A"),
+                        release("candidate-b", "Candidate B"),
+                    ])),
+                },
+                ctx: ctx_for_session(target_paths.clone(), true, guard),
+            },
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MbSelect(state) => {
+                assert_eq!(state.paths, target_paths);
+                assert_eq!(state.editor_session, Some(guard));
+            }
+            other => panic!(
+                "valid source-folder transition should open the picker, got {:?}",
+                other
+            ),
+        }
+        let parked = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("source editor should be parked behind the picker");
+        assert_eq!(session_guard_for(parked), guard);
+    }
+
+    #[test]
+    fn stale_editor_session_completion_does_not_mutate_reopened_editor() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let tx = tx();
+        let old_editor = editor_with_tabs(0, 2);
+        let editor_paths = old_editor.active_surface().paths.clone();
+        let old_guard = session_guard_for(&old_editor);
+
+        let reopened_editor = editor_with_tabs(0, 2);
+        let reopened_guard = session_guard_for(&reopened_editor);
+        assert_ne!(
+            old_guard.session_id, reopened_guard.session_id,
+            "reopened metadata editors must have distinct async session ids"
+        );
+        app.active_overlay = ActiveOverlay::MetadataEditor(reopened_editor);
+
+        handle_message(
+            &mut app,
+            AppMessage::TagsFromMbComplete {
+                outcome: crate::tui::message::MbOutcome::Toc {
+                    outcome: Ok(lookup_outcome(vec![release("", "Stale Match")])),
+                },
+                ctx: ctx_for_session(editor_paths, true, old_guard),
+            },
+            &tx,
+        );
+
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert_eq!(
+                    session_guard_for(state).session_id,
+                    reopened_guard.session_id,
+                    "stale completion must restore the current reopened editor, not replace it"
+                );
+            }
+            other => panic!("expected reopened editor to remain active, got {:?}", other),
+        }
+        assert!(
+            app.pending_metadata_editor.is_none(),
+            "stale completion must not park or populate the reopened editor"
+        );
+        let status = app.status_message.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status
+                .unwrap_or_default()
+                .contains("metadata editor changed since lookup"),
+            "stale completion should explain that the editor session changed, got {:?}",
+            status
+        );
     }
 
     #[test]
