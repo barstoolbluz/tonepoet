@@ -232,12 +232,14 @@ the writer plans work only for image B (A has no diffs), the batch
 contains only B, the all-slots check fails, row originals never
 advance, and every later `:w` plans zero writes while the surface stays
 dirty (the Alt+O-can't-close class, unrecoverable without discarding).
-Fix: track saved slots cumulatively per save generation across batches
-(e.g. per-tab set of slots whose CUESHEET original already equals the
-staged sheet counts as saved), so slot A's earlier success plus slot
-B's retry success completes the row advance. Tests: partial save then
-successful retry → rows advance, dirty clears; partial save then
-failing retry → still dirty.
+Fix: derive per-slot savedness from persisted state rather than batch
+membership — a member slot counts as saved when it appears in the
+current batch OR its CUESHEET per_file_original already equals the
+staged sheet (the previous partial save advanced it). When every slot
+satisfies that, advance the row-dim originals. Tests: partial save
+then successful retry → rows advance, dirty clears, a further `:w`
+reports "No changes to save"; partial save then failing retry → still
+dirty, rows unadvanced.
 
 ### H2 — forced cleanup irreversibly deletes LEGITIMATE tags (SEVERE)
 
@@ -252,10 +254,17 @@ bug are destroyed with no CUE copy. Fix policy: (a) always cleanable:
 MUSICBRAINZ_TRACKID / MUSICBRAINZ_RELEASETRACKID (recording/track ids
 are never legitimate whole-file album tags on a multi-track image);
 (b) ISRC / TRACKNUMBER cleanable ONLY when the value matches the F2
-pollution signature — equal to the projected per-track row value of
-that image's first track (track 1 on image A, first-track-of-image-B
-etc.); (c) MUSICBRAINZ_ARTISTID never force-cleaned. Tests: signature
-match cleans; foreign non-matching ISRC survives; ARTISTID survives.
+pollution signature. CAREFUL — the signature is indexed by MEMBER
+POSITION, not by the image's first track: the F2 bug's per-file loop
+wrote MB track (member_index + 1)'s values to member image i, so image
+A carries track 1's ISRC / TRACKNUMBER "1" and image B carries track
+2's ISRC / TRACKNUMBER "2" (verified on the user's real tree: side A
+had TRACKNUMBER 1 + track-1 ISRC). Match the whole-file value against
+row (member_index) of the unified projection — i.e. MB track position
+member_index+1 — before classifying it as pollution;
+(c) MUSICBRAINZ_ARTISTID never force-cleaned. Tests: signature match
+on BOTH member images cleans (image B's track-2-valued tags included);
+foreign non-matching ISRC survives; ARTISTID survives.
 
 ### H3 — embedded-authority accepts sheets it cannot round-trip; first save normalizes them (data loss)
 
