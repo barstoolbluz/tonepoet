@@ -31,7 +31,8 @@ hours. This round:
     `unified_cue_album_row_entries_clear_dirty_after_all_member_images_save`
     (~12900) for the unified-sheet variant.
   - The DSOTM-shaped fixture builder in src/tui/keybindings.rs tests
-    (~34690, `fixture_cue` + real ffmpeg sine FLACs + stale embedded
+    (`fixture_cue` at ~33514; the unified-surface tests that use it run
+    ~34690+, real ffmpeg sine FLACs + stale embedded
     CUESHEET written through `crate::tui::probe::write_all_tags`) — the
     canonical unified-surface integration fixture. Tests that need a
     real unified surface MUST build it through
@@ -117,7 +118,7 @@ Tests (keybindings.rs, DSOTM-shaped fixture):
 
 ## F2 — MB supplemental populate writes WRONG per-track IDs (data corruption)
 
-src/tui/musicbrainz.rs:1160 (`populate_editor_mb_supplemental_with_per_track_decision`)
+src/tui/musicbrainz.rs:1153 (`populate_editor_mb_supplemental_with_per_track_decision`)
 uses `n = state.active_surface().paths.len()` and unguarded
 `per_file_values[i]` writes (1384-1444). On a unified surface (2 paths,
 10 rows): ISRC/MUSICBRAINZ_TRACKID/RELEASETRACKID/ARTISTID entries
@@ -152,7 +153,7 @@ track-1's ID at file slot 0.
 
 ## F3 — MB apply loses ALBUM/DATE when cues lack headers
 
-src/tui/musicbrainz.rs:1902-1919: `find_or_create` for ALBUM (1907) and
+src/tui/musicbrainz.rs:1902-1919: `find_or_create` for ALBUM (1903) and
 DATE (1916) uses `n` = row count on unified surfaces. The unified
 builder only creates ALBUM/DATE at file dimension when the merged cue
 model has values (keybindings.rs:9423-9459), so cue groups without
@@ -393,7 +394,14 @@ the member infos from the sheet (cue_paths/audio_paths are stored on
 it; `collect_single_image_cue_infos_for_sources` over the audio paths
 matches the Browse path) and route through the SAME
 `dispatch_split_cue_musicbrainz_concat_or_text_fallback` the tabbed
-branch uses — concat-TOC probe first, then the album text fallback
+branch uses. REDUCER CAUTION: the existing tabbed/single-folder
+branches already call `collect_single_image_cue_infos_for_sources`
+(filesystem discovery + cue parse) directly on the reducer path
+(src/tui/command.rs:1674, 1712) — a pre-existing violation of the
+worker-only rule. Do not add a third: run the unified branch's info
+collection in a blocking worker (the Browse dispatch shape), and if
+the fix is cheap, move the two existing call sites with it; extend the
+source-scan sentinel to pin all three — concat-TOC probe first, then the album text fallback
 seeded with the merged title (`common_cue_album_title`). Never a bare
 single/concatenated-image TOC miss with no fallback. MB results then
 apply positionally through the existing unified populate
@@ -532,7 +540,7 @@ src/tui/command.rs, src/tui/musicbrainz.rs, src/tui/app.rs,
 src/tui/context_menu.rs, src/tui/event_loop.rs, src/tui/probe.rs,
 src/tui/cue_parser.rs, src/convert/mod.rs,
 src/convert/queue_expansion.rs, src/convert/split_cue_album.rs,
-src/convert/queue.rs, src/main.rs,
+src/convert/queue.rs, src/main.rs, src/tui/external_editor.rs,
 tests/unified_synthetic_cue_output_boundary.rs. Reference-only:
 src/tui/message.rs, src/tui/accuraterip.rs, src/tui/browse.rs,
 src/tui/help.rs, src/convert/classify.rs, src/convert/cue_parser.rs,
