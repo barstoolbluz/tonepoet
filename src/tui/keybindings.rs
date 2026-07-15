@@ -5965,6 +5965,42 @@ fn unified_cue_album_per_track_key_is_persistable(display_key: &str) -> bool {
     )
 }
 
+fn unified_cue_album_per_track_add_key_refusal(
+    state: &super::app::MetadataEditorState,
+    display_key: &str,
+) -> Option<String> {
+    let surface = state.active_surface();
+    let sheet = surface.cue_album_synthetic_sheet.as_ref()?;
+    let canonical = super::probe::canonical_metadata_display_key(display_key);
+    if canonical == "TRACKNUMBER" {
+        return Some(
+            "metadata editor: cannot edit per-track TRACKNUMBER on a multi-image CUE album; CUE TRACK numbers are positional and continuous"
+                .to_string(),
+        );
+    }
+    if matches!(
+        canonical.as_str(),
+        "ISRC" | "MUSICBRAINZ_TRACKID" | "MUSICBRAINZ_RELEASETRACKID"
+    ) {
+        return Some(format!(
+            "metadata editor: cannot persist per-track {} on a multi-image CUE album",
+            canonical
+        ));
+    }
+    let track_dim = sheet.track_sources.len();
+    if surface.entries.iter().any(|entry| {
+        super::probe::canonical_metadata_display_key(&entry.display_key) == canonical
+            && entry.per_file_values.len() == track_dim
+            && track_dim != surface.paths.len()
+    }) {
+        return Some(format!(
+            "metadata editor: cannot add {}; it is already managed by the unified CUE album projection",
+            canonical
+        ));
+    }
+    None
+}
+
 pub(super) fn metadata_editor_unpersistable_per_track_reason(
     state: &super::app::MetadataEditorState,
     entry_idx: usize,
@@ -6147,6 +6183,10 @@ pub(super) fn metadata_editor_open_detail(state: &mut super::app::MetadataEditor
 }
 
 
+fn cue_album_forced_cleanup_item_allowed(key: &lofty::tag::ItemKey) -> bool {
+    !matches!(key, lofty::tag::ItemKey::MusicBrainzArtistId)
+}
+
 fn metadata_editor_forced_delete_items(
     state: &super::app::MetadataEditorState,
 ) -> Vec<(usize, lofty::tag::ItemKey)> {
@@ -6158,7 +6198,14 @@ fn metadata_editor_forced_delete_items(
         );
     }
     if state.active_surface().cue_album_synthetic_sheet.is_some() {
-        forced.extend(state.active_surface().cue_album_forced_cleanup.iter().cloned());
+        forced.extend(
+            state
+                .active_surface()
+                .cue_album_forced_cleanup
+                .iter()
+                .filter(|(_, key)| cue_album_forced_cleanup_item_allowed(key))
+                .cloned(),
+        );
     }
     forced
 }
@@ -8815,11 +8862,17 @@ fn handle_metadata_editor_key(
                     recalc_dirty(state);
                 }
                 KeyCode::Enter => {
-                    let key_name = input.text.trim().to_uppercase();
+                    let key_name = super::probe::canonical_metadata_display_key(input.text.trim());
                     if !key_name.is_empty() {
                         let (writable, blocked) = metadata_editor_file_slot_counts(state);
                         if writable == 0 && blocked > 0 {
                             app.set_status("metadata editor: cannot add field — no writable files in this editor session");
+                            state.add_key_input = None;
+                            state.phase = MetadataEditorPhase::Editing;
+                            return;
+                        }
+                        if let Some(reason) = unified_cue_album_per_track_add_key_refusal(state, &key_name) {
+                            app.set_status(reason);
                             state.add_key_input = None;
                             state.phase = MetadataEditorPhase::Editing;
                             return;
@@ -9581,9 +9634,10 @@ fn cue_album_format_tag_for_audio(path: &std::path::Path) -> &'static str {
 }
 
 fn cue_album_entry_index(entries: &[super::probe::TagEntry], key: &str) -> Option<usize> {
-    entries
-        .iter()
-        .position(|entry| entry.display_key.eq_ignore_ascii_case(key))
+    let canonical_key = super::probe::canonical_metadata_display_key(key);
+    entries.iter().position(|entry| {
+        super::probe::canonical_metadata_display_key(&entry.display_key) == canonical_key
+    })
 }
 
 fn cue_album_entry_display(values: &[String]) -> (String, bool) {
@@ -9595,6 +9649,59 @@ fn cue_album_entry_display(values: &[String]) -> (String, bool) {
     }
 }
 
+fn cue_album_recompute_entry_display(entry: &mut super::probe::TagEntry) {
+    let (display, mixed) = cue_album_entry_display(&entry.per_file_values);
+    entry.value = display;
+    entry.is_mixed = mixed;
+}
+
+fn cue_album_merge_slot_values(dst: &mut Vec<String>, src: &[String]) {
+    if dst.len() < src.len() {
+        dst.resize(src.len(), String::new());
+    }
+    for (idx, value) in src.iter().enumerate() {
+        if dst[idx].trim().is_empty() && !value.trim().is_empty() {
+            dst[idx] = value.clone();
+        }
+    }
+}
+
+fn cue_album_normalize_entry_keys(entries: &mut Vec<super::probe::TagEntry>) {
+    let mut normalized = Vec::with_capacity(entries.len());
+    for mut entry in entries.drain(..) {
+        let canonical = super::probe::canonical_metadata_display_key(&entry.display_key);
+        if !canonical.is_empty() {
+            entry.display_key = canonical;
+        }
+        if let Some(idx) = cue_album_entry_index(&normalized, &entry.display_key) {
+            let existing: &mut super::probe::TagEntry = &mut normalized[idx];
+            cue_album_merge_slot_values(&mut existing.per_file_values, &entry.per_file_values);
+            cue_album_merge_slot_values(&mut existing.per_file_originals, &entry.per_file_originals);
+            if existing.original.trim().is_empty() && !entry.original.trim().is_empty() {
+                existing.original = entry.original.clone();
+            }
+            existing.is_binary |= entry.is_binary;
+            existing.mb_proposed_value = None;
+            existing.mb_proposed_per_file = None;
+            cue_album_recompute_entry_display(existing);
+        } else {
+            normalized.push(entry);
+        }
+    }
+    *entries = normalized;
+}
+
+fn cue_album_sort_entries(entries: &mut Vec<super::probe::TagEntry>) {
+    super::probe::sort_entries_standard_first_existing_only(entries);
+    let mut tail = Vec::new();
+    for key in ["CUE MERGE NOTES", "CUESHEET"] {
+        if let Some(pos) = entries.iter().position(|entry| entry.display_key.eq_ignore_ascii_case(key)) {
+            tail.push(entries.remove(pos));
+        }
+    }
+    entries.extend(tail);
+}
+
 fn cue_album_upsert_album_entry(
     entries: &mut Vec<super::probe::TagEntry>,
     display_key: &str,
@@ -9602,9 +9709,13 @@ fn cue_album_upsert_album_entry(
     value: Option<String>,
     n_paths: usize,
 ) {
-    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
-        return;
-    };
+    // Always materialize the standard album row, even when the merged cue
+    // model has no value: the plain editor presents the full standard key set
+    // as (possibly empty) rows, alias normalization + replaced-key removal
+    // would otherwise make loaded Year/Genre tags vanish with no row left to
+    // edit, and MB apply needs a file-dimensioned home to land ALBUM/DATE in
+    // (the F3 empty-header case).
+    let value = value.filter(|value| !value.trim().is_empty()).unwrap_or_default();
     let values = vec![value.clone(); n_paths];
     if let Some(idx) = cue_album_entry_index(entries, display_key) {
         let entry = &mut entries[idx];
@@ -9688,47 +9799,73 @@ fn cue_album_first_non_empty_with_divergence(
     (first, divergent)
 }
 
-fn cue_album_managed_whole_file_cleanup_key(display_key: &str) -> Option<lofty::tag::ItemKey> {
-    match display_key.to_ascii_uppercase().as_str() {
-        "TRACKNUMBER" => Some(lofty::tag::ItemKey::TrackNumber),
-        "ISRC" => Some(lofty::tag::ItemKey::Isrc),
+fn cue_album_always_cleanable_whole_file_cleanup_key(display_key: &str) -> Option<lofty::tag::ItemKey> {
+    match super::probe::canonical_metadata_display_key(display_key).as_str() {
         "MUSICBRAINZ_TRACKID" => Some(lofty::tag::ItemKey::MusicBrainzRecordingId),
         "MUSICBRAINZ_RELEASETRACKID" => Some(lofty::tag::ItemKey::MusicBrainzTrackId),
-        "MUSICBRAINZ_ARTISTID" => Some(lofty::tag::ItemKey::MusicBrainzArtistId),
         _ => None,
     }
 }
 
-fn cue_album_entry_has_value_at(entry: &super::probe::TagEntry, idx: usize) -> bool {
+fn cue_album_entry_value_at(entry: &super::probe::TagEntry, idx: usize) -> Option<&str> {
     entry
         .per_file_originals
         .get(idx)
         .or_else(|| entry.per_file_values.get(idx))
         .or_else(|| (idx == 0).then_some(&entry.original))
         .or_else(|| (idx == 0).then_some(&entry.value))
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn cue_album_f2_signature_cleanup_key(
+    entry: &super::probe::TagEntry,
+    sheet: &super::app::CueAlbumSyntheticSheet,
+    idx: usize,
+) -> Option<lofty::tag::ItemKey> {
+    let value = cue_album_entry_value_at(entry, idx)?;
+    match super::probe::canonical_metadata_display_key(&entry.display_key).as_str() {
+        "TRACKNUMBER" => {
+            let expected = (idx + 1).to_string();
+            let first = value.split('/').next().unwrap_or(value).trim();
+            (first == expected).then_some(lofty::tag::ItemKey::TrackNumber)
+        }
+        "ISRC" => sheet
+            .track_sources
+            .get(idx)
+            .and_then(|track| track.isrc.as_deref())
+            .map(str::trim)
+            .filter(|expected| !expected.is_empty() && value.eq_ignore_ascii_case(expected))
+            .map(|_| lofty::tag::ItemKey::Isrc),
+        _ => None,
+    }
 }
 
 fn cue_album_removed_key_cleanup_items(
     entry: &super::probe::TagEntry,
+    sheet: &super::app::CueAlbumSyntheticSheet,
     n_paths: usize,
 ) -> Vec<(usize, lofty::tag::ItemKey)> {
-    let Some(key) = cue_album_managed_whole_file_cleanup_key(&entry.display_key) else {
-        return Vec::new();
-    };
     if n_paths == 0 {
         return Vec::new();
     }
 
+    let always_key = cue_album_always_cleanable_whole_file_cleanup_key(&entry.display_key);
     (0..n_paths)
-        .filter(|&idx| cue_album_entry_has_value_at(entry, idx))
-        .map(|idx| (idx, key.clone()))
+        .filter_map(|idx| {
+            if let Some(key) = always_key.clone() {
+                if cue_album_entry_value_at(entry, idx).is_some() {
+                    return Some((idx, key));
+                }
+            }
+            cue_album_f2_signature_cleanup_key(entry, sheet, idx).map(|key| (idx, key))
+        })
         .collect()
 }
 
 fn cue_album_remove_replaced_keys(
     entries: &mut Vec<super::probe::TagEntry>,
+    sheet: &super::app::CueAlbumSyntheticSheet,
     n_paths: usize,
 ) -> (Vec<String>, Vec<(usize, lofty::tag::ItemKey)>) {
     let mut cuesheet_originals = Vec::new();
@@ -9746,7 +9883,6 @@ fn cue_album_remove_replaced_keys(
         "CATALOGNUMBER",
         "MUSICBRAINZ_TRACKID",
         "MUSICBRAINZ_RELEASETRACKID",
-        "MUSICBRAINZ_ARTISTID",
     ];
     let mut retained = Vec::with_capacity(entries.len());
     for entry in entries.drain(..) {
@@ -9762,7 +9898,7 @@ fn cue_album_remove_replaced_keys(
             .iter()
             .any(|key| entry.display_key.eq_ignore_ascii_case(key))
         {
-            forced_cleanup.extend(cue_album_removed_key_cleanup_items(&entry, n_paths));
+            forced_cleanup.extend(cue_album_removed_key_cleanup_items(&entry, sheet, n_paths));
             continue;
         }
         retained.push(entry);
@@ -10202,7 +10338,8 @@ fn build_metadata_editor_for_cue_surfaces(
     let merged = super::probe::read_all_tags_merged_with_metadata(&paths)
         .map_err(|err| format!("Failed to read tags for unified CUE album: {err}"))?;
     let mut entries = merged.entries;
-    let (mut cuesheet_originals, forced_cleanup) = cue_album_remove_replaced_keys(&mut entries, paths.len());
+    cue_album_normalize_entry_keys(&mut entries);
+    let (mut cuesheet_originals, forced_cleanup) = cue_album_remove_replaced_keys(&mut entries, &sheet, paths.len());
     cuesheet_originals.resize(paths.len(), String::new());
 
     let n_paths = paths.len();
@@ -10286,8 +10423,12 @@ fn build_metadata_editor_for_cue_surfaces(
 
     let generated_cue = cue_album_generate_synthetic_cuesheet(&sheet, &entries, &[])?;
     let (synthetic_cue, embedded_disagrees) = if let Some(text) = authoritative_embedded_text {
-        cuesheet_originals = vec![text.clone(); n_paths];
-        (text, false)
+        if text.trim() == generated_cue.trim() {
+            cuesheet_originals = vec![text.clone(); n_paths];
+            (text, false)
+        } else {
+            (generated_cue, true)
+        }
     } else {
         let repair = cue_album_member_sheets_need_repair(&cuesheet_originals, &generated_cue);
         (generated_cue, repair)
@@ -10318,6 +10459,7 @@ fn build_metadata_editor_for_cue_surfaces(
     tab.cue_album_synthetic_sheet = Some(sheet);
     tab.cue_album_forced_cleanup = forced_cleanup;
     cue_album_update_cuesheet_entry(&mut tab, synthetic_cue, Some(cuesheet_originals));
+    cue_album_sort_entries(&mut tab.entries);
     tab.dirty = embedded_disagrees;
 
     let n_tracks = tab.file_labels.len();
@@ -21269,6 +21411,28 @@ fn metadata_editor_slot_edit_block_reason(
         .map(|reason| format!("save blocked: {}", reason))
 }
 
+fn metadata_editor_detail_slot_file_index(
+    state: &super::app::MetadataEditorState,
+    entry_idx: usize,
+    slot_index: usize,
+) -> Option<usize> {
+    let surface = state.active_surface();
+    let entry = surface.entries.get(entry_idx)?;
+    if entry.per_file_values.len() == surface.paths.len() {
+        return Some(slot_index);
+    }
+    if surface.paths.len() == 1 {
+        return Some(0);
+    }
+    let sheet = surface.cue_album_synthetic_sheet.as_ref()?;
+    let source = sheet.track_sources.get(slot_index)?;
+    surface
+        .paths
+        .iter()
+        .position(|path| path == &source.audio_path)
+        .or_else(|| sheet.audio_paths.iter().position(|path| path == &source.audio_path))
+}
+
 fn metadata_editor_detail_value_edit_refusal(
     state: &super::app::MetadataEditorState,
     entry_idx: usize,
@@ -21277,8 +21441,63 @@ fn metadata_editor_detail_value_edit_refusal(
     if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, entry_idx) {
         return Some(reason);
     }
-    metadata_editor_slot_edit_block_reason(state, slot_index)
+    let file_slot = metadata_editor_detail_slot_file_index(state, entry_idx, slot_index)?;
+    metadata_editor_slot_edit_block_reason(state, file_slot)
         .map(|reason| format!("metadata editor: slot is not editable — {}", reason))
+}
+
+pub(super) fn metadata_editor_apply_detail_paste(
+    state: &mut super::app::MetadataEditorState,
+    entry_idx: usize,
+    text: &str,
+) -> Result<usize, String> {
+    if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, entry_idx) {
+        return Err(reason);
+    }
+    let dim = state
+        .active_surface()
+        .entries
+        .get(entry_idx)
+        .map(|entry| entry.per_file_values.len())
+        .ok_or_else(|| "metadata editor: selected field is no longer available".to_string())?;
+    if dim == 0 {
+        return Ok(0);
+    }
+    let lines: Vec<String> = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(|line| line.trim_end().to_string())
+        .collect();
+    if lines.is_empty() {
+        return Ok(0);
+    }
+
+    let targets: Vec<(usize, String)> = if dim == state.active_surface().paths.len() && dim > 1 && lines.len() == 1 {
+        (0..dim).map(|idx| (idx, lines[0].clone())).collect()
+    } else {
+        lines
+            .into_iter()
+            .take(dim)
+            .enumerate()
+            .collect()
+    };
+    for (slot, _) in &targets {
+        if let Some(reason) = metadata_editor_detail_value_edit_refusal(state, entry_idx, *slot) {
+            return Err(reason);
+        }
+    }
+    let Some(entry) = state.active_surface_mut().entries.get_mut(entry_idx) else {
+        return Err("metadata editor: selected field is no longer available".to_string());
+    };
+    for (slot, value) in &targets {
+        if let Some(existing) = entry.per_file_values.get_mut(*slot) {
+            *existing = value.clone();
+        }
+    }
+    metadata_editor_recompute_entry_display(entry);
+    state.active_surface_mut().dirty = true;
+    Ok(targets.len())
 }
 
 fn metadata_editor_entry_edit_block_reason(
@@ -34166,16 +34385,40 @@ mod single_image_metadata_editor_regression_tests {
             vec![
                 (0, lofty::tag::ItemKey::MusicBrainzRecordingId),
                 (0, lofty::tag::ItemKey::MusicBrainzTrackId),
-                (0, lofty::tag::ItemKey::MusicBrainzArtistId),
                 (0, lofty::tag::ItemKey::Isrc),
                 (0, lofty::tag::ItemKey::TrackNumber),
                 (1, lofty::tag::ItemKey::MusicBrainzRecordingId),
             ],
-            "forced cleanup must be a loaded-state migration plan, not an unconditional per-save tombstone set"
+            "forced cleanup must be a loaded-state migration plan, but MUSICBRAINZ_ARTISTID is a legitimate whole-file album-artist id and must never be force-cleaned"
+        );
+        assert!(
+            !forced
+                .iter()
+                .any(|(_, key)| matches!(key, lofty::tag::ItemKey::MusicBrainzArtistId)),
+            "MUSICBRAINZ_ARTISTID must be suppressed even if a stale/manual cleanup plan contains it"
         );
         assert!(
             metadata_editor_has_audio_save_work(&state, &forced),
             "an otherwise clean unified surface with observed pollution must still run a cleanup-only save"
+        );
+    }
+
+
+    #[test]
+    fn unified_cleanup_stale_manual_artistid_plan_is_not_save_work() {
+        let mut state = unified_cue_album_edit_state();
+        state.active_surface_mut().dirty = false;
+        state.active_surface_mut().cue_album_forced_cleanup =
+            vec![(0, lofty::tag::ItemKey::MusicBrainzArtistId)];
+
+        let forced = metadata_editor_forced_delete_items(&state);
+        assert!(
+            forced.is_empty(),
+            "MUSICBRAINZ_ARTISTID must be ignored even if it appears in a stale serialized/manual cleanup plan"
+        );
+        assert!(
+            !metadata_editor_has_audio_save_work(&state, &forced),
+            "a stale MUSICBRAINZ_ARTISTID-only cleanup plan must not trigger a cleanup-only save"
         );
     }
 
@@ -34209,7 +34452,45 @@ mod single_image_metadata_editor_regression_tests {
             title_tag_entry(vec!["ordinary title", "ordinary title"]),
         ];
 
-        let (_cuesheet_originals, forced) = cue_album_remove_replaced_keys(&mut entries, 2);
+        let sheet = crate::tui::app::CueAlbumSyntheticSheet {
+            cue_paths: vec![
+                std::path::PathBuf::from("/tmp/album/side_a.cue"),
+                std::path::PathBuf::from("/tmp/album/side_b.cue"),
+            ],
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/album/side_a.flac"),
+                std::path::PathBuf::from("/tmp/album/side_b.flac"),
+            ],
+            track_sources: vec![
+                crate::tui::app::CueAlbumTrackSource {
+                    cue_path: std::path::PathBuf::from("/tmp/album/side_a.cue"),
+                    audio_path: std::path::PathBuf::from("/tmp/album/side_a.flac"),
+                    local_track_index: 0,
+                    original_track_number: 1,
+                    file_ref: "side_a.flac".to_string(),
+                    index00_frames: None,
+                    index01_frames: Some(0),
+                    isrc: Some("GBAYE0300334".to_string()),
+                },
+                crate::tui::app::CueAlbumTrackSource {
+                    cue_path: std::path::PathBuf::from("/tmp/album/side_b.cue"),
+                    audio_path: std::path::PathBuf::from("/tmp/album/side_b.flac"),
+                    local_track_index: 0,
+                    original_track_number: 1,
+                    file_ref: "side_b.flac".to_string(),
+                    index00_frames: None,
+                    index01_frames: Some(0),
+                    isrc: Some("GBAYE0300335".to_string()),
+                },
+            ],
+            album_title: Some("Original Album".to_string()),
+            album_performer: Some("Original Artist".to_string()),
+            album_date: Some("1973".to_string()),
+            album_genre: Some("Rock".to_string()),
+            album_catalog: Some("0000000000001".to_string()),
+        };
+        let n_paths = sheet.audio_paths.len();
+        let (_cuesheet_originals, forced) = cue_album_remove_replaced_keys(&mut entries, &sheet, n_paths);
         assert!(
             entries.is_empty(),
             "unified builder still replaces managed rows with CUE-derived dimensions"
@@ -34219,6 +34500,98 @@ mod single_image_metadata_editor_regression_tests {
         assert!(forced.contains(&(0, lofty::tag::ItemKey::TrackNumber)));
         assert!(forced.contains(&(1, lofty::tag::ItemKey::TrackNumber)));
     }
+
+    #[test]
+    fn unified_cleanup_plan_preserves_musicbrainz_artistid_and_foreign_isrc() {
+        let mut entries = vec![
+            crate::tui::probe::TagEntry {
+                display_key: "MUSICBRAINZ_ARTISTID".to_string(),
+                item_key: lofty::tag::ItemKey::MusicBrainzArtistId,
+                value: "album-artist-id".to_string(),
+                original: "album-artist-id".to_string(),
+                is_binary: false,
+                is_mixed: false,
+                per_file_values: vec!["album-artist-id".to_string(), "album-artist-id".to_string()],
+                per_file_originals: vec!["album-artist-id".to_string(), "album-artist-id".to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            },
+            crate::tui::probe::TagEntry {
+                display_key: "ISRC".to_string(),
+                item_key: lofty::tag::ItemKey::Isrc,
+                value: "<multiple values>".to_string(),
+                original: "foreign".to_string(),
+                is_binary: false,
+                is_mixed: true,
+                per_file_values: vec!["FOREIGN000001".to_string(), "FOREIGN000002".to_string()],
+                per_file_originals: vec!["FOREIGN000001".to_string(), "FOREIGN000002".to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            },
+            title_tag_entry(vec!["ordinary title", "ordinary title"]),
+        ];
+
+        let sheet = crate::tui::app::CueAlbumSyntheticSheet {
+            cue_paths: vec![
+                std::path::PathBuf::from("/tmp/album/side_a.cue"),
+                std::path::PathBuf::from("/tmp/album/side_b.cue"),
+            ],
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/album/side_a.flac"),
+                std::path::PathBuf::from("/tmp/album/side_b.flac"),
+            ],
+            track_sources: vec![
+                crate::tui::app::CueAlbumTrackSource {
+                    cue_path: std::path::PathBuf::from("/tmp/album/side_a.cue"),
+                    audio_path: std::path::PathBuf::from("/tmp/album/side_a.flac"),
+                    local_track_index: 0,
+                    original_track_number: 1,
+                    file_ref: "side_a.flac".to_string(),
+                    index00_frames: None,
+                    index01_frames: Some(0),
+                    isrc: Some("MATCH000001".to_string()),
+                },
+                crate::tui::app::CueAlbumTrackSource {
+                    cue_path: std::path::PathBuf::from("/tmp/album/side_b.cue"),
+                    audio_path: std::path::PathBuf::from("/tmp/album/side_b.flac"),
+                    local_track_index: 0,
+                    original_track_number: 1,
+                    file_ref: "side_b.flac".to_string(),
+                    index00_frames: None,
+                    index01_frames: Some(0),
+                    isrc: Some("MATCH000002".to_string()),
+                },
+            ],
+            album_title: Some("Original Album".to_string()),
+            album_performer: Some("Original Artist".to_string()),
+            album_date: Some("1973".to_string()),
+            album_genre: Some("Rock".to_string()),
+            album_catalog: Some("0000000000001".to_string()),
+        };
+
+        let (_cuesheet_originals, forced) =
+            cue_album_remove_replaced_keys(&mut entries, &sheet, sheet.audio_paths.len());
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.display_key.eq_ignore_ascii_case("MUSICBRAINZ_ARTISTID")),
+            "whole-file MUSICBRAINZ_ARTISTID is legitimate album-artist metadata and must remain visible, not be converted into a cleanup tombstone"
+        );
+        assert!(
+            !forced
+                .iter()
+                .any(|(_, key)| matches!(key, lofty::tag::ItemKey::MusicBrainzArtistId)),
+            "MUSICBRAINZ_ARTISTID must never be force-cleaned by replaced-row cleanup"
+        );
+        assert!(
+            !forced
+                .iter()
+                .any(|(_, key)| matches!(key, lofty::tag::ItemKey::Isrc)),
+            "foreign nonmatching whole-file ISRC values must survive; only F2-signature ISRC pollution is cleanable"
+        );
+    }
+
 
 
     fn write_metadata_surface_part(
@@ -35542,6 +35915,177 @@ mod single_image_metadata_editor_regression_tests {
         assert_eq!(n_tracks, 10, "DSOTM-shaped fixture must expose ten rows");
         assert!(state.active_surface().cue_album_synthetic_sheet.is_some());
         state
+    }
+
+    fn dsotm_authoritative_embedded_sheet(album_title: &str) -> String {
+        let mut cue = format!(
+            "CATALOG EOP-80778\nPERFORMER \"Pink Floyd\"\nTITLE \"{album_title}\"\nREM DATE 1973\nREM GENRE \"Rock\"\nFILE \"tdsotm_a.flac\" WAVE\n"
+        );
+        for track in 1..=5 {
+            let total_seconds = (track - 1) * 30;
+            cue.push_str(&format!(
+                "  TRACK {track:02} AUDIO\n    TITLE \"A Track {track}\"\n    INDEX 01 {:02}:{:02}:00\n",
+                total_seconds / 60,
+                total_seconds % 60,
+            ));
+        }
+        cue.push_str("FILE \"tdsotm_b.flac\" WAVE\n");
+        for track in 6..=10 {
+            let local = track - 5;
+            let total_seconds = (local - 1) * 30;
+            cue.push_str(&format!(
+                "  TRACK {track:02} AUDIO\n    TITLE \"B Track {local}\"\n    INDEX 01 {:02}:{:02}:00\n",
+                total_seconds / 60,
+                total_seconds % 60,
+            ));
+        }
+        cue
+    }
+
+    fn dsotm_unified_sheet_model(album: &std::path::Path) -> crate::tui::app::CueAlbumSyntheticSheet {
+        let mut surfaces = collect_metadata_cue_surfaces(&[album.to_path_buf()]);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut active_surface = 0usize;
+        apply_cached_or_ladder_split_cue_grouping_to_metadata_surfaces(
+            &mut app,
+            &mut surfaces,
+            &mut active_surface,
+        );
+        let (sheet, _track_numbers, _track_titles, _track_artists, _isrcs, _warnings) =
+            build_unified_cue_album_sheet(&surfaces).expect("unified sheet model");
+        sheet
+    }
+
+    #[test]
+    fn planner_and_editor_embedded_authority_acceptance_stay_in_lockstep() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dsotm");
+        let (side_a, side_b) = create_dsotm_sidecar_fixture(&album, true);
+        let sheet = dsotm_unified_sheet_model(&album);
+        let member_audio = vec![side_a.clone(), side_b.clone()];
+
+        let accepted = dsotm_authoritative_embedded_sheet(
+            "The Dark Side of the Moon (Japan Toshiba Harvest-Odeon EOP-80778 LP / 24-192)",
+        );
+        for image in [&side_a, &side_b] {
+            crate::tui::probe::write_all_tags(
+                image,
+                &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(accepted.clone()))],
+            )
+            .expect("write accepted CUESHEET");
+        }
+        let editor_accepts = cue_album_authoritative_embedded_cuesheet(
+            &sheet,
+            &[accepted.clone(), accepted.clone()],
+            member_audio.len(),
+        )
+        .is_some();
+        let planner_accepts = crate::convert::queue_expansion::planner_authoritative_embedded_cuesheet_accepts_for_test(
+            &member_audio,
+            &album,
+        );
+        assert_eq!(planner_accepts, editor_accepts, "planner/editor authority must agree for identical regenerated multi-FILE sheets");
+        assert!(planner_accepts);
+
+        let differing = dsotm_authoritative_embedded_sheet("Different Embedded Title");
+        crate::tui::probe::write_all_tags(
+            &side_b,
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(differing.clone()))],
+        )
+        .expect("write differing CUESHEET");
+        let editor_accepts = cue_album_authoritative_embedded_cuesheet(
+            &sheet,
+            &[accepted.clone(), differing],
+            member_audio.len(),
+        )
+        .is_some();
+        let planner_accepts = crate::convert::queue_expansion::planner_authoritative_embedded_cuesheet_accepts_for_test(
+            &member_audio,
+            &album,
+        );
+        assert_eq!(planner_accepts, editor_accepts, "planner/editor authority must both reject differing member sheets");
+        assert!(!planner_accepts);
+
+        let stale_subset = fixture_cue("tdsotm_a", "Stale Side A Only", "A", 5);
+        for image in [&side_a, &side_b] {
+            crate::tui::probe::write_all_tags(
+                image,
+                &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(stale_subset.clone()))],
+            )
+            .expect("write stale subset CUESHEET");
+        }
+        let editor_accepts = cue_album_authoritative_embedded_cuesheet(
+            &sheet,
+            &[stale_subset.clone(), stale_subset],
+            member_audio.len(),
+        )
+        .is_some();
+        let planner_accepts = crate::convert::queue_expansion::planner_authoritative_embedded_cuesheet_accepts_for_test(
+            &member_audio,
+            &album,
+        );
+        assert_eq!(planner_accepts, editor_accepts, "planner/editor authority must both reject stale subset sheets");
+        assert!(!planner_accepts);
+    }
+
+    #[test]
+    fn unified_editor_uses_plain_editor_canonical_order_and_alias_deduplication() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dsotm");
+        let (side_a, side_b) = create_dsotm_sidecar_fixture(&album, true);
+        for image in [&side_a, &side_b] {
+            crate::tui::probe::write_all_tags(
+                image,
+                &[
+                    (lofty::tag::ItemKey::Unknown("Year".to_string()), Some("1973".to_string())),
+                    (lofty::tag::ItemKey::Unknown("Album Artist".to_string()), Some("Pink Floyd".to_string())),
+                    (lofty::tag::ItemKey::Unknown("Composer".to_string()), Some("Pink Floyd".to_string())),
+                    (lofty::tag::ItemKey::Unknown("Performer".to_string()), Some("Pink Floyd".to_string())),
+                    (lofty::tag::ItemKey::Unknown("TotalTracks".to_string()), Some("10".to_string())),
+                    (lofty::tag::ItemKey::Unknown("DiscNumber".to_string()), Some("1".to_string())),
+                    (lofty::tag::ItemKey::Unknown("TotalDiscs".to_string()), Some("1".to_string())),
+                    (lofty::tag::ItemKey::Unknown("Comment".to_string()), Some("fixture".to_string())),
+                ],
+            )
+            .expect("write alias tags");
+        }
+
+        let state = build_dsotm_unified_editor(&album);
+        let keys: Vec<&str> = state
+            .active_surface()
+            .entries
+            .iter()
+            .map(|entry| entry.display_key.as_str())
+            .collect();
+        let expected_prefix = [
+            "TITLE",
+            "ARTIST",
+            "ALBUM",
+            "DATE",
+            "GENRE",
+            "COMPOSER",
+            "PERFORMER",
+            "ALBUMARTIST",
+            "TRACKNUMBER",
+            "TOTALTRACKS",
+            "DISCNUMBER",
+            "TOTALDISCS",
+            "COMMENT",
+        ];
+        assert_eq!(&keys[..expected_prefix.len()], expected_prefix, "unified surface must share the plain editor's standard key order: {keys:?}");
+        assert_eq!(keys.iter().filter(|key| key.eq_ignore_ascii_case("DATE")).count(), 1, "Year alias must collapse into DATE: {keys:?}");
+        assert_eq!(keys.iter().filter(|key| key.eq_ignore_ascii_case("YEAR")).count(), 0, "raw Year row must not survive normalization: {keys:?}");
+        assert_eq!(keys.iter().filter(|key| key.eq_ignore_ascii_case("ALBUMARTIST")).count(), 1, "Album Artist alias must collapse into ALBUMARTIST: {keys:?}");
+        assert_eq!(keys.iter().filter(|key| key.eq_ignore_ascii_case("Album Artist")).count(), 0, "raw Album Artist row must not survive normalization: {keys:?}");
+        assert!(keys.last().map(|key| key.eq_ignore_ascii_case("CUESHEET")).unwrap_or(false), "CUESHEET synthetic row stays at the tail: {keys:?}");
     }
 
     fn mb_release_10_tracks() -> crate::tui::musicbrainz::MbRelease {

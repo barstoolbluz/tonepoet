@@ -65,12 +65,25 @@ impl EntryKind {
     }
 }
 
-/// Return true when `path` names a CUE sheet.
+/// Return true when `path` is a dot-prefixed filesystem sidecar that should
+/// never participate in CUE planning/import. This catches AppleDouble
+/// `._album.cue` files and ordinary hidden scratch cues while preserving
+/// explicit non-hidden CUE names in hidden directories.
+pub fn is_hidden_cue_sheet_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with('.') && name.to_ascii_lowercase().ends_with(".cue")
+}
+
+/// Return true when `path` names a user-visible CUE sheet.
 pub fn is_cue_sheet_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("cue"))
-        .unwrap_or(false)
+    !is_hidden_cue_sheet_path(path)
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("cue"))
+            .unwrap_or(false)
 }
 
 /// Return true when `path` is classified as an audio file by extension.
@@ -202,6 +215,16 @@ mod tests {
         assert!(is_cue_sheet_path(cue));
         assert_eq!(classify_file(cue), EntryKind::OtherFile);
         assert!(!is_audio_file_path(cue));
+    }
+
+
+    #[test]
+    fn hidden_dot_cues_are_not_user_visible_cue_sheets() {
+        assert!(is_hidden_cue_sheet_path(Path::new("._album.cue")));
+        assert!(is_hidden_cue_sheet_path(Path::new(".scratch.CUE")));
+        assert!(!is_cue_sheet_path(Path::new("._album.cue")));
+        assert!(!is_cue_sheet_path(Path::new(".scratch.CUE")));
+        assert!(is_cue_sheet_path(Path::new(".hidden_dir/album.cue")));
     }
 
     #[test]

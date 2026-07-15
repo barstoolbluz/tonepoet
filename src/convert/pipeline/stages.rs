@@ -3796,6 +3796,20 @@ fn is_internal_metadata_extra_key(key: &str) -> bool {
         || key == CUE_ARTWORK_MIME_EXTRA_KEY
         || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
         || key == CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY
+        || key == "image_metadata_source"
+}
+
+fn album_extra_real_tag_key(key: &str) -> Option<&'static str> {
+    match key {
+        "catalognumber" => Some("CATALOGNUMBER"),
+        "releasecountry" => Some("RELEASECOUNTRY"),
+        "originalyear" => Some("ORIGINALYEAR"),
+        "originaldate" => Some("ORIGINALDATE"),
+        "musicbrainz_albumid" => Some("MUSICBRAINZ_ALBUMID"),
+        "musicbrainz_albumartistid" => Some("MUSICBRAINZ_ALBUMARTISTID"),
+        "musicbrainz_releasegroupid" => Some("MUSICBRAINZ_RELEASEGROUPID"),
+        _ => None,
+    }
 }
 
 fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> Vec<(String, String)> {
@@ -3890,7 +3904,11 @@ fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> V
         push_tag_value(&mut tags, "CATALOG", v);
     }
     for (key, value) in &album.extra {
-        if is_internal_metadata_extra_key(key) {
+        if is_internal_metadata_extra_key(key) || key == "catalog" {
+            continue;
+        }
+        if let Some(tag_key) = album_extra_real_tag_key(key) {
+            push_tag_value(&mut tags, tag_key, value);
             continue;
         }
         let tag_key = cue_extra_tag_key("ALBUM", key);
@@ -4576,6 +4594,69 @@ mod metadata_writer_command_tests {
         assert!(tags.contains(&("PERFORMER".to_string(), "Cue Performer".to_string())));
         assert!(tags.contains(&("PRE_EMPHASIS".to_string(), "1".to_string())));
         assert_no_internal_metadata_tags(&tags);
+    }
+
+    #[test]
+    fn image_metadata_source_extra_is_internal_and_not_user_visible() {
+        let (track, mut album) = sample_metadata();
+        album
+            .extra
+            .insert("image_metadata_source".to_string(), "/music/side_a.flac".to_string());
+
+        let tags = authoritative_metadata_tags(&track, &album);
+        assert!(
+            !tags.iter().any(|(key, _)| key == "TONEPOET_ALBUM_IMAGE_METADATA_SOURCE"),
+            "image metadata provenance must remain internal and must not leak as a user-visible album tag: {tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|(key, value)| key.contains("IMAGE_METADATA_SOURCE") || value == "/music/side_a.flac"),
+            "image metadata provenance must not be emitted under any tag key: {tags:?}"
+        );
+    }
+
+    #[test]
+    fn album_whitelisted_extras_emit_real_tags_without_prefixed_duplicates() {
+        let (track, mut album) = sample_metadata();
+        for (key, value) in [
+            ("catalognumber", "IMG-001"),
+            ("releasecountry", "JP"),
+            ("originalyear", "1973"),
+            ("originaldate", "1973-03-01"),
+            ("musicbrainz_albumid", "mb-album"),
+            ("musicbrainz_albumartistid", "mb-album-artist"),
+            ("musicbrainz_releasegroupid", "mb-release-group"),
+            ("unrecognized_extra", "keep-prefixed"),
+        ] {
+            album.extra.insert(key.to_string(), value.to_string());
+        }
+
+        let tags = authoritative_metadata_tags(&track, &album);
+        for (real_key, value) in [
+            ("CATALOGNUMBER", "IMG-001"),
+            ("RELEASECOUNTRY", "JP"),
+            ("ORIGINALYEAR", "1973"),
+            ("ORIGINALDATE", "1973-03-01"),
+            ("MUSICBRAINZ_ALBUMID", "mb-album"),
+            ("MUSICBRAINZ_ALBUMARTISTID", "mb-album-artist"),
+            ("MUSICBRAINZ_RELEASEGROUPID", "mb-release-group"),
+        ] {
+            assert!(tags.contains(&(real_key.to_string(), value.to_string())), "missing real tag {real_key}: {tags:?}");
+        }
+        for forbidden in [
+            "TONEPOET_ALBUM_CATALOGNUMBER",
+            "TONEPOET_ALBUM_RELEASECOUNTRY",
+            "TONEPOET_ALBUM_ORIGINALYEAR",
+            "TONEPOET_ALBUM_ORIGINALDATE",
+            "TONEPOET_ALBUM_MUSICBRAINZ_ALBUMID",
+            "TONEPOET_ALBUM_MUSICBRAINZ_ALBUMARTISTID",
+            "TONEPOET_ALBUM_MUSICBRAINZ_RELEASEGROUPID",
+        ] {
+            assert!(
+                !tags.iter().any(|(key, _)| key == forbidden),
+                "real-tag-mapped album extra must not also emit {forbidden}: {tags:?}"
+            );
+        }
+        assert!(tags.contains(&("TONEPOET_ALBUM_UNRECOGNIZED_EXTRA".to_string(), "keep-prefixed".to_string())));
     }
 
     #[test]

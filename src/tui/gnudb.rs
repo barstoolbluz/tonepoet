@@ -700,11 +700,7 @@ pub fn find_cues_in_dir(dir: &std::path::Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("cue"))
-                .unwrap_or(false)
-                .then_some(path)
+            crate::convert::classify::is_cue_sheet_path(&path).then_some(path)
         })
         .collect();
     cues.sort();
@@ -763,6 +759,18 @@ mod gnudb_per_track_tests {
             crate::tui::app::MetadataTechnicalDetails::default(),
         );
         (state, td)
+    }
+
+    #[test]
+    fn find_cues_in_dir_ignores_hidden_dot_cues_for_import() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let visible = td.path().join("album.cue");
+        let hidden = td.path().join("._album.cue");
+        std::fs::write(&visible, b"visible cue").expect("visible cue");
+        std::fs::write(&hidden, b"hidden appledouble cue").expect("hidden cue");
+
+        let cues = find_cues_in_dir(td.path());
+        assert_eq!(cues, vec![visible], "ImportCue enumeration must not surface hidden dot-cue sidecars");
     }
 
     fn cuesheet_entry(text: &str) -> TagEntry {

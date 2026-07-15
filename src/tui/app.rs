@@ -373,10 +373,7 @@ fn read_embedded_cuesheet_for_preview(path: &Path) -> Option<crate::tui::cue_par
 
 
 pub(crate) fn is_cue_sheet_path_for_preview(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("cue"))
-        .unwrap_or(false)
+    crate::convert::classify::is_cue_sheet_path(path)
 }
 
 fn should_render_cue_sheet_as_multitrack(
@@ -7589,6 +7586,29 @@ fn unified_cue_album_per_track_key_is_persistable_for_dirty_clear(display_key: &
     )
 }
 
+fn unified_cue_album_fully_saved_for_dirty_clear(
+    tab: &PresentationTab,
+    saved_slots: &std::collections::BTreeSet<usize>,
+) -> bool {
+    let path_count = tab.paths.len();
+    if tab.cue_album_synthetic_sheet.is_none()
+        || tab.pending_embedded_cuesheet_delete
+        || path_count == 0
+    {
+        return false;
+    }
+    let Some(cuesheet) = tab.entries.iter().find(|entry| {
+        entry.display_key.eq_ignore_ascii_case("CUESHEET")
+            && entry.per_file_values.len() == path_count
+            && entry.per_file_originals.len() == path_count
+    }) else {
+        return false;
+    };
+    (0..path_count).all(|idx| {
+        saved_slots.contains(&idx) || cuesheet.per_file_values[idx] == cuesheet.per_file_originals[idx]
+    })
+}
+
 fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections::BTreeSet<usize>) {
     if saved_slots.is_empty() {
         return;
@@ -7596,6 +7616,7 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
 
     let path_count = tab.paths.len();
     let deleted: std::collections::BTreeSet<usize> = tab.deleted.iter().copied().collect();
+    let unified_cue_album_fully_saved = unified_cue_album_fully_saved_for_dirty_clear(tab, saved_slots);
     let mut remove_entries = Vec::new();
     let mut retained_deleted = Vec::new();
 
@@ -7604,10 +7625,6 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
             && entry.per_file_originals.len() == path_count;
 
         if !file_aligned {
-            let unified_cue_album_fully_saved = tab.cue_album_synthetic_sheet.is_some()
-                && !tab.pending_embedded_cuesheet_delete
-                && path_count > 0
-                && (0..path_count).all(|idx| saved_slots.contains(&idx));
             let unified_row_persistable = unified_cue_album_per_track_key_is_persistable_for_dirty_clear(
                 &entry.display_key,
             );
@@ -12967,6 +12984,10 @@ mod metadata_presentation_tab_tests {
         state
             .active_surface_mut()
             .entries
+            .push(tag("CUESHEET", "[CUE sheet]", vec!["SHEET-A", "SHEET-B"]));
+        state
+            .active_surface_mut()
+            .entries
             .push(tag("TITLE", "<multiple values>", vec!["T1", "T2", "T3", "T4"]));
         let row_idx = state.active_surface().entries.len() - 1;
         state.active_surface_mut().entries[row_idx].per_file_values[2] = "Edited".to_string();
@@ -13016,6 +13037,18 @@ mod metadata_presentation_tab_tests {
         state
             .active_surface_mut()
             .entries
+            .push(tag("CUESHEET", "[CUE sheet]", vec!["SHEET-A", "SHEET-B"]));
+        {
+            // A regenerated sheet is STAGED but not yet written anywhere: the
+            // H1 disk-equivalence rule must not treat the unsaved member as
+            // already persisted.
+            let cue_idx = state.active_surface().entries.len() - 1;
+            let entry = &mut state.active_surface_mut().entries[cue_idx];
+            entry.per_file_values = vec!["SHEET-NEW-A".to_string(), "SHEET-NEW-B".to_string()];
+        }
+        state
+            .active_surface_mut()
+            .entries
             .push(tag("TITLE", "<multiple values>", vec!["T1", "T2", "T3", "T4"]));
         let row_idx = state.active_surface().entries.len() - 1;
         state.active_surface_mut().entries[row_idx].per_file_values[2] = "Edited".to_string();
@@ -13043,6 +13076,173 @@ mod metadata_presentation_tab_tests {
         assert!(state.active_surface().dirty, "partial save keeps the surface dirty for retry");
     }
 
+
+
+    #[test]
+    fn unified_cue_album_partial_save_retry_only_remaining_member_clears_dirty() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: Vec::new(),
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: Some("Album".to_string()),
+            album_performer: Some("Artist".to_string()),
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state.active_surface_mut().entries = vec![
+            TagEntry {
+                display_key: "CUESHEET".to_string(),
+                item_key: ItemKey::Unknown("CUESHEET".to_string()),
+                value: "new synthetic sheet".to_string(),
+                original: "old synthetic sheet".to_string(),
+                is_binary: true,
+                is_mixed: false,
+                per_file_values: vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()],
+                per_file_originals: vec!["old synthetic sheet".to_string(), "old synthetic sheet".to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            },
+            tag("TITLE", "<multiple values>", vec!["A1", "A2", "B1", "B2"]),
+        ];
+        state.active_surface_mut().entries[1].per_file_values[2] = "B1 edited".to_string();
+        state.active_surface_mut().dirty = true;
+
+        let (session_id, generation) = state.begin_write();
+        let partial = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::failed(state.active_surface().paths[1].clone(), "locked"),
+                ],
+            )
+            .expect("partial save should reduce");
+
+        assert_eq!(partial.saved, 1);
+        assert_eq!(partial.failed, 1);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_originals,
+            vec!["new synthetic sheet".to_string(), "old synthetic sheet".to_string()],
+            "successful member's embedded CUESHEET original must advance before retry"
+        );
+        assert_eq!(
+            state.active_surface().entries[1].per_file_originals[2],
+            "B1",
+            "row-dimensioned unified edits must not advance on a partial member save"
+        );
+        assert!(state.active_surface().dirty);
+
+        let (session_id, generation) = state.begin_write();
+        let retry = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![MetadataEditorWriteResult::saved(
+                    state.active_surface().paths[1].clone(),
+                )],
+            )
+            .expect("remaining-member retry should reduce");
+
+        assert_eq!(retry.saved, 1);
+        assert_eq!(retry.failed, 0);
+        assert!(!retry.remaining_dirty);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_originals,
+            vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()],
+            "retry only writes the remaining member but the sheet is now persisted for every slot"
+        );
+        assert_eq!(
+            state.active_surface().entries[1].per_file_originals[2],
+            "B1 edited",
+            "row originals must advance once all member images have the regenerated sheet, even across batches"
+        );
+        assert!(!state.active_surface().dirty);
+        assert!(
+            !crate::tui::probe::metadata_editor_has_changes(&state),
+            "a subsequent :w should find no metadata changes to save"
+        );
+    }
+
+    #[test]
+    fn unified_cue_album_partial_save_failing_retry_remains_dirty() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: Vec::new(),
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: Some("Album".to_string()),
+            album_performer: Some("Artist".to_string()),
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state.active_surface_mut().entries = vec![
+            TagEntry {
+                display_key: "CUESHEET".to_string(),
+                item_key: ItemKey::Unknown("CUESHEET".to_string()),
+                value: "new synthetic sheet".to_string(),
+                original: "old synthetic sheet".to_string(),
+                is_binary: true,
+                is_mixed: false,
+                per_file_values: vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()],
+                per_file_originals: vec!["old synthetic sheet".to_string(), "old synthetic sheet".to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            },
+            tag("TITLE", "<multiple values>", vec!["A1", "A2", "B1", "B2"]),
+        ];
+        state.active_surface_mut().entries[1].per_file_values[2] = "B1 edited".to_string();
+        state.active_surface_mut().dirty = true;
+
+        let (session_id, generation) = state.begin_write();
+        state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::saved(state.active_surface().paths[0].clone()),
+                    MetadataEditorWriteResult::failed(state.active_surface().paths[1].clone(), "locked"),
+                ],
+            )
+            .expect("partial save should reduce");
+
+        let (session_id, generation) = state.begin_write();
+        let retry = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![MetadataEditorWriteResult::failed(
+                    state.active_surface().paths[1].clone(),
+                    "still locked",
+                )],
+            )
+            .expect("failing retry should reduce");
+
+        assert_eq!(retry.saved, 0);
+        assert_eq!(retry.failed, 1);
+        assert!(retry.remaining_dirty);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_originals,
+            vec!["new synthetic sheet".to_string(), "old synthetic sheet".to_string()],
+            "failed retry must not claim the remaining member's embedded CUESHEET is persisted"
+        );
+        assert_eq!(
+            state.active_surface().entries[1].per_file_originals[2],
+            "B1",
+            "row originals remain unadvanced while any member image still failed"
+        );
+        assert!(state.active_surface().dirty);
+        assert!(crate::tui::probe::metadata_editor_has_changes(&state));
+    }
 
     #[test]
     fn unified_cue_album_tracknumber_edits_do_not_clear_as_saved() {

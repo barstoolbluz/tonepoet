@@ -599,13 +599,19 @@ impl ConversionManager {
                 Ok(format) => detected.push((file.clone(), format)),
                 Err(err) => {
                     outcome.errors += 1;
-                    outcome.last_error = Some(err.to_string());
-                    return CommitBatchCueArtifactTransaction::failed_without_queue_mutation(
-                        outcome,
-                        source_synthetic_cue_artifacts.clone(),
-                    );
+                    outcome.last_error = Some(format!(
+                        "skipped {}: {}",
+                        file.display(),
+                        err
+                    ));
                 }
             }
+        }
+        if detected.is_empty() {
+            return CommitBatchCueArtifactTransaction::failed_without_queue_mutation(
+                outcome,
+                source_synthetic_cue_artifacts.clone(),
+            );
         }
 
         let mut queue = match self.queue.try_write() {

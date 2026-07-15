@@ -573,20 +573,12 @@ pub(crate) fn effective_browse_context_entry_kind(kind: &EntryKind, _path: &Path
     kind.clone()
 }
 
-fn audio_file_extension_supports_embedded_cuesheet(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "flac" | "wv" | "ape" | "ogg" | "opus"))
-        .unwrap_or(false)
-}
-
-fn audio_file_is_cue_bearing(path: &Path) -> bool {
+fn audio_file_is_cue_bearing(_path: &Path) -> bool {
     // Menu construction runs on the reducer. Do not read tags or scan sibling
-    // directories here: either can block on slow or disconnected mounts. Enable
-    // embedded-CUESHEET actions for plausible carriers by extension only and let
-    // the dispatch path, which already reports precise errors, resolve actual
-    // sidecar/embedded presence on its worker-safe path.
-    audio_file_extension_supports_embedded_cuesheet(path)
+    // directories here: either can block on slow or disconnected mounts. Show
+    // CUE actions for every audio file and let the dispatch path, which already
+    // reports precise errors, resolve sidecar/embedded presence on its worker-safe path.
+    true
 }
 
 /// Build the context menu for a right-click on a browse entry.
@@ -731,12 +723,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         }
         EntryKind::OtherFile => {
             // CUE files are convertible (they reference an image file).
-            let is_cue = entry
-                .path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("cue"))
-                .unwrap_or(false);
+            let is_cue = crate::convert::classify::is_cue_sheet_path(&entry.path);
             if is_cue {
                 items.push(build_convert_submenu(app));
                 items.push(item("Edit metadata", ContextAction::EditMetadataFull));

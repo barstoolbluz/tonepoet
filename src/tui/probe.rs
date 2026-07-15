@@ -5109,17 +5109,15 @@ pub fn cue_summary_string(value: &str) -> String {
 /// refresh the editor's `dirty` flag after a revert toggle so the
 /// indicator accurately reflects whether anything would be written
 /// on save.
-/// Resize `entry.per_file_values` and `per_file_originals` to
-/// `target_dim`, padding with the existing first-element value when
-/// growing. Replicating preserves revert semantics: pressing revert
-/// after a per-track populate restores the editor to whatever was on
-/// disk for the original (lower) dimension. Truncation is a plain
-/// `Vec::resize` and discards trailing values.
+/// Grow `entry.per_file_values` and `per_file_originals` to `target_dim`,
+/// padding with the existing first-element value. This deliberately never
+/// shrinks: a guarded per-track populate path must not destroy existing
+/// row-dimension values or their revert originals.
 ///
 /// Used by both MB and gnudb populate paths to grow tag entries to
 /// per-track dimension on single-image rips.
 pub fn ensure_dim_replicate(entry: &mut TagEntry, target_dim: usize) {
-    if entry.per_file_values.len() == target_dim {
+    if entry.per_file_values.len() >= target_dim {
         return;
     }
     let pad_v = entry.per_file_values.first().cloned().unwrap_or_default();
@@ -5659,6 +5657,30 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
     *paths = sorted;
 }
 
+/// Canonical display-key identity used by metadata-editor surfaces when they
+/// need to merge format-specific aliases before applying the standard ordering.
+/// The returned key is a logical editor key, not necessarily the raw tag name.
+pub fn canonical_metadata_display_key(display_key: &str) -> String {
+    let normalized: String = display_key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect();
+    match normalized.as_str() {
+        "YEAR" => "DATE".to_string(),
+        "ALBUMARTIST" | "ALBUMARTISTS" | "ALBUMARTISTCREDIT" => "ALBUMARTIST".to_string(),
+        "TRACKTOTAL" => "TOTALTRACKS".to_string(),
+        "DISCTOTAL" => "TOTALDISCS".to_string(),
+        "MUSICBRAINZALBUMID" => "MUSICBRAINZ_ALBUMID".to_string(),
+        "MUSICBRAINZALBUMARTISTID" => "MUSICBRAINZ_ALBUMARTISTID".to_string(),
+        "MUSICBRAINZRELEASEGROUPID" => "MUSICBRAINZ_RELEASEGROUPID".to_string(),
+        "MUSICBRAINZTRACKID" | "MUSICBRAINZRECORDINGID" => "MUSICBRAINZ_TRACKID".to_string(),
+        "MUSICBRAINZRELEASETRACKID" => "MUSICBRAINZ_RELEASETRACKID".to_string(),
+        "MUSICBRAINZARTISTID" => "MUSICBRAINZ_ARTISTID".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Priority order for standard fields (displayed first, in this order).
 pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "TITLE",
@@ -5737,8 +5759,8 @@ pub fn ensure_standard_fields_present(entries: &mut Vec<TagEntry>, n_files: usiz
 
 fn sort_entries_by_standard_order(entries: &mut Vec<TagEntry>) {
     entries.sort_by(|a, b| {
-        let a_upper = a.display_key.to_ascii_uppercase();
-        let b_upper = b.display_key.to_ascii_uppercase();
+        let a_upper = canonical_metadata_display_key(&a.display_key);
+        let b_upper = canonical_metadata_display_key(&b.display_key);
         let a_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == a_upper);
         let b_idx = STANDARD_KEY_ORDER.iter().position(|&k| k == b_upper);
         match (a_idx, b_idx) {
@@ -7500,6 +7522,33 @@ mod tests {
             }));
         let _guard = LoftyFallbackHookGuard;
         body()
+    }
+
+    #[test]
+    fn canonical_metadata_display_key_collapses_editor_aliases() {
+        assert_eq!(canonical_metadata_display_key("Year"), "DATE");
+        assert_eq!(canonical_metadata_display_key("Album Artist"), "ALBUMARTIST");
+        assert_eq!(canonical_metadata_display_key("MUSICBRAINZ_ALBUMID"), "MUSICBRAINZ_ALBUMID");
+        assert_eq!(canonical_metadata_display_key("MusicBrainz Release Track Id"), "MUSICBRAINZ_RELEASETRACKID");
+    }
+
+    #[test]
+    fn ensure_dim_replicate_never_shrinks_existing_row_values() {
+        let mut entry = TagEntry {
+            display_key: "TITLE".to_string(),
+            item_key: lofty::tag::ItemKey::TrackTitle,
+            value: "A".to_string(),
+            original: "A".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            per_file_values: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            per_file_originals: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        };
+        ensure_dim_replicate(&mut entry, 1);
+        assert_eq!(entry.per_file_values, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+        assert_eq!(entry.per_file_originals, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
     }
 
     #[test]

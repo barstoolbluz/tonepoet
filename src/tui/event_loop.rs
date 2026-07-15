@@ -4705,50 +4705,15 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 if state.phase == MetadataEditorPhase::DetailEdit {
                     let field_idx = state.detail_field_idx;
                     if field_idx < state.active_surface().entries.len() {
-                        let sanitized = text.replace("\r\n", "\n").replace('\r', "\n");
-                        let lines: Vec<&str> = sanitized.split('\n').collect();
-                        let n_files = state.active_surface().paths.len();
-
-                        // Cancel any active inline edit before taking the
-                        // mutable entry borrow (avoids double-borrow of state).
                         state.detail_edit = None;
-
-                        let entry = &mut state.active_surface_mut().entries[field_idx];
-                        let is_album = entry.display_key.eq_ignore_ascii_case("ALBUM");
-
-                        if is_album {
-                            let val = lines
-                                .first()
-                                .map(|l| l.trim().to_string())
-                                .unwrap_or_default();
-                            for v in &mut entry.per_file_values {
-                                *v = val.clone();
-                            }
-                        } else {
-                            for (i, line) in lines.iter().enumerate() {
-                                if i >= n_files {
-                                    break;
-                                }
-                                entry.per_file_values[i] = line.trim().to_string();
-                            }
+                        match super::keybindings::metadata_editor_apply_detail_paste(&mut state, field_idx, &text) {
+                            Ok(applied) => app.set_status(format!(
+                                "Pasted {} value{}",
+                                applied,
+                                if applied == 1 { "" } else { "s" },
+                            )),
+                            Err(reason) => app.set_status(reason),
                         }
-
-                        // Update merged display value + mixed state.
-                        let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
-                        entry.is_mixed = !all_same && n_files > 1;
-                        entry.value = if entry.is_mixed {
-                            "<multiple values>".to_string()
-                        } else {
-                            entry.per_file_values.first().cloned().unwrap_or_default()
-                        };
-
-                        state.active_surface_mut().dirty = true;
-                        let applied = lines.len().min(n_files);
-                        app.set_status(format!(
-                            "Pasted {} value{}",
-                            applied,
-                            if applied == 1 { "" } else { "s" },
-                        ));
                     }
                 } else if state.phase == MetadataEditorPhase::InlineEdit {
                     // Single-field inline edit: insert first line at cursor.
@@ -5153,7 +5118,7 @@ fn open_mb_select_picker(
     query_label: Option<String>,
 ) {
     if ctx.editor_park {
-        let Some(state_owned) = take_metadata_editor(app) else {
+        let Some(taken) = take_metadata_editor_with_restore_slot(app) else {
             let detail = match &query_label {
                 Some(l) => format!("rerun to apply \"{}\" ({} matches)", l, n),
                 None => format!("rerun ({} matches)", n),
@@ -5161,14 +5126,18 @@ fn open_mb_select_picker(
             app.set_status(format!(":tags-mb: editor closed during lookup; {}", detail));
             return;
         };
-        if !metadata_editor_matches_tags_mb_context(&state_owned, &ctx.paths, ctx.editor_session) {
-            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        if !metadata_editor_matches_tags_mb_context(
+            &taken.state,
+            &ctx.paths,
+            ctx.editor_session,
+        ) {
+            restore_taken_metadata_editor(app, taken);
             app.set_status(
                 ":tags-mb: metadata editor changed since lookup; rerun".to_string(),
             );
             return;
         }
-        app.pending_metadata_editor = Some(state_owned);
+        app.pending_metadata_editor = Some(taken.state);
     }
     let status = match query_label {
         Some(l) => format!(
@@ -5224,22 +5193,64 @@ pub(super) fn restore_parked_editor(app: &mut AppState) {
 /// during the async search so the surrounding command-input /
 /// context-menu auto-restore wrappers see `active != None` and
 /// don't drain the parking slot before our async result arrives.
-pub(super) fn take_metadata_editor(
+#[derive(Clone, Copy)]
+pub(super) enum MetadataEditorRestoreSlot {
+    Active,
+    Pending,
+}
+
+pub(super) struct TakenMetadataEditor {
+    pub(super) state: Box<super::app::MetadataEditorState>,
+    pub(super) slot: MetadataEditorRestoreSlot,
+}
+
+pub(super) fn take_metadata_editor_with_restore_slot(
     app: &mut AppState,
-) -> Option<Box<super::app::MetadataEditorState>> {
+) -> Option<TakenMetadataEditor> {
     if let Some(parked) = app.pending_metadata_editor.take() {
-        return Some(parked);
+        return Some(TakenMetadataEditor {
+            state: parked,
+            slot: MetadataEditorRestoreSlot::Pending,
+        });
     }
     if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
         if let ActiveOverlay::MetadataEditor(s) =
             std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
         {
-            return Some(s);
+            return Some(TakenMetadataEditor {
+                state: s,
+                slot: MetadataEditorRestoreSlot::Active,
+            });
         }
     }
     None
 }
 
+pub(super) fn restore_taken_metadata_editor(app: &mut AppState, taken: TakenMetadataEditor) {
+    match taken.slot {
+        MetadataEditorRestoreSlot::Active => {
+            // If another overlay (for example a newer MbSelect picker) became
+            // active while this async completion was in flight, do not clobber
+            // it. Park the editor back in the pending slot so the active UI
+            // survives and normal picker cancel/apply paths can restore it.
+            if matches!(app.active_overlay, ActiveOverlay::None) {
+                app.active_overlay = ActiveOverlay::MetadataEditor(taken.state);
+            } else if app.pending_metadata_editor.is_none() {
+                app.pending_metadata_editor = Some(taken.state);
+            } else {
+                // This should be unreachable in the current one-editor flow,
+                // but prefer preserving the visible overlay over destroying a
+                // newer modal. Leave the pre-existing parked editor untouched.
+                app.set_status(
+                    ":tags-mb: metadata editor changed since lookup; rerun".to_string(),
+                );
+            }
+        }
+        MetadataEditorRestoreSlot::Pending => {
+            app.pending_metadata_editor = Some(taken.state);
+        }
+    }
+}
 
 fn metadata_editor_paths_match_tags_mb_context(
     state: &super::app::MetadataEditorState,
@@ -5263,6 +5274,12 @@ fn metadata_editor_paths_match_tags_mb_context(
             .map(|source| source.audio_path.clone())
             .collect();
         if !track_paths.is_empty() && track_paths == paths {
+            return true;
+        }
+        if !paths.is_empty()
+            && paths.len() < track_paths.len()
+            && paths.iter().all(|path| track_paths.iter().any(|candidate| candidate == path))
+        {
             return true;
         }
 
@@ -5293,12 +5310,20 @@ fn metadata_editor_paths_match_tags_mb_context(
 }
 
 
-fn metadata_editor_matches_session_guard(
+pub(super) fn metadata_editor_matches_session_guard(
     state: &super::app::MetadataEditorState,
     guard: super::message::MetadataEditorSessionGuard,
 ) -> bool {
-    let details = &state.active_surface().technical_details;
-    details.session_id == guard.session_id && details.save_generation == guard.save_generation
+    // Editor-level identity: match ANY surface's session, not just the active
+    // tab (H9). Tabless editors (plain files, unified cue albums) keep their
+    // only surface in `model.file_surface` — presentation_tabs is EMPTY there,
+    // so the file surface must participate or every completion is rejected.
+    std::iter::once(&state.model.file_surface)
+        .chain(state.presentation_tabs.iter())
+        .any(|tab| {
+            tab.technical_details.session_id == guard.session_id
+                && tab.technical_details.save_generation == guard.save_generation
+        })
 }
 
 fn metadata_editor_matches_tags_mb_context(
@@ -5504,7 +5529,7 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
         return;
     };
 
-    // Three arrival modes, checked via `take_metadata_editor`:
+    // Three arrival modes, checked via `take_metadata_editor_with_restore_slot`:
     // - Browse → MbSelect: no editor was open before `:tags-mb`,
     //   neither slot holds one; `open_metadata_editor` builds fresh
     //   from the selection.
@@ -5514,10 +5539,12 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
     //   `active_overlay` because the dispatch deliberately left it
     //   there during the async wait to suppress auto-restore from
     //   the command-input / context-menu wrappers.
-    let (mut state, mut split_cue_mb_populated, source_session_validated) = if let Some(s) = take_metadata_editor(app) {
+    let (mut state, mut split_cue_mb_populated, source_session_validated) = if let Some(taken) = take_metadata_editor_with_restore_slot(app) {
+        let restore_slot = taken.slot;
+        let s = taken.state;
         if let Some(guard) = editor_session {
             if !metadata_editor_matches_session_guard(&s, guard) {
-                app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                restore_taken_metadata_editor(app, TakenMetadataEditor { state: s, slot: restore_slot });
                 app.set_status(
                     ":tags-mb: metadata editor changed since lookup; rerun".to_string(),
                 );
@@ -5526,6 +5553,14 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
             if metadata_editor_paths_match_tags_mb_context(&s, &paths) {
                 (s, false, true)
             } else if metadata_editor_can_transition_to_split_cue_target(&s, &paths) {
+                if s.any_presentation_dirty() {
+                    restore_taken_metadata_editor(app, TakenMetadataEditor { state: s, slot: restore_slot });
+                    app.set_status(
+                        ":tags-mb: source editor changed during lookup; save or revert editor changes before rerunning"
+                            .to_string(),
+                    );
+                    return;
+                }
                 match super::keybindings::build_metadata_editor_for_cue_surfaces_with_mb_release(
                     app,
                     &paths,
@@ -5533,7 +5568,7 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
                 ) {
                     Ok(Some(state)) => (state, true, true),
                     Ok(None) => {
-                        app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                        restore_taken_metadata_editor(app, TakenMetadataEditor { state: s, slot: restore_slot });
                         app.set_status(
                             ":tags-mb: could not open split CUE target editor; rerun from Browse"
                                 .to_string(),
@@ -5541,7 +5576,7 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
                         return;
                     }
                     Err(err) => {
-                        app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                        restore_taken_metadata_editor(app, TakenMetadataEditor { state: s, slot: restore_slot });
                         app.set_status(format!(
                             ":tags-mb: could not open split CUE editor: {}",
                             err
@@ -5550,7 +5585,7 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
                     }
                 }
             } else {
-                app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                restore_taken_metadata_editor(app, TakenMetadataEditor { state: s, slot: restore_slot });
                 app.set_status(
                     ":tags-mb: metadata editor target changed since lookup; rerun"
                         .to_string(),
@@ -5559,7 +5594,7 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
             }
         } else {
             if !metadata_editor_paths_match_tags_mb_context(&s, &paths) {
-                app.active_overlay = ActiveOverlay::MetadataEditor(s);
+                restore_taken_metadata_editor(app, TakenMetadataEditor { state: s, slot: restore_slot });
                 app.set_status(
                     ":tags-mb: metadata editor changed since lookup; rerun".to_string(),
                 );

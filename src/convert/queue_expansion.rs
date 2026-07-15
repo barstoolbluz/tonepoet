@@ -840,7 +840,225 @@ fn first_resolved_member_audio_path_with_quote(parts: &[SyntheticCueAlbumPart]) 
     None
 }
 
+fn read_embedded_cuesheet_text_for_queue(path: &Path) -> Option<String> {
+    use lofty::prelude::*;
+
+    let tagged = lofty::read_from_path(path).ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    for item in tag.items() {
+        if let lofty::tag::ItemKey::Unknown(key) = item.key() {
+            if key.eq_ignore_ascii_case("CUESHEET") {
+                if let Some(text) = item.value().text() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    tag.get_string(&lofty::tag::ItemKey::Unknown("CUESHEET".to_string()))
+        .map(|value| value.to_string())
+}
+
+fn unique_member_audio_paths_for_synthetic_parts(parts: &[SyntheticCueAlbumPart]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for part in parts {
+        for audio in &part.referenced_audio {
+            if seen.insert(queue_path_key(audio)) {
+                out.push(audio.clone());
+            }
+        }
+    }
+    out
+}
+
+fn push_unique_embedded_cue_base_dir(
+    bases: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    base: PathBuf,
+) {
+    if seen.insert(queue_path_key(&base)) {
+        bases.push(base);
+    }
+}
+
+fn common_existing_parent_dir(paths: &[PathBuf]) -> Option<PathBuf> {
+    let parents: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect();
+    let first = parents.first()?;
+    first
+        .ancestors()
+        .find(|candidate| {
+            candidate.parent().is_some()
+                && parents.iter().all(|parent| parent.starts_with(candidate))
+        })
+        .map(Path::to_path_buf)
+}
+
+fn embedded_cue_base_dirs_for_synthetic_parts(parts: &[SyntheticCueAlbumPart]) -> Vec<PathBuf> {
+    let member_audio = unique_member_audio_paths_for_synthetic_parts(parts);
+    let mut bases = Vec::new();
+    let mut seen = HashSet::new();
+
+    for part in parts {
+        if let Some(parent) = part.cue_path.parent() {
+            push_unique_embedded_cue_base_dir(&mut bases, &mut seen, parent.to_path_buf());
+        }
+    }
+    if let Some(common) = common_existing_parent_dir(&member_audio) {
+        push_unique_embedded_cue_base_dir(&mut bases, &mut seen, common);
+    }
+    for audio in member_audio {
+        if let Some(parent) = audio.parent() {
+            push_unique_embedded_cue_base_dir(&mut bases, &mut seen, parent.to_path_buf());
+        }
+    }
+
+    bases
+}
+
+fn resolved_file_order_for_parsed_cue(
+    parent: &Path,
+    parsed: &crate::convert::cue_parser::CueSheet,
+) -> Option<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    let mut last_key: Option<PathBuf> = None;
+    for track in &parsed.tracks {
+        let file_ref = track.file.as_deref()?;
+        let path = match resolve_cue_file_reference_for_queue(parent, file_ref) {
+            CueReferenceResolution::Resolved(path) => path,
+            CueReferenceResolution::Missing | CueReferenceResolution::Ambiguous(_) => return None,
+        };
+        let key = queue_path_key(&path);
+        if last_key.as_ref() != Some(&key) {
+            resolved.push(path);
+            last_key = Some(key);
+        }
+    }
+    Some(resolved)
+}
+
+fn rewrite_embedded_cue_file_lines_to_absolute_paths(
+    text: &str,
+    file_order: &[PathBuf],
+) -> Option<String> {
+    let mut next_file = 0usize;
+    let mut out = String::new();
+    for line in text.trim().lines() {
+        let leading = line.len().saturating_sub(line.trim_start().len());
+        let trimmed = line.trim_start();
+        if trimmed
+            .get(..4)
+            .map(|prefix| prefix.eq_ignore_ascii_case("FILE"))
+            .unwrap_or(false)
+        {
+            let after = trimmed[4..].chars().next();
+            if !after.map(|ch| ch.is_whitespace()).unwrap_or(false) {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            let path = file_order.get(next_file)?;
+            if path.display().to_string().contains('"') {
+                return None;
+            }
+            out.push_str(&line[..leading]);
+            out.push_str(&format!(
+                "FILE \"{}\" {}\n",
+                quote_cue_value(&path.display().to_string()),
+                cue_file_type_for_queue(path)
+            ));
+            next_file += 1;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    (next_file == file_order.len()).then_some(out)
+}
+
+fn authoritative_embedded_cuesheet_for_member_audio(
+    member_audio: &[PathBuf],
+    base_dir: &Path,
+) -> Option<String> {
+    if member_audio.len() < 2 {
+        return None;
+    }
+
+    let mut embedded_texts = Vec::with_capacity(member_audio.len());
+    for audio in member_audio {
+        let text = read_embedded_cuesheet_text_for_queue(audio)?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        embedded_texts.push(trimmed.to_string());
+    }
+    let first = embedded_texts.first()?.clone();
+    if embedded_texts.iter().any(|text| text != &first) {
+        return None;
+    }
+
+    let parsed = crate::convert::cue_parser::parse_cue(&first);
+    if parsed.tracks.is_empty() {
+        return None;
+    }
+    let file_order = resolved_file_order_for_parsed_cue(base_dir, &parsed)?;
+    if file_order.len() != member_audio.len() {
+        return None;
+    }
+
+    let expected: HashSet<PathBuf> = member_audio.iter().map(|path| queue_path_key(path)).collect();
+    let actual: HashSet<PathBuf> = file_order.iter().map(|path| queue_path_key(path)).collect();
+    if actual != expected {
+        return None;
+    }
+
+    if parsed.tracks.iter().any(|track| track.index01_frames.is_none() || track.file.is_none()) {
+        return None;
+    }
+
+    rewrite_embedded_cue_file_lines_to_absolute_paths(&first, &file_order)
+}
+
+#[cfg(test)]
+pub(crate) fn planner_authoritative_embedded_cuesheet_accepts_for_test(
+    member_audio: &[PathBuf],
+    base_dir: &Path,
+) -> bool {
+    authoritative_embedded_cuesheet_for_member_audio(member_audio, base_dir).is_some()
+}
+
+fn authoritative_embedded_cuesheet_for_member_audio_with_base_dirs(
+    member_audio: &[PathBuf],
+    base_dirs: &[PathBuf],
+) -> Option<String> {
+    for base_dir in base_dirs {
+        if let Some(text) = authoritative_embedded_cuesheet_for_member_audio(member_audio, base_dir) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn authoritative_embedded_cuesheet_for_synthetic_parts(parts: &[SyntheticCueAlbumPart]) -> Option<String> {
+    if parts.len() < 2 {
+        return None;
+    }
+    let member_audio = unique_member_audio_paths_for_synthetic_parts(parts);
+    if member_audio.len() != parts.len() || member_audio.is_empty() {
+        return None;
+    }
+    let base_dirs = embedded_cue_base_dirs_for_synthetic_parts(parts);
+    authoritative_embedded_cuesheet_for_member_audio_with_base_dirs(&member_audio, &base_dirs)
+}
+
 fn generate_queue_synthetic_cue_album(parts: &[SyntheticCueAlbumPart]) -> Result<String, String> {
+    if let Some(authoritative) = authoritative_embedded_cuesheet_for_synthetic_parts(parts) {
+        return Ok(authoritative);
+    }
+
     let titles: Vec<String> = parts
         .iter()
         .map(|part| part.sheet.title.clone().unwrap_or_default())
@@ -3391,6 +3609,249 @@ mod limited_queue_expansion_tests {
         assert_eq!(expanded.paths.len(), 1);
         assert!(path_list_contains(&expanded.paths, &real));
         assert!(path_list_contains(&expanded.paths, &link));
+    }
+}
+
+
+#[cfg(test)]
+mod planner_embedded_authority_tests {
+    use super::*;
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::{ItemKey, ItemValue, Tag, TagItem};
+    use std::process::Command;
+
+    fn tool_available(tool: &str) -> bool {
+        Command::new(tool)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn require_flac_fixture_tool(test_name: &str) -> bool {
+        if tool_available("ffmpeg") {
+            return true;
+        }
+        eprintln!("skipping {test_name}: ffmpeg is required to create FLAC fixtures");
+        false
+    }
+
+    fn create_flac(path: &Path) {
+        let output = Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("sine=frequency=440:sample_rate=44100:duration=1")
+            .arg("-c:a")
+            .arg("flac")
+            .arg(path)
+            .output()
+            .expect("run ffmpeg fixture encode");
+        assert!(
+            output.status.success(),
+            "ffmpeg fixture encode failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn set_embedded_cuesheet(image: &Path, cue_text: &str) {
+        let mut tagged = lofty::read_from_path(image)
+            .unwrap_or_else(|err| panic!("read FLAC fixture for CUESHEET write {}: {err}", image.display()));
+        if tagged.primary_tag().is_none() {
+            let tag_type = tagged.primary_tag_type();
+            tagged.insert_tag(Tag::new(tag_type));
+        }
+        let tag = tagged.primary_tag_mut().expect("primary tag after insertion");
+        let key = ItemKey::Unknown("CUESHEET".to_string());
+        tag.remove_key(&key);
+        tag.insert_unchecked(TagItem::new(
+            key,
+            ItemValue::Text(cue_text.trim().to_string()),
+        ));
+        tagged
+            .save_to_path(image, WriteOptions::default())
+            .unwrap_or_else(|err| panic!("save CUESHEET tag via lofty {}: {err}", image.display()));
+    }
+
+    fn write_split_album(dir: &Path) -> (PathBuf, PathBuf) {
+        let side_a = dir.join("side_a.flac");
+        let side_b = dir.join("side_b.flac");
+        create_flac(&side_a);
+        create_flac(&side_b);
+        std::fs::write(
+            dir.join("side_a.cue"),
+            "PERFORMER \"Pink Floyd\"\nTITLE \"The Dark Side Of The Moon Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:00:37\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            dir.join("side_b.cue"),
+            "PERFORMER \"Pink Floyd\"\nTITLE \"The Dark Side Of The Moon Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"B1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"B2\"\n    INDEX 01 00:00:37\n",
+        )
+        .expect("side B cue");
+        (side_a, side_b)
+    }
+
+    fn authoritative_album_cue(title: &str) -> String {
+        format!(
+            "CATALOG EOP-80778\nPERFORMER \"Pink Floyd\"\nTITLE \"{title}\"\nREM DATE 1973\nREM GENRE \"Rock\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:00:37\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    TITLE \"B1\"\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    TITLE \"B2\"\n    INDEX 01 00:00:37\n"
+        )
+    }
+
+    fn single_synthetic_text(expansion: &QueueExpansionResult) -> String {
+        assert_eq!(expansion.expansion_errors, Vec::<String>::new());
+        assert_eq!(expansion.paths.len(), 1, "expected one synthetic queue item");
+        assert_eq!(expansion.synthetic_cue_artifacts.len(), 1);
+        std::fs::read_to_string(&expansion.paths[0]).expect("synthetic cue text")
+    }
+
+    #[test]
+    fn identical_member_embedded_cuesheet_is_authoritative_for_synthetic_artifact() {
+        if !require_flac_fixture_tool("identical_member_embedded_cuesheet_is_authoritative_for_synthetic_artifact") {
+            return;
+        }
+        let td = tempfile::tempdir().expect("tempdir");
+        let (side_a, side_b) = write_split_album(td.path());
+        let full_title = "The Dark Side of the Moon (Japan Toshiba Harvest-Odeon EOP-80778 LP / 24-192)";
+        let embedded = authoritative_album_cue(full_title);
+        set_embedded_cuesheet(&side_a, &embedded);
+        set_embedded_cuesheet(&side_b, &embedded);
+
+        let expansion = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        let synthetic = single_synthetic_text(&expansion);
+
+        assert!(synthetic.contains(&format!("TITLE \"{full_title}\"")), "embedded album title must win: {synthetic}");
+        assert!(synthetic.contains("CATALOG EOP-80778"));
+        assert!(synthetic.contains(&format!("FILE \"{}\" FLAC", side_a.display())) || synthetic.contains(&format!("FILE \"{}\" WAVE", side_a.display())));
+        assert!(synthetic.contains(&format!("FILE \"{}\" FLAC", side_b.display())) || synthetic.contains(&format!("FILE \"{}\" WAVE", side_b.display())));
+        assert!(!synthetic.contains("TITLE \"The Dark Side Of The Moon\""), "sidecar common-prefix title must not overwrite embedded authority");
+        cleanup_synthetic_cue_artifacts(&expansion.synthetic_cue_artifacts);
+    }
+
+    #[test]
+    fn embedded_authority_resolves_nested_member_files_from_common_album_root() {
+        if !require_flac_fixture_tool("embedded_authority_resolves_nested_member_files_from_common_album_root") {
+            return;
+        }
+        let td = tempfile::tempdir().expect("tempdir");
+        let disc1 = td.path().join("disc1");
+        let disc2 = td.path().join("disc2");
+        std::fs::create_dir_all(&disc1).expect("disc1");
+        std::fs::create_dir_all(&disc2).expect("disc2");
+        let side_a = disc1.join("side_a.flac");
+        let side_b = disc2.join("side_b.flac");
+        create_flac(&side_a);
+        create_flac(&side_b);
+
+        let embedded = r#"CATALOG EOP-80778
+PERFORMER "Pink Floyd"
+TITLE "Nested Member Authority"
+FILE "disc1/side_a.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "A1"
+    INDEX 01 00:00:00
+FILE "disc2/side_b.flac" WAVE
+  TRACK 02 AUDIO
+    TITLE "B1"
+    INDEX 01 00:00:00
+"#;
+        set_embedded_cuesheet(&side_a, embedded);
+        set_embedded_cuesheet(&side_b, embedded);
+
+        let accepted = authoritative_embedded_cuesheet_for_member_audio_with_base_dirs(
+            &[side_a.clone(), side_b.clone()],
+            &[disc1.clone(), td.path().to_path_buf(), disc2.clone()],
+        )
+        .expect("common-root base must accept nested member FILE references");
+
+        assert!(accepted.contains("TITLE \"Nested Member Authority\""));
+        assert!(
+            accepted.contains(&format!("FILE \"{}\" FLAC", side_a.display()))
+                || accepted.contains(&format!("FILE \"{}\" WAVE", side_a.display())),
+            "side A FILE must be rewritten to its absolute nested path: {accepted}"
+        );
+        assert!(
+            accepted.contains(&format!("FILE \"{}\" FLAC", side_b.display()))
+                || accepted.contains(&format!("FILE \"{}\" WAVE", side_b.display())),
+            "side B FILE must be rewritten to its absolute nested path: {accepted}"
+        );
+    }
+
+    #[test]
+    fn missing_or_differing_member_embedded_cuesheets_fall_back_to_sidecar_regeneration() {
+        if !require_flac_fixture_tool("missing_or_differing_member_embedded_cuesheets_fall_back_to_sidecar_regeneration") {
+            return;
+        }
+        let td = tempfile::tempdir().expect("tempdir");
+        let (side_a, side_b) = write_split_album(td.path());
+        set_embedded_cuesheet(&side_a, &authoritative_album_cue("Authoritative A"));
+        set_embedded_cuesheet(&side_b, &authoritative_album_cue("Authoritative B"));
+
+        let differing = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        let differing_text = single_synthetic_text(&differing);
+        assert!(differing_text.contains("TITLE \"The Dark Side Of The Moon\""), "differing embedded sheets must fall back to regenerated sidecar model: {differing_text}");
+        assert!(!differing_text.contains("Authoritative A"));
+        assert!(!differing_text.contains("Authoritative B"));
+        cleanup_synthetic_cue_artifacts(&differing.synthetic_cue_artifacts);
+
+        let td_missing = tempfile::tempdir().expect("tempdir");
+        let (missing_a, _missing_b) = write_split_album(td_missing.path());
+        set_embedded_cuesheet(&missing_a, &authoritative_album_cue("Only One Member Has This"));
+        let missing = expand_paths_to_audio_with_metadata(&[td_missing.path().to_path_buf()]);
+        let missing_text = single_synthetic_text(&missing);
+        assert!(missing_text.contains("TITLE \"The Dark Side Of The Moon\""));
+        assert!(!missing_text.contains("Only One Member Has This"));
+        cleanup_synthetic_cue_artifacts(&missing.synthetic_cue_artifacts);
+    }
+
+    #[test]
+    fn stale_subset_embedded_cuesheet_falls_back_to_sidecar_regeneration() {
+        if !require_flac_fixture_tool("stale_subset_embedded_cuesheet_falls_back_to_sidecar_regeneration") {
+            return;
+        }
+        let td = tempfile::tempdir().expect("tempdir");
+        let (side_a, side_b) = write_split_album(td.path());
+        let stale_subset = "PERFORMER \"Pink Floyd\"\nTITLE \"Stale Side A Only\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:00:37\n";
+        set_embedded_cuesheet(&side_a, stale_subset);
+        set_embedded_cuesheet(&side_b, stale_subset);
+
+        let expansion = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        let synthetic = single_synthetic_text(&expansion);
+        assert!(synthetic.contains("TITLE \"The Dark Side Of The Moon\""), "FILE-set mismatch must reject embedded subset authority: {synthetic}");
+        assert!(!synthetic.contains("Stale Side A Only"));
+        cleanup_synthetic_cue_artifacts(&expansion.synthetic_cue_artifacts);
+    }
+
+    #[test]
+    fn planner_ignores_hidden_dot_cues_when_building_synthetic_groups() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(td.path().join("side_a.flac"), b"placeholder audio").expect("side A audio");
+        std::fs::write(td.path().join("side_b.flac"), b"placeholder audio").expect("side B audio");
+        std::fs::write(
+            td.path().join("side_a.cue"),
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:30:00\n",
+        )
+        .expect("visible cue A");
+        std::fs::write(
+            td.path().join("side_b.cue"),
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:30:00\n",
+        )
+        .expect("visible cue B");
+        std::fs::write(td.path().join("._album.cue"), b"not a cue").expect("appledouble cue");
+
+        let expansion = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert_eq!(expansion.expansion_errors, Vec::<String>::new(), "hidden cue must not poison planning");
+        assert_eq!(expansion.paths.len(), 1);
+        assert_eq!(expansion.synthetic_cue_artifacts.len(), 1);
+        cleanup_synthetic_cue_artifacts(&expansion.synthetic_cue_artifacts);
     }
 }
 

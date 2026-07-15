@@ -1720,15 +1720,6 @@ fn metadata_editor_session_guard(
     }
 }
 
-fn metadata_editor_matches_session_guard(
-    state: &super::app::MetadataEditorState,
-    guard: super::message::MetadataEditorSessionGuard,
-) -> bool {
-    let details = &state.active_surface().technical_details;
-    details.session_id == guard.session_id && details.save_generation == guard.save_generation
-}
-
-
 fn metadata_editor_tags_mb_context_paths(
     state: &super::app::MetadataEditorState,
 ) -> Vec<PathBuf> {
@@ -6865,6 +6856,23 @@ fn execute_commit_with_source_options_transform(
         crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
     });
     let canonical_naming_template = options.effective_naming_template("%NN% - %TITLE%");
+    let mut archive_passwords_by_path: BTreeMap<std::path::PathBuf, String> = BTreeMap::new();
+    for path in &batch {
+        if crate::is_encrypted_archive_ext(path) {
+            if let Some(password) = app
+                .archive_passwords
+                .get(path)
+                .cloned()
+                .or_else(|| {
+                    app.keychain.ensure_loaded();
+                    app.keychain.passwords.first().cloned()
+                })
+                .or_else(|| app.config.conversion.archive_password.clone())
+            {
+                archive_passwords_by_path.insert(path.clone(), password);
+            }
+        }
+    }
 
     // Enqueue the whole batch via the manager transaction API. CUE sidecar
     // override metadata lives on the Convert source state, because that state
@@ -6887,6 +6895,9 @@ fn execute_commit_with_source_options_transform(
                 item.archive_metadata_overrides = archive_metadata_overrides.clone();
             }
 
+            if let Some(password) = archive_passwords_by_path.get(&item.input_path) {
+                item.archive_password = Some(password.clone());
+            }
             let mut item_source = commit_source.clone();
             if let Some(ref pw) = item.archive_password {
                 item_source.archive_password = Some(SecretString::new(pw.clone()));
@@ -7054,6 +7065,7 @@ fn execute_commit_with_source_options_transform(
     app.convert.source.cue_artifact_audio.clear();
     app.convert.metadata = MetadataState::default();
     let _ = app.db.clear_batch_state();
+    app.save_queue();
 
     // Remove only the committed paths from browse.multi_selected so the
     // user's unrelated selection state is preserved. This handles:
@@ -11294,15 +11306,30 @@ fn dispatch_regular_file_editor_tags_mb_toc(
     tx: &mpsc::Sender<AppMessage>,
     state_owned: Box<super::app::MetadataEditorState>,
 ) -> bool {
-    use super::app::ActiveOverlay;
+    dispatch_regular_file_editor_tags_mb_toc_from_taken(
+        app,
+        tx,
+        super::event_loop::TakenMetadataEditor {
+            state: state_owned,
+            slot: super::event_loop::MetadataEditorRestoreSlot::Active,
+        },
+    )
+}
 
+fn dispatch_regular_file_editor_tags_mb_toc_from_taken(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    taken: super::event_loop::TakenMetadataEditor,
+) -> bool {
     // File editor: state.active_surface().paths is the audio file set. Use the
     // same TOC derivation the Browse path uses — first try AccurateRip-style
-    // offsets in the parent dir, fall back to per-file sample counts.
-    let editor_session = metadata_editor_session_guard(&state_owned);
-    let paths = state_owned.active_surface().paths.clone();
+    // offsets in the parent dir, fall back to per-file sample counts. The
+    // editor is restored through the slot-aware event-loop helper on every
+    // path so a stale async completion cannot overwrite a newer picker/modal.
+    let editor_session = metadata_editor_session_guard(&taken.state);
+    let paths = taken.state.active_surface().paths.clone();
     let Some(first_path) = paths.first().cloned() else {
-        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        super::event_loop::restore_taken_metadata_editor(app, taken);
         app.set_status(":tags-mb: editor has no paths".to_string());
         return true;
     };
@@ -11325,7 +11352,7 @@ fn dispatch_regular_file_editor_tags_mb_toc(
                 sectors
             }
             Err(e) => {
-                app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+                super::event_loop::restore_taken_metadata_editor(app, taken);
                 app.set_status(format!(":tags-mb: {}", e));
                 return true;
             }
@@ -11333,12 +11360,12 @@ fn dispatch_regular_file_editor_tags_mb_toc(
     };
 
     if super::musicbrainz::build_mb_toc(&sectors).is_none() {
-        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+        super::event_loop::restore_taken_metadata_editor(app, taken);
         app.set_status(":tags-mb: TOC too short".to_string());
         return true;
     }
 
-    app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+    super::event_loop::restore_taken_metadata_editor(app, taken);
     spawn_tags_mb_toc_lookup(
         app,
         tx,
@@ -11386,14 +11413,15 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
     request: InEditorSplitCueMusicBrainzInfoRequest,
     result: Result<Vec<super::cue_parser::SingleImageInfo>, String>,
 ) {
-    use super::app::ActiveOverlay;
-
-    let Some(state_owned) = super::event_loop::take_metadata_editor(app) else {
+    let Some(taken) = super::event_loop::take_metadata_editor_with_restore_slot(app) else {
         app.set_status(":tags-mb: editor closed during split-CUE discovery; rerun".to_string());
         return;
     };
-    if !metadata_editor_matches_session_guard(&state_owned, request.editor_session) {
-        app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+    if !super::event_loop::metadata_editor_matches_session_guard(
+        &taken.state,
+        request.editor_session,
+    ) {
+        super::event_loop::restore_taken_metadata_editor(app, taken);
         app.set_status(
             ":tags-mb: metadata editor changed during split-CUE discovery; rerun"
                 .to_string(),
@@ -11404,7 +11432,7 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
     let infos = match result {
         Ok(infos) => infos,
         Err(err) => {
-            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            super::event_loop::restore_taken_metadata_editor(app, taken);
             app.set_status(format!(":tags-mb: {err}"));
             return;
         }
@@ -11412,7 +11440,7 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
 
     match request.source {
         InEditorSplitCueMusicBrainzSource::UnifiedAlbum => {
-            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            super::event_loop::restore_taken_metadata_editor(app, taken);
             if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
                 app,
                 tx,
@@ -11429,7 +11457,7 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
             );
         }
         InEditorSplitCueMusicBrainzSource::PresentationTabs => {
-            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            super::event_loop::restore_taken_metadata_editor(app, taken);
             if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
                 app,
                 tx,
@@ -11447,7 +11475,7 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
         }
         InEditorSplitCueMusicBrainzSource::SingleSourceFolder => {
             let Some(active_audio_path) = request.active_audio_path else {
-                app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+                super::event_loop::restore_taken_metadata_editor(app, taken);
                 app.set_status(":tags-mb: editor has no active audio path".to_string());
                 return;
             };
@@ -11462,11 +11490,11 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
                 same_path_for_split_cue(&info.audio_path, &active_audio_path)
             });
             if same_folder_infos.len() < 2 || !contains_active {
-                dispatch_regular_file_editor_tags_mb_toc(app, tx, state_owned);
+                dispatch_regular_file_editor_tags_mb_toc_from_taken(app, tx, taken);
                 return;
             }
-            if state_owned.any_presentation_dirty() {
-                app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            if taken.state.any_presentation_dirty() {
+                super::event_loop::restore_taken_metadata_editor(app, taken);
                 app.set_status(
                     ":tags-mb: source folder contains multiple CUE surfaces; save or revert editor changes before running split-CUE MusicBrainz lookup"
                         .to_string(),
@@ -11480,7 +11508,7 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
             // and parked behind any picker so the async completion can prove
             // the same editor session is still current, but do not require
             // its file-dimension paths to equal the target paths later.
-            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            super::event_loop::restore_taken_metadata_editor(app, taken);
             if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
                 app,
                 tx,
@@ -17058,8 +17086,22 @@ mod in_editor_tags_mb_reducer_safety_tests {
             .expect("completion handler should precede :tags-mb dispatcher");
         let completion_body = &source[completion_start..completion_end];
         assert!(
-            completion_body.contains("metadata_editor_matches_session_guard(&state_owned, request.editor_session)"),
-            "stale split-CUE discovery completions must be rejected before mutating an editor"
+            completion_body.contains("super::event_loop::metadata_editor_matches_session_guard(")
+                && completion_body.contains("&taken.state")
+                && completion_body.contains("request.editor_session"),
+            "stale split-CUE discovery completions must be rejected through the editor-level shared session guard"
+        );
+        assert!(
+            completion_body.contains("super::event_loop::take_metadata_editor_with_restore_slot(app)"),
+            "split-CUE discovery completions must remember whether the editor came from active or pending"
+        );
+        assert!(
+            completion_body.contains("super::event_loop::restore_taken_metadata_editor(app, taken)"),
+            "split-CUE discovery rejection paths must restore without overwriting a newer active overlay"
+        );
+        assert!(
+            !completion_body.contains("ActiveOverlay::MetadataEditor(state_owned)"),
+            "split-CUE discovery completion must not directly overwrite active_overlay on rejection"
         );
         assert!(
             completion_body.contains("Some(request.editor_session)"),

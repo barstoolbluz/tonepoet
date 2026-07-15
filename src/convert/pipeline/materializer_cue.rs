@@ -23,6 +23,7 @@ use super::reporter::PipelineReporter;
 use super::stages::Materializer;
 use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
+use crate::convert::classify::is_cue_sheet_path;
 use crate::tui::cue_parser::{decode_cue_bytes_for_path, parse_cue, CueSheet};
 
 #[derive(Debug, Clone)]
@@ -324,7 +325,8 @@ fn read_sidecar_cue(
     validate_sidecar_layout(&sheet)?;
 
     let cue_parent = cue_path.parent().map(Path::to_path_buf);
-    let fallback_image = (!has_extension(&req.container, "cue")).then(|| req.container.clone());
+    let req_container_is_visible_cue = is_cue_sheet_path(&req.container);
+    let fallback_image = (!req_container_is_visible_cue).then(|| req.container.clone());
     let cue_input = CueInput {
         sheet,
         raw_cue,
@@ -333,7 +335,7 @@ fn read_sidecar_cue(
         fallback_image,
     };
 
-    if !has_extension(&req.container, "cue") {
+    if !req_container_is_visible_cue {
         let track_images = resolve_track_image_paths(&cue_input)?;
         if !track_images
             .iter()
@@ -354,7 +356,7 @@ fn read_sidecar_cue(
     // When the referenced image carries an embedded sheet that structurally
     // matches, prefer that sheet for metadata so conversion observes saved
     // editor corrections even if sidecar write-back was skipped or failed.
-    if has_extension(&req.container, "cue") {
+    if req_container_is_visible_cue {
         if let Some(upgraded) = try_upgrade_sidecar_to_embedded_image_cue(&cue_input) {
             return Ok(upgraded);
         }
@@ -493,11 +495,10 @@ pub(crate) fn is_cue_image_candidate(req: &PipelineRequest) -> Result<bool, Sour
         return Ok(false);
     }
 
-    if has_extension(&req.container, "cue") {
-        // A .cue path is a CUE-image candidate even when its contents are
-        // malformed. The materializer owns parse validation and will return
-        // MaterializeError::Parse instead of letting the processor fall back to
-        // one-file legacy conversion.
+    if is_cue_sheet_path(&req.container) {
+        // A user-visible .cue path is a CUE-image candidate even when its
+        // contents are malformed. Hidden dot-cues are sidecar artifacts and
+        // must be ignored consistently with Browse and queue expansion.
         return Ok(true);
     }
 
@@ -527,7 +528,7 @@ pub(crate) fn is_cue_image_candidate(req: &PipelineRequest) -> Result<bool, Sour
 }
 
 fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDetectError> {
-    if has_extension(image, "cue") {
+    if is_cue_sheet_path(image) {
         return Ok(Some(image.to_path_buf()));
     }
 
@@ -628,7 +629,7 @@ fn embedded_cuesheet_is_present(path: &Path) -> bool {
 }
 
 fn find_valid_sidecar_cue_for_image(image: &Path) -> Result<Option<PathBuf>, MaterializeError> {
-    if has_extension(image, "cue") {
+    if is_cue_sheet_path(image) {
         return Ok(Some(image.to_path_buf()));
     }
 
@@ -735,7 +736,7 @@ fn source_detect_to_materialize(err: SourceDetectError) -> MaterializeError {
 }
 
 fn sidecar_cue_candidates(path: &Path) -> Result<Vec<PathBuf>, SourceDetectError> {
-    if has_extension(path, "cue") {
+    if is_cue_sheet_path(path) {
         return Ok(vec![path.to_path_buf()]);
     }
 
@@ -747,7 +748,7 @@ fn sidecar_cue_candidates(path: &Path) -> Result<Vec<PathBuf>, SourceDetectError
     for entry in std::fs::read_dir(parent)? {
         let entry = entry?;
         let candidate = entry.path();
-        if candidate.is_file() && has_extension(&candidate, "cue") {
+        if candidate.is_file() && is_cue_sheet_path(&candidate) {
             cues.push(candidate);
         }
     }
@@ -2149,6 +2150,7 @@ struct ImageAlbumMetadata {
     date: Option<String>,
     total_discs: Option<u32>,
     disc_number: Option<u32>,
+    extra: BTreeMap<String, String>,
     source: Option<String>,
 }
 
@@ -2190,6 +2192,7 @@ fn merge_image_album_metadata(
         if merged.disc_number.is_none() {
             merged.disc_number = metadata.disc_number;
         }
+        merge_image_album_metadata_extra(&mut merged.extra, &metadata.extra, &image_path);
     }
 
     if !sources.is_empty() {
@@ -2197,6 +2200,51 @@ fn merge_image_album_metadata(
     }
 
     merged
+}
+
+fn merge_image_album_metadata_extra(
+    merged: &mut BTreeMap<String, String>,
+    candidate: &BTreeMap<String, String>,
+    image_path: &Path,
+) {
+    for (key, value) in candidate {
+        if value.trim().is_empty() {
+            continue;
+        }
+        match merged.get(key) {
+            None => {
+                merged.insert(key.clone(), value.clone());
+            }
+            Some(existing) if existing == value => {}
+            Some(existing) => {
+                log::warn!(
+                    "conflicting album-level image tag {key} on CUE member '{}'; keeping first value {:?}, ignoring {:?}",
+                    image_path.display(),
+                    existing,
+                    value
+                );
+            }
+        }
+    }
+}
+
+fn set_extra_if_empty(extra: &mut BTreeMap<String, String>, key: &str, value: &str) {
+    if !value.trim().is_empty() && !extra.contains_key(key) {
+        extra.insert(key.to_string(), value.trim().to_string());
+    }
+}
+
+fn cue_image_extra_key(key: &str) -> Option<&'static str> {
+    match key {
+        "catalog" | "catalognumber" | "discogscatalog" => Some("catalognumber"),
+        "releasecountry" | "country" => Some("releasecountry"),
+        "originalyear" => Some("originalyear"),
+        "originaldate" | "originalreleasedate" | "tdor" => Some("originaldate"),
+        "musicbrainzalbumid" | "musicbrainzreleaseid" => Some("musicbrainz_albumid"),
+        "musicbrainzalbumartistid" | "musicbrainzreleaseartistid" => Some("musicbrainz_albumartistid"),
+        "musicbrainzreleasegroupid" => Some("musicbrainz_releasegroupid"),
+        _ => None,
+    }
 }
 
 fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
@@ -2238,7 +2286,11 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
                     metadata.total_discs = parse_tag_number(value);
                 }
             }
-            None => {}
+            None => {
+                if let Some(extra_key) = cue_image_extra_key(&key) {
+                    set_extra_if_empty(&mut metadata.extra, extra_key, value);
+                }
+            }
         }
     }
 
@@ -2249,6 +2301,7 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
         || metadata.date.is_some()
         || metadata.total_discs.is_some()
         || metadata.disc_number.is_some()
+        || !metadata.extra.is_empty()
     {
         metadata.source = Some(path.display().to_string());
     }
@@ -2274,9 +2327,7 @@ fn cue_image_tag_field(key: &str) -> Option<ImageTagField> {
         }
         "artist" | "trackartist" | "performer" | "tpe1" => Some(ImageTagField::Artist),
         "genre" | "tcon" => Some(ImageTagField::Genre),
-        "date" | "year" | "recordingdate" | "originaldate" | "tdrc" | "tyer" => {
-            Some(ImageTagField::Date)
-        }
+        "date" | "year" | "recordingdate" | "tdrc" | "tyer" => Some(ImageTagField::Date),
         "discnumber" | "disc" | "partofset" | "tpos" => Some(ImageTagField::DiscNumber),
         "totaldiscs" | "disctotal" => Some(ImageTagField::TotalDiscs),
         _ => None,
@@ -2416,8 +2467,12 @@ fn cue_album_metadata(
     total_tracks: u32,
 ) -> AlbumMetadata {
     let mut extra = BTreeMap::new();
+    for (key, value) in &image.extra {
+        extra.entry(key.clone()).or_insert_with(|| value.clone());
+    }
     if let Some(catalog) = &sheet.catalog {
         extra.insert("catalog".to_string(), catalog.clone());
+        extra.insert("catalognumber".to_string(), catalog.clone());
     }
     if let Some(source) = &image.source {
         extra.insert("image_metadata_source".to_string(), source.clone());
@@ -2633,13 +2688,6 @@ fn has_audio_extension(path: &Path) -> bool {
     // classifier as Browse and queue expansion. Do not maintain an
     // independent extension table here.
     crate::convert::classify::is_audio_file_path(path)
-}
-
-fn has_extension(path: &Path, ext: &str) -> bool {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case(ext))
-        .unwrap_or(false)
 }
 
 fn same_existing_path(left: &Path, right: &Path) -> bool {
@@ -3983,6 +4031,43 @@ FILE "track2.flac" WAVE
     }
 
     #[test]
+    fn sidecar_discovery_ignores_hidden_dot_cue_when_visible_matching_cue_exists() {
+        // Hidden dot-cues are filesystem sidecars (for example AppleDouble
+        // ._album.cue) and must not participate in CUE route detection. A
+        // valid hidden CUE that also subdivides the image must not make the
+        // visible sidecar ambiguous or win discovery.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let visible_cue = temp.path().join("visible.cue");
+        let hidden_cue = temp.path().join("._album.cue");
+        let _ = std::fs::write(&image, b"fake-audio-data");
+        let cue_text = br#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#;
+        let _ = std::fs::write(&visible_cue, cue_text);
+        let _ = std::fs::write(&hidden_cue, cue_text);
+
+        let route = sidecar_cue_route_candidate(&image)
+            .expect("hidden dot-cue must not make route detection ambiguous")
+            .expect("visible subdividing CUE should be discovered");
+        assert_eq!(route, visible_cue);
+
+        let materializer_cue = find_valid_sidecar_cue_for_image(&image)
+            .expect("hidden dot-cue must not make materializer discovery ambiguous")
+            .expect("visible subdividing CUE should be discovered");
+        assert_eq!(materializer_cue, visible_cue);
+
+        let req = test_request(&image);
+        assert!(
+            is_cue_image_candidate(&req).expect("candidate detection succeeds"),
+            "visible CUE should still select the CUE materializer route"
+        );
+    }
+
+    #[test]
     fn sidecar_discovery_matches_side_image_subdivided_by_multi_file_cue() {
         // The legitimate multi-FILE case: per-side images where the CUE maps
         // several tracks to each file. Scan-based discovery still applies.
@@ -4389,6 +4474,39 @@ FILE "side-b.flac" WAVE
         );
     }
 
+    pub(super) fn write_lofty_tags(path: &Path, tags: &[(&str, &str)]) {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+        let mut tagged = lofty::read_from_path(path)
+            .unwrap_or_else(|err| panic!("failed to read {} with lofty: {err}", path.display()));
+        if tagged.primary_tag().is_none() {
+            let tag_type = tagged.primary_tag_type();
+            tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+        }
+        let tag = tagged
+            .primary_tag_mut()
+            .unwrap_or_else(|| panic!("failed to create primary tag for {}", path.display()));
+
+        for (key, value) in tags {
+            let item_key = ItemKey::Unknown((*key).to_string());
+            tag.remove_key(&item_key);
+            tag.insert_unchecked(TagItem::new(
+                item_key,
+                ItemValue::Text((*value).to_string()),
+            ));
+        }
+
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .unwrap_or_else(|err| panic!("failed to save {} with lofty: {err}", path.display()));
+    }
+
+    pub(super) fn write_lofty_cuesheet(path: &Path, cue: &str) {
+        write_lofty_tags(path, &[("CUESHEET", cue)]);
+    }
+
     struct RealProcessToolRunner;
 
     #[async_trait]
@@ -4611,10 +4729,8 @@ FILE "side-b.flac" WAVE
 
     #[test]
     fn prefer_embedded_does_not_swallow_malformed_embedded_cuesheet() {
-        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
-            eprintln!(
-                "skipping malformed embedded CUESHEET fixture: ffmpeg or metaflac is unavailable"
-            );
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping malformed embedded CUESHEET fixture: ffmpeg unavailable");
             return;
         }
 
@@ -4652,14 +4768,8 @@ FILE "side-b.flac" WAVE
                 .arg("flac")
                 .arg(&image),
         );
-        run_fixture_command(
-            std::process::Command::new("metaflac")
-                .arg(format!(
-                    "--set-tag-from-file=CUESHEET={}",
-                    embedded_cue.display()
-                ))
-                .arg(&image),
-        );
+        let embedded = std::fs::read_to_string(&embedded_cue).expect("embedded cue text");
+        write_lofty_cuesheet(&image, &embedded);
 
         let mut req = test_request(&image);
         req.source.cue_sidecar = CueSidecarPolicy::PreferEmbedded;
@@ -4679,14 +4789,13 @@ FILE "side-b.flac" WAVE
 
     #[test]
     fn lofty_reads_real_flac_tags_and_embedded_cuesheet_fixture() {
-        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
-            eprintln!("skipping real FLAC/lofty fixture: ffmpeg or metaflac is unavailable");
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping real FLAC/lofty fixture: ffmpeg unavailable");
             return;
         }
 
         let temp = tempfile::tempdir().expect("temp dir");
         let image = temp.path().join("lofty-image.flac");
-        let cue_path = temp.path().join("embedded.cue");
         let cue = r#"PERFORMER "Embedded Cue Artist"
 TITLE "Embedded Cue Album"
 FILE "lofty-image.flac" WAVE
@@ -4694,7 +4803,6 @@ FILE "lofty-image.flac" WAVE
     TITLE "Embedded Cue Track One"
     INDEX 01 00:00:00
 "#;
-        std::fs::write(&cue_path, cue).expect("write cue text");
 
         run_fixture_command(
             std::process::Command::new("ffmpeg")
@@ -4710,17 +4818,26 @@ FILE "lofty-image.flac" WAVE
                 .arg("flac")
                 .arg(&image),
         );
-        run_fixture_command(
-            std::process::Command::new("metaflac")
-                .arg("--set-tag=ALBUM=Lofty Image Album")
-                .arg("--set-tag=ARTIST=Lofty Image Artist")
-                .arg("--set-tag=ALBUMARTIST=Lofty Image Album Artist")
-                .arg("--set-tag=DATE=2026")
-                .arg("--set-tag=GENRE=Lofty Fixture")
-                .arg("--set-tag=DISCNUMBER=1")
-                .arg("--set-tag=TOTALDISCS=2")
-                .arg(format!("--set-tag-from-file=CUESHEET={}", cue_path.display()))
-                .arg(&image),
+        write_lofty_tags(
+            &image,
+            &[
+                ("ALBUM", "Lofty Image Album"),
+                ("ARTIST", "Lofty Image Artist"),
+                ("ALBUMARTIST", "Lofty Image Album Artist"),
+                ("DATE", "2026"),
+                ("GENRE", "Lofty Fixture"),
+                ("DISCNUMBER", "1"),
+                ("TOTALDISCS", "2"),
+                ("CATALOGNUMBER", "IMG-001"),
+                ("RELEASECOUNTRY", "JP"),
+                ("ORIGINALYEAR", "1973"),
+                ("MUSICBRAINZ_ALBUMID", "mb-album"),
+                ("MUSICBRAINZ_ALBUMARTISTID", "mb-album-artist"),
+                ("MUSICBRAINZ_RELEASEGROUPID", "mb-release-group"),
+                ("ISRC", "USRC17607839"),
+                ("MUSICBRAINZ_TRACKID", "mb-track-must-not-copy"),
+                ("CUESHEET", cue),
+            ],
         );
 
         let image_metadata = read_image_album_metadata(&image);
@@ -4734,12 +4851,73 @@ FILE "lofty-image.flac" WAVE
         assert_eq!(image_metadata.genre.as_deref(), Some("Lofty Fixture"));
         assert_eq!(image_metadata.disc_number, Some(1));
         assert_eq!(image_metadata.total_discs, Some(2));
+        assert_eq!(image_metadata.extra.get("catalognumber").map(String::as_str), Some("IMG-001"));
+        assert_eq!(image_metadata.extra.get("releasecountry").map(String::as_str), Some("JP"));
+        assert_eq!(
+            image_metadata
+                .extra
+                .get("originalyear")
+                .or_else(|| image_metadata.extra.get("originaldate"))
+                .map(String::as_str),
+            Some("1973"),
+            "lofty canonicalizes Vorbis ORIGINALYEAR to OriginalReleaseDate on read"
+        );
+        assert_eq!(image_metadata.extra.get("musicbrainz_albumid").map(String::as_str), Some("mb-album"));
+        assert_eq!(image_metadata.extra.get("musicbrainz_albumartistid").map(String::as_str), Some("mb-album-artist"));
+        assert_eq!(image_metadata.extra.get("musicbrainz_releasegroupid").map(String::as_str), Some("mb-release-group"));
+        assert!(!image_metadata.extra.contains_key("isrc"), "per-track ISRC must not be copied as album metadata");
+        assert!(!image_metadata.extra.contains_key("musicbrainz_trackid"), "per-track MusicBrainz IDs must not be copied as album metadata");
+
+        let mut sheet = crate::tui::cue_parser::parse_cue(cue);
+        sheet.catalog = Some("SHEET-CATALOG".to_string());
+        let album = cue_album_metadata(&sheet, &image_metadata, 1);
+        assert_eq!(album.extra.get("catalog").map(String::as_str), Some("SHEET-CATALOG"));
+        assert_eq!(album.extra.get("catalognumber").map(String::as_str), Some("SHEET-CATALOG"), "CUE CATALOG is the authoritative catalog number when both sheet and image tags provide catalog data");
+        assert_eq!(album.extra.get("releasecountry").map(String::as_str), Some("JP"));
+        assert_eq!(
+            album.extra.get("originalyear").or_else(|| album.extra.get("originaldate")).map(String::as_str),
+            Some("1973"),
+            "lofty canonicalizes Vorbis ORIGINALYEAR to OriginalReleaseDate on read"
+        );
+        assert_eq!(album.extra.get("musicbrainz_albumid").map(String::as_str), Some("mb-album"));
 
         let embedded = read_embedded_cuesheet(&image)
             .expect("lofty read should succeed")
             .expect("embedded CUESHEET should exist");
         assert!(embedded.contains("Embedded Cue Album"));
         assert!(embedded.contains("Embedded Cue Track One"));
+    }
+
+
+    #[test]
+    fn image_album_metadata_extra_merge_is_first_non_empty_and_conflict_safe() {
+        let first = PathBuf::from("/album/side_a.flac");
+        let second = PathBuf::from("/album/side_b.flac");
+        let mut first_metadata = ImageAlbumMetadata::default();
+        first_metadata.extra.insert("releasecountry".to_string(), "JP".to_string());
+        first_metadata.extra.insert("originalyear".to_string(), "1973".to_string());
+        let mut second_metadata = ImageAlbumMetadata::default();
+        second_metadata.extra.insert("releasecountry".to_string(), "US".to_string());
+        second_metadata.extra.insert("musicbrainz_albumid".to_string(), "mb-album".to_string());
+
+        let mut by_image = HashMap::new();
+        by_image.insert(path_identity(&first), first_metadata);
+        by_image.insert(path_identity(&second), second_metadata);
+
+        let merged = merge_image_album_metadata(&[first, second], &by_image);
+        assert_eq!(merged.extra.get("releasecountry").map(String::as_str), Some("JP"));
+        assert_eq!(merged.extra.get("originalyear").map(String::as_str), Some("1973"));
+        assert_eq!(merged.extra.get("musicbrainz_albumid").map(String::as_str), Some("mb-album"));
+    }
+
+    #[test]
+    fn album_extra_whitelist_rejects_track_scoped_keys() {
+        assert_eq!(cue_image_extra_key(&normalize_tag_key("CATALOGNUMBER")), Some("catalognumber"));
+        assert_eq!(cue_image_extra_key(&normalize_tag_key("RELEASECOUNTRY")), Some("releasecountry"));
+        assert_eq!(cue_image_extra_key(&normalize_tag_key("MUSICBRAINZ_ALBUMID")), Some("musicbrainz_albumid"));
+        assert_eq!(cue_image_extra_key(&normalize_tag_key("ISRC")), None);
+        assert_eq!(cue_image_extra_key(&normalize_tag_key("MUSICBRAINZ_TRACKID")), None);
+        assert_eq!(cue_image_extra_key(&normalize_tag_key("MUSICBRAINZ_RELEASETRACKID")), None);
     }
 
     // ── Category G: probe failure ──
@@ -4770,7 +4948,9 @@ FILE "lofty-image.flac" WAVE
 #[cfg(test)]
 mod sidecar_embedded_upgrade_tests {
     use super::*;
-    use super::materializer_cue_tests::{fixture_tool_available, run_fixture_command, test_request};
+    use super::materializer_cue_tests::{
+        fixture_tool_available, run_fixture_command, test_request, write_lofty_cuesheet,
+    };
 
     fn write_image_with_embedded(dir: &Path, image_name: &str, embedded_cue: Option<&str>) -> PathBuf {
         let image = dir.join(image_name);
@@ -4789,14 +4969,7 @@ mod sidecar_embedded_upgrade_tests {
                 .arg(&image),
         );
         if let Some(cue) = embedded_cue {
-            let cue_path = dir.join("embedded-fixture.cue");
-            std::fs::write(&cue_path, cue).expect("embedded cue text");
-            run_fixture_command(
-                std::process::Command::new("metaflac")
-                    .arg(format!("--set-tag-from-file=CUESHEET={}", cue_path.display()))
-                    .arg(&image),
-            );
-            std::fs::remove_file(&cue_path).expect("remove staging cue");
+            write_lofty_cuesheet(&image, cue);
         }
         image
     }
@@ -4813,8 +4986,8 @@ mod sidecar_embedded_upgrade_tests {
     /// instead of stale sidecar text.
     #[test]
     fn sidecar_resolution_prefers_matching_embedded_sheet_metadata() {
-        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
-            eprintln!("skipping: ffmpeg or metaflac unavailable");
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
             return;
         }
         let temp = tempfile::tempdir().expect("temp dir");
@@ -4835,8 +5008,8 @@ mod sidecar_embedded_upgrade_tests {
     /// the upgrade is metadata freshness, never a structure override.
     #[test]
     fn sidecar_resolution_keeps_sidecar_when_embedded_track_count_differs() {
-        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
-            eprintln!("skipping: ffmpeg or metaflac unavailable");
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
             return;
         }
         let temp = tempfile::tempdir().expect("temp dir");
@@ -4857,8 +5030,8 @@ mod sidecar_embedded_upgrade_tests {
     /// points.
     #[test]
     fn sidecar_resolution_keeps_sidecar_when_embedded_boundaries_differ() {
-        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
-            eprintln!("skipping: ffmpeg or metaflac unavailable");
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
             return;
         }
         let temp = tempfile::tempdir().expect("temp dir");
@@ -4880,8 +5053,8 @@ mod sidecar_embedded_upgrade_tests {
     /// cannot name album folders from stale sidecar text.
     #[test]
     fn dispatch_metadata_sheet_matches_materialization_precedence() {
-        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
-            eprintln!("skipping: ffmpeg or metaflac unavailable");
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
             return;
         }
         let temp = tempfile::tempdir().expect("temp dir");
@@ -4909,8 +5082,8 @@ mod sidecar_embedded_upgrade_tests {
     /// No embedded sheet: byte-identical to today's behavior.
     #[test]
     fn sidecar_resolution_unchanged_without_embedded_sheet() {
-        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("metaflac") {
-            eprintln!("skipping: ffmpeg or metaflac unavailable");
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
             return;
         }
         let temp = tempfile::tempdir().expect("temp dir");
