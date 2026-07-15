@@ -5276,9 +5276,17 @@ fn metadata_editor_paths_match_tags_mb_context(
         if !track_paths.is_empty() && track_paths == paths {
             return true;
         }
+        // A sub-group completion (grouping ladder split) is only safe when it
+        // is the CONTIGUOUS ROW PREFIX of the unified projection: the MB
+        // populate applies release tracks positionally from row 0, so a
+        // non-prefix subset (e.g. side B's group) would overwrite the FIRST
+        // group's rows with the second group's titles. Membership-only
+        // matching also let a stale unguarded Browse lookup for one member
+        // image apply into the wrong rows. Non-prefix groups are rejected
+        // with the rerun status until group-offset-aware apply exists.
         if !paths.is_empty()
             && paths.len() < track_paths.len()
-            && paths.iter().all(|path| track_paths.iter().any(|candidate| candidate == path))
+            && track_paths[..paths.len()] == paths[..]
         {
             return true;
         }

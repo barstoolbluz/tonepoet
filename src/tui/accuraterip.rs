@@ -529,10 +529,7 @@ pub fn find_cue_files(dir: &Path) -> Vec<std::path::PathBuf> {
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("cue"))
-                .unwrap_or(false)
+            crate::convert::classify::is_cue_sheet_path(&path)
                 .then_some(path)
         })
         .collect();

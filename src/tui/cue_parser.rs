@@ -14,19 +14,9 @@ use std::path::{Path, PathBuf};
 /// editor scratch buffers, not user sidecars, so a rejected embedded-CUESHEET
 /// edit cannot poison the next folder open or make sidecar detection ambiguous.
 pub fn is_user_visible_cue_path(path: &Path) -> bool {
-    let is_cue = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("cue"))
-        .unwrap_or(false);
-    if !is_cue {
-        return false;
-    }
-    !path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| name.starts_with('.'))
-        .unwrap_or(false)
+    // Single shared definition: the convert-layer classifier owns the
+    // hidden-cue policy so the TUI and planner cannot drift.
+    crate::convert::classify::is_cue_sheet_path(path)
 }
 
 

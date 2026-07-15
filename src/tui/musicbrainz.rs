@@ -1929,12 +1929,11 @@ pub fn populate_editor_from_mb_with_per_track_decision(
     // For pre-existing TITLE/ARTIST entries on a per-track-eligible
     // rip (Phase 2 may have parsed them from an embedded CUESHEET, or
     // the file may have a single TITLE tag carrying the album name),
-    // grow or shrink the entry to MB's track count. The first
-    // existing value is replicated to padded slots so revert restores
-    // the pre-populate state cleanly. :tags-mb is an explicit user
-    // request to overwrite from MB; track-count divergence between
-    // Phase 2's CUESHEET dim and MB's track count is resolved in MB's
-    // favor.
+    // GROW the entry to MB's track count (ensure_dim_replicate is
+    // grow-only since the H7 truncation fix: an MB release with fewer
+    // tracks leaves the trailing slots untouched rather than destroying
+    // them and their originals). The first existing value is replicated
+    // to padded slots so revert restores the pre-populate state cleanly.
     if per_track_populate {
         if let Some(idx) = title_idx {
             crate::tui::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[idx], track_dim);

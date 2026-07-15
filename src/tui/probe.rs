@@ -5661,6 +5661,10 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
 /// need to merge format-specific aliases before applying the standard ordering.
 /// The returned key is a logical editor key, not necessarily the raw tag name.
 pub fn canonical_metadata_display_key(display_key: &str) -> String {
+    // Alias LOOKUP uses the squashed form, but keys with no known alias
+    // must keep their separators: returning the squashed fallback rewrote
+    // e.g. REPLAYGAIN_ALBUM_GAIN to REPLAYGAINALBUMGAIN — and the AddKey
+    // flow then wrote that separator-less tag name to disk.
     let normalized: String = display_key
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -5677,7 +5681,7 @@ pub fn canonical_metadata_display_key(display_key: &str) -> String {
         "MUSICBRAINZTRACKID" | "MUSICBRAINZRECORDINGID" => "MUSICBRAINZ_TRACKID".to_string(),
         "MUSICBRAINZRELEASETRACKID" => "MUSICBRAINZ_RELEASETRACKID".to_string(),
         "MUSICBRAINZARTISTID" => "MUSICBRAINZ_ARTISTID".to_string(),
-        other => other.to_string(),
+        _ => display_key.trim().to_ascii_uppercase(),
     }
 }
 

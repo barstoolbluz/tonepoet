@@ -9863,6 +9863,40 @@ fn cue_album_removed_key_cleanup_items(
         .collect()
 }
 
+/// Non-destructive peek at the loaded embedded CUESHEET originals, used to
+/// decide embedded authority BEFORE the replaced-key removal runs.
+fn cue_album_peek_cuesheet_originals(entries: &[super::probe::TagEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+        .map(|entry| {
+            if entry.per_file_originals.is_empty() {
+                entry.per_file_values.clone()
+            } else {
+                entry.per_file_originals.clone()
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// First non-empty loaded value for an album-scoped key (post alias
+/// normalization, pre replaced-key removal).
+fn cue_album_loaded_album_value(
+    entries: &[super::probe::TagEntry],
+    display_key: &str,
+) -> Option<String> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case(display_key))?;
+    entry
+        .per_file_values
+        .iter()
+        .chain(std::iter::once(&entry.value))
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn cue_album_remove_replaced_keys(
     entries: &mut Vec<super::probe::TagEntry>,
     sheet: &super::app::CueAlbumSyntheticSheet,
@@ -10339,13 +10373,16 @@ fn build_metadata_editor_for_cue_surfaces(
         .map_err(|err| format!("Failed to read tags for unified CUE album: {err}"))?;
     let mut entries = merged.entries;
     cue_album_normalize_entry_keys(&mut entries);
-    let (mut cuesheet_originals, forced_cleanup) = cue_album_remove_replaced_keys(&mut entries, &sheet, paths.len());
-    cuesheet_originals.resize(paths.len(), String::new());
-
     let n_paths = paths.len();
+
+    // Authority must be decided BEFORE the replaced-key removal so the
+    // forced-cleanup signatures (H2) compare against the PROJECTED sheet —
+    // the F2 pollution values live in the embedded sheets, not the sidecars.
+    let mut peeked_cuesheet_originals = cue_album_peek_cuesheet_originals(&entries);
+    peeked_cuesheet_originals.resize(n_paths, String::new());
     let embedded_authority = cue_album_authoritative_embedded_cuesheet(
         &sheet,
-        &cuesheet_originals,
+        &peeked_cuesheet_originals,
         n_paths,
     );
     let authoritative_embedded_text = if let Some((parsed, text)) = embedded_authority {
@@ -10358,39 +10395,52 @@ fn build_metadata_editor_for_cue_surfaces(
     } else {
         None
     };
+
+    // Loaded file-tag fallbacks for album fields the sheet cannot supply:
+    // alias normalization turns Year/Album Artist into DATE/ALBUMARTIST, and
+    // the replaced-key removal would otherwise make those loaded values
+    // vanish from both display and revert. Sheet values keep precedence.
+    let loaded_album = cue_album_loaded_album_value(&entries, "ALBUM");
+    let loaded_album_artist = cue_album_loaded_album_value(&entries, "ALBUMARTIST");
+    let loaded_date = cue_album_loaded_album_value(&entries, "DATE");
+    let loaded_genre = cue_album_loaded_album_value(&entries, "GENRE");
+    let loaded_catalog = cue_album_loaded_album_value(&entries, "CATALOGNUMBER");
+
+    let (mut cuesheet_originals, forced_cleanup) = cue_album_remove_replaced_keys(&mut entries, &sheet, n_paths);
+    cuesheet_originals.resize(n_paths, String::new());
     cue_album_upsert_album_entry(
         &mut entries,
         "ALBUM",
         lofty::tag::ItemKey::AlbumTitle,
-        sheet.album_title.clone(),
+        sheet.album_title.clone().or(loaded_album),
         n_paths,
     );
     cue_album_upsert_album_entry(
         &mut entries,
         "ALBUMARTIST",
         lofty::tag::ItemKey::AlbumArtist,
-        sheet.album_performer.clone(),
+        sheet.album_performer.clone().or(loaded_album_artist),
         n_paths,
     );
     cue_album_upsert_album_entry(
         &mut entries,
         "DATE",
         lofty::tag::ItemKey::Year,
-        sheet.album_date.clone(),
+        sheet.album_date.clone().or(loaded_date),
         n_paths,
     );
     cue_album_upsert_album_entry(
         &mut entries,
         "GENRE",
         lofty::tag::ItemKey::Genre,
-        sheet.album_genre.clone(),
+        sheet.album_genre.clone().or(loaded_genre),
         n_paths,
     );
     cue_album_upsert_album_entry(
         &mut entries,
         "CATALOGNUMBER",
         lofty::tag::ItemKey::CatalogNumber,
-        sheet.album_catalog.clone(),
+        sheet.album_catalog.clone().or(loaded_catalog),
         n_paths,
     );
     cue_album_upsert_per_track_entry(
@@ -21473,7 +21523,24 @@ pub(super) fn metadata_editor_apply_detail_paste(
         return Ok(0);
     }
 
-    let targets: Vec<(usize, String)> = if dim == state.active_surface().paths.len() && dim > 1 && lines.len() == 1 {
+    // Replication rules mirror the pre-existing paste semantics: only the
+    // album-scoped keys force one uniform value across slots (single line →
+    // replicate; multi-line → first line replicated, per-file album values
+    // are deliberately impossible). Every other key maps pasted lines
+    // positionally from slot 0, so a single-line paste touches ONE slot
+    // instead of silently overwriting every title in the surface.
+    let album_scoped = state
+        .active_surface()
+        .entries
+        .get(entry_idx)
+        .map(|entry| {
+            matches!(
+                entry.display_key.to_ascii_uppercase().as_str(),
+                "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER"
+            )
+        })
+        .unwrap_or(false);
+    let targets: Vec<(usize, String)> = if album_scoped && dim > 1 {
         (0..dim).map(|idx| (idx, lines[0].clone())).collect()
     } else {
         lines
@@ -22222,21 +22289,20 @@ pub fn open_bulk_rename(app: &mut AppState, paths: Vec<std::path::PathBuf>) {
 fn apply_cue_to_rename(app: &mut AppState, state: &mut BulkRenameState) {
     let base_dir = &state.plan.base_dir;
 
-    // Scan for .cue files in the base directory.
-    let cue_files: Vec<std::path::PathBuf> = std::fs::read_dir(base_dir)
+    // Scan for .cue files in the base directory. Uses the shared classifier
+    // predicate (hidden dot-cues like AppleDouble `._album.cue` excluded) and
+    // sorts so the pick is deterministic instead of read_dir order.
+    let mut cue_files: Vec<std::path::PathBuf> = std::fs::read_dir(base_dir)
         .ok()
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| {
-                    p.extension()
-                        .map(|e| e.to_ascii_lowercase() == "cue")
-                        .unwrap_or(false)
-                })
+                .filter(|p| crate::convert::classify::is_cue_sheet_path(p))
                 .collect()
         })
         .unwrap_or_default();
+    cue_files.sort();
 
     if cue_files.is_empty() {
         app.set_status("No .cue files found in this directory");

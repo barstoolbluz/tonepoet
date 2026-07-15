@@ -1019,6 +1019,38 @@ fn authoritative_embedded_cuesheet_for_member_audio(
         return None;
     }
 
+    // Structural validation the materializer will later enforce on the
+    // synthetic sheet: adopting an embedded sheet that fails it would turn a
+    // plan-time sidecar fallback into a convert-time group failure.
+    // TRACK numbers must be unique, non-zero, and continuous from 01, and
+    // INDEX 01 must strictly increase within each FILE.
+    let mut seen_track_numbers = HashSet::new();
+    for (position, track) in parsed.tracks.iter().enumerate() {
+        if track.number == 0
+            || track.number as usize != position + 1
+            || !seen_track_numbers.insert(track.number)
+        {
+            return None;
+        }
+    }
+    let resolved_tracks: Vec<(u32, PathBuf, u32)> = parsed
+        .tracks
+        .iter()
+        .filter_map(|track| {
+            let file_ref = track.file.as_deref()?;
+            let resolved = match resolve_cue_file_reference_for_queue(base_dir, file_ref) {
+                CueReferenceResolution::Resolved(path) => path,
+                _ => return None,
+            };
+            Some((track.number, resolved, track.index01_frames?))
+        })
+        .collect();
+    if resolved_tracks.len() != parsed.tracks.len()
+        || validate_queue_cue_index_order(&resolved_tracks).is_err()
+    {
+        return None;
+    }
+
     rewrite_embedded_cue_file_lines_to_absolute_paths(&first, &file_order)
 }
 
