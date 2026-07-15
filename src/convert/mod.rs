@@ -1122,14 +1122,22 @@ impl ConversionManager {
     /// queue is busy, live synthetic inputs are preserved.
     pub fn clear_queue(&mut self) {
         self.try_resolve_pending_synthetic_cue_artifacts();
-        let cleared = if let Ok(mut queue) = self.queue.try_write() {
+        let cleared_processing = if let Ok(mut queue) = self.queue.try_write() {
+            let processing: HashSet<String> = queue
+                .all_items()
+                .into_iter()
+                .filter(|item| matches!(item.status, ConversionStatus::Processing { .. }))
+                .map(|item| item.id.clone())
+                .collect();
             queue.clear();
-            true
+            Some(processing)
         } else {
-            false
+            None
         };
-        if cleared {
-            self.cleanup_all_synthetic_cue_artifacts();
+        if let Some(processing) = cleared_processing {
+            // In-flight items keep their artifacts until the worker's terminal
+            // status arrives (deferred cleanup in `update_item_status`).
+            self.cleanup_all_synthetic_cue_artifacts_except(&processing);
         }
     }
 
@@ -1462,6 +1470,15 @@ impl ConversionManager {
     }
 
     pub fn cleanup_all_synthetic_cue_artifacts(&self) {
+        self.cleanup_all_synthetic_cue_artifacts_except(&HashSet::new());
+    }
+
+    /// Clean all owned synthetic artifacts EXCEPT those registered to the
+    /// given item ids. In-flight (Processing) items keep their registry
+    /// entries: the worker is still reading the artifact, and the deferred
+    /// terminal-status path in `update_item_status` cleans it once the worker
+    /// reports done (manager drop and the TTL scavenger are the backstops).
+    fn cleanup_all_synthetic_cue_artifacts_except(&self, keep_item_ids: &HashSet<String>) {
         let Ok(mut artifacts) =
             lock_synthetic_cue_artifact_registry(self.synthetic_cue_artifacts.as_ref())
         else {
@@ -1475,7 +1492,17 @@ impl ConversionManager {
                 self.pending_synthetic_cue_artifacts.as_ref(),
                 "pending_synthetic_cue_artifacts",
             );
-            let mut paths = artifacts.drain().map(|(_, path)| path).collect::<HashSet<_>>();
+            let mut kept = HashMap::new();
+            let mut paths: HashSet<PathBuf> = HashSet::new();
+            for (item_id, path) in artifacts.drain() {
+                if keep_item_ids.contains(&item_id) {
+                    pending.remove(&path);
+                    kept.insert(item_id, path);
+                } else {
+                    paths.insert(path);
+                }
+            }
+            *artifacts = kept;
             paths.extend(pending.drain());
             paths
         };
@@ -1558,6 +1585,14 @@ impl ConversionManager {
             }
         }
 
+        let terminal = matches!(
+            status,
+            ConversionStatus::Completed { .. }
+                | ConversionStatus::CompletedWithActionErrors { .. }
+                | ConversionStatus::Failed { .. }
+                | ConversionStatus::Partial { .. }
+                | ConversionStatus::Cancelled
+        );
         if updated
             && matches!(
                 status,
@@ -1565,6 +1600,29 @@ impl ConversionManager {
             )
         {
             self.cleanup_synthetic_cue_artifact_for_item_id(id);
+        } else if !updated && terminal {
+            // The worker finished but the queue write lock was contended (a
+            // completed item's cleanup would otherwise be silently lost) or the
+            // item was removed/cleared while Processing (its artifact was
+            // deliberately preserved for the in-flight worker). Verify against
+            // a read snapshot before touching artifacts: an item that is live
+            // and non-terminal (e.g. retried under the same id) keeps its input.
+            if let Ok(queue) = self.queue.try_read() {
+                let safe = match queue.all_items().into_iter().find(|item| item.id == id) {
+                    None => true,
+                    Some(item) => matches!(
+                        item.status,
+                        ConversionStatus::Completed { .. }
+                            | ConversionStatus::CompletedWithActionErrors { .. }
+                    ),
+                };
+                drop(queue);
+                if safe {
+                    self.cleanup_synthetic_cue_artifact_for_item_id(id);
+                }
+            }
+            // Read-lock miss: leave the artifact; manager drop and the TTL
+            // scavenger are the backstops.
         }
         updated
     }
@@ -1798,13 +1856,22 @@ impl ConversionManager {
     /// Remove selected items from queue
     pub fn remove_selected(&mut self) -> usize {
         self.try_resolve_pending_synthetic_cue_artifacts();
-        let removed_item_ids = if let Ok(mut queue) = self.queue.try_write() {
-            queue.remove_selected_item_ids()
+        let removed_records = if let Ok(mut queue) = self.queue.try_write() {
+            queue.remove_selected_records()
         } else {
             Vec::new()
         };
-        let removed = removed_item_ids.len();
-        self.cleanup_synthetic_cue_artifacts_for_item_ids(removed_item_ids);
+        let removed = removed_records.len();
+        // Never delete a synthetic input a worker is still reading: Processing
+        // items keep their registry entries, and the worker's terminal status
+        // message triggers the deferred cleanup in `update_item_status` (manager
+        // drop and the TTL scavenger are the backstops).
+        let cleanable: Vec<String> = removed_records
+            .into_iter()
+            .filter(|(_, status)| !matches!(status, ConversionStatus::Processing { .. }))
+            .map(|(id, _)| id)
+            .collect();
+        self.cleanup_synthetic_cue_artifacts_for_item_ids(cleanable);
         removed
     }
 
@@ -1961,14 +2028,22 @@ impl ConversionManager {
 
     pub fn clear_all(&mut self) {
         self.try_resolve_pending_synthetic_cue_artifacts();
-        let cleared = if let Ok(mut queue) = self.queue.try_write() {
+        let cleared_processing = if let Ok(mut queue) = self.queue.try_write() {
+            let processing: HashSet<String> = queue
+                .all_items()
+                .into_iter()
+                .filter(|item| matches!(item.status, ConversionStatus::Processing { .. }))
+                .map(|item| item.id.clone())
+                .collect();
             queue.clear();
-            true
+            Some(processing)
         } else {
-            false
+            None
         };
-        if cleared {
-            self.cleanup_all_synthetic_cue_artifacts();
+        if let Some(processing) = cleared_processing {
+            // In-flight items keep their artifacts until the worker's terminal
+            // status arrives (deferred cleanup in `update_item_status`).
+            self.cleanup_all_synthetic_cue_artifacts_except(&processing);
         }
     }
 
@@ -2625,6 +2700,12 @@ mod bluray_queue_admission_tests {
             let mut queue = manager.queue.try_write().expect("queue write lock");
             let item = queue.find_item_mut(&item_id).expect("item exists");
             item.selected = true;
+            // Terminal status: in-flight (Processing) items deliberately keep
+            // their artifacts on removal (see remove_selected_preserves_...).
+            item.status = ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            };
         }
 
         let removed = manager.remove_selected();
@@ -3415,6 +3496,117 @@ mod per_track_epoch_tests {
         assert!(
             !artifact_dir.exists(),
             "explicit removal must clean the owned synthetic CUE artifact directory"
+        );
+    }
+
+    #[test]
+    fn remove_selected_preserves_artifact_of_processing_item_until_worker_terminal() {
+        let (mut manager, item_id) = test_manager_with_item();
+        let (artifact_dir, artifact) = synthetic_artifact_for(&item_id, "remove-processing-preserve");
+        manager.register_synthetic_cue_artifact(&item_id, &artifact).expect("registration");
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue.find_item_mut(&item_id).expect("item");
+            item.selected = true;
+            // status is already Processing from the fixture
+        }
+
+        let removed = manager.remove_selected();
+        assert_eq!(removed, 1);
+        assert_path_exists(
+            &artifact,
+            "removing an in-flight item must not delete the input its worker is reading",
+        );
+
+        // The worker's terminal status closes the loop: item is absent from the
+        // queue, so the deferred branch cleans the artifact.
+        let updated = manager.update_item_status(
+            &item_id,
+            ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            },
+            100.0,
+        );
+        assert!(!updated, "removed item is no longer in the queue");
+        assert!(
+            !artifact_dir.exists(),
+            "worker-terminal status must clean the deferred artifact"
+        );
+    }
+
+    #[test]
+    fn clear_all_preserves_processing_artifacts_and_cleans_the_rest() {
+        let (mut manager, item_id) = test_manager_with_item();
+        let (processing_dir, processing_artifact) =
+            synthetic_artifact_for(&item_id, "clear-processing-preserve");
+        manager
+            .register_synthetic_cue_artifact(&item_id, &processing_artifact)
+            .expect("registration");
+
+        let (queued_dir, queued_artifact) = synthetic_artifact_for("queued-item", "clear-queued-clean");
+        queued_synthetic_item(&manager, "queued-item", &queued_artifact, ConversionStatus::Queued);
+        manager
+            .register_synthetic_cue_artifact("queued-item", &queued_artifact)
+            .expect("registration");
+
+        manager.clear_all();
+        assert_path_exists(
+            &processing_artifact,
+            "clear must not delete the in-flight worker's input",
+        );
+        assert!(
+            !queued_dir.exists(),
+            "clear must clean artifacts of non-processing items"
+        );
+        let _ = std::fs::remove_dir_all(processing_dir);
+    }
+
+    #[test]
+    fn completed_cleanup_lost_to_queue_contention_recovers_on_read_verified_retry() {
+        let (manager, item_id) = test_manager_with_item();
+        let (artifact_dir, artifact) = synthetic_artifact_for(&item_id, "contention-recover");
+        manager.register_synthetic_cue_artifact(&item_id, &artifact).expect("registration");
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue.find_item_mut(&item_id).expect("item");
+            item.status = ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            };
+        }
+
+        // Simulate the reducer's completion message arriving while another
+        // writer holds the queue lock: updated == false, but the read-verified
+        // deferred branch must still clean the completed item's artifact.
+        let guard = manager.queue.try_write().expect("hold write lock");
+        let updated_under_contention = {
+            // update_item_status takes &self; the held guard forces try_write to fail
+            manager.update_item_status(
+                &item_id,
+                ConversionStatus::Completed {
+                    output_path: PathBuf::from("/tmp/out.flac"),
+                    log_path: None,
+                },
+                100.0,
+            )
+        };
+        assert!(!updated_under_contention);
+        assert_path_exists(&artifact, "read lock also contended: artifact preserved");
+        drop(guard);
+
+        let updated = manager.update_item_status(
+            &item_id,
+            ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            },
+            100.0,
+        );
+        let _ = updated;
+        assert!(
+            !artifact_dir.exists(),
+            "uncontended terminal delivery must clean the completed item's artifact"
         );
     }
 

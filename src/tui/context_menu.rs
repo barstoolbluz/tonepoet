@@ -1593,17 +1593,12 @@ pub fn execute_context_action(
             app.set_status(format!("Removed {} item(s)", removed));
         }
         ContextAction::RetryFailed => {
-            // Mark failed items as Queued for retry. Release the lock
-            // before calling set_status (which needs &mut app).
+            // Retry failed items by MOVING their records back into the active
+            // queue (flipping statuses in place stranded Queued rows inside the
+            // completed history that the processor never scans and persistence
+            // resurrected next session). Release the lock before set_status.
             let result = if let Ok(mut queue) = app.manager.queue.try_write() {
-                let mut count = 0;
-                for qi in queue.all_items_mut() {
-                    if matches!(qi.status, ConversionStatus::Failed { .. }) {
-                        qi.status = ConversionStatus::Queued;
-                        count += 1;
-                    }
-                }
-                Ok(count)
+                Ok(queue.retry_all_failed())
             } else {
                 Err(())
             };

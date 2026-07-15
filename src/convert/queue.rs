@@ -856,6 +856,69 @@ impl ConversionQueue {
         }
     }
 
+    /// Retry every retryable failed/cancelled record regardless of selection.
+    ///
+    /// Bulk counterpart of `retry_failed`: settles finished items first, then
+    /// MOVES each retryable record out of completed history back into the
+    /// active queue. Flipping statuses in place (the old context-menu path)
+    /// stranded Queued rows inside `completed` that the processor never scans
+    /// and persistence resurrected on the next session.
+    pub fn retry_all_failed(&mut self) -> usize {
+        self.settle_finished();
+        let mut to_retry = Vec::new();
+        let mut retained_completed = Vec::with_capacity(self.completed.len());
+
+        for mut item in self.completed.drain(..) {
+            if item.can_retry() {
+                item.status = ConversionStatus::Queued;
+                item.started_at = None;
+                item.completed_at = None;
+                item.output_path = None;
+                item.selected = false;
+                to_retry.push(item);
+            } else {
+                retained_completed.push(item);
+            }
+        }
+
+        self.completed = retained_completed;
+        let count = to_retry.len();
+        for item in to_retry {
+            self.items.push_back(item);
+        }
+        count
+    }
+
+    /// Remove selected items and return the removed records' (id, status)
+    /// pairs so the manager can make status-aware lifecycle decisions (e.g.
+    /// never deleting a synthetic input still being read by an in-flight
+    /// worker).
+    pub fn remove_selected_records(&mut self) -> Vec<(String, ConversionStatus)> {
+        let mut records = Vec::new();
+        self.items.retain(|item| {
+            if item.selected {
+                records.push((item.id.clone(), item.status.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        if self.current.as_ref().map(|item| item.selected).unwrap_or(false) {
+            if let Some(item) = self.current.take() {
+                records.push((item.id.clone(), item.status.clone()));
+            }
+        }
+        self.completed.retain(|item| {
+            if item.selected {
+                records.push((item.id.clone(), item.status.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        records
+    }
+
     /// Remove selected items from the queue.
     ///
     /// Selection spans the active queue, the current item, and the completed
@@ -1047,6 +1110,27 @@ mod cue_sidecar_override_queue_tests {
         assert!(
             !retry.selected,
             "a retried item should not inherit the history-row selection that triggered retry"
+        );
+    }
+
+    #[test]
+    fn retry_all_failed_moves_history_records_back_into_active_queue() {
+        let mut queue = ConversionQueue::new();
+        let mut failed = ConversionItem::default();
+        failed.id = "failed-1".to_string();
+        failed.status = ConversionStatus::Failed { error: "boom".to_string(), log_path: None };
+        queue.items_mut().push_back(failed);
+        queue.settle_finished();
+        assert_eq!(queue.queued_items().len(), 0);
+
+        let retried = queue.retry_all_failed();
+        assert_eq!(retried, 1);
+        let queued = queue.queued_items();
+        assert_eq!(queued.len(), 1, "retried record must live in the active queue the processor scans");
+        assert_eq!(queued[0].id, "failed-1");
+        assert!(
+            queue.all_items().into_iter().filter(|item| item.id == "failed-1").count() == 1,
+            "no duplicate lifecycle records after bulk retry"
         );
     }
 

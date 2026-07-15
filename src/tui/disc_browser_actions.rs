@@ -223,12 +223,23 @@ pub fn handle_disc_context_action(
             true
         }
         crate::tui::context_menu::ContextAction::ConvertCustom => {
-            if let Some(path) = selected_entry_effective_disc_path(app) {
-                convert_default_disc_stream(app, &path, tx);
-                true
-            } else {
-                false
+            // ConvertCustom is a generic action shared with archive entries.
+            // Only consume it for entries ALREADY classified as disc sources;
+            // an unprobed Archive `.iso` must fall through to the generic
+            // archive conversion handler (extension-based disc acceptance is
+            // reserved for explicitly disc-labeled actions).
+            let strict_disc = app
+                .browse
+                .entries
+                .get(app.browse.selected_index)
+                .is_some_and(|entry| entry.kind.is_disc_source());
+            if strict_disc {
+                if let Some(path) = selected_entry_effective_disc_path(app) {
+                    convert_default_disc_stream(app, &path, tx);
+                    return true;
+                }
             }
+            false
         }
         crate::tui::context_menu::ContextAction::BrowseDiscStreams => {
             open_selected_disc_browser(app, tx);
@@ -661,6 +672,27 @@ mod tests {
         assert_eq!(selected, iso);
         // No ISO header probe runs on the reducer: the row keeps its lazy
         // Archive kind until the async disc probe reclassifies it.
+        assert!(matches!(app.browse.entries[0].kind, EntryKind::Archive));
+    }
+
+    #[test]
+    fn convert_custom_on_unprobed_archive_iso_falls_through_to_generic_handler() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let iso = temp.path().join("disc.iso");
+        write_synthetic_sacd_iso(&iso);
+        let mut app = app_with_selected_archive_iso(iso);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let consumed = handle_disc_context_action(
+            &mut app,
+            &crate::tui::context_menu::ContextAction::ConvertCustom,
+            &tx,
+        );
+
+        assert!(
+            !consumed,
+            "ConvertCustom on an unprobed Archive .iso must fall through to the generic archive handler"
+        );
         assert!(matches!(app.browse.entries[0].kind, EntryKind::Archive));
     }
 

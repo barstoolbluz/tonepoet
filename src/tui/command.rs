@@ -5882,7 +5882,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 Ok(_) => {
                     app.force_redraw = true;
                 }
-                Err(e) => app.set_status(format!("View error: {}", e)),
+                Err(e) => {
+                    app.force_redraw = true;
+                    app.set_status(format!("View error: {}", e));
+                }
             }
         }
         Command::EditFile(path) => {
