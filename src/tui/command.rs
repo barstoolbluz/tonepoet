@@ -7056,6 +7056,12 @@ fn execute_commit_with_source_options_transform(
         success_status.push_str("; ");
         success_status.push_str(&warning);
     }
+    if outcome.errors > 0 {
+        if let Some(ref err) = outcome.last_error {
+            success_status.push_str("; last error: ");
+            success_status.push_str(err);
+        }
+    }
 
     // Clear source pane so a subsequent `:queue` arrives fresh. Transfer any
     // archive preview staging to the queued item before dropping the source.

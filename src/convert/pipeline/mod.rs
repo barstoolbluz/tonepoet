@@ -170,6 +170,7 @@ mod tests {
             bytes_in: None,
             bytes_out: None,
             duration: None,
+            verified_output_bit_depth: None,
             dsd_dst_stats: None,
         }
     }

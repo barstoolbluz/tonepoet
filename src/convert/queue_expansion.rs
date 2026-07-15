@@ -369,11 +369,17 @@ where
     }
 
     let queue = plan.into_queue_paths_with_grouping_decisions(grouping_decisions);
-    if let Some(message) = queue.first_error() {
-        return Err(QueueExpansionLimitedError::failed(
-            message.to_string(),
-            state.visited,
-        ));
+    // Expansion warnings are carried alongside usable paths, matching the
+    // unlimited API. Fail closed only when no queueable path survived, and
+    // reclaim every transient artifact before dropping the result.
+    if queue.paths.is_empty() {
+        if let Some(message) = queue.first_error() {
+            cleanup_synthetic_cue_artifacts(&queue.synthetic_cue_artifacts);
+            return Err(QueueExpansionLimitedError::failed(
+                message.to_string(),
+                state.visited,
+            ));
+        }
     }
 
     Ok((queue, state.visited))
@@ -572,6 +578,12 @@ impl QueueExpansionPlan {
             push_unique_path_with_keys(&mut result, &mut result_keys, path);
         }
 
+        let orphaned_synthetic_artifacts = synthetic_cue_artifacts
+            .iter()
+            .filter(|path| !result.iter().any(|queued| queue_path_key(queued) == queue_path_key(path)))
+            .cloned()
+            .collect::<HashSet<_>>();
+        cleanup_synthetic_cue_artifacts(&orphaned_synthetic_artifacts);
         synthetic_cue_artifacts.retain(|path| {
             result.iter().any(|queued| queue_path_key(queued) == queue_path_key(path))
         });

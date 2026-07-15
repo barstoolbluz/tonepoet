@@ -752,12 +752,13 @@ impl ConversionManager {
             for artifact in &caller_owned_completed_artifacts_to_cleanup {
                 crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
             }
-            self.cleanup_rolled_back_synthetic_cue_artifacts(&transferred_by_item);
+            // Rollback restores ownership to the caller. Release transferred
+            // siblings from the manager registry without deleting them: the
+            // retained source batch still references them and must remain
+            // self-consistent for retry.
+            self.release_rolled_back_synthetic_cue_artifacts_to_caller(&transferred_by_item);
 
             let mut caller_owned = source_synthetic_cue_artifacts.clone();
-            for artifact in &transferred {
-                caller_owned.remove(artifact);
-            }
             for artifact in &cleaned_after_completed_skip {
                 caller_owned.remove(artifact);
             }
@@ -806,16 +807,16 @@ impl ConversionManager {
             for artifact in &caller_owned_completed_artifacts_to_cleanup {
                 crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
             }
-            self.cleanup_rolled_back_synthetic_cue_artifacts(&transferred_by_item);
+            // Ownership failure is still a retryable Convert-screen rollback.
+            // Release any earlier successful registrations from manager
+            // ownership, but keep the artifact files themselves because the
+            // retained source batch still references them.
+            self.release_rolled_back_synthetic_cue_artifacts_to_caller(&transferred_by_item);
 
             let mut caller_owned = source_synthetic_cue_artifacts.clone();
-            for artifact in &transferred {
-                caller_owned.remove(artifact);
-            }
             for artifact in &cleaned_after_completed_skip {
                 caller_owned.remove(artifact);
             }
-            caller_owned.insert(failed_artifact.clone());
             outcome.enqueued = 0;
             outcome.last_error = Some(format!(
                 "synthetic CUE artifact ownership registration failed for {}: {}",
@@ -1129,21 +1130,28 @@ impl ConversionManager {
     pub fn clear_queue(&mut self) {
         self.try_resolve_pending_synthetic_cue_artifacts();
         let cleared_processing = if let Ok(mut queue) = self.queue.try_write() {
-            let processing: HashSet<String> = queue
-                .all_items()
-                .into_iter()
-                .filter(|item| matches!(item.status, ConversionStatus::Processing { .. }))
-                .map(|item| item.id.clone())
-                .collect();
+            let mut processing = HashSet::new();
+            let mut processing_synthetic_inputs = HashSet::new();
+            for item in queue.all_items() {
+                if matches!(item.status, ConversionStatus::Processing { .. }) {
+                    processing.insert(item.id.clone());
+                    if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path) {
+                        processing_synthetic_inputs.insert(item.input_path.clone());
+                    }
+                }
+            }
             queue.clear();
-            Some(processing)
+            Some((processing, processing_synthetic_inputs))
         } else {
             None
         };
-        if let Some(processing) = cleared_processing {
+        if let Some((processing, processing_synthetic_inputs)) = cleared_processing {
             // In-flight items keep their artifacts until the worker's terminal
             // status arrives (deferred cleanup in `update_item_status`).
-            self.cleanup_all_synthetic_cue_artifacts_except(&processing);
+            self.cleanup_all_synthetic_cue_artifacts_except_with_processing_inputs(
+                &processing,
+                Some(&processing_synthetic_inputs),
+            );
         }
     }
 
@@ -1466,6 +1474,40 @@ impl ConversionManager {
         }
     }
 
+    /// Release rolled-back synthetic artifacts back to the caller without
+    /// deleting the filesystem paths. Convert-screen batch retries still hold
+    /// source records that reference these files, so rollback must remove
+    /// stale manager ownership while preserving the caller-owned artifacts.
+    fn release_rolled_back_synthetic_cue_artifacts_to_caller(
+        &self,
+        artifacts_to_release: &[(String, PathBuf)],
+    ) {
+        if artifacts_to_release.is_empty() {
+            return;
+        }
+
+        if let Ok(mut artifacts) =
+            lock_synthetic_cue_artifact_registry(self.synthetic_cue_artifacts.as_ref())
+        {
+            for (item_id, _) in artifacts_to_release {
+                artifacts.remove(item_id);
+            }
+        } else {
+            log::error!(
+                "synthetic CUE artifact registry unavailable during rollback release; \
+                 preserving exact rolled-back artifact paths for caller retry"
+            );
+        }
+
+        let mut pending = recover_mutex_lock(
+            self.pending_synthetic_cue_artifacts.as_ref(),
+            "pending_synthetic_cue_artifacts",
+        );
+        for (_, path) in artifacts_to_release {
+            pending.remove(path);
+        }
+    }
+
     fn cleanup_synthetic_cue_artifacts_for_item_ids<I>(&self, item_ids: I)
     where
         I: IntoIterator<Item = String>,
@@ -1485,6 +1527,18 @@ impl ConversionManager {
     /// terminal-status path in `update_item_status` cleans it once the worker
     /// reports done (manager drop and the TTL scavenger are the backstops).
     fn cleanup_all_synthetic_cue_artifacts_except(&self, keep_item_ids: &HashSet<String>) {
+        let processing_inputs = self.processing_synthetic_cue_inputs_snapshot();
+        self.cleanup_all_synthetic_cue_artifacts_except_with_processing_inputs(
+            keep_item_ids,
+            processing_inputs.as_ref(),
+        );
+    }
+
+    fn cleanup_all_synthetic_cue_artifacts_except_with_processing_inputs(
+        &self,
+        keep_item_ids: &HashSet<String>,
+        processing_inputs: Option<&HashSet<PathBuf>>,
+    ) {
         let Ok(mut artifacts) =
             lock_synthetic_cue_artifact_registry(self.synthetic_cue_artifacts.as_ref())
         else {
@@ -1509,12 +1563,44 @@ impl ConversionManager {
                 }
             }
             *artifacts = kept;
-            paths.extend(pending.drain());
+
+            // Pending artifacts do not yet have item-id ownership.  A clear-all
+            // during the deferred-registration window must therefore match them
+            // by the Processing queue input path and preserve them until worker
+            // terminal status or manager drop can clean them safely.  If the
+            // queue snapshot is contended, fail closed by preserving all pending
+            // paths rather than deleting an input a worker may be reading.
+            let mut retained_pending = HashSet::new();
+            for path in pending.drain() {
+                let keep_pending = processing_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.iter().any(|input| same_path_for_queue(input, &path)))
+                    .unwrap_or(true);
+                if keep_pending {
+                    retained_pending.insert(path);
+                } else {
+                    paths.insert(path);
+                }
+            }
+            *pending = retained_pending;
             paths
         };
         for path in paths {
             crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(&path);
         }
+    }
+
+    fn processing_synthetic_cue_inputs_snapshot(&self) -> Option<HashSet<PathBuf>> {
+        let queue = self.queue.try_read().ok()?;
+        Some(
+            queue
+                .all_items()
+                .into_iter()
+                .filter(|item| matches!(item.status, ConversionStatus::Processing { .. }))
+                .filter(|item| crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path))
+                .map(|item| item.input_path.clone())
+                .collect(),
+        )
     }
 
     fn record_closed_track_epoch(item: &mut ConversionItem, track_index: u32, epoch: u64) {
@@ -2035,21 +2121,28 @@ impl ConversionManager {
     pub fn clear_all(&mut self) {
         self.try_resolve_pending_synthetic_cue_artifacts();
         let cleared_processing = if let Ok(mut queue) = self.queue.try_write() {
-            let processing: HashSet<String> = queue
-                .all_items()
-                .into_iter()
-                .filter(|item| matches!(item.status, ConversionStatus::Processing { .. }))
-                .map(|item| item.id.clone())
-                .collect();
+            let mut processing = HashSet::new();
+            let mut processing_synthetic_inputs = HashSet::new();
+            for item in queue.all_items() {
+                if matches!(item.status, ConversionStatus::Processing { .. }) {
+                    processing.insert(item.id.clone());
+                    if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path) {
+                        processing_synthetic_inputs.insert(item.input_path.clone());
+                    }
+                }
+            }
             queue.clear();
-            Some(processing)
+            Some((processing, processing_synthetic_inputs))
         } else {
             None
         };
-        if let Some(processing) = cleared_processing {
+        if let Some((processing, processing_synthetic_inputs)) = cleared_processing {
             // In-flight items keep their artifacts until the worker's terminal
             // status arrives (deferred cleanup in `update_item_status`).
-            self.cleanup_all_synthetic_cue_artifacts_except(&processing);
+            self.cleanup_all_synthetic_cue_artifacts_except_with_processing_inputs(
+                &processing,
+                Some(&processing_synthetic_inputs),
+            );
         }
     }
 
@@ -3808,9 +3901,9 @@ mod per_track_epoch_tests {
     }
 
     #[test]
-    fn commit_batch_rolls_back_exact_admissions_after_later_registry_failure() {
+    fn commit_batch_registry_failure_releases_transferred_artifacts_for_retry() {
         let manager = ConversionManager::new(ConversionConfig::default());
-        let (first_dir, first_artifact) = synthetic_artifact_for("commit-first", "commit-first");
+        let (_first_dir, first_artifact) = synthetic_artifact_for("commit-first", "commit-first");
         let (_second_dir, second_artifact) = synthetic_artifact_for("commit-second", "commit-second");
         let source_artifacts = [first_artifact.clone(), second_artifact.clone()]
             .into_iter()
@@ -3842,10 +3935,11 @@ mod per_track_epoch_tests {
         assert!(rollback.failed_item_ids.is_empty());
         assert!(rollback.completed);
         assert!(transaction.artifacts_transferred_to_manager.is_empty());
+        assert!(transaction.artifacts_remaining_caller_owned.contains(&first_artifact));
         assert!(transaction.artifacts_remaining_caller_owned.contains(&second_artifact));
-        assert!(
-            !first_dir.exists(),
-            "artifact successfully transferred earlier in the failed transaction must be cleaned by exact rollback"
+        assert_path_exists(
+            &first_artifact,
+            "artifact successfully transferred earlier in the failed transaction must be preserved for retry"
         );
         assert_path_exists(
             &second_artifact,

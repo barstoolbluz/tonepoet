@@ -3573,6 +3573,9 @@ impl FormatState {
             AudioFormat::Flac | AudioFormat::Alac => {
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
+                if fmt == AudioFormat::Alac {
+                    self.bit_depth.set_enabled(&BitDepthChoice::Int32, false);
+                }
                 for opt in &mut self.sample_rate.options {
                     if opt.value > 384_000 {
                         opt.enabled = false;
@@ -3580,7 +3583,9 @@ impl FormatState {
                 }
             }
             AudioFormat::WavPack => {
-                // Float32 supported, Float64 rejected by WavPack encoder.
+                // The current conversion carrier integerizes float sources.
+                // Disable both float targets until float WAV is preserved end-to-end.
+                self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
             }
             AudioFormat::Wav | AudioFormat::Aiff | AudioFormat::Lpcm => {

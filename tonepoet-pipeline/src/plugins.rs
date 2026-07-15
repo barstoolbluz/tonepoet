@@ -203,6 +203,19 @@ impl ToolPlugin for SoxPlugin {
                 apply_processing,
                 ..
             } if target_format.sox_encodable() => {
+                let target_depth = match &step.operation {
+                    PlanOperation::EncodePcm { target_bit_depth, .. } => *target_bit_depth,
+                    _ => unreachable!("guarded by EncodePcm pattern"),
+                };
+                let silently_substituted = matches!(
+                    ((*target_format).clone(), target_depth),
+                    (AudioFormat::Flac, PcmBitDepth::Int32)
+                        | (AudioFormat::Aiff, PcmBitDepth::Float32 | PcmBitDepth::Float64)
+                        | (AudioFormat::WavPack, PcmBitDepth::Float32 | PcmBitDepth::Float64)
+                );
+                if silently_substituted {
+                    return ToolSupport::UNSUPPORTED;
+                }
                 if *apply_processing
                     && mapping::requires_sox_dither(context.request.settings.dither_type)
                 {
@@ -1334,6 +1347,12 @@ fn add_ffmpeg_pcm_encoder_args(
         AudioFormat::Flac => {
             args.push("-c:a".into());
             args.push("flac".into());
+            if target_depth == PcmBitDepth::Int32 {
+                // FFmpeg otherwise silently stores s32 input as 24-bit FLAC.
+                // Experimental mode is the explicit opt-in for true 32-bit FLAC.
+                args.push("-strict".into());
+                args.push("experimental".into());
+            }
             args.push("-compression_level".into());
             args.push(context.request.settings.flac.compression_level.to_string());
             if !context.request.settings.flac.write_md5 {

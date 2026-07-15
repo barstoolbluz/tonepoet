@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tonepoet_pipeline::PipelineSettings;
+use tonepoet_pipeline::{PcmBitDepth, PipelineSettings};
 
 use crate::disc::bluray_backend::BluRayAudioCoding;
 
@@ -2153,6 +2153,11 @@ pub struct TrackRecord {
     pub bytes_in: Option<u64>,
     pub bytes_out: Option<u64>,
     pub duration: Option<Duration>,
+    /// Bit depth/sample kind measured from the encoded output after post-encode
+    /// validation. Conversion logs must prefer this over the planned target so
+    /// the paper trail describes the bytes that were actually written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_output_bit_depth: Option<PcmBitDepth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsd_dst_stats: Option<DsdDstPipelineStats>,
 }

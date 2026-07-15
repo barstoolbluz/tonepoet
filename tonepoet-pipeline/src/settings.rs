@@ -116,6 +116,22 @@ impl PipelineSettings {
             ));
         }
 
+        match (&self.target_format, self.target_bit_depth) {
+            (AudioFormat::Alac, BitDepthTarget::Pcm(PcmBitDepth::Int32)) => {
+                return Err(PlanningError::invalid_settings(
+                    "target_bit_depth",
+                    "ALAC 32-bit is not supported by available encoders; choose 24-bit or WavPack/WAV",
+                ));
+            }
+            (AudioFormat::WavPack, BitDepthTarget::Pcm(PcmBitDepth::Float32 | PcmBitDepth::Float64)) => {
+                return Err(PlanningError::invalid_settings(
+                    "target_bit_depth",
+                    "floating-point WavPack is not yet supported by the conversion carrier; choose 32-bit integer or WAV",
+                ));
+            }
+            _ => {}
+        }
+
         if self.metadata.store_source_audio_md5 && !matches!(&self.target_format, AudioFormat::Flac)
         {
             return Err(PlanningError::invalid_settings(

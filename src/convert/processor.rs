@@ -3782,6 +3782,7 @@ mod tests {
                 bytes_out: None,
                 duration: None,
                 dsd_dst_stats: None,
+                verified_output_bit_depth: None,
             },
             artifact: None,
             ok: false,
@@ -4030,6 +4031,7 @@ mod tests {
                         bytes_out: Some(1024),
                         duration: None,
                         dsd_dst_stats: None,
+                        verified_output_bit_depth: None,
                     },
                     artifact: Some(TrackArtifact {
                         track_id,
@@ -4365,6 +4367,7 @@ mod tests {
                 bytes_out: Some(1024),
                 duration: None,
                 dsd_dst_stats: None,
+                verified_output_bit_depth: None,
             },
             artifact: Some(TrackArtifact {
                 track_id,

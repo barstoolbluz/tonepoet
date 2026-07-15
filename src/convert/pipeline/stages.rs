@@ -1403,11 +1403,15 @@ async fn validate_realized_segment(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RealizedProbe {
     sample_rate: u32,
     samples: Option<u64>,
     exact: bool,
+    codec_name: Option<String>,
+    sample_fmt: Option<String>,
+    bits_per_raw_sample: Option<u32>,
+    bits_per_sample: Option<u32>,
 }
 
 #[allow(dead_code)]
@@ -1433,7 +1437,7 @@ async fn probe_realized_segment_with_tool_limits(
             "-select_streams".into(),
             "a:0".into(),
             "-show_entries".into(),
-            "stream=sample_rate,duration_ts,time_base,duration".into(),
+            "stream=sample_rate,duration_ts,time_base,duration,codec_name,sample_fmt,bits_per_raw_sample,bits_per_sample".into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -1479,6 +1483,10 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
             sample_rate,
             samples: Some(samples),
             exact: true,
+            codec_name: json_string(stream, "codec_name"),
+            sample_fmt: json_string(stream, "sample_fmt"),
+            bits_per_raw_sample: json_u32_field(stream, "bits_per_raw_sample"),
+            bits_per_sample: json_u32_field(stream, "bits_per_sample"),
         });
     }
 
@@ -1497,6 +1505,10 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
         sample_rate,
         samples,
         exact: false,
+        codec_name: json_string(stream, "codec_name"),
+        sample_fmt: json_string(stream, "sample_fmt"),
+        bits_per_raw_sample: json_u32_field(stream, "bits_per_raw_sample"),
+        bits_per_sample: json_u32_field(stream, "bits_per_sample"),
     })
 }
 
@@ -1525,6 +1537,39 @@ struct PostEncodeSampleExpectation {
     ssrc_fft_length: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostEncodeValidation {
+    samples: Option<u64>,
+    measured_depth: Option<tonepoet_pipeline::PcmBitDepth>,
+}
+
+fn expected_post_encode_depth_for_track(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<tonepoet_pipeline::PcmBitDepth> {
+    match settings.target_bit_depth {
+        tonepoet_pipeline::BitDepthTarget::Pcm(depth) => Some(depth),
+        tonepoet_pipeline::BitDepthTarget::Source => {
+            pcm_bit_depth_from_source_bits(track.bit_depth.or(track.source_audio.bit_depth))
+        }
+    }
+}
+
+fn pcm_bit_depth_from_source_bits(bits: Option<u32>) -> Option<tonepoet_pipeline::PcmBitDepth> {
+    use tonepoet_pipeline::PcmBitDepth;
+    match bits {
+        Some(8) => Some(PcmBitDepth::Int8),
+        Some(16) => Some(PcmBitDepth::Int16),
+        Some(24) => Some(PcmBitDepth::Int24),
+        Some(32) => Some(PcmBitDepth::Int32),
+        // Legacy/UI source-depth convention: 320/640 encode float32/float64.
+        // Some older feature paths also used 33 for 32-bit float.
+        Some(33) | Some(320) => Some(PcmBitDepth::Float32),
+        Some(640) => Some(PcmBitDepth::Float64),
+        _ => None,
+    }
+}
+
 impl PostEncodeSampleExpectation {
     fn same_rate(samples: u64, sample_rate: Option<u32>) -> Self {
         Self {
@@ -1547,28 +1592,37 @@ async fn validate_encoded_output(
     validate_encoded_output_with_tool_limits(
         out_path,
         expected_samples.map(|samples| PostEncodeSampleExpectation::same_rate(samples, None)),
+        None,
         target_format,
         runner,
         cancel,
         None,
     )
     .await
+    .map(|validation| validation.samples)
 }
 
 async fn validate_encoded_output_with_tool_limits(
     out_path: &Path,
     expected_samples: Option<PostEncodeSampleExpectation>,
+    expected_depth: Option<tonepoet_pipeline::PcmBitDepth>,
     target_format: &tonepoet_pipeline::AudioFormat,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
-) -> Result<Option<u64>, ConvertError> {
-    let Some(expected) = expected_samples else {
-        return Ok(None);
-    };
-
+) -> Result<PostEncodeValidation, ConvertError> {
     if !requires_lossless_post_encode_sample_validation(target_format) {
-        return Ok(Some(expected.samples));
+        return Ok(PostEncodeValidation {
+            samples: expected_samples.map(|expected| expected.samples),
+            measured_depth: None,
+        });
+    }
+
+    if expected_samples.is_none() && expected_depth.is_none() {
+        return Ok(PostEncodeValidation {
+            samples: None,
+            measured_depth: None,
+        });
     }
 
     let probe = probe_realized_segment_with_tool_limits(
@@ -1585,35 +1639,70 @@ async fn validate_encoded_output_with_tool_limits(
         ))
     })?;
 
-    let actual = probe.samples.ok_or_else(|| {
-        ConvertError::TrackValidation(format!(
-            "post-encode sample validation failed for lossless output {}: ffprobe returned no sample count or duration",
-            out_path.display()
-        ))
-    })?;
+    let actual = probe.samples;
 
-    if let Some(expected_rate) = expected.sample_rate {
-        if probe.sample_rate != expected_rate {
+    if let Some(expected) = expected_samples {
+        let actual = actual.ok_or_else(|| {
+            ConvertError::TrackValidation(format!(
+                "post-encode sample validation failed for lossless output {}: ffprobe returned no sample count or duration",
+                out_path.display()
+            ))
+        })?;
+        if let Some(expected_rate) = expected.sample_rate {
+            if probe.sample_rate != expected_rate {
+                return Err(ConvertError::TrackValidation(format!(
+                    "post-encode sample rate mismatch for lossless output {}: expected {expected_rate}, got {}",
+                    out_path.display(),
+                    probe.sample_rate
+                )));
+            }
+        }
+
+        let delta = actual.abs_diff(expected.samples);
+        let allowed = encoded_output_sample_tolerance(&probe, &expected);
+
+        if delta > allowed {
             return Err(ConvertError::TrackValidation(format!(
-                "post-encode sample rate mismatch for lossless output {}: expected {expected_rate}, got {}",
+                "post-encode sample drift for lossless output {}: expected {}, got {actual}, allowed {allowed}",
                 out_path.display(),
-                probe.sample_rate
+                expected.samples
             )));
         }
     }
 
-    let delta = actual.abs_diff(expected.samples);
-    let allowed = encoded_output_sample_tolerance(&probe, &expected);
+    let measured_depth = if expected_depth.is_some() {
+        measured_pcm_depth_with_tool_limits(
+            out_path,
+            target_format,
+            &probe,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?
+    } else {
+        measured_pcm_depth(&probe)
+    };
 
-    if delta > allowed {
-        return Err(ConvertError::TrackValidation(format!(
-            "post-encode sample drift for lossless output {}: expected {}, got {actual}, allowed {allowed}",
-            out_path.display(),
-            expected.samples
-        )));
+    if let Some(expected_depth) = expected_depth {
+        let measured = measured_depth.ok_or_else(|| {
+            ConvertError::TrackValidation(format!(
+                "post-encode depth validation failed for {}: no usable sample format/depth (codec={:?}, sample_fmt={:?})",
+                out_path.display(), probe.codec_name, probe.sample_fmt
+            ))
+        })?;
+        if measured != expected_depth {
+            return Err(ConvertError::TrackValidation(format!(
+                "post-encode depth mismatch for {}: requested {:?}, measured {:?} (codec={:?}, sample_fmt={:?}, bits_per_raw_sample={:?})",
+                out_path.display(), expected_depth, measured, probe.codec_name, probe.sample_fmt, probe.bits_per_raw_sample
+            )));
+        }
     }
 
-    Ok(Some(actual))
+    Ok(PostEncodeValidation {
+        samples: actual,
+        measured_depth,
+    })
 }
 
 fn requires_lossless_post_encode_sample_validation(target_format: &tonepoet_pipeline::AudioFormat) -> bool {
@@ -1666,6 +1755,155 @@ fn json_u64(value: &serde_json::Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn json_string(object: &serde_json::Value, key: &str) -> Option<String> {
+    object.get(key)?.as_str().map(str::to_owned).filter(|value| !value.is_empty() && value != "N/A")
+}
+
+fn json_u32_field(object: &serde_json::Value, key: &str) -> Option<u32> {
+    object.get(key).and_then(json_u64).and_then(|value| u32::try_from(value).ok()).filter(|value| *value > 0)
+}
+
+async fn measured_pcm_depth_with_tool_limits(
+    out_path: &Path,
+    target_format: &tonepoet_pipeline::AudioFormat,
+    probe: &RealizedProbe,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<Option<tonepoet_pipeline::PcmBitDepth>, ConvertError> {
+    if matches!(target_format, tonepoet_pipeline::AudioFormat::WavPack) {
+        return probe_wavpack_depth_with_tool_limits(
+            out_path,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await;
+    }
+
+    Ok(measured_pcm_depth(probe))
+}
+
+async fn probe_wavpack_depth_with_tool_limits(
+    out_path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<Option<tonepoet_pipeline::PcmBitDepth>, ConvertError> {
+    let cmd = ToolCommand {
+        binary: ToolBinary::Wvunpack,
+        args: vec![
+            "-q".into(),
+            "-s".into(),
+            out_path.to_string_lossy().into_owned(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(30),
+    };
+
+    let output = match run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits).await {
+        Ok(output) => output,
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            return Err(ConvertError::Realize("cancelled".to_string()));
+        }
+        Err(err) => {
+            return Err(ConvertError::TrackValidation(format!(
+                "post-encode WavPack depth validation failed for {}: wvunpack probe failed: {err}",
+                out_path.display()
+            )));
+        }
+    };
+
+    let summary_text = if output.stderr_tail.trim().is_empty() {
+        output.stdout_tail.clone()
+    } else if output.stdout_tail.trim().is_empty() {
+        output.stderr_tail.clone()
+    } else {
+        format!("{}\n{}", output.stdout_tail, output.stderr_tail)
+    };
+
+    parse_wvunpack_source_depth(&summary_text).ok_or_else(|| {
+        ConvertError::TrackValidation(format!(
+            "post-encode WavPack depth validation failed for {}: wvunpack did not report a parseable source depth",
+            out_path.display()
+        ))
+    }).map(Some)
+}
+
+fn parse_wvunpack_source_depth(text: &str) -> Option<tonepoet_pipeline::PcmBitDepth> {
+    use tonepoet_pipeline::PcmBitDepth;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.to_ascii_lowercase().starts_with("source:") {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let bit_pos = lower.find("-bit")?;
+        let prefix = lower[..bit_pos].trim_end();
+        let digits = prefix
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let bits: u32 = digits.parse().ok()?;
+        let is_float = lower.contains("float");
+        return match (bits, is_float) {
+            (8, false) => Some(PcmBitDepth::Int8),
+            (16, false) => Some(PcmBitDepth::Int16),
+            (24, false) => Some(PcmBitDepth::Int24),
+            (32, false) => Some(PcmBitDepth::Int32),
+            (32, true) => Some(PcmBitDepth::Float32),
+            (64, true) => Some(PcmBitDepth::Float64),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn measured_pcm_depth(probe: &RealizedProbe) -> Option<tonepoet_pipeline::PcmBitDepth> {
+    use tonepoet_pipeline::PcmBitDepth;
+    let sample_fmt = probe.sample_fmt.as_deref().unwrap_or_default();
+    if sample_fmt.starts_with("flt") {
+        return Some(PcmBitDepth::Float32);
+    }
+    if sample_fmt.starts_with("dbl") {
+        return Some(PcmBitDepth::Float64);
+    }
+
+    let codec = probe.codec_name.as_deref().unwrap_or_default();
+    if codec.starts_with("pcm_f32") {
+        return Some(PcmBitDepth::Float32);
+    }
+    if codec.starts_with("pcm_f64") {
+        return Some(PcmBitDepth::Float64);
+    }
+
+    let bits = probe.bits_per_raw_sample.or(probe.bits_per_sample).or_else(|| {
+        [
+            ("pcm_u8", 8),
+            ("pcm_s16", 16),
+            ("pcm_s24", 24),
+            ("pcm_s32", 32),
+        ]
+        .into_iter()
+        .find_map(|(prefix, bits)| codec.starts_with(prefix).then_some(bits))
+    })?;
+    match bits {
+        8 => Some(PcmBitDepth::Int8),
+        16 => Some(PcmBitDepth::Int16),
+        24 => Some(PcmBitDepth::Int24),
+        32 => Some(PcmBitDepth::Int32),
+        _ => None,
+    }
 }
 
 fn has_path_extension(path: &Path, ext: &str) -> bool {
@@ -2592,6 +2830,7 @@ pub fn scheduled_worker_failure_output(
             bytes_in: None,
             bytes_out: None,
             duration: None,
+            verified_output_bit_depth: None,
             dsd_dst_stats: None,
         },
         artifact: None,
@@ -2618,6 +2857,7 @@ fn track_records_for_terminal_source_issue(
             bytes_in: None,
             bytes_out: None,
             duration: None,
+            verified_output_bit_depth: None,
             dsd_dst_stats: None,
         })
         .collect()
@@ -2922,9 +3162,10 @@ async fn convert_one_track_work(
                     }
                 };
 
-                let actual_samples = match validate_encoded_output_with_tool_limits(
+                let post_encode_validation = match validate_encoded_output_with_tool_limits(
                     &staged_path,
                     post_encode_expected_samples,
+                    expected_post_encode_depth_for_track(&track, &req.settings),
                     &req.settings.target_format,
                     runner,
                     &cancel,
@@ -2932,7 +3173,7 @@ async fn convert_one_track_work(
                 )
                 .await
                 {
-                    Ok(samples) => samples,
+                    Ok(validation) => validation,
                     Err(err) => {
                         let commands = command_from_convert_error(&err);
                         let record = failed_track_record(
@@ -2945,6 +3186,7 @@ async fn convert_one_track_work(
                         return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
                     }
                 };
+                let actual_samples = post_encode_validation.samples;
                 let mut dsd_dst_stats = realized_dsd_dst_stats;
                 merge_optional_dsd_dst_stats(
                     &mut dsd_dst_stats,
@@ -2963,6 +3205,7 @@ async fn convert_one_track_work(
                     bytes_in,
                     bytes_out,
                     duration: Some(executed.elapsed),
+                    verified_output_bit_depth: post_encode_validation.measured_depth,
                     dsd_dst_stats,
                 };
                 let artifact = TrackArtifact {
@@ -7016,6 +7259,7 @@ fn stage_pre_materialization_conversion_log_fragment(
         bytes_in: None,
         bytes_out: None,
         duration: None,
+        verified_output_bit_depth: None,
         dsd_dst_stats: None,
     };
 
@@ -13338,7 +13582,11 @@ fn append_track_log(
         push_optional_kv_line(log, "  Artist", track.metadata.artist.as_deref());
         push_optional_kv_line(log, "  Composer", track.metadata.composer.as_deref());
         push_kv_line(log, "  Source audio", source_audio_description(track));
-        push_kv_line(log, "  Conversion", conversion_summary(track, req));
+        push_kv_line(
+            log,
+            "  Conversion",
+            conversion_summary(track, req, record.verified_output_bit_depth),
+        );
     }
 
     if let Some(pipeline) = planned_pipeline_label(&record.commands)
@@ -13960,21 +14208,37 @@ fn metadata_dimension_labels(value: PlannedMetadataSatisfaction) -> Vec<&'static
     labels
 }
 
-fn conversion_summary(track: &PreparedTrack, req: &PipelineRequest) -> String {
+fn conversion_summary(
+    track: &PreparedTrack,
+    req: &PipelineRequest,
+    verified_output_bit_depth: Option<tonepoet_pipeline::PcmBitDepth>,
+) -> String {
     let source_rate = track.scalar_sample_rate();
-    let source_depth = track.bit_depth;
+    let source_depth_bits = track.bit_depth.or(track.source_audio.bit_depth);
+    let source_pcm_depth = pcm_bit_depth_from_source_bits(source_depth_bits);
+    let source_depth = source_pcm_depth
+        .map(tonepoet_pipeline::PcmBitDepth::bits)
+        .or_else(|| source_depth_bits.filter(|bits| *bits < 100));
     let source_format = source_track_format_label(track);
     let target_rate = resolved_target_rate_hz(track, &req.settings).or(source_rate);
-    let target_depth = if req.settings.target_format.is_dsd() {
+    let planned_target_depth = if req.settings.target_format.is_dsd() {
         None
     } else {
         resolved_target_bit_depth(track, req.settings.target_bit_depth)
     };
+    let target_depth = verified_output_bit_depth
+        .map(tonepoet_pipeline::PcmBitDepth::bits)
+        .or(planned_target_depth);
+    let target_stream = verified_output_bit_depth
+        .map(|depth| measured_target_stream_description(depth, target_rate))
+        .unwrap_or_else(|| target_stream_description(track, target_depth, target_rate, &req.settings));
     let mut summary = format!(
         "{} {} → {} {}",
-        stream_description(source_depth, source_rate, Some(&source_format)),
+        source_pcm_depth
+            .map(|depth| measured_target_stream_description(depth, source_rate))
+            .unwrap_or_else(|| stream_description(source_depth, source_rate, Some(&source_format))),
         source_format,
-        target_stream_description(track, target_depth, target_rate, &req.settings),
+        target_stream,
         req.settings.target_format.display_name(),
     );
     let mut transforms = Vec::new();
@@ -13983,7 +14247,7 @@ fn conversion_summary(track: &PreparedTrack, req: &PipelineRequest) -> String {
             transforms.push(format!("{} resampling", preferred_resampler_label(&req.settings)));
         }
     }
-    if dither_applies(source_depth, target_depth, req.settings.dither_type) {
+    if dither_applies(source_depth, planned_target_depth, req.settings.dither_type) {
         transforms.push(format!("{} dither", dither_type_label(req.settings.dither_type)));
     }
     if !transforms.is_empty() {
@@ -14029,6 +14293,21 @@ fn target_stream_description(
         }
     }
     stream_description(bit_depth, sample_rate, None)
+}
+
+fn measured_target_stream_description(
+    depth: tonepoet_pipeline::PcmBitDepth,
+    sample_rate: Option<u32>,
+) -> String {
+    let rate = sample_rate
+        .map(format_sample_rate)
+        .unwrap_or_else(|| "unknown rate".to_string());
+    match depth {
+        tonepoet_pipeline::PcmBitDepth::Float32 | tonepoet_pipeline::PcmBitDepth::Float64 => {
+            format!("{}/{rate}", pcm_bit_depth_label(depth))
+        }
+        _ => format!("{}-bit/{rate}", depth.bits()),
+    }
 }
 
 fn resampling_applies_for_source(
@@ -14100,7 +14379,7 @@ fn resolved_target_rate_hz(
 
 fn resolved_target_bit_depth(track: &PreparedTrack, target: BitDepthTarget) -> Option<u32> {
     match target {
-        BitDepthTarget::Source => track.bit_depth,
+        BitDepthTarget::Source => track.bit_depth.or(track.source_audio.bit_depth),
         BitDepthTarget::Pcm(depth) => Some(depth.bits()),
     }
 }
@@ -20505,9 +20784,10 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                     }
                 };
 
-                let actual_samples = match validate_encoded_output_with_tool_limits(
+                let post_encode_validation = match validate_encoded_output_with_tool_limits(
                     &staged_path,
                     post_encode_expected_samples,
+                    expected_post_encode_depth_for_track(&realized.track, &realized.req.settings),
                     &realized.req.settings.target_format,
                     &runner,
                     &realized.cancel,
@@ -20515,7 +20795,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                 )
                 .await
                 {
-                    Ok(samples) => samples,
+                    Ok(validation) => validation,
                     Err(err) => {
                         let commands = command_from_convert_error(&err);
                         let record = failed_track_record(
@@ -20528,6 +20808,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                         return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
                     }
                 };
+                let actual_samples = post_encode_validation.samples;
                 let mut dsd_dst_stats = realized.realized_dsd_dst_stats.clone();
                 merge_optional_dsd_dst_stats(
                     &mut dsd_dst_stats,
@@ -20546,6 +20827,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                     bytes_in,
                     bytes_out,
                     duration: Some(executed.elapsed),
+                    verified_output_bit_depth: post_encode_validation.measured_depth,
                     dsd_dst_stats,
                 };
                 let artifact = TrackArtifact {
@@ -31815,7 +32097,12 @@ fn sanitize_component(value: &str) -> String {
             ch => ch,
         })
         .collect();
-    let trimmed = sanitized.trim().trim_matches('.').to_string();
+    let trimmed = sanitized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches('.')
+        .to_string();
     if trimmed.is_empty() {
         "untitled".to_string()
     } else {
@@ -32111,6 +32398,7 @@ fn failed_track_record(
         bytes_in: None,
         bytes_out: None,
         duration: None,
+        verified_output_bit_depth: None,
         dsd_dst_stats: None,
     }
 }
@@ -34846,6 +35134,7 @@ mod pipeline_test_helpers {
             bytes_in: Some(2048),
             bytes_out: Some(1024),
             duration: Some(Duration::from_secs(65)),
+            verified_output_bit_depth: None,
             dsd_dst_stats: None,
         }
     }
@@ -34865,6 +35154,7 @@ mod pipeline_test_helpers {
             bytes_in: Some(4096),
             bytes_out: None,
             duration: None,
+            verified_output_bit_depth: None,
             dsd_dst_stats: None,
         }
     }
@@ -35435,6 +35725,10 @@ mod conversion_log_tests {
         source.kind = SourceKind::SacdIso;
         source.tracks[0].sample_rate = Some(DsdRate::Dsd64.hz());
         source.tracks[0].bit_depth = None;
+        // The PCM fixture's descriptor carries a 24-bit depth; a real SACD
+        // track would not, and the source-depth fallback must not resolve a
+        // PCM depth for a DSD source.
+        source.tracks[0].source_audio.bit_depth = None;
         source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
             iso: PathBuf::from("/music/source.iso"),
             track_index: 0,
@@ -37054,6 +37348,11 @@ mod naming_template_tests {
     }
 
     #[test]
+    fn sanitize_component_collapses_whitespace_after_separator_replacement() {
+        assert_eq!(sanitize_component("LP / 24-192"), "LP 24-192");
+    }
+
+    #[test]
     fn folder_template_sanitizes_value_slashes_but_preserves_template_slashes() {
         let mut source = template_source();
         source.album_metadata.album_artist = Some("Miles/Davis".to_string());
@@ -38063,6 +38362,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             bytes_in: None,
             bytes_out: None,
             duration: None,
+            verified_output_bit_depth: None,
             dsd_dst_stats: None,
         }
     }
@@ -40451,6 +40751,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             record.outcome = TrackOutcome::Ok;
             record.bytes_out = Some(1024 + u64::from(track_number));
             record.duration = Some(Duration::from_secs(60 + u64::from(track_number)));
+            record.verified_output_bit_depth = None;
         } else {
             record.outcome = TrackOutcome::Err(format!("track {track_number} encode failed"));
             record.bytes_out = None;
@@ -44374,22 +44675,38 @@ mod validate_encoded_output_tests {
         )
     }
 
+
+    fn ffprobe_exact_json_with_depth(
+        sample_rate: u32,
+        total_samples: u64,
+        codec_name: &str,
+        sample_fmt: &str,
+        bits_per_raw_sample: u32,
+    ) -> String {
+        format!(
+            r#"{{"streams":[{{"sample_rate":"{sample_rate}","duration_ts":{total_samples},"time_base":"1/{sample_rate}","codec_name":"{codec_name}","sample_fmt":"{sample_fmt}","bits_per_raw_sample":"{bits_per_raw_sample}"}}],"format":{{}}}}"#
+        )
+    }
+
     fn ffprobe_approx_json(sample_rate: u32, duration_secs: f64) -> String {
         format!(
             r#"{{"streams":[{{"sample_rate":"{sample_rate}","duration":"{duration_secs}"}}],"format":{{"duration":"{duration_secs}"}}}}"#
         )
     }
 
-    fn stub_with_probe(json: &str) -> StubToolRunner {
-        let runner = StubToolRunner::new();
-        runner.push_output(ToolOutput {
+    fn stub_output(binary: ToolBinary, stdout_tail: &str) -> ToolOutput {
+        stub_output_with_stderr(binary, stdout_tail, "")
+    }
+
+    fn stub_output_with_stderr(binary: ToolBinary, stdout_tail: &str, stderr_tail: &str) -> ToolOutput {
+        ToolOutput {
             exit: ProcessExit::Code(0),
-            stdout_tail: json.to_string(),
-            stderr_tail: String::new(),
+            stdout_tail: stdout_tail.to_string(),
+            stderr_tail: stderr_tail.to_string(),
             elapsed: Duration::from_millis(1),
             command: CommandRecord {
                 description: None,
-                binary: ToolBinary::Ffprobe,
+                binary,
                 sanitized_args: vec![],
                 cwd: None,
                 env_keys: vec![],
@@ -44398,7 +44715,26 @@ mod validate_encoded_output_tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::from_millis(1),
             },
-        });
+        }
+    }
+
+    fn stub_with_probe(json: &str) -> StubToolRunner {
+        let runner = StubToolRunner::new();
+        runner.push_output(stub_output(ToolBinary::Ffprobe, json));
+        runner
+    }
+
+    fn stub_with_probe_and_wvunpack(json: &str, wvunpack_summary: &str) -> StubToolRunner {
+        let runner = StubToolRunner::new();
+        runner.push_output(stub_output(ToolBinary::Ffprobe, json));
+        runner.push_output(stub_output(ToolBinary::Wvunpack, wvunpack_summary));
+        runner
+    }
+
+    fn stub_with_probe_and_wvunpack_stderr(json: &str, wvunpack_summary: &str) -> StubToolRunner {
+        let runner = StubToolRunner::new();
+        runner.push_output(stub_output(ToolBinary::Ffprobe, json));
+        runner.push_output(stub_output_with_stderr(ToolBinary::Wvunpack, "", wvunpack_summary));
         runner
     }
 
@@ -44706,6 +45042,224 @@ mod validate_encoded_output_tests {
         }
     }
 
+
+    #[test]
+    fn expected_post_encode_depth_uses_track_source_depth_for_source_target() {
+        let mut track = dvda_validation_test_track(Some(1_000));
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+
+        track.bit_depth = Some(24);
+        assert_eq!(
+            expected_post_encode_depth_for_track(&track, &settings),
+            Some(tonepoet_pipeline::PcmBitDepth::Int24)
+        );
+
+        track.bit_depth = Some(320);
+        assert_eq!(
+            expected_post_encode_depth_for_track(&track, &settings),
+            Some(tonepoet_pipeline::PcmBitDepth::Float32)
+        );
+
+        track.bit_depth = None;
+        track.source_audio.bit_depth = Some(24);
+        assert_eq!(
+            expected_post_encode_depth_for_track(&track, &settings),
+            Some(tonepoet_pipeline::PcmBitDepth::Int24)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_encode_depth_validation_returns_measured_depth_for_log() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json_with_depth(
+            192_000,
+            1_000_000,
+            "flac",
+            "s32",
+            32,
+        ));
+        let cancel = CancellationToken::new();
+
+        let validation = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(192_000))),
+            Some(tonepoet_pipeline::PcmBitDepth::Int32),
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("32-bit FLAC should validate");
+
+        assert_eq!(validation.samples, Some(1_000_000));
+        assert_eq!(validation.measured_depth, Some(tonepoet_pipeline::PcmBitDepth::Int32));
+    }
+
+    #[tokio::test]
+    async fn post_encode_depth_validation_derives_float_from_pcm_codec_name() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.aiff");
+        std::fs::write(&out, b"fake-aiff").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json_with_depth(
+            192_000,
+            1_000_000,
+            "pcm_f32be",
+            "N/A",
+            32,
+        ));
+        let cancel = CancellationToken::new();
+
+        let validation = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(192_000))),
+            Some(tonepoet_pipeline::PcmBitDepth::Float32),
+            &tonepoet_pipeline::AudioFormat::Aiff,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("float AIFF should derive Float32 from pcm_f32 codec name");
+
+        assert_eq!(validation.measured_depth, Some(tonepoet_pipeline::PcmBitDepth::Float32));
+    }
+
+    #[tokio::test]
+    async fn post_encode_depth_validation_uses_wvunpack_for_wavpack_int24() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.wv");
+        std::fs::write(&out, b"fake-wv").expect("write");
+        let runner = stub_with_probe_and_wvunpack(
+            &ffprobe_exact_json_with_depth(
+                48_000,
+                1_000_000,
+                "wavpack",
+                "s32p",
+                32,
+            ),
+            "source:            24-bit ints at 48000 Hz\nduration:          0:00:20.83\n",
+        );
+        let cancel = CancellationToken::new();
+
+        let validation = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
+            Some(tonepoet_pipeline::PcmBitDepth::Int24),
+            &tonepoet_pipeline::AudioFormat::WavPack,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("WavPack 24-bit should be measured by wvunpack, not ffprobe's s32 container representation");
+
+        assert_eq!(validation.measured_depth, Some(tonepoet_pipeline::PcmBitDepth::Int24));
+        assert_eq!(runner.transcript().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_encode_depth_validation_accepts_wvunpack_summary_on_stderr() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.wv");
+        std::fs::write(&out, b"fake-wv").expect("write");
+        let runner = stub_with_probe_and_wvunpack_stderr(
+            &ffprobe_exact_json_with_depth(
+                48_000,
+                1_000_000,
+                "wavpack",
+                "s32p",
+                32,
+            ),
+            "source:            24-bit ints at 48000 Hz\nduration:          0:00:20.83\n",
+        );
+        let cancel = CancellationToken::new();
+
+        let validation = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
+            Some(tonepoet_pipeline::PcmBitDepth::Int24),
+            &tonepoet_pipeline::AudioFormat::WavPack,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("WavPack depth should parse wvunpack summaries from stderr as well as stdout");
+
+        assert_eq!(validation.measured_depth, Some(tonepoet_pipeline::PcmBitDepth::Int24));
+    }
+
+    #[test]
+    fn conversion_summary_uses_measured_float_kind_and_source_audio_depth_fallback() {
+        let mut track = non_dvda_validation_test_track(Some(1_000), Some(192_000));
+        track.bit_depth = None;
+        track.source_audio.bit_depth = Some(24);
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Aiff;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Float32,
+        );
+
+        let summary = conversion_summary(
+            &track,
+            &req,
+            Some(tonepoet_pipeline::PcmBitDepth::Float32),
+        );
+
+        assert!(summary.contains("24-bit/192kHz WAV"), "{summary}");
+        assert!(summary.contains("32-bit float/192kHz AIFF"), "{summary}");
+
+        track.source_audio.bit_depth = Some(320);
+        let float_source_summary = conversion_summary(
+            &track,
+            &req,
+            Some(tonepoet_pipeline::PcmBitDepth::Float32),
+        );
+
+        assert!(
+            float_source_summary.contains("32-bit float/192kHz WAV"),
+            "{float_source_summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_encode_depth_validation_rejects_silent_flac_32_to_24_substitution() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json_with_depth(
+            192_000,
+            1_000_000,
+            "flac",
+            "s32",
+            24,
+        ));
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(192_000))),
+            Some(tonepoet_pipeline::PcmBitDepth::Int32),
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ConvertError::TrackValidation(message))
+                if message.contains("post-encode depth mismatch")
+                    && message.contains("Int32")
+                    && message.contains("Int24")
+        ));
+    }
+
     #[tokio::test]
     async fn resampled_lossless_exact_probe_accepts_rounded_target_sample_count() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -44722,6 +45276,7 @@ mod validate_encoded_output_tests {
                 resampled: true,
                 ssrc_fft_length: None,
             }),
+            None,
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,
             &cancel,
@@ -44730,7 +45285,7 @@ mod validate_encoded_output_tests {
         .await;
 
         assert_eq!(
-            result.expect("resampled validation should pass"),
+            result.expect("resampled validation should pass").samples,
             Some(19_712_540)
         );
     }
@@ -44751,6 +45306,7 @@ mod validate_encoded_output_tests {
                 resampled: true,
                 ssrc_fft_length: None,
             }),
+            None,
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,
             &cancel,
@@ -44759,7 +45315,7 @@ mod validate_encoded_output_tests {
         .await;
 
         assert_eq!(
-            result.expect("one-sample resampler difference should pass"),
+            result.expect("one-sample resampler difference should pass").samples,
             Some(19_712_541)
         );
     }
@@ -44775,6 +45331,7 @@ mod validate_encoded_output_tests {
         let result = validate_encoded_output_with_tool_limits(
             &out,
             Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
+            None,
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,
             &cancel,
@@ -44805,6 +45362,7 @@ mod validate_encoded_output_tests {
                 resampled: true,
                 ssrc_fft_length: None,
             }),
+            None,
             &tonepoet_pipeline::AudioFormat::Flac,
             &runner,
             &cancel,

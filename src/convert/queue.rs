@@ -834,6 +834,10 @@ impl ConversionQueue {
 
     /// Retry failed items
     pub fn retry_failed(&mut self) {
+        // Failed/cancelled items may still reside in the active deque until a
+        // reducer settles them. Normalize first so selected retry semantics do
+        // not depend on reducer timing.
+        self.settle_finished();
         let mut to_retry = Vec::new();
         let mut retained_completed = Vec::with_capacity(self.completed.len());
 
