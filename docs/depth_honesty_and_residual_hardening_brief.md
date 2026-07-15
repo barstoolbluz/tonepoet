@@ -444,7 +444,9 @@ tonepoet-pipeline/src/{plugins.rs,mapping.rs,settings.rs,enums.rs,tools.rs,plan.
 src/convert/pipeline/stages.rs (ONLY the D5/D6 functions named above),
 src/convert/pipeline/materializer_cue.rs (D3 carrier + E8),
 src/convert/pipeline/types.rs (only if the carrier/verification needs it),
-crates/tonepoet-features/src/log_writer.rs (D6),
+crates/tonepoet-features/src/log_writer.rs (D6; NOTE the crate root is
+src/mod.rs, not lib.rs — included as reference with the crate's
+Cargo.toml),
 src/convert/{queue_expansion.rs,mod.rs,queue.rs,split_cue_album.rs,classify.rs},
 src/tui/{keybindings.rs,event_loop.rs,command.rs,app.rs,musicbrainz.rs,probe.rs,context_menu.rs,message.rs,draw_overlays.rs,accuraterip.rs,cue_parser.rs},
 tests/unified_synthetic_cue_output_boundary.rs,
@@ -453,4 +455,5 @@ Reference-only: src/convert/pipeline/{mod.rs,track_executor.rs,unified_request.r
 src/convert/cue_parser.rs, src/tui/gnudb.rs, src/tui/external_editor.rs,
 docs/unified_cue_album_hardening_brief.md,
 docs/unified_cue_album_conversion_metadata_brief.md.
-Manifests: Cargo.toml, Cargo.lock, src/lib.rs, CLAUDE.md.
+Manifests: Cargo.toml, Cargo.lock, src/lib.rs, CLAUDE.md,
+tonepoet-pipeline/Cargo.toml, crates/tonepoet-features/Cargo.toml.
