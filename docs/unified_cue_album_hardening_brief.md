@@ -206,7 +206,7 @@ After a confirmed unified `:cuesheet-delete`
 (keybindings.rs:10840-10861) the per-track rows remain visible and
 editable, but they have no write path (writer skips row-dim entries;
 regen bails on `pending_embedded_cuesheet_delete`, 8836-8838). Then
-`reduce_saved_slots`' unified branch (src/tui/app.rs:7566-7581, added
+`reduce_saved_slots`' unified branch (src/tui/app.rs:7571-7579, added
 in 36ff51a) marks those rows saved once the delete write lands —
 falsely. Scenario: :cuesheet-delete → confirm → edit track 3 title →
 :w → "saved", rendered clean, written nowhere.
@@ -217,7 +217,7 @@ also drop the synthetic-sheet model: clear
 entries (mirror `remove_cuesheet_derived_per_track_rows`, which today
 requires paths.len()==1 — extend or add the unified variant), and
 re-shape the surface as a plain 2-file editor. Additionally guard the
-app.rs:7566 branch with `!tab.pending_embedded_cuesheet_delete` so
+app.rs:7571 branch with `!tab.pending_embedded_cuesheet_delete` so
 in-flight deletes never mark row entries saved.
 
 Tests: (1) app.rs `metadata_presentation_tab_tests`: unified sheet +
