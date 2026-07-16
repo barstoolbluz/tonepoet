@@ -647,6 +647,10 @@ pub(crate) fn handle_browse_convert_expansion_complete(
             ));
             return;
         }
+        // Currently unreachable (constructors only populate this field with
+        // empty queue paths), but if it ever fires the status below is
+        // overwritten in the same reducer pass — keep a durable record.
+        log::warn!("browse expansion warning: {}", err);
         app.set_status(status_with_stale_selection_notice(
             request.dropped_stale_selection_count,
             format!("{}; continuing with queueable sources", err),
@@ -6392,6 +6396,9 @@ fn finish_browse_queue_review_after_expansion(
     }
     let paths = normalized_path_snapshot(paths);
     if paths.is_empty() {
+        if let Some(err) = expansion_errors.first() {
+            log::warn!("queue expansion warning dropped by empty selection: {}", err);
+        }
         crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
         app.set_status("queue: no supported sources in selection");
         return false;
@@ -6403,6 +6410,10 @@ fn finish_browse_queue_review_after_expansion(
 
     if let Some(name) = &preset {
         if let Err(msg) = load_queue_preset_into_pills(app, name) {
+            if let Some(err) = expansion_errors.first() {
+                log::warn!("queue expansion warning dropped by preset failure: {}", err);
+            }
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
             app.set_status(msg);
             return false;
         }
@@ -12032,8 +12043,19 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(f) = fmt {
+                let rate_before = *app.convert.format.sample_rate.selected_value();
                 app.convert.format.format.select_value(&f);
                 app.convert.format.apply_format_constraints();
+                // Mirror after_user_selection: a DSD-rate selection falling
+                // back to PCM should land on the probed source rate, not the
+                // lowest PCM rate.
+                if tonepoet_pipeline::DsdRate::from_hz(rate_before).is_some()
+                    && !app.convert.format.is_dsd_selected()
+                {
+                    if let Some(rate) = app.convert.current_source_sample_rate() {
+                        app.convert.format.sample_rate.select_value(&rate);
+                    }
+                }
                 app.preset.mark_modified();
                 app.set_status(format!("format = {}", f.name()));
             } else {

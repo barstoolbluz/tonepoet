@@ -2314,6 +2314,36 @@ mod clamp_pill_tests {
     }
 
     #[test]
+    fn dsd_fallback_restores_probed_pcm_source_rate() {
+        use super::{BitDepthChoice, FormatField};
+        let mut format = FormatState::new();
+        format.sample_rate.select_value(&96_000);
+        let before = *format.format.selected_value();
+        format.format.select_value(&AudioFormat::Dsf);
+        format.after_user_selection(
+            FormatField::Format,
+            before,
+            BitDepthChoice::Int24,
+            Some(24),
+            Some(96_000),
+        );
+        let before = *format.format.selected_value();
+        format.format.select_value(&AudioFormat::Wav);
+        format.after_user_selection(
+            FormatField::Format,
+            before,
+            BitDepthChoice::Int24,
+            Some(24),
+            Some(96_000),
+        );
+        assert_eq!(
+            format.sample_rate.selected_value(),
+            &96_000,
+            "a DSF round-trip on a 96 kHz source must return to the source rate"
+        );
+    }
+
+    #[test]
     fn pcm_rate_cap_still_degrades_to_nearest_lower_rate() {
         let mut format = FormatState::new();
         format.sample_rate.select_value(&96_000);
@@ -3364,11 +3394,23 @@ impl FormatState {
         if row == FormatField::Format && before_format != *self.format.selected_value() {
             self.selected_container_index = 0;
             self.resampler_overridden = false;
+            let rate_before = *self.sample_rate.selected_value();
             self.apply_format_constraints();
             if self.is_dsd_selected() {
                 self.dither.select_value(&DitherType::None);
                 self.cascade_dsd_rate_defaults();
             } else {
+                // A DSD-rate selection just fell back to the lowest PCM rate
+                // (clamp_sample_rate_pill). For a probed PCM source the honest
+                // default is the source rate — a DSF round-trip on a 96 kHz
+                // source must not arm a silent 96 -> 44.1 downsample. DSD
+                // sources refuse here (their rate is not a PCM option) and are
+                // handled by cascade_dsd_source_to_pcm_defaults.
+                if tonepoet_pipeline::DsdRate::from_hz(rate_before).is_some() {
+                    if let Some(rate) = source_rate {
+                        self.sample_rate.select_value(&rate);
+                    }
+                }
                 if !self.dither_overridden {
                     self.apply_auto_dither(source_bits);
                 }
@@ -3740,7 +3782,9 @@ fn clamp_pill<T: Clone + PartialEq>(pill: &mut PillState<T>) {
 /// downward would select 768 kHz and silently arm a large upsample from a
 /// typical 44.1/48 kHz source. Land on the lowest enabled rate instead.
 fn clamp_sample_rate_pill(pill: &mut PillState<u32>) {
-    if !pill.options[pill.selected].enabled && pill.options[pill.selected].value >= 2_822_400 {
+    if !pill.options[pill.selected].enabled
+        && tonepoet_pipeline::DsdRate::from_hz(pill.options[pill.selected].value).is_some()
+    {
         if let Some(idx) = pill.options.iter().position(|o| o.enabled) {
             pill.selected = idx;
             return;

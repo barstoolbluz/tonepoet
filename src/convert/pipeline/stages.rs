@@ -1702,11 +1702,7 @@ async fn validate_encoded_output_with_tool_limits(
         )
         .await?
     } else if matches!(target_format, tonepoet_pipeline::AudioFormat::WavPack) {
-        // Without an expectation the wvunpack oracle is not consulted, and
-        // ffprobe reports 24-bit WavPack as its decoded s32p form — recording
-        // that as a verified 32-bit output would put a lie in the conversion
-        // log. Leave it unmeasured; the log falls back to the planned depth.
-        None
+        wavpack_log_only_measured_depth(&probe)
     } else {
         measured_pcm_depth(&probe)
     };
@@ -1923,6 +1919,61 @@ fn parse_wvunpack_source_depth(text: &str) -> Option<tonepoet_pipeline::PcmBitDe
     }
 
     None
+}
+
+/// Log-side WavPack depth without the wvunpack oracle (no expectation to
+/// enforce, so an oracle failure must not fail the track). ffprobe decodes
+/// every WavPack depth to sample_fmt s32p, so measured_pcm_depth's fallback
+/// chain would report 32 for a 24-bit file; bits_per_raw_sample, when
+/// present, is container-accurate (verified against wvunpack -s). Trust only
+/// that field and leave the depth unmeasured otherwise.
+fn wavpack_log_only_measured_depth(
+    probe: &RealizedProbe,
+) -> Option<tonepoet_pipeline::PcmBitDepth> {
+    use tonepoet_pipeline::PcmBitDepth;
+    match probe.bits_per_raw_sample? {
+        8 => Some(PcmBitDepth::Int8),
+        16 => Some(PcmBitDepth::Int16),
+        24 => Some(PcmBitDepth::Int24),
+        32 => Some(PcmBitDepth::Int32),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod wavpack_log_only_depth_tests {
+    use super::*;
+
+    fn wv_probe(raw_bits: Option<u32>) -> RealizedProbe {
+        RealizedProbe {
+            sample_rate: 44_100,
+            samples: Some(8_820),
+            exact: true,
+            codec_name: Some("wavpack".to_string()),
+            sample_fmt: Some("s32p".to_string()),
+            bits_per_raw_sample: raw_bits,
+            bits_per_sample: None,
+        }
+    }
+
+    #[test]
+    fn trusts_container_accurate_raw_bits() {
+        assert_eq!(
+            wavpack_log_only_measured_depth(&wv_probe(Some(24))),
+            Some(tonepoet_pipeline::PcmBitDepth::Int24)
+        );
+        assert_eq!(
+            wavpack_log_only_measured_depth(&wv_probe(Some(32))),
+            Some(tonepoet_pipeline::PcmBitDepth::Int32)
+        );
+    }
+
+    #[test]
+    fn stays_unmeasured_without_raw_bits() {
+        // sample_fmt=s32p is the decoded form, not the container depth —
+        // the log-side WavPack probe must not derive anything from it.
+        assert_eq!(wavpack_log_only_measured_depth(&wv_probe(None)), None);
+    }
 }
 
 fn measured_pcm_depth(probe: &RealizedProbe) -> Option<tonepoet_pipeline::PcmBitDepth> {
@@ -14288,6 +14339,10 @@ fn conversion_summary(
                 BitDepthTarget::Source => track.source_audio.bit_depth,
                 BitDepthTarget::Pcm(_) => None,
             })
+            // Raw descriptor values can carry the legacy 320/640 float
+            // convention (source side filters identically); never render
+            // them as literal bit widths like "320-bit".
+            .filter(|bits| *bits < 100)
     };
     let target_depth = verified_output_bit_depth
         .map(tonepoet_pipeline::PcmBitDepth::bits)
