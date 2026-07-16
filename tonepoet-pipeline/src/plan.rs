@@ -9,7 +9,7 @@ use crate::mapping;
 use crate::settings::{
     default_pcm_depth_for_format, FlacSettings, PipelineSettings, WavPackSettings,
 };
-use crate::source::SourceInfo;
+use crate::source::{SourceInfo, SourceRepresentationKind};
 use crate::tools::{ToolIdentifier, ToolRegistry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -1524,6 +1524,12 @@ fn reject_unsupported_resolved_depth(
             "target_bit_depth",
             "ALAC 32-bit is not supported by available encoders; choose 24-bit or WavPack/WAV (source resolves to 32-bit)",
         )),
+        (AudioFormat::Flac | AudioFormat::Alac, PcmBitDepth::Float32 | PcmBitDepth::Float64) => {
+            Err(PlanningError::invalid_settings(
+                "target_bit_depth",
+                "FLAC/ALAC floating-point output is not supported; choose 24-bit integer or WAV",
+            ))
+        }
         (AudioFormat::WavPack, PcmBitDepth::Float32 | PcmBitDepth::Float64) => {
             Err(PlanningError::invalid_settings(
                 "target_bit_depth",
@@ -1536,17 +1542,28 @@ fn reject_unsupported_resolved_depth(
 
 fn resolve_target_bit_depth(request: &PlanRequest) -> Result<PcmBitDepth> {
     match request.settings.target_bit_depth {
-        BitDepthTarget::Source => match request.source.bit_depth {
-            Some(depth) => Ok(depth),
-            None if request.settings.target_format.is_pcm_lossless() => {
+        BitDepthTarget::Source => match request.source.representation_kind() {
+            // DSD and lossy sources have no authoritative PCM word length.
+            // Resolve Source to the documented format default even when the
+            // realized decoder carrier reports an integer width.
+            SourceRepresentationKind::Dsd | SourceRepresentationKind::Lossy => {
+                Ok(default_pcm_depth_for_format(&request.settings.target_format))
+            }
+            SourceRepresentationKind::Pcm => request
+                .source
+                .authoritative_pcm_depth()
+                .ok_or_else(|| {
+                    PlanningError::invalid_source(
+                        "bit_depth",
+                        "a PCM-lossless Source target requires an authoritative source PCM representation; choose an explicit target bit depth",
+                    )
+                }),
+            SourceRepresentationKind::Unknown | SourceRepresentationKind::Unspecified => {
                 Err(PlanningError::invalid_source(
                     "bit_depth",
-                    "a PCM-lossless Source target requires an authoritative source PCM representation; choose an explicit target bit depth",
+                    "the source PCM representation is unknown; choose an explicit target bit depth",
                 ))
             }
-            None => Ok(default_pcm_depth_for_format(
-                &request.settings.target_format,
-            )),
         },
         BitDepthTarget::Pcm(depth) => Ok(depth),
     }
@@ -1626,7 +1643,7 @@ mod metadata_pruning_tests {
     use super::*;
     use crate::enums::{AudioCodec, AudioFormat, PcmBitDepth, SampleKind};
     use crate::settings::PipelineSettings;
-    use crate::source::SourceInfo;
+    use crate::source::{SourceInfo, SourceRepresentationKind};
     use crate::tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolSupport};
     use std::path::PathBuf;
 
@@ -1704,6 +1721,8 @@ mod metadata_pruning_tests {
                 codec: AudioCodec::PcmSigned,
                 sample_rate_hz: Some(44_100),
                 bit_depth: Some(PcmBitDepth::Int16),
+                true_source_depth: Some(PcmBitDepth::Int16),
+                source_representation: Default::default(),
                 sample_kind: Some(SampleKind::SignedInteger),
                 channels: Some(2),
                 duration: None,

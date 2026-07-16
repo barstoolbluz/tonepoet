@@ -1655,12 +1655,16 @@ fn base64_encode(data: &[u8]) -> String {
 
 
 fn launch_gnudb_for_split_cue_grouping_decision(
+    operation_id: super::message::TagsMbOperationId,
     infos: Vec<super::cue_parser::SingleImageInfo>,
     decision: &super::command::SplitCueAlbumGroupingDecision,
     active_audio_path: Option<&std::path::Path>,
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    if !super::event_loop::gnudb_operation_is_current(app, operation_id) {
+        return;
+    }
     let groups = super::command::split_cue_decision_groups_as_infos(decision, &infos);
     let selected = if decision.groups.len() > 1 {
         super::command::split_cue_active_group(&groups, active_audio_path)
@@ -1671,10 +1675,11 @@ fn launch_gnudb_for_split_cue_grouping_decision(
     };
 
     if selected.len() > 1 {
-        launch_multi_single_image_gnudb(selected, app, tx);
+        launch_multi_single_image_gnudb(operation_id, selected, app, tx);
     } else if let Some(info) = selected.into_iter().next() {
-        launch_single_image_gnudb(info, app, tx);
+        launch_single_image_gnudb(operation_id, info, app, tx);
     } else {
+        super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
         app.set_status("GNUDB: no usable CUE/image pairs for lookup");
     }
 }
@@ -1682,19 +1687,30 @@ fn launch_gnudb_for_split_cue_grouping_decision(
 pub(super) fn handle_gnudb_split_cue_album_grouping_complete(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     infos: Vec<super::cue_parser::SingleImageInfo>,
     active_audio_path: Option<std::path::PathBuf>,
     result: Result<Box<super::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
 ) {
+    if !super::event_loop::gnudb_operation_is_current(app, operation_id) {
+        return;
+    }
     let outcome = match result {
         Ok(outcome) => *outcome,
         Err(err) => {
+            super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
             app.set_status(format!("GNUDB: split-CUE grouping failed: {err}"));
             return;
         }
     };
     super::command::store_split_cue_album_grouping_outcome(app, &infos, &outcome);
+    let Some(lookup_operation_id) =
+        super::event_loop::advance_gnudb_operation(app, operation_id)
+    else {
+        return;
+    };
     launch_gnudb_for_split_cue_grouping_decision(
+        lookup_operation_id,
         infos,
         &outcome.decision,
         active_audio_path.as_deref(),
@@ -1742,12 +1758,24 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         .first()
         .cloned()
         .or_else(|| cue_infos.first().map(|info| info.audio_path.clone()));
+    if cue_infos.is_empty() && audio_paths.is_empty() {
+        app.set_status("No audio files for GNUDB lookup");
+        return;
+    }
+    let operation_id = match super::event_loop::begin_gnudb_operation(app) {
+        Ok(operation_id) => operation_id,
+        Err(error) => {
+            app.set_status(error);
+            return;
+        }
+    };
     if cue_infos.len() > 1 {
         if super::command::same_folder_split_cue_infos(&cue_infos) {
             if let Some(decision) =
                 super::command::cached_or_title_split_cue_album_grouping_decision(app, &cue_infos)
             {
                 launch_gnudb_for_split_cue_grouping_decision(
+                    operation_id,
                     cue_infos,
                     &decision,
                     active_audio_path.as_deref(),
@@ -1761,23 +1789,19 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             if super::command::spawn_split_cue_album_grouping_ladder_for_gnudb(
                 app,
                 tx,
+                operation_id,
                 cue_infos.clone(),
                 active_audio_path,
             ) {
                 return;
             }
         } else {
-            launch_multi_single_image_gnudb(cue_infos, app, tx);
+            launch_multi_single_image_gnudb(operation_id, cue_infos, app, tx);
             return;
         }
     }
     if let Some(info) = cue_infos.into_iter().next() {
-        launch_single_image_gnudb(info, app, tx);
-        return;
-    }
-
-    if audio_paths.is_empty() {
-        app.set_status("No audio files for GNUDB lookup");
+        launch_single_image_gnudb(operation_id, info, app, tx);
         return;
     }
 
@@ -1789,6 +1813,7 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         let durations =
             super::gnudb::collect_durations(group_paths, &app.browse);
         if durations.len() != group_paths.len() {
+            super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
             app.set_status("Probe all files first (some durations missing)");
             return;
         }
@@ -1803,6 +1828,7 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             let result = super::gnudb::query_gnudb(&disc_id).await;
             let _ = tx
                 .send(super::message::AppMessage::GnudbQueryComplete {
+                    operation_id,
                     result,
                     paths: paths_for_editor,
                 })
@@ -1830,6 +1856,7 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             disc_queries.push((label, disc_id, group_paths));
         }
         if disc_queries.is_empty() {
+            super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
             app.set_status("Could not probe disc durations");
             return;
         }
@@ -1849,6 +1876,7 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             }
             let _ = tx
                 .send(super::message::AppMessage::GnudbMultiDiscComplete {
+                    operation_id,
                     entries: all_entries,
                 })
                 .await;
@@ -1864,6 +1892,7 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
 /// reads are merged into the existing multi-disc review surface. No synthetic
 /// joined TOC is fabricated.
 pub(super) fn launch_multi_single_image_gnudb(
+    operation_id: super::message::TagsMbOperationId,
     infos: Vec<super::cue_parser::SingleImageInfo>,
     app: &mut AppState,
     tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
@@ -1891,6 +1920,7 @@ pub(super) fn launch_multi_single_image_gnudb(
     }
 
     if queries.is_empty() {
+        super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
         app.set_status("GNUDB: no usable CUE/image pairs for lookup");
         return;
     }
@@ -1913,6 +1943,7 @@ pub(super) fn launch_multi_single_image_gnudb(
         }
         let _ = tx
             .send(super::message::AppMessage::GnudbMultiDiscComplete {
+                operation_id,
                 entries: all_entries,
             })
             .await;
@@ -1920,6 +1951,7 @@ pub(super) fn launch_multi_single_image_gnudb(
 }
 
 pub(super) fn launch_single_image_gnudb(
+    operation_id: super::message::TagsMbOperationId,
     info: super::cue_parser::SingleImageInfo,
     app: &mut AppState,
     tx: &tokio::sync::mpsc::Sender<super::message::AppMessage>,
@@ -1929,6 +1961,11 @@ pub(super) fn launch_single_image_gnudb(
         .iter()
         .map(|&(_, count)| count as f64 / info.sample_rate as f64)
         .collect();
+    if durations.is_empty() {
+        super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
+        app.set_status("GNUDB: CUE has no usable track boundaries");
+        return;
+    }
     let disc_id = super::gnudb::compute_disc_id(&durations);
     app.set_status(format!(
         "Querying gnudb.org (single image, disc ID: {})...",
@@ -1942,6 +1979,7 @@ pub(super) fn launch_single_image_gnudb(
         let result = super::gnudb::query_gnudb(&disc_id).await;
         let _ = tx
             .send(super::message::AppMessage::GnudbQueryComplete {
+                operation_id,
                 result,
                 paths: paths_for_editor,
             })

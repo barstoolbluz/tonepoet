@@ -166,6 +166,13 @@ pub trait ToolRunner: Send + Sync {
     fn tool_version(&self, _binary: ToolBinary) -> Option<String> {
         None
     }
+
+    /// Return whether a binary can be resolved before an album starts doing
+    /// irreversible or expensive work. Test/in-process runners default to
+    /// available; the real runner performs an executable-path lookup.
+    fn tool_available(&self, _binary: ToolBinary) -> bool {
+        true
+    }
 }
 
 // ===========================================================================
@@ -666,11 +673,42 @@ fn map_exit_status(status: std::process::ExitStatus) -> ProcessExit {
     ProcessExit::Unknown
 }
 
+fn executable_path_is_available(path: &Path) -> bool {
+    let is_usable_file = |candidate: &Path| {
+        let Ok(metadata) = candidate.metadata() else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    };
+
+    if path.components().count() > 1 || path.is_absolute() {
+        return is_usable_file(path);
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| is_usable_file(&dir.join(path))))
+        .unwrap_or(false)
+}
+
 #[async_trait]
 impl ToolRunner for RealToolRunner {
     fn tool_version(&self, binary: ToolBinary) -> Option<String> {
         let path = self.resolve_binary(binary);
         self.tool_version_for_resolved_path(binary, &path)
+    }
+
+    fn tool_available(&self, binary: ToolBinary) -> bool {
+        executable_path_is_available(&self.resolve_binary(binary))
     }
 
     async fn run(

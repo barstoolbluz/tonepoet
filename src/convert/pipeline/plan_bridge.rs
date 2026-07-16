@@ -10,14 +10,16 @@ use sacd_rs::{
     DsdContainerInfo,
 };
 use tonepoet_pipeline::{
-    AudioCodec as PlannerCodec, AudioFormat as PlannerFormat, BitDepthTarget,
-    PcmBitDepth, PipelineSettings, PlanRequest, PreferredTool, SampleKind, SourceInfo,
+    default_pcm_depth_for_format, AudioCodec as PlannerCodec, AudioFormat as PlannerFormat,
+    BitDepthTarget, PcmBitDepth, PipelineSettings, PlanRequest, PreferredTool, SampleKind,
+    SourceInfo, SourceRepresentationKind,
 };
 
 use super::errors::ConvertError;
 use super::types::{
     AlbumMetadata, PlannedMetadataSatisfaction, PipelineRequest, PreparedSource, PreparedTrack,
-    CueSegmentCarrier, SourceKind, StageRequirement, TrackMetadata, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
+    CueSegmentCarrier, SourceAudioCoding, SourceKind, StageRequirement, TrackMetadata,
+    TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
 };
 
 pub fn plan_request_for_track(
@@ -114,17 +116,28 @@ pub fn plan_request_for_track(
     if matches!(settings.target_bit_depth, BitDepthTarget::Source)
         && settings.target_format.is_pcm_lossless()
     {
-        // "Same as source" is an exact representation request for PCM-lossless
-        // outputs. It may only be resolved from authoritative original-source
-        // facts; silently substituting a target-format default would make the
-        // UI promise false and would later be logged as though it were measured.
-        let Some(resolved_source_depth) = resolve_source_pcm_depth(track) else {
-            return Err(ConvertError::Backend(format!(
-                "cannot honor Source bit depth for {:?}: the source PCM representation could not be measured; choose an explicit bit depth",
-                settings.target_format
-            )));
-        };
-        settings.target_bit_depth = BitDepthTarget::Pcm(resolved_source_depth);
+        match track.source_audio.coding.unwrap_or(SourceAudioCoding::Unknown) {
+            SourceAudioCoding::Dsd | SourceAudioCoding::Lossy => {
+                // Source-depth has no PCM meaning for DSD/lossy inputs. Resolve
+                // the documented conservative target default as a PLAN choice;
+                // never write it back into source facts.
+                settings.target_bit_depth = BitDepthTarget::Pcm(
+                    default_pcm_depth_for_format(&settings.target_format),
+                );
+            }
+            SourceAudioCoding::Pcm | SourceAudioCoding::DvdaUnknown => {
+                if let Some(resolved_source_depth) = resolve_source_pcm_depth(track) {
+                    settings.target_bit_depth = BitDepthTarget::Pcm(resolved_source_depth);
+                }
+                // Unknown measured depth remains Source here so same-format
+                // passthrough can still succeed. The planner fails closed only
+                // if an encode actually requires an authoritative depth.
+            }
+            SourceAudioCoding::Unknown => {
+                // Preserve Source for the planner's passthrough-first decision;
+                // any required encode fails closed in resolve_target_bit_depth.
+            }
+        }
     }
     settings
         .validate()
@@ -578,11 +591,23 @@ pub fn source_info_for_realized_track(
         codec,
         sample_rate_hz,
         bit_depth,
+        true_source_depth: resolve_source_pcm_depth(track),
+        source_representation: planner_source_representation(track),
         sample_kind,
         channels,
         duration,
         audio_md5: flac_streaminfo_audio_md5(realized_input),
     })
+}
+
+
+fn planner_source_representation(track: &PreparedTrack) -> SourceRepresentationKind {
+    match track.source_audio.coding.unwrap_or(SourceAudioCoding::Unknown) {
+        SourceAudioCoding::Pcm | SourceAudioCoding::DvdaUnknown => SourceRepresentationKind::Pcm,
+        SourceAudioCoding::Dsd => SourceRepresentationKind::Dsd,
+        SourceAudioCoding::Lossy => SourceRepresentationKind::Lossy,
+        SourceAudioCoding::Unknown => SourceRepresentationKind::Unknown,
+    }
 }
 
 pub fn planner_format_from_main(format: crate::convert::AudioFormat) -> PlannerFormat {
@@ -646,6 +671,9 @@ pub(super) fn pcm_bit_depth_from_source_bits(bits: u32) -> Option<PcmBitDepth> {
     match bits {
         8 => Some(PcmBitDepth::Int8),
         16 => Some(PcmBitDepth::Int16),
+        // DVD-Audio permits 20-bit LPCM. Available output encoders store it in
+        // a 24-bit PCM container, so Source resolves honestly to Int24.
+        20 => Some(PcmBitDepth::Int24),
         24 => Some(PcmBitDepth::Int24),
         32 => Some(PcmBitDepth::Int32),
         // Legacy/UI source-depth convention: 320/640 encode float32/float64.
@@ -672,6 +700,15 @@ pub(super) fn resolve_source_pcm_depth(track: &PreparedTrack) -> Option<PcmBitDe
                 .bit_depth
                 .and_then(pcm_bit_depth_from_source_bits)
         })
+}
+
+
+/// Resolve the original-source width used by the planner's dither decision.
+/// The realized carrier is deliberately excluded: the planner treats a missing
+/// authoritative width conservatively and applies dither for integer targets
+/// below 32 bits, so the conversion log must make the same decision.
+pub(super) fn resolve_dither_source_pcm_depth(track: &PreparedTrack) -> Option<PcmBitDepth> {
+    resolve_source_pcm_depth(track)
 }
 
 fn cue_pcm_segment_carrier_depth_descriptor(track: &PreparedTrack) -> Option<u32> {
@@ -1172,6 +1209,8 @@ mod tests {
         let mut track = track(bluray_track_ref(temp.path().join("album.iso")));
         track.sample_rate = Some(192_000);
         track.bit_depth = Some(24);
+        // Production Blu-ray materializer classifies LPCM as Pcm.
+        track.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
             .expect("Blu-ray plan request builds");
@@ -1196,6 +1235,8 @@ mod tests {
         let mut track = track(bluray_track_ref(temp.path().join("album.iso")));
         track.sample_rate = Some(192_000);
         track.bit_depth = Some(24);
+        // Production Blu-ray materializer classifies LPCM as Pcm.
+        track.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
             .expect("Blu-ray plan request builds");
@@ -1223,6 +1264,8 @@ mod tests {
         let mut track = track(bluray_track_ref(temp.path().join("album.iso")));
         track.sample_rate = Some(192_000);
         track.bit_depth = Some(24);
+        // Production Blu-ray materializer classifies LPCM as Pcm.
+        track.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
             .expect("Blu-ray plan request builds");
@@ -1276,6 +1319,7 @@ mod tests {
         req.settings.metadata.store_source_audio_md5 = true;
         let mut track = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
         track.sample_rate = Some(44_100);
+        track.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
         track.bit_depth = Some(16);
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
@@ -1392,7 +1436,9 @@ mod tests {
             req.settings.metadata.transfer_tags = true;
             req.settings.metadata.preserve_artwork = true;
             let mut prepared = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
+        prepared.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
             prepared.sample_rate = Some(44_100);
+            prepared.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
             prepared.bit_depth = Some(16);
 
             let planned = plan_request_for_track(
@@ -1447,6 +1493,7 @@ mod tests {
             samples: 44_100,
             carrier: CueSegmentCarrier::PcmF32LeWav,
         });
+        prepared.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
         prepared.sample_rate = Some(44_100);
         prepared.bit_depth = Some(320);
 
@@ -1482,18 +1529,23 @@ mod tests {
         prepared.bit_depth = None;
         prepared.source_audio.bit_depth = None;
 
-        let error = plan_request_for_track(
+        let planned = plan_request_for_track(
             &req,
             &prepared,
             &input,
             &output,
             temp.path().join("work"),
         )
-        .expect_err("unknown Source representation must not become a format default");
+        .expect("bridge preserves Source so passthrough remains reachable");
 
+        let error = tonepoet_pipeline::plan_conversion(&planned)
+            .expect_err("an encode with unknown PCM representation must fail closed");
         let message = error.to_string();
-        assert!(message.contains("cannot honor Source bit depth"), "{message}");
-        assert!(message.contains("choose an explicit bit depth"), "{message}");
+        assert!(
+            message.contains("the source PCM representation is unknown"),
+            "{message}"
+        );
+        assert!(message.contains("choose an explicit target bit depth"), "{message}");
     }
 
     #[test]
@@ -1509,6 +1561,7 @@ mod tests {
         req.settings.metadata.transfer_tags = true;
         req.settings.metadata.preserve_artwork = true;
         let mut prepared = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
+        prepared.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
         prepared.sample_rate = Some(44_100);
         prepared.bit_depth = Some(16);
 

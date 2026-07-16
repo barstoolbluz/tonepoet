@@ -1313,6 +1313,7 @@ pub(crate) fn store_split_cue_album_grouping_outcome(
 pub(crate) fn spawn_split_cue_album_grouping_ladder_for_gnudb(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     infos: Vec<super::cue_parser::SingleImageInfo>,
     active_audio_path: Option<PathBuf>,
 ) -> bool {
@@ -1327,16 +1328,23 @@ pub(crate) fn spawn_split_cue_album_grouping_ladder_for_gnudb(
     ));
     let tx = tx.clone();
     tokio::spawn(async move {
-        let result = compute_split_cue_album_grouping_ladder(
-            infos.clone(),
-            concat_candidates,
-            concat_cached,
-            per_cue_cached,
-        )
-        .await
-        .map(Box::new);
+        let worker_infos = infos.clone();
+        let worker = tokio::spawn(async move {
+            compute_split_cue_album_grouping_ladder(
+                worker_infos,
+                concat_candidates,
+                concat_cached,
+                per_cue_cached,
+            )
+            .await
+            .map(Box::new)
+        });
+        let result = worker.await.unwrap_or_else(|err| {
+            Err(format!("GNUDB split-CUE grouping worker failed: {err}"))
+        });
         let _ = tx
             .send(AppMessage::GnudbSplitCueAlbumGroupingComplete {
+                operation_id,
                 infos,
                 active_audio_path,
                 result,
@@ -1363,14 +1371,20 @@ pub(crate) fn spawn_split_cue_album_grouping_ladder_for_metadata_editor(
     ));
     let tx = tx.clone();
     tokio::spawn(async move {
-        let result = compute_split_cue_album_grouping_ladder(
-            infos.clone(),
-            concat_candidates,
-            concat_cached,
-            per_cue_cached,
-        )
-        .await
-        .map(Box::new);
+        let worker_infos = infos.clone();
+        let worker = tokio::spawn(async move {
+            compute_split_cue_album_grouping_ladder(
+                worker_infos,
+                concat_candidates,
+                concat_cached,
+                per_cue_cached,
+            )
+            .await
+            .map(Box::new)
+        });
+        let result = worker.await.unwrap_or_else(|err| {
+            Err(format!("metadata split-CUE grouping worker failed: {err}"))
+        });
         let _ = tx
             .send(AppMessage::MetadataEditorSplitCueAlbumGroupingComplete {
                 infos,
@@ -1657,14 +1671,20 @@ fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
     ));
     let tx = tx.clone();
     tokio::spawn(async move {
-        let result = compute_split_cue_album_grouping_ladder(
-            request.infos.clone(),
-            concat_candidates,
-            concat_cached,
-            per_cue_cached,
-        )
-        .await
-        .map(Box::new);
+        let worker_infos = request.infos.clone();
+        let worker = tokio::spawn(async move {
+            compute_split_cue_album_grouping_ladder(
+                worker_infos,
+                concat_candidates,
+                concat_cached,
+                per_cue_cached,
+            )
+            .await
+            .map(Box::new)
+        });
+        let result = worker.await.unwrap_or_else(|err| {
+            Err(format!("MusicBrainz split-CUE grouping worker failed: {err}"))
+        });
         let _ = tx
             .send(AppMessage::SplitCueAlbumGroupingComplete {
                 request: Box::new(request),
@@ -4148,6 +4168,13 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             with_editor_state(app, |state| super::keybindings::metadata_editor_open_detail(state));
         }
         Command::MbBack => {
+            if app.active_tags_mb_operation.is_some() {
+                app.set_status(
+                    ":mb-back: cancel the running MusicBrainz lookup before returning to prior results"
+                        .to_string(),
+                );
+                return;
+            }
             let Some(taken) = super::event_loop::take_metadata_editor_with_restore_slot(app) else {
                 app.set_status(":mb-back only works in the metadata editor");
                 return;
@@ -4165,51 +4192,48 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             // accepting another release is guarded against any intervening
             // save on any presentation tab.
             let editor_session = metadata_editor_session_guard(&taken.state);
+            let operation_id = match super::event_loop::begin_mb_select_operation(app) {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    super::event_loop::restore_taken_metadata_editor(app, taken);
+                    app.set_status(error);
+                    return;
+                }
+            };
             app.pending_metadata_editor = Some(taken.state);
             let mut mb_state = super::app::MbSelectState::new_with_editor_session(
                 cache.releases,
                 cache.paths,
                 Some(editor_session),
-            );
+            )
+            .with_operation_id(operation_id);
             mb_state.selected = cache.selected;
             app.active_overlay = super::app::ActiveOverlay::MbSelect(Box::new(mb_state));
             app.set_status(":mb-back: pick a different release".to_string());
         }
         Command::GnudbBack => {
-            // Mirror of Command::MbBack for the gnudb flow.
-            let state = if let Some(parked) = app.pending_metadata_editor.take() {
-                parked
-            } else if matches!(
-                app.active_overlay,
-                super::app::ActiveOverlay::MetadataEditor(_)
-            ) {
-                let prev =
-                    std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
-                if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
-                    s
-                } else {
-                    unreachable!()
-                }
-            } else {
+            if app.active_tags_mb_operation.is_some() {
+                app.set_status(
+                    ":gnudb-back: cancel the running MusicBrainz lookup first".to_string(),
+                );
+                return;
+            }
+            let Some(taken) = super::event_loop::take_metadata_editor_with_restore_slot(app) else {
                 app.set_status(":gnudb-back only works in the metadata editor");
                 return;
             };
-            let Some(review) = state.gnudb_back.clone() else {
+            let Some(review) = taken.state.gnudb_back.clone() else {
                 app.set_status(
                     ":gnudb-back: no gnudb review to return to (run :tags-gnudb first)".to_string(),
                 );
-                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                super::event_loop::restore_taken_metadata_editor(app, taken);
                 return;
             };
-            if state.any_presentation_dirty() {
-                app.pending_metadata_editor = Some(state);
-                app.active_overlay = super::app::ActiveOverlay::Confirmation {
-                    action: super::app::ConfirmAction::GnudbBack(review),
-                    message: "Discard editor changes and return to gnudb review?".to_string(),
-                };
-                return;
-            }
-            drop(state);
+
+            // Preserve the exact editor, including unsaved values and any
+            // active latch. Accepting or cancelling the review returns to this
+            // parked state rather than rebuilding from disk or dropping it.
+            app.pending_metadata_editor = Some(taken.state);
             app.active_overlay = super::app::ActiveOverlay::GnudbReview(review);
             app.set_status(":gnudb-back: review per-track values".to_string());
         }
@@ -7029,9 +7053,18 @@ fn execute_commit_with_source_options_transform(
 
     let rg_enabled = options.calculate_replaygain;
     let companion_policy = companion_copy_policy_from_conversion_options(&options);
-    let pipeline_settings = options.pipeline_settings.clone().unwrap_or_else(|| {
-        crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options)
-    });
+    let pipeline_settings = match options.pipeline_settings.clone() {
+        Some(settings) => settings,
+        None => match crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(&options) {
+            Ok(settings) => settings,
+            Err(error) => {
+                app.set_status(format!(
+                    "conversion settings refused before queue admission: {error}"
+                ));
+                return;
+            }
+        },
+    };
     let canonical_naming_template = options.effective_naming_template("%NN% - %TITLE%");
     let mut archive_passwords_by_path: BTreeMap<std::path::PathBuf, String> = BTreeMap::new();
     for path in &batch {
@@ -11501,8 +11534,12 @@ pub(super) fn spawn_tags_mb_toc_lookup(
     };
 
     tokio::spawn(async move {
-        let outcome =
-            super::musicbrainz::lookup_release_by_toc_cascading(&candidates, cached).await;
+        let worker = tokio::spawn(async move {
+            super::musicbrainz::lookup_release_by_toc_cascading(&candidates, cached).await
+        });
+        let outcome = worker.await.unwrap_or_else(|err| {
+            Err(format!("MusicBrainz TOC lookup worker failed: {err}"))
+        });
         let _ = tx
             .send(AppMessage::TagsFromMbComplete {
                 outcome: super::message::MbOutcome::Toc { outcome },

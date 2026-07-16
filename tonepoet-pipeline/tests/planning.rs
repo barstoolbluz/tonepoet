@@ -9,6 +9,8 @@ fn flac_source() -> SourceInfo {
         codec: AudioCodec::Flac,
         sample_rate_hz: Some(96_000),
         bit_depth: Some(PcmBitDepth::Int24),
+        true_source_depth: Some(PcmBitDepth::Int24),
+        source_representation: Default::default(),
         sample_kind: Some(SampleKind::SignedInteger),
         channels: Some(2),
         duration: None,
@@ -155,6 +157,7 @@ fn pcm_lossless_source_target_requires_authoritative_source_depth() {
     settings.force_encode = true;
     let mut req = request(settings);
     req.source.bit_depth = None;
+    req.source.true_source_depth = None;
 
     assert!(matches!(
         plan_conversion(&req),
@@ -166,12 +169,85 @@ fn pcm_lossless_source_target_requires_authoritative_source_depth() {
 }
 
 #[test]
+fn explicit_pcm_representation_does_not_promote_carrier_depth_to_source_truth() {
+    let mut settings = PipelineSettings::default();
+    settings.target_bit_depth = BitDepthTarget::Source;
+    settings.force_encode = true;
+    let mut req = request(settings);
+    req.source.bit_depth = Some(PcmBitDepth::Int32);
+    req.source.true_source_depth = None;
+    req.source.source_representation = SourceRepresentationKind::Pcm;
+
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSource {
+            field: "bit_depth",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn explicit_unknown_representation_ignores_decoded_pcm_carrier() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Wav;
+    settings.target_bit_depth = BitDepthTarget::Source;
+    settings.force_encode = true;
+    let mut req = request(settings);
+    req.input_path = PathBuf::from("decoded-unknown.wav");
+    req.output_path = PathBuf::from("out.wav");
+    req.source.format = AudioFormat::Wav;
+    req.source.codec = AudioCodec::PcmSigned;
+    req.source.bit_depth = Some(PcmBitDepth::Int32);
+    req.source.true_source_depth = None;
+    req.source.source_representation = SourceRepresentationKind::Unknown;
+
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSource {
+            field: "bit_depth",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn legacy_unspecified_representation_keeps_single_depth_fact_authoritative() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Wav;
+    settings.target_bit_depth = BitDepthTarget::Source;
+    settings.force_encode = true;
+    let mut req = request(settings);
+    req.input_path = PathBuf::from("legacy.wav");
+    req.output_path = PathBuf::from("out.wav");
+    req.source.format = AudioFormat::Wav;
+    req.source.codec = AudioCodec::PcmSigned;
+    req.source.bit_depth = Some(PcmBitDepth::Int24);
+    req.source.true_source_depth = None;
+    req.source.source_representation = SourceRepresentationKind::Unspecified;
+
+    let topology = plan_topology(&req).expect("legacy depth remains authoritative");
+    let TopologyPlan::Execute { steps, .. } = topology else {
+        panic!("forced conversion must execute");
+    };
+    assert!(steps.iter().any(|step| matches!(
+        step.operation,
+        PlanOperation::EncodePcm {
+            target_bit_depth: PcmBitDepth::Int24,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn high_rate_pcm_is_not_misclassified_as_dsd() {
     let source = SourceInfo {
         format: AudioFormat::Wav,
         codec: AudioCodec::PcmSigned,
         sample_rate_hz: Some(DsdRate::Dsd64.hz()),
         bit_depth: Some(PcmBitDepth::Int24),
+        true_source_depth: Some(PcmBitDepth::Int24),
+        source_representation: Default::default(),
         sample_kind: Some(SampleKind::SignedInteger),
         channels: Some(2),
         duration: None,
@@ -205,6 +281,8 @@ fn dsd_to_pcm_uses_sox() {
             codec: AudioCodec::Dsd,
             sample_rate_hz: Some(DsdRate::Dsd64.hz()),
             bit_depth: None,
+            true_source_depth: None,
+            source_representation: Default::default(),
             sample_kind: Some(SampleKind::Dsd),
             channels: Some(2),
             duration: None,
@@ -220,7 +298,7 @@ fn dsd_to_pcm_uses_sox() {
 }
 
 #[test]
-fn dsd_to_pcm_source_depth_is_undefined_and_rejected() {
+fn dsd_to_pcm_source_depth_uses_documented_target_default() {
     let mut settings = PipelineSettings::default();
     settings.target_sample_rate = RateTarget::PcmHz(88_200);
     settings.target_bit_depth = BitDepthTarget::Source;
@@ -232,6 +310,8 @@ fn dsd_to_pcm_source_depth_is_undefined_and_rejected() {
             codec: AudioCodec::Dsd,
             sample_rate_hz: Some(DsdRate::Dsd64.hz()),
             bit_depth: None,
+            true_source_depth: None,
+            source_representation: Default::default(),
             sample_kind: Some(SampleKind::Dsd),
             channels: Some(2),
             duration: None,
@@ -242,13 +322,97 @@ fn dsd_to_pcm_source_depth_is_undefined_and_rejected() {
         container_ffmpeg_flags: Vec::new(),
     };
 
-    assert!(matches!(
-        plan_conversion(&req),
-        Err(PlanningError::InvalidSource {
-            field: "bit_depth",
+    let topology = plan_topology(&req).expect("DSD Source depth resolves to target default");
+    let TopologyPlan::Execute { steps, .. } = topology else {
+        panic!("DSD to PCM must execute");
+    };
+    assert!(steps.iter().any(|step| matches!(
+        step.operation,
+        PlanOperation::DsdToPcm {
+            target_bit_depth: PcmBitDepth::Int24,
             ..
-        })
-    ));
+        }
+    )));
+}
+
+#[test]
+fn lossy_source_depth_uses_documented_target_default() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Wav;
+    settings.target_bit_depth = BitDepthTarget::Source;
+    settings.force_encode = true;
+    let req = PlanRequest {
+        input_path: PathBuf::from("in.mp3"),
+        output_path: PathBuf::from("out.wav"),
+        source: SourceInfo {
+            format: AudioFormat::Mp3,
+            codec: AudioCodec::Mp3,
+            sample_rate_hz: Some(44_100),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: Default::default(),
+            sample_kind: None,
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
+    };
+
+    let topology = plan_topology(&req).expect("lossy Source depth resolves to target default");
+    let TopologyPlan::Execute { steps, .. } = topology else {
+        panic!("lossy to PCM must execute");
+    };
+    assert!(steps.iter().any(|step| matches!(
+        step.operation,
+        PlanOperation::EncodePcm {
+            target_bit_depth: PcmBitDepth::Int24,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn lossy_source_default_ignores_decoded_integer_carrier_width() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Wav;
+    settings.target_bit_depth = BitDepthTarget::Source;
+    settings.force_encode = true;
+    let req = PlanRequest {
+        input_path: PathBuf::from("decoded-lossy.wav"),
+        output_path: PathBuf::from("out.wav"),
+        source: SourceInfo {
+            format: AudioFormat::Wav,
+            codec: AudioCodec::PcmSigned,
+            sample_rate_hz: Some(44_100),
+            // This is the realized decoder carrier, not an original-source
+            // PCM representation and therefore must not drive Source policy.
+            bit_depth: Some(PcmBitDepth::Int32),
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Lossy,
+            sample_kind: Some(SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
+    };
+
+    let topology = plan_topology(&req).expect("lossy carrier resolves to target default");
+    let TopologyPlan::Execute { steps, .. } = topology else {
+        panic!("forced lossy-carrier conversion must execute");
+    };
+    assert!(steps.iter().any(|step| matches!(
+        step.operation,
+        PlanOperation::EncodePcm {
+            target_bit_depth: PcmBitDepth::Int24,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -275,6 +439,8 @@ fn lossy_same_format_never_passes_through_without_proven_encoder_settings() {
             codec: AudioCodec::Mp3,
             sample_rate_hz: Some(44_100),
             bit_depth: None,
+            true_source_depth: None,
+            source_representation: Default::default(),
             sample_kind: None,
             channels: Some(2),
             duration: None,
@@ -526,6 +692,8 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
         codec: AudioCodec::Dsd,
         sample_rate_hz: Some(DsdRate::Dsd64.hz()),
         bit_depth: None,
+        true_source_depth: None,
+        source_representation: Default::default(),
         sample_kind: Some(SampleKind::Dsd),
         channels: Some(2),
         duration: None,
@@ -562,6 +730,8 @@ fn dsd_source_rejects_pcm_bit_depth_fact() {
         codec: AudioCodec::Dsd,
         sample_rate_hz: Some(DsdRate::Dsd64.hz()),
         bit_depth: Some(PcmBitDepth::Int24),
+        true_source_depth: Some(PcmBitDepth::Int24),
+        source_representation: Default::default(),
         sample_kind: Some(SampleKind::Dsd),
         channels: Some(2),
         duration: None,
@@ -759,6 +929,8 @@ fn dsd_source_rejects_bit_depth_even_without_sample_kind() {
         codec: AudioCodec::Dsd,
         sample_rate_hz: Some(DsdRate::Dsd64.hz()),
         bit_depth: Some(PcmBitDepth::Int24),
+        true_source_depth: Some(PcmBitDepth::Int24),
+        source_representation: Default::default(),
         sample_kind: None,
         channels: Some(2),
         duration: None,
@@ -801,6 +973,8 @@ fn dsd_request_for(format: AudioFormat, depth: PcmBitDepth, extension: &str) -> 
             codec: AudioCodec::Dsd,
             sample_rate_hz: Some(DsdRate::Dsd64.hz()),
             bit_depth: None,
+            true_source_depth: None,
+            source_representation: Default::default(),
             sample_kind: Some(SampleKind::Dsd),
             channels: Some(2),
             duration: None,
@@ -826,6 +1000,8 @@ fn source_resolved_int32_alac_is_rejected_through_public_planner() {
             codec: AudioCodec::PcmSigned,
             sample_rate_hz: Some(96_000),
             bit_depth: Some(PcmBitDepth::Int32),
+            true_source_depth: Some(PcmBitDepth::Int32),
+            source_representation: Default::default(),
             sample_kind: Some(SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,

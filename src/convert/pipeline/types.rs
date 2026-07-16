@@ -1639,6 +1639,7 @@ pub struct ExtractionProvenance {
 pub enum SourceAudioCoding {
     Pcm,
     Dsd,
+    Lossy,
     DvdaUnknown,
     Unknown,
 }
@@ -1647,6 +1648,89 @@ impl Default for SourceAudioCoding {
     fn default() -> Self {
         Self::Unknown
     }
+}
+
+
+/// Classify source coding and authoritative source PCM representation from
+/// ffprobe's codec/sample-format facts.
+///
+/// Decoder output sample formats are not source facts for lossy codecs: MP3,
+/// AAC, Vorbis, and Opus commonly decode to `flt`/`fltp`. Floating-point source
+/// class is therefore accepted only for native float PCM codecs or WavPack,
+/// whose decoder preserves integer-vs-float class in `sample_fmt`.
+#[must_use]
+pub fn classify_source_audio_probe(
+    codec_name: Option<&str>,
+    sample_fmt: Option<&str>,
+    integer_bit_depth: Option<u32>,
+) -> (SourceAudioCoding, Option<u32>) {
+    let codec = codec_name.unwrap_or_default().trim().to_ascii_lowercase();
+    let sample_fmt = sample_fmt.unwrap_or_default().trim().to_ascii_lowercase();
+
+    let coding = if codec.starts_with("dsd") {
+        SourceAudioCoding::Dsd
+    } else if matches!(
+        codec.as_str(),
+        "mp1"
+            | "mp2"
+            | "mp3"
+            | "aac"
+            | "vorbis"
+            | "opus"
+            | "ac3"
+            | "eac3"
+            | "dts"
+            | "wmalossy"
+            | "wmav1"
+            | "wmav2"
+            | "mpc7"
+            | "mpc8"
+            | "cook"
+            | "atrac3"
+            | "atrac3plus"
+            | "amr_nb"
+            | "amr_wb"
+            | "gsm"
+            | "ra_144"
+            | "ra_288"
+    ) {
+        SourceAudioCoding::Lossy
+    } else if codec.starts_with("pcm_")
+        || matches!(
+            codec.as_str(),
+            "flac"
+                | "alac"
+                | "wavpack"
+                | "tta"
+                | "shorten"
+                | "ape"
+                | "truehd"
+                | "mlp"
+                | "tak"
+        )
+    {
+        SourceAudioCoding::Pcm
+    } else {
+        SourceAudioCoding::Unknown
+    };
+
+    let bit_depth = match coding {
+        SourceAudioCoding::Pcm if codec.starts_with("pcm_f32") => Some(320),
+        SourceAudioCoding::Pcm if codec.starts_with("pcm_f64") => Some(640),
+        SourceAudioCoding::Pcm if codec == "wavpack" && sample_fmt.starts_with("flt") => {
+            Some(320)
+        }
+        SourceAudioCoding::Pcm if codec == "wavpack" && sample_fmt.starts_with("dbl") => {
+            Some(640)
+        }
+        SourceAudioCoding::Pcm => integer_bit_depth,
+        SourceAudioCoding::Dsd
+        | SourceAudioCoding::Lossy
+        | SourceAudioCoding::DvdaUnknown
+        | SourceAudioCoding::Unknown => None,
+    };
+
+    (coding, bit_depth)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2352,6 +2436,59 @@ impl Drop for StagingDir {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod source_audio_probe_classification_tests {
+    use super::{classify_source_audio_probe, SourceAudioCoding};
+
+    #[test]
+    fn lossy_decoder_float_sample_format_is_not_source_float() {
+        for codec in ["mp3", "aac", "vorbis", "opus"] {
+            assert_eq!(
+                classify_source_audio_probe(Some(codec), Some("fltp"), Some(32)),
+                (SourceAudioCoding::Lossy, None),
+                "{codec} decoder output must not become an authoritative float source",
+            );
+        }
+    }
+
+    #[test]
+    fn native_float_pcm_and_float_wavpack_preserve_float_class() {
+        assert_eq!(
+            classify_source_audio_probe(Some("pcm_f32le"), Some("flt"), None),
+            (SourceAudioCoding::Pcm, Some(320)),
+        );
+        assert_eq!(
+            classify_source_audio_probe(Some("pcm_f64be"), Some("dbl"), None),
+            (SourceAudioCoding::Pcm, Some(640)),
+        );
+        assert_eq!(
+            classify_source_audio_probe(Some("wavpack"), Some("fltp"), Some(32)),
+            (SourceAudioCoding::Pcm, Some(320)),
+        );
+        assert_eq!(
+            classify_source_audio_probe(Some("wavpack"), Some("dblp"), Some(64)),
+            (SourceAudioCoding::Pcm, Some(640)),
+        );
+    }
+
+    #[test]
+    fn integer_wavpack_uses_measured_integer_width() {
+        assert_eq!(
+            classify_source_audio_probe(Some("wavpack"), Some("s32p"), Some(24)),
+            (SourceAudioCoding::Pcm, Some(24)),
+        );
+    }
+
+    #[test]
+    fn unknown_float_decoder_output_fails_closed() {
+        assert_eq!(
+            classify_source_audio_probe(Some("mystery"), Some("fltp"), Some(32)),
+            (SourceAudioCoding::Unknown, None),
+        );
     }
 }
 

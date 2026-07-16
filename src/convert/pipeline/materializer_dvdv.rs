@@ -1166,7 +1166,7 @@ fn source_audio_coding(coding: DvdVideoAudioCoding) -> Option<SourceAudioCoding>
     match coding {
         DvdVideoAudioCoding::Lpcm => Some(SourceAudioCoding::Pcm),
         DvdVideoAudioCoding::Ac3 | DvdVideoAudioCoding::Dts | DvdVideoAudioCoding::Mpeg => {
-            Some(SourceAudioCoding::Unknown)
+            Some(SourceAudioCoding::Lossy)
         }
     }
 }

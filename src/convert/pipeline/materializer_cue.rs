@@ -44,6 +44,7 @@ struct AudioProbe {
     /// Original source sample representation using the shared source-depth
     /// convention: integer widths are literal bits; 320/640 are Float32/64.
     bit_depth: Option<u32>,
+    coding: SourceAudioCoding,
     codec_name: Option<String>,
     format_name: Option<String>,
 }
@@ -216,7 +217,11 @@ impl Materializer for CueImageMaterializer {
                 expected_samples: Some(samples),
                 sample_rate: Some(probe.sample_rate),
                 bit_depth: probe.bit_depth,
-                source_audio: SourceAudioDescriptor::default(),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(probe.sample_rate),
+                    probe.bit_depth,
+                    Some(probe.coding),
+                ),
             });
         }
 
@@ -1575,15 +1580,11 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty() && *value != "N/A")
         .map(str::to_string);
-    let sample_fmt = sample_fmt.as_deref().unwrap_or_default();
-    let codec = codec_name.as_deref().unwrap_or_default();
-    let bit_depth = if sample_fmt.starts_with("flt") || codec.starts_with("pcm_f32") {
-        Some(320)
-    } else if sample_fmt.starts_with("dbl") || codec.starts_with("pcm_f64") {
-        Some(640)
-    } else {
-        integer_bit_depth
-    };
+    let (coding, bit_depth) = classify_source_audio_probe(
+        codec_name.as_deref(),
+        sample_fmt.as_deref(),
+        integer_bit_depth,
+    );
     let format_name = value
         .pointer("/format/format_name")
         .and_then(|value| value.as_str())
@@ -1596,6 +1597,7 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
                 total_samples: duration_ts_samples,
                 exact_samples: true,
                 bit_depth,
+                coding,
                 codec_name,
                 format_name,
             });
@@ -1626,6 +1628,7 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
         total_samples,
         exact_samples: false,
         bit_depth,
+        coding,
         codec_name,
         format_name,
     })
@@ -3023,6 +3026,7 @@ mod materializer_cue_tests {
         format!(
             r#"{{
   "streams": [{{
+    "codec_name": "flac",
     "sample_rate": "{sample_rate}",
     "duration_ts": {total_samples},
     "time_base": "{time_base}",

@@ -123,6 +123,15 @@ impl PipelineSettings {
                     "ALAC 32-bit is not supported by available encoders; choose 24-bit or WavPack/WAV",
                 ));
             }
+            (
+                AudioFormat::Flac | AudioFormat::Alac,
+                BitDepthTarget::Pcm(PcmBitDepth::Float32 | PcmBitDepth::Float64),
+            ) => {
+                return Err(PlanningError::invalid_settings(
+                    "target_bit_depth",
+                    "FLAC/ALAC floating-point output is not supported; choose 24-bit integer or WAV",
+                ));
+            }
             (AudioFormat::WavPack, BitDepthTarget::Pcm(PcmBitDepth::Float32 | PcmBitDepth::Float64)) => {
                 return Err(PlanningError::invalid_settings(
                     "target_bit_depth",
@@ -1029,6 +1038,8 @@ mod ssrc_rate_dependent_dither_validation_tests {
     #[test]
     fn skips_derived_ssrc_dither_validation_for_explicit_float_output() {
         let mut settings = PipelineSettings::default();
+        // Float targets are only valid for WAV/AIFF now (FLAC/ALAC reject).
+        settings.target_format = AudioFormat::Wav;
         settings.preferred_tool = PreferredTool::Ssrc;
         settings.target_sample_rate = RateTarget::PcmHz(176_400);
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);

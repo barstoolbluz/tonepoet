@@ -348,6 +348,41 @@ fn defer_quit_for_browse_archive_metadata(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
+    if app
+        .pending_metadata_editor
+        .as_ref()
+        .is_some_and(|state| state.any_presentation_dirty())
+    {
+        app.should_quit = false;
+        app.set_status(
+            "quit blocked: a parked metadata editor has unsaved changes; return to it and save or discard"
+                .to_string(),
+        );
+        return true;
+    }
+
+    if let ActiveOverlay::MetadataEditor(state) = &app.active_overlay {
+        let browse_archive_owned = state
+            .archive_edit_context
+            .as_ref()
+            .is_some_and(|context| {
+                context.owner == super::app::ArchiveMetadataEditOwner::Browse
+            });
+        if !browse_archive_owned
+            && (state.any_presentation_dirty()
+                || state.phase == super::app::MetadataEditorPhase::Saving
+                || state.replaygain_scan.is_some()
+                || state.artwork_write.is_some())
+        {
+            app.should_quit = false;
+            app.set_status(
+                "quit blocked: metadata editor has unsaved changes or an active write; save or discard before quitting"
+                    .to_string(),
+            );
+            return true;
+        }
+    }
+
     if app.browse_archive_repackage.is_some() {
         app.should_quit = false;
         app.quit_after_browse_archive_repackage = true;
@@ -2551,6 +2586,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         }
         AppMessage::ConversionComplete { completed, failed } => {
             app.processing_active = false;
+            app.manager.complete_conversion_run();
             if failed > 0 {
                 app.set_status(format!(
                     "Conversion done: {} completed, {} failed",
@@ -4110,10 +4146,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 );
             }
         }
-        AppMessage::GnudbQueryComplete { result, paths } => {
+        AppMessage::GnudbQueryComplete {
+            operation_id,
+            result,
+            paths,
+        } => {
+            if !gnudb_operation_is_current(app, operation_id) {
+                return;
+            }
             match result {
                 Ok(matches) if matches.len() == 1 => {
-                    // Single match: auto-read the entry.
+                    let Some(read_operation_id) = advance_gnudb_operation(app, operation_id) else {
+                        return;
+                    };
                     let m = matches[0].clone();
                     app.set_status(format!("GNUDB: found {} — reading...", m.title));
                     let tx = tx.clone();
@@ -4121,6 +4166,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         let result = super::gnudb::read_gnudb(&m.category, &m.disc_id).await;
                         let _ = tx
                             .send(AppMessage::GnudbReadComplete {
+                                operation_id: read_operation_id,
                                 result,
                                 paths,
                                 origin_matches: None,
@@ -4129,12 +4175,16 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     });
                 }
                 Ok(matches) if matches.is_empty() => {
+                    finish_gnudb_operation_if_current(app, operation_id);
                     app.set_status("GNUDB: no matches found");
                 }
                 Ok(matches) => {
-                    // Multiple matches: show selection overlay.
+                    let Some(picker_operation_id) = advance_gnudb_operation(app, operation_id) else {
+                        return;
+                    };
                     app.set_status(format!("GNUDB: {} matches found", matches.len()));
                     app.active_overlay = ActiveOverlay::GnudbSelect {
+                        operation_id: picker_operation_id,
                         matches,
                         selected: 0,
                         scroll: 0,
@@ -4142,18 +4192,23 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     };
                 }
                 Err(e) => {
+                    finish_gnudb_operation_if_current(app, operation_id);
                     app.set_status(format!("GNUDB error: {}", e));
                 }
             }
         }
         AppMessage::GnudbReadComplete {
+            operation_id,
             result,
             paths,
             origin_matches,
         } => {
+            if !gnudb_operation_is_current(app, operation_id) {
+                return;
+            }
+            finish_gnudb_operation_if_current(app, operation_id);
             match result {
                 Ok(entry) => {
-                    // Open GNUDB review overlay for user editing before accept.
                     let mut review = super::gnudb::build_review_state(&entry, paths);
                     review.origin_matches = origin_matches;
                     app.set_status(format!(
@@ -4169,13 +4224,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::GnudbMultiDiscComplete { entries } => {
+        AppMessage::GnudbMultiDiscComplete {
+            operation_id,
+            entries,
+        } => {
+            if !gnudb_operation_is_current(app, operation_id) {
+                return;
+            }
+            finish_gnudb_operation_if_current(app, operation_id);
             if entries.is_empty() {
                 app.set_status("GNUDB: no matches found for any disc");
                 return;
             }
 
-            // Open GNUDB review overlay with multi-disc data.
             let review = super::gnudb::build_multi_disc_review_state(&entries);
             let n_discs = entries.len();
             let n_tracks: usize = entries.iter().map(|(_, e, _)| e.tracks.len()).sum();
@@ -4411,6 +4472,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             );
         }
         AppMessage::GnudbSplitCueAlbumGroupingComplete {
+            operation_id,
             infos,
             active_audio_path,
             result,
@@ -4418,6 +4480,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             super::context_menu::handle_gnudb_split_cue_album_grouping_complete(
                 app,
                 tx,
+                operation_id,
                 infos,
                 active_audio_path,
                 result,
@@ -4463,14 +4526,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 decision,
             );
         }
-        AppMessage::MbDetailPrefetchComplete { release_id, result } => {
-            // Stamp the in-memory cache if the picker is still open,
-            // and persist the raw body to SQLite (Phase B-5) so future
-            // sessions skip the HTTP call. Cache-writes happen even
-            // when the picker has been dismissed — the response was
-            // already paid for and a re-open will benefit. Errors and
-            // `release: None` (HTTP 404) are silent (best-effort
-            // prefetch).
+        AppMessage::MbDetailPrefetchComplete {
+            operation_id,
+            release_id,
+            result,
+        } => {
+            // Persist the paid-for response regardless of picker lifetime, but
+            // stamp in-memory state only onto the picker that launched it.
             if let Ok(outcome) = result {
                 if let Some((key, body)) = outcome.cache_write {
                     if let Err(e) = app.db.store_mb_search(&key, &body) {
@@ -4478,8 +4540,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                 }
                 if let Some(release) = outcome.release {
-                    if let ActiveOverlay::MbSelect(ref mut state) = app.active_overlay {
-                        state.prefetch.insert(release_id, release);
+                    let identity_is_current = tags_mb_operation_is_current(app, operation_id);
+                    if identity_is_current {
+                        if let ActiveOverlay::MbSelect(ref mut state) = app.active_overlay {
+                            if state.operation_id == operation_id {
+                                state.prefetch.insert(release_id, release);
+                                return;
+                            }
+                        }
+                        if let Some(state) = app.pending_mb_select.as_mut() {
+                            if state.operation_id == operation_id {
+                                state.prefetch.insert(release_id, release);
+                            }
+                        }
                     }
                 }
             }
@@ -4932,26 +5005,38 @@ fn handle_tags_from_mb_complete(
     outcome: super::message::MbOutcome,
     ctx: super::message::TagsMbContext,
 ) {
-    if !tags_mb_operation_is_current_phase(
-        app,
-        ctx.operation_id,
-        super::app::TagsMbOperationPhase::Lookup,
-    ) {
-        log::debug!(
-            "discarded stale MusicBrainz lookup completion {:?}",
-            ctx.operation_id
-        );
-        return;
-    }
     use super::message::MbOutcome;
     match outcome {
         MbOutcome::Toc { outcome } => {
+            if !tags_mb_operation_is_current_phase(
+                app,
+                ctx.operation_id,
+                super::app::TagsMbOperationPhase::Lookup,
+            ) {
+                log::debug!(
+                    "discarded stale MusicBrainz TOC completion {:?}",
+                    ctx.operation_id
+                );
+                return;
+            }
             handle_mb_toc_outcome(app, tx, outcome, ctx);
         }
         MbOutcome::Search {
             outcome,
             query_label,
         } => {
+            if !transition_tags_mb_operation_phase(
+                app,
+                ctx.operation_id,
+                super::app::TagsMbOperationPhase::LookupTextFallback,
+                super::app::TagsMbOperationPhase::Lookup,
+            ) {
+                log::debug!(
+                    "discarded stale or duplicate MusicBrainz text-search completion {:?}",
+                    ctx.operation_id
+                );
+                return;
+            }
             handle_mb_search_outcome(app, tx, outcome, query_label, ctx);
         }
     }
@@ -4998,7 +5083,14 @@ fn handle_mb_toc_outcome(
     match outcome.releases.len() {
         0 => match ctx.fallback_seed.clone() {
             Some(seed) => {
-                spawn_tags_mb_text_search(app, tx, seed, ctx, TextSearchMode::TocFallback)
+                if transition_tags_mb_operation_phase(
+                    app,
+                    ctx.operation_id,
+                    super::app::TagsMbOperationPhase::Lookup,
+                    super::app::TagsMbOperationPhase::LookupTextFallback,
+                ) {
+                    spawn_tags_mb_text_search(app, tx, seed, ctx, TextSearchMode::TocFallback)
+                }
             }
             None => {
                 finish_tags_mb_operation_if_current(app, ctx.operation_id);
@@ -5117,10 +5209,23 @@ pub(super) fn spawn_tags_mb_text_search(
     mode: TextSearchMode,
 ) {
     if ctx.operation_id.is_assigned() {
-        if !tags_mb_operation_is_current_phase(
+        if tags_mb_operation_is_current_phase(
             app,
             ctx.operation_id,
             super::app::TagsMbOperationPhase::Lookup,
+        ) {
+            if !transition_tags_mb_operation_phase(
+                app,
+                ctx.operation_id,
+                super::app::TagsMbOperationPhase::Lookup,
+                super::app::TagsMbOperationPhase::LookupTextFallback,
+            ) {
+                return;
+            }
+        } else if !tags_mb_operation_is_current_phase(
+            app,
+            ctx.operation_id,
+            super::app::TagsMbOperationPhase::LookupTextFallback,
         ) {
             return;
         }
@@ -5133,6 +5238,14 @@ pub(super) fn spawn_tags_mb_text_search(
             }
         };
         ctx.operation_id = operation_id;
+        if !transition_tags_mb_operation_phase(
+            app,
+            ctx.operation_id,
+            super::app::TagsMbOperationPhase::Lookup,
+            super::app::TagsMbOperationPhase::LookupTextFallback,
+        ) {
+            return;
+        }
     }
     let super::command::SacdMbSeed {
         artist,
@@ -5188,15 +5301,20 @@ pub(super) fn spawn_tags_mb_text_search(
     let ctx_for_msg = ctx;
 
     tokio::spawn(async move {
-        let outcome = super::musicbrainz::search_releases_by_query(
-            &artist,
-            &album,
-            catalog.as_deref(),
-            year.as_deref(),
-            n_tracks,
-            cached,
-        )
-        .await;
+        let worker = tokio::spawn(async move {
+            super::musicbrainz::search_releases_by_query(
+                &artist,
+                &album,
+                catalog.as_deref(),
+                year.as_deref(),
+                n_tracks,
+                cached,
+            )
+            .await
+        });
+        let outcome = worker.await.unwrap_or_else(|err| {
+            Err(format!("MusicBrainz text-search worker failed: {err}"))
+        });
         let _ = tx_inner
             .send(AppMessage::TagsFromMbComplete {
                 outcome: super::message::MbOutcome::Search {
@@ -5303,6 +5421,7 @@ fn open_mb_select_picker(
             .get_cached_mb_search(&super::musicbrainz::detail_cache_key(&top.release_id));
         spawn_mb_detail_prefetch(
             tx.clone(),
+            ctx.operation_id,
             top.release_id.clone(),
             state.paths.len(),
             std::sync::Arc::clone(&state.generation),
@@ -5386,6 +5505,10 @@ pub(super) fn begin_tags_mb_lookup_operation(
     app: &mut AppState,
     editor_owned: bool,
 ) -> Result<super::message::TagsMbOperationId, String> {
+    // MusicBrainz and GNUDB share the metadata-editor authority domain.
+    // A new MB dispatch retires GNUDB authority first so any later GNUDB
+    // completion is a total no-op.
+    app.active_gnudb_operation = None;
     if let Some(active) = app.active_tags_mb_operation {
         if active.picker_owned {
             let active_picker_matches = matches!(
@@ -5471,10 +5594,100 @@ pub(super) fn transition_tags_mb_operation_phase(
     true
 }
 
+pub(super) fn begin_gnudb_operation(
+    app: &mut AppState,
+) -> Result<super::message::TagsMbOperationId, String> {
+    if app.active_tags_mb_operation.is_some() {
+        return Err(
+            "GNUDB: a MusicBrainz workflow is active; cancel it before starting GNUDB"
+                .to_string(),
+        );
+    }
+    if app.active_gnudb_operation.is_some() {
+        return Err(
+            "GNUDB: another GNUDB workflow is active; cancel it before starting again"
+                .to_string(),
+        );
+    }
+    let generation = app
+        .tags_mb_operation_generation
+        .checked_add(1)
+        .ok_or_else(|| {
+            "GNUDB: operation identity space exhausted; restart Tonepoet before retrying"
+                .to_string()
+        })?;
+    app.tags_mb_operation_generation = generation;
+    let operation_id = super::message::TagsMbOperationId(generation);
+    app.active_gnudb_operation = Some(operation_id);
+    Ok(operation_id)
+}
+
+pub(super) fn gnudb_operation_is_current(
+    app: &AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    operation_id.is_assigned()
+        && app.active_tags_mb_operation.is_none()
+        && app.active_gnudb_operation == Some(operation_id)
+}
+
+pub(super) fn finish_gnudb_operation_if_current(
+    app: &mut AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    if !gnudb_operation_is_current(app, operation_id) {
+        return false;
+    }
+    app.active_gnudb_operation = None;
+    true
+}
+
+pub(super) fn advance_gnudb_operation(
+    app: &mut AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> Option<super::message::TagsMbOperationId> {
+    if !gnudb_operation_is_current(app, operation_id) {
+        return None;
+    }
+    let generation = app.tags_mb_operation_generation.checked_add(1)?;
+    app.tags_mb_operation_generation = generation;
+    let next = super::message::TagsMbOperationId(generation);
+    app.active_gnudb_operation = Some(next);
+    Some(next)
+}
+
+pub(super) fn begin_mb_select_operation(
+    app: &mut AppState,
+) -> Result<super::message::TagsMbOperationId, String> {
+    if app.active_gnudb_operation.is_some() {
+        return Err(
+            ":mb-back: a GNUDB workflow is active; cancel it before returning"
+                .to_string(),
+        );
+    }
+    if app.active_tags_mb_operation.is_some() {
+        return Err(
+            ":mb-back: another MusicBrainz workflow is active; cancel it before returning"
+                .to_string(),
+        );
+    }
+    allocate_tags_mb_operation(
+        app,
+        true,
+        super::app::TagsMbOperationPhase::Selecting,
+    )
+}
+
 fn begin_tags_mb_apply_operation(
     app: &mut AppState,
     picker_owned: bool,
 ) -> Result<super::message::TagsMbOperationId, String> {
+    if app.active_gnudb_operation.is_some() {
+        return Err(
+            ":tags-mb: a GNUDB workflow is active; cancel it before selecting again"
+                .to_string(),
+        );
+    }
     if app.active_tags_mb_operation.is_some() {
         return Err(
             ":tags-mb: another MusicBrainz workflow is active; cancel it before selecting again"
@@ -5561,11 +5774,15 @@ fn reconcile_tags_mb_apply_operation_state(app: &mut AppState) {
     );
 }
 
-pub(super) fn restore_parked_editor(app: &mut AppState) {
-    finish_metadata_editor_tags_mb_operation(app);
+pub(super) fn restore_parked_editor_without_finishing(app: &mut AppState) {
     if let Some(parked) = app.pending_metadata_editor.take() {
         app.active_overlay = ActiveOverlay::MetadataEditor(parked);
     }
+}
+
+pub(super) fn restore_parked_editor(app: &mut AppState) {
+    finish_metadata_editor_tags_mb_operation(app);
+    restore_parked_editor_without_finishing(app);
 }
 
 /// Take the metadata editor from wherever it's currently living —
@@ -5782,14 +5999,16 @@ fn metadata_editor_can_transition_to_split_cue_target(
 /// has this MBID and we skip both the debounce sleep and any HTTP
 /// call — the parse happens immediately and the message fires on the
 /// next runtime tick. The generation check is skipped on the cached
-/// path too: a "stale" cache hit can't waste an MB token, and the
-/// handler always stamps `state.prefetch` regardless, so a hit that
-/// lands after the user moved still benefits a later re-cursor.
+/// path too: a "stale" cache hit can't waste an MB token. The
+/// completion handler still applies the in-memory prefetch only when the
+/// operation, picker, generation, and selected release remain current;
+/// cache persistence is deliberately independent of picker ownership.
 ///
 /// Pass `release_id` empty to skip — callers shouldn't generally do
 /// this but the guard is cheap.
 pub(super) fn spawn_mb_detail_prefetch(
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     release_id: String,
     n_tracks: usize,
     generation_arc: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -5812,7 +6031,11 @@ pub(super) fn spawn_mb_detail_prefetch(
         let result =
             super::musicbrainz::fetch_release_detail(&release_id, n_tracks, cached_body).await;
         let _ = tx
-            .send(crate::tui::message::AppMessage::MbDetailPrefetchComplete { release_id, result })
+            .send(crate::tui::message::AppMessage::MbDetailPrefetchComplete {
+                operation_id,
+                release_id,
+                result,
+            })
             .await;
     });
 }
@@ -5891,7 +6114,7 @@ fn start_mb_select_apply_operation(
             }
             Err(error) => {
                 app.active_overlay = ActiveOverlay::None;
-                restore_parked_editor(app);
+                restore_parked_editor_without_finishing(app);
                 app.set_status(error);
                 return None;
             }
@@ -5957,7 +6180,9 @@ pub(super) fn open_editor_with_mb_release_guarded(
     let operation_id = match begin_tags_mb_apply_operation(app, false) {
         Ok(operation_id) => operation_id,
         Err(error) => {
-            finish_metadata_editor_tags_mb_operation(app);
+            // `begin_tags_mb_apply_operation` may reject because another
+            // lookup owns the authority. This shim did not acquire anything,
+            // so it must not finish the foreign operation.
             app.set_status(error);
             return;
         }
@@ -6113,7 +6338,9 @@ fn complete_tags_mb_apply_operation(
             &app.active_overlay,
             ActiveOverlay::MbSelect(state)
                 if state.phase.verifying_operation() == Some(operation_id)
-        );
+        ) || app.pending_mb_select.as_ref().is_some_and(|state| {
+            state.phase.verifying_operation() == Some(operation_id)
+        });
         if !picker_matches {
             // The picker was cancelled, replaced, or otherwise left its
             // verifying state without going through the normal cancel helper.
@@ -6128,6 +6355,10 @@ fn complete_tags_mb_apply_operation(
             log::debug!(
                 "discarded MusicBrainz apply completion {:?}: verifying picker no longer active",
                 operation_id
+            );
+            app.set_status(
+                ":tags-mb: selected release verification finished after its picker was replaced; no tags were applied"
+                    .to_string(),
             );
             return;
         }
@@ -6508,6 +6739,50 @@ mod browse_archive_quit_lifecycle_tests {
             staging_dir,
         ));
         Box::new(state)
+    }
+
+    #[test]
+    fn quit_is_blocked_by_dirty_parked_non_archive_editor() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.should_quit = true;
+        let mut state = MetadataEditorState::for_files(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().dirty = true;
+        app.pending_metadata_editor = Some(Box::new(state));
+
+        assert!(defer_quit_for_browse_archive_metadata(&mut app, &tx()));
+        assert!(!app.should_quit);
+        assert!(app.pending_metadata_editor.is_some());
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("parked metadata editor")));
+    }
+
+    #[test]
+    fn quit_is_blocked_by_dirty_open_non_archive_editor() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.should_quit = true;
+        let mut state = MetadataEditorState::for_files(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().dirty = true;
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+
+        assert!(defer_quit_for_browse_archive_metadata(&mut app, &tx()));
+        assert!(!app.should_quit);
+        assert!(matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)));
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("metadata editor")));
     }
 
     #[test]
@@ -7539,9 +7814,20 @@ mod musicbrainz_completion_dispatch_tests {
         let tx = tx();
         let editor = editor_with_tabs(0, 2);
         let editor_paths = editor.active_surface().paths.clone();
+        // Editor-owned completions now require a session guard; without one
+        // the reducer treats the completion as stale and restores the editor.
+        let guard = session_guard_for(&editor);
         app.active_overlay = ActiveOverlay::MetadataEditor(editor);
 
-        let ctx = ctx_for(&mut app, editor_paths, true);
+        let ctx = ctx_for_session(&mut app, editor_paths, true, guard);
+        // Production only dispatches a Search completion after the TOC
+        // zero-match fallback advanced the phase to LookupTextFallback.
+        assert!(transition_tags_mb_operation_phase(
+            &mut app,
+            ctx.operation_id,
+            crate::tui::app::TagsMbOperationPhase::Lookup,
+            crate::tui::app::TagsMbOperationPhase::LookupTextFallback,
+        ));
         handle_message(
             &mut app,
             AppMessage::TagsFromMbComplete {
@@ -7774,6 +8060,137 @@ mod musicbrainz_completion_dispatch_tests {
         assert_eq!(mb_back.selected, 1);
         assert_eq!(mb_back.releases.len(), 2);
         assert_eq!(state.presentation_tabs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unassigned_picker_refusal_restores_editor_without_finishing_foreign_operation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = single_source_file_editor();
+        editor.model.tags_mb_in_flight = true;
+        let editor_paths = editor.active_surface().paths.clone();
+        app.pending_metadata_editor = Some(editor);
+        let foreign_operation = begin_tags_mb_lookup_operation(&mut app, true)
+            .expect("foreign lookup operation");
+
+        let picker = Box::new(crate::tui::app::MbSelectState::new(
+            vec![release("old-a", "Old A"), release("old-b", "Old B")],
+            editor_paths,
+        ));
+        assert!(!picker.operation_id.is_assigned());
+
+        assert!(
+            start_mb_select_apply_operation(&mut app, picker).is_none(),
+            "an UNASSIGNED picker must refuse while foreign authority is live"
+        );
+        assert_eq!(
+            app.active_tags_mb_operation.map(|active| active.operation_id),
+            Some(foreign_operation),
+            "the refusing picker must not finish the operation that caused its refusal"
+        );
+        let ActiveOverlay::MetadataEditor(restored) = &app.active_overlay else {
+            panic!("the parked editor must be restored after refusal");
+        };
+        assert!(restored.model.tags_mb_in_flight);
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("workflow is active")));
+    }
+
+    #[tokio::test]
+    async fn stale_gnudb_completion_is_total_noop_over_live_mb_picker() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let tx = tx();
+        let editor = single_source_file_editor();
+        let editor_paths = editor.active_surface().paths.clone();
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+        let ctx = ctx_for(&mut app, editor_paths.clone(), true);
+        let mb_operation = ctx.operation_id;
+        handle_message(
+            &mut app,
+            AppMessage::TagsFromMbComplete {
+                outcome: crate::tui::message::MbOutcome::Toc {
+                    outcome: Ok(lookup_outcome(vec![
+                        release("mb-current-a", "Current A"),
+                        release("mb-current-b", "Current B"),
+                    ])),
+                },
+                ctx,
+            },
+            &tx,
+        );
+        app.set_status("current MusicBrainz picker remains authoritative".to_string());
+        let status_before = app.status_message.clone();
+
+        handle_message(
+            &mut app,
+            AppMessage::GnudbQueryComplete {
+                operation_id: crate::tui::message::TagsMbOperationId(u64::MAX),
+                result: Ok(Vec::new()),
+                paths: editor_paths,
+            },
+            &tx,
+        );
+
+        assert_eq!(
+            app.active_tags_mb_operation.map(|active| active.operation_id),
+            Some(mb_operation)
+        );
+        let ActiveOverlay::MbSelect(picker) = &app.active_overlay else {
+            panic!("stale GNUDB completion must not replace the live MB picker");
+        };
+        assert_eq!(picker.operation_id, mb_operation);
+        assert_eq!(picker.releases[0].release_id, "mb-current-a");
+        assert_eq!(app.status_message, status_before);
+        assert!(app.pending_metadata_editor.is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_toc_zero_match_dispatches_text_fallback_once() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(single_source_file_editor());
+        let operation_id = begin_tags_mb_lookup_operation(&mut app, true)
+            .expect("lookup operation");
+        let context = crate::tui::message::TagsMbContext {
+            operation_id,
+            paths: paths(1),
+            editor_park: true,
+            fallback_seed: Some(crate::tui::command::SacdMbSeed {
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                catalog: None,
+                year: None,
+            }),
+            editor_session: None,
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let message = || AppMessage::TagsFromMbComplete {
+            outcome: crate::tui::message::MbOutcome::Toc {
+                outcome: Ok(lookup_outcome(Vec::new())),
+            },
+            ctx: context.clone(),
+        };
+
+        handle_message(&mut app, message(), &tx);
+        assert!(tags_mb_operation_is_current_phase(
+            &app,
+            operation_id,
+            crate::tui::app::TagsMbOperationPhase::LookupTextFallback,
+        ));
+        let generation_after_first = app.tags_mb_operation_generation;
+        let status_after_first = app.status_message.clone();
+
+        handle_message(&mut app, message(), &tx);
+        assert_eq!(app.tags_mb_operation_generation, generation_after_first);
+        assert!(tags_mb_operation_is_current_phase(
+            &app,
+            operation_id,
+            crate::tui::app::TagsMbOperationPhase::LookupTextFallback,
+        ));
+        assert_eq!(
+            app.status_message, status_after_first,
+            "duplicate TOC completion must not dispatch or report another fallback"
+        );
     }
 
     #[test]

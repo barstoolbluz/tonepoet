@@ -15,7 +15,7 @@ use tonepoet_pipeline::{
 /// Sentinel values:
 /// - target_format: Flac
 /// - target_sample_rate: PcmHz(96_000)
-/// - target_bit_depth: Pcm(Float32)
+/// - target_bit_depth: Pcm(Int24)
 /// - resample_quality: Ultra
 /// - nyquist_transition: BrickWall
 /// - dither_type: Gesemann
@@ -83,7 +83,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
     PipelineSettings {
         target_format: AudioFormat::Flac,
         target_sample_rate: RateTarget::PcmHz(96_000),
-        target_bit_depth: BitDepthTarget::Pcm(PcmBitDepth::Float32),
+        target_bit_depth: BitDepthTarget::Pcm(PcmBitDepth::Int24),
         resample_quality: ResampleQuality::Ultra,
         nyquist_transition: NyquistTransition::BrickWall,
         dither_type: DitherType::Gesemann,
@@ -241,7 +241,7 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
         settings.target_sample_rate = RateTarget::PcmHz(88_200);
     });
     assert_mutation_changes_fingerprint!(covered, base, "target_bit_depth", |settings| {
-        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
     });
     assert_mutation_changes_fingerprint!(covered, base, "resample_quality", |settings| {
         settings.resample_quality = ResampleQuality::VeryHigh;

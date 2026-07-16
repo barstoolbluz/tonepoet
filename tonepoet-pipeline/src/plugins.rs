@@ -356,7 +356,7 @@ impl ToolPlugin for SsrcPlugin {
                 profile.as_arg().into(),
             ];
             let needs_dither = match *target_bit_depth {
-                Some(depth) => pcm_conversion_reduces_depth(context.request.source.bit_depth, depth),
+                Some(depth) => pcm_conversion_reduces_depth(context.request.source.authoritative_pcm_depth(), depth),
                 None => true,
             };
             // SSRC treats `--dither` and `--pdf` as parameters of the terminal
@@ -1319,11 +1319,11 @@ fn ffmpeg_audio_filter(
         opts.push(format!("phase_shift={}", phase));
     }
     let ffmpeg_needs_dither = match target_depth {
-        Some(depth) => pcm_conversion_reduces_depth(context.request.source.bit_depth, depth),
+        Some(depth) => pcm_conversion_reduces_depth(context.request.source.authoritative_pcm_depth(), depth),
         None => match context.request.settings.target_bit_depth {
             BitDepthTarget::Source => false,
             BitDepthTarget::Pcm(depth) => pcm_conversion_reduces_depth(
-                context.request.source.bit_depth, depth),
+                context.request.source.authoritative_pcm_depth(), depth),
         },
     };
     if settings.dither_type != DitherType::None && ffmpeg_needs_dither {
@@ -1544,7 +1544,7 @@ fn add_sox_pcm_effects(
         args.push(rate.to_string());
     }
     let depth_allows_dither = match target_depth {
-        Some(depth) => pcm_conversion_reduces_depth(context.request.source.bit_depth, depth),
+        Some(depth) => pcm_conversion_reduces_depth(context.request.source.authoritative_pcm_depth(), depth),
         None => true,
     };
     let should_dither =
@@ -1827,6 +1827,8 @@ mod tests {
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
             bit_depth: Some(PcmBitDepth::Int24),
+            true_source_depth: Some(PcmBitDepth::Int24),
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
@@ -2046,6 +2048,8 @@ mod tests {
             codec: crate::enums::AudioCodec::Flac,
             sample_rate_hz: Some(44_100),
             bit_depth: Some(PcmBitDepth::Int24),
+            true_source_depth: Some(PcmBitDepth::Int24),
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
@@ -2140,6 +2144,8 @@ mod tests {
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
             bit_depth: Some(PcmBitDepth::Int16),
+            true_source_depth: Some(PcmBitDepth::Int16),
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
@@ -2183,6 +2189,8 @@ mod tests {
             codec: crate::enums::AudioCodec::Flac,
             sample_rate_hz: Some(44_100),
             bit_depth: Some(PcmBitDepth::Int16),
+            true_source_depth: Some(PcmBitDepth::Int16),
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
@@ -2250,6 +2258,8 @@ mod tests {
             codec: crate::enums::AudioCodec::Dsd,
             sample_rate_hz: Some(2_822_400),
             bit_depth: None,
+            true_source_depth: None,
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::Dsd),
             channels: Some(2),
             duration: None,
@@ -2299,6 +2309,8 @@ mod tests {
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
             bit_depth: Some(PcmBitDepth::Int16),
+            true_source_depth: Some(PcmBitDepth::Int16),
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
@@ -2354,6 +2366,8 @@ mod tests {
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
             bit_depth: Some(PcmBitDepth::Int16),
+            true_source_depth: Some(PcmBitDepth::Int16),
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
@@ -2408,6 +2422,8 @@ mod tests {
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
             bit_depth: Some(PcmBitDepth::Int16),
+            true_source_depth: Some(PcmBitDepth::Int16),
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
@@ -2507,6 +2523,8 @@ mod tests {
             codec: crate::enums::AudioCodec::Dsd,
             sample_rate_hz: Some(2_822_400),
             bit_depth: None,
+            true_source_depth: None,
+            source_representation: Default::default(),
             sample_kind: Some(crate::enums::SampleKind::Dsd),
             channels: Some(2),
             duration: None,

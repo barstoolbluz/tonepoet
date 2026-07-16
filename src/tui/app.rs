@@ -4616,6 +4616,7 @@ pub enum ActiveOverlay {
     },
     /// GNUDB match selection overlay (when multiple matches are returned).
     GnudbSelect {
+        operation_id: crate::tui::message::TagsMbOperationId,
         matches: Vec<crate::tui::gnudb::GnudbMatch>,
         selected: usize,
         scroll: usize,
@@ -6166,6 +6167,9 @@ pub struct CueAlbumTrackSource {
     pub index00_frames: Option<u32>,
     pub index01_frames: Option<u32>,
     pub isrc: Option<String>,
+    /// Track-scoped CUE directives retained verbatim in parse-normal form
+    /// (for example `FLAGS PRE` and track-level `REM` lines).
+    pub directives: Vec<String>,
 }
 
 /// State carried by a unified synthetic split-CUE album surface.
@@ -6201,6 +6205,10 @@ pub struct PresentationTab {
     pub file_labels: Vec<String>,
     pub deleted: Vec<usize>,
     pub dirty: bool,
+    /// Sticky unresolved state set when a mandatory post-save re-read fails.
+    /// It survives ordinary dirty recomputation and is cleared only after a
+    /// successful refresh replaces the surface entries from disk.
+    pub refresh_failed: bool,
     /// Cached Details/Artwork data for this presentation.
     pub technical_details: MetadataTechnicalDetails,
     pub sacd_area_kind: Option<crate::tui::sacd::AreaKind>,
@@ -6259,6 +6267,7 @@ impl Default for PresentationTab {
             file_labels: Vec::new(),
             deleted: Vec::new(),
             dirty: false,
+            refresh_failed: false,
             technical_details: MetadataTechnicalDetails::default(),
             sacd_area_kind: None,
             sacd_stereo_durations: None,
@@ -7511,6 +7520,7 @@ impl MetadataEditorState {
             tab.entries = entries;
             tab.deleted.clear();
             tab.dirty = false;
+            tab.refresh_failed = false;
             tab.embedded_cuesheet_present = false;
             tab.sidecar_cuesheet_shadow_present = false;
             tab.pending_embedded_cuesheet_delete = false;
@@ -7538,6 +7548,7 @@ impl MetadataEditorState {
         let Some(tab) = tab else {
             return false;
         };
+        tab.refresh_failed = true;
         tab.dirty = true;
         true
     }
@@ -7907,7 +7918,7 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
 }
 
 fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
-    if tab.pending_embedded_cuesheet_delete || !tab.deleted.is_empty() {
+    if tab.refresh_failed || tab.pending_embedded_cuesheet_delete || !tab.deleted.is_empty() {
         return true;
     }
 
@@ -8060,6 +8071,9 @@ pub enum TagsMbOperationPhase {
     Discovery,
     Grouping,
     Lookup,
+    /// TOC-zero-match text fallback has been dispatched and its one
+    /// completion is the only accepted next transition.
+    LookupTextFallback,
     Selecting,
     Verifying,
 }
@@ -9100,11 +9114,15 @@ pub struct AppState {
     /// without consuming the picker.
     pub pending_mb_select: Option<Box<MbSelectState>>,
 
-    /// Monotonic source for opaque MusicBrainz apply operation identities.
+    /// Monotonic source for opaque MusicBrainz/GNUDB operation identities.
     pub tags_mb_operation_generation: u64,
     /// Currently authoritative selected-release apply, if any. Async
     /// completions must match this record before mutating an editor.
     pub active_tags_mb_operation: Option<ActiveTagsMbOperation>,
+    /// Currently authoritative GNUDB lookup/read workflow, if any. GNUDB
+    /// completions must match this identity and must never run while a
+    /// MusicBrainz workflow owns the metadata-editor authority.
+    pub active_gnudb_operation: Option<crate::tui::message::TagsMbOperationId>,
 
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
@@ -9857,6 +9875,7 @@ impl AppState {
             pending_mb_select: None,
             tags_mb_operation_generation: 0,
             active_tags_mb_operation: None,
+            active_gnudb_operation: None,
             status_message: theme_startup_status.map(|message| (message, std::time::Instant::now())),
             processing_active: false,
             should_quit: false,
@@ -12472,17 +12491,16 @@ FILE "02.flac" WAVE
     INDEX 01 00:00:00
 "#,
         );
-        let mut hook = CueProxyProbeTestHook::default();
-        hook.probe_results
-            .insert(non_audio.clone(), Err("not an audio stream".to_string()));
+        let hook = CueProxyProbeTestHook::default();
         let (non_audio_result, hook) = with_cue_proxy_probe_test_hook(hook, || {
             probe_cue_proxy_source(&non_audio_cue).expect("non-audio reference should be a warning result")
         });
         assert!(non_audio_result.info.is_none());
-        let notice = non_audio_result.probe_notice.expect("non-audio probe failure should warn");
-        assert!(notice.contains("CUE image probe failed"));
-        assert!(notice.contains("set format manually"));
-        assert_eq!(hook.probed_paths, vec![non_audio]);
+        // The unified FILE-ref resolver rejects non-audio references at
+        // resolution, so no probe is attempted at all.
+        let notice = non_audio_result.probe_notice.expect("non-audio reference should warn");
+        assert!(notice.contains("set format manually"), "{notice}");
+        assert!(hook.probed_paths.is_empty(), "{:?}", hook.probed_paths);
         assert!(hook.metadata_paths.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
@@ -12830,6 +12848,29 @@ mod metadata_presentation_tab_tests {
 
         assert!(state.set_content_tab(ContentTab::Metadata));
         assert_eq!(state.scroll, 4, "selected metadata row must remain reachable after tab switch");
+    }
+
+    #[test]
+    fn failed_mandatory_refresh_remains_dirty_until_successful_reread() {
+        let mut surface = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![tag("TITLE", "saved", vec!["saved"])],
+            1,
+        );
+        surface.technical_details.session_id = 77;
+        let mut state = state_with_tabs(vec![surface], 0);
+
+        assert!(state.mark_saved_surface_refresh_failed(77));
+        assert!(state.active_surface().refresh_failed);
+        assert!(state.recompute_active_dirty());
+        assert!(state.active_surface().dirty);
+
+        let reread = vec![tag("TITLE", "saved", vec!["saved"])];
+        assert!(state.replace_saved_surface_entries(77, reread));
+        assert!(!state.active_surface().refresh_failed);
+        assert!(!state.recompute_active_dirty());
+        assert!(!state.active_surface().dirty);
     }
 
     #[test]

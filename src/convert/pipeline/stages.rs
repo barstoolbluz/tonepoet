@@ -2934,6 +2934,24 @@ async fn convert_tracks_with_reporter(
     .await
 }
 
+const WAVPACK_WVUNPACK_PREFLIGHT_ERROR: &str =
+    "WavPack conversion requires wvunpack for authoritative post-encode depth verification; install wvunpack before starting the album";
+
+/// Validate album-scoped external-tool requirements before any track encode
+/// work is admitted. This must be called exactly once by each album execution
+/// path: the serial converter and the shared-scheduler preparation path.
+fn preflight_album_conversion_tools(
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+) -> Result<(), String> {
+    if matches!(req.settings.target_format, PlannerAudioFormat::WavPack)
+        && !runner.tool_available(ToolBinary::Wvunpack)
+    {
+        return Err(WAVPACK_WVUNPACK_PREFLIGHT_ERROR.to_string());
+    }
+    Ok(())
+}
+
 async fn convert_tracks_with_reporter_with_tool_paths(
     source: &PreparedSource,
     plan: &AlbumPlan,
@@ -2945,6 +2963,22 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> ConvertStageResult {
+    if let Err(error) = preflight_album_conversion_tools(req, runner) {
+        let records = source
+            .tracks
+            .iter()
+            .map(|track| failed_track_record(track, None, None, Vec::new(), error.clone()))
+            .collect();
+        return ConvertStageResult {
+            tracks: records,
+            artifacts: ArtifactSet {
+                audio: AudioArtifacts::Tracks(Vec::new()),
+                sidecars: Vec::new(),
+            },
+            record: stage_record(PipelineStage::Convert, StageOutcome::Failed(error)),
+        };
+    }
+
     let planned: BTreeMap<_, _> = plan
         .entries
         .iter()
@@ -14255,10 +14289,12 @@ fn conversion_summary(
         .or_else(|| source_depth_bits.filter(|bits| *bits < 100));
     let source_format = source_track_format_label(track);
     let target_rate = resolved_target_rate_hz(track, &req.settings).or(source_rate);
+    let defaulted_source_target = source_default_pcm_depth_for_track(track, &req.settings);
     let planned_target_pcm_depth = if req.settings.target_format.is_dsd() {
         None
     } else {
         resolved_target_pcm_depth(track, req.settings.target_bit_depth)
+            .or(defaulted_source_target.map(|(depth, _)| depth))
     };
     let planned_target_depth = planned_target_pcm_depth.map(tonepoet_pipeline::PcmBitDepth::bits);
     let target_depth = verified_output_bit_depth
@@ -14271,7 +14307,15 @@ fn conversion_summary(
         .or(planned_float_target)
         .map(|depth| measured_target_stream_description(depth, target_rate))
         .unwrap_or_else(|| target_stream_description(track, target_depth, target_rate, &req.settings));
-    let target_stream = if output_depth_unverified {
+    let target_stream = if let Some((depth, reason)) = defaulted_source_target {
+        let rate = target_rate
+            .map(|hz| format!(" at {}", format_sample_rate(hz)))
+            .unwrap_or_default();
+        format!(
+            "requested {}-bit (default for {reason} source){rate}",
+            depth.bits()
+        )
+    } else if output_depth_unverified {
         format!("requested {target_stream}")
     } else {
         target_stream
@@ -14288,6 +14332,11 @@ fn conversion_summary(
     if output_depth_unverified {
         summary.push_str(" [output depth unverified]");
     }
+    if req.settings.target_bit_depth == BitDepthTarget::Source
+        && matches!(track.bit_depth.or(track.source_audio.bit_depth), Some(20))
+    {
+        summary.push_str(" [20-bit source stored as 24-bit]");
+    }
     let mut transforms = Vec::new();
     if let (Some(source_rate), Some(target_rate)) = (source_rate, target_rate) {
         if source_rate != target_rate {
@@ -14295,7 +14344,7 @@ fn conversion_summary(
         }
     }
     if dither_applies(
-        source_pcm_depth,
+        super::plan_bridge::resolve_dither_source_pcm_depth(track),
         planned_target_pcm_depth,
         req.settings.dither_type,
     ) {
@@ -14383,7 +14432,8 @@ fn bit_depth_change_applies_for_source(
     source.tracks.iter().any(|track| {
         match (
             super::plan_bridge::resolve_source_pcm_depth(track),
-            resolved_target_pcm_depth(track, settings.target_bit_depth),
+            resolved_target_pcm_depth(track, settings.target_bit_depth)
+                .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)),
         ) {
             (Some(source_depth), Some(target_depth)) => source_depth != target_depth,
             _ => false,
@@ -14400,8 +14450,9 @@ fn dithering_applies_for_source(
     }
     source.tracks.iter().any(|track| {
         dither_applies(
-            super::plan_bridge::resolve_source_pcm_depth(track),
-            resolved_target_pcm_depth(track, settings.target_bit_depth),
+            super::plan_bridge::resolve_dither_source_pcm_depth(track),
+            resolved_target_pcm_depth(track, settings.target_bit_depth)
+                .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)),
             settings.dither_type,
         )
     })
@@ -14415,11 +14466,44 @@ fn dither_applies(
     if dither == DitherType::None {
         return false;
     }
-    match (source_depth, target_depth) {
-        (Some(source), Some(target)) if !target.is_float() => {
-            source.is_float() || target.bits() < source.bits()
-        }
-        _ => false,
+    match target_depth {
+        Some(
+            target @ (tonepoet_pipeline::PcmBitDepth::Int8
+            | tonepoet_pipeline::PcmBitDepth::Int16
+            | tonepoet_pipeline::PcmBitDepth::Int24),
+        ) => source_depth
+            .map(|source| target.bits() < source.bits())
+            .unwrap_or(true),
+        Some(
+            tonepoet_pipeline::PcmBitDepth::Int32
+            | tonepoet_pipeline::PcmBitDepth::Float32
+            | tonepoet_pipeline::PcmBitDepth::Float64,
+        )
+        | None => false,
+    }
+}
+
+fn source_default_pcm_depth_for_track(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<(tonepoet_pipeline::PcmBitDepth, &'static str)> {
+    if settings.target_bit_depth != BitDepthTarget::Source
+        || !settings.target_format.is_pcm_lossless()
+    {
+        return None;
+    }
+    match track.source_audio.coding.unwrap_or(SourceAudioCoding::Unknown) {
+        SourceAudioCoding::Dsd => Some((
+            tonepoet_pipeline::default_pcm_depth_for_format(&settings.target_format),
+            "DSD",
+        )),
+        SourceAudioCoding::Lossy => Some((
+            tonepoet_pipeline::default_pcm_depth_for_format(&settings.target_format),
+            "lossy",
+        )),
+        SourceAudioCoding::Pcm
+        | SourceAudioCoding::DvdaUnknown
+        | SourceAudioCoding::Unknown => None,
     }
 }
 
@@ -14510,6 +14594,7 @@ fn source_audio_coding_label(coding: SourceAudioCoding) -> &'static str {
     match coding {
         SourceAudioCoding::Pcm => "PCM",
         SourceAudioCoding::Dsd => "DSD",
+        SourceAudioCoding::Lossy => "lossy",
         SourceAudioCoding::DvdaUnknown => "DVD-Audio",
         SourceAudioCoding::Unknown => "source",
     }
@@ -20523,6 +20608,43 @@ pub async fn prepare_pipeline_item_for_scheduler(
                 .await,
             );
         }
+    }
+
+    if let Err(error) = preflight_album_conversion_tools(&req, runner) {
+        emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
+        let record = stage_record(
+            PipelineStage::Convert,
+            StageOutcome::Failed(error.clone()),
+        );
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let failed = failed_track_records(&prepared, &error);
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed,
+            stages,
+            reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
+        };
+        let published = publish_terminal_conversion_log_fragment_if_needed(
+            &req,
+            Some(&prepared),
+            None,
+            &outcome,
+            staging,
+            Some(runner),
+        );
+        return ScheduledMaterialization::Finished(
+            finalize_report(
+                &req,
+                reporter,
+                Some(prepared),
+                Some(album_plan),
+                None,
+                published,
+                outcome,
+            )
+            .await,
+        );
     }
 
     ScheduledMaterialization::Ready(ScheduledAlbum {
@@ -35817,6 +35939,7 @@ mod conversion_log_tests {
         // track would not, and the source-depth fallback must not resolve a
         // PCM depth for a DSD source.
         source.tracks[0].source_audio.bit_depth = None;
+        source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
         source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
             iso: PathBuf::from("/music/source.iso"),
             track_index: 0,
@@ -35839,10 +35962,47 @@ mod conversion_log_tests {
         // The record has no verified output depth, so the PCM-lossless target
         // is labelled as requested and flagged unverified (D6 honesty).
         assert!(
-            log.contains("Conversion: DSD64 DSD → requested 88.2kHz FLAC"),
+            log.contains(
+                "Conversion: DSD64 DSD → requested 24-bit (default for DSD source) at 88.2kHz FLAC"
+            ),
             "{log}"
         );
         assert!(!log.contains("2822.4kHz FLAC"), "{log}");
+    }
+
+    #[test]
+    fn explicit_dsd_to_pcm_depth_does_not_claim_default_policy() {
+        let mut source = log_test_source();
+        source.kind = SourceKind::SacdIso;
+        source.tracks[0].sample_rate = Some(DsdRate::Dsd64.hz());
+        source.tracks[0].bit_depth = None;
+        source.tracks[0].source_audio.bit_depth = None;
+        source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
+        source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
+            iso: PathBuf::from("/music/source.iso"),
+            track_index: 0,
+            area: SacdArea::Stereo,
+        };
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains("requested 24-bit/88.2kHz FLAC"), "{log}");
+        assert!(!log.contains("default for DSD source"), "{log}");
     }
 
     #[test]
@@ -39041,6 +39201,238 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
+    struct ToolAvailabilityRunner {
+        inner: StubToolRunner,
+        unavailable: ToolBinary,
+        availability_checks: Mutex<Vec<ToolBinary>>,
+    }
+
+    impl ToolAvailabilityRunner {
+        fn with_unavailable(unavailable: ToolBinary) -> Self {
+            Self {
+                inner: StubToolRunner::new(),
+                unavailable,
+                availability_checks: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn push_output(&self, output: ToolOutput) {
+            self.inner.push_output(output);
+        }
+
+        fn transcript(&self) -> Vec<CommandRecord> {
+            self.inner.transcript()
+        }
+
+        fn availability_checks(&self) -> Vec<ToolBinary> {
+            self.availability_checks.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ToolRunner for ToolAvailabilityRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            self.inner.run(cmd, cancel).await
+        }
+
+        fn tool_available(&self, binary: ToolBinary) -> bool {
+            self.availability_checks.lock().unwrap().push(binary);
+            binary != self.unavailable
+        }
+    }
+
+    fn scheduled_archive_request(
+        root: &Path,
+        target_format: PlannerAudioFormat,
+    ) -> PipelineRequest {
+        std::fs::create_dir_all(root).expect("case root");
+        std::fs::create_dir_all(root.join("out")).expect("output root");
+        std::fs::create_dir_all(root.join("logs")).expect("log root");
+        let container = root.join("album.7z");
+        std::fs::write(&container, b"archive placeholder").expect("archive container");
+        let preview = root.join("preview");
+        std::fs::create_dir_all(&preview).expect("preview root");
+        std::fs::write(preview.join("01.wav"), b"first track").expect("first preview track");
+        std::fs::write(preview.join("02.wav"), b"second track").expect("second preview track");
+
+        let mut req = request(
+            root,
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.container = container;
+        req.pre_extracted_staging = Some(preview);
+        let target_extension = target_format.extension().to_string();
+        req.settings.target_format = target_format;
+        req.item_id = format!("scheduled-preflight-{target_extension}");
+        req
+    }
+
+    fn pcm16_ffprobe_output() -> ToolOutput {
+        ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: r#"{"streams":[{"codec_name":"pcm_s16le","sample_fmt":"s16","sample_rate":"44100","duration":"1.0","bits_per_raw_sample":"16"}],"format":{"duration":"1.0"}}"#.to_string(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(1),
+            command: CommandRecord {
+                description: None,
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: Vec::new(),
+                cwd: None,
+                env_keys: Vec::new(),
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(1),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_wavpack_preflight_finishes_before_encode_submission() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let wavpack_root = temp.path().join("wavpack");
+        let wavpack_req = scheduled_archive_request(&wavpack_root, PlannerAudioFormat::WavPack);
+        let wavpack_runner = ToolAvailabilityRunner::with_unavailable(ToolBinary::Wvunpack);
+        for _ in 0..4 {
+            wavpack_runner.push_output(pcm16_ffprobe_output());
+        }
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+
+        let materialized = prepare_pipeline_item_for_scheduler(
+            wavpack_req,
+            &wavpack_runner,
+            &reporter,
+            &cancel,
+            &HashMap::new(),
+        )
+        .await;
+
+        let report = match materialized {
+            ScheduledMaterialization::Finished(report) => report,
+            ScheduledMaterialization::Ready(_) => {
+                panic!("unavailable wvunpack must finish album preparation before track work is schedulable")
+            }
+        };
+        assert_eq!(
+            report.source.as_ref().map(|source| source.tracks.len()),
+            Some(2),
+            "the regression must exercise a multi-track scheduled album; outcome={:?}",
+            report.outcome
+        );
+        let stages = match &report.outcome {
+            AlbumOutcome::Blocked {
+                failed,
+                stages,
+                reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
+                ..
+            } => {
+                assert_eq!(failed.len(), 2, "every planned track receives the album preflight failure");
+                for record in failed {
+                    match &record.outcome {
+                        TrackOutcome::Err(error) => {
+                            assert_eq!(error, WAVPACK_WVUNPACK_PREFLIGHT_ERROR);
+                        }
+                        other => panic!("unexpected preflight track outcome: {other:?}"),
+                    }
+                }
+                stages
+            }
+            other => panic!("unexpected WavPack preflight outcome: {other:?}"),
+        };
+        let convert_error = stages
+            .iter()
+            .find_map(|record| {
+                if record.stage == PipelineStage::Convert {
+                    if let StageOutcome::Failed(error) = &record.outcome {
+                        return Some(error.as_str());
+                    }
+                }
+                None
+            })
+            .expect("Convert preflight failure");
+        assert_eq!(convert_error, WAVPACK_WVUNPACK_PREFLIGHT_ERROR);
+        assert_eq!(
+            wavpack_runner.availability_checks(),
+            vec![ToolBinary::Wvunpack],
+            "the shared scheduler probes wvunpack exactly once per album"
+        );
+        let transcript = wavpack_runner.transcript();
+        // Materialization runs one ffprobe per staged track plus follow-up
+        // probes; the load-bearing invariant is that ONLY probe commands ran.
+        assert!(
+            transcript.len() >= 2,
+            "materialization probes must run before the preflight verdict"
+        );
+        assert!(
+            transcript
+                .iter()
+                .all(|command| matches!(
+                    command.binary,
+                    ToolBinary::Ffprobe | ToolBinary::SevenZip
+                )),
+            "no encoder work unit may be invoked after the album preflight fails; transcript={:?}",
+            transcript
+                .iter()
+                .map(|c| (c.binary, c.sanitized_args.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        let flac_root = temp.path().join("flac");
+        let flac_req = scheduled_archive_request(&flac_root, PlannerAudioFormat::Flac);
+        let flac_runner = ToolAvailabilityRunner::with_unavailable(ToolBinary::Wvunpack);
+        for _ in 0..4 {
+            flac_runner.push_output(pcm16_ffprobe_output());
+        }
+        let flac_reporter = RecordingReporter::new();
+        let flac_cancel = CancellationToken::new();
+        let flac_materialized = prepare_pipeline_item_for_scheduler(
+            flac_req,
+            &flac_runner,
+            &flac_reporter,
+            &flac_cancel,
+            &HashMap::new(),
+        )
+        .await;
+
+        let scheduled = match flac_materialized {
+            ScheduledMaterialization::Ready(album) => album,
+            ScheduledMaterialization::Finished(report) => {
+                panic!("adjacent FLAC target must remain schedulable: {:?}", report.outcome)
+            }
+        };
+        assert_eq!(scheduled.track_count(), 2);
+        assert!(
+            flac_runner.availability_checks().is_empty(),
+            "non-WavPack targets must not probe wvunpack"
+        );
+        let flac_transcript = flac_runner.transcript();
+        // 7z extraction + one probe per staged track; the invariant is that
+        // preparation proceeded normally with no encoder invoked yet.
+        assert!(
+            flac_transcript
+                .iter()
+                .all(|command| matches!(
+                    command.binary,
+                    ToolBinary::Ffprobe | ToolBinary::SevenZip
+                )),
+            "the adjacent non-WavPack target proceeds through ordinary album preparation"
+        );
+        assert!(
+            flac_transcript
+                .iter()
+                .filter(|command| command.binary == ToolBinary::Ffprobe)
+                .count()
+                >= 2,
+            "both staged tracks are probed"
+        );
+    }
 
     #[tokio::test]
     async fn realized_image_segment_waits_on_ffmpeg_family_limit_before_runner() {

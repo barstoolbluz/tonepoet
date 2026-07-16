@@ -180,6 +180,14 @@ impl AudioCodec {
     pub fn is_dsd(&self) -> bool {
         matches!(self, Self::Dsd)
     }
+
+
+    /// True when this codec does not carry an authoritative PCM source
+    /// representation even though its decoder may output PCM samples.
+    #[must_use]
+    pub fn is_lossy(&self) -> bool {
+        matches!(self, Self::Mp3 | Self::Aac | Self::Opus)
+    }
 }
 
 /// Sample representation for a decoded or target stream.

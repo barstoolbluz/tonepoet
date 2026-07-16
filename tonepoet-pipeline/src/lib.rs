@@ -28,6 +28,6 @@ pub use plugins::{
     FfmpegPlugin, FlacPlugin, LoudgainPlugin, MetaflacPlugin, SoxPlugin, SsrcPlugin,
 };
 pub use settings::*;
-pub use source::SourceInfo;
+pub use source::{SourceInfo, SourceRepresentationKind};
 pub use tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolRegistry, ToolSupport};
 pub use fingerprint::{settings_fingerprint, SettingsFingerprint, SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS};

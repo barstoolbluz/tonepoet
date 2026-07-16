@@ -61,6 +61,11 @@ enum Commands {
         #[arg(short, long)]
         format: Option<String>,
 
+        /// Target PCM bit depth (16, 24, 32, 32f, 64f, or source). With no
+        /// flag, DSD/lossy sources use the target format's documented default.
+        #[arg(long = "bit-depth", value_name = "16|24|32|32f|64f|source", value_parser = parse_cli_bit_depth)]
+        bit_depth: Option<u32>,
+
         /// Output directory
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -354,6 +359,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         Commands::Convert {
             paths,
             format,
+            bit_depth,
             output,
             workers,
             replaygain,
@@ -385,6 +391,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             run_convert(
                 paths,
                 format,
+                bit_depth,
                 output,
                 workers,
                 replaygain,
@@ -617,6 +624,114 @@ fn parse_format(s: &str) -> anyhow::Result<AudioFormat> {
     }
 }
 
+fn parse_cli_bit_depth(value: &str) -> Result<u32, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "source" => Ok(0),
+        "16" => Ok(16),
+        "24" => Ok(24),
+        "32" => Ok(32),
+        "32f" | "f32" | "float32" => Ok(320),
+        "64f" | "f64" | "float64" => Ok(640),
+        other => Err(format!(
+            "invalid bit depth '{other}'; expected 16, 24, 32, 32f, 64f, or source"
+        )),
+    }
+}
+
+
+#[cfg(test)]
+mod bit_depth_cli_tests {
+    use super::parse_cli_bit_depth;
+
+    #[test]
+    fn accepts_documented_bit_depth_values() {
+        assert_eq!(parse_cli_bit_depth("source"), Ok(0));
+        assert_eq!(parse_cli_bit_depth("16"), Ok(16));
+        assert_eq!(parse_cli_bit_depth("24"), Ok(24));
+        assert_eq!(parse_cli_bit_depth("32"), Ok(32));
+        assert_eq!(parse_cli_bit_depth("32f"), Ok(320));
+        assert_eq!(parse_cli_bit_depth("64f"), Ok(640));
+    }
+
+    #[test]
+    fn no_depth_flag_reaches_dsd_planner_as_source_and_uses_documented_default() {
+        use clap::Parser;
+        use std::path::PathBuf;
+        use tonepoet_pipeline::{
+            AudioCodec, BitDepthTarget, DsdRate, PcmBitDepth, PlanOperation, PlanRequest,
+            SampleKind, SourceInfo, SourceRepresentationKind, TopologyPlan,
+        };
+
+        let cli = super::Cli::try_parse_from([
+            "tonepoet",
+            "convert",
+            "album.dsf",
+            "--format",
+            "flac",
+        ])
+        .expect("parse default-depth CLI");
+        let super::Commands::Convert {
+            format,
+            bit_depth,
+            ..
+        } = cli.command
+        else {
+            panic!("expected convert command");
+        };
+        assert_eq!(bit_depth, None);
+
+        let mut options = tonepoet::convert::ConversionOptions::default();
+        options.output_format = super::parse_format(format.as_deref().expect("format"))
+            .expect("parse FLAC format");
+        options.target_bit_depth = bit_depth;
+        let settings = tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options)
+            .expect("project default CLI settings");
+        assert_eq!(settings.target_bit_depth, BitDepthTarget::Source);
+
+        let request = PlanRequest {
+            input_path: PathBuf::from("album.dsf"),
+            output_path: PathBuf::from("album.flac"),
+            source: SourceInfo {
+                format: tonepoet_pipeline::AudioFormat::Dsf,
+                codec: AudioCodec::Dsd,
+                sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+                bit_depth: None,
+                true_source_depth: None,
+                source_representation: SourceRepresentationKind::Dsd,
+                sample_kind: Some(SampleKind::Dsd),
+                channels: Some(2),
+                duration: None,
+                audio_md5: None,
+            },
+            settings,
+            intermediate_dir: Some(PathBuf::from("work")),
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let topology = tonepoet_pipeline::plan_topology(&request)
+            .expect("no-depth CLI DSD conversion must plan");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("DSD to FLAC must execute");
+        };
+        assert!(steps.iter().any(|step| matches!(
+            step.operation,
+            PlanOperation::DsdToPcm {
+                target_bit_depth: PcmBitDepth::Int24,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn rejects_undocumented_or_ambiguous_bit_depth_values() {
+        for value in ["8", "20", "33", "640", "float"] {
+            assert!(
+                parse_cli_bit_depth(value).is_err(),
+                "{value} must not be accepted as a CLI bit-depth value"
+            );
+        }
+    }
+}
+
 fn parse_replaygain_mode(s: &str) -> Option<tonepoet::convert::simple_wizard::ReplayGainMode> {
     use tonepoet::convert::simple_wizard::ReplayGainMode;
     match s.to_lowercase().as_str() {
@@ -667,6 +782,7 @@ fn parse_dvda_downmix_policy(s: &str) -> Result<DvdaDownmixPolicy, String> {
 async fn run_convert(
     paths: Vec<PathBuf>,
     format: Option<String>,
+    bit_depth: Option<u32>,
     output: Option<PathBuf>,
     workers: Option<usize>,
     replaygain: Option<String>,
@@ -726,6 +842,9 @@ async fn run_convert(
 
     // Apply CLI overrides
     options.output_format = output_format;
+    if let Some(depth) = bit_depth {
+        options.target_bit_depth = Some(depth);
+    }
     if let Some(dir) = &output {
         options.output_dir = Some(dir.clone());
     } else if let Some(ref dir) = config.conversion.default_destination {
@@ -803,6 +922,14 @@ async fn run_convert(
     if let Some(template) = &folder_naming {
         options.folder_template = Some(template.clone());
     }
+
+    // Materialize the CLI's complete planner settings through the checked
+    // compatibility bridge. This is where `--bit-depth source` remains Source,
+    // while malformed numeric requests are rejected rather than substituted.
+    let cli_pipeline_settings =
+        tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options)
+            .map_err(|error| anyhow::anyhow!("invalid conversion settings: {error}"))?;
+    options.pipeline_settings = Some(cli_pipeline_settings);
 
     // Build pipeline request template from CLI flags (PR 10).
     // If any pipeline-specific flags are set, we construct a PipelineRequest
@@ -912,7 +1039,10 @@ async fn run_convert(
         } else {
             // No pipeline-specific flags — attach PipelineSettings from legacy
             // ConversionOptions so the processor can build a PipelineRequest.
-            let settings = tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options);
+            let settings = options
+                .pipeline_settings
+                .clone()
+                .expect("run_convert installs checked CLI pipeline settings");
             for item in q.all_items_mut() {
                 item.options.pipeline_settings = Some(settings.clone());
             }
@@ -1251,12 +1381,10 @@ fn build_pipeline_request_template(
             cue_sidecar: cue_policy,
             track_selection,
         },
-        settings: options
-            .pipeline_settings
-            .clone()
-            .unwrap_or_else(|| {
-                tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options)
-            }),
+        settings: options.pipeline_settings.clone().unwrap_or_else(|| {
+            tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(options)
+                .expect("CLI template tests supply valid legacy conversion options")
+        }),
         merge,
         output_root: output_root.clone(),
         naming: NamingPolicy {

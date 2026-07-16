@@ -720,9 +720,10 @@ fn source_audio_coding(coding: BluRayAudioCoding) -> Option<SourceAudioCoding> {
         BluRayAudioCoding::Ac3
         | BluRayAudioCoding::Eac3
         | BluRayAudioCoding::Dts
-        | BluRayAudioCoding::TrueHd
-        | BluRayAudioCoding::DtsHd
-        | BluRayAudioCoding::DtsHdMaster => Some(SourceAudioCoding::Unknown),
+        | BluRayAudioCoding::DtsHd => Some(SourceAudioCoding::Lossy),
+        BluRayAudioCoding::TrueHd | BluRayAudioCoding::DtsHdMaster => {
+            Some(SourceAudioCoding::Pcm)
+        }
     }
 }
 
@@ -2226,7 +2227,7 @@ mod tests {
         for track in &prepared.tracks {
             assert_eq!(track.bit_depth, None);
             assert_eq!(track.sample_rate, Some(96_000));
-            assert_eq!(track.source_audio.coding, Some(SourceAudioCoding::Unknown));
+            assert_eq!(track.source_audio.coding, Some(SourceAudioCoding::Lossy));
             match &track.source_ref {
                 TrackSourceRef::BluRayTrack {
                     audio_coding,

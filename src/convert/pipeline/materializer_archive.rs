@@ -1650,7 +1650,7 @@ async fn probe_audio_file(
             "-select_streams".into(),
             "a:0".into(),
             "-show_entries".into(),
-            "stream=codec_name,sample_rate,duration,bits_per_raw_sample,bits_per_sample".into(),
+            "stream=codec_name,sample_fmt,sample_rate,duration,bits_per_raw_sample,bits_per_sample".into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -1703,37 +1703,30 @@ fn parse_ffprobe_json(json_str: &str) -> Result<ProbeResult, MaterializeError> {
         });
 
     let expected_samples = duration_secs.map(|d| (d * sample_rate as f64).round() as u64);
-    let bit_depth = val
+    let integer_bit_depth = val
         .pointer("/streams/0/bits_per_raw_sample")
-        .or_else(|| val.pointer("/streams/0/bits_per_sample"))
-        .and_then(json_u32);
-    let coding = val
+        .and_then(json_u32)
+        .filter(|bits| *bits > 0)
+        .or_else(|| {
+            val.pointer("/streams/0/bits_per_sample")
+                .and_then(json_u32)
+                .filter(|bits| *bits > 0)
+        });
+    let codec_name = val
         .pointer("/streams/0/codec_name")
-        .and_then(|v| v.as_str())
-        .map(source_audio_coding_from_codec_name);
+        .and_then(|value| value.as_str());
+    let sample_fmt = val
+        .pointer("/streams/0/sample_fmt")
+        .and_then(|value| value.as_str());
+    let (coding, bit_depth) =
+        classify_source_audio_probe(codec_name, sample_fmt, integer_bit_depth);
 
     Ok(ProbeResult {
         sample_rate,
         expected_samples,
         bit_depth,
-        coding,
+        coding: Some(coding),
     })
-}
-
-fn source_audio_coding_from_codec_name(codec_name: &str) -> SourceAudioCoding {
-    let codec_name = codec_name.to_ascii_lowercase();
-    if codec_name.starts_with("dsd") {
-        SourceAudioCoding::Dsd
-    } else if codec_name.starts_with("pcm_")
-        || matches!(
-            codec_name.as_str(),
-            "flac" | "alac" | "wavpack" | "tta" | "shorten"
-        )
-    {
-        SourceAudioCoding::Pcm
-    } else {
-        SourceAudioCoding::Unknown
-    }
 }
 
 fn json_u32(value: &serde_json::Value) -> Option<u32> {
@@ -3268,6 +3261,7 @@ mod tests {
     fn parse_ffprobe_json_extracts_bit_depth_from_raw_sample_field() {
         let json = r#"{
             "streams": [{
+                "codec_name": "flac",
                 "sample_rate": "96000",
                 "duration": "1.5",
                 "bits_per_raw_sample": "24"
@@ -3283,6 +3277,7 @@ mod tests {
     fn parse_ffprobe_json_falls_back_to_bits_per_sample() {
         let json = r#"{
             "streams": [{
+                "codec_name": "pcm_s16le",
                 "sample_rate": "44100",
                 "duration": "2.0",
                 "bits_per_sample": 16

@@ -4790,6 +4790,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
         }
         ActiveOverlay::GnudbSelect {
+            operation_id,
             ref matches,
             mut selected,
             scroll,
@@ -4799,11 +4800,16 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             let paths = paths.clone();
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
+                    super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
                     app.active_overlay = ActiveOverlay::None;
+                    if let Some(parked) = app.pending_metadata_editor.take() {
+                        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                    }
                 }
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
                     app.active_overlay = ActiveOverlay::GnudbSelect {
+                        operation_id,
                         matches,
                         selected,
                         scroll,
@@ -4815,6 +4821,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         selected += 1;
                     }
                     app.active_overlay = ActiveOverlay::GnudbSelect {
+                        operation_id,
                         matches,
                         selected,
                         scroll,
@@ -4822,7 +4829,19 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     };
                 }
                 KeyCode::Enter => {
-                    if let Some(m) = matches.get(selected) {
+                    if let Some(m) = matches.get(selected).cloned() {
+                        let Some(read_operation_id) =
+                            super::event_loop::advance_gnudb_operation(app, operation_id)
+                        else {
+                            app.active_overlay = ActiveOverlay::GnudbSelect {
+                                operation_id,
+                                matches,
+                                selected,
+                                scroll,
+                                paths,
+                            };
+                            return;
+                        };
                         let category = m.category.clone();
                         let disc_id = m.disc_id.clone();
                         app.set_status(format!("Reading {}...", m.title));
@@ -4833,6 +4852,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             let result = super::gnudb::read_gnudb(&category, &disc_id).await;
                             let _ = tx
                                 .send(AppMessage::GnudbReadComplete {
+                                    operation_id: read_operation_id,
                                     result,
                                     paths,
                                     origin_matches: Some(origin),
@@ -4893,19 +4913,31 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
                         app.active_overlay = ActiveOverlay::None;
+                        if let Some(parked) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                        }
                         app.set_status("GNUDB review cancelled".to_string());
                     }
                     // Back to match list (if came from multi-match selection).
                     (KeyCode::Char('b'), _) => {
                         if let Some(matches) = state.origin_matches.take() {
-                            let paths = state.paths;
-                            app.active_overlay = ActiveOverlay::GnudbSelect {
-                                matches,
-                                selected: 0,
-                                scroll: 0,
-                                paths,
-                            };
-                            app.set_status("Back to match list");
+                            match super::event_loop::begin_gnudb_operation(app) {
+                                Ok(operation_id) => {
+                                    app.active_overlay = ActiveOverlay::GnudbSelect {
+                                        operation_id,
+                                        matches,
+                                        selected: 0,
+                                        scroll: 0,
+                                        paths: state.paths,
+                                    };
+                                    app.set_status("Back to match list");
+                                }
+                                Err(error) => {
+                                    state.origin_matches = Some(matches);
+                                    app.active_overlay = ActiveOverlay::GnudbReview(state);
+                                    app.set_status(error);
+                                }
+                            }
                         } else {
                             app.active_overlay = ActiveOverlay::GnudbReview(state);
                         }
@@ -5047,8 +5079,14 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
                     (KeyCode::Char('a'), _) => {
-                        // Accept ALL pages.
-                        super::keybindings::open_metadata_editor_with_tx(app, tx);
+                        // Accept ALL pages. A `:gnudb-back` editor is parked
+                        // verbatim; ordinary Browse-originated reviews still
+                        // open the selected files through the normal route.
+                        if let Some(parked) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(parked);
+                        } else {
+                            super::keybindings::open_metadata_editor_with_tx(app, tx);
+                        }
                         if let ActiveOverlay::MetadataEditor(ref mut editor_state) =
                             app.active_overlay
                         {
@@ -5696,6 +5734,7 @@ fn prefetch_current_mb_row(
         db.get_cached_mb_search(&super::musicbrainz::detail_cache_key(&row.release_id));
     super::event_loop::spawn_mb_detail_prefetch(
         tx.clone(),
+        state.operation_id,
         row.release_id.clone(),
         state.paths.len(),
         std::sync::Arc::clone(&state.generation),
@@ -5780,8 +5819,8 @@ fn run_context_action_restoring_parked(
         // the guarded completion lose their authoritative target.
         let preserve_mb_editor = matches!(
             &app.active_overlay,
-            ActiveOverlay::MbSelect(state) if !state.is_selecting()
-        );
+            ActiveOverlay::MbSelect(_)
+        ) || app.active_tags_mb_operation.is_some();
         if !preserve_mb_editor {
             app.pending_metadata_editor = None;
         }
@@ -10167,6 +10206,7 @@ fn cue_album_project_authoritative_parsed_sheet(
         source.index00_frames = track.index00_frames;
         source.index01_frames = track.index01_frames;
         source.isrc = track.isrc.clone();
+        source.directives = track.directives.clone();
         track_numbers.push(format!("{:02}", idx + 1));
         track_titles.push(track.title.clone().unwrap_or_default());
         track_artists.push(track.performer.clone().unwrap_or_default());
@@ -10313,6 +10353,12 @@ fn cue_album_generate_synthetic_cuesheet(
                     "    PERFORMER \"{}\"\n",
                     cue_album_quote(performer.trim())
                 ));
+            }
+        }
+        for directive in &source.directives {
+            let directive = directive.trim();
+            if !directive.is_empty() {
+                out.push_str(&format!("    {directive}\n"));
             }
         }
         if let Some(frames) = source.index00_frames {
@@ -10471,6 +10517,7 @@ fn build_unified_cue_album_sheet(
                 index00_frames: track.index00_frames,
                 index01_frames: track.index01_frames,
                 isrc: track.isrc.clone(),
+                directives: track.directives.clone(),
             });
             track_numbers.push(format!("{:02}", track_sources.len()));
             track_titles.push(track.title.clone().unwrap_or_default());
@@ -10515,7 +10562,7 @@ fn build_metadata_editor_for_cue_surfaces(
 
     let mut sorted = surfaces.to_vec();
     sorted.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
-    if sorted.len() == 1 {
+    if sorted.len() == 1 && sorted[0].audio_paths.len() == 1 {
         let surface = &sorted[0];
         let paths = surface.audio_paths.clone();
         let merged = super::probe::read_all_tags_merged_with_metadata(&paths).map_err(|err| {
@@ -10793,11 +10840,12 @@ pub(super) fn build_metadata_editor_for_cue_surfaces_with_mb_release(
             &mut active_surface,
         );
     }
-    if surfaces.len() <= 1 {
+    if surfaces.len() == 1 && surfaces[0].audio_paths.len() == 1 {
         return Ok(None);
     }
 
-    let (mut state, _n_tracks) = build_metadata_editor_for_cue_surfaces(app, &surfaces, active_surface)?;
+    let (mut state, _n_tracks) =
+        build_metadata_editor_for_cue_surfaces(app, &surfaces, active_surface)?;
     let decision = super::musicbrainz::PerTrackDecision {
         per_track_populate: release.tracks.len() > 1,
         skip_reason: None,
@@ -11687,6 +11735,7 @@ fn cue_album_stage_per_track_entry_from_cuesheet_edit(
     let (display, mixed) = cue_album_entry_display(&values);
     if let Some(idx) = cue_album_entry_index(entries, display_key) {
         let entry = &mut entries[idx];
+        entry.row_scope = crate::tui::probe::RowScope::Track;
         entry.item_key = item_key;
         entry.value = display.clone();
         entry.is_binary = false;
@@ -11701,7 +11750,7 @@ fn cue_album_stage_per_track_entry_from_cuesheet_edit(
         entry.mb_proposed_per_file = None;
     } else if values.iter().any(|value| !value.trim().is_empty()) {
         entries.push(super::probe::TagEntry {
-            row_scope: crate::tui::probe::RowScope::File,
+            row_scope: crate::tui::probe::RowScope::Track,
             display_key: display_key.to_string(),
             item_key,
             value: display,
@@ -18540,6 +18589,7 @@ fn handle_generic_overlay_mouse(
                 && matches!(app.active_overlay, ActiveOverlay::GnudbSelect { .. }) =>
         {
             if let ActiveOverlay::GnudbSelect {
+                operation_id,
                 matches,
                 mut selected,
                 scroll,
@@ -18552,7 +18602,19 @@ fn handle_generic_overlay_mouse(
                     if clicked_row < matches.len() {
                         if clicked_row == selected {
                             // Click on already-selected row = confirm (like double-click).
-                            let m = &matches[clicked_row];
+                            let m = matches[clicked_row].clone();
+                            let Some(read_operation_id) =
+                                super::event_loop::advance_gnudb_operation(app, operation_id)
+                            else {
+                                app.active_overlay = ActiveOverlay::GnudbSelect {
+                                    operation_id,
+                                    matches,
+                                    selected,
+                                    scroll,
+                                    paths,
+                                };
+                                return true;
+                            };
                             let category = m.category.clone();
                             let disc_id = m.disc_id.clone();
                             app.set_status(format!("Reading {}...", m.title));
@@ -18563,6 +18625,7 @@ fn handle_generic_overlay_mouse(
                                 let result = super::gnudb::read_gnudb(&category, &disc_id).await;
                                 let _ = tx
                                     .send(AppMessage::GnudbReadComplete {
+                                        operation_id: read_operation_id,
                                         result,
                                         paths: paths_c,
                                         origin_matches: Some(origin),
@@ -18575,6 +18638,7 @@ fn handle_generic_overlay_mouse(
                     }
                 }
                 app.active_overlay = ActiveOverlay::GnudbSelect {
+                    operation_id,
                     matches,
                     selected,
                     scroll,
@@ -20492,8 +20556,12 @@ fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Send
                     origin: (mx, my),
                 };
             } else {
-                super::event_loop::restore_parked_editor(app);
-                app.set_status("MusicBrainz picker cancelled".to_string());
+                let operation_id = state.operation_id;
+                if super::event_loop::cancel_mb_select_operation(app, operation_id) {
+                    app.set_status("MusicBrainz picker cancelled".to_string());
+                } else {
+                    app.active_overlay = ActiveOverlay::MbSelect(state);
+                }
             }
         }
         _ => {
@@ -27698,10 +27766,9 @@ fn execute_confirm_action(
             app.set_status(":mb-back: pick a different release".to_string());
         }
         ConfirmAction::GnudbBack(review) => {
-            // Discard parked editor; restore the cached GnudbReviewState
-            // (preserves the user's per-track review edits) and
-            // transition back.
-            app.pending_metadata_editor = None;
+            // Compatibility path for confirmations created by older command
+            // state: preserve the parked editor and restore it on cancel or
+            // reuse it on accept.
             app.active_overlay = ActiveOverlay::GnudbReview(review.clone());
             app.set_status(":gnudb-back: review per-track values".to_string());
         }
@@ -29927,6 +29994,7 @@ mod phase4_tests {
                         index00_frames: None,
                         index01_frames: Some(0),
                         isrc: None,
+                        directives: Vec::new(),
                     },
                     crate::tui::app::CueAlbumTrackSource {
                         cue_path: std::path::PathBuf::from("/tmp/side_a.cue"),
@@ -29937,6 +30005,7 @@ mod phase4_tests {
                         index00_frames: None,
                         index01_frames: Some(75),
                         isrc: None,
+                        directives: Vec::new(),
                     },
                     crate::tui::app::CueAlbumTrackSource {
                         cue_path: std::path::PathBuf::from("/tmp/side_b.cue"),
@@ -29947,6 +30016,7 @@ mod phase4_tests {
                         index00_frames: None,
                         index01_frames: Some(0),
                         isrc: None,
+                        directives: Vec::new(),
                     },
                     crate::tui::app::CueAlbumTrackSource {
                         cue_path: std::path::PathBuf::from("/tmp/side_b.cue"),
@@ -29957,6 +30027,7 @@ mod phase4_tests {
                         index00_frames: None,
                         index01_frames: Some(75),
                         isrc: None,
+                        directives: Vec::new(),
                     },
                 ],
                 album_title: None,
@@ -30629,14 +30700,22 @@ mod phase4_tests {
 
         crate::tui::command::execute_command(&mut app, crate::tui::command::Command::GnudbBack, &tx);
 
-        match &app.active_overlay {
-            ActiveOverlay::Confirmation { action, message } => {
-                assert!(matches!(action, ConfirmAction::GnudbBack(_)));
-                assert!(message.contains("Discard editor changes"));
-            }
-            other => panic!("expected gnudb back confirmation, got {:?}", other),
-        }
-        assert!(app.pending_metadata_editor.is_some());
+        // :gnudb-back no longer discards (so no confirmation): the exact
+        // editor — dirty siblings included — is parked behind the restored
+        // review and returned on accept/cancel.
+        assert!(
+            matches!(&app.active_overlay, ActiveOverlay::GnudbReview(_)),
+            "expected restored gnudb review, got {:?}",
+            app.active_overlay
+        );
+        let parked = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("dirty editor must be parked, not discarded");
+        assert!(
+            parked.model.presentation_tabs.iter().any(|tab| tab.dirty),
+            "the dirty sibling presentation must survive parking"
+        );
     }
 
 
@@ -34500,14 +34579,20 @@ mod single_image_metadata_editor_regression_tests {
     use crate::config::TonepoetConfig;
 
     fn fixture_tool_available(tool: &str) -> bool {
-        std::process::Command::new(tool)
+        let available = std::process::Command::new(tool)
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !available
+            && std::env::var("TONEPOET_REQUIRE_TOOLS").as_deref() == Ok("1")
+        {
+            panic!("required fixture tool is unavailable: {tool}");
+        }
+        available
     }
 
 
@@ -34592,6 +34677,7 @@ mod single_image_metadata_editor_regression_tests {
                     // The deletion-respecting regeneration test deletes the
                     // ISRC row, so the model must HAVE one.
                     isrc: Some(format!("USRC176{:04}", local_idx + 1)),
+                    directives: Vec::new(),
                 });
             }
         }
@@ -34825,6 +34911,7 @@ mod single_image_metadata_editor_regression_tests {
                     index00_frames: None,
                     index01_frames: Some(0),
                     isrc: Some("GBAYE0300334".to_string()),
+                    directives: Vec::new(),
                 },
                 crate::tui::app::CueAlbumTrackSource {
                     cue_path: std::path::PathBuf::from("/tmp/album/side_b.cue"),
@@ -34835,6 +34922,7 @@ mod single_image_metadata_editor_regression_tests {
                     index00_frames: None,
                     index01_frames: Some(0),
                     isrc: Some("GBAYE0300335".to_string()),
+                    directives: Vec::new(),
                 },
             ],
             album_title: Some("Original Album".to_string()),
@@ -34906,6 +34994,7 @@ mod single_image_metadata_editor_regression_tests {
                     index00_frames: None,
                     index01_frames: Some(0),
                     isrc: Some("MATCH000001".to_string()),
+                    directives: Vec::new(),
                 },
                 crate::tui::app::CueAlbumTrackSource {
                     cue_path: std::path::PathBuf::from("/tmp/album/side_b.cue"),
@@ -34916,6 +35005,7 @@ mod single_image_metadata_editor_regression_tests {
                     index00_frames: None,
                     index01_frames: Some(0),
                     isrc: Some("MATCH000002".to_string()),
+                    directives: Vec::new(),
                 },
             ],
             album_title: Some("Original Album".to_string()),
@@ -36854,6 +36944,165 @@ mod single_image_metadata_editor_regression_tests {
     }
 
     #[test]
+    fn one_cue_two_images_track_edit_round_trips_through_unified_sheet() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio_a = temp.path().join("disc-a.flac");
+        let audio_b = temp.path().join("disc-b.flac");
+        for (path, frequency) in [(&audio_a, "440"), (&audio_b, "660")] {
+            let source = format!(
+                "sine=frequency={frequency}:sample_rate=44100:duration=1"
+            );
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    source.as_str(),
+                    "-c:a",
+                    "flac",
+                ])
+                .arg(path)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("ffmpeg fixture");
+            assert!(status.success());
+        }
+
+        let cue_path = temp.path().join("album.cue");
+        let sidecar = concat!(
+            "PERFORMER \"Artist\"\n",
+            "TITLE \"Album\"\n",
+            "FILE \"disc-a.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"A1\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"A2\"\n",
+            "    FLAGS PRE\n",
+            "    INDEX 01 00:00:30\n",
+            "FILE \"disc-b.flac\" WAVE\n",
+            "  TRACK 03 AUDIO\n",
+            "    TITLE \"B1\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 04 AUDIO\n",
+            "    TITLE \"B2\"\n",
+            "    INDEX 01 00:00:30\n",
+        );
+        std::fs::write(&cue_path, sidecar).expect("multi-FILE CUE fixture");
+
+        let (surfaces, warnings) = collect_metadata_cue_surfaces_with_warnings(&[cue_path.clone()]);
+        assert!(warnings.is_empty(), "unexpected admission warnings: {warnings:?}");
+        assert_eq!(surfaces.len(), 1, "one sidecar must remain one admitted surface");
+        assert_eq!(surfaces[0].audio_paths, vec![audio_a.clone(), audio_b.clone()]);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (mut state, track_count) = build_metadata_editor_for_cue_surfaces(&mut app, &surfaces, 0)
+            .expect("build unified editor for one multi-FILE CUE");
+        assert_eq!(track_count, 4);
+        assert!(
+            state.active_surface().cue_album_synthetic_sheet.is_some(),
+            "one CUE with multiple images must install the unified persistence model"
+        );
+
+        let title = state
+            .active_surface_mut()
+            .entries
+            .iter_mut()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("track TITLE row");
+        assert_eq!(title.row_scope, crate::tui::probe::RowScope::Track);
+        assert_eq!(
+            title.per_file_values,
+            vec![
+                "A1".to_string(),
+                "A2".to_string(),
+                "B1".to_string(),
+                "B2".to_string(),
+            ]
+        );
+        title.per_file_values[2] = "Edited B1".to_string();
+        title.value = "<multiple values>".to_string();
+        title.is_mixed = true;
+        state.active_surface_mut().dirty = true;
+
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("regenerate unified CUE"));
+        let generated = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .and_then(|entry| entry.per_file_values.first())
+            .expect("generated CUESHEET");
+        // Synthetic sheets tag FLAC members as FLAC (cue_album_format_tag_for_audio).
+        assert!(generated.contains("FILE \"disc-a.flac\" FLAC"), "{generated}");
+        assert!(generated.contains("FILE \"disc-b.flac\" FLAC"), "{generated}");
+        assert!(generated.contains("TITLE \"Edited B1\""));
+        assert!(generated.contains("FLAGS PRE"), "track directives must survive regeneration");
+
+        let snapshot = metadata_editor_entries_snapshot_for_save(&state);
+        let results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
+            &[audio_a.clone(), audio_b.clone()],
+            &snapshot,
+            &[],
+            &[None, None],
+            None,
+            None,
+            &[],
+        );
+        assert!(
+            results.iter().all(|result| matches!(
+                &result.outcome,
+                crate::tui::app::MetadataEditorWriteOutcome::Saved
+                    | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+            )),
+            "unexpected write results: {results:?}"
+        );
+
+        let (reopened_surfaces, reopened_warnings) =
+            collect_metadata_cue_surfaces_with_warnings(&[cue_path]);
+        assert!(
+            reopened_warnings.is_empty(),
+            "unexpected reopen warnings: {reopened_warnings:?}"
+        );
+        let (reopened, reopened_tracks) =
+            build_metadata_editor_for_cue_surfaces(&mut app, &reopened_surfaces, 0)
+                .expect("reopen unified editor");
+        assert_eq!(reopened_tracks, 4);
+        let reopened_title = reopened
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("reopened TITLE row");
+        assert_eq!(
+            reopened_title.per_file_values,
+            vec![
+                "A1".to_string(),
+                "A2".to_string(),
+                "Edited B1".to_string(),
+                "B2".to_string(),
+            ],
+            "track edit must survive save and reopen"
+        );
+        let reopened_cue = reopened
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .and_then(|entry| entry.per_file_values.first())
+            .expect("reopened CUESHEET");
+        assert!(reopened_cue.contains("FLAGS PRE"));
+    }
+
+    #[test]
     fn mb_apply_two_track_two_image_rows_save_without_whole_file_title_writes() {
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
@@ -36886,6 +37135,18 @@ mod single_image_metadata_editor_regression_tests {
             assert!(status.success());
         }
 
+        let whole_file_titles = [
+            (audio_a.clone(), "Whole-file Side A".to_string()),
+            (audio_b.clone(), "Whole-file Side B".to_string()),
+        ];
+        for (path, title) in &whole_file_titles {
+            crate::tui::probe::write_all_tags(
+                path,
+                &[(lofty::tag::ItemKey::TrackTitle, Some(title.clone()))],
+            )
+            .expect("pre-tag legitimate whole-file TITLE");
+        }
+
         let cue_a = temp.path().join("side-a.cue");
         let cue_b = temp.path().join("side-b.cue");
         let sheet = crate::tui::app::CueAlbumSyntheticSheet {
@@ -36901,6 +37162,7 @@ mod single_image_metadata_editor_regression_tests {
                     index00_frames: None,
                     index01_frames: Some(0),
                     isrc: None,
+                    directives: Vec::new(),
                 },
                 crate::tui::app::CueAlbumTrackSource {
                     cue_path: cue_b,
@@ -36911,6 +37173,7 @@ mod single_image_metadata_editor_regression_tests {
                     index00_frames: None,
                     index01_frames: Some(0),
                     isrc: None,
+                    directives: Vec::new(),
                 },
             ],
             album_title: Some("Two Sides".to_string()),
@@ -37021,19 +37284,19 @@ mod single_image_metadata_editor_regression_tests {
                 | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
         )), "unexpected write results: {results:?}");
 
-        for path in [&audio_a, &audio_b] {
-            let reread = crate::tui::probe::read_all_tags_merged(&[path.to_path_buf()])
+        for (path, expected_whole_file_title) in &whole_file_titles {
+            let reread = crate::tui::probe::read_all_tags_merged(&[path.clone()])
                 .expect("re-read tags");
-            // read_all_tags_merged synthesizes empty placeholder rows for the
-            // standard keys; only a NON-EMPTY TITLE means the track-scoped MB
-            // title was sprayed as a whole-file tag.
-            assert!(
-                !reread.iter().any(|entry| {
-                    entry.display_key.eq_ignore_ascii_case("TITLE")
-                        && (!entry.value.is_empty()
-                            || entry.per_file_values.iter().any(|v| !v.is_empty()))
-                }),
-                "track-scoped MusicBrainz TITLE must not be sprayed as a whole-file tag on {}",
+            let whole_file_title = reread
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+                .and_then(|entry| entry.per_file_values.first())
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                whole_file_title,
+                expected_whole_file_title,
+                "legitimate whole-file TITLE must survive track-scoped MusicBrainz save on {}",
                 path.display()
             );
             let cue = reread

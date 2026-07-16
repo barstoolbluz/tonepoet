@@ -20,7 +20,7 @@ The crate root re-exports the public items from these modules.
 - `PcmBitDepth`: `Int8`, `Int16`, `Int24`, `Int32`, `Float32`, `Float64`
   - Methods: `bits`, `is_float`, `sample_kind`
 - `BitDepthTarget`: `Source`, `Pcm(PcmBitDepth)`
-  - For PCM-lossless paths that require encoding, `Source` requires an authoritative `SourceInfo.bit_depth`; planning returns `PlanningError::InvalidSource` instead of substituting a format default when that fact is unavailable. A proven passthrough may preserve the original stream without resolving a numeric depth.
+  - `Source` is representation-aware. DSD and lossy sources have no PCM source width, so an encode resolves to the target format's documented conservative default. PCM sources require `SourceInfo.true_source_depth`; an encode fails with `PlanningError::InvalidSource` when that fact is unavailable. A proven passthrough is selected before numeric depth resolution and may preserve an unknown-depth stream. `SourceInfo.bit_depth` remains the realized input-carrier width.
 - `RateTarget`: `Source`, `PcmHz(u32)`, `Dsd(DsdRate)`
 - `DsdRate`: `Dsd64`, `Dsd128`, `Dsd256`, `Dsd512`, `Dsd1024`
   - Methods: `hz`, `sox_effect`, `default_pcm_target_hz`, `from_hz`
@@ -77,8 +77,9 @@ The crate root re-exports the public items from these modules.
 - `VerificationSettings`: `verify_after_encode`, `prefer_native_flac_verify`
 - `ReplayGainSettings`: `mode`, `prevent_clipping` (built-in support is target-aware)
 - `SourceInfo`
-  - Fields: `format`, `codec`, `sample_rate_hz`, `bit_depth`, `sample_kind`, `channels`, `duration`, `audio_md5`
-  - Methods: `is_dsd`, `dsd_rate`, `validate`
+  - Fields: `format`, `codec`, `sample_rate_hz`, `bit_depth` (realized carrier), `true_source_depth` (authoritative original PCM width), `source_representation`, `sample_kind`, `channels`, `duration`, `audio_md5`
+  - Methods: `is_dsd`, `representation_kind`, `authoritative_pcm_depth`, `dsd_rate`, `validate`
+- `SourceRepresentationKind`: `Pcm`, `Dsd`, `Lossy`, `Unknown`, `Unspecified` (legacy compatibility)
 - `PlanRequest`
   - Fields: `input_path`, `output_path`, `source`, `settings`, `intermediate_dir`
   - Methods: `context`

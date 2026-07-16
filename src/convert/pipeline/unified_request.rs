@@ -235,36 +235,26 @@ pub fn build_pipeline_request_from_legacy_options(
     build_pipeline_request_from_settings(item, settings)
 }
 
-/// Build PipelineSettings from legacy ConversionOptions fields.
-/// Used as a fallback when pipeline_settings is None (CLI path).
-// settings-sentinel-allow: legacy bridge constructs default then overrides from ConversionOptions
-pub fn pipeline_settings_from_legacy_options(options: &crate::convert::formats::ConversionOptions) -> PipelineSettings {
+/// Build checked `PipelineSettings` from legacy `ConversionOptions` fields.
+///
+/// This compatibility projection is still used at CLI/TUI boundaries that have
+/// not yet been migrated to construct the planner settings directly. Invalid
+/// numeric depth requests are rejected; `0` preserves the explicit `Source`
+/// policy instead of being mistaken for a target-format default.
+pub fn pipeline_settings_from_legacy_options(
+    options: &crate::convert::formats::ConversionOptions,
+) -> ConversionResult<PipelineSettings> {
     use tonepoet_pipeline::enums as pe;
+
+    // settings-sentinel-allow: legacy bridge constructs default then overrides from ConversionOptions
     let mut settings = PipelineSettings::default();
     settings.target_format = main_audio_format_to_planner(options.output_format);
-    settings.force_encode = options.reencode_flac;
+    settings.force_encode = options.force_encode || options.reencode_flac;
     settings.metadata.transfer_tags = options.preserve_metadata;
     settings.metadata.preserve_artwork = options.preserve_metadata;
-    if let Some(rate) = options.target_sample_rate {
-        if rate >= 2_822_400 {
-            if let Some(dsd) = pe::DsdRate::from_hz(rate) {
-                settings.target_sample_rate = pe::RateTarget::Dsd(dsd);
-            }
-        } else {
-            settings.target_sample_rate = pe::RateTarget::PcmHz(rate);
-        }
-    }
-    if let Some(depth) = options.target_bit_depth {
-        let pcm = match depth {
-            16 => pe::PcmBitDepth::Int16,
-            24 => pe::PcmBitDepth::Int24,
-            32 => pe::PcmBitDepth::Int32,
-            320 => pe::PcmBitDepth::Float32,
-            640 => pe::PcmBitDepth::Float64,
-            _ => pe::PcmBitDepth::Int24,
-        };
-        settings.target_bit_depth = pe::BitDepthTarget::Pcm(pcm);
-    }
+    settings.target_sample_rate =
+        sample_rate_target_for_format(&settings.target_format, options.target_sample_rate)?;
+    settings.target_bit_depth = bit_depth_target(options.target_bit_depth)?;
     if let Some(dither) = options.dither_type {
         settings.dither_type = match dither {
             crate::convert::simple_wizard::DitherType::None => pe::DitherType::None,
@@ -275,22 +265,29 @@ pub fn pipeline_settings_from_legacy_options(options: &crate::convert::formats::
             crate::convert::simple_wizard::DitherType::Gesemann => pe::DitherType::Gesemann,
             crate::convert::simple_wizard::DitherType::Lipshitz => pe::DitherType::Lipshitz,
             crate::convert::simple_wizard::DitherType::FWeighted => pe::DitherType::FWeighted,
-            crate::convert::simple_wizard::DitherType::ModifiedEWeighted => pe::DitherType::ModifiedEWeighted,
-            crate::convert::simple_wizard::DitherType::ImprovedEWeighted => pe::DitherType::ImprovedEWeighted,
+            crate::convert::simple_wizard::DitherType::ModifiedEWeighted => {
+                pe::DitherType::ModifiedEWeighted
+            }
+            crate::convert::simple_wizard::DitherType::ImprovedEWeighted => {
+                pe::DitherType::ImprovedEWeighted
+            }
             crate::convert::simple_wizard::DitherType::SloppedTPDF => pe::DitherType::SlopedTpdf,
         };
     }
     if options.calculate_replaygain {
-        settings.replay_gain.mode = options.replaygain_mode.as_ref().map(|mode| {
-            match mode {
-                crate::convert::simple_wizard::ReplayGainMode::Album => pe::ReplayGainMode::Album,
-                crate::convert::simple_wizard::ReplayGainMode::Track => pe::ReplayGainMode::Track,
-                crate::convert::simple_wizard::ReplayGainMode::Both => pe::ReplayGainMode::Both,
-            }
+        settings.replay_gain.mode = options.replaygain_mode.as_ref().map(|mode| match mode {
+            crate::convert::simple_wizard::ReplayGainMode::Album => pe::ReplayGainMode::Album,
+            crate::convert::simple_wizard::ReplayGainMode::Track => pe::ReplayGainMode::Track,
+            crate::convert::simple_wizard::ReplayGainMode::Both => pe::ReplayGainMode::Both,
         });
     }
     apply_legacy_resampler_defaults(&mut settings);
-    settings
+    settings.validate().map_err(|error| {
+        ConversionError::ValidationError(format!(
+            "invalid legacy conversion settings: {error}"
+        ))
+    })?;
+    Ok(settings)
 }
 
 // settings-sentinel-allow: legacy bridge constructs default then overrides from ConversionItem
@@ -367,7 +364,7 @@ fn legacy_pipeline_settings_for_item(item: &ConversionItem) -> ConversionResult<
             .target_bit_depth
             .map(u32::from)
             .or_else(|| item.options.original_settings.as_ref().and_then(|s| s.bit_depth)),
-    );
+    )?;
 
     apply_quality_settings(&mut settings, &item.options.quality, item)?;
     apply_explicit_pipeline_defaults(&mut settings, item);
@@ -410,7 +407,7 @@ fn apply_quality_settings(settings: &mut PipelineSettings, quality: &QualitySett
             settings.target_sample_rate = sample_rate_target_for_format(&settings.target_format, Some(rate))?;
         }
         if let Some(depth) = original.bit_depth {
-            settings.target_bit_depth = bit_depth_target(Some(depth));
+            settings.target_bit_depth = bit_depth_target(Some(depth))?;
         }
         if let Some(mode) = original.mp3_mode {
             settings.mp3.mode = match mode {
@@ -443,7 +440,7 @@ fn apply_quality_settings(settings: &mut PipelineSettings, quality: &QualitySett
         }
         QualitySettings::Wav { bit_depth, sample_rate }
         | QualitySettings::Aiff { bit_depth, sample_rate } => {
-            settings.target_bit_depth = bit_depth_target(Some(u32::from(*bit_depth)));
+            settings.target_bit_depth = bit_depth_target(Some(u32::from(*bit_depth)))?;
             settings.target_sample_rate = sample_rate_target_for_format(&settings.target_format, Some(*sample_rate))?;
         }
         QualitySettings::WavPack {
@@ -599,15 +596,18 @@ fn sample_rate_target_for_format(
     }
 }
 
-fn bit_depth_target(value: Option<u32>) -> BitDepthTarget {
+fn bit_depth_target(value: Option<u32>) -> ConversionResult<BitDepthTarget> {
     match value {
-        Some(0) | None => BitDepthTarget::Source,
-        Some(8) => BitDepthTarget::Pcm(PcmBitDepth::Int8),
-        Some(16) => BitDepthTarget::Pcm(PcmBitDepth::Int16),
-        Some(24) => BitDepthTarget::Pcm(PcmBitDepth::Int24),
-        Some(32) => BitDepthTarget::Pcm(PcmBitDepth::Int32),
-        Some(320) => BitDepthTarget::Pcm(PcmBitDepth::Float32),
-        Some(_) => BitDepthTarget::Source,
+        Some(0) | None => Ok(BitDepthTarget::Source),
+        Some(8) => Ok(BitDepthTarget::Pcm(PcmBitDepth::Int8)),
+        Some(16) => Ok(BitDepthTarget::Pcm(PcmBitDepth::Int16)),
+        Some(24) => Ok(BitDepthTarget::Pcm(PcmBitDepth::Int24)),
+        Some(32) => Ok(BitDepthTarget::Pcm(PcmBitDepth::Int32)),
+        Some(320) => Ok(BitDepthTarget::Pcm(PcmBitDepth::Float32)),
+        Some(640) => Ok(BitDepthTarget::Pcm(PcmBitDepth::Float64)),
+        Some(value) => Err(ConversionError::ValidationError(format!(
+            "unsupported target bit depth {value}; expected 8, 16, 24, 32, 320 (32f), 640 (64f), or 0/source"
+        ))),
     }
 }
 
@@ -805,4 +805,46 @@ mod cue_sidecar_override_request_tests {
 
         assert_eq!(request.source.cue_sidecar, CueSidecarPolicy::EmbeddedOnly);
     }
+
+    #[test]
+    fn bit_depth_target_maps_float64_without_falling_back_to_source() {
+        assert_eq!(
+            bit_depth_target(Some(640)).expect("64f mapping"),
+            BitDepthTarget::Pcm(PcmBitDepth::Float64)
+        );
+    }
+
+    #[test]
+    fn bit_depth_target_rejects_unmappable_numeric_values() {
+        let error = bit_depth_target(Some(20)).expect_err("20 has no direct planner target");
+        assert!(error.to_string().contains("unsupported target bit depth 20"));
+    }
+
+
+    #[test]
+    fn legacy_cli_projection_preserves_unset_and_explicit_source_depth() {
+        let mut options = crate::convert::formats::ConversionOptions::default();
+        options.output_format = crate::convert::AudioFormat::Flac;
+
+        let unset = pipeline_settings_from_legacy_options(&options)
+            .expect("unset CLI depth projection");
+        assert_eq!(unset.target_bit_depth, BitDepthTarget::Source);
+
+        options.target_bit_depth = Some(0);
+        let explicit = pipeline_settings_from_legacy_options(&options)
+            .expect("explicit Source CLI depth projection");
+        assert_eq!(explicit.target_bit_depth, BitDepthTarget::Source);
+    }
+
+    #[test]
+    fn legacy_cli_projection_rejects_unmappable_numeric_depth() {
+        let mut options = crate::convert::formats::ConversionOptions::default();
+        options.output_format = crate::convert::AudioFormat::Wav;
+        options.target_bit_depth = Some(20);
+
+        let error = pipeline_settings_from_legacy_options(&options)
+            .expect_err("unmappable CLI depth must fail closed");
+        assert!(error.to_string().contains("unsupported target bit depth 20"));
+    }
+
 }

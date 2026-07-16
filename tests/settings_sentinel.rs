@@ -213,14 +213,16 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
 fn flac_md5_sentinel() -> PipelineSettings {
     let mut settings = raw_all_non_default_sentinel();
     settings.target_format = AudioFormat::Flac;
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
     settings.metadata.transfer_tags = true;
     settings
 }
 
-/// Valid custom-target sentinel for the field values that conflict with FLAC-only
-/// MD5 and native FLAC verification rules.
+/// Valid WAV sentinel for Float32 and the field values that conflict with
+/// FLAC-only MD5 and native FLAC verification rules.
 fn custom_format_sentinel() -> PipelineSettings {
     let mut settings = raw_all_non_default_sentinel();
+    settings.target_format = AudioFormat::Wav;
     settings.flac.verify = false;
     settings.metadata.store_source_audio_md5 = false;
     settings

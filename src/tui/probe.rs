@@ -5161,6 +5161,12 @@ pub fn ensure_dim_replicate(entry: &mut TagEntry, target_dim: usize) {
 }
 
 pub fn metadata_editor_has_changes(state: &super::app::MetadataEditorState) -> bool {
+    if state.active_surface().refresh_failed
+        || state.active_surface().pending_embedded_cuesheet_delete
+    {
+        return true;
+    }
+
     let writable_indices: Vec<usize> = state.active_surface()
         .technical_details
         .files
@@ -6586,10 +6592,15 @@ pub fn apply_audio_tag_changes_with_save_blocks(
     )
 }
 
-/// Apply audio tag changes with bounded per-file parallelism. Planning remains
-/// deterministic and single-threaded; only independent file writes are piped.
-/// Results are returned in path order so save-result reduction and sidecar
-/// gating remain stable even when workers complete out of order.
+/// Apply whole-file audio-tag changes with bounded per-file parallelism.
+///
+/// This is the legacy File-scope API boundary used by CLI/non-editor callers.
+/// Every value/original vector must be path-aligned. Track-scoped rows must use
+/// `apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes`, which
+/// carries an explicit `RowScope`; this wrapper never infers scope by length.
+/// Planning remains deterministic and single-threaded; only independent file
+/// writes are piped. Results are returned in path order so save-result reduction
+/// and sidecar gating remain stable even when workers complete out of order.
 pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
     paths: &[std::path::PathBuf],
     entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
@@ -6598,15 +6609,32 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
     progress: Option<MetadataWriteProgressCallback>,
     cancel: Option<MetadataWriteCancelFlag>,
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+    if let Some((entry_idx, _)) = entries_snap
+        .iter()
+        .enumerate()
+        .find(|(_, (_, values, originals))| {
+            values.len() != paths.len() || originals.len() != paths.len()
+        })
+    {
+        let reason = format!(
+            "legacy whole-file metadata write row {entry_idx} is not aligned to {} path(s); track-scoped callers must use the explicit RowScope API",
+            paths.len()
+        );
+        return paths
+            .iter()
+            .cloned()
+            .map(|path| crate::tui::app::MetadataEditorWriteResult::skipped(path, reason.clone()))
+            .collect();
+    }
     let scoped_entries: Vec<_> = entries_snap
         .iter()
         .map(|(key, values, originals)| {
-            let scope = if values.len() == paths.len() {
-                RowScope::File
-            } else {
-                RowScope::Track
-            };
-            (key.clone(), scope, values.clone(), originals.clone())
+            (
+                key.clone(),
+                RowScope::File,
+                values.clone(),
+                originals.clone(),
+            )
         })
         .collect();
     apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(

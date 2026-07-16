@@ -41,6 +41,12 @@ Verification means decoding the encoded file. FLAC can use the `flac -t -s` plug
 
 For encode and post-processing paths, metadata-transfer pruning happens only after `ToolRegistry` selects the actual encoder plugin. A SoX-selected encode therefore keeps an FFmpeg metadata transfer step unless the selected plugin explicitly reports `MetadataDisposition::WritesRequestedPolicy`. When the planner prunes a redundant metadata step, it rewires later in-place MD5, ReplayGain, and verification steps to the selected encoder output.
 
+## Source-depth behavior
+
+`SourceInfo.bit_depth` describes the realized planner input carrier. `SourceInfo.true_source_depth` separately records the authoritative PCM width of the original source, and `source_representation` records whether that source was PCM, DSD, lossy, or unknown. The split is intentional: a decoder may realize MP3 as Float32 or a 16-bit CUE image as signed 32-bit PCM, but neither carrier fact changes the original representation. Dither and `BitDepthTarget::Source` use the authoritative source channel; encoder argument construction continues to use the carrier channel.
+
+For an encode, `BitDepthTarget::Source` resolves DSD and lossy inputs to the target format's conservative PCM default because no PCM source width exists. An unmeasured PCM source and an unknown representation fail closed. Same-format passthrough is decided before numeric depth resolution, so a proven copy can preserve an unknown-depth stream without fabricating a measurement. Twenty-bit PCM resolves to a 24-bit output container.
+
 ## DSD behavior
 
 DSD target rate lives only in `PipelineSettings::target_sample_rate` via `RateTarget::Dsd`, so there is no duplicate DSD rate field. DSD source classification uses explicit container/codec/sample-kind facts; a PCM stream at a DSD-like sample rate is not treated as DSD by coincidence. DSD low-pass mode and sinc transition width shape the SoX command line, so those settings are not decorative.

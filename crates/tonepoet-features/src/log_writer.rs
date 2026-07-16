@@ -312,8 +312,10 @@ fn generate_log_content(data: &ConversionLogData) -> String {
             let mut parts = vec![src.format.clone()];
 
             if let Some(depth) = src.bit_depth {
-                if depth == 320 {
+                if depth == 320 || depth == 33 {
                     parts.push("32-bit float".to_string());
+                } else if depth == 640 {
+                    parts.push("64-bit float".to_string());
                 } else {
                     parts.push(format!("{}bit", depth));
                 }
@@ -398,8 +400,10 @@ fn generate_log_content(data: &ConversionLogData) -> String {
                         let mut parts = vec![src.format.clone()];
 
                         if let Some(depth) = src.bit_depth {
-                            if depth == 320 {
+                            if depth == 320 || depth == 33 {
                                 parts.push("32-bit float".to_string());
+                            } else if depth == 640 {
+                                parts.push("64-bit float".to_string());
                             } else {
                                 parts.push(format!("{}bit", depth));
                             }
@@ -896,6 +900,8 @@ fn format_from_conversion_settings(value: &serde_json::Value) -> Option<String> 
                 "Same As Source".to_string()
             } else if bit_depth == 320 || bit_depth == 33 {
                 "32-bit float".to_string()
+            } else if bit_depth == 640 {
+                "64-bit float".to_string()
             } else {
                 format!("{}bit", bit_depth)
             };
@@ -1061,6 +1067,8 @@ fn format_quality_settings_from_json(json_str: &str) -> Option<String> {
                 "Same As Source".to_string()
             } else if bit_depth == 320 || bit_depth == 33 {
                 "32-bit float".to_string()
+            } else if bit_depth == 640 {
+                "64-bit float".to_string()
             } else {
                 format!("{}bit", bit_depth)
             };
@@ -1074,6 +1082,8 @@ fn format_quality_settings_from_json(json_str: &str) -> Option<String> {
                 "Same As Source".to_string()
             } else if bit_depth == 320 || bit_depth == 33 {
                 "32-bit float".to_string()
+            } else if bit_depth == 640 {
+                "64-bit float".to_string()
             } else {
                 format!("{}bit", bit_depth)
             };

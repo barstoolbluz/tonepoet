@@ -14,7 +14,8 @@ use crate::convert::source_admission::is_direct_queue_source_path;
 use crate::convert::pipeline::CueSidecarPolicy;
 use crate::convert::split_cue_album::{
     common_cue_album_title, decide_with_toc_evidence, grouping_key_from_paths,
-    SplitCueAlbumGroupingDecision, SplitCueAlbumGroupingReason,
+    resolve_split_cue_file_reference, SplitCueAlbumGroupingDecision,
+    SplitCueAlbumGroupingReason, SplitCueReferenceResolution,
 };
 
 
@@ -1170,6 +1171,12 @@ fn generate_queue_synthetic_cue_album(parts: &[SyntheticCueAlbumPart]) -> Result
             if let Some(track_performer) = track_performer {
                 out.push_str(&format!("    PERFORMER \"{}\"\n", quote_cue_value(track_performer.trim())));
             }
+            for directive in &track.directives {
+                let directive = directive.trim();
+                if !directive.is_empty() {
+                    out.push_str(&format!("    {directive}\n"));
+                }
+            }
             if let Some(frames) = track.index00_frames {
                 out.push_str(&format!("    INDEX 00 {}\n", cue_timestamp(frames)));
             }
@@ -1480,7 +1487,10 @@ pub(crate) fn process_id_is_live(pid: u32) -> bool {
 
     #[cfg(not(unix))]
     {
-        false
+        // No portable foreign-PID liveness probe is available here. Fail
+        // toward preserving a possibly-live process root rather than deleting
+        // another session's synthetic-CUE edit buffers.
+        true
     }
 }
 
@@ -1767,91 +1777,18 @@ fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Re
     Ok(())
 }
 
-#[derive(Debug)]
-pub(crate) enum CueReferenceResolution {
-    Resolved(PathBuf),
-    Missing,
-    Ambiguous(Vec<PathBuf>),
-}
+pub(crate) type CueReferenceResolution = SplitCueReferenceResolution;
 
-pub(crate) fn resolve_cue_file_reference_for_queue(parent: &Path, file_ref: &str) -> CueReferenceResolution {
-    let normalized_ref = file_ref.replace('\\', &std::path::MAIN_SEPARATOR.to_string());
-    let raw_path = PathBuf::from(&normalized_ref);
-
-    if raw_path.is_absolute() && raw_path.is_file() {
-        return CueReferenceResolution::Resolved(raw_path);
-    }
-
-    let direct = parent.join(&raw_path);
-    if direct.is_file() {
-        return CueReferenceResolution::Resolved(direct);
-    }
-
-    let wanted_name = raw_path.file_name().and_then(|value| value.to_str());
-    let wanted_stem = raw_path.file_stem().and_then(|value| value.to_str());
-    let fallback_search_dir = cue_reference_fallback_search_dir(parent, &raw_path);
-
-    if let Some(wanted) = wanted_name {
-        let name_matches = collect_audio_reference_candidates(&fallback_search_dir, |path| {
-            path.file_name()
-                .and_then(|value| value.to_str())
-                .map(|value| value.eq_ignore_ascii_case(wanted))
-                .unwrap_or(false)
-        });
-        match unique_queue_reference_candidate(name_matches) {
-            CueReferenceResolution::Missing => {}
-            other => return other,
-        }
-    }
-
-    if let Some(wanted) = wanted_stem {
-        let stem_matches = collect_audio_reference_candidates(&fallback_search_dir, |path| {
-            path.file_stem()
-                .and_then(|value| value.to_str())
-                .map(|value| value.eq_ignore_ascii_case(wanted))
-                .unwrap_or(false)
-        });
-        return unique_queue_reference_candidate(stem_matches);
-    }
-
-    CueReferenceResolution::Missing
-}
-
-
-fn cue_reference_fallback_search_dir(parent: &Path, raw_path: &Path) -> PathBuf {
-    raw_path
-        .parent()
-        .filter(|component| !component.as_os_str().is_empty())
-        .map(|component| parent.join(component))
-        .unwrap_or_else(|| parent.to_path_buf())
-}
-
-fn collect_audio_reference_candidates(
+/// Resolve a CUE FILE reference under the authoritative split-CUE policy.
+/// Direct and fallback candidates must be regular, non-symlink audio files;
+/// queue admission and editor admission therefore cannot drift on path safety.
+pub(crate) fn resolve_cue_file_reference_for_queue(
     parent: &Path,
-    matches_reference: impl Fn(&Path) -> bool,
-) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(parent) else {
-        return Vec::new();
-    };
-
-    let mut candidates: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_audio_file_path(path) && matches_reference(path))
-        .collect();
-    candidates.sort_by_key(|path| deterministic_path_sort_key(path));
-    let mut seen = HashSet::new();
-    candidates.retain(|path| seen.insert(queue_path_key(path)));
-    candidates
+    file_ref: &str,
+) -> CueReferenceResolution {
+    resolve_split_cue_file_reference(parent, file_ref)
 }
 
-fn unique_queue_reference_candidate(candidates: Vec<PathBuf>) -> CueReferenceResolution {
-    match candidates.len() {
-        0 => CueReferenceResolution::Missing,
-        1 => CueReferenceResolution::Resolved(candidates.into_iter().next().unwrap()),
-        _ => CueReferenceResolution::Ambiguous(candidates),
-    }
-}
 
 fn deterministic_path_sort_key(path: &Path) -> String {
     path.to_string_lossy()

@@ -362,15 +362,16 @@ pub fn admit_split_cue_candidate_paths(cue_paths: &[PathBuf]) -> SplitCueAdmissi
             match admit_split_cue_member(cue_path) {
                 Ok(member) => members.push(member),
                 Err(message) => {
-                    rejection = Some(message);
+                    rejection = Some((cue_path.clone(), message));
                     break;
                 }
             }
         }
-        if let Some(message) = rejection {
+        if let Some((offending_cue, message)) = rejection {
             report.rejected_folders.push(parent_key.clone());
             report.warnings.push(format!(
-                "{} — conversion will not include this folder ({})",
+                "offending CUE {}: {} — conversion will not include this folder ({})",
+                offending_cue.display(),
                 message,
                 parent_key.display()
             ));
@@ -508,7 +509,7 @@ pub fn resolve_split_cue_file_reference(
     } else {
         parent.join(&raw_path)
     };
-    if direct.is_file() {
+    if split_cue_regular_audio_file(&direct) {
         return SplitCueReferenceResolution::Resolved(direct);
     }
 
@@ -542,6 +543,18 @@ pub fn resolve_split_cue_file_reference(
         ));
     }
     SplitCueReferenceResolution::Missing
+}
+
+fn split_cue_regular_audio_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    !meta.file_type().is_symlink()
+        && meta.is_file()
+        && matches!(
+            crate::convert::classify::classify_file(path),
+            crate::convert::classify::EntryKind::AudioFile(_)
+        )
 }
 
 fn collect_split_cue_audio_candidates(

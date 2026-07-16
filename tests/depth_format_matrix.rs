@@ -15,12 +15,37 @@ use tokio_util::sync::CancellationToken;
 use tonepoet::convert::pipeline::*;
 use tonepoet_pipeline::{AudioFormat, BitDepthTarget, PcmBitDepth, PreferredTool};
 
-fn unique_root(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!("tonepoet-{label}-{}-{nanos}", std::process::id()))
+struct TempRoot(PathBuf);
+
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Self(std::env::temp_dir().join(format!(
+            "tonepoet-{label}-{}-{nanos}",
+            std::process::id()
+        )))
+    }
+}
+
+impl std::ops::Deref for TempRoot {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_dir_all(&self.0) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("depth matrix cleanup failed for {}: {err}", self.0.display());
+            }
+        }
+    }
 }
 
 fn executable_on_path(name: &str) -> bool {
@@ -38,7 +63,7 @@ fn require_tools_or_skip(test_name: &str, tools: &[&str]) -> bool {
     if missing.is_empty() {
         return true;
     }
-    if std::env::var_os("TONEPOET_REQUIRE_TOOLS").is_some() {
+    if std::env::var("TONEPOET_REQUIRE_TOOLS").as_deref() == Ok("1") {
         panic!("{test_name}: required tools unavailable: {}", missing.join(", "));
     }
     eprintln!("{test_name}: skipped; required tools unavailable: {}", missing.join(", "));
@@ -79,7 +104,7 @@ struct Measurement {
     bits_per_sample: Option<u32>,
 }
 
-fn probe(path: &Path) -> Measurement {
+fn probe(path: &Path) -> Result<Measurement, String> {
     let output = ProcessCommand::new("ffprobe")
         .args([
             "-v",
@@ -93,13 +118,14 @@ fn probe(path: &Path) -> Measurement {
         ])
         .arg(path)
         .output()
-        .expect("launch ffprobe");
-    assert!(
-        output.status.success(),
-        "ffprobe failed for {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .map_err(|err| format!("launch ffprobe for {}: {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     let value = |key: &str| {
         text.lines()
@@ -109,26 +135,27 @@ fn probe(path: &Path) -> Measurement {
             .to_string()
     };
     let parse_bits = |key: &str| value(key).parse::<u32>().ok().filter(|bits| *bits > 0);
-    Measurement {
+    Ok(Measurement {
         codec: value("codec_name"),
         sample_fmt: value("sample_fmt"),
         bits_per_raw_sample: parse_bits("bits_per_raw_sample"),
         bits_per_sample: parse_bits("bits_per_sample"),
-    }
+    })
 }
 
-fn authoritative_wavpack_depth(path: &Path) -> PcmBitDepth {
+fn authoritative_wavpack_depth(path: &Path) -> Result<PcmBitDepth, String> {
     let output = ProcessCommand::new("wvunpack")
         .args(["-q", "-s"])
         .arg(path)
         .output()
-        .expect("launch wvunpack");
-    assert!(
-        output.status.success(),
-        "wvunpack failed for {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .map_err(|err| format!("launch wvunpack for {}: {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "wvunpack failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -139,7 +166,9 @@ fn authoritative_wavpack_depth(path: &Path) -> PcmBitDepth {
         if !lower.starts_with("source:") {
             continue;
         }
-        let bit_pos = lower.find("-bit").expect("wvunpack source depth");
+        let Some(bit_pos) = lower.find("-bit") else {
+            return Err(format!("wvunpack source line lacked -bit: {line}"));
+        };
         let digits: String = lower[..bit_pos]
             .trim_end()
             .chars()
@@ -149,46 +178,64 @@ fn authoritative_wavpack_depth(path: &Path) -> PcmBitDepth {
             .chars()
             .rev()
             .collect();
-        let bits: u32 = digits.parse().expect("wvunpack numeric source depth");
+        let bits: u32 = digits
+            .parse()
+            .map_err(|err| format!("wvunpack source depth was not numeric in {line:?}: {err}"))?;
         return match (bits, lower.contains("float")) {
-            (8, false) => PcmBitDepth::Int8,
-            (16, false) => PcmBitDepth::Int16,
-            (24, false) => PcmBitDepth::Int24,
-            (32, false) => PcmBitDepth::Int32,
-            (32, true) => PcmBitDepth::Float32,
-            (64, true) => PcmBitDepth::Float64,
-            other => panic!("unsupported wvunpack measurement {other:?}: {line}"),
+            (8, false) => Ok(PcmBitDepth::Int8),
+            (16, false) => Ok(PcmBitDepth::Int16),
+            (24, false) => Ok(PcmBitDepth::Int24),
+            (32, false) => Ok(PcmBitDepth::Int32),
+            (32, true) => Ok(PcmBitDepth::Float32),
+            (64, true) => Ok(PcmBitDepth::Float64),
+            other => Err(format!("unsupported wvunpack measurement {other:?}: {line}")),
         };
     }
-    panic!("wvunpack did not report source depth for {}: {text}", path.display());
+    Err(format!(
+        "wvunpack did not report source depth for {}: {text}",
+        path.display()
+    ))
 }
 
-fn assert_measurement(path: &Path, requested: PcmBitDepth) {
+fn assert_measurement(path: &Path, requested: PcmBitDepth) -> Result<(), String> {
     if path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("wv"))
     {
-        assert_eq!(authoritative_wavpack_depth(path), requested);
-        return;
+        let measured = authoritative_wavpack_depth(path)?;
+        return (measured == requested).then_some(()).ok_or_else(|| {
+            format!(
+                "{} requested {requested:?} but wvunpack measured {measured:?}",
+                path.display()
+            )
+        });
     }
 
-    let measured = probe(path);
+    let measured = probe(path)?;
     let codec = measured.codec.to_ascii_lowercase();
     let sample_fmt = measured.sample_fmt.to_ascii_lowercase();
     match requested {
-        PcmBitDepth::Float32 => assert!(
-            sample_fmt.starts_with("flt") || codec.contains("f32"),
-            "{} requested Float32 but measured {:?}",
-            path.display(),
-            measured
-        ),
-        PcmBitDepth::Float64 => assert!(
-            sample_fmt.starts_with("dbl") || codec.contains("f64"),
-            "{} requested Float64 but measured {:?}",
-            path.display(),
-            measured
-        ),
+        PcmBitDepth::Float32 => {
+            if sample_fmt.starts_with("flt") || codec.contains("f32") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} requested Float32 but measured {:?}",
+                    path.display(), measured
+                ))
+            }
+        }
+        PcmBitDepth::Float64 => {
+            if sample_fmt.starts_with("dbl") || codec.contains("f64") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} requested Float64 but measured {:?}",
+                    path.display(), measured
+                ))
+            }
+        }
         requested => {
             let expected = requested.bits();
             let codec_depth = [8_u32, 16, 24, 32].into_iter().find(|bits| {
@@ -198,19 +245,16 @@ fn assert_measurement(path: &Path, requested: PcmBitDepth) {
                 .bits_per_raw_sample
                 .or(measured.bits_per_sample)
                 .or(codec_depth);
-            assert_eq!(
-                measured_depth,
-                Some(expected),
-                "{} requested {requested:?} but measured {:?}",
-                path.display(),
-                measured
-            );
-            assert!(
-                !sample_fmt.starts_with("flt") && !sample_fmt.starts_with("dbl"),
-                "{} requested integer PCM but measured {:?}",
-                path.display(),
-                measured
-            );
+            if measured_depth != Some(expected)
+                || sample_fmt.starts_with("flt")
+                || sample_fmt.starts_with("dbl")
+            {
+                return Err(format!(
+                    "{} requested {requested:?} but measured {:?}",
+                    path.display(), measured
+                ));
+            }
+            Ok(())
         }
     }
 }
@@ -298,7 +342,7 @@ async fn supported_pcm_depth_format_cells_publish_exact_requested_representation
         return;
     }
 
-    let root = unique_root("depth-format-matrix");
+    let root = TempRoot::new("depth-format-matrix");
     let source_dir = root.join("source");
     fs::create_dir_all(&source_dir).expect("create source directory");
     let image = source_dir.join("matrix.wav");
@@ -331,6 +375,7 @@ async fn supported_pcm_depth_format_cells_publish_exact_requested_representation
         MatrixCase { format: AudioFormat::Aiff, depth: PcmBitDepth::Float64, extension: "aiff", preferred_tool: PreferredTool::Ffmpeg, extra_tools: &[] },
     ];
 
+    let mut failures = Vec::new();
     for case in cases {
         let case_name = format!("{:?}-{:?}-{:?}", case.format, case.depth, case.preferred_tool);
         let mut tools = vec!["ffmpeg", "ffprobe"];
@@ -351,22 +396,37 @@ async fn supported_pcm_depth_format_cells_publish_exact_requested_representation
         let runner = RealToolRunner::new(HashMap::new());
         let reporter = RecordingReporter::new();
         let report = run_pipeline_item(request, &runner, &reporter, &CancellationToken::new()).await;
-        let published = report
-            .published
-            .as_ref()
-            .unwrap_or_else(|| panic!("{case_name}: pipeline did not publish: {:?}", report.outcome));
+        let Some(published) = report.published.as_ref() else {
+            failures.push(format!(
+                "{case_name}: pipeline did not publish: {:?}",
+                report.outcome
+            ));
+            continue;
+        };
         let audio: Vec<_> = published
             .entries
             .iter()
             .filter(|entry| matches!(&entry.role, PublishRole::Audio))
             .collect();
-        assert_eq!(audio.len(), 2, "{case_name}: expected two published tracks");
+        if audio.len() != 2 {
+            failures.push(format!(
+                "{case_name}: expected two published tracks, got {}",
+                audio.len()
+            ));
+            continue;
+        }
         for entry in audio {
-            assert_measurement(&entry.final_path, case.depth);
+            if let Err(err) = assert_measurement(&entry.final_path, case.depth) {
+                failures.push(format!("{case_name}: {err}"));
+            }
         }
     }
 
-    let _ = fs::remove_dir_all(root);
+    assert!(
+        failures.is_empty(),
+        "depth/format matrix failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[tokio::test]
@@ -376,7 +436,7 @@ async fn source_target_preserves_float32_cue_sample_class() {
         return;
     }
 
-    let root = unique_root("source-float32-cue");
+    let root = TempRoot::new("source-float32-cue");
     let source_dir = root.join("source");
     fs::create_dir_all(&source_dir).expect("create source directory");
     let image = source_dir.join("float.wav");
@@ -409,7 +469,152 @@ async fn source_target_preserves_float32_cue_sample_class() {
         .filter(|entry| matches!(&entry.role, PublishRole::Audio))
         .collect();
     assert_eq!(audio.len(), 1);
-    assert_measurement(&audio[0].final_path, PcmBitDepth::Float32);
+    assert_measurement(&audio[0].final_path, PcmBitDepth::Float32)
+        .expect("float32 Source output measurement");
 
-    let _ = fs::remove_dir_all(root);
+}
+#[ignore = "KNOWN GAP: CUE segment staging validates exact sample counts derived \
+from the probed (header) duration, but lossy decodes are shorter (encoder \
+delay/padding) — real MP3+CUE conversions fail at Materialize. Needs a \
+lossy-source tolerance policy; deferred to the next brief."]
+#[tokio::test]
+async fn lossy_cue_source_defaults_to_integer_pcm_for_flac_and_wav() {
+    const TEST: &str = "lossy_cue_source_defaults_to_integer_pcm_for_flac_and_wav";
+    if !require_tools_or_skip(TEST, &["ffmpeg", "ffprobe"]) {
+        return;
+    }
+
+    let root = TempRoot::new("lossy-cue-source-default");
+    let source_dir = root.join("source");
+    fs::create_dir_all(&source_dir).expect("create source directory");
+    let image = source_dir.join("lossy.mp3");
+    create_sine(&image, "libmp3lame", 44_100, 0.35);
+    let cue = source_dir.join("lossy.cue");
+    fs::write(
+        &cue,
+        "FILE \"lossy.mp3\" MP3\n  TRACK 01 AUDIO\n    TITLE \"Lossy\"\n    INDEX 01 00:00:00\n",
+    )
+    .expect("write lossy CUE");
+
+    let cases = [
+        (AudioFormat::Flac, "flac"),
+        (AudioFormat::Wav, "wav"),
+    ];
+    let mut failures = Vec::new();
+    for (format, extension) in cases {
+        let case_name = format!("lossy-source-{format:?}");
+        let mut request = base_request(
+            cue.clone(),
+            root.join(&case_name).join("output"),
+            root.join(&case_name).join("logs"),
+        );
+        request.item_id = case_name.clone();
+        request.settings.target_format = format;
+        request.settings.target_bit_depth = BitDepthTarget::Source;
+        request.settings.preferred_tool = PreferredTool::Ffmpeg;
+        request.settings.force_encode = true;
+        request.container_extension = Some(extension.to_string());
+
+        let runner = RealToolRunner::new(HashMap::new());
+        let reporter = RecordingReporter::new();
+        let report = run_pipeline_item(request, &runner, &reporter, &CancellationToken::new()).await;
+        let Some(published) = report.published.as_ref() else {
+            failures.push(format!("{case_name}: pipeline did not publish: {:?}", report.outcome));
+            continue;
+        };
+        let audio: Vec<_> = published
+            .entries
+            .iter()
+            .filter(|entry| matches!(&entry.role, PublishRole::Audio))
+            .collect();
+        if audio.len() != 1 {
+            failures.push(format!(
+                "{case_name}: expected one published track, got {}",
+                audio.len()
+            ));
+            continue;
+        }
+        if let Err(error) = assert_measurement(&audio[0].final_path, PcmBitDepth::Int24) {
+            failures.push(format!("{case_name}: {error}"));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "lossy CUE Source-default failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn source_target_preserves_float32_wavpack_cue_sample_class() {
+    const TEST: &str = "source_target_preserves_float32_wavpack_cue_sample_class";
+    if !require_tools_or_skip(TEST, &["ffmpeg", "ffprobe", "wvunpack"]) {
+        return;
+    }
+
+    let root = TempRoot::new("source-float32-wavpack-cue");
+    let source_dir = root.join("source");
+    fs::create_dir_all(&source_dir).expect("create source directory");
+    let image = source_dir.join("float.wv");
+    let output = ProcessCommand::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=96000:duration=0.25",
+            "-c:a",
+            "wavpack",
+            "-sample_fmt",
+            "fltp",
+        ])
+        .arg(&image)
+        .output()
+        .expect("launch float WavPack fixture encoder");
+    assert!(
+        output.status.success(),
+        "float WavPack fixture encode failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        authoritative_wavpack_depth(&image).expect("measure float WavPack fixture"),
+        PcmBitDepth::Float32,
+        "fixture must be genuinely float WavPack"
+    );
+
+    let cue = source_dir.join("float.cue");
+    fs::write(
+        &cue,
+        "FILE \"float.wv\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Float\"\n    INDEX 01 00:00:00\n",
+    )
+    .expect("write float WavPack CUE");
+
+    let mut request = base_request(cue, root.join("output"), root.join("logs"));
+    request.item_id = "source-float32-wavpack".to_string();
+    request.settings.target_format = AudioFormat::Wav;
+    request.settings.target_bit_depth = BitDepthTarget::Source;
+    request.settings.preferred_tool = PreferredTool::Ffmpeg;
+    request.settings.force_encode = true;
+    request.container_extension = Some("wav".to_string());
+
+    let runner = RealToolRunner::new(HashMap::new());
+    let reporter = RecordingReporter::new();
+    let report = run_pipeline_item(request, &runner, &reporter, &CancellationToken::new()).await;
+    let published = report
+        .published
+        .as_ref()
+        .unwrap_or_else(|| panic!("float WavPack Source pipeline did not publish: {:?}", report.outcome));
+    let audio: Vec<_> = published
+        .entries
+        .iter()
+        .filter(|entry| matches!(&entry.role, PublishRole::Audio))
+        .collect();
+    assert_eq!(audio.len(), 1);
+    assert_measurement(&audio[0].final_path, PcmBitDepth::Float32)
+        .expect("float32 WavPack Source output measurement");
 }

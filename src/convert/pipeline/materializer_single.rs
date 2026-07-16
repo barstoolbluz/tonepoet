@@ -52,7 +52,11 @@ impl super::stages::Materializer for SingleFileMaterializer {
             expected_samples: probe.expected_samples,
             sample_rate: Some(probe.sample_rate),
             bit_depth: probe.bit_depth,
-            source_audio: SourceAudioDescriptor::default(),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(probe.sample_rate),
+                probe.bit_depth,
+                Some(probe.coding),
+            ),
         };
 
         let tracks = apply_track_selection(vec![track], &req.source.track_selection)?;
@@ -76,6 +80,7 @@ struct ProbeResult {
     sample_rate: u32,
     expected_samples: Option<u64>,
     bit_depth: Option<u32>,
+    coding: SourceAudioCoding,
 }
 
 async fn probe_audio_file(
@@ -91,7 +96,7 @@ async fn probe_audio_file(
             "-select_streams".into(),
             "a:0".into(),
             "-show_entries".into(),
-            "stream=sample_rate,duration,bits_per_raw_sample,bits_per_sample".into(),
+            "stream=sample_rate,duration,bits_per_raw_sample,bits_per_sample,sample_fmt,codec_name".into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -137,15 +142,30 @@ fn parse_ffprobe_json(json: &str) -> Result<ProbeResult, MaterializeError> {
                 .and_then(|text| text.parse::<f64>().ok())
         });
     let expected_samples = duration_secs.map(|secs| (secs * f64::from(sample_rate)).round() as u64);
-    let bit_depth = value
+    let integer_bit_depth = value
         .pointer("/streams/0/bits_per_raw_sample")
-        .or_else(|| value.pointer("/streams/0/bits_per_sample"))
-        .and_then(json_u32);
+        .and_then(json_u32)
+        .filter(|bits| *bits > 0)
+        .or_else(|| {
+            value
+                .pointer("/streams/0/bits_per_sample")
+                .and_then(json_u32)
+                .filter(|bits| *bits > 0)
+        });
+    let codec_name = value
+        .pointer("/streams/0/codec_name")
+        .and_then(|value| value.as_str());
+    let sample_fmt = value
+        .pointer("/streams/0/sample_fmt")
+        .and_then(|value| value.as_str());
+    let (coding, bit_depth) =
+        classify_source_audio_probe(codec_name, sample_fmt, integer_bit_depth);
 
     Ok(ProbeResult {
         sample_rate,
         expected_samples,
         bit_depth,
+        coding,
     })
 }
 

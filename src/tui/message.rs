@@ -482,11 +482,13 @@ pub enum AppMessage {
     },
     /// Result of an async GNUDB query.
     GnudbQueryComplete {
+        operation_id: TagsMbOperationId,
         result: Result<Vec<crate::tui::gnudb::GnudbMatch>, String>,
         paths: Vec<std::path::PathBuf>,
     },
     /// Result of an async GNUDB read (single entry).
     GnudbReadComplete {
+        operation_id: TagsMbOperationId,
         result: Result<crate::tui::gnudb::GnudbEntry, String>,
         paths: Vec<std::path::PathBuf>,
         /// Original match list for "back" navigation (None for single/auto-read).
@@ -494,6 +496,7 @@ pub enum AppMessage {
     },
     /// Result of a multi-disc GNUDB query (sequential queries per disc).
     GnudbMultiDiscComplete {
+        operation_id: TagsMbOperationId,
         /// Per-disc results: (disc_label, entry, file_paths).
         entries: Vec<(
             String,
@@ -592,6 +595,7 @@ pub enum AppMessage {
     /// belong to the active tagging operation before issuing per-CUE GNUDB
     /// lookups.
     GnudbSplitCueAlbumGroupingComplete {
+        operation_id: TagsMbOperationId,
         infos: Vec<crate::tui::cue_parser::SingleImageInfo>,
         active_audio_path: Option<std::path::PathBuf>,
         result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
@@ -632,6 +636,7 @@ pub enum AppMessage {
     /// later re-open) and persists the raw body into the SQLite
     /// `musicbrainz_search_cache` (Phase B-5).
     MbDetailPrefetchComplete {
+        operation_id: TagsMbOperationId,
         release_id: String,
         result: Result<crate::tui::musicbrainz::MbDetailOutcome, String>,
     },
