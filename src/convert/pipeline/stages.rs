@@ -1701,6 +1701,12 @@ async fn validate_encoded_output_with_tool_limits(
             tool_concurrency_limits,
         )
         .await?
+    } else if matches!(target_format, tonepoet_pipeline::AudioFormat::WavPack) {
+        // Without an expectation the wvunpack oracle is not consulted, and
+        // ffprobe reports 24-bit WavPack as its decoded s32p form — recording
+        // that as a verified 32-bit output would put a lie in the conversion
+        // log. Leave it unmeasured; the log falls back to the planned depth.
+        None
     } else {
         measured_pcm_depth(&probe)
     };

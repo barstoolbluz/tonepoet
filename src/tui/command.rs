@@ -6239,13 +6239,18 @@ pub(crate) fn install_browse_convert_source_paths(
 ) {
     app.cancel_browse_convert_expansion();
     let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
+    // A set_status here would be overwritten by the final review-settings
+    // status in the same reducer pass; capture the warning and fold it into
+    // that status instead (and keep a durable log record).
+    let mut expansion_warning: Option<String> = None;
     if let Some(err) = expansion_errors.first() {
         if paths.is_empty() {
             crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
             app.set_status(err.clone());
             return;
         }
-        app.set_status(format!("{}; continuing with queueable sources", err));
+        log::warn!("browse expansion warning: {}", err);
+        expansion_warning = Some(err.clone());
     }
     let paths = normalized_path_snapshot(paths);
     if paths.is_empty() {
@@ -6336,31 +6341,35 @@ pub(crate) fn install_browse_convert_source_paths(
     app.previous_screen = Some(AppScreen::Browse);
     app.current_screen = AppScreen::Convert;
 
-    if archive_preview_single {
-        app.set_status(format!(
+    let mut status = if archive_preview_single {
+        format!(
             "Extracting archive: {} — review settings, then :commit or :Commit",
             first.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        )
     } else if probe_notice.is_some() {
-        app.set_status(format!(
+        format!(
             "Probing: {} — review settings, then :commit or :Commit",
             first.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        )
     } else if from_folder_expansion && expanded_folder_count > 0 {
-        app.set_status(format!(
+        format!(
             "expanded {} folder{} into {} files — review settings, then :commit or :Commit",
             expanded_folder_count,
             if expanded_folder_count == 1 { "" } else { "s" },
             path_count
-        ));
+        )
     } else if path_count == 1 {
-        app.set_status("review settings, then :commit or :Commit");
+        "review settings, then :commit or :Commit".to_string()
     } else {
-        app.set_status(format!(
+        format!(
             "batch of {} files — review settings, then :commit or :Commit",
             path_count
-        ));
+        )
+    };
+    if let Some(warning) = expansion_warning {
+        status = format!("{} — note: {}", status, warning);
     }
+    app.set_status(status);
 }
 
 fn finish_browse_queue_review_after_expansion(
@@ -6377,7 +6386,9 @@ fn finish_browse_queue_review_after_expansion(
             app.set_status(err.clone());
             return false;
         }
-        app.set_status(format!("{}; continuing with queueable sources", err));
+        // Don't set a status here — install_browse_convert_source_paths's
+        // final status would overwrite it in the same reducer pass. The
+        // errors are passed through below and folded into that status.
     }
     let paths = normalized_path_snapshot(paths);
     if paths.is_empty() {
@@ -6408,7 +6419,7 @@ fn finish_browse_queue_review_after_expansion(
     install_browse_convert_source_paths(
         app,
         tx,
-        QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors: Vec::new() },
+        QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors },
         expanded_folder_count,
         expanded_folder_count > 0,
     );
@@ -12047,9 +12058,16 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(r) = rate {
-                app.convert.format.sample_rate.select_value(&r);
-                app.preset.mark_modified();
-                app.set_status(format!("rate = {} kHz", value));
+                if app.convert.format.sample_rate.select_value(&r) {
+                    app.preset.mark_modified();
+                    app.set_status(format!("rate = {} kHz", value));
+                } else {
+                    app.set_status(format!(
+                        "rate {} is not available for {}",
+                        value,
+                        app.convert.format.format.selected_label()
+                    ));
+                }
             } else {
                 app.set_status(format!(
                     "Unknown rate: {}. Try: 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, 768",
@@ -12092,9 +12110,16 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(d) = dt {
-                app.convert.format.dither.select_value(&d);
-                app.preset.mark_modified();
-                app.set_status(format!("dither = {}", value));
+                if app.convert.format.dither.select_value(&d) {
+                    app.preset.mark_modified();
+                    app.set_status(format!("dither = {}", value));
+                } else {
+                    app.set_status(format!(
+                        "dither {} is not available for {}",
+                        value,
+                        app.convert.format.format.selected_label()
+                    ));
+                }
             } else {
                 app.set_status(format!(
                     "Unknown dither: {}. Try: tpdf, none, shaped",
@@ -12111,9 +12136,16 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(r) = rg {
-                app.convert.format.replaygain.select_value(&r);
-                app.preset.mark_modified();
-                app.set_status(format!("replaygain = {}", value));
+                if app.convert.format.replaygain.select_value(&r) {
+                    app.preset.mark_modified();
+                    app.set_status(format!("replaygain = {}", value));
+                } else {
+                    app.set_status(format!(
+                        "replaygain {} is not available for {}",
+                        value,
+                        app.convert.format.format.selected_label()
+                    ));
+                }
             } else {
                 app.set_status(format!(
                     "Unknown rg mode: {}. Try: album, track, both, off",
@@ -15482,21 +15514,15 @@ mod execute_queue_state_consistency_tests {
             "fresh async completions must not recompute queue semantics through Browse"
         );
         let destructure = finish_body
-            .find("let QueueExpansionResult { paths, mut cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
-    if let Some(err) = expansion_errors.first() {
-        if paths.is_empty() {
-            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
-            app.set_status(err.clone());
-            return false;
-        }
-        app.set_status(format!(\"{}; continuing with queueable sources\", err));
-    }")
+            .find("let QueueExpansionResult { paths, mut cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;")
             .expect("CUE metadata should come from the expansion result");
         let retain = finish_body
             .find("cue_artifact_audio.retain")
             .expect("CUE metadata must be trimmed to expanded paths");
+        // Warnings pass through to install_browse_convert_source_paths so
+        // they fold into the final status instead of being overwritten.
         let publish = finish_body
-            .find("QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors: Vec::new() }")
+            .find("QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors }")
             .expect("CUE metadata should be published with source paths");
 
         assert!(destructure < retain);

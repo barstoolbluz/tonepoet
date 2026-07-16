@@ -2291,6 +2291,43 @@ fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
 }
 
 #[cfg(test)]
+mod clamp_pill_tests {
+    use super::FormatState;
+    use crate::convert::formats::AudioFormat;
+
+    #[test]
+    fn dsd_rate_falling_back_to_pcm_lands_on_lowest_rate_not_maximum() {
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Dsf);
+        format.apply_format_constraints();
+        assert!(
+            format.sample_rate.selected_value() >= &2_822_400,
+            "DSF should clamp the rate up to a DSD rate"
+        );
+        format.format.select_value(&AudioFormat::Wav);
+        format.apply_format_constraints();
+        assert_eq!(
+            format.sample_rate.selected_value(),
+            &44_100,
+            "returning to PCM must not arm a silent upsample to the max rate"
+        );
+    }
+
+    #[test]
+    fn pcm_rate_cap_still_degrades_to_nearest_lower_rate() {
+        let mut format = FormatState::new();
+        format.sample_rate.select_value(&96_000);
+        format.format.select_value(&AudioFormat::Mp3);
+        format.apply_format_constraints();
+        assert_eq!(
+            format.sample_rate.selected_value(),
+            &48_000,
+            "MP3 cap should land on 48 kHz, not wrap to 44.1"
+        );
+    }
+}
+
+#[cfg(test)]
 mod batch_format_extension_tests {
     use super::{compute_format_histogram, detect_format_from_extension};
     use crate::convert::formats::AudioFormat;
@@ -3628,7 +3665,7 @@ impl FormatState {
     }
 
     fn clamp_disabled_selections(&mut self) {
-        clamp_pill(&mut self.sample_rate);
+        clamp_sample_rate_pill(&mut self.sample_rate);
         clamp_pill(&mut self.bit_depth);
         clamp_pill(&mut self.resampler);
         clamp_pill(&mut self.dither);
@@ -3695,6 +3732,21 @@ fn clamp_pill<T: Clone + PartialEq>(pill: &mut PillState<T>) {
             }
         }
     }
+}
+
+/// Sample-rate clamping: PCM caps degrade to the nearest lower rate
+/// (MP3 with 96 kHz selected lands on 48), but a DSD-rate selection falling
+/// back to PCM must NOT land on the maximum PCM rate — DSD64 scanning
+/// downward would select 768 kHz and silently arm a large upsample from a
+/// typical 44.1/48 kHz source. Land on the lowest enabled rate instead.
+fn clamp_sample_rate_pill(pill: &mut PillState<u32>) {
+    if !pill.options[pill.selected].enabled && pill.options[pill.selected].value >= 2_822_400 {
+        if let Some(idx) = pill.options.iter().position(|o| o.enabled) {
+            pill.selected = idx;
+            return;
+        }
+    }
+    clamp_pill(pill);
 }
 
 fn select_enabled_index<T: Clone + PartialEq>(pill: &mut PillState<T>, index: usize) {
