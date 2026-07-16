@@ -473,10 +473,6 @@ async fn source_target_preserves_float32_cue_sample_class() {
         .expect("float32 Source output measurement");
 
 }
-#[ignore = "KNOWN GAP: CUE segment staging validates exact sample counts derived \
-from the probed (header) duration, but lossy decodes are shorter (encoder \
-delay/padding) — real MP3+CUE conversions fail at Materialize. Needs a \
-lossy-source tolerance policy; deferred to the next brief."]
 #[tokio::test]
 async fn lossy_cue_source_defaults_to_integer_pcm_for_flac_and_wav() {
     const TEST: &str = "lossy_cue_source_defaults_to_integer_pcm_for_flac_and_wav";
@@ -488,11 +484,14 @@ async fn lossy_cue_source_defaults_to_integer_pcm_for_flac_and_wav() {
     let source_dir = root.join("source");
     fs::create_dir_all(&source_dir).expect("create source directory");
     let image = source_dir.join("lossy.mp3");
-    create_sine(&image, "libmp3lame", 44_100, 0.35);
+    create_sine(&image, "libmp3lame", 44_100, 2.0);
+    // Two tracks: track 1 ends at an INDEX position (interior boundary stays
+    // exact), track 2 is the image tail whose length is MEASURED from the
+    // decode (the MP3 header's frame count includes encoder delay/padding).
     let cue = source_dir.join("lossy.cue");
     fs::write(
         &cue,
-        "FILE \"lossy.mp3\" MP3\n  TRACK 01 AUDIO\n    TITLE \"Lossy\"\n    INDEX 01 00:00:00\n",
+        "FILE \"lossy.mp3\" MP3\n  TRACK 01 AUDIO\n    TITLE \"Lossy One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Lossy Two\"\n    INDEX 01 00:01:00\n",
     )
     .expect("write lossy CUE");
 
@@ -527,15 +526,17 @@ async fn lossy_cue_source_defaults_to_integer_pcm_for_flac_and_wav() {
             .iter()
             .filter(|entry| matches!(&entry.role, PublishRole::Audio))
             .collect();
-        if audio.len() != 1 {
+        if audio.len() != 2 {
             failures.push(format!(
-                "{case_name}: expected one published track, got {}",
+                "{case_name}: expected two published tracks, got {}",
                 audio.len()
             ));
             continue;
         }
-        if let Err(error) = assert_measurement(&audio[0].final_path, PcmBitDepth::Int24) {
-            failures.push(format!("{case_name}: {error}"));
+        for entry in &audio {
+            if let Err(error) = assert_measurement(&entry.final_path, PcmBitDepth::Int24) {
+                failures.push(format!("{case_name}: {error}"));
+            }
         }
     }
 

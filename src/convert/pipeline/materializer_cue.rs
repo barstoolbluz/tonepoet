@@ -163,7 +163,11 @@ impl Materializer for CueImageMaterializer {
                     image_path.display()
                 ))
             })?;
-            let (start_sample, samples) = boundaries[idx];
+            let SegmentBounds {
+                start_sample,
+                samples,
+                is_image_tail,
+            } = boundaries[idx];
             let staged_path = staged_cue_segment_path(
                 staging,
                 ordinal,
@@ -179,17 +183,28 @@ impl Materializer for CueImageMaterializer {
                 ))
             })?;
             let carrier = CueSegmentCarrier::for_source_depth_descriptor(probe.bit_depth);
-            stage_cue_segment_as_wav(
+            // A lossy image's header length is an estimate; its tail segment
+            // is staged open-ended and the DECODED length becomes the fact
+            // (backfilled below). All other segments stay exact.
+            let policy = if probe.coding == SourceAudioCoding::Lossy && is_image_tail {
+                SegmentLengthPolicy::LossyTail
+            } else {
+                SegmentLengthPolicy::Exact
+            };
+            let staged = stage_cue_segment_as_wav(
                 decode_path,
                 start_sample,
                 samples,
                 probe.sample_rate,
                 carrier,
                 &staged_path,
+                policy,
                 runner,
                 cancel,
             )
             .await?;
+            let staged_path = staged.path;
+            let samples = staged.samples;
 
             let mut metadata = cue_track_metadata(
                 cue_track,
@@ -1666,11 +1681,21 @@ fn json_u32_from_value(value: &serde_json::Value) -> Option<u32> {
         .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
 }
 
+/// Per-track segment bounds. `is_image_tail` marks the last track of its
+/// image file — the only segment whose end is the (header-derived) image
+/// total rather than a CUE INDEX position.
+#[derive(Debug, Clone, Copy)]
+struct SegmentBounds {
+    start_sample: u64,
+    samples: u64,
+    is_image_tail: bool,
+}
+
 fn compute_track_boundaries_for_layout(
     sheet: &CueSheet,
     track_images: &[PathBuf],
     probes: &HashMap<PathBuf, AudioProbe>,
-) -> Result<Vec<(u64, u64)>, MaterializeError> {
+) -> Result<Vec<SegmentBounds>, MaterializeError> {
     if sheet.tracks.len() != track_images.len() {
         return Err(MaterializeError::Parse(format!(
             "CUE track/image cardinality mismatch: {} tracks, {} images",
@@ -1738,7 +1763,11 @@ fn compute_track_boundaries_for_layout(
                 image_path.display()
             )));
         }
-        boundaries.push((start, end - start));
+        boundaries.push(SegmentBounds {
+            start_sample: start,
+            samples: end - start,
+            is_image_tail: next_start.is_none(),
+        });
     }
 
     Ok(boundaries)
@@ -1824,10 +1853,63 @@ async fn stage_cue_segment_as_s32_wav(
         sample_rate,
         CueSegmentCarrier::PcmS32LeWav,
         destination,
+        SegmentLengthPolicy::Exact,
         runner,
         cancel,
     )
     .await
+    .map(|_| ())
+}
+
+/// How a staged segment's length is validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentLengthPolicy {
+    /// The segment length is fully determined by CUE INDEX positions (or a
+    /// lossless image's exact total): the staged WAV must match exactly.
+    Exact,
+    /// The segment is the tail of a LOSSY image: the header-derived length is
+    /// an estimate (encoder delay/padding, VBR duration estimates), so the
+    /// segment is staged open-ended and the DECODED length becomes the fact.
+    /// A bounded shortfall guards against genuinely truncated sources.
+    LossyTail,
+}
+
+/// Maximum acceptable shortfall of a lossy image-tail decode versus its
+/// header-derived length (~100 ms). Codec delay/padding classes top out
+/// around 4.7k samples (AAC); anything beyond this indicates a truncated
+/// source and fails closed.
+fn lossy_tail_shortfall_limit(sample_rate: u32) -> u64 {
+    ((sample_rate as u64) / 10).max(8_192)
+}
+
+/// Rebuild a staged-segment destination for a corrected sample count. The
+/// provisional name embeds the header-derived `-n{samples}.wav` suffix
+/// (see `staged_cue_segment_path`); test shims may pass arbitrary names, in
+/// which case the provisional path is kept as-is.
+fn segment_destination_with_samples(
+    provisional: &Path,
+    header_samples: u64,
+    measured_samples: u64,
+) -> PathBuf {
+    if measured_samples == header_samples {
+        return provisional.to_path_buf();
+    }
+    let Some(name) = provisional.file_name().and_then(|value| value.to_str()) else {
+        return provisional.to_path_buf();
+    };
+    let expected_suffix = format!("-n{header_samples}.wav");
+    let Some(stem) = name.strip_suffix(expected_suffix.as_str()) else {
+        return provisional.to_path_buf();
+    };
+    provisional.with_file_name(format!("{stem}-n{measured_samples}.wav"))
+}
+
+/// A published, validated staged segment: the final path plus the measured
+/// sample count (equal to the requested count under `Exact`).
+#[derive(Debug, Clone)]
+struct StagedCueSegment {
+    path: PathBuf,
+    samples: u64,
 }
 
 async fn stage_cue_segment_as_wav(
@@ -1837,10 +1919,15 @@ async fn stage_cue_segment_as_wav(
     sample_rate: u32,
     carrier: CueSegmentCarrier,
     destination: &Path,
+    policy: SegmentLengthPolicy,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
-) -> Result<(), MaterializeError> {
-    if destination.exists() {
+) -> Result<StagedCueSegment, MaterializeError> {
+    // Pre-ffmpeg reuse short-circuit. For LossyTail the published file lives
+    // under the MEASURED name, which is unknowable before decoding, so an
+    // interrupted-run retry pays one extra decode (correctness unaffected —
+    // the publish path still reuses a valid measured-name file).
+    if policy == SegmentLengthPolicy::Exact && destination.exists() {
         match validate_staged_cue_segment_as(
             destination,
             sample_rate,
@@ -1851,7 +1938,12 @@ async fn stage_cue_segment_as_wav(
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                return Ok(StagedCueSegment {
+                    path: destination.to_path_buf(),
+                    samples,
+                })
+            }
             Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
             Err(_) => {
                 // Do not remove the published path yet. A stale or partial file from a
@@ -1873,10 +1965,18 @@ async fn stage_cue_segment_as_wav(
     cleanup_old_temporary_segments(destination);
     remove_path_if_exists(&tmp_destination)?;
 
+    // LossyTail stages OPEN-ENDED: the header-derived end is an estimate in
+    // both directions (delay/padding overstates; Xing-less VBR understates —
+    // a capped extraction would silently truncate real audio AND validate
+    // clean). CUE tail semantics are "play to end of audio".
+    let capped_samples = match policy {
+        SegmentLengthPolicy::Exact => Some(samples),
+        SegmentLengthPolicy::LossyTail => None,
+    };
     let cmd = cue_segment_ffmpeg_command_for_carrier(
         image,
         start_sample,
-        samples,
+        capped_samples,
         carrier,
         &tmp_destination,
     )?;
@@ -1884,27 +1984,76 @@ async fn stage_cue_segment_as_wav(
     let run_result = runner.run(cmd, cancel).await;
     match run_result {
         Ok(_) => {
-            if let Err(err) = validate_staged_cue_segment_as(
+            // Measure once on the tmp file; every later validation is Exact
+            // against the measured count.
+            let measured = match measure_staged_cue_segment_as(
                 &tmp_destination,
                 sample_rate,
-                samples,
                 carrier,
                 runner,
                 cancel,
             )
             .await
             {
-                let _ = remove_path_if_exists(&tmp_destination);
-                return Err(err);
+                Ok(measured) => measured,
+                Err(err) => {
+                    let _ = remove_path_if_exists(&tmp_destination);
+                    return Err(err);
+                }
+            };
+            match policy {
+                SegmentLengthPolicy::Exact => {
+                    if measured != samples {
+                        let _ = remove_path_if_exists(&tmp_destination);
+                        return Err(MaterializeError::Parse(format!(
+                            "staged CUE segment {} has {} samples, expected {}",
+                            tmp_destination.display(),
+                            measured,
+                            samples
+                        )));
+                    }
+                }
+                SegmentLengthPolicy::LossyTail => {
+                    let limit = lossy_tail_shortfall_limit(sample_rate);
+                    if measured == 0 {
+                        let _ = remove_path_if_exists(&tmp_destination);
+                        return Err(MaterializeError::Parse(format!(
+                            "lossy CUE image {} decoded no samples for its tail segment",
+                            image.display()
+                        )));
+                    }
+                    if measured + limit < samples {
+                        let _ = remove_path_if_exists(&tmp_destination);
+                        return Err(MaterializeError::Parse(format!(
+                            "lossy CUE image {} decoded {} samples short of its header length for the tail segment (measured {}, expected {}, limit {}); the source appears truncated",
+                            image.display(),
+                            samples - measured,
+                            measured,
+                            samples,
+                            limit
+                        )));
+                    }
+                    if measured > samples + sample_rate as u64 {
+                        log::warn!(
+                            "lossy CUE image {} decoded {} samples beyond its header length for the tail segment (measured {}, header {}); keeping the full decode",
+                            image.display(),
+                            measured - samples,
+                            measured,
+                            samples
+                        );
+                    }
+                }
             }
+            let final_destination =
+                segment_destination_with_samples(destination, samples, measured);
 
             sync_file_to_storage(&tmp_destination)?;
 
-            if destination.exists() {
+            if final_destination.exists() {
                 match validate_staged_cue_segment_as(
-                    destination,
+                    &final_destination,
                     sample_rate,
-                    samples,
+                    measured,
                     carrier,
                     runner,
                     cancel,
@@ -1913,7 +2062,10 @@ async fn stage_cue_segment_as_wav(
                 {
                     Ok(()) => {
                         let _ = remove_path_if_exists(&tmp_destination);
-                        return Ok(());
+                        return Ok(StagedCueSegment {
+                            path: final_destination,
+                            samples: measured,
+                        });
                     }
                     Err(MaterializeError::Cancelled) => {
                         let _ = remove_path_if_exists(&tmp_destination);
@@ -1925,9 +2077,9 @@ async fn stage_cue_segment_as_wav(
 
             if let Err(err) = publish_validated_staged_segment(
                 &tmp_destination,
-                destination,
+                &final_destination,
                 sample_rate,
-                samples,
+                measured,
                 carrier,
                 runner,
                 cancel,
@@ -1937,7 +2089,10 @@ async fn stage_cue_segment_as_wav(
                 let _ = remove_path_if_exists(&tmp_destination);
                 return Err(err);
             }
-            Ok(())
+            Ok(StagedCueSegment {
+                path: final_destination,
+                samples: measured,
+            })
         }
         Err(ToolRunnerError::Cancelled { .. }) => {
             let _ = remove_path_if_exists(&tmp_destination);
@@ -1977,6 +2132,36 @@ async fn validate_staged_cue_segment_as(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
+    let measured = measure_staged_cue_segment_as(
+        path,
+        expected_sample_rate,
+        carrier,
+        runner,
+        cancel,
+    )
+    .await?;
+    if measured != expected_samples {
+        return Err(MaterializeError::Parse(format!(
+            "staged CUE segment {} has {} samples, expected {}",
+            path.display(),
+            measured,
+            expected_samples
+        )));
+    }
+    Ok(())
+}
+
+/// All staged-segment integrity checks EXCEPT the sample-count comparison:
+/// readable, non-empty, expected sample rate, exact probe, expected carrier
+/// codec, WAV container. Returns the measured sample count so callers can
+/// apply their own length policy.
+async fn measure_staged_cue_segment_as(
+    path: &Path,
+    expected_sample_rate: u32,
+    carrier: CueSegmentCarrier,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<u64, MaterializeError> {
     let metadata = path.metadata().map_err(|err| {
         MaterializeError::Parse(format!(
             "staged CUE segment {} is not readable: {err}",
@@ -2005,14 +2190,6 @@ async fn validate_staged_cue_segment_as(
             path.display()
         )));
     }
-    if probe.total_samples != expected_samples {
-        return Err(MaterializeError::Parse(format!(
-            "staged CUE segment {} has {} samples, expected {}",
-            path.display(),
-            probe.total_samples,
-            expected_samples
-        )));
-    }
     if probe.codec_name.as_deref() != Some(carrier.codec_name()) {
         return Err(MaterializeError::Parse(format!(
             "staged CUE segment {} has codec {:?}, expected {}",
@@ -2034,7 +2211,7 @@ async fn validate_staged_cue_segment_as(
         )));
     }
 
-    Ok(())
+    Ok(probe.total_samples)
 }
 
 async fn probe_staged_cue_segment(
@@ -2370,7 +2547,7 @@ fn cue_segment_ffmpeg_command(
     cue_segment_ffmpeg_command_for_carrier(
         image,
         start_sample,
-        samples,
+        Some(samples),
         CueSegmentCarrier::PcmS32LeWav,
         destination,
     )
@@ -2379,7 +2556,7 @@ fn cue_segment_ffmpeg_command(
 fn cue_segment_ffmpeg_command_for_carrier(
     image: &Path,
     start_sample: u64,
-    samples: u64,
+    samples: Option<u64>,
     carrier: CueSegmentCarrier,
     destination: &Path,
 ) -> Result<ToolCommand, MaterializeError> {
@@ -2414,7 +2591,17 @@ fn cue_segment_ffmpeg_command_for_carrier(
     })
 }
 
-fn cue_segment_atrim_filter(start_sample: u64, samples: u64) -> Result<String, MaterializeError> {
+fn cue_segment_atrim_filter(
+    start_sample: u64,
+    samples: Option<u64>,
+) -> Result<String, MaterializeError> {
+    let Some(samples) = samples else {
+        // Open-ended: lossy image-tail segments run to decode EOF because the
+        // header-derived end is an estimate in both directions.
+        return Ok(format!(
+            "atrim=start_sample={start_sample},asetpts=N/SR/TB"
+        ));
+    };
     let end_sample = start_sample.checked_add(samples).ok_or_else(|| {
         MaterializeError::Parse("CUE segment sample range overflowed u64".to_string())
     })?;
@@ -3595,8 +3782,13 @@ TRACK XX AUDIO
 
     #[test]
     fn cue_segment_filter_rejects_zero_length_and_overflow() {
-        assert!(cue_segment_atrim_filter(100, 0).is_err());
-        assert!(cue_segment_atrim_filter(u64::MAX, 1).is_err());
+        assert!(cue_segment_atrim_filter(100, Some(0)).is_err());
+        assert!(cue_segment_atrim_filter(u64::MAX, Some(1)).is_err());
+        // Open-ended (lossy tail) has no end_sample and no zero-length guard.
+        assert_eq!(
+            cue_segment_atrim_filter(100, None).unwrap(),
+            "atrim=start_sample=100,asetpts=N/SR/TB"
+        );
     }
 
     #[test]
@@ -3658,6 +3850,159 @@ TRACK XX AUDIO
             now,
             STALE_CUE_SEGMENT_TMP_MAX_AGE
         ));
+    }
+
+    #[test]
+    fn segment_destination_with_samples_rewrites_only_the_expected_suffix() {
+        let provisional = Path::new("staging/cue-segments/001-cue01-track01-s0-n17280.wav");
+        assert_eq!(
+            segment_destination_with_samples(provisional, 17_280, 15_435),
+            Path::new("staging/cue-segments/001-cue01-track01-s0-n15435.wav")
+        );
+        // Equal counts keep the provisional path (exact segments: no-op).
+        assert_eq!(
+            segment_destination_with_samples(provisional, 17_280, 17_280),
+            provisional
+        );
+        // Arbitrary names (test shims) are kept as-is.
+        let arbitrary = Path::new("staging/cue-segments/001.wav");
+        assert_eq!(
+            segment_destination_with_samples(arbitrary, 17_280, 15_435),
+            arbitrary
+        );
+    }
+
+    #[tokio::test]
+    async fn lossy_tail_shortfall_within_bound_backfills_measured_facts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let provisional = temp
+            .path()
+            .join("staging/cue-segments/001-cue01-track01-s0-n17280.wav");
+        let measured_name = temp
+            .path()
+            .join("staging/cue-segments/001-cue01-track01-s0-n15435.wav");
+        // MP3 delay/padding class: header 17280, decode 15435 (< 100ms short).
+        let measured_probe = ffprobe_json_staged_segment(44_100, 15_435);
+        let runner = stub_runner_with_expected_probes(vec![
+            expected_temp_ffprobe_for(&provisional, measured_probe.clone()),
+            expected_ffprobe(&measured_name, measured_probe),
+        ]);
+        let cancel = CancellationToken::new();
+
+        let staged = stage_cue_segment_as_wav(
+            Path::new("album.mp3"),
+            0,
+            17_280,
+            44_100,
+            CueSegmentCarrier::PcmS32LeWav,
+            &provisional,
+            SegmentLengthPolicy::LossyTail,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("lossy tail shortfall within the bound is accepted");
+
+        assert_eq!(staged.path, measured_name);
+        assert_eq!(staged.samples, 15_435);
+        assert!(measured_name.exists(), "published under the measured name");
+        assert!(!provisional.exists(), "no file under the header-derived name");
+    }
+
+    #[tokio::test]
+    async fn lossy_tail_shortfall_beyond_bound_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let provisional = temp
+            .path()
+            .join("staging/cue-segments/001-cue01-track01-s0-n200000.wav");
+        // Way past the ~100ms/8192-sample limit: a genuinely truncated source.
+        let runner = stub_runner_with_expected_probes(vec![expected_temp_ffprobe_for(
+            &provisional,
+            ffprobe_json_staged_segment(44_100, 100_000),
+        )]);
+        let cancel = CancellationToken::new();
+
+        let err = stage_cue_segment_as_wav(
+            Path::new("album.mp3"),
+            0,
+            200_000,
+            44_100,
+            CueSegmentCarrier::PcmS32LeWav,
+            &provisional,
+            SegmentLengthPolicy::LossyTail,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect_err("shortfall beyond the bound must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("appears truncated"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn lossy_tail_overage_is_kept_and_backfilled() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let provisional = temp
+            .path()
+            .join("staging/cue-segments/001-cue01-track01-s0-n17280.wav");
+        let measured_name = temp
+            .path()
+            .join("staging/cue-segments/001-cue01-track01-s0-n80000.wav");
+        // Xing-less VBR: header understates; the full decode is the fact.
+        let measured_probe = ffprobe_json_staged_segment(44_100, 80_000);
+        let runner = stub_runner_with_expected_probes(vec![
+            expected_temp_ffprobe_for(&provisional, measured_probe.clone()),
+            expected_ffprobe(&measured_name, measured_probe),
+        ]);
+        let cancel = CancellationToken::new();
+
+        let staged = stage_cue_segment_as_wav(
+            Path::new("album.mp3"),
+            0,
+            17_280,
+            44_100,
+            CueSegmentCarrier::PcmS32LeWav,
+            &provisional,
+            SegmentLengthPolicy::LossyTail,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("header-understating decode keeps the full audio");
+        assert_eq!(staged.samples, 80_000);
+        assert_eq!(staged.path, measured_name);
+    }
+
+    #[tokio::test]
+    async fn exact_segments_keep_the_strict_count_failure() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let destination = temp
+            .path()
+            .join("staging/cue-segments/001-cue01-track01-s0-n17280.wav");
+        let runner = stub_runner_with_expected_probes(vec![expected_temp_ffprobe_for(
+            &destination,
+            ffprobe_json_staged_segment(44_100, 15_435),
+        )]);
+        let cancel = CancellationToken::new();
+
+        let err = stage_cue_segment_as_wav(
+            Path::new("album.flac"),
+            0,
+            17_280,
+            44_100,
+            CueSegmentCarrier::PcmS32LeWav,
+            &destination,
+            SegmentLengthPolicy::Exact,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect_err("exact segments must not tolerate any count mismatch");
+        let message = err.to_string();
+        assert!(
+            message.contains("has 15435 samples, expected 17280"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -3871,7 +4216,11 @@ TRACK XX AUDIO
 
         for idx in selected_indices {
             let cue_track = &cue_input.sheet.tracks[idx];
-            let (start_sample, samples) = boundaries[idx];
+            let SegmentBounds {
+                start_sample,
+                samples,
+                ..
+            } = boundaries[idx];
             let staged_path = staged_cue_segment_path(
                 staging,
                 (idx + 1) as u32,
@@ -4976,6 +5325,7 @@ FILE "side-b.flac" WAVE
             44_100,
             carrier,
             &destination,
+            SegmentLengthPolicy::Exact,
             &runner,
             &cancel,
         )
