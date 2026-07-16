@@ -1,7 +1,7 @@
 //! Comprehensive test suite for conversion features
 
 use chrono::Utc;
-use conversion_features::*;
+use tonepoet_features::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -25,7 +25,7 @@ async fn test_log_file_creation() {
     let results = create_test_results();
 
     // Generate log file
-    let log_path = write_conversion_log(output_dir, &results, &config)
+    let log_path = write_conversion_log(output_dir, &results, &config, None)
         .await
         .expect("Failed to write log file");
 
@@ -63,7 +63,7 @@ async fn test_log_file_creation() {
     // Check specific content
     assert!(content.contains("Backend: FFmpeg"), "Backend not recorded");
     assert!(
-        content.contains("Workers: 4 parallel"),
+        content.contains("Workers: 4 concurrent"),
         "Worker count not recorded"
     );
     assert!(content.contains("✅"), "Success markers missing");
@@ -267,6 +267,9 @@ async fn test_compression_ratio_calculation() {
         start_time: Utc::now(),
         end_time: Utc::now(),
         error_message: None,
+        replaygain_values: None,
+        source_info: None,
+        conversion_pipeline: None,
     };
 
     assert_eq!(result.compression_ratio(), 75.0);

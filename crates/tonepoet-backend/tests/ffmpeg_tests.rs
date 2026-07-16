@@ -1,6 +1,6 @@
 //! Tests for FFmpeg command generation
 
-use conversion_backend::*;
+use tonepoet_backend::*;
 use std::path::Path;
 
 #[test]
@@ -22,14 +22,14 @@ fn test_aiff_with_float_fallback() {
     // Should use 32-bit integer since AIFF doesn't support float
     assert!(cmd.arguments.contains(&"pcm_s32be".to_string()));
 
-    // Should use precision=16 for LQ resampling
+    // resample_quality 0 = Ultra -> precision=32 (0=Ultra .. 4=LQ scale)
     let filter_arg = cmd
         .arguments
         .iter()
         .position(|arg| arg == "-af")
         .and_then(|i| cmd.arguments.get(i + 1))
         .unwrap();
-    assert!(filter_arg.contains("precision=16"));
+    assert!(filter_arg.contains("precision=32"));
     assert!(filter_arg.contains("out_sample_rate=192000"));
 }
 
@@ -52,14 +52,14 @@ fn test_wav_with_float() {
     // Should use float PCM
     assert!(cmd.arguments.contains(&"pcm_f32le".to_string()));
 
-    // Should use precision=32 for Ultra resampling
+    // resample_quality 4 = LQ -> precision=16 (0=Ultra .. 4=LQ scale)
     let filter_arg = cmd
         .arguments
         .iter()
         .position(|arg| arg == "-af")
         .and_then(|i| cmd.arguments.get(i + 1))
         .unwrap();
-    assert!(filter_arg.contains("precision=32"));
+    assert!(filter_arg.contains("precision=16"));
 }
 
 #[test]
@@ -120,11 +120,11 @@ fn test_no_resampling_when_not_needed() {
 #[test]
 fn test_resampling_quality_mapping() {
     let quality_tests = vec![
-        (0, "precision=16"), // LQ
-        (1, "precision=20"), // MQ
+        (0, "precision=32"), // Ultra
+        (1, "precision=28"), // VHQ
         (2, "precision=24"), // HQ
-        (3, "precision=28"), // VHQ
-        (4, "precision=32"), // Ultra
+        (3, "precision=20"), // MQ
+        (4, "precision=16"), // LQ
     ];
 
     for (quality, expected_precision) in quality_tests {

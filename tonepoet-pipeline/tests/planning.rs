@@ -23,6 +23,7 @@ fn request(settings: PipelineSettings) -> PlanRequest {
         source: flac_source(),
         settings,
         intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
     }
 }
 
@@ -78,7 +79,7 @@ fn sox_flac_resample_dither_plan_is_deterministic_and_preserves_metadata_by_post
 }
 
 #[test]
-fn brickwall_uses_ffmpeg_ssrc_final_encode_without_redundant_metadata_step() {
+fn brickwall_uses_ffmpeg_ssrc_final_encode_plus_original_source_metadata_transfer() {
     let mut settings = PipelineSettings::default();
     settings.target_sample_rate = RateTarget::PcmHz(44_100);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
@@ -88,14 +89,26 @@ fn brickwall_uses_ffmpeg_ssrc_final_encode_without_redundant_metadata_step() {
     let req = request(settings);
     let plan = plan_conversion(&req).unwrap();
     let tools: Vec<_> = plan.commands().iter().map(|cmd| cmd.tool.clone()).collect();
+    // The final encode reads a tagless SSRC intermediate, so an explicit
+    // original-source MetadataTransfer step is REQUIRED — the old 3-step
+    // plan silently lost all tags/artwork through the SSRC path (fixed by
+    // the typed metadata-effect pruner).
     assert_eq!(
         tools,
         vec![
             ToolIdentifier::Ffmpeg,
             ToolIdentifier::Ssrc,
+            ToolIdentifier::Ffmpeg,
             ToolIdentifier::Ffmpeg
         ]
     );
+    let transfer = &plan.commands()[3];
+    assert_eq!(
+        transfer.args.iter().filter(|arg| *arg == "-i").count(),
+        2,
+        "metadata transfer must read the encoded file plus the original source"
+    );
+    assert!(transfer.args.iter().any(|arg| arg == "-map_metadata"));
 }
 
 #[test]
@@ -182,6 +195,7 @@ fn dsd_to_pcm_uses_sox() {
         },
         settings,
         intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
     };
     let plan = plan_conversion(&req).unwrap();
     assert_eq!(plan.commands()[0].tool, ToolIdentifier::Sox);
@@ -191,7 +205,8 @@ fn dsd_to_pcm_uses_sox() {
 #[test]
 fn changed_flac_compression_blocks_passthrough() {
     let mut settings = PipelineSettings::default();
-    settings.flac.compression_level = 8;
+    // The default is 8; any NON-default level must force a re-encode.
+    settings.flac.compression_level = 5;
     let req = request(settings);
     let plan = plan_conversion(&req).unwrap();
     assert!(matches!(plan.action, PlanAction::Execute { .. }));
@@ -218,6 +233,7 @@ fn lossy_same_format_never_passes_through_without_proven_encoder_settings() {
         },
         settings,
         intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
     };
     let plan = plan_conversion(&req).unwrap();
     assert!(matches!(plan.action, PlanAction::Execute { .. }));
@@ -302,6 +318,27 @@ impl ToolPlugin for CustomEncodePlugin {
                 ..
             } => MetadataDisposition::WritesRequestedPolicy,
             _ => MetadataDisposition::DoesNotWrite,
+        }
+    }
+
+    // The pruner ignores the legacy disposition; a typed effect is required
+    // for the MetadataTransfer step to prune. Truthful here: the custom
+    // encode's input IS the original request input.
+    fn metadata_effect(
+        &self,
+        _context: &PlanContext<'_>,
+        step: &PlanStep,
+    ) -> MetadataPlanEffect {
+        match &step.operation {
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Custom { .. },
+                ..
+            } => MetadataPlanEffect {
+                source_tags_transferred_from_original_source: true,
+                artwork_transferred_from_original_source: true,
+                ..MetadataPlanEffect::none()
+            },
+            _ => MetadataPlanEffect::none(),
         }
     }
 
@@ -428,7 +465,7 @@ fn dsd_sinc_transition_width_shapes_sox_command() {
 }
 
 #[test]
-fn dsd_auto_and_sox_ultra_lowpass_produce_distinct_rate_flags() {
+fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
     let mut auto = PipelineSettings::default();
     auto.target_sample_rate = RateTarget::PcmHz(88_200);
     auto.resample_quality = ResampleQuality::Low;
@@ -451,6 +488,7 @@ fn dsd_auto_and_sox_ultra_lowpass_produce_distinct_rate_flags() {
         source: source.clone(),
         settings: auto,
         intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
     };
 
     let mut ultra = req_auto.clone();
@@ -460,7 +498,10 @@ fn dsd_auto_and_sox_ultra_lowpass_produce_distinct_rate_flags() {
     let ultra_plan = plan_conversion(&ultra).unwrap();
     let auto_args = &auto_plan.commands()[0].args;
     let ultra_args = &ultra_plan.commands()[0].args;
-    assert!(auto_args.iter().any(|arg| arg == "-q"));
+    // resample_quality no longer affects DSD rate conversion: every DSD
+    // lowpass path deliberately uses sox's -u (701 taps / 210.7 dB).
+    assert!(auto_args.iter().any(|arg| arg == "-u"));
+    assert!(!auto_args.iter().any(|arg| arg == "-q"));
     assert!(ultra_args.iter().any(|arg| arg == "-u"));
 }
 

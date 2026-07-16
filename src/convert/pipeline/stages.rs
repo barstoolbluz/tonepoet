@@ -1923,14 +1923,23 @@ fn parse_wvunpack_source_depth(text: &str) -> Option<tonepoet_pipeline::PcmBitDe
 
 /// Log-side WavPack depth without the wvunpack oracle (no expectation to
 /// enforce, so an oracle failure must not fail the track). ffprobe decodes
-/// every WavPack depth to sample_fmt s32p, so measured_pcm_depth's fallback
-/// chain would report 32 for a 24-bit file; bits_per_raw_sample, when
-/// present, is container-accurate (verified against wvunpack -s). Trust only
-/// that field and leave the depth unmeasured otherwise.
+/// integer WavPack to sample_fmt s32p regardless of depth, so
+/// measured_pcm_depth's fallback chain cannot be trusted here;
+/// bits_per_raw_sample, when present, is container-accurate for INTEGER
+/// WavPack (verified against wvunpack -s). Float WavPack probes as fltp
+/// with bits_per_raw_sample=32 (bytes-per-sample, not an int width), so
+/// float is classified first. Anything else stays unmeasured.
 fn wavpack_log_only_measured_depth(
     probe: &RealizedProbe,
 ) -> Option<tonepoet_pipeline::PcmBitDepth> {
     use tonepoet_pipeline::PcmBitDepth;
+    let sample_fmt = probe.sample_fmt.as_deref().unwrap_or_default();
+    if sample_fmt.starts_with("flt") {
+        return Some(PcmBitDepth::Float32);
+    }
+    if sample_fmt.starts_with("dbl") {
+        return Some(PcmBitDepth::Float64);
+    }
     match probe.bits_per_raw_sample? {
         8 => Some(PcmBitDepth::Int8),
         16 => Some(PcmBitDepth::Int16),
@@ -1965,6 +1974,18 @@ mod wavpack_log_only_depth_tests {
         assert_eq!(
             wavpack_log_only_measured_depth(&wv_probe(Some(32))),
             Some(tonepoet_pipeline::PcmBitDepth::Int32)
+        );
+    }
+
+    #[test]
+    fn classifies_float_wavpack_before_trusting_raw_bits() {
+        // Float .wv probes as fltp with bits_per_raw_sample=32 (a byte
+        // width, not an integer depth) — must not be recorded as Int32.
+        let mut probe = wv_probe(Some(32));
+        probe.sample_fmt = Some("fltp".to_string());
+        assert_eq!(
+            wavpack_log_only_measured_depth(&probe),
+            Some(tonepoet_pipeline::PcmBitDepth::Float32)
         );
     }
 
@@ -14339,16 +14360,23 @@ fn conversion_summary(
                 BitDepthTarget::Source => track.source_audio.bit_depth,
                 BitDepthTarget::Pcm(_) => None,
             })
-            // Raw descriptor values can carry the legacy 320/640 float
-            // convention (source side filters identically); never render
-            // them as literal bit widths like "320-bit".
-            .filter(|bits| *bits < 100)
+            // Raw descriptor values can carry the legacy 33/320/640 float
+            // conventions; interpret them like the source side does instead
+            // of rendering literal widths like "320-bit" or "33-bit".
+            .and_then(|bits| pcm_bit_depth_from_source_bits(Some(bits)))
+            .map(tonepoet_pipeline::PcmBitDepth::bits)
     };
     let target_depth = verified_output_bit_depth
         .map(tonepoet_pipeline::PcmBitDepth::bits)
         .or(planned_target_depth);
     let planned_float_target = match req.settings.target_bit_depth {
         BitDepthTarget::Pcm(depth) if depth.is_float() => Some(depth),
+        // A Source target over a float-convention descriptor is a planned
+        // float output too — label it "32-bit float", not "32-bit".
+        BitDepthTarget::Source => pcm_bit_depth_from_source_bits(
+            track.bit_depth.or(track.source_audio.bit_depth),
+        )
+        .filter(|depth| depth.is_float()),
         _ => None,
     };
     let target_stream = verified_output_bit_depth

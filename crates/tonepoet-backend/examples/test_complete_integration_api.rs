@@ -1,7 +1,7 @@
 //! Test the complete integration API
 
-use conversion_backend::integration::*;
-use conversion_backend::*;
+use tonepoet_backend::integration::*;
+use tonepoet_backend::*;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -53,6 +53,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create test conversion item
     let test_item = ConversionItem {
         id: "api_test_001".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::Flac,
         options: MainConversionOptions {
             quality: MainQualitySettings::Flac {
@@ -61,6 +64,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             calculate_replaygain: true,
             overwrite: true,
             resample_quality: Some(2), // HQ
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 

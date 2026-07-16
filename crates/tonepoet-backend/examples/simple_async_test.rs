@@ -1,6 +1,6 @@
 //! Simple async test to check basic functionality
 
-use conversion_backend::integration::*;
+use tonepoet_backend::integration::*;
 use tokio::sync::mpsc;
 
 #[tokio::main]

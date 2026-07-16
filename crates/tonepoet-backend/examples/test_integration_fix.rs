@@ -1,13 +1,16 @@
 //! Test the integration layer fix with actual backend pipeline
 
-use conversion_backend::integration::*;
-use conversion_backend::*;
+use tonepoet_backend::integration::*;
+use tonepoet_backend::*;
 use std::path::Path;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create the exact failing case: AIFF, bit_depth=33, sample_rate=192000, resample_quality=0
     let failing_item = ConversionItem {
         id: "critical_test".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::Aiff,
         options: MainConversionOptions {
             quality: MainQualitySettings::Aiff {
@@ -17,6 +20,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             calculate_replaygain: false,
             overwrite: true,
             resample_quality: Some(0), // LQ - this was being lost before our fix!
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 

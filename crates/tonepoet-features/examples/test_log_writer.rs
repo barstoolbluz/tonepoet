@@ -1,7 +1,7 @@
 //! Standalone test for log file writing functionality
 
 use chrono::Utc;
-use conversion_features::{
+use tonepoet_features::{
     write_conversion_log, ConversionConfig, ConversionResult, ConversionStatus,
 };
 use std::path::PathBuf;
@@ -254,6 +254,9 @@ fn create_large_album_results(count: usize) -> Vec<ConversionResult> {
             } else {
                 None
             },
+            replaygain_values: None,
+            source_info: None,
+            conversion_pipeline: None,
         });
     }
 

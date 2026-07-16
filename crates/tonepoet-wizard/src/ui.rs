@@ -4526,7 +4526,9 @@ mod tests {
         assert_bg(&popup_cells, theme.input_bg, "input_bg");
 
         let mut disabled_wizard = SimpleWizard::new();
-        disabled_wizard.current_step = 1;
+        // Step 0's right pane hosts the format options with the disabled
+        // forced "Re-encode FLAC files" row.
+        disabled_wizard.current_step = 0;
         disabled_wizard.selected_format = Some(AudioFormat::Flac);
         disabled_wizard.bit_depth = Some(16);
         let disabled_cells = render_colors(&disabled_wizard, theme);
@@ -4625,7 +4627,9 @@ mod tests {
     #[test]
     fn disabled_options_use_disabled_foreground_role() {
         let mut wizard = SimpleWizard::new();
-        wizard.current_step = 1;
+        // Step 0's right pane is the FLAC format-options screen; bit_depth
+        // Some(16) forces re-encode, disabling "Re-encode FLAC files".
+        wizard.current_step = 0;
         wizard.selected_format = Some(AudioFormat::Flac);
         wizard.bit_depth = Some(16);
         let theme = sentinel_theme();

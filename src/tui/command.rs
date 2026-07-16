@@ -6396,9 +6396,6 @@ fn finish_browse_queue_review_after_expansion(
     }
     let paths = normalized_path_snapshot(paths);
     if paths.is_empty() {
-        if let Some(err) = expansion_errors.first() {
-            log::warn!("queue expansion warning dropped by empty selection: {}", err);
-        }
         crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
         app.set_status("queue: no supported sources in selection");
         return false;
@@ -12043,19 +12040,26 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(f) = fmt {
-                let rate_before = *app.convert.format.sample_rate.selected_value();
+                // Route through the same transition logic as the keyboard and
+                // mouse paths (rate restore, auto dither/resampler, DSD-source
+                // cascade) so :set format cannot drift from them.
+                let before_format = *app.convert.format.format.selected_value();
+                let before_depth = *app.convert.format.bit_depth.selected_value();
+                let before_dsd = app.convert.format.is_dsd_selected();
+                let source_bits = app.convert.current_source_bit_depth();
+                let source_rate = app.convert.current_source_sample_rate();
                 app.convert.format.format.select_value(&f);
-                app.convert.format.apply_format_constraints();
-                // Mirror after_user_selection: a DSD-rate selection falling
-                // back to PCM should land on the probed source rate, not the
-                // lowest PCM rate.
-                if tonepoet_pipeline::DsdRate::from_hz(rate_before).is_some()
-                    && !app.convert.format.is_dsd_selected()
-                {
-                    if let Some(rate) = app.convert.current_source_sample_rate() {
-                        app.convert.format.sample_rate.select_value(&rate);
-                    }
-                }
+                app.convert.format.after_user_selection(
+                    super::app::FormatField::Format,
+                    before_format,
+                    before_depth,
+                    source_bits,
+                    source_rate,
+                );
+                super::format_interactions::cascade_dsd_source_to_pcm(
+                    &mut app.convert,
+                    before_dsd,
+                );
                 app.preset.mark_modified();
                 app.set_status(format!("format = {}", f.name()));
             } else {

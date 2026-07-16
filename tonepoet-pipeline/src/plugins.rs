@@ -53,9 +53,23 @@ impl ToolPlugin for FfmpegPlugin {
             } => ToolSupport::UNSUPPORTED,
             PlanOperation::EncodePcm {
                 target_format,
+                target_bit_depth,
                 apply_processing,
                 ..
             } => {
+                // ffmpeg's wavpack encoder has no 24-bit sample format: an
+                // Int24 request stores true 32-bit ints (verified with
+                // wvunpack -s) — the same silent-substitution class as sox
+                // FLAC Int32. Hybrid requests are exempt because
+                // build_ffmpeg_encode_pcm delegates them to the native
+                // wavpack CLI, which writes true 24-bit.
+                if matches!(
+                    (target_format, target_bit_depth),
+                    (AudioFormat::WavPack, PcmBitDepth::Int24)
+                ) && !context.request.settings.wavpack.hybrid
+                {
+                    return ToolSupport::UNSUPPORTED;
+                }
                 let dither = context.request.settings.dither_type;
                 let dither_supported = !*apply_processing || !mapping::requires_sox_dither(dither);
                 if target_format.ffmpeg_encodable() && dither_supported {
@@ -2021,6 +2035,102 @@ mod tests {
         assert!(!AudioFormat::Wav.supports_cue_post_encode_artwork_embedding());
         assert!(!AudioFormat::Aiff.supports_cue_post_encode_artwork_embedding());
         assert!(!AudioFormat::Dsf.supports_cue_post_encode_artwork_embedding());
+    }
+
+    #[test]
+    fn ffmpeg_is_unsupported_for_wavpack_int24_but_sox_still_encodes_it() {
+        // ffmpeg's wavpack encoder cannot write 24-bit (it stores true
+        // 32-bit ints) — the plan must never route this cell to ffmpeg.
+        let source = SourceInfo {
+            format: AudioFormat::Flac,
+            codec: crate::enums::AudioCodec::Flac,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(PcmBitDepth::Int24),
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::WavPack;
+        settings.target_bit_depth = crate::enums::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        let request = PlanRequest {
+            input_path: PathBuf::from("realized.flac"),
+            output_path: PathBuf::from("track.wv"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let step = |apply_processing: bool| {
+            PlanStep::new(
+                0,
+                PlanOperation::EncodePcm {
+                    target_format: AudioFormat::WavPack,
+                    target_rate_hz: None,
+                    target_bit_depth: PcmBitDepth::Int24,
+                    apply_processing,
+                },
+                InputSource::Path(PathBuf::from("realized.flac")),
+                OutputSink::Path(PathBuf::from("track.wv")),
+                "Encode WavPack output",
+            )
+        };
+
+        for apply_processing in [false, true] {
+            let support = FfmpegPlugin.supports(&request.context(), &step(apply_processing));
+            assert!(
+                !support.is_supported(),
+                "ffmpeg must be unsupported for WavPack Int24 (apply_processing={apply_processing})"
+            );
+            let sox = SoxPlugin.supports(&request.context(), &step(apply_processing));
+            assert!(
+                sox.is_supported(),
+                "sox must remain available for WavPack Int24 (apply_processing={apply_processing})"
+            );
+        }
+
+        // Other integer depths stay ffmpeg-eligible (16 and 32 are faithful).
+        for depth in [PcmBitDepth::Int16, PcmBitDepth::Int32] {
+            let step = PlanStep::new(
+                0,
+                PlanOperation::EncodePcm {
+                    target_format: AudioFormat::WavPack,
+                    target_rate_hz: None,
+                    target_bit_depth: depth,
+                    apply_processing: false,
+                },
+                InputSource::Path(PathBuf::from("realized.flac")),
+                OutputSink::Path(PathBuf::from("track.wv")),
+                "Encode WavPack output",
+            );
+            assert!(
+                FfmpegPlugin.supports(&request.context(), &step).is_supported(),
+                "ffmpeg should stay eligible for WavPack {depth:?}"
+            );
+        }
+
+        // Hybrid mode is exempt: the ffmpeg plugin delegates hybrid encodes
+        // to the native wavpack CLI, which writes true 24-bit.
+        let mut hybrid_settings = PipelineSettings::default();
+        hybrid_settings.target_format = AudioFormat::WavPack;
+        hybrid_settings.target_bit_depth =
+            crate::enums::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        hybrid_settings.wavpack.hybrid = true;
+        let hybrid_request = PlanRequest {
+            input_path: PathBuf::from("realized.flac"),
+            output_path: PathBuf::from("track.wv"),
+            source: request.source.clone(),
+            settings: hybrid_settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        assert!(
+            FfmpegPlugin
+                .supports(&hybrid_request.context(), &step(false))
+                .is_supported(),
+            "hybrid WavPack Int24 keeps the ffmpeg plugin (wavpack CLI delegate)"
+        );
     }
 
     #[test]

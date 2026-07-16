@@ -1,7 +1,7 @@
 //! Integration demonstration - Shows how to add log and cue file features
 
 use chrono::Utc;
-use conversion_features::{
+use tonepoet_features::{
     generate_cue_file, write_conversion_log, ConversionConfig, ConversionResult, ConversionStatus,
 };
 use std::path::PathBuf;

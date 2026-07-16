@@ -1,6 +1,6 @@
 //! Standalone test for cue file generation functionality
 
-use conversion_features::{generate_cue_file, ConversionConfig};
+use tonepoet_features::{generate_cue_file, ConversionConfig};
 use std::path::PathBuf;
 
 #[tokio::main]

@@ -1,7 +1,7 @@
 //! Verify that our integration fix actually solved the data loss issue
 
-use conversion_backend::integration::*;
-use conversion_backend::*;
+use tonepoet_backend::integration::*;
+use tonepoet_backend::*;
 use std::path::Path;
 
 fn main() {
@@ -10,6 +10,9 @@ fn main() {
     // Create test case with critical settings
     let test_item = ConversionItem {
         id: "data_loss_test".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::Aiff,
         options: MainConversionOptions {
             quality: MainQualitySettings::Aiff {
@@ -19,6 +22,15 @@ fn main() {
             calculate_replaygain: true,
             overwrite: false,
             resample_quality: Some(0), // LQ - THIS WAS BEING LOST BEFORE!
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 
@@ -46,6 +58,9 @@ fn main() {
     // Test AAC profile mapping
     let aac_item = ConversionItem {
         id: "aac_test".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::Aac,
         options: MainConversionOptions {
             quality: MainQualitySettings::Aac {
@@ -55,6 +70,15 @@ fn main() {
             calculate_replaygain: false,
             overwrite: true,
             resample_quality: Some(2),
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 
@@ -75,6 +99,9 @@ fn main() {
     // Test WavPack mapping
     let wavpack_item = ConversionItem {
         id: "wavpack_test".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::WavPack,
         options: MainConversionOptions {
             quality: MainQualitySettings::WavPack {
@@ -85,6 +112,15 @@ fn main() {
             calculate_replaygain: false,
             overwrite: true,
             resample_quality: Some(3),
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 

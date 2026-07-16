@@ -69,7 +69,7 @@ pub fn handle_convert_format_button(convert: &mut ConvertState, button: TuiButto
 
 /// If the format just changed from DSD to PCM and the source is a DSD file,
 /// auto-select the recommended PCM sample rate and 24-bit depth.
-fn cascade_dsd_source_to_pcm(convert: &mut ConvertState, was_dsd_before: bool) {
+pub(crate) fn cascade_dsd_source_to_pcm(convert: &mut ConvertState, was_dsd_before: bool) {
     // Only cascade when transitioning FROM DSD output TO PCM output
     if !was_dsd_before || convert.format.is_dsd_selected() {
         return;

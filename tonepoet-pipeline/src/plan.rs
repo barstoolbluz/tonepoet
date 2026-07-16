@@ -699,6 +699,17 @@ fn prune_redundant_metadata_steps(
 
     while index < pruned.len() {
         if let Some(required) = metadata_transfer_required_effect(&pruned[index].operation) {
+            // A MetadataTransfer with both policy flags false is a STRIP:
+            // its purpose is the rewrite itself (-map_metadata -1), so an
+            // empty requirement must never count as vacuously satisfied —
+            // pruning it would publish the source with tags intact and
+            // redirect finalization to rename the plan input.
+            let is_strip = !required.source_tags_transferred_from_original_source
+                && !required.artwork_transferred_from_original_source;
+            if is_strip {
+                index += 1;
+                continue;
+            }
             let Some(input_path) = pruned[index]
                 .input
                 .as_path()
@@ -1576,6 +1587,27 @@ mod resolved_depth_rejection_tests {
 
 #[cfg(test)]
 mod metadata_pruning_tests {
+    #[test]
+    fn strip_mode_metadata_transfer_is_never_pruned() {
+        // Both policy flags false = strip (-map_metadata -1). The empty
+        // requirement is vacuously "satisfied" by any prior effect; without
+        // the explicit guard the pruner deletes the only step that performs
+        // the strip and rewrites finalization to rename the plan input.
+        let required = metadata_transfer_required_effect(&PlanOperation::MetadataTransfer {
+            transfer_tags: false,
+            preserve_artwork: false,
+            target_format: AudioFormat::Flac,
+        })
+        .expect("strip is a metadata transfer");
+        assert!(
+            metadata_effect_satisfies_original_source_transfer(
+                MetadataPlanEffect::none(),
+                required
+            ),
+            "premise: an empty requirement IS vacuously satisfiable — the guard must catch it first"
+        );
+    }
+
     use super::*;
     use crate::enums::{AudioCodec, AudioFormat, PcmBitDepth, SampleKind};
     use crate::settings::PipelineSettings;

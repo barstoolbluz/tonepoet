@@ -1,7 +1,7 @@
 //! Test with real audio files
 
 use chrono::Utc;
-use conversion_features::{
+use tonepoet_features::{
     generate_cue_file, post_conversion_features, write_conversion_log, ConversionConfig,
     ConversionResult, ConversionStatus,
 };
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 1: Generate log file
     println!("\n📄 Generating log file...");
-    match write_conversion_log(&output_dir, &conversion_results, &config).await {
+    match write_conversion_log(&output_dir, &conversion_results, &config, None).await {
         Ok(log_path) => {
             println!("✅ Log file created: {}", log_path.display());
 
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 3: Use integration function
     println!("\n🔄 Testing integrated post_conversion_features...");
     let result =
-        post_conversion_features(&output_dir, &conversion_results, &output_files, &config).await;
+        post_conversion_features(&output_dir, &conversion_results, &output_files, &config, None).await;
 
     match result {
         Ok(_) => println!("✅ Integration function successful"),
@@ -185,6 +185,9 @@ async fn create_results_from_files(
             } else {
                 None
             },
+            replaygain_values: None,
+            source_info: None,
+            conversion_pipeline: None,
         });
     }
 

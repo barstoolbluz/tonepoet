@@ -1,13 +1,16 @@
 //! Integration layer tests
 
-use conversion_backend::integration::*;
-use conversion_backend::types::*;
+use tonepoet_backend::integration::*;
+use tonepoet_backend::types::*;
 
 #[test]
 fn test_resample_quality_preservation() {
     // Test that resample_quality is no longer lost in mapping
     let item = ConversionItem {
         id: "test".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::Aiff,
         options: MainConversionOptions {
             quality: MainQualitySettings::Aiff {
@@ -17,6 +20,17 @@ fn test_resample_quality_preservation() {
             calculate_replaygain: false,
             overwrite: true,
             resample_quality: Some(0), // Ultra quality - this was being lost!
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            // The mapper reads target_sample_rate for ALL formats; the
+            // quality-embedded sample_rate is no longer consulted.
+            target_sample_rate: Some(192000),
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 
@@ -36,6 +50,9 @@ fn test_aac_profile_preservation() {
     // Test that AAC profile is no longer lost in mapping
     let item = ConversionItem {
         id: "test".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::Aac,
         options: MainConversionOptions {
             quality: MainQualitySettings::Aac {
@@ -45,6 +62,15 @@ fn test_aac_profile_preservation() {
             calculate_replaygain: false,
             overwrite: true,
             resample_quality: Some(2), // HQ
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 
@@ -62,6 +88,9 @@ fn test_wavpack_mapping_improvement() {
     // Test that WavPack settings are now mapped instead of ignored
     let item = ConversionItem {
         id: "test".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::WavPack,
         options: MainConversionOptions {
             quality: MainQualitySettings::WavPack {
@@ -72,6 +101,15 @@ fn test_wavpack_mapping_improvement() {
             calculate_replaygain: false,
             overwrite: true,
             resample_quality: Some(3), // MQ
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 
@@ -91,6 +129,9 @@ fn test_opus_complexity_todo() {
     // Test demonstrates Opus complexity field that needs mapping
     let item = ConversionItem {
         id: "test".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
         output_format: MainAudioFormat::Opus,
         options: MainConversionOptions {
             quality: MainQualitySettings::Opus {
@@ -100,6 +141,15 @@ fn test_opus_complexity_todo() {
             calculate_replaygain: false,
             overwrite: true,
             resample_quality: Some(1), // VHQ
+            replaygain_mode: None,
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
         },
     };
 

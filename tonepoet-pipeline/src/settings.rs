@@ -501,6 +501,7 @@ pub struct FlacSettings {
     pub write_md5: bool,
 }
 
+#[cfg(feature = "serde")]
 fn default_true() -> bool { true }
 
 impl Default for FlacSettings {

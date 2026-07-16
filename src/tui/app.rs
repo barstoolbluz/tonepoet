@@ -2313,33 +2313,47 @@ mod clamp_pill_tests {
         );
     }
 
+    fn format_round_trip(format: &mut FormatState, to: AudioFormat, source_rate: u32) {
+        use super::{BitDepthChoice, FormatField};
+        let before = *format.format.selected_value();
+        format.format.select_value(&to);
+        format.after_user_selection(
+            FormatField::Format,
+            before,
+            BitDepthChoice::Int24,
+            Some(24),
+            Some(source_rate),
+        );
+    }
+
     #[test]
     fn dsd_fallback_restores_probed_pcm_source_rate() {
-        use super::{BitDepthChoice, FormatField};
         let mut format = FormatState::new();
         format.sample_rate.select_value(&96_000);
-        let before = *format.format.selected_value();
-        format.format.select_value(&AudioFormat::Dsf);
-        format.after_user_selection(
-            FormatField::Format,
-            before,
-            BitDepthChoice::Int24,
-            Some(24),
-            Some(96_000),
+        format_round_trip(&mut format, AudioFormat::Dsf, 96_000);
+        assert!(
+            *format.sample_rate.selected_value() >= 2_822_400,
+            "DSF leg must land on a DSD rate for this test to be meaningful"
         );
-        let before = *format.format.selected_value();
-        format.format.select_value(&AudioFormat::Wav);
-        format.after_user_selection(
-            FormatField::Format,
-            before,
-            BitDepthChoice::Int24,
-            Some(24),
-            Some(96_000),
-        );
+        format_round_trip(&mut format, AudioFormat::Wav, 96_000);
         assert_eq!(
             format.sample_rate.selected_value(),
             &96_000,
             "a DSF round-trip on a 96 kHz source must return to the source rate"
+        );
+    }
+
+    #[test]
+    fn dsd_round_trip_preserves_deliberate_manual_downsample() {
+        let mut format = FormatState::new();
+        // 96 kHz source, but the user deliberately staged a 44.1 downsample.
+        format.sample_rate.select_value(&44_100);
+        format_round_trip(&mut format, AudioFormat::Dsf, 96_000);
+        format_round_trip(&mut format, AudioFormat::Wav, 96_000);
+        assert_eq!(
+            format.sample_rate.selected_value(),
+            &44_100,
+            "the round-trip must restore the user's staged rate, not the source rate"
         );
     }
 
@@ -2802,6 +2816,10 @@ pub struct FormatState {
     pub dither_overridden: bool,
     /// False until the user explicitly picks a resampler. Rate/source changes may reset it.
     pub resampler_overridden: bool,
+    /// PCM rate selected before the user switched to a DSD format, so a
+    /// DSD round-trip restores the exact prior selection (deliberate
+    /// downsamples included) instead of guessing from the source rate.
+    pub pcm_rate_before_dsd: Option<u32>,
     /// Selected container index into `AudioFormat::available_containers()`.
     /// 0 = codec default. Reset to 0 when the format pill changes.
     pub selected_container_index: usize,
@@ -3032,6 +3050,7 @@ impl FormatState {
             advanced_open: false,
             dither_overridden: false,
             resampler_overridden: false,
+            pcm_rate_before_dsd: None,
             selected_container_index: 0,
             flac_compression_level: 8,
             flac_verify: PillState::new(vec![
@@ -3376,7 +3395,7 @@ impl FormatState {
         self.after_user_selection(row, before_format, before_depth, source_bits, source_rate);
     }
 
-    fn after_user_selection(
+    pub(crate) fn after_user_selection(
         &mut self,
         row: FormatField,
         before_format: AudioFormat,
@@ -3395,19 +3414,25 @@ impl FormatState {
             self.selected_container_index = 0;
             self.resampler_overridden = false;
             let rate_before = *self.sample_rate.selected_value();
+            let rate_before_was_dsd =
+                tonepoet_pipeline::DsdRate::from_hz(rate_before).is_some();
             self.apply_format_constraints();
             if self.is_dsd_selected() {
+                if !rate_before_was_dsd {
+                    self.pcm_rate_before_dsd = Some(rate_before);
+                }
                 self.dither.select_value(&DitherType::None);
                 self.cascade_dsd_rate_defaults();
             } else {
                 // A DSD-rate selection just fell back to the lowest PCM rate
-                // (clamp_sample_rate_pill). For a probed PCM source the honest
-                // default is the source rate — a DSF round-trip on a 96 kHz
-                // source must not arm a silent 96 -> 44.1 downsample. DSD
-                // sources refuse here (their rate is not a PCM option) and are
-                // handled by cascade_dsd_source_to_pcm_defaults.
-                if tonepoet_pipeline::DsdRate::from_hz(rate_before).is_some() {
-                    if let Some(rate) = source_rate {
+                // (clamp_sample_rate_pill). Restore the PCM rate the user had
+                // before entering DSD (preserving deliberate downsamples),
+                // falling back to the probed source rate — a DSF round-trip
+                // on a 96 kHz source must not arm a silent 96 -> 44.1
+                // downsample. DSD-source rates refuse here (not PCM options)
+                // and are handled by cascade_dsd_source_to_pcm_defaults.
+                if rate_before_was_dsd {
+                    if let Some(rate) = self.pcm_rate_before_dsd.take().or(source_rate) {
                         self.sample_rate.select_value(&rate);
                     }
                 }

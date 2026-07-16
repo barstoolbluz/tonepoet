@@ -508,11 +508,15 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
 #[cfg(feature = "serde")]
 #[test]
 fn serde_recursive_field_count_matches_checked_inventory_for_known_shapes() {
+    // Counts re-baselined 2026-07-15: this serde-gated sentinel only runs
+    // under workspace feature unification and had been dark while settings
+    // grew (56 -> 79 / 63 -> 86). The mutation-inventory test above is the
+    // authoritative drift guard; this pins raw serialized shape.
     let default = serde_json::to_value(PipelineSettings::default()).unwrap();
     let sentinel = serde_json::to_value(flac_md5_sentinel()).unwrap();
 
-    assert_eq!(recursive_object_key_count(&default), 56);
-    assert_eq!(recursive_object_key_count(&sentinel), 63);
+    assert_eq!(recursive_object_key_count(&default), 79);
+    assert_eq!(recursive_object_key_count(&sentinel), 86);
 }
 
 #[cfg(feature = "serde")]

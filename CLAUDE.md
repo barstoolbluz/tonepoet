@@ -15,7 +15,9 @@ nix develop --extra-experimental-features 'nix-command flakes'
 # Inside the dev shell:
 cargo build                  # Debug build
 cargo build --release        # Release build
-cargo test                   # Run all workspace tests
+cargo test --workspace       # Run ALL workspace tests (plain `cargo test` only
+                             # tests the root package — sub-crate tests went
+                             # dark for months under it; always use --workspace)
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
 cargo check                  # Fast type check
@@ -186,9 +188,10 @@ The `FormatState::apply_format_constraints()` method recalculates available opti
 ## Testing
 
 ```bash
-cargo test                          # All workspace tests
-cargo test -p tonepoet-backend     # 16 tests: ffmpeg builders, integration, channels
-cargo test -p tonepoet-features    # 14 tests: log writer, CUE generator
+cargo test --workspace              # All workspace tests (NOT plain `cargo test`,
+                                    # which silently skips every sub-crate)
+cargo test -p tonepoet-backend     # ffmpeg builders, integration, channels
+cargo test -p tonepoet-features    # log writer, CUE generator
 ```
 
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The main crate has 2500+ tests across all binaries. Run `cargo test` for the full suite.
