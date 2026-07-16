@@ -149,6 +149,23 @@ fn invalid_pcm_target_rejects_dsd_rate() {
 }
 
 #[test]
+fn pcm_lossless_source_target_requires_authoritative_source_depth() {
+    let mut settings = PipelineSettings::default();
+    settings.target_bit_depth = BitDepthTarget::Source;
+    settings.force_encode = true;
+    let mut req = request(settings);
+    req.source.bit_depth = None;
+
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSource {
+            field: "bit_depth",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn high_rate_pcm_is_not_misclassified_as_dsd() {
     let source = SourceInfo {
         format: AudioFormat::Wav,
@@ -200,6 +217,38 @@ fn dsd_to_pcm_uses_sox() {
     let plan = plan_conversion(&req).unwrap();
     assert_eq!(plan.commands()[0].tool, ToolIdentifier::Sox);
     assert!(plan.commands()[0].args.iter().any(|arg| arg == "88200"));
+}
+
+#[test]
+fn dsd_to_pcm_source_depth_is_undefined_and_rejected() {
+    let mut settings = PipelineSettings::default();
+    settings.target_sample_rate = RateTarget::PcmHz(88_200);
+    settings.target_bit_depth = BitDepthTarget::Source;
+    let req = PlanRequest {
+        input_path: PathBuf::from("in.dsf"),
+        output_path: PathBuf::from("out.flac"),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+            bit_depth: None,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
+    };
+
+    assert!(matches!(
+        plan_conversion(&req),
+        Err(PlanningError::InvalidSource {
+            field: "bit_depth",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -468,6 +517,7 @@ fn dsd_sinc_transition_width_shapes_sox_command() {
 fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
     let mut auto = PipelineSettings::default();
     auto.target_sample_rate = RateTarget::PcmHz(88_200);
+    auto.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
     auto.resample_quality = ResampleQuality::Low;
     auto.dsd.dsd_to_pcm_lowpass = DsdLowpassMethod::Auto;
 
@@ -619,6 +669,39 @@ fn sox_selected_encode_gets_metadata_transfer_step() {
 }
 
 #[test]
+fn flac_int32_forced_sox_routes_encode_through_ffmpeg_experimental() {
+    let mut settings = PipelineSettings::default();
+    settings.force_encode = true;
+    settings.target_format = AudioFormat::Flac;
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+    settings.preferred_tool = PreferredTool::Sox;
+
+    let plan = plan_conversion(&request(settings))
+        .expect("true 32-bit FLAC must remain plannable when Sox is preferred");
+    let encode = plan
+        .commands()
+        .iter()
+        .find(|command| command.description.contains("32-bit FLAC"))
+        .expect("planner must expose the selected true-32-bit FLAC route");
+
+    assert_eq!(encode.tool, ToolIdentifier::Ffmpeg);
+    assert!(
+        encode
+            .args
+            .windows(2)
+            .any(|args| args[0] == "-strict" && args[1] == "experimental"),
+        "FFmpeg true-32-bit FLAC route must opt into the experimental encoder: {:?}",
+        encode.args
+    );
+    assert!(
+        plan.commands()
+            .iter()
+            .all(|command| command.tool != ToolIdentifier::Sox),
+        "Sox must never encode a true 32-bit FLAC target"
+    );
+}
+
+#[test]
 fn wav_artwork_preservation_needs_a_metadata_plugin() {
     let mut settings = PipelineSettings::default();
     settings.target_format = AudioFormat::Wav;
@@ -702,4 +785,119 @@ fn ssrc_force_without_rate_change_is_rejected() {
             ..
         })
     ));
+}
+
+fn dsd_request_for(format: AudioFormat, depth: PcmBitDepth, extension: &str) -> PlanRequest {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = format;
+    settings.target_sample_rate = RateTarget::PcmHz(88_200);
+    settings.target_bit_depth = BitDepthTarget::Pcm(depth);
+    settings.force_encode = true;
+    PlanRequest {
+        input_path: PathBuf::from("in.dsf"),
+        output_path: PathBuf::from(format!("out.{extension}")),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+            bit_depth: None,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
+    }
+}
+
+#[test]
+fn source_resolved_int32_alac_is_rejected_through_public_planner() {
+    let mut settings = PipelineSettings::default();
+    settings.target_format = AudioFormat::Alac;
+    settings.target_bit_depth = BitDepthTarget::Source;
+    settings.force_encode = true;
+    let req = PlanRequest {
+        input_path: PathBuf::from("in.wav"),
+        output_path: PathBuf::from("out.m4a"),
+        source: SourceInfo {
+            format: AudioFormat::Wav,
+            codec: AudioCodec::PcmSigned,
+            sample_rate_hz: Some(96_000),
+            bit_depth: Some(PcmBitDepth::Int32),
+            sample_kind: Some(SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(PathBuf::from("work")),
+        container_ffmpeg_flags: Vec::new(),
+    };
+    let err = plan_conversion(&req).expect_err("ALAC Source over Int32 must fail closed");
+    match err {
+        PlanningError::InvalidSettings { field, reason } => {
+            assert_eq!(field, "target_bit_depth");
+            assert!(reason.contains("ALAC 32-bit"), "{reason}");
+        }
+        other => panic!("unexpected planning error: {other}"),
+    }
+}
+
+#[test]
+fn dsd_to_flac_int32_routes_through_wav_then_ffmpeg_experimental() {
+    let plan = plan_conversion(&dsd_request_for(
+        AudioFormat::Flac,
+        PcmBitDepth::Int32,
+        "flac",
+    ))
+    .expect("DSD to true 32-bit FLAC should be plannable");
+    let commands = plan.commands();
+    assert!(commands.len() >= 2, "expected DSD intermediate plus final encode");
+    assert_eq!(commands[0].tool, ToolIdentifier::Sox);
+    assert_eq!(commands[1].tool, ToolIdentifier::Ffmpeg);
+    assert!(commands[1]
+        .args
+        .windows(2)
+        .any(|args| args[0] == "-strict" && args[1] == "experimental"));
+    assert!(commands[1].description.contains("32-bit FLAC"));
+    assert!(commands[0]
+        .output
+        .as_path()
+        .and_then(|path| path.extension())
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav")));
+}
+
+#[test]
+fn dsd_to_aiff_float32_routes_through_wav_then_ffmpeg() {
+    let mut request = dsd_request_for(AudioFormat::Aiff, PcmBitDepth::Float32, "aiff");
+    // AIFF has no ffmpeg metadata-transfer support; the production bridge
+    // downgrades the metadata policy before planning, so mirror that here.
+    request.settings.metadata.transfer_tags = false;
+    request.settings.metadata.preserve_artwork = false;
+    let plan = plan_conversion(&request).expect("DSD to float AIFF should be plannable");
+    let commands = plan.commands();
+    assert!(commands.len() >= 2, "expected DSD intermediate plus final encode");
+    assert_eq!(commands[0].tool, ToolIdentifier::Sox);
+    assert_eq!(commands[1].tool, ToolIdentifier::Ffmpeg);
+    assert!(commands[1].args.iter().any(|arg| arg == "pcm_f32be"));
+}
+
+#[test]
+fn dsd_to_wavpack_float32_is_rejected_through_public_planner() {
+    let err = plan_conversion(&dsd_request_for(
+        AudioFormat::WavPack,
+        PcmBitDepth::Float32,
+        "wv",
+    ))
+    .expect_err("unsupported WavPack float must fail before command construction");
+    match err {
+        PlanningError::InvalidSettings { field, reason } => {
+            assert_eq!(field, "target_bit_depth");
+            assert!(reason.contains("floating-point WavPack"), "{reason}");
+        }
+        other => panic!("unexpected planning error: {other}"),
+    }
 }

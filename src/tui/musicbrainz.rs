@@ -39,6 +39,9 @@ pub struct MbRelease {
     /// (which can't be unambiguously embedded into one file).
     pub disc_count: usize,
     pub tracks: Vec<MbTrack>,
+    /// Parse-integrity failure for an advertised MB track list. Callers must
+    /// refuse mutation rather than applying a silently truncated projection.
+    pub track_parse_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1035,12 +1038,83 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
         .and_then(|v| v.as_array())
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let pick_medium = pick_medium_for_release(media, n_tracks);
-    let tracks = pick_medium
-        .and_then(|m| m.get("tracks"))
-        .and_then(|t| t.as_array())
-        .map(|tracks| tracks.iter().filter_map(track_from_json).collect())
-        .unwrap_or_default();
+    let exact_single_medium = n_tracks > 0
+        && media
+            .iter()
+            .any(|medium| medium_track_count(medium) == n_tracks as u64);
+    let aggregate_track_count: usize = media
+        .iter()
+        .map(|medium| medium_track_count(medium) as usize)
+        .sum();
+    let (tracks, advertised_track_count) = if !exact_single_medium
+        && media.len() > 1
+        && n_tracks > 0
+    {
+        let mut global_position = 0u32;
+        let tracks: Vec<MbTrack> = media
+            .iter()
+            .flat_map(|medium| {
+                medium
+                    .get("tracks")
+                    .and_then(|tracks| tracks.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(track_from_json)
+            .map(|mut track| {
+                global_position = global_position.saturating_add(1);
+                track.position = global_position;
+                track
+            })
+            .collect();
+        (tracks, Some(aggregate_track_count))
+    } else if let Some(medium) = pick_medium_for_release(media, n_tracks) {
+        let track_values = medium.get("tracks").and_then(|t| t.as_array());
+        let advertised = usize::try_from(medium_track_count(medium)).ok();
+        let tracks = track_values
+            .map(|tracks| tracks.iter().filter_map(track_from_json).collect())
+            .unwrap_or_default();
+        (tracks, advertised)
+    } else {
+        (Vec::new(), None)
+    };
+    let has_track_payload = media.iter().any(|medium| {
+        medium
+            .get("tracks")
+            .and_then(|tracks| tracks.as_array())
+            .is_some()
+    });
+    // Search-endpoint rows are intentionally shallow and advertise counts
+    // without carrying `tracks[]`; only detailed payloads can be judged for
+    // parse completeness. Once tracks are present, require both advertised
+    // count integrity and exact dimensional agreement with the editor before
+    // any mutation is allowed.
+    let track_parse_error = if has_track_payload {
+        if let Some(advertised) = advertised_track_count {
+            if advertised != tracks.len() {
+                Some(format!(
+                    "MusicBrainz advertised {advertised} tracks but only {} parsed",
+                    tracks.len()
+                ))
+            } else if n_tracks > 0 && tracks.len() != n_tracks {
+                Some(format!(
+                    "MusicBrainz track projection parsed {} tracks but the editor expects {n_tracks}",
+                    tracks.len()
+                ))
+            } else {
+                None
+            }
+        } else if n_tracks > 0 && tracks.len() != n_tracks {
+            Some(format!(
+                "MusicBrainz track projection parsed {} tracks but the editor expects {n_tracks}",
+                tracks.len()
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     MbRelease {
         release_id,
@@ -1055,6 +1129,7 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
         barcode,
         disc_count: media.len(),
         tracks,
+        track_parse_error,
     }
 }
 
@@ -1155,6 +1230,19 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     release: &MbRelease,
     decision: &PerTrackDecision,
 ) {
+    populate_editor_mb_supplemental_scoped(state, release, decision, true);
+}
+
+/// Populate MB supplemental fields while optionally withholding every
+/// album-scoped value. Group-local MusicBrainz matches use this to update only
+/// the addressed track rows without stamping partial-release identity across
+/// every member image in a unified album.
+pub fn populate_editor_mb_supplemental_scoped(
+    state: &mut crate::tui::app::MetadataEditorState,
+    release: &MbRelease,
+    decision: &PerTrackDecision,
+    apply_album_fields: bool,
+) {
     use lofty::tag::ItemKey;
 
     let file_dim = state.active_surface().paths.len().max(1);
@@ -1186,6 +1274,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
             return i;
         }
         entries.push(crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: key.to_string(),
             item_key,
             value: String::new(),
@@ -1260,6 +1349,11 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     } else {
         None
     };
+    if let Some(idx) = isrc_idx {
+        if unified || per_track_populate {
+            state.active_surface_mut().entries[idx].row_scope = crate::tui::probe::RowScope::Track;
+        }
+    }
     let recording_idx = if any_recording {
         Some(find_or_create(
             &mut state.active_surface_mut().entries,
@@ -1300,7 +1394,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
         .or(release.barcode.as_deref())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let catalog_idx = if catalog_value.is_some() {
+    let catalog_idx = if apply_album_fields && catalog_value.is_some() {
         Some(find_or_create(
             &mut state.active_surface_mut().entries,
             "CATALOGNUMBER",
@@ -1310,7 +1404,7 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     } else {
         None
     };
-    let album_id_idx = if !release.release_id.is_empty() {
+    let album_id_idx = if apply_album_fields && !release.release_id.is_empty() {
         Some(find_or_create(
             &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_ALBUMID",
@@ -1320,7 +1414,9 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     } else {
         None
     };
-    let album_artist_id_idx = if release.artist_id.as_deref().is_some_and(|s| !s.is_empty()) {
+    let album_artist_id_idx = if apply_album_fields
+        && release.artist_id.as_deref().is_some_and(|s| !s.is_empty())
+    {
         Some(find_or_create(
             &mut state.active_surface_mut().entries,
             "MUSICBRAINZ_ALBUMARTISTID",
@@ -1330,7 +1426,8 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     } else {
         None
     };
-    let release_group_idx = if release
+    let release_group_idx = if apply_album_fields
+        && release
         .release_group_id
         .as_deref()
         .is_some_and(|s| !s.is_empty())
@@ -1344,7 +1441,8 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     } else {
         None
     };
-    let original_date_idx = if release
+    let original_date_idx = if apply_album_fields
+        && release
         .original_date
         .as_deref()
         .is_some_and(|s| !s.is_empty())
@@ -1358,7 +1456,9 @@ pub fn populate_editor_mb_supplemental_with_per_track_decision(
     } else {
         None
     };
-    let country_idx = if release.country.as_deref().is_some_and(|s| !s.is_empty()) {
+    let country_idx = if apply_album_fields
+        && release.country.as_deref().is_some_and(|s| !s.is_empty())
+    {
         Some(find_or_create(
             &mut state.active_surface_mut().entries,
             "RELEASECOUNTRY",
@@ -1510,12 +1610,17 @@ pub fn track_count_mismatch_message(
     state: &crate::tui::app::MetadataEditorState,
     release: &MbRelease,
 ) -> Option<String> {
-    let n_files = state.active_surface().paths.len();
+    let surface = state.active_surface();
+    let editor_track_count = if surface.cue_album_synthetic_sheet.is_some() {
+        surface.file_labels.len().max(1)
+    } else {
+        surface.paths.len()
+    };
     let n_mb = release.tracks.len();
-    if n_files == 1 && n_mb > 1 {
+    if surface.paths.len() == 1 && n_mb > 1 {
         return None;
     }
-    count_mismatch_text(n_files, n_mb)
+    count_mismatch_text(editor_track_count, n_mb)
 }
 
 pub(super) fn count_mismatch_text(n_files: usize, n_mb: usize) -> Option<String> {
@@ -1658,6 +1763,7 @@ fn upsert_dvdv_duration_warning_entry(
         entry.mb_proposed_per_file = None;
     } else if !mismatches.is_empty() {
         state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: DVDV_DURATION_WARNING_KEY.to_string(),
             item_key: lofty::tag::ItemKey::Unknown(DVDV_DURATION_WARNING_KEY.to_string()),
             value: summary,
@@ -1814,9 +1920,26 @@ pub fn populate_editor_from_mb_with_per_track_decision(
     release: &MbRelease,
     decision: &PerTrackDecision,
 ) {
+    populate_editor_from_mb_scoped(state, release, decision, true);
+}
+
+/// Populate a release into the editor while optionally preserving all
+/// album-scoped fields. `apply_album_fields == false` is reserved for a
+/// proper-prefix/group-local apply into a unified projection.
+pub fn populate_editor_from_mb_scoped(
+    state: &mut crate::tui::app::MetadataEditorState,
+    release: &MbRelease,
+    decision: &PerTrackDecision,
+    apply_album_fields: bool,
+) {
     use lofty::tag::ItemKey;
 
-    populate_editor_mb_supplemental_with_per_track_decision(state, release, decision);
+    populate_editor_mb_supplemental_scoped(
+        state,
+        release,
+        decision,
+        apply_album_fields,
+    );
 
     let unified = state.active_surface().cue_album_synthetic_sheet.is_some();
     let file_dim = state.active_surface().paths.len().max(1);
@@ -1846,6 +1969,7 @@ pub fn populate_editor_from_mb_with_per_track_decision(
             return i;
         }
         entries.push(crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: key.to_string(),
             item_key,
             value: String::new(),
@@ -1902,7 +2026,7 @@ pub fn populate_editor_from_mb_with_per_track_decision(
     } else {
         None
     };
-    let album_idx = if !release.title.is_empty() {
+    let album_idx = if apply_album_fields && !release.title.is_empty() {
         Some(find_or_create(
             &mut state.active_surface_mut().entries,
             "ALBUM",
@@ -1920,11 +2044,19 @@ pub fn populate_editor_from_mb_with_per_track_decision(
     let tn_idx = (!unified).then(|| {
         find_or_create(&mut state.active_surface_mut().entries, "TRACKNUMBER", ItemKey::TrackNumber, n)
     });
-    let date_idx = if release.year.as_deref().is_some_and(|s| !s.is_empty()) {
+    let date_idx = if apply_album_fields
+        && release.year.as_deref().is_some_and(|s| !s.is_empty())
+    {
         Some(find_or_create(&mut state.active_surface_mut().entries, "DATE", ItemKey::Year, album_dim))
     } else {
         None
     };
+
+    if unified || per_track_populate {
+        for idx in [title_idx, artist_idx].into_iter().flatten() {
+            state.active_surface_mut().entries[idx].row_scope = crate::tui::probe::RowScope::Track;
+        }
+    }
 
     // For pre-existing TITLE/ARTIST entries on a per-track-eligible
     // rip (Phase 2 may have parsed them from an embedded CUESHEET, or
@@ -2089,7 +2221,38 @@ pub fn populate_editor_from_mb_with_per_track_decision(
         }
     }
 
+    // `deleted` stores row indices, so preserve tombstone identity across
+    // the canonical MB re-sort instead of letting the indices drift onto
+    // unrelated fields.
+    let mut deleted_rows: Vec<_> = state
+        .active_surface()
+        .deleted
+        .iter()
+        .filter_map(|&idx| state.active_surface().entries.get(idx))
+        .map(|entry| {
+            (
+                entry.display_key.clone(),
+                format!("{:?}", entry.item_key),
+                entry.per_file_values.clone(),
+                entry.per_file_originals.clone(),
+            )
+        })
+        .collect();
     crate::tui::probe::sort_entries_standard_first(&mut state.active_surface_mut().entries);
+    let mut remapped_deleted = Vec::new();
+    for (idx, entry) in state.active_surface().entries.iter().enumerate() {
+        let fingerprint = (
+            entry.display_key.clone(),
+            format!("{:?}", entry.item_key),
+            entry.per_file_values.clone(),
+            entry.per_file_originals.clone(),
+        );
+        if let Some(pos) = deleted_rows.iter().position(|row| row == &fingerprint) {
+            remapped_deleted.push(idx);
+            deleted_rows.remove(pos);
+        }
+    }
+    state.active_surface_mut().deleted = remapped_deleted;
     state.active_surface_mut().dirty = true;
 }
 
@@ -2246,6 +2409,81 @@ fn artist_credit_string(value: Option<&serde_json::Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn two_lp_release_json(drop_last_track_position: bool) -> serde_json::Value {
+        let medium = |start: u32| {
+            let tracks: Vec<serde_json::Value> = (start..start + 5)
+                .map(|position| {
+                    if drop_last_track_position && position == 10 {
+                        serde_json::json!({ "title": "Malformed Track 10" })
+                    } else {
+                        serde_json::json!({
+                            "position": position - start + 1,
+                            "title": format!("Track {position}"),
+                            "recording": { "id": format!("recording-{position}") }
+                        })
+                    }
+                })
+                .collect();
+            serde_json::json!({
+                "track-count": 5,
+                "tracks": tracks
+            })
+        };
+        serde_json::json!({
+            "id": "release-2lp",
+            "title": "Double Album",
+            "artist-credit": [{ "artist": { "id": "artist", "name": "Artist" } }],
+            "media": [medium(1), medium(6)]
+        })
+    }
+
+    #[test]
+    fn release_from_json_flattens_two_lp_five_plus_five_in_global_order() {
+        let release = super::release_from_json(&two_lp_release_json(false), 10);
+        assert_eq!(release.disc_count, 2);
+        assert_eq!(release.tracks.len(), 10);
+        assert_eq!(
+            release.tracks.iter().map(|track| track.position).collect::<Vec<_>>(),
+            (1..=10).collect::<Vec<_>>()
+        );
+        assert_eq!(release.tracks.first().map(|track| track.title.as_str()), Some("Track 1"));
+        assert_eq!(release.tracks.last().map(|track| track.title.as_str()), Some("Track 10"));
+        assert!(release.track_parse_error.is_none());
+    }
+
+    #[test]
+    fn release_from_json_does_not_treat_shallow_search_rows_as_parse_failures() {
+        let release = super::release_from_json(
+            &serde_json::json!({
+                "id": "shallow-search-row",
+                "title": "Double Album",
+                "media": [
+                    { "track-count": 5 },
+                    { "track-count": 5 }
+                ]
+            }),
+            10,
+        );
+        assert!(release.tracks.is_empty());
+        assert!(release.track_parse_error.is_none());
+    }
+
+    #[test]
+    fn release_from_json_refuses_truncated_or_wrong_dimension_multi_medium_projection() {
+        let malformed = super::release_from_json(&two_lp_release_json(true), 10);
+        assert_eq!(malformed.tracks.len(), 9);
+        assert!(malformed
+            .track_parse_error
+            .as_deref()
+            .is_some_and(|error| error.contains("advertised 10 tracks") && error.contains("only 9 parsed")));
+
+        let wrong_dimension = super::release_from_json(&two_lp_release_json(false), 9);
+        assert!(wrong_dimension
+            .track_parse_error
+            .as_deref()
+            .is_some_and(|error| error.contains("parsed 10 tracks") && error.contains("editor expects 9")));
+    }
+
     // ── stub-drop TOC cascade ──────────────────────────────────────────
 
     // Real-world fixture lives in two_against_nature_frames_test_reexport():
@@ -2508,6 +2746,7 @@ mod tests {
             barcode: None,
             disc_count: 1,
             tracks,
+            track_parse_error: None,
         }
     }
 
@@ -3815,6 +4054,7 @@ mod tests {
                             TRACK 01 AUDIO\nTITLE \"Pre T1\"\nINDEX 01 00:00:00\n\
                             TRACK 02 AUDIO\nTITLE \"Pre T2\"\nINDEX 01 00:00:50\n";
         state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: "CUESHEET".to_string(),
             item_key: lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
             value: "<cue summary>".to_string(),

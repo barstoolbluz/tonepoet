@@ -4423,7 +4423,13 @@ fn draw_metadata_editor(
         } else if super::probe::is_synthetic_preview(entry) {
             // Multi-KB structured tag (CUESHEET): show summary instead
             // of raw multi-line content.
-            super::probe::cue_summary_string(&entry.value)
+            super::probe::cue_summary_string(
+                entry
+                    .per_file_values
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or(entry.value.as_str()),
+            )
         } else if entry.is_binary {
             entry.value.clone()
         } else {
@@ -7268,6 +7274,7 @@ fn draw_mb_select(
     button_map: &mut super::button_map::ButtonRenderMap,
     theme: super::theme::Theme,
 ) {
+    let verifying = !state.is_selecting();
     let area = f.size();
     let w = (area.width * 80 / 100)
         .max(60)
@@ -7285,7 +7292,11 @@ fn draw_mb_select(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.purple))
         .title(Span::styled(
-            format!(" MusicBrainz · {} matches ", state.releases.len()),
+            if verifying {
+                " MusicBrainz · verifying selection ".to_string()
+            } else {
+                format!(" MusicBrainz · {} matches ", state.releases.len())
+            },
             Style::default()
                 .fg(theme.purple)
                 .add_modifier(Modifier::BOLD),
@@ -7353,7 +7364,9 @@ fn draw_mb_select(
             let year = r.year.as_deref().unwrap_or("—");
             let cat = r.catalog.as_deref().or(r.barcode.as_deref()).unwrap_or("—");
             let body = format!("{}{}  {}  ·  {}  ·  {}", prefix, n, title, year, cat,);
-            let style = if is_cursor {
+            let style = if verifying {
+                Style::default().fg(theme.text_dim)
+            } else if is_cursor {
                 Style::default()
                     .fg(theme.text_bright)
                     .bg(theme.surface)
@@ -7363,10 +7376,12 @@ fn draw_mb_select(
             };
             // Register the row rect for mouse hit-testing.
             let visible_row = (i - scroll) as u16;
-            button_map.record_button(
-                super::button_map::TuiButton::MbSelectRow(i),
-                Rect::new(chunks[2].x, chunks[2].y + visible_row, chunks[2].width, 1),
-            );
+            if !verifying {
+                button_map.record_button(
+                    super::button_map::TuiButton::MbSelectRow(i),
+                    Rect::new(chunks[2].x, chunks[2].y + visible_row, chunks[2].width, 1),
+                );
+            }
             Line::from(Span::styled(body, style))
         })
         .collect();
@@ -7381,6 +7396,29 @@ fn draw_mb_select(
         chunks[3],
     );
     draw_mb_select_tracks(f, state, chunks[4], theme);
+
+    if verifying {
+        let prefix = " Verifying selected release against the source… ";
+        let cancel_label = " [Cancel] ";
+        let footer = Line::from(vec![
+            Span::styled(prefix, theme.muted()),
+            Span::styled(
+                cancel_label,
+                Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(footer), chunks[5]);
+        button_map.record_button(
+            super::button_map::TuiButton::MbSelectCancel,
+            Rect::new(
+                chunks[5].x + prefix.chars().count() as u16,
+                chunks[5].y,
+                cancel_label.chars().count() as u16,
+                1,
+            ),
+        );
+        return;
+    }
 
     // Footer pills: clickable Accept / Cancel + scroll hint.
     let accept_label = " [Accept] ";
@@ -7492,6 +7530,7 @@ mod tests {
 
     fn tag(display_key: &str, value: &str, per_file_values: Vec<&str>) -> TagEntry {
         TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: display_key.to_string(),
             item_key: ItemKey::TrackTitle,
             value: value.to_string(),

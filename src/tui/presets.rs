@@ -74,6 +74,33 @@ pub struct TuiPreset {
     pub actions: crate::convert::pipeline::ActionPipeline,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresetApplyReport {
+    /// Preset fields whose values could not be parsed or whose pill option was
+    /// unavailable/disabled under the resulting format constraints.
+    pub refused_fields: Vec<String>,
+}
+
+impl PresetApplyReport {
+    pub fn is_complete(&self) -> bool {
+        self.refused_fields.is_empty()
+    }
+
+    pub fn status_suffix(&self) -> String {
+        if self.refused_fields.is_empty() {
+            String::new()
+        } else {
+            format!("; refused fields: {}", self.refused_fields.join(", "))
+        }
+    }
+
+    fn record(&mut self, field: &str, applied: bool) {
+        if !applied && !self.refused_fields.iter().any(|existing| existing == field) {
+            self.refused_fields.push(field.to_string());
+        }
+    }
+}
+
 impl TuiPreset {
     /// Capture current pill state into a preset
     pub fn from_pill_state(
@@ -123,77 +150,127 @@ impl TuiPreset {
     }
 
     /// Apply preset values to pill state
+    /// A refused `select_value` only counts as a lost preset field when the
+    /// requested value differs from the current selection: presets snapshot
+    /// every pill (including format-disabled ones), so re-applying a pill's
+    /// own current/default value must not be reported as a refusal.
+    fn select_or_already<T: PartialEq + Clone>(
+        pill: &mut crate::tui::pill::PillState<T>,
+        value: &T,
+    ) -> bool {
+        pill.select_value(value) || pill.selected_value() == value
+    }
+
     pub fn apply_to_pills(
         &self,
         format_state: &mut FormatState,
         output_opts: &mut OutputOptionsState,
         metadata: &mut MetadataState,
-    ) {
-        // Format
-        if let Some(fmt) = parse_format(&self.format) {
-            format_state.format.select_value(&fmt);
-            format_state.apply_format_constraints();
+    ) -> PresetApplyReport {
+        let mut report = PresetApplyReport::default();
+
+        // Format first, because it controls which downstream pills are
+        // available. Invalid serialized values are surfaced rather than
+        // silently treated as a successful load.
+        match parse_format(&self.format) {
+            Some(fmt) => {
+                report.record("format", Self::select_or_already(&mut format_state.format, &fmt));
+                format_state.apply_format_constraints();
+            }
+            None => report.record("format", false),
         }
 
-        // Sample rate
-        format_state.sample_rate.select_value(&self.sample_rate);
+        report.record(
+            "sample_rate",
+            Self::select_or_already(&mut format_state.sample_rate, &self.sample_rate),
+        );
 
-        // Bit depth
-        if let Some(bd) = parse_bit_depth(&self.bit_depth) {
-            format_state.bit_depth.select_value(&bd);
+        match parse_bit_depth(&self.bit_depth) {
+            Some(value) => report.record("bit_depth", Self::select_or_already(&mut format_state.bit_depth, &value)),
+            None => report.record("bit_depth", false),
         }
-
-        // Dither
-        if let Some(dt) = parse_dither(&self.dither) {
-            format_state.dither.select_value(&dt);
+        match parse_dither(&self.dither) {
+            Some(value) => report.record("dither", Self::select_or_already(&mut format_state.dither, &value)),
+            None => report.record("dither", false),
         }
-
-        // ReplayGain
-        if let Some(rg) = parse_replaygain(&self.replaygain) {
-            format_state.replaygain.select_value(&rg);
+        match parse_replaygain(&self.replaygain) {
+            Some(value) => report.record(
+                "replaygain",
+                Self::select_or_already(&mut format_state.replaygain, &value),
+            ),
+            None => report.record("replaygain", false),
         }
-
-        if let Some(resampler) = parse_resampler(&self.resampler) {
-            format_state.resampler.select_value(&resampler);
+        match parse_resampler(&self.resampler) {
+            Some(value) => report.record(
+                "resampler",
+                Self::select_or_already(&mut format_state.resampler, &value),
+            ),
+            None => report.record("resampler", false),
         }
-        if let Some(ref shaper) = self.noise_shaper {
-            if let Some(value) = parse_noise_shaper(shaper) {
-                format_state.noise_shaper.select_value(&value);
+        if let Some(ref serialized) = self.noise_shaper {
+            match parse_noise_shaper(serialized) {
+                Some(value) => report.record(
+                    "noise_shaper",
+                    Self::select_or_already(&mut format_state.noise_shaper, &value),
+                ),
+                None => report.record("noise_shaper", false),
             }
         }
-        if let Some(order) = self.modulator_order.and_then(parse_modulator_order) {
-            format_state.modulator_order.select_value(&order);
+        if let Some(serialized) = self.modulator_order {
+            match parse_modulator_order(serialized) {
+                Some(value) => report.record(
+                    "modulator_order",
+                    Self::select_or_already(&mut format_state.modulator_order, &value),
+                ),
+                None => report.record("modulator_order", false),
+            }
         }
-        if let Some(ref preset) = self.dsd_filter_preset {
-            if let Some(value) = parse_dsd_filter_preset(preset) {
-                format_state.conversion_preset.select_value(&value);
+        if let Some(ref serialized) = self.dsd_filter_preset {
+            match parse_dsd_filter_preset(serialized) {
+                Some(value) => report.record(
+                    "dsd_filter_preset",
+                    Self::select_or_already(&mut format_state.conversion_preset, &value),
+                ),
+                None => report.record("dsd_filter_preset", false),
             }
         }
 
-        // Output options
-        if let Some(ref p) = self.dest_path {
-            output_opts.dest_path = Some(std::path::PathBuf::from(p));
+        if let Some(ref path) = self.dest_path {
+            output_opts.dest_path = Some(std::path::PathBuf::from(path));
         }
         output_opts.folder_template = self.folder_template.clone();
         output_opts.filename_template = self.filename_template.clone();
         output_opts.companion_extensions = self.companion_extensions.clone();
         output_opts.companion_folders = self.companion_folders.clone();
         output_opts.companion_exclude_files = self.companion_exclude_files.clone();
-        output_opts.force_encode.select_value(&self.force_encode);
-        output_opts.disc_subfolders.select_value(&self.disc_subfolders);
-        output_opts.write_log.select_value(&self.write_log);
+        report.record(
+            "force_encode",
+            output_opts.force_encode.select_value(&self.force_encode),
+        );
+        report.record(
+            "disc_subfolders",
+            output_opts.disc_subfolders.select_value(&self.disc_subfolders),
+        );
+        report.record(
+            "write_log",
+            output_opts.write_log.select_value(&self.write_log),
+        );
         output_opts.actions = self.actions.clone();
 
-        if let Some(mm) = parse_merge(&self.merge) {
-            output_opts.merge.select_value(&mm);
+        match parse_merge(&self.merge) {
+            Some(value) => report.record("merge", output_opts.merge.select_value(&value)),
+            None => report.record("merge", false),
         }
 
         metadata.album_artist_for_conversion = normalize_optional_text_override(
             self.album_artist_for_conversion.as_deref(),
         );
 
-        // Re-apply constraints after all pills are set
+        // A preset can request a value that becomes disabled after another
+        // field is applied. Re-run the cascade and verify the selected values
+        // remained representable; callers receive every refusal.
         format_state.apply_format_constraints();
+        report
     }
 
     /// Import from a legacy wizard ConversionPreset
@@ -641,6 +718,9 @@ fn parse_dither(s: &str) -> Option<DitherType> {
 
 fn parse_resampler(s: &str) -> Option<ResamplerChoice> {
     match s {
+        // from_pill_state serializes the pill label lowercased, and the
+        // default pill selection is None — the parser must round-trip it.
+        "none" | "off" => Some(ResamplerChoice::None),
         "sox" => Some(ResamplerChoice::Sox),
         "ssrc" => Some(ResamplerChoice::Ssrc),
         "soxr" => Some(ResamplerChoice::Soxr),
@@ -849,6 +929,39 @@ merge = "multi-file"
             &mut restored_metadata,
         );
         assert_eq!(restored_output.actions, output.actions);
+    }
+
+    #[test]
+    fn apply_to_pills_reports_values_refused_by_format_constraints_and_parsing() {
+        let format = FormatState::new();
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let mut preset = TuiPreset::from_pill_state("refused", &format, &output, &metadata);
+        preset.format = "alac".to_string();
+        preset.bit_depth = "32".to_string();
+        preset.merge = "not-a-merge-mode".to_string();
+
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+
+        assert_eq!(
+            report.refused_fields,
+            vec!["bit_depth".to_string(), "merge".to_string()]
+        );
+        assert!(!report.is_complete());
+        assert!(report.status_suffix().contains("bit_depth, merge"));
+        assert_eq!(*restored_format.format.selected_value(), AudioFormat::Alac);
+        assert_ne!(
+            *restored_format.bit_depth.selected_value(),
+            BitDepthChoice::Int32,
+            "ALAC must not silently retain the refused 32-bit selection"
+        );
     }
 
     #[test]

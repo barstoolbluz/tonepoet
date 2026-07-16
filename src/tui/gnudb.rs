@@ -413,6 +413,7 @@ pub fn populate_editor_from_review(
             return i;
         }
         entries.push(super::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: key.to_string(),
             item_key,
             value: String::new(),
@@ -455,6 +456,8 @@ pub fn populate_editor_from_review(
     let genre_idx = find_or_create(&mut state.active_surface_mut().entries, "GENRE", lofty::tag::ItemKey::Genre, n);
 
     if per_track_populate {
+        state.active_surface_mut().entries[title_idx].row_scope = super::probe::RowScope::Track;
+        state.active_surface_mut().entries[artist_idx].row_scope = super::probe::RowScope::Track;
         super::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[title_idx], track_dim);
         super::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[artist_idx], track_dim);
     }
@@ -775,6 +778,7 @@ mod gnudb_per_track_tests {
 
     fn cuesheet_entry(text: &str) -> TagEntry {
         TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: "CUESHEET".to_string(),
             item_key: lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
             value: "<cue summary>".to_string(),

@@ -1377,28 +1377,21 @@ pub fn execute_context_action(
             }
         }
         ContextAction::MbSelectAcceptCurrent => {
-            if let Some(mut state) = app.pending_mb_select.take() {
-                let idx = state.selected;
-                if idx < state.releases.len() {
-                    let releases = std::mem::take(&mut state.releases);
-                    let paths = std::mem::take(&mut state.paths);
-                    let editor_session = state.editor_session;
-                    super::event_loop::open_editor_with_mb_release_guarded(
-                        app, tx, releases, idx, paths, editor_session,
-                    );
-                } else {
-                    // Out-of-range — restore the picker.
-                    app.active_overlay = super::app::ActiveOverlay::MbSelect(state);
-                }
+            if let Some(state) = app.pending_mb_select.take() {
+                super::event_loop::accept_mb_select_release(app, tx, state);
             }
         }
         ContextAction::MbSelectCancelPicker => {
-            // Discard parked picker state; restore any parked editor
-            // (Phase C-2 SACD path) so the user lands back on the
-            // editor they came from rather than a blank screen.
-            app.pending_mb_select = None;
-            super::event_loop::restore_parked_editor(app);
-            app.set_status("MusicBrainz picker cancelled".to_string());
+            // Cancel only the operation that owns the parked picker. A stale
+            // context-menu action cannot release a newer workflow's latch.
+            if let Some(state) = app.pending_mb_select.take() {
+                let operation_id = state.operation_id;
+                if super::event_loop::cancel_mb_select_operation(app, operation_id) {
+                    app.set_status("MusicBrainz picker cancelled".to_string());
+                } else {
+                    app.active_overlay = super::app::ActiveOverlay::MbSelect(state);
+                }
+            }
         }
         ContextAction::CuePreviewSave => {
             // Reuse Command::Write — its handler consumes
@@ -1580,6 +1573,7 @@ pub fn execute_context_action(
             app.set_status(format!("Removed {} item(s)", removed));
         }
         ContextAction::RetryFailed => {
+            app.manager.invalidate_deferred_stop_requests();
             // Retry failed items by MOVING their records back into the active
             // queue (flipping statuses in place stranded Queued rows inside the
             // completed history that the processor never scans and persistence
@@ -2611,6 +2605,7 @@ mod tests {
 
         let entries = vec![
             TagEntry {
+                row_scope: crate::tui::probe::RowScope::File,
                 display_key: "TITLE".into(),
                 item_key: lofty::tag::ItemKey::TrackTitle,
                 value: "x".into(),
@@ -2623,6 +2618,7 @@ mod tests {
                 mb_proposed_per_file: None,
             },
             TagEntry {
+                row_scope: crate::tui::probe::RowScope::File,
                 display_key: "CUESHEET".into(),
                 item_key: lofty::tag::ItemKey::Unknown("CUESHEET".into()),
                 value: "FILE \"a.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".into(),

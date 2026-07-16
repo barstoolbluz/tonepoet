@@ -1,12 +1,13 @@
 //! PR 8 - CUE image materializer.
 //!
-//! Parses CUE image layouts and stages each CUE track as a bounded 32-bit
-//! signed PCM WAV file. The staged carrier is always `pcm_s32le`; the
+//! Parses CUE image layouts and stages each CUE track as a bounded PCM WAV
+//! carrier. Integer sources normalize to `pcm_s32le`; Float32/Float64 sources
+//! retain their sample class as `pcm_f32le`/`pcm_f64le`. The
 //! `PreparedTrack::bit_depth` field remains the original probed source-image
-//! bit depth so `target_bit_depth = Source` resolves to the source, not the
-//! carrier. Downstream planning receives a typed `CueSegmentCarrier` source
-//! fact and encodes the requested final target from that validated WAV instead
-//! of re-encoding through an intermediate FLAC carrier.
+//! representation so `target_bit_depth = Source` resolves to the source, not
+//! merely the carrier width. Downstream planning receives a typed
+//! `CueSegmentCarrier` fact and encodes the requested final target from that
+//! validated WAV instead of re-encoding through an intermediate FLAC carrier.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -40,6 +41,8 @@ struct AudioProbe {
     sample_rate: u32,
     total_samples: u64,
     exact_samples: bool,
+    /// Original source sample representation using the shared source-depth
+    /// convention: integer widths are literal bits; 320/640 are Float32/64.
     bit_depth: Option<u32>,
     codec_name: Option<String>,
     format_name: Option<String>,
@@ -90,23 +93,36 @@ impl Materializer for CueImageMaterializer {
         let unique_images = unique_existing_paths(&track_images);
 
         let mut probes = HashMap::new();
+        let mut decode_paths = HashMap::new();
         let mut image_metadata = HashMap::new();
         let mut image_artwork = HashMap::new();
         for image_path in &unique_images {
             if cancel.is_cancelled() {
                 return Err(MaterializeError::Cancelled);
             }
-            probes.insert(
-                path_identity(image_path),
-                probe_audio_image(image_path, runner, cancel).await?,
-            );
-            image_metadata.insert(path_identity(image_path), read_image_album_metadata(image_path));
+            let image_key = path_identity(image_path);
+            let (probe, decode_path, used_wvunpack_fallback) =
+                probe_cue_image_with_wavpack_fallback(
+                    image_path,
+                    staging,
+                    runner,
+                    cancel,
+                )
+                .await?;
+            probes.insert(image_key.clone(), probe);
+            decode_paths.insert(image_key.clone(), decode_path);
+            image_metadata.insert(image_key.clone(), read_image_album_metadata(image_path));
             let artwork = if req.settings.metadata.preserve_artwork {
-                extract_cue_image_artwork(image_path, staging, runner, cancel).await?
+                match extract_cue_image_artwork(image_path, staging, runner, cancel).await {
+                    Ok(artwork) => artwork,
+                    Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
+                    Err(_) if used_wvunpack_fallback => None,
+                    Err(err) => return Err(err),
+                }
             } else {
                 None
             };
-            image_artwork.insert(path_identity(image_path), artwork);
+            image_artwork.insert(image_key, artwork);
         }
 
         let boundaries = compute_track_boundaries_for_layout(
@@ -155,11 +171,19 @@ impl Materializer for CueImageMaterializer {
                 start_sample,
                 samples,
             );
-            stage_cue_segment_as_s32_wav(
-                image_path,
+            let decode_path = decode_paths.get(&image_key).ok_or_else(|| {
+                MaterializeError::Parse(format!(
+                    "missing decode source for CUE image {}",
+                    image_path.display()
+                ))
+            })?;
+            let carrier = CueSegmentCarrier::for_source_depth_descriptor(probe.bit_depth);
+            stage_cue_segment_as_wav(
+                decode_path,
                 start_sample,
                 samples,
                 probe.sample_rate,
+                carrier,
                 &staged_path,
                 runner,
                 cancel,
@@ -186,7 +210,7 @@ impl Materializer for CueImageMaterializer {
                     source_image: image_path.clone(),
                     start_sample,
                     samples,
-                    carrier: CueSegmentCarrier::PcmS32LeWav,
+                    carrier,
                 },
                 metadata,
                 expected_samples: Some(samples),
@@ -1079,6 +1103,156 @@ fn format_candidate_paths_for_error(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
+fn is_wavpack_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("wv"))
+        .unwrap_or(false)
+}
+
+fn staged_wavpack_decode_path(staging: &StagingDir, input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("wavpack-image")
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .collect::<String>();
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in path_identity(input).to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    staging
+        .root
+        .join("cue-decoded-images")
+        .join(format!("{stem}-{hash:016x}.wav"))
+}
+
+
+fn temporary_wavpack_decode_path(destination: &Path) -> Result<PathBuf, MaterializeError> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let random = random_temp_suffix()?;
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("wavpack-image");
+    let tmp_dir = destination
+        .parent()
+        .map(|parent| parent.join(".tmp"))
+        .unwrap_or_else(|| PathBuf::from(".tmp"));
+    // Keep a terminal .wav extension: wvunpack uses the requested output
+    // filename directly, and downstream ffprobe must see an unambiguous WAV
+    // carrier even while the file is private and unpublished.
+    Ok(tmp_dir.join(format!("{stem}.tmp.{pid}.{stamp}.{random}.wav")))
+}
+
+async fn decode_wavpack_image_for_cue(
+    input: &Path,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, MaterializeError> {
+    let destination = staged_wavpack_decode_path(staging, input);
+    if destination.exists() {
+        match probe_audio_image(&destination, runner, cancel).await {
+            Ok(_) => return Ok(destination),
+            Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
+            Err(_) => {}
+        }
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = temporary_wavpack_decode_path(&destination)?;
+    if let Some(parent) = temporary.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_path_if_exists(&temporary)?;
+    let command = ToolCommand {
+        binary: ToolBinary::Wvunpack,
+        args: vec![
+            "-q".into(),
+            "-o".into(),
+            temporary.display().to_string(),
+            input.display().to_string(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(15 * 60),
+    };
+    match runner.run(command, cancel).await {
+        Ok(_) => {}
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            let _ = remove_path_if_exists(&temporary);
+            return Err(MaterializeError::Cancelled);
+        }
+        Err(err) => {
+            let _ = remove_path_if_exists(&temporary);
+            return Err(MaterializeError::Parse(format!(
+                "ffmpeg could not read WavPack CUE image {}; wvunpack fallback failed: {err}",
+                input.display()
+            )));
+        }
+    }
+    if let Err(err) = probe_audio_image(&temporary, runner, cancel).await {
+        let _ = remove_path_if_exists(&temporary);
+        return Err(MaterializeError::Parse(format!(
+            "wvunpack produced an unusable decode for CUE image {}: {err}",
+            input.display()
+        )));
+    }
+    sync_file_to_storage(&temporary)?;
+    if destination.exists() {
+        match probe_audio_image(&destination, runner, cancel).await {
+            Ok(_) => {
+                let _ = remove_path_if_exists(&temporary);
+                return Ok(destination);
+            }
+            Err(MaterializeError::Cancelled) => {
+                let _ = remove_path_if_exists(&temporary);
+                return Err(MaterializeError::Cancelled);
+            }
+            Err(_) => {
+                remove_path_if_exists(&destination)?;
+            }
+        }
+    }
+    fs::rename(&temporary, &destination)?;
+    sync_parent_dir_best_effort(&destination);
+    Ok(destination)
+}
+
+async fn probe_cue_image_with_wavpack_fallback(
+    path: &Path,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(AudioProbe, PathBuf, bool), MaterializeError> {
+    match probe_audio_image(path, runner, cancel).await {
+        Ok(probe) => Ok((probe, path.to_path_buf(), false)),
+        Err(MaterializeError::Cancelled) => Err(MaterializeError::Cancelled),
+        Err(primary) if is_wavpack_path(path) => {
+            let decoded = decode_wavpack_image_for_cue(path, staging, runner, cancel).await?;
+            let probe = probe_audio_image(&decoded, runner, cancel).await.map_err(|fallback| {
+                MaterializeError::Parse(format!(
+                    "ffmpeg probe failed for WavPack CUE image {} ({primary}); decoded fallback {} also failed: {fallback}",
+                    path.display(),
+                    decoded.display()
+                ))
+            })?;
+            Ok((probe, decoded, true))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn probe_audio_image(
     path: &Path,
     runner: &dyn ToolRunner,
@@ -1093,7 +1267,7 @@ async fn probe_audio_image(
             "a:0".into(),
             "-count_frames".into(),
             "-show_entries".into(),
-            "stream=codec_name,sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
+            "stream=codec_name,sample_fmt,sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
                 .into(),
             "-show_entries".into(),
             "format=format_name,duration".into(),
@@ -1383,14 +1557,33 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
             "ffprobe returned no valid sample_rate".to_string(),
         ));
     }
-    let bit_depth = stream
+    let sample_fmt = stream
+        .get("sample_fmt")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty() && *value != "N/A")
+        .map(str::to_string);
+    let integer_bit_depth = stream
         .get("bits_per_raw_sample")
-        .or_else(|| stream.get("bits_per_sample"))
-        .and_then(json_u32_from_value);
+        .and_then(json_u32_from_value)
+        .or_else(|| {
+            stream
+                .get("bits_per_sample")
+                .and_then(json_u32_from_value)
+        });
     let codec_name = stream
         .get("codec_name")
         .and_then(|value| value.as_str())
-        .map(|value| value.to_string());
+        .filter(|value| !value.is_empty() && *value != "N/A")
+        .map(str::to_string);
+    let sample_fmt = sample_fmt.as_deref().unwrap_or_default();
+    let codec = codec_name.as_deref().unwrap_or_default();
+    let bit_depth = if sample_fmt.starts_with("flt") || codec.starts_with("pcm_f32") {
+        Some(320)
+    } else if sample_fmt.starts_with("dbl") || codec.starts_with("pcm_f64") {
+        Some(640)
+    } else {
+        integer_bit_depth
+    };
     let format_name = value
         .pointer("/format/format_name")
         .and_then(|value| value.as_str())
@@ -1611,6 +1804,7 @@ fn staged_cue_segment_path(
     ))
 }
 
+#[cfg(test)] // test-only shim over the typed-carrier path
 async fn stage_cue_segment_as_s32_wav(
     image: &Path,
     start_sample: u64,
@@ -1620,8 +1814,40 @@ async fn stage_cue_segment_as_s32_wav(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
+    stage_cue_segment_as_wav(
+        image,
+        start_sample,
+        samples,
+        sample_rate,
+        CueSegmentCarrier::PcmS32LeWav,
+        destination,
+        runner,
+        cancel,
+    )
+    .await
+}
+
+async fn stage_cue_segment_as_wav(
+    image: &Path,
+    start_sample: u64,
+    samples: u64,
+    sample_rate: u32,
+    carrier: CueSegmentCarrier,
+    destination: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
     if destination.exists() {
-        match validate_staged_cue_segment(destination, sample_rate, samples, runner, cancel).await {
+        match validate_staged_cue_segment_as(
+            destination,
+            sample_rate,
+            samples,
+            carrier,
+            runner,
+            cancel,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
             Err(_) => {
@@ -1644,15 +1870,22 @@ async fn stage_cue_segment_as_s32_wav(
     cleanup_old_temporary_segments(destination);
     remove_path_if_exists(&tmp_destination)?;
 
-    let cmd = cue_segment_ffmpeg_command(image, start_sample, samples, &tmp_destination)?;
+    let cmd = cue_segment_ffmpeg_command_for_carrier(
+        image,
+        start_sample,
+        samples,
+        carrier,
+        &tmp_destination,
+    )?;
 
     let run_result = runner.run(cmd, cancel).await;
     match run_result {
         Ok(_) => {
-            if let Err(err) = validate_staged_cue_segment(
+            if let Err(err) = validate_staged_cue_segment_as(
                 &tmp_destination,
                 sample_rate,
                 samples,
+                carrier,
                 runner,
                 cancel,
             )
@@ -1665,8 +1898,15 @@ async fn stage_cue_segment_as_s32_wav(
             sync_file_to_storage(&tmp_destination)?;
 
             if destination.exists() {
-                match validate_staged_cue_segment(destination, sample_rate, samples, runner, cancel)
-                    .await
+                match validate_staged_cue_segment_as(
+                    destination,
+                    sample_rate,
+                    samples,
+                    carrier,
+                    runner,
+                    cancel,
+                )
+                .await
                 {
                     Ok(()) => {
                         let _ = remove_path_if_exists(&tmp_destination);
@@ -1685,6 +1925,7 @@ async fn stage_cue_segment_as_s32_wav(
                 destination,
                 sample_rate,
                 samples,
+                carrier,
                 runner,
                 cancel,
             )
@@ -1706,10 +1947,30 @@ async fn stage_cue_segment_as_s32_wav(
     }
 }
 
+#[cfg(test)] // test-only shim over the typed-carrier path
 async fn validate_staged_cue_segment(
     path: &Path,
     expected_sample_rate: u32,
     expected_samples: u64,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    validate_staged_cue_segment_as(
+        path,
+        expected_sample_rate,
+        expected_samples,
+        CueSegmentCarrier::PcmS32LeWav,
+        runner,
+        cancel,
+    )
+    .await
+}
+
+async fn validate_staged_cue_segment_as(
+    path: &Path,
+    expected_sample_rate: u32,
+    expected_samples: u64,
+    carrier: CueSegmentCarrier,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
@@ -1749,11 +2010,12 @@ async fn validate_staged_cue_segment(
             expected_samples
         )));
     }
-    if probe.codec_name.as_deref() != Some("pcm_s32le") {
+    if probe.codec_name.as_deref() != Some(carrier.codec_name()) {
         return Err(MaterializeError::Parse(format!(
-            "staged CUE segment {} has codec {:?}, expected pcm_s32le",
+            "staged CUE segment {} has codec {:?}, expected {}",
             path.display(),
-            probe.codec_name
+            probe.codec_name,
+            carrier.codec_name()
         )));
     }
     if !probe
@@ -1785,7 +2047,7 @@ async fn probe_staged_cue_segment(
             "-select_streams".into(),
             "a:0".into(),
             "-show_entries".into(),
-            "stream=codec_name,sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
+            "stream=codec_name,sample_fmt,sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
                 .into(),
             "-show_entries".into(),
             "format=format_name,duration".into(),
@@ -1968,16 +2230,18 @@ async fn publish_validated_staged_segment(
     destination: &Path,
     expected_sample_rate: u32,
     expected_samples: u64,
+    carrier: CueSegmentCarrier,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<(), MaterializeError> {
     match fs::rename(tmp_destination, destination) {
         Ok(()) => {
             sync_parent_dir_best_effort(destination);
-            validate_staged_cue_segment(
+            validate_staged_cue_segment_as(
                 destination,
                 expected_sample_rate,
                 expected_samples,
+                carrier,
                 runner,
                 cancel,
             )
@@ -1990,10 +2254,11 @@ async fn publish_validated_staged_segment(
             // std-only fallback has an unavoidable remove+rename window, so before deleting
             // anything, re-check whether a concurrent worker has already published a valid
             // segment. If so, discard our temp and reuse the published file.
-            match validate_staged_cue_segment(
+            match validate_staged_cue_segment_as(
                 destination,
                 expected_sample_rate,
                 expected_samples,
+                carrier,
                 runner,
                 cancel,
             )
@@ -2016,10 +2281,11 @@ async fn publish_validated_staged_segment(
                     // Another concurrent worker may have published in the tiny interval
                     // after our delete/rename attempt. Prefer a valid destination over
                     // failing or overwriting it.
-                    match validate_staged_cue_segment(
+                    match validate_staged_cue_segment_as(
                         destination,
                         expected_sample_rate,
                         expected_samples,
+                        carrier,
                         runner,
                         cancel,
                     )
@@ -2054,10 +2320,11 @@ async fn publish_validated_staged_segment(
                 }
             }
             sync_parent_dir_best_effort(destination);
-            validate_staged_cue_segment(
+            validate_staged_cue_segment_as(
                 destination,
                 expected_sample_rate,
                 expected_samples,
+                carrier,
                 runner,
                 cancel,
             )
@@ -2090,10 +2357,27 @@ fn sync_parent_dir_best_effort(path: &Path) {
     }
 }
 
+#[cfg(test)] // test-only shim over the typed-carrier path
 fn cue_segment_ffmpeg_command(
     image: &Path,
     start_sample: u64,
     samples: u64,
+    destination: &Path,
+) -> Result<ToolCommand, MaterializeError> {
+    cue_segment_ffmpeg_command_for_carrier(
+        image,
+        start_sample,
+        samples,
+        CueSegmentCarrier::PcmS32LeWav,
+        destination,
+    )
+}
+
+fn cue_segment_ffmpeg_command_for_carrier(
+    image: &Path,
+    start_sample: u64,
+    samples: u64,
+    carrier: CueSegmentCarrier,
     destination: &Path,
 ) -> Result<ToolCommand, MaterializeError> {
     let filter = cue_segment_atrim_filter(start_sample, samples)?;
@@ -2117,7 +2401,7 @@ fn cue_segment_ffmpeg_command(
             "-f".into(),
             "wav".into(),
             "-c:a".into(),
-            "pcm_s32le".into(),
+            carrier.codec_name().into(),
             destination.display().to_string(),
         ],
         secret_args: vec![],
@@ -2747,6 +3031,32 @@ mod materializer_cue_tests {
   "format": {{}}
 }}"#
         )
+    }
+
+    #[test]
+    fn cue_probe_preserves_float32_sample_class_for_source_resolution() {
+        let probe = parse_audio_probe_json(
+            r#"{
+  "streams": [{
+    "codec_name": "pcm_f32le",
+    "sample_fmt": "flt",
+    "sample_rate": "96000",
+    "duration_ts": 96000,
+    "time_base": "1/96000",
+    "bits_per_raw_sample": "32"
+  }],
+  "format": { "format_name": "wav" }
+}"#,
+        )
+        .expect("parse float32 CUE image probe");
+
+        assert_eq!(probe.bit_depth, Some(320));
+        assert_eq!(
+            super::super::plan_bridge::pcm_bit_depth_from_source_bits(
+                probe.bit_depth.expect("source depth descriptor")
+            ),
+            Some(tonepoet_pipeline::PcmBitDepth::Float32)
+        );
     }
 
     fn ffprobe_json_approx(sample_rate: u32, duration_secs: f64) -> String {
@@ -4620,6 +4930,70 @@ FILE "side-b.flac" WAVE
             destination.metadata().expect("staged metadata").len() > 0,
             "published staged segment should be non-empty"
         );
+    }
+
+    #[tokio::test]
+    async fn real_ffmpeg_staging_preserves_float32_carrier_class_when_available() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("ffprobe") {
+            eprintln!(
+                "skipping real float CUE segment staging fixture: ffmpeg or ffprobe is unavailable"
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("source-f32.wav");
+        let destination = temp
+            .path()
+            .join("staging/cue-segments/track01-f32-s0-n22050.wav");
+
+        run_fixture_command(
+            std::process::Command::new("ffmpeg")
+                .arg("-y")
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg("anullsrc=r=44100:cl=mono:d=1")
+                .arg("-c:a")
+                .arg("pcm_f32le")
+                .arg(&image),
+        );
+
+        let runner = RealProcessToolRunner;
+        let cancel = CancellationToken::new();
+        let carrier = CueSegmentCarrier::PcmF32LeWav;
+        stage_cue_segment_as_wav(
+            &image,
+            0,
+            22_050,
+            44_100,
+            carrier,
+            &destination,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("real ffmpeg stages a Float32 CUE segment without integer quantization");
+
+        validate_staged_cue_segment_as(
+            &destination,
+            44_100,
+            22_050,
+            carrier,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect("real ffprobe validates staged pcm_f32le WAV sample count and class");
+
+        let probe = probe_staged_cue_segment(&destination, &runner, &cancel)
+            .await
+            .expect("probe staged Float32 carrier");
+        assert_eq!(probe.codec_name.as_deref(), Some("pcm_f32le"));
+        assert_eq!(probe.bit_depth, Some(320));
     }
 
     fn split_track_album_cue_fixture(dir: &Path, ref_ext: &str) -> Vec<std::path::PathBuf> {

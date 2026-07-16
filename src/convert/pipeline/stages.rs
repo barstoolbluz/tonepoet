@@ -936,7 +936,7 @@ async fn realize_track_with_tool_limits_and_stats(
                 dsd_dst_stats: dsd_dst_stats_from_file(path, Some(file_len(path).unwrap_or(0)), None),
             })
         }
-        TrackSourceRef::CueSegmentCarrier { path, carrier, .. } => {
+        TrackSourceRef::CueSegmentCarrier { path, .. } => {
             if !path.exists() {
                 return Err(ConvertError::TrackValidation(format!(
                     "staged CUE segment carrier does not exist: {}",
@@ -946,13 +946,6 @@ async fn realize_track_with_tool_limits_and_stats(
             if !path.is_file() {
                 return Err(ConvertError::TrackValidation(format!(
                     "staged CUE segment carrier is not a regular file: {}",
-                    path.display()
-                )));
-            }
-            if *carrier != CueSegmentCarrier::PcmS32LeWav {
-                return Err(ConvertError::TrackValidation(format!(
-                    "unsupported staged CUE segment carrier {:?} at {}",
-                    carrier,
                     path.display()
                 )));
             }
@@ -1555,17 +1548,17 @@ fn expected_post_encode_depth_for_track(
             class_strict: true,
         }),
         tonepoet_pipeline::BitDepthTarget::Source => {
-            pcm_bit_depth_from_source_bits(track.bit_depth.or(track.source_audio.bit_depth)).map(
-                |depth| PostEncodeDepthExpectation {
-                    depth,
-                    // Probes store float sources as plain 32-bit with no float
-                    // marker, so "same as source" can only assert the WIDTH:
-                    // a float-preserving passthrough measuring Float32 against
-                    // a source-resolved Int32 is correct output, while a real
-                    // 32 -> 24 downgrade still fails.
-                    class_strict: false,
-                },
-            )
+            if !settings.target_format.is_pcm_lossless() {
+                return None;
+            }
+            super::plan_bridge::resolve_source_pcm_depth(track).map(|depth| PostEncodeDepthExpectation {
+                depth,
+                // Source resolution preserves integer-versus-float class
+                // as well as width. Unknown source representation is rejected
+                // by the bridge before planning; validation never invents a
+                // target-format default and labels it as source-derived.
+                class_strict: true,
+            })
         }
     }
 }
@@ -1576,20 +1569,6 @@ struct PostEncodeDepthExpectation {
     class_strict: bool,
 }
 
-fn pcm_bit_depth_from_source_bits(bits: Option<u32>) -> Option<tonepoet_pipeline::PcmBitDepth> {
-    use tonepoet_pipeline::PcmBitDepth;
-    match bits {
-        Some(8) => Some(PcmBitDepth::Int8),
-        Some(16) => Some(PcmBitDepth::Int16),
-        Some(24) => Some(PcmBitDepth::Int24),
-        Some(32) => Some(PcmBitDepth::Int32),
-        // Legacy/UI source-depth convention: 320/640 encode float32/float64.
-        // Some older feature paths also used 33 for 32-bit float.
-        Some(33) | Some(320) => Some(PcmBitDepth::Float32),
-        Some(640) => Some(PcmBitDepth::Float64),
-        _ => None,
-    }
-}
 
 impl PostEncodeSampleExpectation {
     fn same_rate(samples: u64, sample_rate: Option<u32>) -> Self {
@@ -1691,7 +1670,9 @@ async fn validate_encoded_output_with_tool_limits(
         }
     }
 
-    let measured_depth = if expected_depth.is_some() {
+    let measured_depth = if expected_depth.is_some()
+        || matches!(target_format, tonepoet_pipeline::AudioFormat::WavPack)
+    {
         measured_pcm_depth_with_tool_limits(
             out_path,
             target_format,
@@ -1701,24 +1682,12 @@ async fn validate_encoded_output_with_tool_limits(
             tool_concurrency_limits,
         )
         .await?
-    } else if matches!(target_format, tonepoet_pipeline::AudioFormat::WavPack) {
-        wavpack_log_only_measured_depth(&probe)
     } else {
         measured_pcm_depth(&probe)
     };
 
     if let Some(expectation) = expected_depth {
         let Some(measured) = measured_depth else {
-            if matches!(target_format, tonepoet_pipeline::AudioFormat::WavPack) {
-                // The wvunpack oracle was unavailable (see
-                // probe_wavpack_depth_with_tool_limits); measurement is
-                // best-effort there, and the ffprobe fallback cannot
-                // distinguish 24-bit WavPack from its decoded s32p form.
-                return Ok(PostEncodeValidation {
-                    samples: actual,
-                    measured_depth: None,
-                });
-            }
             return Err(ConvertError::TrackValidation(format!(
                 "post-encode depth validation failed for {}: no usable sample format/depth (codec={:?}, sample_fmt={:?})",
                 out_path.display(), probe.codec_name, probe.sample_fmt
@@ -1849,16 +1818,15 @@ async fn probe_wavpack_depth_with_tool_limits(
             return Err(ConvertError::Realize("cancelled".to_string()));
         }
         Err(ToolRunnerError::Spawn { .. }) => {
-            // wvunpack is the only oracle that distinguishes 24-bit WavPack
-            // from its decoded s32p representation. On machines without it,
-            // depth measurement is best-effort: skip the assertion (the log
-            // then falls back to the planned depth) rather than failing every
-            // WavPack conversion after a successful encode.
-            log::warn!(
-                "wvunpack unavailable; skipping post-encode WavPack depth verification for {}",
+            // wvunpack is the only authoritative oracle that distinguishes
+            // integer WavPack depths from FFmpeg's decoded s32p view. An
+            // explicit or Source-resolved depth must therefore fail closed
+            // when the oracle is unavailable; publishing an unmeasured file
+            // would turn the conversion log into a repetition of intent.
+            return Err(ConvertError::TrackValidation(format!(
+                "post-encode WavPack depth validation failed for {}: wvunpack is required for authoritative depth measurement",
                 out_path.display()
-            );
-            return Ok(None);
+            )));
         }
         Err(err) => {
             return Err(ConvertError::TrackValidation(format!(
@@ -1929,74 +1897,6 @@ fn parse_wvunpack_source_depth(text: &str) -> Option<tonepoet_pipeline::PcmBitDe
 /// WavPack (verified against wvunpack -s). Float WavPack probes as fltp
 /// with bits_per_raw_sample=32 (bytes-per-sample, not an int width), so
 /// float is classified first. Anything else stays unmeasured.
-fn wavpack_log_only_measured_depth(
-    probe: &RealizedProbe,
-) -> Option<tonepoet_pipeline::PcmBitDepth> {
-    use tonepoet_pipeline::PcmBitDepth;
-    let sample_fmt = probe.sample_fmt.as_deref().unwrap_or_default();
-    if sample_fmt.starts_with("flt") {
-        return Some(PcmBitDepth::Float32);
-    }
-    if sample_fmt.starts_with("dbl") {
-        return Some(PcmBitDepth::Float64);
-    }
-    match probe.bits_per_raw_sample? {
-        8 => Some(PcmBitDepth::Int8),
-        16 => Some(PcmBitDepth::Int16),
-        24 => Some(PcmBitDepth::Int24),
-        32 => Some(PcmBitDepth::Int32),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod wavpack_log_only_depth_tests {
-    use super::*;
-
-    fn wv_probe(raw_bits: Option<u32>) -> RealizedProbe {
-        RealizedProbe {
-            sample_rate: 44_100,
-            samples: Some(8_820),
-            exact: true,
-            codec_name: Some("wavpack".to_string()),
-            sample_fmt: Some("s32p".to_string()),
-            bits_per_raw_sample: raw_bits,
-            bits_per_sample: None,
-        }
-    }
-
-    #[test]
-    fn trusts_container_accurate_raw_bits() {
-        assert_eq!(
-            wavpack_log_only_measured_depth(&wv_probe(Some(24))),
-            Some(tonepoet_pipeline::PcmBitDepth::Int24)
-        );
-        assert_eq!(
-            wavpack_log_only_measured_depth(&wv_probe(Some(32))),
-            Some(tonepoet_pipeline::PcmBitDepth::Int32)
-        );
-    }
-
-    #[test]
-    fn classifies_float_wavpack_before_trusting_raw_bits() {
-        // Float .wv probes as fltp with bits_per_raw_sample=32 (a byte
-        // width, not an integer depth) — must not be recorded as Int32.
-        let mut probe = wv_probe(Some(32));
-        probe.sample_fmt = Some("fltp".to_string());
-        assert_eq!(
-            wavpack_log_only_measured_depth(&probe),
-            Some(tonepoet_pipeline::PcmBitDepth::Float32)
-        );
-    }
-
-    #[test]
-    fn stays_unmeasured_without_raw_bits() {
-        // sample_fmt=s32p is the decoded form, not the container depth —
-        // the log-side WavPack probe must not derive anything from it.
-        assert_eq!(wavpack_log_only_measured_depth(&wv_probe(None)), None);
-    }
-}
-
 fn measured_pcm_depth(probe: &RealizedProbe) -> Option<tonepoet_pipeline::PcmBitDepth> {
     use tonepoet_pipeline::PcmBitDepth;
     let sample_fmt = probe.sample_fmt.as_deref().unwrap_or_default();
@@ -3990,7 +3890,8 @@ fn cue_artwork_sidecar_from_album_metadata(album: &AlbumMetadata) -> Option<CueA
 
 /// Apply metadata tags and CUE artwork to staged audio artifacts.
 ///
-/// CUE tracks use an audio-only PCM S32 WAV carrier. When the materializer
+/// CUE tracks use an audio-only PCM WAV carrier whose integer/float class
+/// matches the source. When the materializer
 /// extracted original image artwork into a sidecar, this stage owns the
 /// post-encode re-injection step for target containers that have a concrete
 /// writer here. Unsupported target families are deliberately skipped with a
@@ -14217,7 +14118,12 @@ fn source_audio_matches_target_for_passthrough(
         return true;
     }
 
-    resolved_target_bit_depth(track, settings.target_bit_depth) == track.bit_depth
+    match settings.target_bit_depth {
+        BitDepthTarget::Source => true,
+        BitDepthTarget::Pcm(target_depth) => {
+            super::plan_bridge::resolve_source_pcm_depth(track) == Some(target_depth)
+        }
+    }
 }
 
 fn source_track_format_matches_target(track: &PreparedTrack, target: &PlannerAudioFormat) -> bool {
@@ -14343,46 +14249,33 @@ fn conversion_summary(
 ) -> String {
     let source_rate = track.scalar_sample_rate();
     let source_depth_bits = track.bit_depth.or(track.source_audio.bit_depth);
-    let source_pcm_depth = pcm_bit_depth_from_source_bits(source_depth_bits);
+    let source_pcm_depth = super::plan_bridge::resolve_source_pcm_depth(track);
     let source_depth = source_pcm_depth
         .map(tonepoet_pipeline::PcmBitDepth::bits)
         .or_else(|| source_depth_bits.filter(|bits| *bits < 100));
     let source_format = source_track_format_label(track);
     let target_rate = resolved_target_rate_hz(track, &req.settings).or(source_rate);
-    let planned_target_depth = if req.settings.target_format.is_dsd() {
+    let planned_target_pcm_depth = if req.settings.target_format.is_dsd() {
         None
     } else {
-        resolved_target_bit_depth(track, req.settings.target_bit_depth)
-            .or_else(|| match req.settings.target_bit_depth {
-                // Log-local fallback only: the summary may consult the
-                // source descriptor for Source targets without leaking that
-                // fallback into naming templates.
-                BitDepthTarget::Source => track.source_audio.bit_depth,
-                BitDepthTarget::Pcm(_) => None,
-            })
-            // Raw descriptor values can carry the legacy 33/320/640 float
-            // conventions; interpret them like the source side does instead
-            // of rendering literal widths like "320-bit" or "33-bit".
-            .and_then(|bits| pcm_bit_depth_from_source_bits(Some(bits)))
-            .map(tonepoet_pipeline::PcmBitDepth::bits)
+        resolved_target_pcm_depth(track, req.settings.target_bit_depth)
     };
+    let planned_target_depth = planned_target_pcm_depth.map(tonepoet_pipeline::PcmBitDepth::bits);
     let target_depth = verified_output_bit_depth
         .map(tonepoet_pipeline::PcmBitDepth::bits)
         .or(planned_target_depth);
-    let planned_float_target = match req.settings.target_bit_depth {
-        BitDepthTarget::Pcm(depth) if depth.is_float() => Some(depth),
-        // A Source target over a float-convention descriptor is a planned
-        // float output too — label it "32-bit float", not "32-bit".
-        BitDepthTarget::Source => pcm_bit_depth_from_source_bits(
-            track.bit_depth.or(track.source_audio.bit_depth),
-        )
-        .filter(|depth| depth.is_float()),
-        _ => None,
-    };
+    let planned_float_target = planned_target_pcm_depth.filter(|depth| depth.is_float());
+    let output_depth_unverified = verified_output_bit_depth.is_none()
+        && req.settings.target_format.is_pcm_lossless();
     let target_stream = verified_output_bit_depth
         .or(planned_float_target)
         .map(|depth| measured_target_stream_description(depth, target_rate))
         .unwrap_or_else(|| target_stream_description(track, target_depth, target_rate, &req.settings));
+    let target_stream = if output_depth_unverified {
+        format!("requested {target_stream}")
+    } else {
+        target_stream
+    };
     let mut summary = format!(
         "{} {} → {} {}",
         source_pcm_depth
@@ -14392,13 +14285,20 @@ fn conversion_summary(
         target_stream,
         req.settings.target_format.display_name(),
     );
+    if output_depth_unverified {
+        summary.push_str(" [output depth unverified]");
+    }
     let mut transforms = Vec::new();
     if let (Some(source_rate), Some(target_rate)) = (source_rate, target_rate) {
         if source_rate != target_rate {
             transforms.push(format!("{} resampling", preferred_resampler_label(&req.settings)));
         }
     }
-    if dither_applies(source_depth, planned_target_depth, req.settings.dither_type) {
+    if dither_applies(
+        source_pcm_depth,
+        planned_target_pcm_depth,
+        req.settings.dither_type,
+    ) {
         transforms.push(format!("{} dither", dither_type_label(req.settings.dither_type)));
     }
     if !transforms.is_empty() {
@@ -14477,11 +14377,14 @@ fn bit_depth_change_applies_for_source(
     source: &PreparedSource,
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
-    if settings.target_format.is_dsd() {
+    if settings.target_format.is_dsd() || settings.target_bit_depth == BitDepthTarget::Source {
         return false;
     }
     source.tracks.iter().any(|track| {
-        match (track.bit_depth, resolved_target_bit_depth(track, settings.target_bit_depth)) {
+        match (
+            super::plan_bridge::resolve_source_pcm_depth(track),
+            resolved_target_pcm_depth(track, settings.target_bit_depth),
+        ) {
             (Some(source_depth), Some(target_depth)) => source_depth != target_depth,
             _ => false,
         }
@@ -14497,19 +14400,25 @@ fn dithering_applies_for_source(
     }
     source.tracks.iter().any(|track| {
         dither_applies(
-            track.bit_depth,
-            resolved_target_bit_depth(track, settings.target_bit_depth),
+            super::plan_bridge::resolve_source_pcm_depth(track),
+            resolved_target_pcm_depth(track, settings.target_bit_depth),
             settings.dither_type,
         )
     })
 }
 
-fn dither_applies(source_depth: Option<u32>, target_depth: Option<u32>, dither: DitherType) -> bool {
+fn dither_applies(
+    source_depth: Option<tonepoet_pipeline::PcmBitDepth>,
+    target_depth: Option<tonepoet_pipeline::PcmBitDepth>,
+    dither: DitherType,
+) -> bool {
     if dither == DitherType::None {
         return false;
     }
     match (source_depth, target_depth) {
-        (Some(source_depth), Some(target_depth)) => target_depth < source_depth,
+        (Some(source), Some(target)) if !target.is_float() => {
+            source.is_float() || target.bits() < source.bits()
+        }
         _ => false,
     }
 }
@@ -14528,14 +14437,18 @@ fn resolved_target_rate_hz(
     }
 }
 
-fn resolved_target_bit_depth(track: &PreparedTrack, target: BitDepthTarget) -> Option<u32> {
-    // Shared by naming templates and the publish path — keep the strict
-    // track-probed depth here. The conversion-log summary applies its own
-    // source_audio fallback locally (log-only concern).
+fn resolved_target_pcm_depth(
+    track: &PreparedTrack,
+    target: BitDepthTarget,
+) -> Option<tonepoet_pipeline::PcmBitDepth> {
     match target {
-        BitDepthTarget::Source => track.bit_depth,
-        BitDepthTarget::Pcm(depth) => Some(depth.bits()),
+        BitDepthTarget::Source => super::plan_bridge::resolve_source_pcm_depth(track),
+        BitDepthTarget::Pcm(depth) => Some(depth),
     }
+}
+
+fn resolved_target_bit_depth(track: &PreparedTrack, target: BitDepthTarget) -> Option<u32> {
+    resolved_target_pcm_depth(track, target).map(tonepoet_pipeline::PcmBitDepth::bits)
 }
 
 fn source_is_dsd(source: &PreparedSource) -> bool {
@@ -14581,8 +14494,8 @@ fn source_audio_description(track: &PreparedTrack) -> String {
         .map(format_sample_rate)
         .unwrap_or_else(|| "unknown rate".to_string());
     let mut parts = vec![rate];
-    if let Some(bits) = track.bit_depth {
-        parts.push(format!("{bits}-bit"));
+    if let Some(depth) = super::plan_bridge::resolve_source_pcm_depth(track) {
+        parts.push(pcm_bit_depth_label(depth).to_string());
     } else {
         parts.push("unknown depth".to_string());
     }
@@ -30288,7 +30201,9 @@ impl TemplateRenderTarget for PlannerAudioFormat {
     }
 
     fn template_bit_depth(&self, _source: &PreparedSource, track: Option<&PreparedTrack>) -> Option<u32> {
-        track.and_then(|track| track.bit_depth)
+        track
+            .and_then(super::plan_bridge::resolve_source_pcm_depth)
+            .map(tonepoet_pipeline::PcmBitDepth::bits)
     }
 }
 
@@ -35859,8 +35774,10 @@ mod conversion_log_tests {
         req.settings.preferred_tool = PreferredTool::Ssrc;
         req.settings.dither_type = DitherType::Tpdf;
         let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
         let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
+            tracks: vec![record],
             stages: stage_records(),
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
@@ -35868,9 +35785,26 @@ mod conversion_log_tests {
         assert!(log.contains(
             "Conversion: 24-bit/96kHz FLAC → 16-bit/44.1kHz FLAC (SSRC resampling, TPDF dither)"
         ));
+        assert!(!log.contains("output depth unverified"));
         assert!(log.contains("Target sample rate: 44.1kHz"));
         assert!(log.contains("Target bit depth: 16-bit"));
         assert!(log.contains("Dither type: TPDF"));
+    }
+
+    #[test]
+    fn conversion_summary_never_presents_unverified_planned_depth_as_measured() {
+        let mut source = log_test_source();
+        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
+        source.tracks[0].sample_rate = Some(96_000);
+        source.tracks[0].bit_depth = Some(24);
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::WavPack;
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+
+        let summary = conversion_summary(&source.tracks[0], &req, None);
+
+        assert!(summary.contains("requested 32-bit/96kHz WavPack"), "{summary}");
+        assert!(summary.contains("[output depth unverified]"), "{summary}");
     }
 
     #[test]
@@ -35902,8 +35836,13 @@ mod conversion_log_tests {
 
         assert!(log.contains("Target sample rate: 88.2kHz"));
         assert!(log.contains("Resampler:"));
-        assert!(log.contains("Conversion: DSD64 DSD → 88.2kHz FLAC"));
-        assert!(!log.contains("Conversion: DSD64 DSD → 2822.4kHz FLAC"));
+        // The record has no verified output depth, so the PCM-lossless target
+        // is labelled as requested and flagged unverified (D6 honesty).
+        assert!(
+            log.contains("Conversion: DSD64 DSD → requested 88.2kHz FLAC"),
+            "{log}"
+        );
+        assert!(!log.contains("2822.4kHz FLAC"), "{log}");
     }
 
     #[test]
@@ -45206,7 +45145,10 @@ mod validate_encoded_output_tests {
         track.bit_depth = Some(24);
         let expectation = expected_post_encode_depth_for_track(&track, &settings).expect("depth");
         assert_eq!(expectation.depth, tonepoet_pipeline::PcmBitDepth::Int24);
-        assert!(!expectation.class_strict, "Source targets assert width only");
+        assert!(
+            expectation.class_strict,
+            "Source targets preserve integer-versus-floating-point sample class"
+        );
 
         track.bit_depth = Some(320);
         assert_eq!(
@@ -45219,6 +45161,14 @@ mod validate_encoded_output_tests {
         assert_eq!(
             expected_post_encode_depth_for_track(&track, &settings).map(|e| e.depth),
             Some(tonepoet_pipeline::PcmBitDepth::Int24)
+        );
+
+        track.source_audio.bit_depth = None;
+        settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
+        assert_eq!(
+            expected_post_encode_depth_for_track(&track, &settings).map(|e| e.depth),
+            None,
+            "unknown Source depth must never be represented as a measured format default"
         );
     }
 
@@ -45321,6 +45271,41 @@ mod validate_encoded_output_tests {
 
         assert_eq!(validation.measured_depth, Some(tonepoet_pipeline::PcmBitDepth::Int24));
         assert_eq!(runner.transcript().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_encode_depth_validation_fails_closed_when_wvunpack_cannot_measure() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.wv");
+        std::fs::write(&out, b"fake-wv").expect("write");
+        let runner = StubToolRunner::new();
+        runner.push_output(stub_output(
+            ToolBinary::Ffprobe,
+            &ffprobe_exact_json_with_depth(48_000, 1_000_000, "wavpack", "s32p", 32),
+        ));
+        runner.push_spawn_failure();
+        let cancel = CancellationToken::new();
+
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
+            Some(PostEncodeDepthExpectation {
+                depth: tonepoet_pipeline::PcmBitDepth::Int24,
+                class_strict: true,
+            }),
+            &tonepoet_pipeline::AudioFormat::WavPack,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ConvertError::TrackValidation(message))
+                if message.contains("WavPack depth validation failed")
+                    && message.contains("wvunpack")
+        ));
     }
 
     #[tokio::test]

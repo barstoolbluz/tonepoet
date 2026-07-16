@@ -1811,6 +1811,7 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     use tonepoet::tui::event_loop::run_app;
 
     install_terminal_restore_panic_hook();
+    tonepoet::tui::external_editor::scavenge_stale_embedded_cuesheet_edit_dirs();
 
     // Set up terminal
     enable_raw_mode()?;

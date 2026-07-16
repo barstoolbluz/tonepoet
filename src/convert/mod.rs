@@ -9,7 +9,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, MutexGuard,
+};
 use tokio::sync::RwLock;
 
 pub mod classify;
@@ -111,6 +114,14 @@ pub struct ConversionManager {
     /// Cancellation token for the active conversion run. Triggered by
     /// `stop_all_conversions()` to kill in-flight child processes.
     cancel_token: tokio_util::sync::CancellationToken,
+    /// Monotonic ownership token for deferred stop-state mutations. A stop
+    /// request may only mark queue items while this generation still names
+    /// the run that was active when Stop was pressed.
+    conversion_run_generation: Arc<AtomicU64>,
+    /// Queue item lifecycle identities owned by the active processing run.
+    /// ID plus queue-at timestamp prevents a delayed Stop from matching a
+    /// retry or replacement that deliberately reuses the stable item ID.
+    active_conversion_items: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 }
 
 /// Configuration for the conversion system
@@ -432,6 +443,39 @@ fn _status_progress_for_update(status: &ConversionStatus, progress_hint: f32) ->
     }
 }
 
+
+fn lock_active_conversion_items(
+    items: &Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
+) -> MutexGuard<'_, HashMap<String, chrono::DateTime<chrono::Utc>>> {
+    items.lock().unwrap_or_else(|poisoned| {
+        log::warn!("recovering poisoned active-conversion ownership lock");
+        poisoned.into_inner()
+    })
+}
+
+fn apply_stop_request_to_generation(
+    queue: &mut ConversionQueue,
+    generation: &AtomicU64,
+    requested_generation: u64,
+    requested_items: &HashMap<String, chrono::DateTime<chrono::Utc>>,
+) {
+    if generation.load(Ordering::Acquire) != requested_generation {
+        return;
+    }
+    for item in queue.all_items_mut() {
+        if requested_items
+            .get(&item.id)
+            .is_some_and(|queued_at| queued_at == &item.queued_at)
+            && matches!(
+                &item.status,
+                ConversionStatus::Queued | ConversionStatus::Processing { .. }
+            )
+        {
+            item.status = ConversionStatus::Cancelled;
+        }
+    }
+}
+
 impl ConversionManager {
     /// Create a new conversion manager
     pub fn new(config: ConversionConfig) -> Self {
@@ -454,6 +498,8 @@ impl ConversionManager {
             synthetic_cue_artifacts: Arc::new(Mutex::new(HashMap::new())),
             pending_synthetic_cue_artifacts: Arc::new(Mutex::new(HashSet::new())),
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            conversion_run_generation: Arc::new(AtomicU64::new(0)),
+            active_conversion_items: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1870,28 +1916,127 @@ impl ConversionManager {
     /// Get a cancellation token for a new conversion run. Each call
     /// replaces the stored token so the previous run's token becomes inert.
     pub fn conversion_cancel_token(&mut self) -> tokio_util::sync::CancellationToken {
+        let items = self
+            .queue
+            .try_read()
+            .map(|queue| {
+                queue
+                    .all_items()
+                    .into_iter()
+                    .filter(|item| {
+                        matches!(
+                            &item.status,
+                            ConversionStatus::Queued | ConversionStatus::Processing { .. }
+                        )
+                    })
+                    .map(|item| (item.id.clone(), item.queued_at.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.conversion_cancel_token_for_items(items)
+    }
+
+    /// Start a conversion run with an explicit immutable ownership set.
+    /// The TUI passes the exact queue lifecycle identities it will process.
+    pub fn conversion_cancel_token_for_items(
+        &mut self,
+        items: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    ) -> tokio_util::sync::CancellationToken {
+        self.conversion_run_generation.fetch_add(1, Ordering::AcqRel);
+        *lock_active_conversion_items(&self.active_conversion_items) = items;
         self.cancel_token = tokio_util::sync::CancellationToken::new();
         self.stop_requested = false;
         self.cancel_token.clone()
     }
 
-    /// Stop all conversions by cancelling the active token and marking
-    /// queued items. The cancellation propagates through the worker pool
-    /// to kill in-flight SoX/ffmpeg child processes.
+    /// Invalidate any deferred Stop mutation before retrying or reconfiguring
+    /// queue records. This is required even when the retry preserves an item ID.
+    pub fn invalidate_deferred_stop_requests(&self) {
+        self.conversion_run_generation.fetch_add(1, Ordering::AcqRel);
+        lock_active_conversion_items(&self.active_conversion_items).clear();
+    }
+
+    /// Stop all conversions by cancelling the active token and marking only
+    /// the items owned by the run visible when Stop was pressed.
     pub fn stop_all_conversions(&mut self) {
         self.stop_requested = true;
         self.paused = false;
         self.cancel_token.cancel();
-        // Cancel all queued items.  Cancelled items are retryable, so their
-        // transient synthetic CUE inputs must stay alive until the item is
-        // removed from the queue or retried to completion.
+        let requested_generation = self.conversion_run_generation.load(Ordering::Acquire);
+        let mut requested_items =
+            lock_active_conversion_items(&self.active_conversion_items).clone();
+
         if let Ok(mut queue) = self.queue.try_write() {
-            for item in queue.all_items_mut() {
-                match &item.status {
-                    ConversionStatus::Queued | ConversionStatus::Processing { .. } => {
-                        item.status = ConversionStatus::Cancelled;
-                    }
-                    _ => {}
+            // Compatibility for callers that did not pass an explicit run set:
+            // an immediate mutation is safe because it cannot cross a lock wait.
+            if requested_items.is_empty() {
+                requested_items.extend(
+                    queue
+                        .all_items()
+                        .into_iter()
+                        .filter(|item| {
+                            matches!(
+                                &item.status,
+                                ConversionStatus::Queued | ConversionStatus::Processing { .. }
+                            )
+                        })
+                        .map(|item| (item.id.clone(), item.queued_at.clone())),
+                );
+            }
+            apply_stop_request_to_generation(
+                &mut queue,
+                &self.conversion_run_generation,
+                requested_generation,
+                &requested_items,
+            );
+        } else if requested_items.is_empty() {
+            // With no immutable ownership snapshot, waiting for the lock would
+            // make it impossible to distinguish old work from later enqueues.
+            // The cancellation token has still fired; refuse an unsafe state
+            // mutation rather than cancelling unknown future records.
+            log::error!(
+                "stop-all queue state was contended and the active run had no item ownership snapshot"
+            );
+        } else {
+            let queue = Arc::clone(&self.queue);
+            let generation = Arc::clone(&self.conversion_run_generation);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let mut queue = queue.write().await;
+                    apply_stop_request_to_generation(
+                        &mut queue,
+                        &generation,
+                        requested_generation,
+                        &requested_items,
+                    );
+                });
+            } else {
+                let queue_for_thread = Arc::clone(&queue);
+                let generation_for_thread = Arc::clone(&generation);
+                let items_for_thread = requested_items.clone();
+                if let Err(err) = std::thread::Builder::new()
+                    .name("tonepoet-stop-all-state".to_string())
+                    .spawn(move || {
+                        let mut queue = queue_for_thread.blocking_write();
+                        apply_stop_request_to_generation(
+                            &mut queue,
+                            &generation_for_thread,
+                            requested_generation,
+                            &items_for_thread,
+                        );
+                    })
+                {
+                    log::error!(
+                        "failed to spawn deferred stop-all state task; applying synchronously: {}",
+                        err
+                    );
+                    let mut queue = queue.blocking_write();
+                    apply_stop_request_to_generation(
+                        &mut queue,
+                        &generation,
+                        requested_generation,
+                        &requested_items,
+                    );
                 }
             }
         }
@@ -1912,6 +2057,7 @@ impl ConversionManager {
 
     /// Resume conversions  
     pub fn resume_conversions(&mut self) {
+        self.invalidate_deferred_stop_requests();
         self.paused = false;
         // Mark paused items as queued
         if let Ok(mut queue) = self.queue.try_write() {
@@ -4160,4 +4306,68 @@ mod per_track_epoch_tests {
         assert!(matches!(err, ConversionError::ValidationError(_)));
     }
 
+}
+
+#[cfg(test)]
+mod stop_generation_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delayed_stop_state_update_cannot_cancel_same_id_retry_or_new_work() {
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        let mut old_item = ConversionItem::new_with_pipeline_settings(
+            PathBuf::from("old.flac"),
+            FileFormat::Audio(AudioFormat::Flac),
+            ConversionOptions::default(),
+            tonepoet_pipeline::PipelineSettings::default(),
+        );
+        old_item.status = ConversionStatus::Queued;
+        let old_id = old_item.id.clone();
+        let old_queued_at = old_item.queued_at.clone();
+        {
+            let mut queue = manager.queue.write().await;
+            queue.add_item_direct(old_item);
+        }
+
+        let _ = manager.conversion_cancel_token_for_items(
+            std::iter::once((old_id.clone(), old_queued_at)).collect(),
+        );
+        let queue = Arc::clone(&manager.queue);
+        let mut guard = queue.write().await;
+        manager.stop_all_conversions();
+        // Let the deferred writer enqueue behind the held lock. Tokio's fair
+        // lock ordering then makes the final read a deterministic completion
+        // barrier for the stale request.
+        tokio::task::yield_now().await;
+
+        // Retrying the same record before the delayed task acquires the queue
+        // must invalidate the old Stop request even though the item ID is stable.
+        manager.invalidate_deferred_stop_requests();
+        let old_item = guard.find_item_mut(&old_id).expect("old item");
+        old_item.status = ConversionStatus::Queued;
+
+        let mut new_item = ConversionItem::new_with_pipeline_settings(
+            PathBuf::from("new.flac"),
+            FileFormat::Audio(AudioFormat::Flac),
+            ConversionOptions::default(),
+            tonepoet_pipeline::PipelineSettings::default(),
+        );
+        new_item.status = ConversionStatus::Queued;
+        let new_id = new_item.id.clone();
+        guard.add_item_direct(new_item);
+        drop(guard);
+
+        let queue = manager.queue.read().await;
+        for id in [&old_id, &new_id] {
+            let item = queue
+                .all_items()
+                .into_iter()
+                .find(|item| &item.id == id)
+                .expect("queued item");
+            assert!(
+                matches!(&item.status, ConversionStatus::Queued),
+                "the deferred Stop request must not cross retry/run ownership boundaries"
+            );
+        }
+    }
 }

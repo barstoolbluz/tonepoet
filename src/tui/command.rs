@@ -866,6 +866,7 @@ pub use crate::convert::split_cue_album::{
 
 #[derive(Debug)]
 pub struct SplitCueAlbumGroupingRequest {
+    pub operation_id: super::message::TagsMbOperationId,
     pub key: SplitCueAlbumGroupingKey,
     pub infos: Vec<super::cue_parser::SingleImageInfo>,
     pub editor_park: bool,
@@ -889,6 +890,7 @@ pub enum InEditorSplitCueMusicBrainzSource {
 
 #[derive(Debug)]
 pub struct InEditorSplitCueMusicBrainzInfoRequest {
+    pub operation_id: super::message::TagsMbOperationId,
     pub source: InEditorSplitCueMusicBrainzSource,
     pub sources: Vec<PathBuf>,
     pub audio_paths: Vec<PathBuf>,
@@ -1006,6 +1008,7 @@ fn seed_mb_query_from_cue_metadata_surfaces(
 fn dispatch_split_cue_musicbrainz_text_fallback_from_surfaces(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     surfaces: &[CueMetadataSurface],
 ) -> bool {
     let Some(seed) = seed_mb_query_from_cue_metadata_surfaces(surfaces) else {
@@ -1016,6 +1019,7 @@ fn dispatch_split_cue_musicbrainz_text_fallback_from_surfaces(
         return false;
     }
     let ctx = super::message::TagsMbContext {
+        operation_id,
         paths,
         editor_park: false,
         fallback_seed: None,
@@ -1401,6 +1405,7 @@ pub(crate) fn split_cue_active_group<'a>(
 fn dispatch_split_cue_musicbrainz_for_decision(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     infos: &[super::cue_parser::SingleImageInfo],
     decision: &SplitCueAlbumGroupingDecision,
     editor_park: bool,
@@ -1425,7 +1430,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
             if let Some(sectors) = concat_single_image_cue_infos_to_cd_sectors(group) {
                 let candidates = super::musicbrainz::toc_candidates_from_sectors(&sectors);
                 if !candidates.is_empty() {
-                    spawn_tags_mb_toc_lookup(app, tx, candidates, paths, editor_park, fallback_seed, editor_session);
+                    spawn_tags_mb_toc_lookup(app, tx, operation_id, candidates, paths, editor_park, fallback_seed, editor_session);
                     return true;
                 }
             }
@@ -1434,6 +1439,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
             return false;
         };
         let ctx = super::message::TagsMbContext {
+            operation_id,
             paths,
             editor_park,
             fallback_seed: None,
@@ -1463,6 +1469,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
                 spawn_tags_mb_toc_lookup(
                     app,
                     tx,
+                    operation_id,
                     vec![super::musicbrainz::TocCandidate::exact(sectors)],
                     paths,
                     editor_park,
@@ -1477,6 +1484,7 @@ fn dispatch_split_cue_musicbrainz_for_decision(
         return false;
     };
     let ctx = super::message::TagsMbContext {
+        operation_id,
         paths,
         editor_park,
         fallback_seed: None,
@@ -1565,6 +1573,7 @@ async fn compute_split_cue_album_grouping_ladder(
 fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     infos: &[super::cue_parser::SingleImageInfo],
     editor_park: bool,
     active_audio_path: Option<PathBuf>,
@@ -1580,9 +1589,18 @@ fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
             infos,
             SplitCueAlbumGroupingReason::AmbiguousMerge,
         );
+        if !super::event_loop::transition_tags_mb_operation_phase(
+            app,
+            operation_id,
+            super::app::TagsMbOperationPhase::Grouping,
+            super::app::TagsMbOperationPhase::Lookup,
+        ) {
+            return false;
+        }
         return dispatch_split_cue_musicbrainz_for_decision(
             app,
             tx,
+            operation_id,
             infos,
             &decision,
             editor_park,
@@ -1594,9 +1612,18 @@ fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
 
     let key = split_cue_album_grouping_key(infos);
     if let Some(decision) = cached_or_title_split_cue_album_grouping_decision(app, infos) {
+        if !super::event_loop::transition_tags_mb_operation_phase(
+            app,
+            operation_id,
+            super::app::TagsMbOperationPhase::Grouping,
+            super::app::TagsMbOperationPhase::Lookup,
+        ) {
+            return false;
+        }
         return dispatch_split_cue_musicbrainz_for_decision(
             app,
             tx,
+            operation_id,
             infos,
             &decision,
             editor_park,
@@ -1609,7 +1636,15 @@ fn dispatch_split_cue_musicbrainz_concat_or_text_fallback(
     let (concat_candidates, concat_cached, per_cue_cached) =
         split_cue_album_grouping_probe_inputs(app, infos);
 
+    if !super::event_loop::tags_mb_operation_is_current_phase(
+        app,
+        operation_id,
+        super::app::TagsMbOperationPhase::Grouping,
+    ) {
+        return false;
+    }
     let request = SplitCueAlbumGroupingRequest {
+        operation_id,
         key,
         infos: infos.to_vec(),
         editor_park,
@@ -1671,18 +1706,41 @@ pub(super) fn handle_split_cue_album_grouping_complete(
     request: SplitCueAlbumGroupingRequest,
     result: Result<Box<SplitCueAlbumGroupingAsyncOutcome>, String>,
 ) {
+    if !super::event_loop::tags_mb_operation_is_current_phase(
+        app,
+        request.operation_id,
+        super::app::TagsMbOperationPhase::Grouping,
+    ) {
+        return;
+    }
+
     let outcome = match result {
         Ok(outcome) => *outcome,
         Err(err) => {
-            app.set_status(format!(":tags-mb: split-CUE grouping failed: {err}"));
+            if super::event_loop::finish_tags_mb_operation_if_current(
+                app,
+                request.operation_id,
+            ) {
+                app.set_status(format!(":tags-mb: split-CUE grouping failed: {err}"));
+            }
             return;
         }
     };
+
+    if !super::event_loop::transition_tags_mb_operation_phase(
+        app,
+        request.operation_id,
+        super::app::TagsMbOperationPhase::Grouping,
+        super::app::TagsMbOperationPhase::Lookup,
+    ) {
+        return;
+    }
 
     store_split_cue_album_grouping_outcome(app, &request.infos, &outcome);
 
     if let Some(toc_outcome) = outcome.toc_outcome {
         let ctx = super::message::TagsMbContext {
+            operation_id: request.operation_id,
             paths: paths_for_single_image_cue_infos(&request.infos),
             editor_park: request.editor_park,
             fallback_seed: seed_mb_query_from_single_image_cues(&request.infos),
@@ -1702,14 +1760,18 @@ pub(super) fn handle_split_cue_album_grouping_complete(
     if !dispatch_split_cue_musicbrainz_for_decision(
         app,
         tx,
+        request.operation_id,
         &request.infos,
         &outcome.decision,
         request.editor_park,
         request.active_audio_path.as_deref(),
         true,
         request.editor_session,
-    ) {
-        app.set_status(":tags-mb: split-CUE grouping produced no usable MusicBrainz seed".to_string());
+    ) && super::event_loop::finish_tags_mb_operation_if_current(app, request.operation_id)
+    {
+        app.set_status(
+            ":tags-mb: split-CUE grouping produced no usable MusicBrainz seed".to_string(),
+        );
     }
 }
 
@@ -1721,6 +1783,7 @@ fn metadata_editor_session_guard(
     super::message::MetadataEditorSessionGuard {
         session_id: details.session_id,
         save_generation: details.save_generation,
+        editor_generation: state.model.editor_save_generation,
     }
 }
 
@@ -1763,6 +1826,7 @@ fn in_editor_split_cue_mb_request_from_metadata_tabs(
         }
     }
     Some(InEditorSplitCueMusicBrainzInfoRequest {
+        operation_id: super::message::TagsMbOperationId::UNASSIGNED,
         source: InEditorSplitCueMusicBrainzSource::PresentationTabs,
         sources: audio_paths.clone(),
         audio_paths,
@@ -1776,6 +1840,7 @@ fn in_editor_split_cue_mb_request_from_unified_album(
 ) -> Option<InEditorSplitCueMusicBrainzInfoRequest> {
     let sheet = state.active_surface().cue_album_synthetic_sheet.as_ref()?;
     Some(InEditorSplitCueMusicBrainzInfoRequest {
+        operation_id: super::message::TagsMbOperationId::UNASSIGNED,
         source: InEditorSplitCueMusicBrainzSource::UnifiedAlbum,
         sources: sheet.audio_paths.clone(),
         audio_paths: sheet.audio_paths.clone(),
@@ -1821,6 +1886,7 @@ fn in_editor_split_cue_mb_request_from_single_editor_source_folder(
     let active_audio = surface.paths.first()?.clone();
     let parent = active_audio.parent()?.to_path_buf();
     Some(InEditorSplitCueMusicBrainzInfoRequest {
+        operation_id: super::message::TagsMbOperationId::UNASSIGNED,
         source: InEditorSplitCueMusicBrainzSource::SingleSourceFolder,
         sources: vec![parent],
         audio_paths: Vec::new(),
@@ -2927,6 +2993,43 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status("CUE preview cancelled".to_string());
                 return;
             }
+
+            let editor = if let Some(parked) = app.pending_metadata_editor.take() {
+                Some(parked)
+            } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
+                match std::mem::replace(
+                    &mut app.active_overlay,
+                    super::app::ActiveOverlay::None,
+                ) {
+                    super::app::ActiveOverlay::MetadataEditor(state) => Some(state),
+                    other => {
+                        app.active_overlay = other;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(state) = editor {
+                if state.any_presentation_dirty() {
+                    app.should_quit = false;
+                    app.quit_after_browse_archive_metadata_resolution = true;
+                    app.pending_metadata_editor = Some(state);
+                    app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                        message: concat!(
+                            "Discard unsaved metadata changes before quitting? ",
+                            "Y discards them; N/Esc returns to the editor."
+                        )
+                        .to_string(),
+                        action: super::app::ConfirmAction::DiscardMetadataEditorChanges,
+                    };
+                    app.set_status(
+                        "quit deferred: confirm unsaved metadata changes".to_string(),
+                    );
+                    return;
+                }
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
             app.should_quit = true;
         }
         Command::Write => {
@@ -3195,7 +3298,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             } else {
                 match super::presets::load_preset(&name) {
                     Ok(preset) => {
-                        preset.apply_to_pills(
+                        let report = preset.apply_to_pills(
                             &mut app.convert.format,
                             &mut app.convert.output_options,
                             &mut app.convert.metadata,
@@ -3203,7 +3306,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         app.preset
                             .set_active_preset_path(name.clone(), super::presets::preset_file_path(&name));
                         app.preset.modified = false;
-                        app.set_status(format!("Loaded preset: {}", name));
+                        app.set_status(format!(
+                            "Loaded preset: {}{}",
+                            name,
+                            report.status_suffix()
+                        ));
                     }
                     Err(e) => app.set_status(format!("Load failed: {}", e)),
                 }
@@ -4041,47 +4148,29 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             with_editor_state(app, |state| super::keybindings::metadata_editor_open_detail(state));
         }
         Command::MbBack => {
-            // Editor state may be in pending (colon command from
-            // command-bar) or active_overlay (mouse-pill click that
-            // restored before dispatching). Take from either.
-            let state = if let Some(parked) = app.pending_metadata_editor.take() {
-                parked
-            } else if matches!(
-                app.active_overlay,
-                super::app::ActiveOverlay::MetadataEditor(_)
-            ) {
-                let prev =
-                    std::mem::replace(&mut app.active_overlay, super::app::ActiveOverlay::None);
-                if let super::app::ActiveOverlay::MetadataEditor(s) = prev {
-                    s
-                } else {
-                    unreachable!()
-                }
-            } else {
+            let Some(taken) = super::event_loop::take_metadata_editor_with_restore_slot(app) else {
                 app.set_status(":mb-back only works in the metadata editor");
                 return;
             };
-            let Some(cache) = state.mb_back.clone() else {
+            let Some(cache) = taken.state.mb_back.clone() else {
                 app.set_status(
                     ":mb-back: no MB lookup to return to (run :tags-mb first)".to_string(),
                 );
-                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                super::event_loop::restore_taken_metadata_editor(app, taken);
                 return;
             };
-            if state.any_presentation_dirty() {
-                // Park the editor on pending so the user can cancel
-                // and come back. ConfirmAction::MbBack carries the
-                // cached release list for the post-confirm transition.
-                app.pending_metadata_editor = Some(state);
-                app.active_overlay = super::app::ActiveOverlay::Confirmation {
-                    action: super::app::ConfirmAction::MbBack(cache),
-                    message: "Discard editor changes and return to MB picker?".to_string(),
-                };
-                return;
-            }
-            // Not dirty — go directly back, no confirmation.
-            drop(state);
-            let mut mb_state = super::app::MbSelectState::new(cache.releases, cache.paths);
+
+            // Keep the exact post-apply editor (including unsaved edits) parked
+            // behind the rebuilt picker. Every picker cancel path restores it;
+            // accepting another release is guarded against any intervening
+            // save on any presentation tab.
+            let editor_session = metadata_editor_session_guard(&taken.state);
+            app.pending_metadata_editor = Some(taken.state);
+            let mut mb_state = super::app::MbSelectState::new_with_editor_session(
+                cache.releases,
+                cache.paths,
+                Some(editor_session),
+            );
             mb_state.selected = cache.selected;
             app.active_overlay = super::app::ActiveOverlay::MbSelect(Box::new(mb_state));
             app.set_status(":mb-back: pick a different release".to_string());
@@ -4258,7 +4347,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
                 return;
             }
-            let content = entry.value.clone();
+            let content = entry
+                .per_file_values
+                .first()
+                .cloned()
+                .unwrap_or_else(|| entry.value.clone());
             let summary = format!(
                 "{} (read-only · {})",
                 entry.display_key,
@@ -4478,6 +4571,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     paths
                 };
                 let ctx = super::message::TagsMbContext {
+                    operation_id: super::message::TagsMbOperationId::UNASSIGNED,
                     paths: ctx_paths,
                     editor_park: false,
                     fallback_seed: None,
@@ -4498,6 +4592,17 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             // title search, while misses remain non-decisive and fall through to
             // the common-title seed.
             if cue_metadata_surfaces.len() > 1 {
+                let operation_id = match super::event_loop::begin_tags_mb_prelookup_operation(
+                    app,
+                    false,
+                    super::app::TagsMbOperationPhase::Grouping,
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(error) => {
+                        app.set_status(error);
+                        return;
+                    }
+                };
                 let active_audio_path = paths
                     .first()
                     .cloned()
@@ -4505,6 +4610,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
                     app,
                     tx,
+                    operation_id,
                     &cue_infos,
                     /* editor_park */ false,
                     active_audio_path,
@@ -4512,20 +4618,42 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 ) {
                     return;
                 }
-                if dispatch_split_cue_musicbrainz_text_fallback_from_surfaces(
+                let _ = super::event_loop::transition_tags_mb_operation_phase(
                     app,
-                    tx,
-                    &cue_metadata_surfaces,
-                ) {
+                    operation_id,
+                    super::app::TagsMbOperationPhase::Grouping,
+                    super::app::TagsMbOperationPhase::Lookup,
+                );
+                if super::event_loop::tags_mb_operation_is_current(app, operation_id)
+                    && dispatch_split_cue_musicbrainz_text_fallback_from_surfaces(
+                        app,
+                        tx,
+                        operation_id,
+                        &cue_metadata_surfaces,
+                    )
+                {
                     return;
                 }
-                app.set_status(
-                    ":tags-mb: split CUE album has no album/artist metadata for text fallback"
-                        .to_string(),
-                );
+                if super::event_loop::finish_tags_mb_operation_if_current(app, operation_id) {
+                    app.set_status(
+                        ":tags-mb: split CUE album has no album/artist metadata for text fallback"
+                            .to_string(),
+                    );
+                }
                 return;
             }
             if cue_infos.len() > 1 {
+                let operation_id = match super::event_loop::begin_tags_mb_prelookup_operation(
+                    app,
+                    false,
+                    super::app::TagsMbOperationPhase::Grouping,
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(error) => {
+                        app.set_status(error);
+                        return;
+                    }
+                };
                 let active_audio_path = paths
                     .first()
                     .cloned()
@@ -4533,6 +4661,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
                     app,
                     tx,
+                    operation_id,
                     &cue_infos,
                     /* editor_park */ false,
                     active_audio_path,
@@ -4540,10 +4669,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 ) {
                     return;
                 }
-                app.set_status(
-                    ":tags-mb: split CUE album has no album/artist metadata for text fallback"
-                        .to_string(),
-                );
+                if super::event_loop::finish_tags_mb_operation_if_current(app, operation_id) {
+                    app.set_status(
+                        ":tags-mb: split CUE album has no album/artist metadata for text fallback"
+                            .to_string(),
+                    );
+                }
                 return;
             }
 
@@ -4590,6 +4721,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         // Real rip geometry: exact TOC, no stub-drop cascade.
                         spawn_tags_mb_toc_lookup(
                             app, tx,
+                            super::message::TagsMbOperationId::UNASSIGNED,
                             vec![super::musicbrainz::TocCandidate::exact(sectors)],
                             image_paths,
                             /* editor_park */ false, /* fallback_seed */ None,
@@ -4627,6 +4759,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             // Real rip geometry: exact TOC, no stub-drop cascade.
             spawn_tags_mb_toc_lookup(
                 app, tx,
+                super::message::TagsMbOperationId::UNASSIGNED,
                 vec![super::musicbrainz::TocCandidate::exact(sectors)],
                 paths, /* editor_park */ false,
                 /* fallback_seed */ None,
@@ -6120,18 +6253,34 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
 ///
 /// Phase 6b limitation: multi-file selections are rejected with a message
 /// directing the user to deselect extras. Real batch support (summary +
-fn load_queue_preset_into_pills(app: &mut AppState, name: &str) -> Result<(), String> {
+fn load_queue_preset_into_pills(
+    app: &mut AppState,
+    name: &str,
+) -> Result<super::presets::PresetApplyReport, String> {
     let path = super::presets::preset_file_path(name);
     match super::presets::load_preset_from_path(&path) {
         Ok(preset) => {
-            preset.apply_to_pills(
+            let previous_format = app.convert.format.clone();
+            let previous_output = app.convert.output_options.clone();
+            let previous_metadata = app.convert.metadata.clone();
+            let report = preset.apply_to_pills(
                 &mut app.convert.format,
                 &mut app.convert.output_options,
                 &mut app.convert.metadata,
             );
+            if !report.is_complete() {
+                app.convert.format = previous_format;
+                app.convert.output_options = previous_output;
+                app.convert.metadata = previous_metadata;
+                return Err(format!(
+                    "preset '{}' refused fields: {}",
+                    name,
+                    report.refused_fields.join(", ")
+                ));
+            }
             app.preset.set_active_preset_path(name.to_string(), path);
             app.preset.modified = false;
-            Ok(())
+            Ok(report)
         }
         Err(err) => Err(format!("preset '{}' failed: {}", name, err)),
     }
@@ -6522,7 +6671,7 @@ fn execute_queue_with_post_load(
             // Placeholder screen. Selection inheritance arrives in 6c.
             if let Some(name) = &preset {
                 match load_queue_preset_into_pills(app, name) {
-                    Ok(()) => app.set_status(format!("preset loaded: {}", name)),
+                    Ok(report) => app.set_status(format!("preset loaded: {}{}", name, report.status_suffix())),
                     Err(msg) => app.set_status(msg),
                 }
             } else {
@@ -6534,7 +6683,7 @@ fn execute_queue_with_post_load(
             // arg, remind the user to pick files in Browse first.
             if let Some(name) = &preset {
                 match load_queue_preset_into_pills(app, name) {
-                    Ok(()) => app.set_status(format!("preset loaded: {}", name)),
+                    Ok(report) => app.set_status(format!("preset loaded: {}{}", name, report.status_suffix())),
                     Err(msg) => app.set_status(msg),
                 }
             } else {
@@ -6544,7 +6693,7 @@ fn execute_queue_with_post_load(
         AppScreen::Queue => {
             if let Some(name) = &preset {
                 match load_queue_preset_into_pills(app, name) {
-                    Ok(()) => app.set_status(format!("preset loaded: {}", name)),
+                    Ok(report) => app.set_status(format!("preset loaded: {}{}", name, report.status_suffix())),
                     Err(msg) => app.set_status(msg),
                 }
             } else {
@@ -8541,6 +8690,7 @@ fn dvdv_upsert_editor_entry(
     }
 
     entries.push(super::probe::TagEntry {
+        row_scope: crate::tui::probe::RowScope::File,
         display_key: key.to_string(),
         item_key: lofty::tag::ItemKey::Unknown(key.to_string()),
         value: value.clone(),
@@ -9567,6 +9717,7 @@ fn bluray_upsert_editor_entry(
     }
 
     entries.push(super::probe::TagEntry {
+        row_scope: crate::tui::probe::RowScope::File,
         display_key: key.to_string(),
         item_key: lofty::tag::ItemKey::Unknown(key.to_string()),
         value: value.clone(),
@@ -11288,12 +11439,30 @@ fn dvdv_is_album_level_sidecar_key(key: &str) -> bool {
 pub(super) fn spawn_tags_mb_toc_lookup(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    mut operation_id: super::message::TagsMbOperationId,
     candidates: Vec<super::musicbrainz::TocCandidate>,
     paths: Vec<std::path::PathBuf>,
     editor_park: bool,
     fallback_seed: Option<SacdMbSeed>,
     editor_session: Option<super::message::MetadataEditorSessionGuard>,
 ) {
+    if operation_id.is_assigned() {
+        if !super::event_loop::tags_mb_operation_is_current_phase(
+            app,
+            operation_id,
+            super::app::TagsMbOperationPhase::Lookup,
+        ) {
+            return;
+        }
+    } else {
+        operation_id = match super::event_loop::begin_tags_mb_lookup_operation(app, editor_park) {
+            Ok(operation_id) => operation_id,
+            Err(error) => {
+                app.set_status(error);
+                return;
+            }
+        };
+    }
     // Pre-fetch the cache body for every cascade stage here on the UI
     // thread; the spawned lookup stays database-free.
     let cached: Vec<Option<String>> = candidates
@@ -11324,6 +11493,7 @@ pub(super) fn spawn_tags_mb_toc_lookup(
 
     let tx = tx.clone();
     let ctx = super::message::TagsMbContext {
+        operation_id,
         paths,
         editor_park,
         fallback_seed,
@@ -11354,6 +11524,7 @@ fn dispatch_regular_file_editor_tags_mb_toc(
             state: state_owned,
             slot: super::event_loop::MetadataEditorRestoreSlot::Active,
         },
+        super::message::TagsMbOperationId::UNASSIGNED,
     )
 }
 
@@ -11361,6 +11532,7 @@ fn dispatch_regular_file_editor_tags_mb_toc_from_taken(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     taken: super::event_loop::TakenMetadataEditor,
+    operation_id: super::message::TagsMbOperationId,
 ) -> bool {
     // File editor: state.active_surface().paths is the audio file set. Use the
     // same TOC derivation the Browse path uses — first try AccurateRip-style
@@ -11371,6 +11543,9 @@ fn dispatch_regular_file_editor_tags_mb_toc_from_taken(
     let paths = taken.state.active_surface().paths.clone();
     let Some(first_path) = paths.first().cloned() else {
         super::event_loop::restore_taken_metadata_editor(app, taken);
+        if operation_id.is_assigned() {
+            super::event_loop::finish_tags_mb_operation_if_current(app, operation_id);
+        }
         app.set_status(":tags-mb: editor has no paths".to_string());
         return true;
     };
@@ -11394,6 +11569,9 @@ fn dispatch_regular_file_editor_tags_mb_toc_from_taken(
             }
             Err(e) => {
                 super::event_loop::restore_taken_metadata_editor(app, taken);
+                if operation_id.is_assigned() {
+                    super::event_loop::finish_tags_mb_operation_if_current(app, operation_id);
+                }
                 app.set_status(format!(":tags-mb: {}", e));
                 return true;
             }
@@ -11402,6 +11580,9 @@ fn dispatch_regular_file_editor_tags_mb_toc_from_taken(
 
     if super::musicbrainz::build_mb_toc(&sectors).is_none() {
         super::event_loop::restore_taken_metadata_editor(app, taken);
+        if operation_id.is_assigned() {
+            super::event_loop::finish_tags_mb_operation_if_current(app, operation_id);
+        }
         app.set_status(":tags-mb: TOC too short".to_string());
         return true;
     }
@@ -11410,6 +11591,7 @@ fn dispatch_regular_file_editor_tags_mb_toc_from_taken(
     spawn_tags_mb_toc_lookup(
         app,
         tx,
+        operation_id,
         vec![super::musicbrainz::TocCandidate::exact(sectors)],
         paths,
         /* editor_park */ true,
@@ -11422,8 +11604,29 @@ fn dispatch_regular_file_editor_tags_mb_toc_from_taken(
 fn spawn_in_editor_split_cue_musicbrainz_info_collection(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
-    request: InEditorSplitCueMusicBrainzInfoRequest,
+    mut request: InEditorSplitCueMusicBrainzInfoRequest,
 ) {
+    if request.operation_id.is_assigned() {
+        if !super::event_loop::tags_mb_operation_is_current_phase(
+            app,
+            request.operation_id,
+            super::app::TagsMbOperationPhase::Discovery,
+        ) {
+            return;
+        }
+    } else {
+        request.operation_id = match super::event_loop::begin_tags_mb_prelookup_operation(
+            app,
+            true,
+            super::app::TagsMbOperationPhase::Discovery,
+        ) {
+            Ok(operation_id) => operation_id,
+            Err(error) => {
+                app.set_status(error);
+                return;
+            }
+        };
+    }
     let label = match request.source {
         InEditorSplitCueMusicBrainzSource::UnifiedAlbum => "unified CUE album",
         InEditorSplitCueMusicBrainzSource::PresentationTabs => "split CUE editor",
@@ -11454,8 +11657,20 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
     request: InEditorSplitCueMusicBrainzInfoRequest,
     result: Result<Vec<super::cue_parser::SingleImageInfo>, String>,
 ) {
+    if !super::event_loop::tags_mb_operation_is_current_phase(
+        app,
+        request.operation_id,
+        super::app::TagsMbOperationPhase::Discovery,
+    ) {
+        return;
+    }
+
     let Some(taken) = super::event_loop::take_metadata_editor_with_restore_slot(app) else {
-        app.set_status(":tags-mb: editor closed during split-CUE discovery; rerun".to_string());
+        if super::event_loop::finish_tags_mb_operation_if_current(app, request.operation_id) {
+            app.set_status(
+                ":tags-mb: editor closed during split-CUE discovery; rerun".to_string(),
+            );
+        }
         return;
     };
     if !super::event_loop::metadata_editor_matches_session_guard(
@@ -11463,10 +11678,12 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
         request.editor_session,
     ) {
         super::event_loop::restore_taken_metadata_editor(app, taken);
-        app.set_status(
-            ":tags-mb: metadata editor changed during split-CUE discovery; rerun"
-                .to_string(),
-        );
+        if super::event_loop::finish_tags_mb_operation_if_current(app, request.operation_id) {
+            app.set_status(
+                ":tags-mb: metadata editor changed during split-CUE discovery; rerun"
+                    .to_string(),
+            );
+        }
         return;
     }
 
@@ -11474,99 +11691,121 @@ pub(super) fn handle_in_editor_split_cue_musicbrainz_info_complete(
         Ok(infos) => infos,
         Err(err) => {
             super::event_loop::restore_taken_metadata_editor(app, taken);
-            app.set_status(format!(":tags-mb: {err}"));
+            if super::event_loop::finish_tags_mb_operation_if_current(app, request.operation_id) {
+                app.set_status(format!(":tags-mb: {err}"));
+            }
             return;
         }
     };
 
+    if !super::event_loop::transition_tags_mb_operation_phase(
+        app,
+        request.operation_id,
+        super::app::TagsMbOperationPhase::Discovery,
+        super::app::TagsMbOperationPhase::Grouping,
+    ) {
+        super::event_loop::restore_taken_metadata_editor(app, taken);
+        return;
+    }
+
     match request.source {
-        InEditorSplitCueMusicBrainzSource::UnifiedAlbum => {
+        InEditorSplitCueMusicBrainzSource::UnifiedAlbum
+        | InEditorSplitCueMusicBrainzSource::PresentationTabs => {
             super::event_loop::restore_taken_metadata_editor(app, taken);
             if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
                 app,
                 tx,
+                request.operation_id,
                 &infos,
-                /* editor_park */ true,
+                true,
                 request.active_audio_path,
                 Some(request.editor_session),
             ) {
                 return;
             }
-            app.set_status(
-                ":tags-mb: unified CUE album has no concatenated TOC or album/artist seed"
-                    .to_string(),
-            );
-        }
-        InEditorSplitCueMusicBrainzSource::PresentationTabs => {
-            super::event_loop::restore_taken_metadata_editor(app, taken);
-            if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
-                app,
-                tx,
-                &infos,
-                /* editor_park */ true,
-                request.active_audio_path,
-                Some(request.editor_session),
-            ) {
-                return;
+            if super::event_loop::finish_tags_mb_operation_if_current(app, request.operation_id) {
+                let kind = match request.source {
+                    InEditorSplitCueMusicBrainzSource::UnifiedAlbum => "unified CUE album",
+                    _ => "split CUE editor",
+                };
+                app.set_status(format!(
+                    ":tags-mb: {kind} has no concatenated TOC or album/artist seed"
+                ));
             }
-            app.set_status(
-                ":tags-mb: split CUE editor has no concatenated TOC or album/artist seed"
-                    .to_string(),
-            );
         }
         InEditorSplitCueMusicBrainzSource::SingleSourceFolder => {
             let Some(active_audio_path) = request.active_audio_path else {
                 super::event_loop::restore_taken_metadata_editor(app, taken);
-                app.set_status(":tags-mb: editor has no active audio path".to_string());
+                if super::event_loop::finish_tags_mb_operation_if_current(
+                    app,
+                    request.operation_id,
+                ) {
+                    app.set_status(":tags-mb: editor has no active audio path".to_string());
+                }
                 return;
             };
             let same_folder_infos: Vec<_> = infos
                 .into_iter()
                 .filter(|info| {
-                    info.cue_path.parent()
-                        == request.sources.first().map(PathBuf::as_path)
+                    info.cue_path.parent() == request.sources.first().map(PathBuf::as_path)
                 })
                 .collect();
-            let contains_active = same_folder_infos.iter().any(|info| {
-                same_path_for_split_cue(&info.audio_path, &active_audio_path)
-            });
+            let contains_active = same_folder_infos
+                .iter()
+                .any(|info| same_path_for_split_cue(&info.audio_path, &active_audio_path));
             if same_folder_infos.len() < 2 || !contains_active {
-                dispatch_regular_file_editor_tags_mb_toc_from_taken(app, tx, taken);
+                if !super::event_loop::transition_tags_mb_operation_phase(
+                    app,
+                    request.operation_id,
+                    super::app::TagsMbOperationPhase::Grouping,
+                    super::app::TagsMbOperationPhase::Lookup,
+                ) {
+                    super::event_loop::restore_taken_metadata_editor(app, taken);
+                    return;
+                }
+                dispatch_regular_file_editor_tags_mb_toc_from_taken(
+                    app,
+                    tx,
+                    taken,
+                    request.operation_id,
+                );
                 return;
             }
             if taken.state.any_presentation_dirty() {
                 super::event_loop::restore_taken_metadata_editor(app, taken);
-                app.set_status(
-                    ":tags-mb: source folder contains multiple CUE surfaces; save or revert editor changes before running split-CUE MusicBrainz lookup"
-                        .to_string(),
-                );
+                if super::event_loop::finish_tags_mb_operation_if_current(
+                    app,
+                    request.operation_id,
+                ) {
+                    app.set_status(
+                        ":tags-mb: source folder contains multiple CUE surfaces; save or revert editor changes before running split-CUE MusicBrainz lookup"
+                            .to_string(),
+                    );
+                }
                 return;
             }
-            // The source-folder branch is an intentional editor-to-target
-            // transition: the initiating editor may contain only the active
-            // audio file, while the MusicBrainz target is the expanded
-            // split-CUE album path vector. Keep the initiating editor alive
-            // and parked behind any picker so the async completion can prove
-            // the same editor session is still current, but do not require
-            // its file-dimension paths to equal the target paths later.
             super::event_loop::restore_taken_metadata_editor(app, taken);
             if dispatch_split_cue_musicbrainz_concat_or_text_fallback(
                 app,
                 tx,
+                request.operation_id,
                 &same_folder_infos,
-                /* editor_park */ true,
+                true,
                 Some(active_audio_path),
                 Some(request.editor_session),
             ) {
                 return;
             }
-            app.set_status(
-                ":tags-mb: split CUE source folder has no concatenated TOC or album/artist seed"
-                    .to_string(),
-            );
+            if super::event_loop::finish_tags_mb_operation_if_current(app, request.operation_id) {
+                app.set_status(
+                    ":tags-mb: split CUE source folder has no concatenated TOC or album/artist seed"
+                        .to_string(),
+                );
+            }
         }
     }
 }
+
 
 /// Dispatch `:tags-mb` when a metadata editor is open. Handles both
 /// SACD ISOs (TOC from per-area durations) and regular file editors
@@ -11594,19 +11833,35 @@ fn try_dispatch_in_editor_tags_mb(
 ) -> Option<bool> {
     use super::app::ActiveOverlay;
 
-    let state_owned: Box<super::app::MetadataEditorState> =
-        if let Some(parked) = app.pending_metadata_editor.take() {
-            parked
-        } else if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-            let prev = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
-            if let ActiveOverlay::MetadataEditor(s) = prev {
-                s
-            } else {
-                unreachable!()
-            }
+    let (state_owned, restore_slot): (
+        Box<super::app::MetadataEditorState>,
+        super::event_loop::MetadataEditorRestoreSlot,
+    ) = if let Some(parked) = app.pending_metadata_editor.take() {
+        (parked, super::event_loop::MetadataEditorRestoreSlot::Pending)
+    } else if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
+        let prev = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        if let ActiveOverlay::MetadataEditor(s) = prev {
+            (s, super::event_loop::MetadataEditorRestoreSlot::Active)
         } else {
-            return None;
-        };
+            unreachable!()
+        }
+    } else {
+        return None;
+    };
+
+    if state_owned.model.tags_mb_in_flight {
+        super::event_loop::restore_taken_metadata_editor(
+            app,
+            super::event_loop::TakenMetadataEditor {
+                state: state_owned,
+                slot: restore_slot,
+            },
+        );
+        app.set_status(
+            ":tags-mb: a MusicBrainz lookup is already in flight for this editor".to_string(),
+        );
+        return Some(true);
+    }
 
     let editor_session = metadata_editor_session_guard(&state_owned);
 
@@ -11618,6 +11873,7 @@ fn try_dispatch_in_editor_tags_mb(
         let paths = metadata_editor_tags_mb_context_paths(&state_owned);
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
         let ctx = super::message::TagsMbContext {
+            operation_id: super::message::TagsMbOperationId::UNASSIGNED,
             paths,
             editor_park: true,
             fallback_seed: None,
@@ -11709,6 +11965,7 @@ fn try_dispatch_in_editor_tags_mb(
                             err
                         ));
                         let ctx = super::message::TagsMbContext {
+                            operation_id: super::message::TagsMbOperationId::UNASSIGNED,
                             paths: ctx_paths,
                             editor_park: true,
                             fallback_seed: None,
@@ -11738,6 +11995,7 @@ fn try_dispatch_in_editor_tags_mb(
                         ":tags-mb: Blu-ray synthetic TOC skipped: no chapter durations are available; running MusicBrainz text search from editor tags".to_string(),
                     );
                     let ctx = super::message::TagsMbContext {
+                        operation_id: super::message::TagsMbOperationId::UNASSIGNED,
                         paths: ctx_paths,
                         editor_park: true,
                         fallback_seed: None,
@@ -11781,6 +12039,7 @@ fn try_dispatch_in_editor_tags_mb(
                     app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
                     if let Some(seed) = seed {
                         let ctx = super::message::TagsMbContext {
+                            operation_id: super::message::TagsMbOperationId::UNASSIGNED,
                             paths: ctx_paths,
                             editor_park: true,
                             fallback_seed: None,
@@ -11852,6 +12111,7 @@ fn try_dispatch_in_editor_tags_mb(
     spawn_tags_mb_toc_lookup(
         app,
         tx,
+        super::message::TagsMbOperationId::UNASSIGNED,
         candidates,
         paths,
         /* editor_park */ true,
@@ -12353,6 +12613,7 @@ pub fn apply_cue_changes(
                     _ => lofty::tag::ItemKey::Unknown(change.field.to_ascii_uppercase()),
                 };
                 state.active_surface_mut().entries.push(super::probe::TagEntry {
+                    row_scope: crate::tui::probe::RowScope::File,
                     display_key: change.field.to_ascii_uppercase(),
                     item_key,
                     value: String::new(),
@@ -12665,6 +12926,7 @@ mod dvdv_sidecar_idempotency_tests {
 
     fn entry(key: &str, value: &str, per_file_values: Vec<&str>) -> TagEntry {
         TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: key.to_string(),
             item_key: ItemKey::Unknown(key.to_string()),
             value: value.to_string(),
@@ -14057,6 +14319,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
 
     fn bluray_tag_entry(key: &str, value: &str, per_file_values: Vec<&str>) -> TagEntry {
         TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: key.to_string(),
             item_key: lofty::tag::ItemKey::Unknown(key.to_string()),
             value: value.to_string(),
@@ -14970,6 +15233,7 @@ mod sacd_seed_tests {
         let entries: Vec<TagEntry> = entries
             .into_iter()
             .map(|(k, v, mixed)| TagEntry {
+                row_scope: crate::tui::probe::RowScope::File,
                 display_key: k.to_string(),
                 item_key: ItemKey::Unknown(k.to_string()),
                 value: v.to_string(),
@@ -16577,6 +16841,7 @@ mod split_cue_source_coverage_tests {
                                 index01_frames: Some(0),
                                 index00_frames: None,
                                 isrc: None,
+                                directives: Vec::new(),
                             },
                             crate::tui::cue_parser::CueTrack {
                                 number: 2,
@@ -16586,6 +16851,7 @@ mod split_cue_source_coverage_tests {
                                 index01_frames: Some(4500),
                                 index00_frames: None,
                                 isrc: None,
+                                directives: Vec::new(),
                             },
                         ],
                     },
@@ -17094,6 +17360,7 @@ mod in_editor_tags_mb_reducer_safety_tests {
         super::super::message::MetadataEditorSessionGuard {
             session_id: details.session_id,
             save_generation: details.save_generation,
+            editor_generation: state.model.editor_save_generation,
         }
     }
 
@@ -17108,7 +17375,14 @@ mod in_editor_tags_mb_reducer_safety_tests {
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(reopened_editor);
+        let operation_id = super::super::event_loop::begin_tags_mb_prelookup_operation(
+            &mut app,
+            true,
+            crate::tui::app::TagsMbOperationPhase::Discovery,
+        )
+        .expect("operation");
         let request = InEditorSplitCueMusicBrainzInfoRequest {
+            operation_id,
             source: InEditorSplitCueMusicBrainzSource::UnifiedAlbum,
             sources: vec![path.clone()],
             audio_paths: vec![path.clone()],
@@ -17236,6 +17510,42 @@ mod in_editor_tags_mb_reducer_safety_tests {
             "the blocking worker should own the CUE discovery/parsing call"
         );
     }
+
+    #[test]
+    fn second_tags_mb_dispatch_keeps_picker_and_parked_editor_latched() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let path = std::path::PathBuf::from("/tmp/album/track.flac");
+        let mut editor = editor_for_path(path.clone());
+        editor.model.tags_mb_in_flight = true;
+        app.pending_metadata_editor = Some(editor);
+        app.active_overlay = ActiveOverlay::MbSelect(Box::new(
+            crate::tui::app::MbSelectState::new(
+                vec![crate::tui::musicbrainz::MbRelease {
+                    release_id: "release-1".to_string(),
+                    title: "Release".to_string(),
+                    ..Default::default()
+                }],
+                vec![path],
+            ),
+        ));
+
+        assert_eq!(try_dispatch_in_editor_tags_mb(&mut app, &tx(), None), Some(true));
+        assert!(
+            matches!(app.active_overlay, ActiveOverlay::MbSelect(_)),
+            "refusing a duplicate dispatch must not replace the active picker"
+        );
+        assert!(
+            app.pending_metadata_editor
+                .as_ref()
+                .is_some_and(|state| state.model.tags_mb_in_flight),
+            "the parked editor must remain latched until picker accept or cancel"
+        );
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("already in flight")));
+    }
+
 }
 
 #[cfg(test)]

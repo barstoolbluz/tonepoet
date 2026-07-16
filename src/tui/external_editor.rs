@@ -56,6 +56,46 @@ fn restore_tui_terminal() {
     );
 }
 
+
+/// Remove stale per-process embedded-CUESHEET edit buffers left by crashed
+/// instances. Live and malformed process directories are retained: deletion is
+/// best-effort and only occurs after a numeric PID is proven dead.
+pub fn scavenge_stale_embedded_cuesheet_edit_dirs() {
+    let root = std::env::temp_dir().join("tonepoet-embedded-cuesheet-edits");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(pid_text) = name.strip_prefix("process-") else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        if crate::convert::queue_expansion::process_id_is_live(pid) {
+            continue;
+        }
+        if let Err(err) = std::fs::remove_dir_all(entry.path()) {
+            log::debug!(
+                "failed to remove stale embedded-CUESHEET edit directory {}: {}",
+                entry.path().display(),
+                err
+            );
+        }
+    }
+    let _ = std::fs::remove_dir(&root);
+}
+
 /// Open a file in the user's preferred editor.
 ///
 /// Suspends the terminal (raw mode off, cursor visible), runs the editor,

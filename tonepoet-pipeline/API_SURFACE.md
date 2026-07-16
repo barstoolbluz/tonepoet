@@ -20,6 +20,7 @@ The crate root re-exports the public items from these modules.
 - `PcmBitDepth`: `Int8`, `Int16`, `Int24`, `Int32`, `Float32`, `Float64`
   - Methods: `bits`, `is_float`, `sample_kind`
 - `BitDepthTarget`: `Source`, `Pcm(PcmBitDepth)`
+  - For PCM-lossless paths that require encoding, `Source` requires an authoritative `SourceInfo.bit_depth`; planning returns `PlanningError::InvalidSource` instead of substituting a format default when that fact is unavailable. A proven passthrough may preserve the original stream without resolving a numeric depth.
 - `RateTarget`: `Source`, `PcmHz(u32)`, `Dsd(DsdRate)`
 - `DsdRate`: `Dsd64`, `Dsd128`, `Dsd256`, `Dsd512`, `Dsd1024`
   - Methods: `hz`, `sox_effect`, `default_pcm_target_hz`, `from_hz`

@@ -1708,6 +1708,7 @@ mod tests {
         let mut state = details_state_for_file(file);
         let surface = state.active_surface_mut();
         surface.entries.push(super::super::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: "REPLAYGAIN_TRACK_GAIN".to_string(),
             item_key: lofty::tag::ItemKey::ReplayGainTrackGain,
             value: "-1.0 dB".to_string(),

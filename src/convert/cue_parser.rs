@@ -49,6 +49,10 @@ pub struct CueTrack {
     pub index00_frames: Option<u32>,
     /// CD ISRC code from an `ISRC` line inside the TRACK block.
     pub isrc: Option<String>,
+    /// Ordered track-level directives that Tonepoet does not interpret but
+    /// must preserve across parse/regenerate cycles. This includes `FLAGS`
+    /// (notably `FLAGS PRE`) and track-scoped `REM` lines.
+    pub directives: Vec<String>,
 }
 
 /// Parse a CUE sheet from a file path.
@@ -1945,9 +1949,18 @@ pub fn parse_cue(content: &str) -> CueSheet {
                     continue;
                 }
             }
+            // Preserve semantically significant or unknown track-level
+            // directives that the structured model does not otherwise own.
+            // Keep their relative order and normalized source spelling.
+            if strip_keyword_ci(trimmed, "FLAGS").is_some()
+                || strip_keyword_ci(trimmed, "REM").is_some()
+            {
+                track.directives.push(trimmed.to_string());
+                continue;
+            }
         }
 
-        // Other lines (FLAGS, etc.) are ignored.
+        // Other lines are outside the editable structured model.
     }
 
     // Commit the last track.

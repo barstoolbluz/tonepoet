@@ -66,7 +66,11 @@ fn enrich(source: &mut PreparedSource, container: &Path) {
     let source_spec = source
         .tracks
         .first()
-        .map(|t| format_source_spec(t.bit_depth, t.sample_rate))
+        .map(|track| {
+            let bit_depth = super::plan_bridge::resolve_source_pcm_depth(track)
+                .map(tonepoet_pipeline::PcmBitDepth::bits);
+            format_source_spec(bit_depth, track.sample_rate)
+        })
         .unwrap_or_else(|| "24-96".to_string());
     extra
         .entry("source_spec".to_string())

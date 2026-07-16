@@ -844,6 +844,7 @@ impl ConversionQueue {
         for mut item in self.completed.drain(..) {
             if item.selected && item.can_retry() {
                 item.status = ConversionStatus::Queued;
+                item.queued_at = Utc::now();
                 item.started_at = None;
                 item.completed_at = None;
                 item.output_path = None;
@@ -875,6 +876,7 @@ impl ConversionQueue {
         for mut item in self.completed.drain(..) {
             if item.can_retry() {
                 item.status = ConversionStatus::Queued;
+                item.queued_at = Utc::now();
                 item.started_at = None;
                 item.completed_at = None;
                 item.output_path = None;

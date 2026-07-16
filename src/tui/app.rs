@@ -6401,6 +6401,10 @@ pub struct MetadataEditorModel {
     pub detail_edit: Option<crate::tui::text_input::TextInputState>,
     pub mb_back: Option<MbBackCache>,
     pub gnudb_back: Option<Box<GnudbReviewState>>,
+    /// One MusicBrainz lookup may own an editor session at a time.
+    pub tags_mb_in_flight: bool,
+    /// Editor-wide mutation generation; every surface save increments it.
+    pub editor_save_generation: u64,
     pub replaygain_cursor: usize,
     pub replaygain_scan_generation: u64,
     pub replaygain_scan: Option<MetadataReplayGainScanState>,
@@ -6440,6 +6444,8 @@ impl Default for MetadataEditorModel {
             detail_edit: None,
             mb_back: None,
             gnudb_back: None,
+            tags_mb_in_flight: false,
+            editor_save_generation: 0,
             replaygain_cursor: 0,
             replaygain_scan_generation: 0,
             replaygain_scan: None,
@@ -7455,6 +7461,7 @@ impl MetadataEditorState {
     /// `(session_id, save_generation)` must be copied into the completion
     /// message and matched before any result can reduce into this editor.
     pub fn begin_write(&mut self) -> (u64, u64) {
+        self.model.editor_save_generation = self.model.editor_save_generation.saturating_add(1);
         self.model.active_surface_mut().technical_details.begin_write()
     }
 
@@ -7484,6 +7491,57 @@ impl MetadataEditorState {
     /// and save generation before applying; stale sessions/generations cannot
     /// close or mutate another editor. Save reduction updates model state only
     /// for files that actually saved.
+    pub fn replace_saved_surface_entries(
+        &mut self,
+        session_id: u64,
+        entries: Vec<crate::tui::probe::TagEntry>,
+    ) -> bool {
+        let entries_len = {
+            let tab = if self.presentation_tabs.is_empty() {
+                (self.model.file_surface.technical_details.session_id == session_id)
+                    .then_some(&mut self.model.file_surface)
+            } else {
+                self.presentation_tabs
+                    .iter_mut()
+                    .find(|tab| tab.technical_details.session_id == session_id)
+            };
+            let Some(tab) = tab else {
+                return false;
+            };
+            tab.entries = entries;
+            tab.deleted.clear();
+            tab.dirty = false;
+            tab.embedded_cuesheet_present = false;
+            tab.sidecar_cuesheet_shadow_present = false;
+            tab.pending_embedded_cuesheet_delete = false;
+            tab.cue_album_synthetic_sheet = None;
+            tab.cue_album_forced_cleanup.clear();
+            tab.entries.len()
+        };
+        self.cursor = self.cursor.min(entries_len.saturating_sub(1));
+        true
+    }
+
+    /// Keep the exact saved surface visibly unresolved when the mandatory
+    /// post-save re-read fails. The carrier write may have succeeded, but the
+    /// editor must not present its pre-save projection as a clean reflection
+    /// of disk state.
+    pub fn mark_saved_surface_refresh_failed(&mut self, session_id: u64) -> bool {
+        let tab = if self.presentation_tabs.is_empty() {
+            (self.model.file_surface.technical_details.session_id == session_id)
+                .then_some(&mut self.model.file_surface)
+        } else {
+            self.presentation_tabs
+                .iter_mut()
+                .find(|tab| tab.technical_details.session_id == session_id)
+        };
+        let Some(tab) = tab else {
+            return false;
+        };
+        tab.dirty = true;
+        true
+    }
+
     pub fn apply_write_results(
         &mut self,
         session_id: u64,
@@ -7699,7 +7757,7 @@ fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
         let is_sidecar_track_row = (entry.display_key.eq_ignore_ascii_case("TITLE")
             || entry.display_key.eq_ignore_ascii_case("ARTIST")
             || entry.display_key.eq_ignore_ascii_case("ISRC"))
-            && entry.per_file_values.len() != path_count;
+            && entry.is_track_scoped(path_count);
         if is_cuesheet_shadow || is_sidecar_track_row {
             mark_tag_entry_saved(entry);
         }
@@ -7756,7 +7814,8 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
     let mut retained_deleted = Vec::new();
 
     for (entry_idx, entry) in tab.entries.iter_mut().enumerate() {
-        let file_aligned = entry.per_file_values.len() == path_count
+        let file_aligned = !entry.is_track_scoped(path_count)
+            && entry.per_file_values.len() == path_count
             && entry.per_file_originals.len() == path_count;
 
         if !file_aligned {
@@ -7866,7 +7925,10 @@ fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
     };
 
     tab.entries.iter().any(|entry| {
-        if entry.per_file_values.len() == path_count && entry.per_file_originals.len() == path_count {
+        if !entry.is_track_scoped(path_count)
+            && entry.per_file_values.len() == path_count
+            && entry.per_file_originals.len() == path_count
+        {
             entry
                 .per_file_values
                 .iter()
@@ -7907,6 +7969,7 @@ fn copy_musicbrainz_entries_preserving_originals(
             Some(i) => {
                 let dst = &mut dst_entries[i];
                 dst.item_key = src.item_key.clone();
+                dst.row_scope = src.row_scope;
                 dst.value = src.value.clone();
                 dst.is_binary = src.is_binary;
                 dst.is_mixed = src.is_mixed;
@@ -7966,6 +8029,53 @@ pub struct MbBackCache {
     pub selected: usize,
 }
 
+/// Interaction phase for the MusicBrainz release picker.
+///
+/// Once a release is accepted, the picker remains visible only as a
+/// non-interactive verification surface. Enter and navigation are ignored;
+/// Esc/Cancel invalidates the identified operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MbSelectPhase {
+    Selecting,
+    Verifying {
+        operation_id: crate::tui::message::TagsMbOperationId,
+    },
+}
+
+impl MbSelectPhase {
+    pub fn verifying_operation(self) -> Option<crate::tui::message::TagsMbOperationId> {
+        match self {
+            Self::Selecting => None,
+            Self::Verifying { operation_id } => Some(operation_id),
+        }
+    }
+}
+
+/// Lifecycle phase owned by one asynchronous MusicBrainz workflow.
+///
+/// Pre-lookup phases are explicit so duplicate discovery/grouping completions
+/// can be rejected before they write caches, status, overlays, or editor state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagsMbOperationPhase {
+    Discovery,
+    Grouping,
+    Lookup,
+    Selecting,
+    Verifying,
+}
+
+/// App-wide owner record for one complete asynchronous MusicBrainz workflow.
+///
+/// The same identity owns discovery, grouping, lookup, fallback, picker,
+/// verification, and apply. `picker_owned` means replacement or dismissal of
+/// the picker invalidates the operation immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveTagsMbOperation {
+    pub operation_id: crate::tui::message::TagsMbOperationId,
+    pub picker_owned: bool,
+    pub phase: TagsMbOperationPhase,
+}
+
 /// State for the MusicBrainz release-selection overlay shown when MB
 /// returns >1 candidate release for a disc TOC. Lists releases sorted
 /// by descending score; user picks one to advance to the metadata
@@ -7981,10 +8091,18 @@ pub struct MbSelectState {
     /// Audio file paths the lookup was computed for (used to populate
     /// the metadata editor after the user accepts).
     pub paths: Vec<std::path::PathBuf>,
+    /// Identity of the lookup workflow that produced this picker. Pickers
+    /// reconstructed by `:mb-back` use `UNASSIGNED` and acquire a fresh ID on
+    /// acceptance; live lookup pickers preserve their original authority.
+    pub operation_id: crate::tui::message::TagsMbOperationId,
     /// Metadata-editor session that initiated this picker, when the picker
     /// came from an in-editor asynchronous MusicBrainz lookup.  Accepting a
     /// release must still match this session before mutating the parked editor.
     pub editor_session: Option<crate::tui::message::MetadataEditorSessionGuard>,
+    /// Selecting until the user accepts a release. Verifying is deliberately
+    /// non-interactive and carries the operation identity expected by the
+    /// eventual async completion.
+    pub phase: MbSelectPhase,
     /// Last left-click on a row, used for double-click-to-accept
     /// detection. Skipped from Clone-derived semantics by being
     /// reset on each click cycle.
@@ -8022,7 +8140,9 @@ impl MbSelectState {
             selected: 0,
             scroll: 0,
             paths,
+            operation_id: crate::tui::message::TagsMbOperationId::UNASSIGNED,
             editor_session,
+            phase: MbSelectPhase::Selecting,
             last_click: None,
             prefetch: std::collections::BTreeMap::new(),
             generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -8037,6 +8157,18 @@ impl MbSelectState {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1
+    }
+
+    pub fn with_operation_id(
+        mut self,
+        operation_id: crate::tui::message::TagsMbOperationId,
+    ) -> Self {
+        self.operation_id = operation_id;
+        self
+    }
+
+    pub fn is_selecting(&self) -> bool {
+        matches!(self.phase, MbSelectPhase::Selecting)
     }
 }
 
@@ -8968,6 +9100,12 @@ pub struct AppState {
     /// without consuming the picker.
     pub pending_mb_select: Option<Box<MbSelectState>>,
 
+    /// Monotonic source for opaque MusicBrainz apply operation identities.
+    pub tags_mb_operation_generation: u64,
+    /// Currently authoritative selected-release apply, if any. Async
+    /// completions must match this record before mutating an editor.
+    pub active_tags_mb_operation: Option<ActiveTagsMbOperation>,
+
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
     pub processing_active: bool,
@@ -9717,6 +9855,8 @@ impl AppState {
             deferred_browse_archive_exit: false,
             pending_cue_preview: None,
             pending_mb_select: None,
+            tags_mb_operation_generation: 0,
+            active_tags_mb_operation: None,
             status_message: theme_startup_status.map(|message| (message, std::time::Instant::now())),
             processing_active: false,
             should_quit: false,
@@ -12572,6 +12712,7 @@ mod metadata_presentation_tab_tests {
 
     fn tag(display_key: &str, value: &str, per_file_values: Vec<&str>) -> TagEntry {
         TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: display_key.to_string(),
             item_key: ItemKey::TrackTitle,
             value: value.to_string(),
@@ -13231,6 +13372,7 @@ mod metadata_presentation_tab_tests {
         });
         state.active_surface_mut().entries = vec![
             TagEntry {
+                row_scope: crate::tui::probe::RowScope::File,
                 display_key: "CUESHEET".to_string(),
                 item_key: ItemKey::Unknown("CUESHEET".to_string()),
                 value: "new synthetic sheet".to_string(),
@@ -13322,6 +13464,7 @@ mod metadata_presentation_tab_tests {
         });
         state.active_surface_mut().entries = vec![
             TagEntry {
+                row_scope: crate::tui::probe::RowScope::File,
                 display_key: "CUESHEET".to_string(),
                 item_key: ItemKey::Unknown("CUESHEET".to_string()),
                 value: "new synthetic sheet".to_string(),

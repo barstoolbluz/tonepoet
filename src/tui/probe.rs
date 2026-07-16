@@ -5048,6 +5048,17 @@ fn metadata_field_item_key(field: MetadataField) -> lofty::tag::ItemKey {
 
 // ── Full tag enumeration + batch write (metadata editor) ────────────
 
+/// Positional dimension represented by a metadata row. File rows align with
+/// `PresentationTab.paths`; track rows align with the CUE/medium track model.
+/// The distinction is explicit because the two dimensions can have the same
+/// length (for example, two tracks across two member images).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RowScope {
+    #[default]
+    File,
+    Track,
+}
+
 /// A single tag entry read from an audio file (or merged across files).
 #[derive(Debug, Clone)]
 pub struct TagEntry {
@@ -5063,8 +5074,9 @@ pub struct TagEntry {
     pub is_binary: bool,
     /// True if files have different values for this key.
     pub is_mixed: bool,
-    /// Per-file current values (indexed by paths order). Length = 1 for
-    /// single-file editing, N for multi-file.
+    /// The semantic dimension of the positional value vectors.
+    pub row_scope: RowScope,
+    /// Current values in the row's declared positional dimension.
     pub per_file_values: Vec<String>,
     /// Per-file original values at read time (for per-file write diff).
     pub per_file_originals: Vec<String>,
@@ -5075,6 +5087,24 @@ pub struct TagEntry {
     pub mb_proposed_value: Option<String>,
     /// Per-file MB-proposed values, paired with `mb_proposed_value`.
     pub mb_proposed_per_file: Option<Vec<String>>,
+}
+
+impl TagEntry {
+    /// Resolve row scope with a compatibility fallback for older construction
+    /// sites and persisted/test fixtures. New synthesized rows must set
+    /// `row_scope` explicitly; a vector that cannot be file-aligned is still
+    /// treated as track-scoped so legacy behavior remains fail-safe.
+    pub fn effective_row_scope(&self, file_count: usize) -> RowScope {
+        if self.row_scope == RowScope::Track || self.per_file_values.len() != file_count {
+            RowScope::Track
+        } else {
+            RowScope::File
+        }
+    }
+
+    pub fn is_track_scoped(&self, file_count: usize) -> bool {
+        self.effective_row_scope(file_count) == RowScope::Track
+    }
 }
 
 /// True when this entry's value is too large or structured to render
@@ -5145,7 +5175,10 @@ pub fn metadata_editor_has_changes(state: &super::app::MetadataEditorState) -> b
 
     deletion_is_dirty
         || state.active_surface().entries.iter().any(|e| {
-            if has_file_access_model && e.per_file_values.len() == state.active_surface().paths.len() {
+            if has_file_access_model
+                && !e.is_track_scoped(state.active_surface().paths.len())
+                && e.per_file_values.len() == state.active_surface().paths.len()
+            {
                 return writable_indices.iter().any(|&idx| {
                     e.per_file_values.get(idx) != e.per_file_originals.get(idx)
                 });
@@ -5517,7 +5550,10 @@ fn apply_paths_entries_permutation(
     *paths = sorted_paths;
 
     for entry in entries.iter_mut() {
-        if entry.per_file_values.len() == n && entry.per_file_originals.len() == n {
+        if !entry.is_track_scoped(n)
+            && entry.per_file_values.len() == n
+            && entry.per_file_originals.len() == n
+        {
             let sv: Vec<_> = perm
                 .iter()
                 .map(|&i| entry.per_file_values[i].clone())
@@ -5746,6 +5782,7 @@ pub fn ensure_standard_fields_present(entries: &mut Vec<TagEntry>, n_files: usiz
             .any(|e| e.display_key.eq_ignore_ascii_case(field));
         if !exists {
             entries.push(TagEntry {
+                row_scope: crate::tui::probe::RowScope::File,
                 display_key: field.to_string(),
                 item_key: lofty::tag::ItemKey::Unknown(field.to_string()),
                 value: String::new(),
@@ -6014,6 +6051,7 @@ fn read_all_tags_from_tagged_file(tagged: &lofty::file::TaggedFile) -> Vec<TagEn
             ItemValue::Binary(b) => (format!("<binary, {} bytes>", b.len()), true),
         };
         entries.push(TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key,
             item_key: key,
             value: value.clone(),
@@ -6211,6 +6249,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
         };
 
         entries.push(TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: data.display_key.clone(),
             item_key: key.clone(),
             value: display_value.clone(),
@@ -6383,6 +6422,7 @@ pub fn read_all_tags_merged_with_metadata(
         };
 
         entries.push(TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: data.display_key.clone(),
             item_key: key.clone(),
             value: display_value.clone(),
@@ -6558,9 +6598,20 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
     progress: Option<MetadataWriteProgressCallback>,
     cancel: Option<MetadataWriteCancelFlag>,
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+    let scoped_entries: Vec<_> = entries_snap
+        .iter()
+        .map(|(key, values, originals)| {
+            let scope = if values.len() == paths.len() {
+                RowScope::File
+            } else {
+                RowScope::Track
+            };
+            (key.clone(), scope, values.clone(), originals.clone())
+        })
+        .collect();
     apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
         paths,
-        entries_snap,
+        &scoped_entries,
         deleted,
         save_block_reasons,
         progress,
@@ -6577,7 +6628,7 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
 /// treated as the tag to delete.
 pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
     paths: &[std::path::PathBuf],
-    entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
+    entries_snap: &[(lofty::tag::ItemKey, RowScope, Vec<String>, Vec<String>)],
     deleted: &[usize],
     save_block_reasons: &[Option<String>],
     progress: Option<MetadataWriteProgressCallback>,
@@ -6596,11 +6647,11 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
 
     for (file_idx, path) in paths.iter().enumerate() {
         let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
-        for (entry_idx, (key, vals, origs)) in entries_snap.iter().enumerate() {
-            // Per-track entries (single-image rips with embedded CUESHEET)
-            // round-trip through the regenerated CUESHEET tag instead of
-            // having a per-file lofty home; skip them here.
-            if vals.len() != paths.len() {
+        for (entry_idx, (key, row_scope, vals, origs)) in entries_snap.iter().enumerate() {
+            // Track-scoped rows round-trip through the regenerated CUESHEET
+            // model instead of through whole-file tag writes. The explicit
+            // marker is required when track and file dimensions are equal.
+            if *row_scope == RowScope::Track {
                 continue;
             }
             if deleted.contains(&entry_idx) {
@@ -7539,6 +7590,7 @@ mod tests {
     #[test]
     fn ensure_dim_replicate_never_shrinks_existing_row_values() {
         let mut entry = TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: "TITLE".to_string(),
             item_key: lofty::tag::ItemKey::TrackTitle,
             value: "A".to_string(),
@@ -9956,6 +10008,7 @@ mod tests {
             std::path::PathBuf::from("01 - First.flac"),
         ];
         let mut entries = vec![TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: "TRACKNUMBER".to_string(),
             item_key: lofty::tag::ItemKey::TrackNumber,
             value: "<multiple values>".to_string(),
@@ -9988,6 +10041,7 @@ mod tests {
 
     fn entry_with_mb_proposed(original: &str, proposed: &str, per_file_count: usize) -> TagEntry {
         TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: "TITLE".to_string(),
             item_key: lofty::tag::ItemKey::TrackTitle,
             value: proposed.to_string(),
@@ -10026,6 +10080,7 @@ mod tests {
     #[test]
     fn pill_state_none_when_not_from_mb() {
         let e = TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: "TITLE".into(),
             item_key: lofty::tag::ItemKey::TrackTitle,
             value: "x".into(),
@@ -10077,6 +10132,7 @@ mod tests {
         let mut state = MetadataEditorState::for_files(
             vec![std::path::PathBuf::from("/tmp/01.flac")],
             vec![TagEntry {
+                row_scope: crate::tui::probe::RowScope::File,
                 display_key: "TITLE".into(),
                 item_key: lofty::tag::ItemKey::TrackTitle,
                 value: "x".into(),
@@ -10211,6 +10267,7 @@ mod tests {
     #[test]
     fn toggle_no_op_when_no_mb_proposed() {
         let mut e = TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
             display_key: "TITLE".into(),
             item_key: lofty::tag::ItemKey::TrackTitle,
             value: "x".into(),

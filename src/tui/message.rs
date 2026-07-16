@@ -61,10 +61,33 @@ pub enum AudioProbeContext {
 pub struct MetadataEditorSessionGuard {
     pub session_id: u64,
     pub save_generation: u64,
+    pub editor_generation: u64,
+}
+
+/// Opaque identity for one complete MusicBrainz tagging workflow.
+///
+/// The ID is allocated before split-CUE discovery or grouping begins and is
+/// preserved through TOC fallback, text search, picker selection, verification,
+/// and application. Every asynchronous completion must prove that it still owns
+/// the active ID before it may change status, overlays, latches, or editor data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TagsMbOperationId(pub u64);
+
+impl TagsMbOperationId {
+    /// Sentinel used only while a caller is assembling a pre-lookup or direct
+    /// lookup request. Spawn helpers replace it with an allocated identity before
+    /// any worker is launched.
+    pub const UNASSIGNED: Self = Self(0);
+
+    pub fn is_assigned(self) -> bool {
+        self != Self::UNASSIGNED
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct TagsMbContext {
+    /// Authority for the complete lookup-to-apply lifecycle.
+    pub operation_id: TagsMbOperationId,
     pub paths: Vec<std::path::PathBuf>,
     /// `true` = the dispatch left a metadata editor in
     /// `active_overlay` that should be populated in place; the
@@ -388,6 +411,10 @@ pub enum AppMessage {
         session_id: u64,
         save_generation: u64,
         results: Vec<crate::tui::app::MetadataEditorWriteResult>,
+        /// Worker-side tag re-read performed only after a fully successful
+        /// embedded-CUESHEET deletion save. This prevents the reducer from
+        /// marking stale CUE-derived rows clean.
+        refreshed_entries: Option<Result<Vec<crate::tui::probe::TagEntry>, String>>,
     },
     /// Result of a background Details-tab media probe from the metadata editor.
     /// Reduced into the active editor model by the event loop; rendering never
@@ -543,17 +570,19 @@ pub enum AppMessage {
     /// Result of an async MusicBrainz lookup driving `:tags-mb`.
     /// Unified across three entry points (Browse audio-file selection,
     /// SACD editor in-place, regular file editor in-place) via the
-    /// `MbOutcome` envelope + `TagsMbContext`. The same handler
-    /// drives all of them; populate-vs-open-fresh and fallback
-    /// eligibility ride on `ctx`.
+    /// `MbOutcome` envelope + `TagsMbContext`. The context carries the
+    /// workflow identity allocated before dispatch; the reducer must reject a
+    /// non-current identity before changing cache, status, overlays, latches,
+    /// or editor state. Populate-vs-open-fresh and fallback eligibility also
+    /// ride on `ctx`.
     TagsFromMbComplete {
         outcome: MbOutcome,
         ctx: TagsMbContext,
     },
-    /// Completion of the same-folder split-CUE album grouping ladder. The
-    /// reducer caches the grouping decision, persists any TOC cache bodies
-    /// produced by the probes, then continues the original MusicBrainz tagging
-    /// dispatch according to the resolved merge/split outcome.
+    /// Completion of the same-folder split-CUE album grouping ladder. The boxed
+    /// request carries the workflow operation ID; the reducer must reject stale
+    /// or duplicate completions before cache, status, overlay, latch, or editor
+    /// mutation, then continue under that unchanged ID.
     SplitCueAlbumGroupingComplete {
         request: Box<crate::tui::command::SplitCueAlbumGroupingRequest>,
         result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
@@ -575,9 +604,9 @@ pub enum AppMessage {
         active_cue_path: Option<std::path::PathBuf>,
         result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
     },
-    /// Completion of in-editor split-CUE discovery for `:tags-mb`. The reducer
-    /// only snapshots paths and parks the editor; filesystem discovery and CUE
-    /// parsing complete on a blocking worker before this message is reduced.
+    /// Completion of in-editor split-CUE discovery for `:tags-mb`. The boxed
+    /// request carries the operation ID allocated before worker launch; stale or
+    /// duplicate completions are total no-ops before any UI or cache mutation.
     InEditorSplitCueMusicBrainzInfoComplete {
         request: Box<crate::tui::command::InEditorSplitCueMusicBrainzInfoRequest>,
         result: Result<Vec<crate::tui::cue_parser::SingleImageInfo>, String>,
@@ -587,6 +616,7 @@ pub enum AppMessage {
     /// may read tags and probe sample counts, so it must complete on a
     /// blocking worker before the event-loop reducer mutates UI state.
     TagsMbApplyReady {
+        operation_id: TagsMbOperationId,
         releases: Vec<crate::tui::musicbrainz::MbRelease>,
         selected: usize,
         paths: Vec<std::path::PathBuf>,

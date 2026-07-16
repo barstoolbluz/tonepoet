@@ -1017,7 +1017,8 @@ pub enum TrackSourceRef {
     StagedFile(PathBuf),
     CueSegmentCarrier {
         /// Validated, sample-bounded CUE segment carrier produced by the
-        /// materializer. This is an audio-only `pcm_s32le` WAV file and must
+        /// materializer. This is an audio-only PCM WAV carrier (`pcm_s32le`
+        /// for integer sources, `pcm_f32le`/`pcm_f64le` for float sources) and must
         /// not be treated as the original source image for tag, artwork, MD5,
         /// or source-bit-depth policy.
         path: PathBuf,
@@ -1514,13 +1515,40 @@ impl DvdaCopyProtectionBlock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CueSegmentCarrier {
     PcmS32LeWav,
+    PcmF32LeWav,
+    PcmF64LeWav,
 }
 
 impl CueSegmentCarrier {
+    /// Select a lossless segmentation carrier for the probed source sample
+    /// representation. Integer PCM is normalized to signed 32-bit; floating
+    /// point stays floating point so `BitDepthTarget::Source` never crosses
+    /// the integer/float class boundary before final planning.
+    #[must_use]
+    pub const fn for_source_depth_descriptor(source_depth: Option<u32>) -> Self {
+        match source_depth {
+            Some(33 | 320) => Self::PcmF32LeWav,
+            Some(640) => Self::PcmF64LeWav,
+            _ => Self::PcmS32LeWav,
+        }
+    }
+
     #[must_use]
     pub const fn bit_depth(self) -> u32 {
         match self {
+            Self::PcmS32LeWav | Self::PcmF32LeWav => 32,
+            Self::PcmF64LeWav => 64,
+        }
+    }
+
+    /// Descriptor consumed by the shared source-depth resolver. Integer widths
+    /// are literal bits; 320/640 preserve Float32/Float64 class.
+    #[must_use]
+    pub const fn source_depth_descriptor(self) -> u32 {
+        match self {
             Self::PcmS32LeWav => 32,
+            Self::PcmF32LeWav => 320,
+            Self::PcmF64LeWav => 640,
         }
     }
 
@@ -1528,13 +1556,15 @@ impl CueSegmentCarrier {
     pub const fn codec_name(self) -> &'static str {
         match self {
             Self::PcmS32LeWav => "pcm_s32le",
+            Self::PcmF32LeWav => "pcm_f32le",
+            Self::PcmF64LeWav => "pcm_f64le",
         }
     }
 
     #[must_use]
     pub const fn container_name(self) -> &'static str {
         match self {
-            Self::PcmS32LeWav => "wav",
+            Self::PcmS32LeWav | Self::PcmF32LeWav | Self::PcmF64LeWav => "wav",
         }
     }
 }
@@ -1648,6 +1678,9 @@ pub struct SourceAudioDescriptor {
         deserialize_with = "deserialize_optional_nonzero_u32"
     )]
     pub primary_sample_rate: Option<u32>,
+    /// Scalar PCM representation when one value describes the source.
+    /// Integer values are literal widths; compatibility descriptors 320/640
+    /// preserve Float32/Float64 sample class for older serialized contracts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bit_depth: Option<u32>,
 }
@@ -1700,10 +1733,12 @@ pub struct PreparedTrack {
     /// from string metadata.
     #[serde(default)]
     pub source_audio: SourceAudioDescriptor,
-    /// Probed bit depth of the original source image/file when available. For
-    /// CUE image tracks this remains the original image depth; it is not the
-    /// `pcm_s32le` depth of the staged segment WAV carrier. For DVD-Audio this
-    /// mirrors `source_audio.bit_depth` only when one scalar bit depth is known.
+    /// Probed PCM representation of the original source image/file when
+    /// available. Integer values are their ordinary widths; the compatibility
+    /// descriptors `320` and `640` denote Float32 and Float64 respectively. For
+    /// CUE image tracks this remains the original image representation; it is
+    /// not the representation of the staged segment WAV carrier. For DVD-Audio
+    /// this mirrors `source_audio.bit_depth` only when one scalar depth is known.
     pub bit_depth: Option<u32>,
 }
 

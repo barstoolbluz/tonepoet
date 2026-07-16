@@ -650,20 +650,26 @@ pub fn commit_batch_with_cue_artifacts(
 
 /// Start processing all queued items. Shared between convert screen and queue screen.
 pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let ready_count = app
+    let ready_items: std::collections::HashMap<
+        String,
+        chrono::DateTime<chrono::Utc>,
+    > = app
         .manager
         .get_items_clone()
-        .iter()
-        .filter(|i| matches!(i.status, ConversionStatus::Queued))
-        .count();
+        .into_iter()
+        .filter(|item| matches!(&item.status, ConversionStatus::Queued))
+        .map(|item| (item.id, item.queued_at))
+        .collect();
 
-    if ready_count == 0 {
+    if ready_items.is_empty() {
         app.set_status("No items ready for conversion");
         return;
     }
 
     app.processing_active = true;
-    let cancel_token = app.manager.conversion_cancel_token();
+    let cancel_token = app
+        .manager
+        .conversion_cancel_token_for_items(ready_items);
 
     let queue = app.manager.queue.clone();
     let processor_config = crate::convert::ProcessorConfig {

@@ -274,6 +274,14 @@ pub fn regenerate_cue_with_overrides(
         if let Some(c) = isrc {
             cue.push_str(&format!("    ISRC {}\n", escape(c)));
         }
+        for directive in &track.directives {
+            let directive = directive.trim();
+            if !directive.is_empty() {
+                cue.push_str("    ");
+                cue.push_str(directive);
+                cue.push('\n');
+            }
+        }
         if let Some(idx00) = track.index00_frames {
             cue.push_str(&format!(
                 "    INDEX 00 {}\n",
@@ -1166,6 +1174,7 @@ mod tests {
                 mb_track(2, "Track 2", Some(180_000), None),                 // 3:00
                 mb_track(3, "Track 3", Some(120_000), None),                 // 2:00
             ],
+            track_parse_error: None,
         };
         let cue = cue_from_mb_release(&release, "image.flac", "flac")
             .expect("cue generation should succeed");
@@ -1213,6 +1222,7 @@ mod tests {
                 mb_track(1, "Track 1", Some(240_000), None),
                 mb_track(2, "Track 2", None, None),
             ],
+            track_parse_error: None,
         };
         let err = cue_from_mb_release(&release, "image.flac", "flac")
             .expect_err("must refuse when a track has no length");
@@ -1238,6 +1248,7 @@ mod tests {
             barcode: None,
             disc_count: 1,
             tracks: vec![],
+            track_parse_error: None,
         };
         assert!(cue_from_mb_release(&release, "image.flac", "flac").is_err());
     }
@@ -1275,6 +1286,7 @@ mod tests {
                     index01_frames: Some(0),
                     index00_frames: None,
                     isrc: Some("USRC0000001".into()),
+                    directives: Vec::new(),
                 },
                 CueTrack {
                     number: 2,
@@ -1284,6 +1296,7 @@ mod tests {
                     index01_frames: Some(18000), // 4:00:00
                     index00_frames: Some(17925), // 3:59:00 (75-frame pregap)
                     isrc: None,
+                    directives: Vec::new(),
                 },
             ],
         };
@@ -1320,6 +1333,46 @@ mod tests {
     }
 
     #[test]
+    fn regenerate_round_trips_track_flags_and_rem_directives_byte_stably() {
+        let original = concat!(
+            "REM GENRE \"Rock\"\n",
+            "REM DATE \"1983\"\n",
+            "TITLE \"Album\"\n",
+            "PERFORMER \"Artist\"\n",
+            "FILE \"image.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"One\"\n",
+            "    PERFORMER \"Artist\"\n",
+            "    ISRC USABC8300001\n",
+            "    FLAGS PRE DCP\n",
+            "    REM COMPOSER \"Composer One\"\n",
+            "    REM COMMENT \"preserve ordering\"\n",
+            "    INDEX 00 00:00:00\n",
+            "    INDEX 01 00:00:10\n",
+        );
+        let parsed = super::super::cue_parser::parse_cue(original);
+        assert_eq!(
+            parsed.tracks[0].directives,
+            vec![
+                "FLAGS PRE DCP".to_string(),
+                "REM COMPOSER \"Composer One\"".to_string(),
+                "REM COMMENT \"preserve ordering\"".to_string(),
+            ]
+        );
+        let regenerated = regenerate_cue_with_overrides(
+            &parsed,
+            &[TrackOverride {
+                title: None,
+                performer: None,
+                isrc: None,
+            }],
+            "image.flac",
+            "FLAC",
+        );
+        assert_eq!(regenerated, original);
+    }
+
+    #[test]
     fn regenerate_with_no_overrides_preserves_parsed_track_titles() {
         use super::super::cue_parser::{CueSheet, CueTrack};
         let parsed = CueSheet {
@@ -1336,6 +1389,7 @@ mod tests {
                 index01_frames: Some(0),
                 index00_frames: None,
                 isrc: None,
+                directives: Vec::new(),
             }],
         };
         let overrides = vec![TrackOverride {

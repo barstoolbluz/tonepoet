@@ -636,52 +636,49 @@ fn push_synthetic_cue_album_groups_for_queue(
         }
         candidates.sort_by(|a, b| deterministic_path_sort_key(&a.path).cmp(&deterministic_path_sort_key(&b.path)));
 
-        let mut parts = Vec::new();
-        let mut parent_failed_closed = false;
-        for cue in &candidates {
-            let sheet = match crate::convert::cue_parser::parse_cue_file(&cue.path) {
-                Ok(sheet) => sheet,
-                Err(err) => {
-                    fatal_errors.push(format!(
-                        "Cannot queue merged CUE album for {}: failed to parse {}: {}. Nothing was staged for this group; fix the CUE or select a single .cue explicitly.",
-                        parent.display(),
-                        cue.path.display(),
-                        err
-                    ));
-                    parent_failed_closed = true;
-                    break;
-                }
-            };
-            let referenced_audio = match cue_queue_decision_for_path(&cue.path) {
-                Ok(CueQueueDecision::SplitSource { referenced_audio }) => referenced_audio,
-                Ok(CueQueueDecision::MetadataArtifact { .. }) => continue,
-                Err(err) => {
-                    fatal_errors.push(format!(
-                        "Cannot queue merged CUE album for {}: failed to analyze {}: {}. Nothing was staged for this group; fix the CUE or select a single .cue explicitly.",
-                        parent.display(),
-                        cue.path.display(),
-                        err
-                    ));
-                    parent_failed_closed = true;
-                    break;
-                }
-            };
-            if referenced_audio.is_empty() || sheet.tracks.is_empty() {
-                continue;
-            }
-            parts.push(SyntheticCueAlbumPart {
-                cue_path: cue.path.clone(),
-                cue_key: cue.path_key.clone(),
-                sheet,
-                referenced_audio,
-            });
-        }
-        if parent_failed_closed {
+        let cue_paths: Vec<PathBuf> = candidates.iter().map(|cue| cue.path.clone()).collect();
+        let admission = crate::convert::split_cue_album::admit_split_cue_candidate_paths(&cue_paths);
+        if !admission.warnings.is_empty() || admission.rejected_folders.iter().any(|rejected| rejected == &parent) {
+            fatal_errors.extend(admission.warnings.into_iter().map(|warning| {
+                format!(
+                    "Cannot queue merged CUE album for {}: {}. Nothing was staged for this group; fix the CUE or select a single .cue explicitly.",
+                    parent.display(),
+                    warning
+                )
+            }));
             for cue in &candidates {
                 grouped.insert(cue.path_key.clone());
             }
-            suppress_parent_audio_for_failed_synthetic_group(&parent, queueable_non_cue, suppressed_audio_keys);
+            suppress_parent_audio_for_failed_synthetic_group(
+                &parent,
+                queueable_non_cue,
+                suppressed_audio_keys,
+            );
             continue;
+        }
+
+        let Some(admitted_folder) = admission
+            .folders
+            .into_iter()
+            .find(|folder| queue_path_key(&folder.parent) == parent)
+        else {
+            continue;
+        };
+        let mut parts = Vec::new();
+        for member in admitted_folder.members {
+            // Membership role is decided by the shared editor/planner policy.
+            // A one-track-per-FILE CUE is a metadata sidecar for already-split
+            // files, not a synthetic album part.
+            if !member.contributes_synthetic_album_part() {
+                continue;
+            }
+            let cue_key = queue_path_key(&member.cue_path);
+            parts.push(SyntheticCueAlbumPart {
+                cue_path: member.cue_path,
+                cue_key,
+                sheet: member.sheet,
+                referenced_audio: member.referenced_audio,
+            });
         }
         if parts.len() < 2 {
             continue;
@@ -1470,7 +1467,7 @@ fn process_root_owner_is_live(process_root: &Path) -> bool {
     process_id_is_live(pid)
 }
 
-fn process_id_is_live(pid: u32) -> bool {
+pub(crate) fn process_id_is_live(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
@@ -1719,32 +1716,15 @@ enum CueQueueDecision {
     MetadataArtifact { referenced_audio: Vec<PathBuf> },
 }
 
-#[derive(Debug)]
-struct CueQueueAnalysis {
-    referenced_audio: Vec<PathBuf>,
-    track_count_by_audio_key: BTreeMap<PathBuf, usize>,
-}
-
 fn cue_queue_decision_for_path(cue_path: &Path) -> Result<CueQueueDecision, String> {
-    let analysis = analyze_cue_for_queue(cue_path)?;
-
-    // A CUE is a split source as soon as it provides split points for at least
-    // one referenced audio file. Mixed layouts can also reference one-track
-    // bonus files; once the CUE is a split source, suppress every referenced
-    // audio file so the materializer owns the complete track index and the
-    // queue never double-converts the one-track references.
-    let has_split_source = analysis
-        .track_count_by_audio_key
-        .values()
-        .any(|track_count| *track_count > 1);
-
-    if has_split_source {
+    let member = crate::convert::split_cue_album::admit_split_cue_member(cue_path)?;
+    if member.contributes_synthetic_album_part() {
         Ok(CueQueueDecision::SplitSource {
-            referenced_audio: analysis.referenced_audio,
+            referenced_audio: member.referenced_audio,
         })
     } else {
         Ok(CueQueueDecision::MetadataArtifact {
-            referenced_audio: analysis.referenced_audio,
+            referenced_audio: member.referenced_audio,
         })
     }
 }
@@ -1765,90 +1745,6 @@ pub(crate) fn cue_referenced_audio_paths_to_suppress_for_queue(
         CueQueueDecision::SplitSource { referenced_audio } => Ok(referenced_audio),
         CueQueueDecision::MetadataArtifact { .. } => Ok(Vec::new()),
     }
-}
-
-fn analyze_cue_for_queue(cue_path: &Path) -> Result<CueQueueAnalysis, String> {
-    let sheet = crate::convert::cue_parser::parse_cue_file(cue_path)
-        .map_err(|err| format!("failed to parse CUE: {err}"))?;
-    let parent = cue_path
-        .parent()
-        .ok_or_else(|| "CUE path has no parent directory".to_string())?;
-    let parent_key = queue_path_key(parent);
-
-    if sheet.tracks.is_empty() {
-        return Err("CUE sheet has no tracks".to_string());
-    }
-
-    let mut referenced_audio = Vec::new();
-    let mut referenced_audio_keys = HashSet::new();
-    let mut resolved_tracks = Vec::with_capacity(sheet.tracks.len());
-    let mut track_count_by_audio_key = BTreeMap::new();
-    for track in &sheet.tracks {
-        let index01 = track
-            .index01_frames
-            .ok_or_else(|| format!("track {} has no INDEX 01", track.number))?;
-        let file_ref = track
-            .file
-            .as_deref()
-            .ok_or_else(|| format!("track {} has no FILE reference", track.number))?;
-
-        let resolved = match resolve_cue_file_reference_for_queue(parent, file_ref) {
-            CueReferenceResolution::Resolved(path) => path,
-            CueReferenceResolution::Missing => {
-                return Err(format!(
-                    "track {} FILE reference {:?} was not found",
-                    track.number, file_ref
-                ));
-            }
-            CueReferenceResolution::Ambiguous(candidates) => {
-                return Err(format!(
-                    "track {} FILE reference {:?} was ambiguous: {}",
-                    track.number,
-                    file_ref,
-                    format_candidate_paths_for_log(&candidates)
-                ));
-            }
-        };
-
-        if !is_audio_file_path(&resolved) {
-            return Err(format!(
-                "track {} FILE reference {:?} did not resolve to a supported audio file: {}",
-                track.number,
-                file_ref,
-                resolved.display()
-            ));
-        }
-
-        // Folder expansion intentionally accepts only CUE references to audio
-        // in the exact same directory as the CUE. Some valid CUE layouts keep
-        // the image under a child directory, but the queue heuristic chooses a
-        // conservative boundary here: cross-directory references are treated as
-        // unsafe metadata artifacts so a folder conversion does not unexpectedly
-        // materialize audio outside the CUE's sibling file set. Explicit CUE
-        // selection is still honored by `into_queue_paths()`.
-        if !is_same_directory_key_for_queue(&parent_key, &resolved) {
-            return Err(format!(
-                "track {} FILE reference {:?} resolved outside the CUE directory: {}",
-                track.number,
-                file_ref,
-                resolved.display()
-            ));
-        }
-
-        let resolved_key = queue_path_key(&resolved);
-        if referenced_audio_keys.insert(resolved_key.clone()) {
-            referenced_audio.push(resolved.clone());
-        }
-        *track_count_by_audio_key.entry(resolved_key).or_insert(0) += 1;
-        resolved_tracks.push((track.number, resolved, index01));
-    }
-
-    validate_queue_cue_index_order(&resolved_tracks)?;
-
-    Ok(CueQueueAnalysis {
-        referenced_audio,
-        track_count_by_audio_key,
-    })
 }
 
 fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Result<(), String> {
@@ -2025,17 +1921,6 @@ fn same_path_for_queue(left: &Path, right: &Path) -> bool {
         _ => left == right,
     }
 }
-
-fn is_same_directory_key_for_queue(left_key: &Path, right_file: &Path) -> bool {
-    let Some(right) = right_file.parent() else {
-        return false;
-    };
-
-    queue_path_key(right) == left_key
-}
-
-
-
 
 /// Map queue-expansion CUE-artifact metadata onto the sidecar policy for one
 /// queued path. Shared by CLI and TUI queue construction so both front ends
@@ -2759,7 +2644,16 @@ FILE "side_a.flac" WAVE
 
         let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
         assert!(expanded.paths.is_empty(), "parse failure must not fall back to side CUEs or raw images: {:?}", expanded.paths);
-        assert!(expanded.expansion_errors.iter().any(|err| err.contains("failed to parse") || err.contains("failed to analyze")), "expected a parse/analyze error, got {:?}", expanded.expansion_errors);
+        assert!(
+            expanded.expansion_errors.iter().any(|err| {
+                err.contains("failed to parse")
+                    || err.contains("failed to analyze")
+                    || err.contains("failed to decode")
+                    || err.contains("member CUE invalid")
+            }),
+            "expected a parse/analyze/decode error, got {:?}",
+            expanded.expansion_errors
+        );
     }
 
 

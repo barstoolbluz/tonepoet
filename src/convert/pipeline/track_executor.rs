@@ -1194,6 +1194,9 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let mut request = metadata_test_request(temp.path());
         request.settings.target_format = AudioFormat::Flac;
+        // Unknown Source depth now fails closed; these tests pin metadata effects.
+        request.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
         request.settings.metadata.transfer_tags = true;
         request.settings.metadata.preserve_artwork = true;
         let track = metadata_test_track(TrackSourceRef::StagedFile(temp.path().join("source.flac")));
@@ -1230,6 +1233,9 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let mut request = metadata_test_request(temp.path());
         request.settings.target_format = AudioFormat::Flac;
+        // Unknown Source depth now fails closed; these tests pin metadata effects.
+        request.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
         request.settings.metadata.transfer_tags = true;
         request.settings.metadata.preserve_artwork = true;
         let track = metadata_test_track(TrackSourceRef::StagedFile(temp.path().join("source.flac")));
@@ -1266,6 +1272,9 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let mut request = metadata_test_request(temp.path());
         request.settings.target_format = AudioFormat::Flac;
+        // Unknown Source depth now fails closed; these tests pin metadata effects.
+        request.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
         request.settings.metadata.transfer_tags = true;
         request.settings.metadata.preserve_artwork = true;
         request.settings.metadata.store_source_audio_md5 = true;
@@ -1310,6 +1319,8 @@ mod tests {
         let staged_output = temp.path().join("out.flac");
         let mut request = metadata_test_request(temp.path());
         request.settings.target_format = AudioFormat::Flac;
+        request.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24);
         request.settings.metadata.transfer_tags = true;
         request.settings.metadata.preserve_artwork = true;
         let track = metadata_test_track(TrackSourceRef::SacdTrack {

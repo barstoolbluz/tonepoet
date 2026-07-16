@@ -177,6 +177,7 @@ pub trait ToolRunner: Send + Sync {
 enum StubResponse {
     Output(ToolOutput),
     Fail(String),
+    Spawn,
 }
 
 /// Transcript-backed `ToolRunner` for unit tests. Never spawns a
@@ -211,6 +212,11 @@ impl StubToolRunner {
             .lock()
             .unwrap()
             .push(StubResponse::Fail(stderr.into()));
+    }
+
+    /// Queue a tool-spawn failure for an upcoming `run` call.
+    pub fn push_spawn_failure(&self) {
+        self.responses.lock().unwrap().push(StubResponse::Spawn);
     }
 
     /// The sanitized command transcript, in call order.
@@ -255,6 +261,11 @@ impl ToolRunner for StubToolRunner {
             }
         };
         match queued {
+            Some(StubResponse::Spawn) => {
+                let record = self.record(&cmd, None, "");
+                self.transcript.lock().unwrap().push(record.clone());
+                Err(ToolRunnerError::Spawn { command: record })
+            }
             Some(StubResponse::Fail(stderr)) => {
                 let record = self.record(&cmd, Some(ProcessExit::Code(1)), &stderr);
                 self.transcript.lock().unwrap().push(record.clone());

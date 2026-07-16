@@ -1184,7 +1184,7 @@ fn plan_from_dsd(
             ));
         }
     };
-    let target_depth = resolve_target_bit_depth(request);
+    let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
 
     // Combos sox silently substitutes (FLAC 32-bit -> 24; AIFF float -> int)
@@ -1251,7 +1251,7 @@ fn plan_from_pcm(
     final_work: PathBuf,
 ) -> Result<()> {
     let processing_rate = rate_change_for_pcm(request);
-    let target_depth = resolve_target_bit_depth(request);
+    let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
     let depth_change = match request.settings.target_bit_depth {
         BitDepthTarget::Source => false,
@@ -1374,6 +1374,13 @@ fn push_encode_final(
             "Encode lossy output",
         );
     } else if request.settings.target_format.is_pcm_lossless() {
+        let description = if request.settings.target_format == AudioFormat::Flac
+            && target_depth == PcmBitDepth::Int32
+        {
+            "Encode true 32-bit FLAC with FFmpeg experimental encoder"
+        } else {
+            "Encode PCM output"
+        };
         push_step(
             steps,
             PlanOperation::EncodePcm {
@@ -1384,7 +1391,7 @@ fn push_encode_final(
             },
             current_input.clone(),
             OutputSink::Path(final_work.clone()),
-            "Encode PCM output",
+            description,
         );
     } else if matches!(request.settings.target_format, AudioFormat::Custom { .. }) {
         push_step(
@@ -1527,13 +1534,21 @@ fn reject_unsupported_resolved_depth(
     }
 }
 
-fn resolve_target_bit_depth(request: &PlanRequest) -> PcmBitDepth {
+fn resolve_target_bit_depth(request: &PlanRequest) -> Result<PcmBitDepth> {
     match request.settings.target_bit_depth {
-        BitDepthTarget::Source => request
-            .source
-            .bit_depth
-            .unwrap_or_else(|| default_pcm_depth_for_format(&request.settings.target_format)),
-        BitDepthTarget::Pcm(depth) => depth,
+        BitDepthTarget::Source => match request.source.bit_depth {
+            Some(depth) => Ok(depth),
+            None if request.settings.target_format.is_pcm_lossless() => {
+                Err(PlanningError::invalid_source(
+                    "bit_depth",
+                    "a PCM-lossless Source target requires an authoritative source PCM representation; choose an explicit target bit depth",
+                ))
+            }
+            None => Ok(default_pcm_depth_for_format(
+                &request.settings.target_format,
+            )),
+        },
+        BitDepthTarget::Pcm(depth) => Ok(depth),
     }
 }
 

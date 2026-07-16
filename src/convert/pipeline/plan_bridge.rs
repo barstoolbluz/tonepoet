@@ -52,14 +52,15 @@ pub fn plan_request_for_track(
         settings.preferred_tool = PreferredTool::Ffmpeg;
     }
 
-    // CUE materialization now produces an audio-only, validated PCM S32LE WAV
-    // carrier. It is a sample-bounded decoded segment, not the original image
+    // CUE materialization produces an audio-only, validated PCM WAV carrier:
+    // S32 for integer sources and class-preserving F32/F64 for float sources.
+    // It is a sample-bounded decoded segment, not the original image
     // container, so the planner must not claim source tag/artwork transfer or
     // source-audio MD5 from this carrier. Authoritative CUE tags remain owned by
     // the post-encode metadata stage. Force an encode step so a target WAV does
-    // not passthrough-copy the S32 carrier when the requested target depth is
+    // not passthrough-copy the staging carrier when the requested target depth is
     // `Source` and the original image depth happened to match the carrier.
-    if cue_pcm_segment_carrier_bit_depth(track).is_some() {
+    if cue_pcm_segment_carrier_depth_descriptor(track).is_some() {
         settings.force_encode = true;
         if settings.metadata.transfer_tags {
             log::warn!(
@@ -111,19 +112,18 @@ pub fn plan_request_for_track(
     // completed tracks.
     settings.replay_gain.mode = None;
     if matches!(settings.target_bit_depth, BitDepthTarget::Source)
-        && !settings.target_format.is_dsd()
+        && settings.target_format.is_pcm_lossless()
     {
-        // "Same as source" means the PROBED source depth. `source.bit_depth`
-        // is carrier-first (always Int32 for CUE segments) and must not leak
-        // here: an unknown-depth image (e.g. a lossy CUE image) would resolve
-        // to Int32, hard-failing ALAC and emitting decoder-hostile 32-bit
-        // FLAC. Unknown resolves to the format's conservative default.
-        let resolved_source_depth = track
-            .bit_depth
-            .and_then(pcm_bit_depth_from_u32)
-            .unwrap_or_else(|| {
-                tonepoet_pipeline::default_pcm_depth_for_format(&settings.target_format)
-            });
+        // "Same as source" is an exact representation request for PCM-lossless
+        // outputs. It may only be resolved from authoritative original-source
+        // facts; silently substituting a target-format default would make the
+        // UI promise false and would later be logged as though it were measured.
+        let Some(resolved_source_depth) = resolve_source_pcm_depth(track) else {
+            return Err(ConvertError::Backend(format!(
+                "cannot honor Source bit depth for {:?}: the source PCM representation could not be measured; choose an explicit bit depth",
+                settings.target_format
+            )));
+        };
         settings.target_bit_depth = BitDepthTarget::Pcm(resolved_source_depth);
     }
     settings
@@ -528,7 +528,13 @@ pub fn source_info_for_realized_track(
         TrackSourceRef::DvdVideoTrack { .. } => PlannerFormat::Wav,
         _ => PlannerFormat::Flac,
     });
-    let codec = codec_for_format(&format);
+    let codec = match &track.source_ref {
+        TrackSourceRef::CueSegmentCarrier {
+            carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
+            ..
+        } => PlannerCodec::PcmFloat,
+        _ => codec_for_format(&format),
+    };
     // For SACD-realized tracks, DSD container inspection may fail on test
     // placeholders or when the file was already validated by the extraction
     // stage. Fall back gracefully rather than blocking the planner.
@@ -542,13 +548,13 @@ pub fn source_info_for_realized_track(
         None
     } else {
         // Carrier-first is deliberate for PLANNING: the realized input is the
-        // s32 staging WAV, and depth-conversion arguments are decided against
+        // staging WAV, and depth-conversion arguments are decided against
         // it (a 16-bit target from an s32 carrier still needs explicit depth
         // args). BitDepthTarget::Source resolution must NOT read this value —
         // it resolves from the true probed track depth below.
-        cue_pcm_segment_carrier_bit_depth(track)
+        cue_pcm_segment_carrier_depth_descriptor(track)
             .or(track.bit_depth)
-            .and_then(pcm_bit_depth_from_u32)
+            .and_then(pcm_bit_depth_from_source_bits)
     };
     let sample_kind = if is_dsd {
         Some(SampleKind::Dsd)
@@ -636,19 +642,43 @@ fn codec_for_format(format: &PlannerFormat) -> PlannerCodec {
     }
 }
 
-fn pcm_bit_depth_from_u32(bits: u32) -> Option<PcmBitDepth> {
+pub(super) fn pcm_bit_depth_from_source_bits(bits: u32) -> Option<PcmBitDepth> {
     match bits {
         8 => Some(PcmBitDepth::Int8),
         16 => Some(PcmBitDepth::Int16),
         24 => Some(PcmBitDepth::Int24),
         32 => Some(PcmBitDepth::Int32),
+        // Legacy/UI source-depth convention: 320/640 encode float32/float64.
+        // Some older feature paths also used 33 for 32-bit float.
+        33 | 320 => Some(PcmBitDepth::Float32),
+        640 => Some(PcmBitDepth::Float64),
         _ => None,
     }
 }
 
-fn cue_pcm_segment_carrier_bit_depth(track: &PreparedTrack) -> Option<u32> {
+/// Resolve the authoritative source PCM depth for a prepared track.
+///
+/// The track-level probe is preferred; the source-audio descriptor is the
+/// compatibility fallback. The realized CUE carrier depth is intentionally
+/// excluded because `BitDepthTarget::Source` describes the original audio,
+/// not the normalized staging WAV.
+pub(super) fn resolve_source_pcm_depth(track: &PreparedTrack) -> Option<PcmBitDepth> {
+    track
+        .bit_depth
+        .and_then(pcm_bit_depth_from_source_bits)
+        .or_else(|| {
+            track
+                .source_audio
+                .bit_depth
+                .and_then(pcm_bit_depth_from_source_bits)
+        })
+}
+
+fn cue_pcm_segment_carrier_depth_descriptor(track: &PreparedTrack) -> Option<u32> {
     match &track.source_ref {
-        TrackSourceRef::CueSegmentCarrier { carrier, .. } => Some(carrier.bit_depth()),
+        TrackSourceRef::CueSegmentCarrier { carrier, .. } => {
+            Some(carrier.source_depth_descriptor())
+        }
         // Legacy callers that still use ImageSegment are realized by stages.rs as
         // the same validated PCM S32LE WAV carrier. New CUE materialization must
         // use the typed CueSegmentCarrier variant instead of relying on a path
@@ -1013,6 +1043,9 @@ mod tests {
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
         let track = track(TrackSourceRef::StagedFile(input.clone()));
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
@@ -1209,6 +1242,9 @@ mod tests {
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
         req.settings.metadata.transfer_tags = true;
         req.settings.metadata.preserve_artwork = true;
         req.settings.metadata.store_source_audio_md5 = true;
@@ -1370,7 +1406,19 @@ mod tests {
 
             assert_eq!(planned.source.format, PlannerFormat::Wav);
             assert_eq!(planned.source.bit_depth, Some(tonepoet_pipeline::PcmBitDepth::Int32));
-            assert_eq!(planned.settings.target_bit_depth, tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16));
+            if format.is_pcm_lossless() {
+                assert_eq!(
+                    planned.settings.target_bit_depth,
+                    tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16),
+                    "PCM-lossless Source targets resolve to the probed track depth"
+                );
+            } else {
+                assert_eq!(
+                    planned.settings.target_bit_depth,
+                    tonepoet_pipeline::BitDepthTarget::Source,
+                    "lossy targets keep Source: their output has no PCM depth to honor"
+                );
+            }
             assert!(planned.settings.force_encode);
             assert_eq!(planned.settings.target_format, format);
             assert_eq!(
@@ -1380,6 +1428,72 @@ mod tests {
             let _ = tonepoet_pipeline::plan_conversion(&planned)
                 .expect("planner accepts validated PCM WAV input for target");
         }
+    }
+
+    #[test]
+    fn float32_cue_carrier_preserves_float_source_facts_and_source_target() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("staging/cue-segments/track01-f32.wav");
+        std::fs::create_dir_all(input.parent().unwrap()).expect("cue staging dir");
+        std::fs::write(&input, b"placeholder float pcm wav").expect("placeholder staged WAV");
+        let output = temp.path().join("out.wav");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Wav;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+        let mut prepared = track(TrackSourceRef::CueSegmentCarrier {
+            path: input.clone(),
+            source_image: temp.path().join("album-f32.wav"),
+            start_sample: 0,
+            samples: 44_100,
+            carrier: CueSegmentCarrier::PcmF32LeWav,
+        });
+        prepared.sample_rate = Some(44_100);
+        prepared.bit_depth = Some(320);
+
+        let planned = plan_request_for_track(
+            &req,
+            &prepared,
+            &input,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect("Float32 CUE staged WAV plan request builds");
+
+        assert_eq!(planned.source.codec, tonepoet_pipeline::AudioCodec::PcmFloat);
+        assert_eq!(planned.source.sample_kind, Some(tonepoet_pipeline::SampleKind::Float));
+        assert_eq!(planned.source.bit_depth, Some(tonepoet_pipeline::PcmBitDepth::Float32));
+        assert_eq!(
+            planned.settings.target_bit_depth,
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Float32)
+        );
+        assert!(planned.settings.force_encode);
+    }
+
+    #[test]
+    fn unknown_source_representation_fails_closed_for_pcm_lossless_target() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.wav");
+        std::fs::write(&input, b"unknown audio representation").expect("fixture input");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+        let mut prepared = track(TrackSourceRef::StagedFile(input.clone()));
+        prepared.bit_depth = None;
+        prepared.source_audio.bit_depth = None;
+
+        let error = plan_request_for_track(
+            &req,
+            &prepared,
+            &input,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect_err("unknown Source representation must not become a format default");
+
+        let message = error.to_string();
+        assert!(message.contains("cannot honor Source bit depth"), "{message}");
+        assert!(message.contains("choose an explicit bit depth"), "{message}");
     }
 
     #[test]
@@ -1436,6 +1550,9 @@ mod tests {
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
         req.settings.metadata.transfer_tags = true;
         req.settings.metadata.preserve_artwork = true;
         req.settings.metadata.store_source_audio_md5 = true;
@@ -1552,6 +1669,9 @@ mod tests {
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
+        // Unknown Source depth now fails closed; this test pins MD5 policy.
+        req.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
         req.settings.metadata.store_source_audio_md5 = true;
         let track = track(TrackSourceRef::StagedFile(input.clone()));
 
@@ -1576,6 +1696,9 @@ mod tests {
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
         req.settings.metadata.transfer_tags = true;
         req.settings.metadata.preserve_artwork = true;
         req.settings.metadata.store_source_audio_md5 = true;
@@ -1616,6 +1739,9 @@ mod tests {
             let output = temp.path().join(format!("out-{ext}.flac"));
             let mut req = request(temp.path());
             req.settings.target_format = PlannerFormat::Flac;
+            req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+                tonepoet_pipeline::PcmBitDepth::Int24,
+            );
             req.settings.metadata.transfer_tags = true;
             req.settings.metadata.preserve_artwork = true;
             let track = track(TrackSourceRef::StagedFile(input.clone()));
@@ -1797,6 +1923,9 @@ mod tests {
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
+        // Unknown Source depth now fails closed; this test pins MD5 policy.
+        req.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
         req.settings.metadata.store_source_audio_md5 = true;
         let track = track(TrackSourceRef::StagedFile(input.clone()));
 
@@ -1816,6 +1945,9 @@ mod tests {
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
+        // Unknown Source depth now fails closed; this test pins MD5 policy.
+        req.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
         req.settings.metadata.store_source_audio_md5 = true;
         let track = track(TrackSourceRef::StagedFile(input.clone()));
 
@@ -1840,6 +1972,9 @@ mod tests {
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
         req.settings.metadata.store_source_audio_md5 = true;
         let track = track(TrackSourceRef::StagedFile(input.clone()));
 
