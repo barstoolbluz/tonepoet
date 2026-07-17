@@ -273,21 +273,28 @@ pub struct SplitCueAdmissionReport {
 pub struct SplitCueFolderRejection {
     pub parent: PathBuf,
     pub offending_cue: PathBuf,
-    /// True when the offending cue resolved at least one EXISTING audio file
-    /// inside its own folder — i.e. it plausibly describes a local album and
-    /// atomic refusal must hold. False for alien sheets (absolute/outside
-    /// refs, nothing local): safe to degrade to a plain-files editor.
+    /// True when the offending cue plausibly describes local content — it
+    /// resolved at least one EXISTING audio file inside its own folder tree,
+    /// or it could not be parsed at all (fail closed: an unparseable local
+    /// cue is the MOST malformed case, not an alien one). Atomic refusal
+    /// must hold. False only for alien sheets (absolute/outside refs,
+    /// nothing local): safe to degrade to a plain-files editor.
     pub references_in_folder_audio: bool,
+    /// True when at least one OTHER cue in the same folder admitted cleanly.
+    /// The folder then genuinely holds a local cue album, so a stray alien
+    /// cue must not downgrade it to plain image-level editing.
+    pub folder_admitted_local_members: bool,
 }
 
 /// Lenient re-scan used only on the rejection path: does this cue resolve
-/// any existing in-folder audio file?
+/// any existing audio file inside its own folder tree (subfolders included)?
+/// Parse failure counts as YES — fail closed toward atomic refusal.
 fn cue_references_in_folder_audio(cue_path: &Path) -> bool {
     let Some(parent) = cue_path.parent() else {
         return false;
     };
     let Ok(sheet) = crate::convert::cue_parser::parse_cue_file(cue_path) else {
-        return false;
+        return true;
     };
     let parent_key = cue_path_key(parent);
     let mut refs: Vec<String> = Vec::new();
@@ -302,7 +309,10 @@ fn cue_references_in_folder_audio(cue_path: &Path) -> bool {
         matches!(
             resolve_split_cue_file_reference(parent, file_ref),
             SplitCueReferenceResolution::Resolved(resolved)
-                if resolved.parent().map(cue_path_key).as_ref() == Some(&parent_key)
+                if resolved
+                    .ancestors()
+                    .skip(1)
+                    .any(|dir| cue_path_key(dir) == parent_key)
         )
     })
 }
@@ -405,30 +415,35 @@ pub fn admit_split_cue_candidate_paths(cue_paths: &[PathBuf]) -> SplitCueAdmissi
     for (parent_key, mut cues) in by_parent {
         cues.sort_by(|left, right| split_cue_path_cmp(left, right));
         cues.dedup_by(|left, right| cue_path_key(left) == cue_path_key(right));
+        // Examine EVERY cue in the folder — stopping at the first offender
+        // would let an alien cue that sorts first mask a local malformed one,
+        // and would discard the fact that other members admitted cleanly.
+        // Both facts feed the caller's degrade-vs-refuse decision.
         let mut members = Vec::with_capacity(cues.len());
-        let mut rejection = None;
+        let mut rejections: Vec<(PathBuf, String)> = Vec::new();
         for cue_path in &cues {
             match admit_split_cue_member(cue_path) {
                 Ok(member) => members.push(member),
-                Err(message) => {
-                    rejection = Some((cue_path.clone(), message));
-                    break;
-                }
+                Err(message) => rejections.push((cue_path.clone(), message)),
             }
         }
-        if let Some((offending_cue, message)) = rejection {
+        if !rejections.is_empty() {
             report.rejected_folders.push(parent_key.clone());
-            report.rejections.push(SplitCueFolderRejection {
-                parent: parent_key.clone(),
-                offending_cue: offending_cue.clone(),
-                references_in_folder_audio: cue_references_in_folder_audio(&offending_cue),
-            });
-            report.warnings.push(format!(
-                "offending CUE {}: {} — conversion will not include this folder ({})",
-                offending_cue.display(),
-                message,
-                parent_key.display()
-            ));
+            let folder_admitted_local_members = !members.is_empty();
+            for (offending_cue, message) in rejections {
+                report.rejections.push(SplitCueFolderRejection {
+                    parent: parent_key.clone(),
+                    offending_cue: offending_cue.clone(),
+                    references_in_folder_audio: cue_references_in_folder_audio(&offending_cue),
+                    folder_admitted_local_members,
+                });
+                report.warnings.push(format!(
+                    "offending CUE {}: {} — conversion will not include this folder ({})",
+                    offending_cue.display(),
+                    message,
+                    parent_key.display()
+                ));
+            }
             continue;
         }
         if !members.is_empty() {
@@ -715,6 +730,64 @@ mod tests {
             report.rejections[0].references_in_folder_audio,
             "a local cue-backed album must keep the atomic refusal: {:?}",
             report.rejections[0]
+        );
+    }
+
+    #[test]
+    fn alien_cue_does_not_downgrade_folder_with_admitted_local_album() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(temp.path().join("side.flac"), b"audio").expect("fixture");
+        // A valid local cue album...
+        let local_cue = temp.path().join("side.cue");
+        std::fs::write(
+            &local_cue,
+            "FILE \"side.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 01:00:00\n",
+        )
+        .expect("fixture cue");
+        // ...plus an alien sheet that SORTS FIRST (album < side): the
+        // rejection sweep must still examine the local cue and record that
+        // the folder admitted a genuine member, so the caller refuses
+        // atomically instead of degrading to image-level plain editing.
+        let outside = tempfile::tempdir().expect("outside dir");
+        let outside_image = outside.path().join("source.wv");
+        std::fs::write(&outside_image, b"image").expect("fixture");
+        let alien_cue = temp.path().join("album.cue");
+        std::fs::write(
+            &alien_cue,
+            format!(
+                "FILE \"{}\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                outside_image.display()
+            ),
+        )
+        .expect("fixture cue");
+
+        let report = admit_split_cue_folders(&[temp.path().to_path_buf()]);
+        assert!(report.folders.is_empty(), "folder must stay rejected");
+        assert!(
+            !report.rejections.is_empty(),
+            "alien cue must be recorded: {:?}",
+            report.warnings
+        );
+        assert!(
+            report
+                .rejections
+                .iter()
+                .all(|rejection| rejection.folder_admitted_local_members),
+            "the admitted local album must veto the alien-only degrade: {:?}",
+            report.rejections
+        );
+    }
+
+    #[test]
+    fn unreadable_cue_rejection_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // The lenient re-scan cannot read/parse this cue at all. It must
+        // count as plausibly-local (fail closed toward atomic refusal),
+        // not as an alien sheet safe to ignore.
+        let cue = temp.path().join("ghost.cue");
+        assert!(
+            cue_references_in_folder_audio(&cue),
+            "an unreadable cue must fail closed"
         );
     }
 

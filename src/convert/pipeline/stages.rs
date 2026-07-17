@@ -15581,19 +15581,39 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
             // A merged image is one continuous timeline: INDEX positions are
             // the cumulative sample offsets of the preceding tracks, not
             // all-zero (which described ten tracks all starting at 0:00).
-            let sample_rate = source
-                .tracks
-                .iter()
-                .find_map(|st| st.sample_rate)
-                .unwrap_or(44_100);
+            // The arithmetic is only honest when every boundary-contributing
+            // track (all but the last — the last track's length is never
+            // emitted) carries measured samples at ONE shared rate. Anything
+            // else (DVD-A with rates unknown until packet inspection, a
+            // mid-album probe failure) falls back to placeholder zeros
+            // rather than silently wrong times — e.g. 96k samples divided
+            // by a 44.1k guess, or a None track shifting every later INDEX
+            // early by its full length.
+            let boundary_tracks =
+                &source.tracks[..source.tracks.len().saturating_sub(1)];
+            let shared_rate = boundary_tracks
+                .first()
+                .and_then(|st| st.sample_rate)
+                .filter(|rate| {
+                    boundary_tracks
+                        .iter()
+                        .all(|st| st.sample_rate == Some(*rate))
+                });
+            let exact_boundaries = boundary_tracks.is_empty()
+                || (shared_rate.is_some()
+                    && boundary_tracks
+                        .iter()
+                        .all(|st| st.expected_samples.is_some()));
             let mut offset_samples: u64 = 0;
             for (i, st) in source.tracks.iter().enumerate() {
                 cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
                 push_track_body(&mut cue, st);
-                cue.push_str(&format!(
-                    "    INDEX 01 {}\n",
-                    cue_index_time(offset_samples, sample_rate)
-                ));
+                let index_time = if exact_boundaries {
+                    cue_index_time(offset_samples, shared_rate.unwrap_or(1))
+                } else {
+                    "00:00:00".to_string()
+                };
+                cue.push_str(&format!("    INDEX 01 {index_time}\n"));
                 offset_samples =
                     offset_samples.saturating_add(st.expected_samples.unwrap_or(0));
             }
@@ -35583,6 +35603,47 @@ mod build_cue_sheet_tests {
             1,
             "only the first track starts at zero: {cue}"
         );
+    }
+
+    #[test]
+    fn merged_cue_degrades_to_zero_indexes_when_boundary_facts_are_incomplete() {
+        // A boundary-contributing track with unknown length (or an unknown/
+        // mixed rate) makes cumulative offsets unknowable: emit placeholder
+        // zeros rather than silently wrong times (dividing by a guessed
+        // rate, or a None track shifting every later INDEX early).
+        let mut source = cue_source();
+        source.tracks[0].expected_samples = None;
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Merged(MergedArtifact {
+                staged_path: PathBuf::from("/encoded/album.flac"),
+                final_path: PathBuf::from("/out/album.flac"),
+                total_samples: 44_100 * 90,
+                source_tracks: source.tracks.iter().map(|t| t.id.clone()).collect(),
+                planned_command_hash: None,
+            }),
+            sidecars: Vec::new(),
+        };
+        let cue = build_cue_sheet(&source, &artifacts);
+        assert_eq!(cue.matches("INDEX 01 00:00:00").count(), 2, "{cue}");
+
+        // Same degradation for a rate mismatch across boundary tracks
+        // (three tracks so track 1 AND 2 both contribute boundaries).
+        let mut source = cue_source();
+        source.tracks.push(source.tracks[1].clone());
+        source.tracks[2].id.track_number = 3;
+        source.tracks[1].sample_rate = Some(96_000);
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Merged(MergedArtifact {
+                staged_path: PathBuf::from("/encoded/album.flac"),
+                final_path: PathBuf::from("/out/album.flac"),
+                total_samples: 44_100 * 120,
+                source_tracks: source.tracks.iter().map(|t| t.id.clone()).collect(),
+                planned_command_hash: None,
+            }),
+            sidecars: Vec::new(),
+        };
+        let cue = build_cue_sheet(&source, &artifacts);
+        assert_eq!(cue.matches("INDEX 01 00:00:00").count(), 3, "{cue}");
     }
 }
 

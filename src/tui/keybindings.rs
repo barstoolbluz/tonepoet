@@ -9643,10 +9643,9 @@ fn collect_metadata_cue_admission(paths: &[std::path::PathBuf]) -> MetadataCueAd
     let inputs = metadata_cue_admission_inputs(paths);
     let report = crate::convert::split_cue_album::admit_split_cue_folders(&inputs);
     let alien_rejections_only = !report.rejections.is_empty()
-        && report
-            .rejections
-            .iter()
-            .all(|rejection| !rejection.references_in_folder_audio);
+        && report.rejections.iter().all(|rejection| {
+            !rejection.references_in_folder_audio && !rejection.folder_admitted_local_members
+        });
     let mut surfaces: Vec<MetadataCueSurface> = report
         .folders
         .into_iter()
@@ -15108,8 +15107,17 @@ fn open_metadata_editor_impl(app: &mut AppState, tx: Option<&mpsc::Sender<AppMes
     let mut paths: Vec<std::path::PathBuf> = if cue_selection_count > 0 && cue_selection_count == sel.len() {
         let resolved: Vec<_> = sel
             .iter()
-            .filter_map(|cue| super::cue_parser::detect_single_image_cue(cue))
-            .map(|info| info.audio_path)
+            .filter_map(|cue| {
+                super::cue_parser::detect_single_image_cue(cue).map(|info| (cue, info))
+            })
+            // Never let a cue expand the editor onto audio OUTSIDE its own
+            // folder tree (an alien/stale sheet with an absolute FILE ref):
+            // saving would write tags to a file the user never selected.
+            .filter(|(cue, info)| {
+                cue.parent()
+                    .is_some_and(|dir| info.audio_path.starts_with(dir))
+            })
+            .map(|(_, info)| info.audio_path)
             .collect();
         if resolved.len() == sel.len() {
             resolved

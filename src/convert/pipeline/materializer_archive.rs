@@ -90,7 +90,24 @@ impl super::stages::Materializer for ArchiveMaterializer {
                 return Err(MaterializeError::Cancelled);
             }
 
-            let probe = probe_audio_file(path, runner, cancel).await?;
+            let mut probe = probe_audio_file(path, runner, cancel).await?;
+            if probe.coding == Some(SourceAudioCoding::Dsd) {
+                // ffprobe reports DSF/DFF byte rates and block-padded
+                // durations; the container header carries the EXACT bit rate
+                // and per-channel sample count. Prefer the header facts so
+                // post-encode sample validation checks against reality, not
+                // an estimate. Mirrors materializer_single.
+                if let Ok(Some(dsd)) =
+                    crate::convert::pipeline::plan_bridge::dsd_source_metadata_from_path(path)
+                {
+                    if dsd.sample_rate_hz > 0 {
+                        probe.sample_rate = dsd.sample_rate_hz;
+                    }
+                    if let Some(count) = dsd.sample_count_per_channel {
+                        probe.expected_samples = Some(count);
+                    }
+                }
+            }
             let ordinal = (idx + 1) as u32;
             let mut metadata = read_track_metadata(path);
             if let Some(override_set) =

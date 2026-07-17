@@ -2584,6 +2584,24 @@ mod tests {
             command.args
         );
 
+        // Equality boundary: sox rejects cutoff >= rate/2, so cutoff ==
+        // Nyquist must ALSO skip. DSD128 (48 kHz cutoff) -> 96 kHz target
+        // and DSD256 (96 kHz cutoff) -> 192 kHz target sit exactly on it;
+        // relaxing the guard's `<` to `<=` regresses both to runtime sox
+        // failures.
+        let command = dsd_sinc_guard_command(5_644_800, 96_000);
+        assert!(
+            !command.args.iter().any(|arg| arg == "sinc"),
+            "{:?}",
+            command.args
+        );
+        let command = dsd_sinc_guard_command(11_289_600, 192_000);
+        assert!(
+            !command.args.iter().any(|arg| arg == "sinc"),
+            "{:?}",
+            command.args
+        );
+
         // DSD256 at its default 352.8 kHz target keeps the strip.
         let command = dsd_sinc_guard_command(11_289_600, 352_800);
         assert!(
