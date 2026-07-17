@@ -1,7 +1,8 @@
 # Big brief: DSF tagging, source-coupled pills, ReplayGain policy, GNUDB/editor hardening, secrets
 
 HEAD at time of writing: `afffe61` (branch `working`). A full-tree archive
-accompanies this brief. You are working WITHOUT a compiler: every file you
+accompanies this brief; it is cut at the follow-up commit that ADDS this
+brief (afffe61 + this document), so treat the archived tree as HEAD. You are working WITHOUT a compiler: every file you
 deliver must be COMPLETE (no elisions, no "rest unchanged" markers), and the
 applying side will fix mechanical compile errors only — logic must be right
 on delivery.
@@ -107,9 +108,10 @@ to fix in this round:
 ## F1 — DSF tagging (the big one: 100s of DSD albums are untaggable)
 
 **Broken today**: right-click → Edit metadata on a folder of `.dsf` files
-fails with lofty's "No format could be determined" (see
-`unsupported-failed-to-read.png` in repo root). lofty 0.21 has no DSF
-support. DSF files carry ID3v2 chunks at a header-declared offset.
+fails with lofty's "No format could be determined" (empirically observed;
+a screenshot exists on our side — not in the archive, take the failure as
+established fact). lofty 0.21 has no DSF support. DSF files carry ID3v2
+chunks at a header-declared offset.
 
 **What we want**:
 - Read AND write ID3v2 tags in `.dsf` files. The `id3` crate (established,
@@ -213,14 +215,17 @@ doc comment says "NOT a security vault"). Additionally there is a CONFIRMED
 third leak: passwords persist into `conversion_queue.json` —
 `ConversionItem.archive_password: Option<String>` (queue.rs:~178, plain
 Serialize) and `PipelineRequest.source.archive_password: Option<SecretString>`
-where `SecretString` derives plain `Serialize` (only its Debug is redacted;
-src/convert/pipeline/types.rs:~28). Replace all of this with an OS
-keychain/secret-service REFERENCE:
+where `SecretString` derives plain `Serialize` (Debug/Display are redacted
+but Serialize is plain; src/convert/pipeline/types.rs:~28). Replace all of
+this with an OS keychain/secret-service REFERENCE:
 
 - Store secrets via the freedesktop Secret Service (Linux; `secret-service`
   or `keyring` crate — prefer `keyring` for cross-platform reach since the
   project targets macOS too) under a stable service/account naming scheme;
-  config/presets store only the reference key.
+  config stores only the reference key. Like F1's id3 note, the keyring
+  crate API is NEEDS-VERIFICATION (not a current dependency, so not in the
+  offline registry): keep the secret-store surface a thin, swappable seam
+  and the applying side will fix signature mismatches at apply time.
 - Migration: on load, if cleartext is found in `config.toml` or
   `passwords.toml`, do a one-time migration (store to keychain, rewrite the
   file without the cleartext, back up the old file).
@@ -238,8 +243,8 @@ keychain/secret-service REFERENCE:
 
 ## H3 — Known-issues backlog (docs/known_issues_after_g_round.md, items 10–13)
 
-Items 1–3, 5, 7–9a were fixed locally (6a56090). Remaining, evidence in the
-doc (line refs are at 7eb466e — re-verify against HEAD):
+Items 1–3, 5, and 7–9 were fixed locally (6a56090). Remaining, evidence in
+the doc (line refs are at 7eb466e — re-verify against HEAD):
 
 - **H3.1 (item 10)** wvunpack preflight runs after materialization and
   pre-actions, contradicting its "before expensive work" doc; serial path
@@ -253,12 +258,15 @@ doc (line refs are at 7eb466e — re-verify against HEAD):
   variant-only; `custom_format_sentinel` no longer carries
   `AudioFormat::Custom`; four command.rs self-scan sentinels have
   EOF-unbounded windows satisfied by their own literals. Restore real teeth.
-- **H3.4 (item 13 + audit leftovers)**: duplicated fixture line
-  (plan_bridge.rs), dead `Unspecified` arm (plan.rs), stale marker comment,
-  prefetch dead on the compat `ConfirmAction::MbBack` picker, README 20-bit
-  claim in the wrong crate; S11 retry gap; quit-gate blocking on in-flight
-  parked editors; `TONEPOET_REQUIRE_TOOLS` "1"-exact vs any-value split
-  (item 8) if not already fixed.
+- **H3.4 (item 13 residuals + audit leftovers)**: dead `Unspecified` arm
+  (tonepoet-pipeline/src/plan.rs:~1573, now `Unknown | Unspecified`);
+  prefetch dead on the compat `ConfirmAction::MbBack` picker; README
+  20-bit claim in the wrong crate; S11 retry gap and the quit gate
+  blocking on in-flight parked editors (both defined in
+  docs/residual_apply_audit_brief.md — S11 and S1 — included in the
+  archive). Item 13's duplicated-fixture-line and stale-marker nits and
+  item 8's `TONEPOET_REQUIRE_TOOLS` split were already fixed at 6a56090 —
+  do not hunt for them.
 
 ## P1 — OPEN product decision: companion `.cue` for per-track outputs
 
