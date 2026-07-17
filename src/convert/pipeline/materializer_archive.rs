@@ -1720,6 +1720,8 @@ fn parse_ffprobe_json(json_str: &str) -> Result<ProbeResult, MaterializeError> {
         .and_then(|value| value.as_str());
     let (coding, bit_depth) =
         classify_source_audio_probe(codec_name, sample_fmt, integer_bit_depth);
+    let (sample_rate, expected_samples) =
+        crate::convert::pipeline::normalize_dsd_probe_rate(coding, sample_rate, expected_samples);
 
     Ok(ProbeResult {
         sample_rate,

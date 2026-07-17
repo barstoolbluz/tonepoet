@@ -1651,6 +1651,34 @@ impl Default for SourceAudioCoding {
 }
 
 
+/// Normalize a DSD probe's (sample_rate, expected_samples) pair to the TRUE
+/// 1-bit rate. ffmpeg's DSF/DFF demuxers expose dsd_u8 BYTE rates (bit rate
+/// / 8: DSD64 -> 352_800, DSD256 -> 1_411_200), while the planner reads the
+/// container header directly and plans against the bit rate — leaving the
+/// prepared-track facts at the byte rate made post-encode validation expect
+/// a rate no plan ever produces. Sample counts scale together with the rate
+/// so resample ratios stay exact.
+#[must_use]
+pub fn normalize_dsd_probe_rate(
+    coding: SourceAudioCoding,
+    sample_rate: u32,
+    expected_samples: Option<u64>,
+) -> (u32, Option<u64>) {
+    if coding == SourceAudioCoding::Dsd
+        && tonepoet_pipeline::DsdRate::from_hz(sample_rate).is_none()
+    {
+        if let Some(byte_scaled) = sample_rate.checked_mul(8) {
+            if tonepoet_pipeline::DsdRate::from_hz(byte_scaled).is_some() {
+                return (
+                    byte_scaled,
+                    expected_samples.map(|samples| samples.saturating_mul(8)),
+                );
+            }
+        }
+    }
+    (sample_rate, expected_samples)
+}
+
 /// Classify source coding and authoritative source PCM representation from
 /// ffprobe's codec/sample-format facts.
 ///
@@ -2025,6 +2053,45 @@ mod metadata_satisfaction_serde_tests {
             serde_json::Value::Bool(true)
         );
         assert!(json.get("authoritative_tags_written").is_none());
+    }
+}
+
+#[cfg(test)]
+mod dsd_probe_rate_normalization_tests {
+    use super::{normalize_dsd_probe_rate, SourceAudioCoding};
+
+    #[test]
+    fn byte_rates_scale_to_bit_rates_with_samples_in_lockstep() {
+        // ffprobe DSF/DFF byte rates: bit rate / 8.
+        assert_eq!(
+            normalize_dsd_probe_rate(SourceAudioCoding::Dsd, 352_800, Some(1_000)),
+            (2_822_400, Some(8_000))
+        ); // DSD64
+        assert_eq!(
+            normalize_dsd_probe_rate(SourceAudioCoding::Dsd, 705_600, None),
+            (5_644_800, None)
+        ); // DSD128
+        assert_eq!(
+            normalize_dsd_probe_rate(SourceAudioCoding::Dsd, 1_411_200, Some(8_841_214)),
+            (11_289_600, Some(70_729_712))
+        ); // DSD256
+    }
+
+    #[test]
+    fn true_bit_rates_and_non_dsd_probes_pass_through() {
+        assert_eq!(
+            normalize_dsd_probe_rate(SourceAudioCoding::Dsd, 2_822_400, Some(42)),
+            (2_822_400, Some(42))
+        );
+        assert_eq!(
+            normalize_dsd_probe_rate(SourceAudioCoding::Pcm, 352_800, Some(42)),
+            (352_800, Some(42))
+        );
+        // Rates whose x8 is not a known DSD rate stay untouched.
+        assert_eq!(
+            normalize_dsd_probe_rate(SourceAudioCoding::Dsd, 44_100, None),
+            (44_100, None)
+        );
     }
 }
 

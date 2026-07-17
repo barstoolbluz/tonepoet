@@ -90,7 +90,15 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
         }
 
         metadata.track_number = vorbis.track();
-        metadata.total_tracks = vorbis.total_tracks();
+        // metaflac's total_tracks() reads only TOTALTRACKS; accept the
+        // foobar/flac-convention TRACKTOTAL spelling too (now the spelling
+        // tonepoet writes).
+        metadata.total_tracks = vorbis.total_tracks().or_else(|| {
+            vorbis
+                .get("TRACKTOTAL")
+                .and_then(|values| values.first())
+                .and_then(|value| value.parse::<u32>().ok())
+        });
 
         if let Some(disc_vec) = vorbis.get("DISCNUMBER") {
             if let Some(disc) = disc_vec.first() {
@@ -100,10 +108,15 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
             }
         }
 
-        if let Some(total_vec) = vorbis.get("TOTALDISCS") {
-            if let Some(total) = total_vec.first() {
-                if let Ok(total_discs) = total.parse::<u32>() {
-                    metadata.total_discs = Some(total_discs);
+        for key in ["DISCTOTAL", "TOTALDISCS"] {
+            if metadata.total_discs.is_some() {
+                break;
+            }
+            if let Some(total_vec) = vorbis.get(key) {
+                if let Some(total) = total_vec.first() {
+                    if let Ok(total_discs) = total.parse::<u32>() {
+                        metadata.total_discs = Some(total_discs);
+                    }
                 }
             }
         }

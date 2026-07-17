@@ -9629,20 +9629,44 @@ fn metadata_cue_admission_inputs(paths: &[std::path::PathBuf]) -> Vec<std::path:
     inputs
 }
 
-fn collect_metadata_cue_surfaces_with_warnings(
-    paths: &[std::path::PathBuf],
-) -> (Vec<MetadataCueSurface>, Vec<String>) {
+struct MetadataCueAdmission {
+    surfaces: Vec<MetadataCueSurface>,
+    warnings: Vec<String>,
+    /// True when every rejection was an ALIEN cue (referencing no existing
+    /// in-folder audio — e.g. a published planner artifact with absolute
+    /// source refs). Such rejections may degrade to a plain-files editor;
+    /// a rejected local cue-backed album keeps the atomic refusal.
+    alien_rejections_only: bool,
+}
+
+fn collect_metadata_cue_admission(paths: &[std::path::PathBuf]) -> MetadataCueAdmission {
     let inputs = metadata_cue_admission_inputs(paths);
     let report = crate::convert::split_cue_album::admit_split_cue_folders(&inputs);
-    let mut out: Vec<MetadataCueSurface> = report
+    let alien_rejections_only = !report.rejections.is_empty()
+        && report
+            .rejections
+            .iter()
+            .all(|rejection| !rejection.references_in_folder_audio);
+    let mut surfaces: Vec<MetadataCueSurface> = report
         .folders
         .into_iter()
         .flat_map(|folder| folder.members)
         .filter(|member| member.contributes_synthetic_album_part())
         .filter_map(metadata_cue_surface_from_admitted_member)
         .collect();
-    out.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
-    (out, report.warnings)
+    surfaces.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    MetadataCueAdmission {
+        surfaces,
+        warnings: report.warnings,
+        alien_rejections_only,
+    }
+}
+
+fn collect_metadata_cue_surfaces_with_warnings(
+    paths: &[std::path::PathBuf],
+) -> (Vec<MetadataCueSurface>, Vec<String>) {
+    let admission = collect_metadata_cue_admission(paths);
+    (admission.surfaces, admission.warnings)
 }
 
 #[cfg(test)] // test-only shim over collect_metadata_cue_surfaces_with_warnings
@@ -14988,14 +15012,27 @@ fn open_metadata_editor_impl(app: &mut AppState, tx: Option<&mpsc::Sender<AppMes
     // path opens image-level rows and loses each side/disc's CUESHEET track
     // structure. Surface each cue/image pair as its own presentation tab before
     // falling back to generic audio-file expansion.
-    let (mut cue_surfaces, cue_admission_warnings) =
-        collect_metadata_cue_surfaces_with_warnings(&sel);
+    let admission = collect_metadata_cue_admission(&sel);
+    let mut cue_surfaces = admission.surfaces;
+    let cue_admission_warnings = admission.warnings;
     if cue_surfaces.is_empty() && !cue_admission_warnings.is_empty() {
-        app.set_status(format!(
-            "metadata: {}",
-            cue_admission_warnings.join("; ")
-        ));
-        return;
+        if admission.alien_rejections_only {
+            // Every rejected cue is alien to this folder (it resolves no
+            // existing in-folder audio — e.g. a stale published planner
+            // sheet with absolute source refs). Don't let it veto editing
+            // the folder's plain audio files: degrade with a visible note
+            // and continue to the generic multi-file path below.
+            app.set_status(format!(
+                "metadata: ignoring unrelated CUE ({})",
+                cue_admission_warnings.join("; ")
+            ));
+        } else {
+            app.set_status(format!(
+                "metadata: {}",
+                cue_admission_warnings.join("; ")
+            ));
+            return;
+        }
     }
     let mut active_surface = 0;
     if sel.len() == 1 && sel[0].is_file() {
@@ -36525,9 +36562,9 @@ mod single_image_metadata_editor_regression_tests {
             "PERFORMER",
             "ALBUMARTIST",
             "TRACKNUMBER",
-            "TOTALTRACKS",
+            "TRACKTOTAL",
             "DISCNUMBER",
-            "TOTALDISCS",
+            "DISCTOTAL",
             "COMMENT",
         ];
         assert_eq!(&keys[..expected_prefix.len()], expected_prefix, "unified surface must share the plain editor's standard key order: {keys:?}");

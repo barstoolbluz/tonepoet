@@ -38,7 +38,25 @@ impl super::stages::Materializer for SingleFileMaterializer {
             )));
         }
 
-        let probe = probe_audio_file(&req.container, runner, cancel).await?;
+        let mut probe = probe_audio_file(&req.container, runner, cancel).await?;
+        if probe.coding == SourceAudioCoding::Dsd {
+            // ffprobe reports DSF/DFF byte rates and block-padded durations;
+            // the container header carries the EXACT bit rate and per-channel
+            // sample count. Prefer the header facts so post-encode sample
+            // validation checks against reality, not an estimate.
+            if let Ok(Some(dsd)) =
+                crate::convert::pipeline::plan_bridge::dsd_source_metadata_from_path(
+                    &req.container,
+                )
+            {
+                if dsd.sample_rate_hz > 0 {
+                    probe.sample_rate = dsd.sample_rate_hz;
+                }
+                if let Some(count) = dsd.sample_count_per_channel {
+                    probe.expected_samples = Some(count);
+                }
+            }
+        }
         let metadata = read_track_metadata(&req.container);
         let track_number = metadata.track_number.unwrap_or(1).max(1);
         let track = PreparedTrack {
@@ -160,6 +178,8 @@ fn parse_ffprobe_json(json: &str) -> Result<ProbeResult, MaterializeError> {
         .and_then(|value| value.as_str());
     let (coding, bit_depth) =
         classify_source_audio_probe(codec_name, sample_fmt, integer_bit_depth);
+    let (sample_rate, expected_samples) =
+        crate::convert::pipeline::normalize_dsd_probe_rate(coding, sample_rate, expected_samples);
 
     Ok(ProbeResult {
         sample_rate,

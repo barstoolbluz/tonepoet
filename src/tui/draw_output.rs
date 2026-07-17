@@ -8,8 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{BitDepthChoice, DsdGainMode, FormatField, FormatState, ResamplerChoice};
-use crate::convert::formats::AudioFormat;
+use super::app::{DsdGainMode, FormatField, FormatState, ResamplerChoice};
 use super::pill::render_pill_spans;
 
 /// Draw the format pane with green border.
@@ -117,19 +116,11 @@ pub fn draw_format_pane(
                 theme,
             ));
         } else {
-            let bit_depth_suffix = if matches!(
-                (*format_state.format.selected_value(), *format_state.bit_depth.selected_value()),
-                (AudioFormat::Flac, BitDepthChoice::Int32)
-            ) {
-                "bit · FLAC 1.4+/ffmpeg 6.1+; many players/DAPs cannot decode"
-            } else {
-                "bit"
-            };
             lines.push(pill_row(
                 border_color,
                 w,
                 "bit depth  ",
-                bit_depth_suffix,
+                "bit",
                 &render_pill_spans(&format_state.bit_depth, bit_depth_focused, theme),
                 bit_depth_focused,
                 theme,

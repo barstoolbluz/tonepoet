@@ -4201,10 +4201,12 @@ fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> V
         push_tag_value(&mut tags, "CUE_FLAGS", "PRE");
     }
     if album.total_tracks > 0 {
-        push_tag_value(&mut tags, "TOTALTRACKS", &album.total_tracks.to_string());
+        // foobar2000/flac convention; legacy TOTALTRACKS remains accepted on
+        // read and is superseded by the authoritative-key sweep on re-runs.
+        push_tag_value(&mut tags, "TRACKTOTAL", &album.total_tracks.to_string());
     }
     if let Some(n) = album.total_discs {
-        push_tag_value(&mut tags, "TOTALDISCS", &n.to_string());
+        push_tag_value(&mut tags, "DISCTOTAL", &n.to_string());
     }
     if let Some(v) = album.extra.get("catalog") {
         push_tag_value(&mut tags, "CATALOG", v);
@@ -4263,16 +4265,16 @@ fn ffmpeg_authoritative_metadata_tags(tags: &[(String, String)]) -> Vec<(String,
     for (key, value) in tags {
         match key.as_str() {
             "TRACKNUMBER" => {
-                if let Some(track) = ffmpeg_metadata_value_for_number(tags, "TRACKNUMBER", "TOTALTRACKS") {
+                if let Some(track) = ffmpeg_metadata_value_for_number(tags, "TRACKNUMBER", "TRACKTOTAL") {
                     push_tag_value(&mut out, "track", &track);
                 }
             }
             "DISCNUMBER" => {
-                if let Some(disc) = ffmpeg_metadata_value_for_number(tags, "DISCNUMBER", "TOTALDISCS") {
+                if let Some(disc) = ffmpeg_metadata_value_for_number(tags, "DISCNUMBER", "DISCTOTAL") {
                     push_tag_value(&mut out, "disc", &disc);
                 }
             }
-            "TOTALTRACKS" | "TOTALDISCS" => {}
+            "TRACKTOTAL" | "DISCTOTAL" | "TOTALTRACKS" | "TOTALDISCS" => {}
             _ => push_tag_value(&mut out, &ffmpeg_metadata_key(key), value),
         }
     }
@@ -4353,8 +4355,10 @@ const AUTHORITATIVE_CUE_MANAGED_TAG_KEYS: &[&str] = &[
     "GENRE",
     "DATE",
     "TRACKNUMBER",
+    "TRACKTOTAL",
     "TOTALTRACKS",
     "DISCNUMBER",
+    "DISCTOTAL",
     "TOTALDISCS",
     "COMMENT",
     "COMPOSER",
@@ -4892,9 +4896,9 @@ mod metadata_writer_command_tests {
         assert!(tags.contains(&("ALBUMARTIST".to_string(), "Cue Album Artist".to_string())));
         assert!(tags.contains(&("ALBUM".to_string(), "Cue Album Override".to_string())));
         assert!(tags.contains(&("TRACKNUMBER".to_string(), "3".to_string())));
-        assert!(tags.contains(&("TOTALTRACKS".to_string(), "12".to_string())));
+        assert!(tags.contains(&("TRACKTOTAL".to_string(), "12".to_string())));
         assert!(tags.contains(&("DISCNUMBER".to_string(), "2".to_string())));
-        assert!(tags.contains(&("TOTALDISCS".to_string(), "2".to_string())));
+        assert!(tags.contains(&("DISCTOTAL".to_string(), "2".to_string())));
         assert!(tags.contains(&("ISRC".to_string(), "USRC17607839".to_string())));
         assert!(tags.contains(&("CATALOG".to_string(), "ABC-123".to_string())));
         assert!(tags.contains(&("PERFORMER".to_string(), "Cue Performer".to_string())));
@@ -15525,12 +15529,32 @@ fn compression_ratio(bytes_in: u64, bytes_out: u64) -> String {
 }
 fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
     let mut cue = String::new();
-    if let Some(ref album) = source.album_metadata.album {
-        cue.push_str(&format!("TITLE \"{}\"\n", album));
+    if let Some(catalog) = source.album_metadata.extra.get("catalog") {
+        cue.push_str(&format!("CATALOG {}\n", catalog));
     }
     if let Some(ref artist) = source.album_metadata.album_artist {
         cue.push_str(&format!("PERFORMER \"{}\"\n", artist));
     }
+    if let Some(ref album) = source.album_metadata.album {
+        cue.push_str(&format!("TITLE \"{}\"\n", album));
+    }
+    if let Some(ref date) = source.album_metadata.date {
+        cue.push_str(&format!("REM DATE {}\n", date));
+    }
+    if let Some(ref genre) = source.album_metadata.genre {
+        cue.push_str(&format!("REM GENRE \"{}\"\n", genre));
+    }
+    let push_track_body = |cue: &mut String, st: &PreparedTrack| {
+        if let Some(ref isrc) = st.metadata.isrc {
+            cue.push_str(&format!("    ISRC {}\n", isrc));
+        }
+        if let Some(ref title) = st.metadata.title {
+            cue.push_str(&format!("    TITLE \"{}\"\n", title));
+        }
+        if let Some(ref artist) = st.metadata.artist {
+            cue.push_str(&format!("    PERFORMER \"{}\"\n", artist));
+        }
+    };
     match &artifacts.audio {
         AudioArtifacts::Tracks(tracks) => {
             for (i, t) in tracks.iter().enumerate() {
@@ -15542,12 +15566,7 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
                 cue.push_str(&format!("FILE \"{}\" WAVE\n", filename));
                 cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
                 if let Some(st) = source.tracks.iter().find(|s| s.id == t.track_id) {
-                    if let Some(ref title) = st.metadata.title {
-                        cue.push_str(&format!("    TITLE \"{}\"\n", title));
-                    }
-                    if let Some(ref artist) = st.metadata.artist {
-                        cue.push_str(&format!("    PERFORMER \"{}\"\n", artist));
-                    }
+                    push_track_body(&mut cue, st);
                 }
                 cue.push_str("    INDEX 01 00:00:00\n");
             }
@@ -15559,19 +15578,38 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
                 .and_then(|f| f.to_str())
                 .unwrap_or("merged");
             cue.push_str(&format!("FILE \"{}\" WAVE\n", filename));
+            // A merged image is one continuous timeline: INDEX positions are
+            // the cumulative sample offsets of the preceding tracks, not
+            // all-zero (which described ten tracks all starting at 0:00).
+            let sample_rate = source
+                .tracks
+                .iter()
+                .find_map(|st| st.sample_rate)
+                .unwrap_or(44_100);
+            let mut offset_samples: u64 = 0;
             for (i, st) in source.tracks.iter().enumerate() {
                 cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
-                if let Some(ref title) = st.metadata.title {
-                    cue.push_str(&format!("    TITLE \"{}\"\n", title));
-                }
-                if let Some(ref artist) = st.metadata.artist {
-                    cue.push_str(&format!("    PERFORMER \"{}\"\n", artist));
-                }
-                cue.push_str("    INDEX 01 00:00:00\n");
+                push_track_body(&mut cue, st);
+                cue.push_str(&format!(
+                    "    INDEX 01 {}\n",
+                    cue_index_time(offset_samples, sample_rate)
+                ));
+                offset_samples =
+                    offset_samples.saturating_add(st.expected_samples.unwrap_or(0));
             }
         }
     }
     cue
+}
+
+/// Format a sample offset as a CUE MM:SS:FF timestamp (75 frames/second).
+fn cue_index_time(offset_samples: u64, sample_rate: u32) -> String {
+    let rate = u64::from(sample_rate.max(1));
+    let frames_total = offset_samples * 75 / rate;
+    let minutes = frames_total / (75 * 60);
+    let seconds = (frames_total / 75) % 60;
+    let frames = frames_total % 75;
+    format!("{minutes:02}:{seconds:02}:{frames:02}")
 }
 
 // ===========================================================================
@@ -24418,7 +24456,20 @@ fn companion_source_dir(req: &PipelineRequest, source: &PreparedSource) -> Optio
 
     match source.kind {
         SourceKind::SingleFile | SourceKind::CueImage => {
-            batch_root.or(request_root).or(prepared_container_root).or(track_root)
+            // Synthetic split-CUE albums use a planner-generated artifact as
+            // the container; it lives in a private temp directory. Sweeping
+            // from there published the synthetic sheet (absolute source FILE
+            // refs) into the output AND skipped the real album folder's
+            // companions entirely. Resolve the REAL folder from the tracks'
+            // source_image refs instead.
+            if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&req.container) {
+                // source.container is the same synthetic artifact, so no
+                // container-derived fallback is safe here: real folder from
+                // the tracks' source images, or no sweep at all.
+                track_root
+            } else {
+                batch_root.or(request_root).or(prepared_container_root).or(track_root)
+            }
         }
         // Self-contained container sources: their companions live INSIDE the
         // container (extracted staging). The directory that merely holds the
@@ -35416,6 +35467,126 @@ mod pipeline_test_helpers {
 }
 
 #[cfg(test)]
+mod build_cue_sheet_tests {
+    use super::*;
+
+    fn cue_source() -> PreparedSource {
+        PreparedSource {
+            container: PathBuf::from("/tmp/album.cue"),
+            kind: SourceKind::CueImage,
+            tracks: vec![
+                PreparedTrack {
+                    id: TrackId { source_ordinal: 1, disc_number: None, track_number: 1 },
+                    source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav")),
+                    metadata: TrackMetadata {
+                        title: Some("One".to_string()),
+                        artist: Some("Artist".to_string()),
+                        track_number: Some(1),
+                        ..TrackMetadata::default()
+                    },
+                    expected_samples: Some(44_100 * 60),
+                    sample_rate: Some(44_100),
+                    source_audio: SourceAudioDescriptor::from_scalar(
+                        Some(44_100),
+                        Some(16),
+                        Some(SourceAudioCoding::Pcm),
+                    ),
+                    bit_depth: Some(16),
+                },
+                PreparedTrack {
+                    id: TrackId { source_ordinal: 1, disc_number: None, track_number: 2 },
+                    source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/02.wav")),
+                    metadata: TrackMetadata {
+                        title: Some("Two".to_string()),
+                        track_number: Some(2),
+                        ..TrackMetadata::default()
+                    },
+                    expected_samples: Some(44_100 * 30),
+                    sample_rate: Some(44_100),
+                    source_audio: SourceAudioDescriptor::from_scalar(
+                        Some(44_100),
+                        Some(16),
+                        Some(SourceAudioCoding::Pcm),
+                    ),
+                    bit_depth: Some(16),
+                },
+            ],
+            album_metadata: AlbumMetadata::default(),
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::CueImage,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        }
+    }
+
+    fn track_artifact(number: u32, name: &str) -> TrackArtifact {
+        TrackArtifact {
+            track_id: TrackId { source_ordinal: 1, disc_number: None, track_number: number },
+            staged_path: PathBuf::from(format!("/encoded/{name}")),
+            final_path: PathBuf::from(format!("/out/{name}")),
+            samples: None,
+            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            metadata_required: PlannedMetadataSatisfaction::none(),
+            planned_command_hash: None,
+        }
+    }
+
+    #[test]
+    fn generated_cue_carries_album_metadata_and_isrc() {
+        let mut source = cue_source();
+        source.album_metadata.album = Some("Album".to_string());
+        source.album_metadata.album_artist = Some("Artist".to_string());
+        source.album_metadata.date = Some("1973".to_string());
+        source.album_metadata.genre = Some("Rock".to_string());
+        source
+            .album_metadata
+            .extra
+            .insert("catalog".to_string(), "EOP-80778".to_string());
+        source.tracks[0].metadata.isrc = Some("GBAYE0300334".to_string());
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![
+                track_artifact(1, "01.flac"),
+                track_artifact(2, "02.flac"),
+            ]),
+            sidecars: Vec::new(),
+        };
+
+        let cue = build_cue_sheet(&source, &artifacts);
+        assert!(cue.contains("CATALOG EOP-80778"), "{cue}");
+        assert!(cue.contains("REM DATE 1973"), "{cue}");
+        assert!(cue.contains("REM GENRE \"Rock\""), "{cue}");
+        assert!(cue.contains("    ISRC GBAYE0300334"), "{cue}");
+        assert!(cue.contains("FILE \"01.flac\" WAVE"), "{cue}");
+    }
+
+    #[test]
+    fn merged_cue_index_times_are_cumulative_not_zero() {
+        let source = cue_source();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Merged(MergedArtifact {
+                staged_path: PathBuf::from("/encoded/album.flac"),
+                final_path: PathBuf::from("/out/album.flac"),
+                total_samples: 44_100 * 90,
+                source_tracks: source.tracks.iter().map(|t| t.id.clone()).collect(),
+                planned_command_hash: None,
+            }),
+            sidecars: Vec::new(),
+        };
+
+        let cue = build_cue_sheet(&source, &artifacts);
+        // Track 2 starts at track 1's cumulative offset (1:00), not zero.
+        assert!(cue.contains("    INDEX 01 01:00:00"), "{cue}");
+        assert_eq!(
+            cue.matches("INDEX 01 00:00:00").count(),
+            1,
+            "only the first track starts at zero: {cue}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod bluray_routing_tests {
     use super::*;
     use super::pipeline_test_helpers::log_test_request;
@@ -38915,7 +39086,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             ("DATE", "1957"),
             ("GENRE", "Jazz"),
             ("TRACKNUMBER", "1"),
-            ("TOTALTRACKS", "3"),
+            ("TRACKTOTAL", "3"),
             ("PERFORMER", "Sonny Rollins"),
         ] {
             assert!(
@@ -39070,7 +39241,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             ("DATE", "1985"),
             ("GENRE", "Rock"),
             ("TRACKNUMBER", "1"),
-            ("TOTALTRACKS", "9"),
+            ("TRACKTOTAL", "9"),
         ] {
             assert!(
                 has_remove_tag(args, key),

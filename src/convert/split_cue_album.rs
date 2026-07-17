@@ -262,6 +262,49 @@ pub struct SplitCueAdmissionReport {
     pub folders: Vec<SplitCueFolderAdmission>,
     pub warnings: Vec<String>,
     pub rejected_folders: Vec<PathBuf>,
+    /// Structured rejection facts (one per rejected folder). Callers that
+    /// need to distinguish "an alien cue referencing nothing in this folder"
+    /// from "a local cue-backed album that is malformed" read these instead
+    /// of string-matching warnings.
+    pub rejections: Vec<SplitCueFolderRejection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SplitCueFolderRejection {
+    pub parent: PathBuf,
+    pub offending_cue: PathBuf,
+    /// True when the offending cue resolved at least one EXISTING audio file
+    /// inside its own folder — i.e. it plausibly describes a local album and
+    /// atomic refusal must hold. False for alien sheets (absolute/outside
+    /// refs, nothing local): safe to degrade to a plain-files editor.
+    pub references_in_folder_audio: bool,
+}
+
+/// Lenient re-scan used only on the rejection path: does this cue resolve
+/// any existing in-folder audio file?
+fn cue_references_in_folder_audio(cue_path: &Path) -> bool {
+    let Some(parent) = cue_path.parent() else {
+        return false;
+    };
+    let Ok(sheet) = crate::convert::cue_parser::parse_cue_file(cue_path) else {
+        return false;
+    };
+    let parent_key = cue_path_key(parent);
+    let mut refs: Vec<String> = Vec::new();
+    for track in &sheet.tracks {
+        if let Some(file_ref) = track.file.as_ref() {
+            if !refs.iter().any(|existing| existing == file_ref) {
+                refs.push(file_ref.clone());
+            }
+        }
+    }
+    refs.iter().any(|file_ref| {
+        matches!(
+            resolve_split_cue_file_reference(parent, file_ref),
+            SplitCueReferenceResolution::Resolved(resolved)
+                if resolved.parent().map(cue_path_key).as_ref() == Some(&parent_key)
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,6 +418,11 @@ pub fn admit_split_cue_candidate_paths(cue_paths: &[PathBuf]) -> SplitCueAdmissi
         }
         if let Some((offending_cue, message)) = rejection {
             report.rejected_folders.push(parent_key.clone());
+            report.rejections.push(SplitCueFolderRejection {
+                parent: parent_key.clone(),
+                offending_cue: offending_cue.clone(),
+                references_in_folder_audio: cue_references_in_folder_audio(&offending_cue),
+            });
             report.warnings.push(format!(
                 "offending CUE {}: {} — conversion will not include this folder ({})",
                 offending_cue.display(),
@@ -617,6 +665,58 @@ fn unique_split_cue_candidate(candidates: Vec<PathBuf>) -> SplitCueReferenceReso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alien_cue_rejection_reports_no_in_folder_audio() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // Folder of plain audio + a published planner sheet whose FILE refs
+        // are absolute paths OUTSIDE the folder — the poisoned-output shape.
+        std::fs::write(temp.path().join("01 - One.flac"), b"audio").expect("fixture");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let outside_image = outside.path().join("source.wv");
+        std::fs::write(&outside_image, b"image").expect("fixture");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            format!(
+                "FILE \"{}\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                outside_image.display()
+            ),
+        )
+        .expect("fixture cue");
+
+        let report = admit_split_cue_folders(&[cue]);
+        assert!(report.folders.is_empty());
+        assert_eq!(report.rejections.len(), 1);
+        assert!(
+            !report.rejections[0].references_in_folder_audio,
+            "an alien sheet resolves no in-folder audio: {:?}",
+            report.rejections[0]
+        );
+    }
+
+    #[test]
+    fn malformed_local_cue_rejection_reports_in_folder_audio() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(temp.path().join("side.flac"), b"audio").expect("fixture");
+        // Local image resolves fine, but TRACK 01 has no INDEX 01 — a
+        // genuinely local cue-backed album that must keep atomic refusal.
+        let cue = temp.path().join("side.cue");
+        std::fs::write(
+            &cue,
+            "FILE \"side.flac\" WAVE\n  TRACK 01 AUDIO\n  TRACK 02 AUDIO\n    INDEX 01 01:00:00\n",
+        )
+        .expect("fixture cue");
+
+        let report = admit_split_cue_folders(&[cue]);
+        assert!(report.folders.is_empty());
+        assert_eq!(report.rejections.len(), 1);
+        assert!(
+            report.rejections[0].references_in_folder_audio,
+            "a local cue-backed album must keep the atomic refusal: {:?}",
+            report.rejections[0]
+        );
+    }
 
     #[test]
     fn existing_non_audio_direct_target_reports_unsupported_not_missing() {

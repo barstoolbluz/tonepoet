@@ -1605,14 +1605,31 @@ mod flac_metadata_writer {
         Err("saved FLAC metadata region did not terminate".to_string())
     }
 
+    /// Alias groups whose spellings all refer to the SAME logical field.
+    /// Editing any of them must remove every alias, or the write leaves a
+    /// stale duplicate under the other spelling (a FLAC tagged TOTALTRACKS
+    /// reads as TrackTotal, and the edit would write TRACKTOTAL alongside).
+    fn vorbis_key_aliases(comment_key: &str) -> &'static [&'static str] {
+        match comment_key {
+            "TRACKTOTAL" | "TOTALTRACKS" => &["TRACKTOTAL", "TOTALTRACKS"],
+            "DISCTOTAL" | "TOTALDISCS" => &["DISCTOTAL", "TOTALDISCS"],
+            "COMMENT" | "DESCRIPTION" => &["COMMENT", "DESCRIPTION"],
+            _ => &[],
+        }
+    }
+
     fn apply_comment_changes(
         vorbis: &mut VorbisComments,
         changes: &[(lofty::tag::ItemKey, Option<String>)],
     ) -> Result<(), String> {
         for (key, new_value) in changes {
             let comment_key = vorbis_comment_key(key)?;
+            let aliases = vorbis_key_aliases(&comment_key);
             vorbis.comments.retain(|comment| match comment {
-                VorbisComment::Parsed { name, .. } => !name.eq_ignore_ascii_case(&comment_key),
+                VorbisComment::Parsed { name, .. } => {
+                    !name.eq_ignore_ascii_case(&comment_key)
+                        && !aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias))
+                }
                 VorbisComment::Raw(_) => true,
             });
             if let Some(value) = new_value.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
@@ -5715,8 +5732,11 @@ pub fn canonical_metadata_display_key(display_key: &str) -> String {
     match normalized.as_str() {
         "YEAR" => "DATE".to_string(),
         "ALBUMARTIST" | "ALBUMARTISTS" | "ALBUMARTISTCREDIT" => "ALBUMARTIST".to_string(),
-        "TRACKTOTAL" => "TOTALTRACKS".to_string(),
-        "DISCTOTAL" => "TOTALDISCS".to_string(),
+        // foobar2000/flac convention is canonical; legacy spellings and
+        // lofty's old DESCRIPTION comment alias merge into it on read.
+        "TOTALTRACKS" => "TRACKTOTAL".to_string(),
+        "TOTALDISCS" => "DISCTOTAL".to_string(),
+        "DESCRIPTION" => "COMMENT".to_string(),
         "MUSICBRAINZALBUMID" => "MUSICBRAINZ_ALBUMID".to_string(),
         "MUSICBRAINZALBUMARTISTID" => "MUSICBRAINZ_ALBUMARTISTID".to_string(),
         "MUSICBRAINZRELEASEGROUPID" => "MUSICBRAINZ_RELEASEGROUPID".to_string(),
@@ -5739,13 +5759,13 @@ pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "ALBUMARTIST",
     "ORIGINALDATE",
     "TRACKNUMBER",
-    "TOTALTRACKS",
+    "TRACKTOTAL",
     "DISCNUMBER",
-    "TOTALDISCS",
+    "DISCTOTAL",
     "COMMENT",
     "YEAR",
-    "TRACKTOTAL",
-    "DISCTOTAL",
+    "TOTALTRACKS",
+    "TOTALDISCS",
     "CATALOGNUMBER",
     "RELEASECOUNTRY",
     "CONDUCTOR",
@@ -5772,9 +5792,9 @@ const CORE_EDITOR_FIELDS: &[&str] = &[
     "PERFORMER",
     "ALBUMARTIST",
     "TRACKNUMBER",
-    "TOTALTRACKS",
+    "TRACKTOTAL",
     "DISCNUMBER",
-    "TOTALDISCS",
+    "DISCTOTAL",
     "COMMENT",
 ];
 
@@ -7575,6 +7595,75 @@ pub fn recover_stale_flac_metadata_journals_in_dir(dir: &std::path::Path) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_totals_removes_legacy_alias_spellings() {
+        // A FLAC tagged with legacy TOTALTRACKS reads as ItemKey::TrackTotal;
+        // an edit must not leave the stale spelling beside the new
+        // TRACKTOTAL — alias-complete deletion.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("legacy.flac");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=44100:duration=0.2", "-c:a", "flac",
+            ])
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        };
+        assert!(status.success());
+        // Seed the legacy spellings raw.
+        write_all_tags(
+            &path,
+            &[
+                (
+                    lofty::tag::ItemKey::Unknown("TOTALTRACKS".to_string()),
+                    Some("10".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DESCRIPTION".to_string()),
+                    Some("old comment".to_string()),
+                ),
+            ],
+        )
+        .expect("seed legacy tags");
+
+        // Edit through the mapped keys (what the editor emits).
+        write_all_tags(
+            &path,
+            &[
+                (lofty::tag::ItemKey::TrackTotal, Some("12".to_string())),
+                (lofty::tag::ItemKey::Comment, Some("new comment".to_string())),
+            ],
+        )
+        .expect("edit totals");
+
+        let reread = read_all_tags_merged(&[path]).expect("re-read");
+        let totals: Vec<_> = reread
+            .iter()
+            .filter(|entry| {
+                entry.display_key.eq_ignore_ascii_case("TRACKTOTAL")
+                    || entry.display_key.eq_ignore_ascii_case("TOTALTRACKS")
+            })
+            .filter(|entry| entry.per_file_values.iter().any(|v| !v.is_empty()))
+            .collect();
+        assert_eq!(totals.len(), 1, "exactly one totals spelling: {totals:?}");
+        assert!(totals[0].per_file_values.iter().any(|v| v == "12"));
+        let comments: Vec<_> = reread
+            .iter()
+            .filter(|entry| {
+                entry.display_key.eq_ignore_ascii_case("COMMENT")
+                    || entry.display_key.eq_ignore_ascii_case("DESCRIPTION")
+            })
+            .filter(|entry| entry.per_file_values.iter().any(|v| !v.is_empty()))
+            .collect();
+        assert_eq!(comments.len(), 1, "exactly one comment spelling: {comments:?}");
+        assert!(comments[0].per_file_values.iter().any(|v| v == "new comment"));
+    }
 
     #[test]
     fn legacy_wrapper_writes_aligned_rows_and_skips_misaligned_per_row() {

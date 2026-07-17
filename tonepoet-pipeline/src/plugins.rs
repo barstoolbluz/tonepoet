@@ -1655,10 +1655,23 @@ fn add_sox_dsd_to_pcm_effects(
             if let Some(source_hz) = context.request.source.sample_rate_hz {
                 if let Some(dsd_rate) = crate::enums::DsdRate::from_hz(source_hz) {
                     if let Some(lowpass_hz) = dsd_rate.default_pcm_lowpass_hz() {
-                        args.push("sinc".into());
-                        args.push("-a".into());
-                        args.push("180".into());
-                        args.push(format!("-{lowpass_hz}"));
+                        // The sinc runs at the OUTPUT rate (it follows the
+                        // rate effect). When the cutoff falls at/above the
+                        // target Nyquist, sox rejects the filter outright —
+                        // and the strip is redundant anyway: the rate
+                        // converter's anti-alias filter already bandlimits
+                        // to Nyquist (the same rationale that makes
+                        // default_pcm_lowpass_hz None for DSD512/1024).
+                        // Without this guard, DSD256 -> <192k, DSD128 ->
+                        // <96k, and DSD64 -> 44.1/48k all failed with
+                        // "sinc: filter frequency must be less than
+                        // sample-rate / 2".
+                        if u64::from(lowpass_hz) < u64::from(target_rate_hz) / 2 {
+                            args.push("sinc".into());
+                            args.push("-a".into());
+                            args.push("180".into());
+                            args.push(format!("-{lowpass_hz}"));
+                        }
                     }
                 }
             }
@@ -2507,6 +2520,77 @@ mod tests {
         add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
 
         assert_eq!(args, vec!["gain", "-1.50"]);
+    }
+
+    fn dsd_sinc_guard_command(source_hz: u32, target_rate_hz: u32) -> PlannedCommand {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.dither_type = DitherType::None;
+        let source = SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: crate::enums::AudioCodec::Dsd,
+            sample_rate_hz: Some(source_hz),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: Default::default(),
+            sample_kind: Some(crate::enums::SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let request = PlanRequest {
+            input_path: PathBuf::from("input.dsf"),
+            output_path: PathBuf::from("output.flac"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let context = request.context();
+        let step = PlanStep::new(
+            0,
+            PlanOperation::DsdToPcm {
+                target_format: AudioFormat::Flac,
+                target_rate_hz,
+                target_bit_depth: PcmBitDepth::Int24,
+                lowpass: DsdLowpassMethod::SoxUltra,
+            },
+            InputSource::Path(PathBuf::from("input.dsf")),
+            OutputSink::Path(PathBuf::from("output.flac")),
+            "Create PCM output",
+        );
+        SoxPlugin.build_command(&context, &step).unwrap()
+    }
+
+    #[test]
+    fn dsd_noise_strip_sinc_is_skipped_when_cutoff_reaches_target_nyquist() {
+        // DSD64 default cutoff is 25 kHz: above the 22.05 kHz Nyquist of a
+        // 44.1 kHz target -> sox would reject the filter, so it must be
+        // skipped (the rate converter's anti-alias already bandlimits).
+        let command = dsd_sinc_guard_command(2_822_400, 44_100);
+        assert!(
+            !command.args.iter().any(|arg| arg == "sinc"),
+            "{:?}",
+            command.args
+        );
+
+        // DSD256 default cutoff is 96 kHz: above the 44.1 kHz Nyquist of an
+        // 88.2 kHz target — the exact shape that failed every real DSD256
+        // DSF conversion.
+        let command = dsd_sinc_guard_command(11_289_600, 88_200);
+        assert!(
+            !command.args.iter().any(|arg| arg == "sinc"),
+            "{:?}",
+            command.args
+        );
+
+        // DSD256 at its default 352.8 kHz target keeps the strip.
+        let command = dsd_sinc_guard_command(11_289_600, 352_800);
+        assert!(
+            command.args.windows(4).any(|w| w == ["sinc", "-a", "180", "-96000"]),
+            "{:?}",
+            command.args
+        );
     }
 
     #[test]
